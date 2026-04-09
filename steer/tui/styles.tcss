@@ -2,51 +2,88 @@ Screen {
     layout: vertical;
 }
 
-#header {
-    width: 100%;
-    height: 1;
-    background: $accent;
-    color: $text;
-    text-style: bold;
-    padding: 0 1;
-}
-
 #main-area {
     height: 1fr;
     layout: horizontal;
 }
 
-#chat-panel {
+/* Three-column layout: left (1fr) | center (2fr) | right (1fr) */
+#left-panel {
     width: 1fr;
     height: 100%;
-    border: solid $primary;
+    border-right: solid $accent;
+    padding: 0 1;
+    layout: vertical;
 }
 
-#right-column {
-    width: 1fr;
+#chat-panel {
+    width: 2fr;
     height: 100%;
     layout: vertical;
 }
 
-#vector-panel {
-    border: solid $secondary;
-    height: auto;
-    max-height: 35%;
-    padding: 0 1;
-}
-
-#controls-panel {
-    border: solid $secondary;
-    height: auto;
-    max-height: 20%;
-    padding: 0 1;
-}
-
 #trait-panel {
-    border: solid $accent;
-    height: 1fr;
-    min-height: 10;
+    width: 1fr;
+    height: 100%;
+    border-left: solid $accent;
     padding: 0 1;
+    layout: vertical;
+}
+
+/* Panel focus highlighting */
+#left-panel.focused {
+    border-right: double $accent;
+}
+
+#chat-panel.focused {
+    border: solid $accent;
+}
+
+#trait-panel.focused {
+    border-left: double $accent;
+}
+
+/* Left panel sections */
+.section-header {
+    color: $accent;
+    text-style: bold;
+    height: 1;
+}
+
+.section-body {
+    height: auto;
+    padding: 0;
+}
+
+#model-section {
+    height: auto;
+}
+
+#vectors-section {
+    height: 1fr;
+    min-height: 5;
+}
+
+#vector-scroll {
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#gen-section {
+    height: auto;
+}
+
+#keys-section {
+    height: auto;
+}
+
+.vector-row {
+    height: auto;
+}
+
+.vector-row-selected {
+    height: auto;
+    background: $surface;
 }
 
 /* Chat panel internals */
@@ -56,10 +93,17 @@ Screen {
     padding: 0 1;
 }
 
+#status-bar {
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+}
+
 #chat-input {
     height: 3;
     dock: bottom;
-    border-top: solid $primary;
+    border-top: solid $accent;
 }
 
 .user-message {
@@ -72,30 +116,12 @@ Screen {
     margin: 0 0 1 0;
 }
 
-/* Vector panel */
-#vector-header {
-    height: 1;
-}
-
-#vector-list {
-    height: auto;
-    max-height: 8;
-}
-
-#vector-actions {
-    height: 1;
-}
-
-.vector-row {
-    height: 1;
-}
-
-/* Trait panel */
+/* Trait panel internals */
 #trait-header {
     height: 1;
 }
 
-#trait-list {
+#trait-scroll {
     height: 1fr;
     overflow-y: auto;
 }
@@ -103,31 +129,24 @@ Screen {
 .trait-category {
     text-style: bold;
     color: $accent;
+    height: 1;
 }
 
 .trait-row {
     height: 1;
 }
 
-#sparkline-display {
-    height: 1;
-    dock: bottom;
-    color: $accent;
+.trait-row-selected {
+    height: auto;
+    background: $surface;
 }
 
-/* Controls panel */
-#controls-header {
+#trait-hints {
     height: 1;
+    color: $text-muted;
 }
 
-#alpha-display {
-    height: 1;
-}
-
-#layer-display {
-    height: 1;
-}
-
-#ortho-display {
+/* Footer */
+Footer {
     height: 1;
 }
