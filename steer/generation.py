@@ -121,11 +121,18 @@ def generate_steered(
                 # Top-p (nucleus) sampling — use topk to avoid sorting full vocab
                 k = min(1000, logits.shape[-1])
                 top_logits, top_idx = logits.topk(k, dim=-1, sorted=True)
+                # Clamp to prevent inf/nan from extreme steering vectors
+                top_logits.clamp_(-100.0, 100.0)
                 probs = top_logits.softmax(dim=-1)
                 cumprobs = probs.cumsum(dim=-1)
                 mask = (cumprobs - probs) >= config.top_p
                 probs[mask] = 0.0
-                probs.div_(probs.sum(dim=-1, keepdim=True))
+                total = probs.sum(dim=-1, keepdim=True)
+                # If top-p masked everything, fall back to top-1
+                if total.item() == 0.0:
+                    probs[0, 0] = 1.0
+                else:
+                    probs.div_(total)
 
                 token_idx = torch.multinomial(probs, 1)
                 next_token = top_idx.gather(-1, token_idx)

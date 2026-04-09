@@ -22,16 +22,16 @@ pytest tests/test_smoke.py -v -k "test_actadd_returns_unit_vector"  # Single tes
 The system has three layers: **model/vector infrastructure**, **generation loop**, and **TUI**.
 
 ### Model + Vector layer
-- `model.py` — Loads HF causal LMs with quantization/device/compile options. `_LAYER_ACCESSORS` dict maps `model_type` strings to layer-list accessors; add new architectures here.
+- `model.py` — Loads HF causal LMs with quantization/device/compile options. `_LAYER_ACCESSORS` dict maps `model_type` strings to layer-list accessors; add new architectures here. `_text_config()` helper resolves `hidden_size` from multimodal configs that nest it under `text_config`.
 - `vectors.py` — Two extraction methods: `extract_actadd` (single concept + baseline batched into one forward pass, mean-pool + L2-normalize the difference) and `extract_caa` (contrastive pairs batched into a single forward pass, same pipeline). Batched variant `extract_actadd_batched` for probe bootstrap. All extraction uses `torch.inference_mode()`. Vectors saved as `.safetensors` + `.json` metadata sidecar.
 - `probes_bootstrap.py` — On startup, loads or extracts probe vectors per `steer/probes/defaults.json`. Probes are cached under `steer/probes/cache/{model_name}/`. Categories: emotion, personality, safety, cultural, gender. CAA probes expect dataset files in `steer/datasets/`.
 
 ### Steering + Monitoring layer
-- `hooks.py` — `SteeringHook` registers a `register_forward_hook` on a layer, adding a pre-composed vector to hidden states in-place via `output[0].add_()` (returns `output` directly — no tuple allocation per token). `recompose` uses stack+matmul to compose multiple vectors. `SteeringManager` groups vectors by layer, handles orthogonalization (Gram-Schmidt), and manages hook lifecycle.
-- `monitor.py` — `TraitMonitor` attaches a read-only forward hook at a single layer. Pre-stacks probe vectors into a unit-normalized matrix; the hook normalizes the hidden state once, then a single matmul yields cosine similarities (no per-probe division). GPU buffer batches results; `flush_to_cpu()` transfers to CPU history on TUI poll — call it once before reading sparklines, not per-probe.
+- `hooks.py` — `SteeringHook` registers a `register_forward_hook` on a layer, adding a pre-composed vector to hidden states in-place. Handles both tuple output (`output[0].add_()`) and bare tensor output (e.g. Gemma 4 decoder layers return a raw tensor). `recompose` uses stack+matmul to compose multiple vectors. `SteeringManager` groups vectors by layer, handles orthogonalization (Gram-Schmidt), and manages hook lifecycle.
+- `monitor.py` — `TraitMonitor` attaches a read-only forward hook at a single layer. Pre-stacks probe vectors into a unit-normalized matrix; the hook normalizes the hidden state once, then a single matmul yields cosine similarities (no per-probe division). Guards against zero/NaN hidden state norms by writing zeros instead of NaN. GPU buffer batches results; `flush_to_cpu()` transfers to CPU history on TUI poll — call it once before reading sparklines, not per-probe.
 
 ### Generation loop
-- `generation.py` — Token-by-token generation with KV cache, top-p sampling via `torch.topk` (avoids full-vocab sort), stop control via `threading.Event`. A single `torch.inference_mode()` context wraps the entire generation loop (not per-token — this matters for performance). Runs in a worker thread; tokens flow to TUI via `queue.SimpleQueue`. Steering hooks are transparent to the generation loop (they modify hidden states via forward hooks).
+- `generation.py` — Token-by-token generation with KV cache, top-p sampling via `torch.topk` (avoids full-vocab sort), stop control via `threading.Event`. A single `torch.inference_mode()` context wraps the entire generation loop (not per-token — this matters for performance). Runs in a worker thread; tokens flow to TUI via `queue.SimpleQueue`. Steering hooks are transparent to the generation loop (they modify hidden states via forward hooks). Logits are clamped to [-100, 100] before softmax to prevent inf/NaN from extreme steering. `build_chat_input` falls back to plain tokenization for base models without a chat template.
 
 ### TUI layer (Textual)
 - `tui/app.py` — `SteerApp` orchestrates everything. Caches `self._device`/`self._dtype` on init (never call `next(model.parameters())` outside `__init__`). Polls token queue + monitor at ~15 FPS. In-chat commands: `/steer`, `/clear`, `/system`, `/temp`, `/probes`. Keybindings for alpha/layer adjustment, orthogonalization toggle, A/B comparison.
@@ -47,7 +47,7 @@ The system has three layers: **model/vector infrastructure**, **generation loop*
 
 These matter for the throughput regression test (steered ≥85% of vanilla tok/s):
 
-- **Hot-path hooks (`hook_fn`, `_hook`)**: No Python allocation, no `.item()`, no CPU sync. Return `output` directly after in-place mutation — never build new tuples. In the monitor hook, normalize with `.clamp(min=1e-8)` instead of branching on `norm > 0` — the branch forces a GPU→CPU sync per token.
+- **Hot-path hooks (`hook_fn`, `_hook`)**: No Python allocation, no `.item()`, no CPU sync. Return `output` directly after in-place mutation — never build new tuples. Both hooks handle bare tensor output (Gemma 4) and tuple output (most models). The monitor hook branches on `norm > 1e-8` to guard against zero/NaN states — this is a necessary GPU→CPU sync but only on degenerate inputs.
 - **`torch.inference_mode()`** over `torch.no_grad()` everywhere (generation, extraction). In the generation loop, the context wraps the entire loop — never re-enter per token.
 - **In-place ops in generation loop**: Use `logits.div_(temperature)` not `logits / temperature` — avoids a tensor allocation per token. The logits view is not reused after sampling.
 - **`torch.topk`** for top-p sampling, not full-vocab sort.
