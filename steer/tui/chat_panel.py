@@ -36,15 +36,13 @@ class ChatPanel(Widget):
     def start_assistant_message(self) -> Static:
         log = self.query_one("#chat-log", VerticalScroll)
         widget = Static("[bold green]Assistant:[/] ", classes="assistant-message")
+        widget._chat_text = "[bold green]Assistant:[/] "
         log.mount(widget)
         return widget
 
     def append_to_assistant(self, widget: Static, token: str) -> None:
-        current = widget.renderable
-        if isinstance(current, str):
-            widget.update(current + token)
-        else:
-            widget.update(str(current) + token)
+        widget._chat_text += token
+        widget.update(widget._chat_text)
         log = self.query_one("#chat-log", VerticalScroll)
         log.scroll_end(animate=False)
 
