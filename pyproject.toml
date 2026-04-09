@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steer"
+version = "0.1.0"
+description = "Local activation steering + trait monitoring TUI for HuggingFace transformers"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "accelerate>=0.27",
+    "bitsandbytes>=0.43",
+    "safetensors>=0.4",
+    "textual>=0.50",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+flash = ["flash-attn>=2.5"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+steer = "steer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["steer*"]
