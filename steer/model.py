@@ -11,10 +11,12 @@ log = logging.getLogger(__name__)
 
 _MODEL_LAYERS = lambda m: m.model.layers  # noqa: E731
 _TRANSFORMER_H = lambda m: m.transformer.h  # noqa: E731
+_VLM_LANGUAGE_LAYERS = lambda m: m.model.language_model.layers  # noqa: E731
 
 _LAYER_ACCESSORS = {
     # Llama family
     "llama": _MODEL_LAYERS,
+    "llama4": _MODEL_LAYERS,
     "llama4_text": _MODEL_LAYERS,
     # Mistral / Mixtral
     "mistral": _MODEL_LAYERS,
@@ -22,7 +24,9 @@ _LAYER_ACCESSORS = {
     # Gemma family
     "gemma": _MODEL_LAYERS,
     "gemma2": _MODEL_LAYERS,
+    "gemma3": _VLM_LANGUAGE_LAYERS,
     "gemma3_text": _MODEL_LAYERS,
+    "gemma4": _VLM_LANGUAGE_LAYERS,
     "gemma4_text": _MODEL_LAYERS,
     "recurrent_gemma": _MODEL_LAYERS,
     # Phi family
