@@ -27,6 +27,7 @@ class SteerApp(App):
         Binding("ctrl+d", "remove_vector", "Remove Vector"),
         Binding("ctrl+p", "add_probe", "Add Probe"),
         Binding("ctrl+a", "ab_compare", "A/B Compare"),
+        Binding("escape", "stop_generation", "Stop", show=False),
         Binding("ctrl+r", "regenerate", "Regenerate"),
         Binding("ctrl+t", "toggle_vector", "Toggle Vector"),
         Binding("left", "alpha_down", "Alpha -", show=False),
@@ -202,6 +203,10 @@ class SteerApp(App):
         cp = self.query_one("#controls-panel", ControlsPanel)
         sel = vp.get_selected()
         cp.update_for_vector(sel, self._model_info["num_layers"])
+
+    def action_stop_generation(self) -> None:
+        if self._gen_state.is_generating.is_set():
+            self._gen_state.request_stop()
 
     def _start_generation(self) -> None:
         if self._gen_state.is_generating.is_set():
