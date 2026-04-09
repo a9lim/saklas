@@ -33,7 +33,8 @@ class TraitMonitor:
 
     def _hook(self, module, input, output):
         """Hot path. One matmul, no .item(), no CPU sync."""
-        last_state = output[0][0, -1, :]  # (D,) — last token of batch dim 0
+        hidden = output[0] if isinstance(output, tuple) else output
+        last_state = hidden[0, -1, :]  # (D,) — last token of batch dim 0
         normed_state = last_state / last_state.norm().clamp(min=1e-8)  # normalize once, no branch
         sims = self._probe_matrix_normed @ normed_state  # (P,) — dot of unit vectors = cosine sim
         if self._buf_idx < self._gpu_buffer.shape[0]:

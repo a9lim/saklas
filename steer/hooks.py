@@ -28,6 +28,9 @@ class SteeringHook:
 
     def hook_fn(self, module, input, output):
         if self.composed is not None:
+            if isinstance(output, torch.Tensor):
+                output.add_(self.composed)
+                return output
             output[0].add_(self.composed)
         return output
 
