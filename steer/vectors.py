@@ -37,35 +37,36 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     catastrophic for architectures like Gemma 4 whose cumulative
     ``layer_scalar`` shrinks the residual stream by orders of magnitude.
     """
-    unit = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    # Compute norm in float32 to avoid fp16 overflow: for hidden_dim=2048
+    # with element magnitudes ~6, the sum-of-squares (73728) exceeds
+    # fp16 max (65504), producing Inf and zeroing the entire vector.
+    v_f32 = v.float()
+    unit = (v_f32 / v_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)).to(v.dtype)
     if ref_norm is not None:
         return unit * ref_norm
     return unit
 
 
-def _capture_hidden_states(model, layer, enc):
-    """Run a forward pass and capture hidden states at a specific layer via hook.
+def _capture_hidden_states_single(model, layer, input_ids):
+    """Run a single-sequence forward pass and capture hidden states at *layer*.
 
-    Using a hook is more robust than ``output_hidden_states`` because
-    multimodal wrappers (Gemma 3/4, etc.) can re-index the hidden-state
-    list, causing an off-by-N mismatch between the extracted vector and
-    the layer the steering hook is attached to.
+    Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
     """
     captured = {}
 
     def _hook(module, input, output):
-        # Handle both bare-tensor (Gemma 4) and tuple outputs
         h = output if isinstance(output, torch.Tensor) else output[0]
-        # Clone to avoid corruption from downstream in-place ops
+        if h.device.type == "mps":
+            torch.mps.synchronize()
         captured["hidden"] = h.clone()
 
     handle = layer.register_forward_hook(_hook)
     try:
         with torch.inference_mode():
-            model(**enc)
+            model(input_ids=input_ids, use_cache=False)
     finally:
         handle.remove()
-    return captured["hidden"]
+    return captured["hidden"]  # (1, seq, dim)
 
 
 def extract_actadd(
@@ -78,39 +79,78 @@ def extract_actadd(
 ) -> torch.Tensor:
     """Single-concept ActAdd extraction (Turner et al., 2023).
 
-    Tokenizes concept and baseline in a single batch, extracts hidden states
-    at the given layer, mean-pools across token positions, mean-centers, and
-    returns the L2-normalized difference vector.
+    Tokenizes concept and baseline **separately** (no batching) to avoid
+    degenerate attention from fully-masked padding when the baseline is
+    shorter.  Each text gets its own forward pass.
     """
     device = next(model.parameters()).device
 
-    enc = tokenizer(
-        [concept, baseline],
-        padding=True,
-        return_tensors="pt",
-        return_attention_mask=True,
-    ).to(device)
+    def _encode_single(text: str) -> torch.Tensor:
+        """Tokenize a single string, guaranteeing ≥1 real token."""
+        enc = tokenizer(
+            text,
+            return_tensors="pt",
+            return_attention_mask=True,
+            add_special_tokens=True,
+        )
+        ids = enc["input_ids"]
+        # If the tokenizer produced nothing (empty string with no BOS),
+        # fall back to the BOS token so the model has valid input.
+        if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
+            bos = tokenizer.bos_token_id
+            if bos is None:
+                bos = tokenizer.eos_token_id or 0
+            ids = torch.tensor([[bos]])
+        return ids.to(device)
+
+    concept_ids = _encode_single(concept)
+    baseline_ids = _encode_single(baseline)
 
     if layers is not None:
-        hidden = _capture_hidden_states(model, layers[layer_idx], enc)
+        layer_mod = layers[layer_idx]
+        h_concept = _capture_hidden_states_single(model, layer_mod, concept_ids)
+        h_baseline = _capture_hidden_states_single(model, layer_mod, baseline_ids)
     else:
         with torch.inference_mode():
-            out = model(**enc, output_hidden_states=True)
-        hidden = out.hidden_states[layer_idx]
+            out_c = model(input_ids=concept_ids, output_hidden_states=True, use_cache=False)
+            out_b = model(input_ids=baseline_ids, output_hidden_states=True, use_cache=False)
+        h_concept = out_c.hidden_states[layer_idx]
+        h_baseline = out_b.hidden_states[layer_idx]
 
-    mask = enc["attention_mask"]  # (2, seq)
-    pooled = _mean_pool(hidden, mask)  # (2, dim)
-
-    # Use the mean hidden-state norm as reference so the steering vector
-    # lives at the same scale as the activations (critical for architectures
-    # with per-layer output scaling like Gemma 4's layer_scalar).
-    ref_norm = pooled.norm(dim=-1).mean().item()
-
-    pos_mean = pooled[0:1]  # (1, dim)
-    neg_mean = pooled[1:2]
+    # Mean-pool over token positions (no padding, so simple mean).
+    pos_mean = h_concept.float().mean(dim=1, keepdim=True)   # (1, 1, dim)
+    neg_mean = h_baseline.float().mean(dim=1, keepdim=True)
+    # Squeeze out seq dim → (1, dim)
+    pos_mean = pos_mean.squeeze(1)
+    neg_mean = neg_mean.squeeze(1)
 
     diff = pos_mean - neg_mean  # (1, dim)
-    return _normalize(diff, ref_norm=ref_norm).squeeze(0)  # (dim,)
+
+    # Scale to 10% of the mean hidden-state norm.
+    ref_norm = (
+        torch.stack([pos_mean, neg_mean]).norm(dim=-1).mean().item() * 0.1
+    )
+
+    return _normalize(diff.to(h_concept.dtype), ref_norm=ref_norm).squeeze(0)
+
+
+def _capture_hidden_states_batched(model, layer, enc):
+    """Batched capture — safe only when every sequence has ≥1 unmasked token."""
+    captured = {}
+
+    def _hook(module, input, output):
+        h = output if isinstance(output, torch.Tensor) else output[0]
+        if h.device.type == "mps":
+            torch.mps.synchronize()
+        captured["hidden"] = h.clone()
+
+    handle = layer.register_forward_hook(_hook)
+    try:
+        with torch.inference_mode():
+            model(**enc, use_cache=False)
+    finally:
+        handle.remove()
+    return captured["hidden"]
 
 
 def extract_actadd_batched(
@@ -130,6 +170,10 @@ def extract_actadd_batched(
         Dict mapping concept string -> unit steering vector.
     """
     device = next(model.parameters()).device
+    # Ensure baseline produces real tokens (empty string → BOS fallback).
+    if not baseline.strip():
+        bos = tokenizer.bos_token
+        baseline = bos if bos else " "
     texts = concepts + [baseline]
 
     enc = tokenizer(
@@ -137,19 +181,20 @@ def extract_actadd_batched(
         padding=True,
         return_tensors="pt",
         return_attention_mask=True,
+        add_special_tokens=True,
     ).to(device)
 
     if layers is not None:
-        hidden = _capture_hidden_states(model, layers[layer_idx], enc)
+        hidden = _capture_hidden_states_batched(model, layers[layer_idx], enc)
     else:
         with torch.inference_mode():
-            out = model(**enc, output_hidden_states=True)
+            out = model(**enc, output_hidden_states=True, use_cache=False)
         hidden = out.hidden_states[layer_idx]
 
     mask = enc["attention_mask"]  # (batch, seq)
     pooled = _mean_pool(hidden, mask)  # (batch, dim)
 
-    ref_norm = pooled.norm(dim=-1).mean().item()
+    ref_norm = pooled.float().norm(dim=-1).mean().item() * 0.1
     neg_mean = pooled[-1]  # baseline is last in batch
     result: dict[str, torch.Tensor] = {}
 
@@ -188,19 +233,20 @@ def extract_caa(
         padding=True,
         return_tensors="pt",
         return_attention_mask=True,
+        add_special_tokens=True,
     ).to(device)
 
     if layers is not None:
-        hidden = _capture_hidden_states(model, layers[layer_idx], enc)
+        hidden = _capture_hidden_states_batched(model, layers[layer_idx], enc)
     else:
         with torch.inference_mode():
-            out = model(**enc, output_hidden_states=True)
+            out = model(**enc, output_hidden_states=True, use_cache=False)
         hidden = out.hidden_states[layer_idx]
 
     mask = enc["attention_mask"]  # (2*n, seq)
     pooled = _mean_pool(hidden, mask)  # (2*n, dim)
 
-    ref_norm = pooled.norm(dim=-1).mean().item()
+    ref_norm = pooled.float().norm(dim=-1).mean().item() * 0.1
     pos_pooled = pooled[:n]  # (n, dim)
     neg_pooled = pooled[n:]  # (n, dim)
 
