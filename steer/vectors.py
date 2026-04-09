@@ -32,12 +32,37 @@ def _normalize(v: torch.Tensor) -> torch.Tensor:
     return v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
 
+def _capture_hidden_states(model, layer, enc):
+    """Run a forward pass and capture hidden states at a specific layer via hook.
+
+    Using a hook is more robust than ``output_hidden_states`` because
+    multimodal wrappers (Gemma 3/4, etc.) can re-index the hidden-state
+    list, causing an off-by-N mismatch between the extracted vector and
+    the layer the steering hook is attached to.
+    """
+    captured = {}
+
+    def _hook(module, input, output):
+        # Handle both bare-tensor (Gemma 4) and tuple outputs
+        h = output if isinstance(output, torch.Tensor) else output[0]
+        captured["hidden"] = h
+
+    handle = layer.register_forward_hook(_hook)
+    try:
+        with torch.inference_mode():
+            model(**enc)
+    finally:
+        handle.remove()
+    return captured["hidden"]
+
+
 def extract_actadd(
     model,
     tokenizer,
     concept: str,
     layer_idx: int,
     baseline: str = "",
+    layers=None,
 ) -> torch.Tensor:
     """Single-concept ActAdd extraction (Turner et al., 2023).
 
@@ -54,10 +79,13 @@ def extract_actadd(
         return_attention_mask=True,
     ).to(device)
 
-    with torch.inference_mode():
-        out = model(**enc, output_hidden_states=True)
+    if layers is not None:
+        hidden = _capture_hidden_states(model, layers[layer_idx], enc)
+    else:
+        with torch.inference_mode():
+            out = model(**enc, output_hidden_states=True)
+        hidden = out.hidden_states[layer_idx]
 
-    hidden = out.hidden_states[layer_idx]  # (2, seq, dim)
     mask = enc["attention_mask"]  # (2, seq)
     pooled = _mean_pool(hidden, mask)  # (2, dim)
 
@@ -74,6 +102,7 @@ def extract_actadd_batched(
     concepts: list[str],
     layer_idx: int,
     baseline: str = "",
+    layers=None,
 ) -> dict[str, torch.Tensor]:
     """Batch multiple ActAdd extractions into fewer forward passes.
 
@@ -93,12 +122,14 @@ def extract_actadd_batched(
         return_attention_mask=True,
     ).to(device)
 
-    with torch.inference_mode():
-        out = model(**enc, output_hidden_states=True)
+    if layers is not None:
+        hidden = _capture_hidden_states(model, layers[layer_idx], enc)
+    else:
+        with torch.inference_mode():
+            out = model(**enc, output_hidden_states=True)
+        hidden = out.hidden_states[layer_idx]
 
-    hidden = out.hidden_states[layer_idx]  # (batch, seq, dim)
     mask = enc["attention_mask"]  # (batch, seq)
-
     pooled = _mean_pool(hidden, mask)  # (batch, dim)
 
     neg_mean = pooled[-1]  # baseline is last in batch
@@ -116,6 +147,7 @@ def extract_caa(
     tokenizer,
     pairs: list[dict],
     layer_idx: int,
+    layers=None,
 ) -> torch.Tensor:
     """Contrastive Activation Addition (Rimsky et al., 2023).
 
@@ -140,10 +172,13 @@ def extract_caa(
         return_attention_mask=True,
     ).to(device)
 
-    with torch.inference_mode():
-        out = model(**enc, output_hidden_states=True)
+    if layers is not None:
+        hidden = _capture_hidden_states(model, layers[layer_idx], enc)
+    else:
+        with torch.inference_mode():
+            out = model(**enc, output_hidden_states=True)
+        hidden = out.hidden_states[layer_idx]
 
-    hidden = out.hidden_states[layer_idx]  # (2*n, seq, dim)
     mask = enc["attention_mask"]  # (2*n, seq)
     pooled = _mean_pool(hidden, mask)  # (2*n, dim)
 
