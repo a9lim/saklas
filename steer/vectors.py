@@ -27,9 +27,20 @@ def _mean_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> tor
     return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
 
-def _normalize(v: torch.Tensor) -> torch.Tensor:
-    """L2-normalize to unit norm."""
-    return v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
+    """Normalize a direction vector.
+
+    If *ref_norm* is given the vector is scaled so that its norm equals
+    *ref_norm* (i.e. it lives at the same magnitude as the hidden states
+    it was derived from).  Otherwise the vector is L2-normalized to unit
+    norm — which is fine for models without per-layer output scaling, but
+    catastrophic for architectures like Gemma 4 whose cumulative
+    ``layer_scalar`` shrinks the residual stream by orders of magnitude.
+    """
+    unit = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    if ref_norm is not None:
+        return unit * ref_norm
+    return unit
 
 
 def _capture_hidden_states(model, layer, enc):
@@ -45,7 +56,8 @@ def _capture_hidden_states(model, layer, enc):
     def _hook(module, input, output):
         # Handle both bare-tensor (Gemma 4) and tuple outputs
         h = output if isinstance(output, torch.Tensor) else output[0]
-        captured["hidden"] = h
+        # Clone to avoid corruption from downstream in-place ops
+        captured["hidden"] = h.clone()
 
     handle = layer.register_forward_hook(_hook)
     try:
@@ -89,11 +101,16 @@ def extract_actadd(
     mask = enc["attention_mask"]  # (2, seq)
     pooled = _mean_pool(hidden, mask)  # (2, dim)
 
+    # Use the mean hidden-state norm as reference so the steering vector
+    # lives at the same scale as the activations (critical for architectures
+    # with per-layer output scaling like Gemma 4's layer_scalar).
+    ref_norm = pooled.norm(dim=-1).mean().item()
+
     pos_mean = pooled[0:1]  # (1, dim)
     neg_mean = pooled[1:2]
 
     diff = pos_mean - neg_mean  # (1, dim)
-    return _normalize(diff).squeeze(0)  # (dim,)
+    return _normalize(diff, ref_norm=ref_norm).squeeze(0)  # (dim,)
 
 
 def extract_actadd_batched(
@@ -132,12 +149,13 @@ def extract_actadd_batched(
     mask = enc["attention_mask"]  # (batch, seq)
     pooled = _mean_pool(hidden, mask)  # (batch, dim)
 
+    ref_norm = pooled.norm(dim=-1).mean().item()
     neg_mean = pooled[-1]  # baseline is last in batch
     result: dict[str, torch.Tensor] = {}
 
     for i, concept in enumerate(concepts):
         diff = pooled[i] - neg_mean
-        result[concept] = _normalize(diff.unsqueeze(0)).squeeze(0)
+        result[concept] = _normalize(diff.unsqueeze(0), ref_norm=ref_norm).squeeze(0)
 
     return result
 
@@ -182,13 +200,14 @@ def extract_caa(
     mask = enc["attention_mask"]  # (2*n, seq)
     pooled = _mean_pool(hidden, mask)  # (2*n, dim)
 
+    ref_norm = pooled.norm(dim=-1).mean().item()
     pos_pooled = pooled[:n]  # (n, dim)
     neg_pooled = pooled[n:]  # (n, dim)
 
     diffs = pos_pooled - neg_pooled  # (n, dim)
     mean_diff = diffs.mean(dim=0, keepdim=True)  # (1, dim)
 
-    return _normalize(mean_diff).squeeze(0)  # (dim,)
+    return _normalize(mean_diff, ref_norm=ref_norm).squeeze(0)  # (dim,)
 
 
 def save_vector(vector: torch.Tensor, path: str, metadata: dict) -> None:
