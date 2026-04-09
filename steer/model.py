@@ -140,7 +140,7 @@ def load_model(model_id: str, quantize=None, device="auto", no_compile=False):
     elif quantize == "8bit":
         quant_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     else:
-        quant_kwargs["torch_dtype"] = _pick_dtype(device)
+        quant_kwargs["dtype"] = _pick_dtype(device)
 
     # --- attention implementation ---
     attn_impl = "sdpa"  # safe default, works everywhere
@@ -172,7 +172,7 @@ def load_model(model_id: str, quantize=None, device="auto", no_compile=False):
         # bf16/fp16 unsupported — fall back through dtypes
         if quantize is None:
             fallback = torch.float16 if device == "cuda" else torch.float32
-            quant_kwargs["torch_dtype"] = fallback
+            quant_kwargs["dtype"] = fallback
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 attn_implementation=attn_impl,

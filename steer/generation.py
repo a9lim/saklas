@@ -62,9 +62,13 @@ def build_chat_input(
         chat.append({"role": "system", "content": system_prompt})
     chat.extend(messages)
     if getattr(tokenizer, "chat_template", None) is not None:
-        return tokenizer.apply_chat_template(
+        result = tokenizer.apply_chat_template(
             chat, add_generation_prompt=True, return_tensors="pt",
         )
+        # Some tokenizers return a BatchEncoding dict instead of a raw tensor
+        if isinstance(result, torch.Tensor):
+            return result
+        return result["input_ids"]
     # Base model without chat template — concatenate raw text
     text = "".join(m["content"] for m in chat)
     return tokenizer(text, return_tensors="pt")["input_ids"]
@@ -84,6 +88,17 @@ def generate_steered(
     """
     state.is_generating.set()
     device = input_ids.device
+    # Build set of all EOS token IDs — model.generation_config often has
+    # additional stop tokens (e.g. <turn|> for Gemma chat models).
+    eos_ids: set[int] = set()
+    if hasattr(model, "generation_config") and model.generation_config.eos_token_id is not None:
+        eid = model.generation_config.eos_token_id
+        if isinstance(eid, int):
+            eos_ids.add(eid)
+        else:
+            eos_ids.update(eid)
+    if tokenizer.eos_token_id is not None:
+        eos_ids.add(tokenizer.eos_token_id)
     past_key_values = None
     current_input = input_ids
     generated_ids: list[int] = []
@@ -119,7 +134,7 @@ def generate_steered(
                     current_input = next_token
                     if on_token:
                         on_token(tokenizer.decode([token_id], skip_special_tokens=True))
-                    if token_id == tokenizer.eos_token_id:
+                    if token_id in eos_ids:
                         break
                     continue
 
@@ -143,7 +158,7 @@ def generate_steered(
                     token_str = tokenizer.decode([token_id], skip_special_tokens=True)
                     on_token(token_str)
 
-                if token_id == tokenizer.eos_token_id:
+                if token_id in eos_ids:
                     break
 
     finally:

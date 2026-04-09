@@ -75,7 +75,7 @@ def bootstrap_probes(
         concepts = [name for name, _ in actadd_concepts]
         try:
             vectors = extract_actadd_batched(
-                model, tokenizer, concepts, probe_layer,
+                model, tokenizer, concepts, probe_layer, layers=layers,
             )
             for name, vec in vectors.items():
                 probes[name] = vec
@@ -92,7 +92,7 @@ def bootstrap_probes(
             from steer.vectors import extract_actadd
             for name, _ in actadd_concepts:
                 try:
-                    vec = extract_actadd(model, tokenizer, name, probe_layer)
+                    vec = extract_actadd(model, tokenizer, name, probe_layer, layers=layers)
                     probes[name] = vec
                     cp = get_cache_path(cache_dir, model_id, name, probe_layer, "actadd")
                     save_vector(vec, cp, {
@@ -116,7 +116,7 @@ def bootstrap_probes(
                 if ds_path.exists():
                     try:
                         ds = load_contrastive_pairs(str(ds_path))
-                        vec = extract_caa(model, tokenizer, ds["pairs"], probe_layer)
+                        vec = extract_caa(model, tokenizer, ds["pairs"], probe_layer, layers=layers)
                         probes[name] = vec
                         cp = get_cache_path(cache_dir, model_id, name, probe_layer, "caa")
                         save_vector(vec, cp, {

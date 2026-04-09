@@ -34,8 +34,8 @@ class SteerApp(App):
         Binding("right", "alpha_up", "Alpha +", show=False),
         Binding("up", "layer_up", "Layer +", show=False),
         Binding("down", "layer_down", "Layer -", show=False),
-        Binding("o", "toggle_ortho", "Ortho", show=False),
-        Binding("s", "cycle_sort", "Sort", show=False),
+        Binding("ctrl+o", "toggle_ortho", "Ortho", show=False),
+        Binding("ctrl+s", "cycle_sort", "Sort", show=False),
     ]
 
     def __init__(
@@ -178,7 +178,7 @@ class SteerApp(App):
 
         def _extract():
             from steer.vectors import extract_actadd
-            vec = extract_actadd(self._model, self._tokenizer, concept, layer_idx)
+            vec = extract_actadd(self._model, self._tokenizer, concept, layer_idx, layers=self._layers)
             self._steering.add_vector(concept, vec, alpha, layer_idx)
             self._steering.apply_to_model(
                 self._layers, self._device, self._dtype,
