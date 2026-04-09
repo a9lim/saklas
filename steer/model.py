@@ -241,10 +241,11 @@ def _text_config(model):
 
 
 def get_model_info(model, tokenizer) -> dict:
-    """Summary dict: model_type, num_layers, hidden_dim, device, dtype, vram_used_gb."""
+    """Summary dict: model_type, num_layers, hidden_dim, device, dtype, vram_used_gb, param_count."""
     layers = get_layers(model)
     first_param = next(model.parameters())
     model_id = getattr(model.config, "_name_or_path", "unknown")
+    param_count = sum(p.numel() for p in model.parameters())
     return {
         "model_id": model_id,
         "model_type": model.config.model_type,
@@ -253,4 +254,5 @@ def get_model_info(model, tokenizer) -> dict:
         "device": str(first_param.device),
         "dtype": str(first_param.dtype),
         "vram_used_gb": _get_memory_gb(str(first_param.device)),
+        "param_count": param_count,
     }
