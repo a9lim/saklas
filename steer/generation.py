@@ -61,10 +61,13 @@ def build_chat_input(
     if system_prompt:
         chat.append({"role": "system", "content": system_prompt})
     chat.extend(messages)
-    input_ids = tokenizer.apply_chat_template(
-        chat, add_generation_prompt=True, return_tensors="pt",
-    )
-    return input_ids
+    if getattr(tokenizer, "chat_template", None) is not None:
+        return tokenizer.apply_chat_template(
+            chat, add_generation_prompt=True, return_tensors="pt",
+        )
+    # Base model without chat template — concatenate raw text
+    text = "".join(m["content"] for m in chat)
+    return tokenizer(text, return_tensors="pt")["input_ids"]
 
 
 def generate_steered(

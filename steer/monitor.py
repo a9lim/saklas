@@ -35,10 +35,13 @@ class TraitMonitor:
         """Hot path. One matmul, no .item(), no CPU sync."""
         hidden = output[0] if isinstance(output, tuple) else output
         last_state = hidden[0, -1, :]  # (D,) — last token of batch dim 0
-        normed_state = last_state / last_state.norm().clamp(min=1e-8)  # normalize once, no branch
-        sims = self._probe_matrix_normed @ normed_state  # (P,) — dot of unit vectors = cosine sim
+        norm = last_state.norm()
         if self._buf_idx < self._gpu_buffer.shape[0]:
-            self._gpu_buffer[self._buf_idx] = sims
+            if norm > 1e-8:
+                normed_state = last_state / norm
+                self._gpu_buffer[self._buf_idx] = self._probe_matrix_normed @ normed_state
+            else:
+                self._gpu_buffer[self._buf_idx].zero_()
             self._buf_idx += 1
         return None  # read-only hook
 
@@ -78,7 +81,8 @@ class TraitMonitor:
     def get_sparkline(self, name: str, width: int = 64) -> str:
         """Unicode sparkline of recent history. Caller must flush_to_cpu() first."""
         blocks = " ▁▂▃▄▅▆▇█"
-        values = self.history[name][-width:]
+        raw = self.history[name][-width:]
+        values = [v for v in raw if v == v]  # drop NaN (NaN != NaN)
         if not values:
             return ""
         lo, hi = min(values), max(values)
