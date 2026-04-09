@@ -102,6 +102,11 @@ def generate_steered(
 
                 past_key_values = outputs.past_key_values
                 logits = outputs.logits[:, -1, :]
+                # Steering can push hidden states past fp16 range, cascading
+                # to inf/NaN logits. nan_to_num replaces NaN→0 and inf→max,
+                # then clamp bounds the range for stable softmax.
+                torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0, out=logits)
+                logits.clamp_(-100.0, 100.0)
 
                 # Temperature
                 if config.temperature > 0:
@@ -121,18 +126,11 @@ def generate_steered(
                 # Top-p (nucleus) sampling — use topk to avoid sorting full vocab
                 k = min(1000, logits.shape[-1])
                 top_logits, top_idx = logits.topk(k, dim=-1, sorted=True)
-                # Clamp to prevent inf/nan from extreme steering vectors
-                top_logits.clamp_(-100.0, 100.0)
                 probs = top_logits.softmax(dim=-1)
                 cumprobs = probs.cumsum(dim=-1)
                 mask = (cumprobs - probs) >= config.top_p
                 probs[mask] = 0.0
-                total = probs.sum(dim=-1, keepdim=True)
-                # If top-p masked everything, fall back to top-1
-                if total.item() == 0.0:
-                    probs[0, 0] = 1.0
-                else:
-                    probs.div_(total)
+                probs.div_(probs.sum(dim=-1, keepdim=True))
 
                 token_idx = torch.multinomial(probs, 1)
                 next_token = top_idx.gather(-1, token_idx)
