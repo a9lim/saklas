@@ -234,6 +234,12 @@ def get_layers(model) -> nn.ModuleList:
     return accessor(model)
 
 
+def _text_config(model):
+    """Return the text-specific config, handling multimodal wrappers."""
+    cfg = model.config
+    return getattr(cfg, "text_config", cfg)
+
+
 def get_model_info(model, tokenizer) -> dict:
     """Summary dict: model_type, num_layers, hidden_dim, device, dtype, vram_used_gb."""
     layers = get_layers(model)
@@ -243,7 +249,7 @@ def get_model_info(model, tokenizer) -> dict:
         "model_id": model_id,
         "model_type": model.config.model_type,
         "num_layers": len(layers),
-        "hidden_dim": model.config.hidden_size,
+        "hidden_dim": _text_config(model).hidden_size,
         "device": str(first_param.device),
         "dtype": str(first_param.dtype),
         "vram_used_gb": _get_memory_gb(str(first_param.device)),
