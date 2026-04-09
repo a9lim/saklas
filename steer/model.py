@@ -9,17 +9,69 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 log = logging.getLogger(__name__)
 
+_MODEL_LAYERS = lambda m: m.model.layers  # noqa: E731
+_TRANSFORMER_H = lambda m: m.transformer.h  # noqa: E731
+
 _LAYER_ACCESSORS = {
-    "llama": lambda m: m.model.layers,
-    "mistral": lambda m: m.model.layers,
-    "gemma": lambda m: m.model.layers,
-    "gemma2": lambda m: m.model.layers,
-    "phi": lambda m: m.model.layers,
-    "phi3": lambda m: m.model.layers,
-    "qwen2": lambda m: m.model.layers,
-    "qwen2_moe": lambda m: m.model.layers,
+    # Llama family
+    "llama": _MODEL_LAYERS,
+    "llama4_text": _MODEL_LAYERS,
+    # Mistral / Mixtral
+    "mistral": _MODEL_LAYERS,
+    "mixtral": _MODEL_LAYERS,
+    # Gemma family
+    "gemma": _MODEL_LAYERS,
+    "gemma2": _MODEL_LAYERS,
+    "gemma3_text": _MODEL_LAYERS,
+    "gemma4_text": _MODEL_LAYERS,
+    "recurrent_gemma": _MODEL_LAYERS,
+    # Phi family
+    "phi": _MODEL_LAYERS,
+    "phi3": _MODEL_LAYERS,
+    "phimoe": _MODEL_LAYERS,
+    # Qwen family
+    "qwen": _TRANSFORMER_H,
+    "qwen2": _MODEL_LAYERS,
+    "qwen2_moe": _MODEL_LAYERS,
+    "qwen3": _MODEL_LAYERS,
+    "qwen3_moe": _MODEL_LAYERS,
+    # Cohere (Command-R)
+    "cohere": _MODEL_LAYERS,
+    "cohere2": _MODEL_LAYERS,
+    # DeepSeek
+    "deepseek_v2": _MODEL_LAYERS,
+    "deepseek_v3": _MODEL_LAYERS,
+    # Starcoder
+    "starcoder2": _MODEL_LAYERS,
+    # OLMo
+    "olmo": _MODEL_LAYERS,
+    "olmo2": _MODEL_LAYERS,
+    "olmoe": _MODEL_LAYERS,
+    # GLM (ChatGLM)
+    "glm": _MODEL_LAYERS,
+    "glm4": _MODEL_LAYERS,
+    # Granite (IBM)
+    "granite": _MODEL_LAYERS,
+    "granitemoe": _MODEL_LAYERS,
+    # NVIDIA
+    "nemotron": _MODEL_LAYERS,
+    # StableLM
+    "stablelm": _MODEL_LAYERS,
+    # GPT-2 family
+    "gpt2": _TRANSFORMER_H,
+    "gpt_neo": _TRANSFORMER_H,
+    "gptj": _TRANSFORMER_H,
+    "gpt_bigcode": _TRANSFORMER_H,
+    # Bloom / Falcon
+    "bloom": _TRANSFORMER_H,
+    "falcon": _TRANSFORMER_H,
+    # GPT-NeoX / Pythia
     "gpt_neox": lambda m: m.gpt_neox.layers,
-    "qwen": lambda m: m.transformer.h,
+    # MPT / DBRX
+    "mpt": lambda m: m.transformer.blocks,
+    "dbrx": lambda m: m.transformer.blocks,
+    # OPT
+    "opt": lambda m: m.model.decoder.layers,
 }
 
 _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)

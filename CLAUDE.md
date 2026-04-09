@@ -58,7 +58,7 @@ These matter for the throughput regression test (steered ≥85% of vanilla tok/s
 
 ## Supported architectures
 
-Defined in `model.py:_LAYER_ACCESSORS`: llama, mistral, gemma, gemma2, phi, phi3, qwen2, qwen2_moe, gpt_neox, qwen. Adding a new architecture = adding one lambda to that dict.
+Defined in `model.py:_LAYER_ACCESSORS`. Most models use `model.model.layers`; GPT-2 family uses `model.transformer.h`; a few have unique paths (GPT-NeoX, MPT/DBRX, OPT). Adding a new architecture = adding one entry to that dict. Currently supported: llama, llama4_text, mistral, mixtral, gemma, gemma2, gemma3_text, gemma4_text, recurrent_gemma, phi, phi3, phimoe, qwen, qwen2, qwen2_moe, qwen3, qwen3_moe, cohere, cohere2, deepseek_v2, deepseek_v3, starcoder2, olmo, olmo2, olmoe, glm, glm4, granite, granitemoe, nemotron, stablelm, gpt2, gpt_neo, gptj, gpt_bigcode, bloom, falcon, gpt_neox, mpt, dbrx, opt.
 
 ## Testing
 
