@@ -70,13 +70,16 @@ class SteerApp(App):
             system_prompt=system_prompt,
         )
 
+        # Cache device/dtype to avoid repeated parameter iteration
+        first_param = next(self._model.parameters())
+        self._device = first_param.device
+        self._dtype = first_param.dtype
+
         # Monitor
         monitor_layer = self._model_info["num_layers"] - 2
         self._monitor = TraitMonitor(probes, monitor_layer) if probes else None
         if self._monitor:
-            device = next(self._model.parameters()).device
-            dtype = next(self._model.parameters()).dtype
-            self._monitor.attach(self._layers, device, dtype)
+            self._monitor.attach(self._layers, self._device, self._dtype)
 
         # TUI state
         self._current_assistant_widget = None
@@ -174,13 +177,10 @@ class SteerApp(App):
 
         def _extract():
             from steer.vectors import extract_actadd
-            device = next(self._model.parameters()).device
             vec = extract_actadd(self._model, self._tokenizer, concept, layer_idx)
             self._steering.add_vector(concept, vec, alpha, layer_idx)
-            device = next(self._model.parameters()).device
-            dtype = next(self._model.parameters()).dtype
             self._steering.apply_to_model(
-                self._layers, device, dtype,
+                self._layers, self._device, self._dtype,
                 orthogonalize=self._orthogonalize,
             )
             self.call_from_thread(self._on_vector_extracted, concept, alpha, layer_idx)
@@ -219,8 +219,7 @@ class SteerApp(App):
             input_ids = build_chat_input(
                 self._tokenizer, self._messages, self._gen_config.system_prompt,
             )
-            device = next(self._model.parameters()).device
-            input_ids = input_ids.to(device)
+            input_ids = input_ids.to(self._device)
 
             def on_token(tok: str):
                 self._gen_state.token_queue.put(tok)
@@ -256,8 +255,9 @@ class SteerApp(App):
 
         # Update trait monitor display
         if self._monitor and self._monitor._buf_idx > 0:
-            current = self._monitor.get_current()
-            previous = self._monitor.get_previous()
+            self._monitor.flush_to_cpu()  # flush once — moves GPU buffer to CPU history
+            current = self._monitor.get_current()    # reads from CPU history, no GPU sync
+            previous = self._monitor.get_previous()  # reads from CPU history, no GPU sync
             sparklines = {}
             for name in self._monitor.probe_names:
                 sparklines[name] = self._monitor.get_sparkline(name, width=64)
@@ -288,10 +288,8 @@ class SteerApp(App):
         sel = vp.get_selected()
         if sel:
             self._steering.remove_vector(sel["name"])
-            device = next(self._model.parameters()).device
-            dtype = next(self._model.parameters()).dtype
             self._steering.apply_to_model(
-                self._layers, device, dtype,
+                self._layers, self._device, self._dtype,
                 orthogonalize=self._orthogonalize,
             )
             self._refresh_vector_panel()
@@ -301,10 +299,8 @@ class SteerApp(App):
         sel = vp.get_selected()
         if sel:
             self._steering.toggle_vector(sel["name"])
-            device = next(self._model.parameters()).device
-            dtype = next(self._model.parameters()).dtype
             self._steering.apply_to_model(
-                self._layers, device, dtype,
+                self._layers, self._device, self._dtype,
                 orthogonalize=self._orthogonalize,
             )
             self._refresh_vector_panel()
@@ -321,10 +317,8 @@ class SteerApp(App):
         if sel:
             new_alpha = max(-3.0, min(3.0, sel["alpha"] + delta))
             self._steering.set_alpha(sel["name"], new_alpha)
-            device = next(self._model.parameters()).device
-            dtype = next(self._model.parameters()).dtype
             self._steering.apply_to_model(
-                self._layers, device, dtype,
+                self._layers, self._device, self._dtype,
                 orthogonalize=self._orthogonalize,
             )
             self._refresh_vector_panel()
@@ -341,20 +335,16 @@ class SteerApp(App):
         if sel:
             new_layer = max(0, min(len(self._layers) - 1, sel["layer_idx"] + delta))
             self._steering.set_layer(sel["name"], new_layer, self._layers)
-            device = next(self._model.parameters()).device
-            dtype = next(self._model.parameters()).dtype
             self._steering.apply_to_model(
-                self._layers, device, dtype,
+                self._layers, self._device, self._dtype,
                 orthogonalize=self._orthogonalize,
             )
             self._refresh_vector_panel()
 
     def action_toggle_ortho(self) -> None:
         self._orthogonalize = not self._orthogonalize
-        device = next(self._model.parameters()).device
-        dtype = next(self._model.parameters()).dtype
         self._steering.apply_to_model(
-            self._layers, device, dtype,
+            self._layers, self._device, self._dtype,
             orthogonalize=self._orthogonalize,
         )
         self._refresh_vector_panel()
@@ -376,14 +366,11 @@ class SteerApp(App):
 
         # Save current steering state, clear hooks, generate, restore
         def _ab_generate():
-            device = next(self._model.parameters()).device
-            dtype = next(self._model.parameters()).dtype
-
             # Build input from the last user message only
             msgs = [{"role": "user", "content": self._last_prompt}]
             input_ids = build_chat_input(
                 self._tokenizer, msgs, self._gen_config.system_prompt,
-            ).to(device)
+            ).to(self._device)
 
             # Temporarily clear steering
             saved_vectors = self._steering.get_active_vectors()
@@ -403,7 +390,7 @@ class SteerApp(App):
                 if not v.get("enabled", True):
                     self._steering.toggle_vector(v["name"])
             self._steering.apply_to_model(
-                self._layers, device, dtype,
+                self._layers, self._device, self._dtype,
                 orthogonalize=self._orthogonalize,
             )
 

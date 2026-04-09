@@ -1,0 +1,65 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`steer` is a local activation steering + trait monitoring TUI for HuggingFace transformer models. It loads a causal LM, extracts steering vectors (ActAdd or CAA), injects them via forward hooks during generation, and monitors activations against probe vectors in real time — all through a Textual terminal UI.
+
+## Commands
+
+```bash
+pip install -e ".[dev]"          # Install in editable mode with test deps
+pip install -e ".[dev,flash]"    # Also install flash-attn (CUDA only)
+steer <model_id>                 # Launch TUI (e.g. steer google/gemma-2-9b-it)
+python -m steer <model_id>       # Alternative entry point
+pytest tests/test_smoke.py -v    # Smoke tests (requires CUDA + downloads gemma-2-2b-it ~5GB)
+pytest tests/test_smoke.py -v -k "test_actadd_returns_unit_vector"  # Single test
+```
+
+## Architecture
+
+The system has three layers: **model/vector infrastructure**, **generation loop**, and **TUI**.
+
+### Model + Vector layer
+- `model.py` — Loads HF causal LMs with quantization/device/compile options. `_LAYER_ACCESSORS` dict maps `model_type` strings to layer-list accessors; add new architectures here.
+- `vectors.py` — Two extraction methods: `extract_actadd` (single concept + baseline batched into one forward pass, mean-pool + L2-normalize the difference) and `extract_caa` (contrastive pairs batched into a single forward pass, same pipeline). Batched variant `extract_actadd_batched` for probe bootstrap. All extraction uses `torch.inference_mode()`. Vectors saved as `.safetensors` + `.json` metadata sidecar.
+- `probes_bootstrap.py` — On startup, loads or extracts probe vectors per `steer/probes/defaults.json`. Probes are cached under `steer/probes/cache/{model_name}/`. Categories: emotion, personality, safety, cultural, gender. CAA probes expect dataset files in `steer/datasets/`.
+
+### Steering + Monitoring layer
+- `hooks.py` — `SteeringHook` registers a `register_forward_hook` on a layer, adding a pre-composed vector to hidden states in-place via `output[0].add_()` (returns `output` directly — no tuple allocation per token). `recompose` uses stack+matmul to compose multiple vectors. `SteeringManager` groups vectors by layer, handles orthogonalization (Gram-Schmidt), and manages hook lifecycle.
+- `monitor.py` — `TraitMonitor` attaches a read-only forward hook at a single layer. Pre-stacks probe vectors into a unit-normalized matrix; the hook normalizes the hidden state once, then a single matmul yields cosine similarities (no per-probe division). GPU buffer batches results; `flush_to_cpu()` transfers to CPU history on TUI poll — call it once before reading sparklines, not per-probe.
+
+### Generation loop
+- `generation.py` — Token-by-token generation with KV cache, top-p sampling via `torch.topk` (avoids full-vocab sort), stop control via `threading.Event`. A single `torch.inference_mode()` context wraps the entire generation loop (not per-token — this matters for performance). Runs in a worker thread; tokens flow to TUI via `queue.SimpleQueue`. Steering hooks are transparent to the generation loop (they modify hidden states via forward hooks).
+
+### TUI layer (Textual)
+- `tui/app.py` — `SteerApp` orchestrates everything. Caches `self._device`/`self._dtype` on init (never call `next(model.parameters())` outside `__init__`). Polls token queue + monitor at ~15 FPS. In-chat commands: `/steer`, `/clear`, `/system`, `/temp`, `/probes`. Keybindings for alpha/layer adjustment, orthogonalization toggle, A/B comparison.
+- `tui/chat_panel.py`, `vector_panel.py`, `trait_panel.py` — Display widgets. Trait panel has collapsible categories, sort modes (name/magnitude/change), and sparkline display.
+- `tui/styles.tcss` — Textual CSS.
+
+### Key data flow
+1. User types message → `ChatPanel.UserSubmitted` → `SteerApp._start_generation()`
+2. Worker thread runs `generate_steered()` → each forward pass triggers steering hooks (add vectors) and monitor hook (record cosine similarities)
+3. TUI poll timer drains token queue into chat panel, flushes monitor buffer, updates trait bars/sparklines
+
+## Performance conventions
+
+These matter for the throughput regression test (steered ≥85% of vanilla tok/s):
+
+- **Hot-path hooks (`hook_fn`, `_hook`)**: No Python allocation, no `.item()`, no CPU sync. Return `output` directly after in-place mutation — never build new tuples. In the monitor hook, normalize with `.clamp(min=1e-8)` instead of branching on `norm > 0` — the branch forces a GPU→CPU sync per token.
+- **`torch.inference_mode()`** over `torch.no_grad()` everywhere (generation, extraction). In the generation loop, the context wraps the entire loop — never re-enter per token.
+- **In-place ops in generation loop**: Use `logits.div_(temperature)` not `logits / temperature` — avoids a tensor allocation per token. The logits view is not reused after sampling.
+- **`torch.topk`** for top-p sampling, not full-vocab sort.
+- **Vector extraction math**: Difference vectors are computed as `pos - neg` directly. Do not re-introduce mean-centering — it's algebraically redundant (`(pos - center) - (neg - center) == pos - neg`). CAA uses a single batched forward pass for all positive+negative pairs.
+- **Device/dtype**: Cached as `self._device`/`self._dtype` in `SteerApp.__init__`. Never call `next(model.parameters())` in action handlers or poll loops.
+- **Monitor flush**: Call `flush_to_cpu()` first in the poll tick, then read `get_current()`/`get_previous()` from CPU history. Never call `get_current()`/`get_previous()` before flushing — they hit the GPU buffer and cause extra syncs.
+- **Vector composition**: `recompose` uses `torch.stack` + broadcasted multiply + `.sum()`, not Python `sum()` over tensors.
+
+## Supported architectures
+
+Defined in `model.py:_LAYER_ACCESSORS`: llama, mistral, gemma, gemma2, phi, phi3, qwen2, qwen2_moe, gpt_neox, qwen. Adding a new architecture = adding one lambda to that dict.
+
+## Testing
+
+Smoke tests require CUDA and download `google/gemma-2-2b-it` on first run. Tests cover vector extraction, steering effect, hook cleanup, save/load roundtrip, monitor history, and throughput regression (steered must be ≥85% of vanilla tok/s).

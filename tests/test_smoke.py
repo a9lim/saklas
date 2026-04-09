@@ -192,6 +192,7 @@ class TestTraitMonitor:
         )
 
         # Sparkline should be non-empty
+        monitor.flush_to_cpu()
         sparkline = monitor.get_sparkline("happy")
         assert len(sparkline) > 0
 

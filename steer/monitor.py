@@ -34,11 +34,8 @@ class TraitMonitor:
     def _hook(self, module, input, output):
         """Hot path. One matmul, no .item(), no CPU sync."""
         last_state = output[0][0, -1, :]  # (D,) — last token of batch dim 0
-        state_norm = last_state.norm()
-        if state_norm > 0:
-            sims = (self._probe_matrix_normed @ last_state) / state_norm  # (P,)
-        else:
-            sims = torch.zeros(len(self.probe_names), device=last_state.device, dtype=last_state.dtype)
+        normed_state = last_state / last_state.norm().clamp(min=1e-8)  # normalize once, no branch
+        sims = self._probe_matrix_normed @ normed_state  # (P,) — dot of unit vectors = cosine sim
         if self._buf_idx < self._gpu_buffer.shape[0]:
             self._gpu_buffer[self._buf_idx] = sims
             self._buf_idx += 1
@@ -78,9 +75,8 @@ class TraitMonitor:
         return result
 
     def get_sparkline(self, name: str, width: int = 64) -> str:
-        """Unicode sparkline of recent history."""
+        """Unicode sparkline of recent history. Caller must flush_to_cpu() first."""
         blocks = " ▁▂▃▄▅▆▇█"
-        self.flush_to_cpu()
         values = self.history[name][-width:]
         if not values:
             return ""

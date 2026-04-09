@@ -41,31 +41,31 @@ def extract_actadd(
 ) -> torch.Tensor:
     """Single-concept ActAdd extraction (Turner et al., 2023).
 
-    Tokenizes concept and baseline, extracts hidden states at the given layer,
-    mean-pools across token positions, mean-centers, and returns the
-    L2-normalized difference vector.
+    Tokenizes concept and baseline in a single batch, extracts hidden states
+    at the given layer, mean-pools across token positions, mean-centers, and
+    returns the L2-normalized difference vector.
     """
     device = next(model.parameters()).device
 
-    with torch.no_grad():
-        pos_enc = tokenizer(concept, return_tensors="pt").to(device)
-        neg_enc = tokenizer(baseline, return_tensors="pt").to(device)
+    enc = tokenizer(
+        [concept, baseline],
+        padding=True,
+        return_tensors="pt",
+        return_attention_mask=True,
+    ).to(device)
 
-        pos_out = model(**pos_enc, output_hidden_states=True)
-        neg_out = model(**neg_enc, output_hidden_states=True)
+    with torch.inference_mode():
+        out = model(**enc, output_hidden_states=True)
 
-        pos_hidden = pos_out.hidden_states[layer_idx]  # (1, seq, dim)
-        neg_hidden = neg_out.hidden_states[layer_idx]
+    hidden = out.hidden_states[layer_idx]  # (2, seq, dim)
+    mask = enc["attention_mask"]  # (2, seq)
+    pooled = _mean_pool(hidden, mask)  # (2, dim)
 
-        pos_mean = pos_hidden.mean(dim=1)  # (1, dim)
-        neg_mean = neg_hidden.mean(dim=1)
+    pos_mean = pooled[0:1]  # (1, dim)
+    neg_mean = pooled[1:2]
 
-        center = (pos_mean + neg_mean) / 2
-        pos_mean = pos_mean - center
-        neg_mean = neg_mean - center
-
-        diff = pos_mean - neg_mean  # (1, dim)
-        return _normalize(diff).squeeze(0)  # (dim,)
+    diff = pos_mean - neg_mean  # (1, dim)
+    return _normalize(diff).squeeze(0)  # (dim,)
 
 
 def extract_actadd_batched(
@@ -93,7 +93,7 @@ def extract_actadd_batched(
         return_attention_mask=True,
     ).to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         out = model(**enc, output_hidden_states=True)
 
     hidden = out.hidden_states[layer_idx]  # (batch, seq, dim)
@@ -105,9 +105,7 @@ def extract_actadd_batched(
     result: dict[str, torch.Tensor] = {}
 
     for i, concept in enumerate(concepts):
-        pos_mean = pooled[i]
-        center = (pos_mean + neg_mean) / 2
-        diff = (pos_mean - center) - (neg_mean - center)
+        diff = pooled[i] - neg_mean
         result[concept] = _normalize(diff.unsqueeze(0)).squeeze(0)
 
     return result
@@ -129,39 +127,30 @@ def extract_caa(
         L2-normalized mean contrastive vector.
     """
     device = next(model.parameters()).device
+    n = len(pairs)
 
     positives = [p["positive"] for p in pairs]
     negatives = [p["negative"] for p in pairs]
 
-    pos_enc = tokenizer(
-        positives,
+    # Single batch: positives then negatives
+    enc = tokenizer(
+        positives + negatives,
         padding=True,
         return_tensors="pt",
         return_attention_mask=True,
     ).to(device)
 
-    neg_enc = tokenizer(
-        negatives,
-        padding=True,
-        return_tensors="pt",
-        return_attention_mask=True,
-    ).to(device)
+    with torch.inference_mode():
+        out = model(**enc, output_hidden_states=True)
 
-    with torch.no_grad():
-        pos_out = model(**pos_enc, output_hidden_states=True)
-        neg_out = model(**neg_enc, output_hidden_states=True)
+    hidden = out.hidden_states[layer_idx]  # (2*n, seq, dim)
+    mask = enc["attention_mask"]  # (2*n, seq)
+    pooled = _mean_pool(hidden, mask)  # (2*n, dim)
 
-    pos_hidden = pos_out.hidden_states[layer_idx]  # (n_pairs, seq, dim)
-    neg_hidden = neg_out.hidden_states[layer_idx]
+    pos_pooled = pooled[:n]  # (n, dim)
+    neg_pooled = pooled[n:]  # (n, dim)
 
-    pos_pooled = _mean_pool(pos_hidden, pos_enc["attention_mask"])  # (n_pairs, dim)
-    neg_pooled = _mean_pool(neg_hidden, neg_enc["attention_mask"])
-
-    # Per-pair mean centering, then average
-    centers = (pos_pooled + neg_pooled) / 2  # (n_pairs, dim)
-    pos_centered = pos_pooled - centers
-    neg_centered = neg_pooled - centers
-    diffs = pos_centered - neg_centered  # (n_pairs, dim)
+    diffs = pos_pooled - neg_pooled  # (n, dim)
     mean_diff = diffs.mean(dim=0, keepdim=True)  # (1, dim)
 
     return _normalize(mean_diff).squeeze(0)  # (dim,)

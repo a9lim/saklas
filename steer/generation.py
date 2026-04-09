@@ -86,56 +86,57 @@ def generate_steered(
     generated_ids: list[int] = []
 
     try:
-        for _ in range(config.max_new_tokens):
-            if state.stop_requested.is_set():
-                break
+        with torch.inference_mode():
+            for _ in range(config.max_new_tokens):
+                if state.stop_requested.is_set():
+                    break
 
-            with torch.no_grad():
                 outputs = model(
                     input_ids=current_input,
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
 
-            past_key_values = outputs.past_key_values
-            logits = outputs.logits[:, -1, :]
+                past_key_values = outputs.past_key_values
+                logits = outputs.logits[:, -1, :]
 
-            # Temperature
-            if config.temperature > 0:
-                logits = logits / config.temperature
-            else:
-                # Greedy
-                next_token = logits.argmax(dim=-1, keepdim=True)
+                # Temperature
+                if config.temperature > 0:
+                    logits.div_(config.temperature)
+                else:
+                    # Greedy
+                    next_token = logits.argmax(dim=-1, keepdim=True)
+                    token_id = next_token.item()
+                    generated_ids.append(token_id)
+                    current_input = next_token
+                    if on_token:
+                        on_token(tokenizer.decode([token_id], skip_special_tokens=True))
+                    if token_id == tokenizer.eos_token_id:
+                        break
+                    continue
+
+                # Top-p (nucleus) sampling — use topk to avoid sorting full vocab
+                k = min(1000, logits.shape[-1])
+                top_logits, top_idx = logits.topk(k, dim=-1, sorted=True)
+                probs = top_logits.softmax(dim=-1)
+                cumprobs = probs.cumsum(dim=-1)
+                mask = (cumprobs - probs) >= config.top_p
+                probs[mask] = 0.0
+                probs.div_(probs.sum(dim=-1, keepdim=True))
+
+                token_idx = torch.multinomial(probs, 1)
+                next_token = top_idx.gather(-1, token_idx)
+
                 token_id = next_token.item()
                 generated_ids.append(token_id)
                 current_input = next_token
+
                 if on_token:
-                    on_token(tokenizer.decode([token_id], skip_special_tokens=True))
+                    token_str = tokenizer.decode([token_id], skip_special_tokens=True)
+                    on_token(token_str)
+
                 if token_id == tokenizer.eos_token_id:
                     break
-                continue
-
-            # Top-p (nucleus) sampling
-            sorted_logits, sorted_idx = logits.sort(descending=True, dim=-1)
-            probs = sorted_logits.softmax(dim=-1)
-            cumprobs = probs.cumsum(dim=-1)
-            mask = (cumprobs - probs) >= config.top_p
-            probs[mask] = 0.0
-            probs.div_(probs.sum(dim=-1, keepdim=True))
-
-            token_idx = torch.multinomial(probs, 1)
-            next_token = sorted_idx.gather(-1, token_idx)
-
-            token_id = next_token.item()
-            generated_ids.append(token_id)
-            current_input = next_token
-
-            if on_token:
-                token_str = tokenizer.decode([token_id], skip_special_tokens=True)
-                on_token(token_str)
-
-            if token_id == tokenizer.eos_token_id:
-                break
 
     finally:
         state.is_generating.clear()

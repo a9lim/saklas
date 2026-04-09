@@ -22,16 +22,14 @@ class SteeringHook:
         if not vectors:
             self.composed = None
             return
-        self.composed = sum(
-            alpha * vec.to(device=device, dtype=dtype) for vec, alpha in vectors
-        )
+        stacked = torch.stack([vec.to(device=device, dtype=dtype) for vec, _ in vectors])
+        alphas = torch.tensor([alpha for _, alpha in vectors], device=device, dtype=dtype)
+        self.composed = (alphas.unsqueeze(1) * stacked).sum(dim=0)
 
     def hook_fn(self, module, input, output):
-        if self.composed is None:
-            return output
-        hidden_states = output[0]
-        hidden_states.add_(self.composed)
-        return (hidden_states,) + output[1:]
+        if self.composed is not None:
+            output[0].add_(self.composed)
+        return output
 
     def attach(self, layer_module: torch.nn.Module) -> None:
         """Register forward hook on a layer module."""
