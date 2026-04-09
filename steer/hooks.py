@@ -22,8 +22,13 @@ class SteeringHook:
         if not vectors:
             self.composed = None
             return
-        stacked = torch.stack([vec.to(device=device, dtype=dtype) for vec, _ in vectors])
         alphas = torch.tensor([alpha for _, alpha in vectors], device=device, dtype=dtype)
+        # All-zero alphas → no perturbation; skip the matmul so that
+        # 0 * NaN (from a bad extraction) doesn't inject NaN into hooks.
+        if alphas.abs().max() == 0:
+            self.composed = None
+            return
+        stacked = torch.stack([vec.to(device=device, dtype=dtype) for vec, _ in vectors])
         self.composed = (alphas.unsqueeze(1) * stacked).sum(dim=0)
 
     def hook_fn(self, module, input, output):

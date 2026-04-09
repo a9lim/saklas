@@ -125,6 +125,10 @@ class TraitPanel(Widget):
 
                 # Bar
                 bar_width = 18
+                if val != val:  # NaN guard (nan != nan)
+                    val = 0.0
+                if delta != delta:
+                    delta = 0.0
                 filled = int(abs(val) * bar_width)
                 filled = min(filled, bar_width)
                 bar = "█" * filled + "░" * (bar_width - filled)
