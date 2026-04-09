@@ -1,4 +1,4 @@
-"""Chat panel: message display + input."""
+"""Chat panel: message display, status bar, and input."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ class ChatPanel(Widget):
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
+        yield Static("", id="status-bar")
         yield Input(placeholder="Type a message...", id="chat-input")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -50,3 +51,31 @@ class ChatPanel(Widget):
         log = self.query_one("#chat-log", VerticalScroll)
         log.mount(Static(f"[dim]{text}[/]"))
         log.scroll_end(animate=False)
+
+    def update_status(
+        self,
+        generating: bool = False,
+        gen_tokens: int = 0,
+        max_tokens: int = 0,
+        tok_per_sec: float = 0.0,
+        elapsed: float = 0.0,
+        prompt_tokens: int = 0,
+        vram_gb: float = 0.0,
+    ) -> None:
+        """Update the status bar with generation stats."""
+        bar = self.query_one("#status-bar", Static)
+        dot = "[green]●[/]" if generating else "[dim]○[/]"
+        if generating:
+            left = f"{dot} {gen_tokens}/{max_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
+        elif gen_tokens > 0:
+            left = f"{dot} {gen_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
+        else:
+            left = f"{dot} idle"
+        right = ""
+        if prompt_tokens > 0:
+            right += f"prompt: {prompt_tokens} tok"
+        if vram_gb > 0:
+            if right:
+                right += " · "
+            right += f"VRAM: {vram_gb:.1f} GB"
+        bar.update(f"{left}{'':>4}{right}")
