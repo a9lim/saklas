@@ -2,6 +2,10 @@ Screen {
     layout: vertical;
     background: ansi_default;
     color: ansi_default;
+
+    .screen--selection {
+        text-style: reverse;
+    }
 }
 
 /* Force all widgets to inherit terminal colors */
@@ -121,6 +125,10 @@ Widget {
 /* Override Textual's default focus border */
 #chat-input:focus {
     border: solid ansi_default;
+}
+
+#chat-input > .input--selection {
+    text-style: reverse;
 }
 
 .user-message,

@@ -386,10 +386,8 @@ class SteerApp(App):
         layer_idx = layer if layer is not None else self._model_info["num_layers"] * 3 // 4
         name = concept if len(concept) <= 20 else concept[:17] + "..."
 
-        if baseline:
-            chat.add_system_message(f"Extracting '{name}' vs '{baseline}'...")
-        else:
-            chat.add_system_message(f"Extracting '{name}' (auto-baseline)...")
+        suffix = f" vs '{baseline}'" if baseline else ""
+        chat.add_system_message(f"Extracting '{name}'{suffix}...")
 
         def _worker():
             self._steer_worker(concept, baseline, alpha, layer_idx, name)
@@ -410,10 +408,8 @@ class SteerApp(App):
         layer_idx = layer if layer is not None else self._model_info["num_layers"] - 2
         name = concept if len(concept) <= 20 else concept[:17] + "..."
 
-        if baseline:
-            chat.add_system_message(f"Extracting probe '{name}' vs '{baseline}'...")
-        else:
-            chat.add_system_message(f"Extracting probe '{name}' (auto-baseline)...")
+        suffix = f" vs '{baseline}'" if baseline else ""
+        chat.add_system_message(f"Extracting '{name}'{suffix}...")
 
         def _worker():
             self._probe_worker(concept, baseline, layer_idx, name)
