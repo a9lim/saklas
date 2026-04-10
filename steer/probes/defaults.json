@@ -1,52 +1,37 @@
 {
   "emotion": {
-    "happy": {"method": "caa", "dataset": "happy.json"},
-    "sad": {"method": "caa", "dataset": "sad.json"},
-    "angry": {"method": "caa", "dataset": "angry.json"},
-    "fearful": {"method": "caa", "dataset": "fearful.json"},
-    "surprised": {"method": "caa", "dataset": "surprised.json"},
-    "disgusted": {"method": "caa", "dataset": "disgusted.json"},
-    "calm": {"method": "caa", "dataset": "calm.json"},
-    "excited": {"method": "caa", "dataset": "excited.json"}
+    "happy": "happy.json",
+    "angry": "angry.json",
+    "fearful": "fearful.json",
+    "surprised": "surprised.json",
+    "disgusted": "disgusted.json",
+    "excited": "excited.json"
   },
   "personality": {
-    "sycophantic": {"method": "caa", "dataset": "sycophantic.json"},
-    "honest": {"method": "caa", "dataset": "honest.json"},
-    "creative": {"method": "caa", "dataset": "creativity.json"},
-    "formal": {"method": "caa", "dataset": "formality.json"},
-    "casual": {"method": "caa", "dataset": "casual.json"},
-    "verbose": {"method": "caa", "dataset": "verbosity.json"},
-    "concise": {"method": "caa", "dataset": "concise.json"},
-    "authoritative": {"method": "caa", "dataset": "authoritative.json"},
-    "uncertain": {"method": "caa", "dataset": "uncertain.json"},
-    "confident": {"method": "caa", "dataset": "confident.json"}
+    "sycophantic": "sycophantic.json",
+    "honest": "honest.json",
+    "creative": "creativity.json",
+    "formal": "formality.json",
+    "verbose": "verbosity.json",
+    "authoritative": "authoritative.json",
+    "confident": "confident.json"
   },
   "safety": {
-    "refusal": {"method": "caa", "dataset": "safety.json"},
-    "compliance": {"method": "caa", "dataset": "compliance.json"},
-    "deceptive": {"method": "caa", "dataset": "deceptive.json"},
-    "hallucinating": {"method": "caa", "dataset": "hallucinating.json"}
+    "refusal": "safety.json",
+    "deceptive": "deceptive.json",
+    "hallucinating": "hallucinating.json"
   },
   "cultural": {
-    "western-individualist": {"method": "caa", "dataset": "western-individualist.json"},
-    "eastern-collectivist": {"method": "caa", "dataset": "eastern-collectivist.json"},
-    "formal-hierarchical": {"method": "caa", "dataset": "formal-hierarchical.json"},
-    "casual-egalitarian": {"method": "caa", "dataset": "casual-egalitarian.json"},
-    "direct-communication": {"method": "caa", "dataset": "directness.json"},
-    "indirect-communication": {"method": "caa", "dataset": "indirect-communication.json"},
-    "high-context": {"method": "caa", "dataset": "high-context.json"},
-    "low-context": {"method": "caa", "dataset": "low-context.json"},
-    "religious": {"method": "caa", "dataset": "religious.json"},
-    "secular": {"method": "caa", "dataset": "secular.json"},
-    "traditional": {"method": "caa", "dataset": "traditional.json"},
-    "progressive": {"method": "caa", "dataset": "progressive.json"}
+    "western-individualist": "western-individualist.json",
+    "formal-hierarchical": "formal-hierarchical.json",
+    "direct-communication": "directness.json",
+    "high-context": "high-context.json",
+    "religious": "religious.json",
+    "traditional": "traditional.json"
   },
   "gender": {
-    "masculine-coded": {"method": "caa", "dataset": "masculine-coded.json"},
-    "feminine-coded": {"method": "caa", "dataset": "feminine-coded.json"},
-    "agentic": {"method": "caa", "dataset": "agency.json"},
-    "communal": {"method": "caa", "dataset": "communal.json"},
-    "paternal": {"method": "caa", "dataset": "paternal.json"},
-    "maternal": {"method": "caa", "dataset": "maternal.json"}
+    "masculine-coded": "masculine-coded.json",
+    "agentic": "agency.json",
+    "paternal": "paternal.json"
   }
 }

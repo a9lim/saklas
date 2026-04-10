@@ -23,7 +23,7 @@ from steer.tui.trait_panel import TraitPanel
 
 PANELS = ["left-panel", "chat-panel", "trait-panel"]
 
-_SMARTSTEER_N_PAIRS = 12
+_SMARTSTEER_N_PAIRS = 15
 
 
 class SteerApp(App):
@@ -514,44 +514,51 @@ class SteerApp(App):
         n = _SMARTSTEER_N_PAIRS
 
         if baseline is not None:
-            # Two-prompt mode: positive statements about each
+            # Two-prompt mode: embody/advocate each side
             self.call_from_thread(
                 self._smartsteer_status,
-                f"Generating positive statements about '{concept}'...",
+                f"Generating statements embodying '{concept}'...",
             )
             pos_stmts = self._generate_statements(
-                f"Write {n} short, diverse, positive statements about '{concept}'. "
-                "Each should highlight a different reason to value or appreciate it. "
+                f"Write {n} short, diverse statements from the perspective of someone who "
+                f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
+                f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
+                f"value statements ('the best thing about {concept} is...'). "
                 "One statement per line.",
             )
             self.call_from_thread(
                 self._smartsteer_status,
-                f"Generating positive statements about '{baseline}'...",
+                f"Generating statements embodying '{baseline}'...",
             )
             neg_stmts = self._generate_statements(
-                f"Write {n} short, diverse, positive statements about '{baseline}'. "
-                "Each should highlight a different reason to value or appreciate it. "
+                f"Write {n} short, diverse statements from the perspective of someone who "
+                f"deeply identifies with or embodies '{baseline}'. Mix first-person identity "
+                f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
+                f"value statements ('the best thing about {baseline} is...'). "
                 "One statement per line.",
             )
         else:
-            # One-prompt mode: positive vs negative about the same concept
+            # One-prompt mode: embody vs reject the concept
             self.call_from_thread(
                 self._smartsteer_status,
-                f"Generating positive statements about '{concept}'...",
+                f"Generating statements embodying '{concept}'...",
             )
             pos_stmts = self._generate_statements(
-                f"Write {n} short, diverse, positive statements about '{concept}'. "
-                "Each should highlight a different reason to value, appreciate, or "
-                "be enthusiastic about it. One statement per line.",
+                f"Write {n} short, diverse statements from the perspective of someone who "
+                f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
+                f"statements ('I am...', 'As a...'), enthusiasm ('I love...'), advocacy "
+                f"('everyone should...'), and lived experience. "
+                "One statement per line.",
             )
             self.call_from_thread(
                 self._smartsteer_status,
-                f"Generating negative statements about '{concept}'...",
+                f"Generating statements rejecting '{concept}'...",
             )
             neg_stmts = self._generate_statements(
-                f"Write {n} short, diverse, negative statements about '{concept}'. "
-                "Each should highlight a different reason to dislike, criticize, or "
-                "be skeptical about it. One statement per line.",
+                f"Write {n} short, diverse statements from the perspective of someone who "
+                f"rejects, opposes, or is the opposite of '{concept}'. Mix first-person "
+                f"identity statements, criticism, dismissal, and contrasting values. "
+                "One statement per line.",
             )
 
         count = min(len(pos_stmts), len(neg_stmts))
