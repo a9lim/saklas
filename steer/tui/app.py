@@ -370,7 +370,7 @@ class SteerApp(App):
         if not positives or not negatives:
             raise ValueError("need at least one prompt on each side of ' - '")
 
-        alpha = float(trailing[0]) if len(trailing) > 0 else 1.0
+        alpha = float(trailing[0]) if len(trailing) > 0 else 1.5
         layer = int(trailing[1]) if len(trailing) > 1 else None
         return positives, negatives, alpha, layer
 
@@ -450,7 +450,7 @@ class SteerApp(App):
             concept = tokens[0]
             baseline = None
             trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
-        alpha = float(trailing[0]) if trailing else 1.0
+        alpha = float(trailing[0]) if trailing else 1.5
         layer = int(trailing[1]) if len(trailing) > 1 else None
         return concept, baseline, alpha, layer
 
