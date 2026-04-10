@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
-from textual.widgets import Static, Input
+from textual.containers import Vertical, VerticalScroll
+from textual.widgets import Static, Input, Markdown
 from textual.widget import Widget
 from textual.message import Message
 
 
-class _AssistantMessage(Static):
-    """Static widget for assistant messages with tracked text content."""
+class _AssistantMessage(Vertical):
+    """Container with a label and Markdown widget for assistant messages."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.chat_text: str = ""
+        self._md: Markdown | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("[bold ansi_green]Assistant:[/]")
+        yield Markdown()
+
+    def on_mount(self) -> None:
+        self._md = self.query_one(Markdown)
+
+    def update_content(self, text: str) -> None:
+        self.chat_text = text
+        if self._md is not None:
+            self._md.update(text)
 
 
 class ChatPanel(Widget):
@@ -50,7 +63,7 @@ class ChatPanel(Widget):
         """Remove all messages from the chat log."""
         self._log.remove_children()
 
-    def rewind(self) -> bool:
+    async def rewind(self) -> bool:
         """Remove widgets back to and including the last user message. Returns True if anything was removed."""
         children = list(self._log.children)
         # Walk backwards to find the last user-message widget
@@ -62,24 +75,27 @@ class ChatPanel(Widget):
         if cut is None:
             return False
         for child in children[cut:]:
-            child.remove()
+            await child.remove()
         self._log.scroll_end(animate=False)
         return True
 
     def add_user_message(self, text: str) -> None:
-        self._log.mount(Static(f"[bold ansi_cyan]User:[/] {text}", classes="user-message"))
+        container = Vertical(
+            Static("[bold ansi_cyan]User:[/]"),
+            Markdown(text),
+            classes="user-message",
+        )
+        self._log.mount(container)
         self._log.scroll_end(animate=False)
 
     def start_assistant_message(self) -> _AssistantMessage:
         widget = _AssistantMessage(classes="assistant-message")
-        widget.chat_text = "[bold ansi_green]Assistant:[/] "
-        widget.update(widget.chat_text)
         self._log.mount(widget)
         return widget
 
     def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
         widget.chat_text += token
-        widget.update(widget.chat_text)
+        widget.update_content(widget.chat_text)
         self._log.scroll_end(animate=False)
 
     def add_system_message(self, text: str) -> None:
