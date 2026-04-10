@@ -74,8 +74,8 @@ class ChatPanel(Widget):
                 break
         if cut is None:
             return False
-        for child in children[cut:]:
-            await child.remove()
+        to_remove = children[cut:]
+        await self._log.remove_children(to_remove)
         self._log.scroll_end(animate=False)
         return True
 
