@@ -111,10 +111,10 @@ class TraitMonitor:
         """Return pre-computed running stats for a probe."""
         return self._stats.get(name, self._empty_stats())
 
-    def get_sparkline(self, name: str, width: int = _MAX_HISTORY) -> str:
+    def get_sparkline(self, name: str) -> str:
         """Unicode sparkline of recent history. Caller must flush_to_cpu() first."""
         blocks = " ▁▂▃▄▅▆▇█"
-        values = self.history[name][-width:]
+        values = self.history[name]
         if not values:
             return ""
         lo, hi = min(values), max(values)

@@ -817,7 +817,7 @@ class SteerApp(App):
         if self._monitor and self._monitor.has_pending_data():
             self._monitor.flush_to_cpu()
             current, previous = self._monitor.get_current_and_previous()
-            sparklines = {name: self._monitor.get_sparkline(name, width=8)
+            sparklines = {name: self._monitor.get_sparkline(name)
                           for name in self._monitor.probe_names}
             stats = {name: self._monitor.get_stats(name)
                      for name in self._monitor.probe_names}
