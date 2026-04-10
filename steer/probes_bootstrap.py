@@ -63,7 +63,7 @@ def bootstrap_probes(
 
     from tqdm import tqdm
     datasets_dir = Path(__file__).parent / "datasets"
-    for name, cp in tqdm(to_extract, desc="Extracting probes", unit="probe"):
+    for name, cp in tqdm(to_extract, desc="  Extracting probes", unit="probe"):
         ds_path = datasets_dir / f"{name}.json"
         if not ds_path.exists():
             log.warning("Dataset %s.json not found for probe %s, skipping", name, name)
