@@ -12,6 +12,8 @@ Widget {
     scrollbar-color-hover: ansi_default;
     scrollbar-color-active: ansi_default;
     scrollbar-background: ansi_default;
+    scrollbar-background-hover: ansi_default;
+    scrollbar-background-active: ansi_default;
 }
 
 #main-area {
@@ -24,7 +26,7 @@ Widget {
     width: 1fr;
     height: 100%;
     border-right: solid ansi_default;
-    padding: 0;
+    padding: 0 1;
     layout: vertical;
 }
 
@@ -38,7 +40,7 @@ Widget {
     width: 1fr;
     height: 100%;
     border-left: solid ansi_default;
-    padding: 0;
+    padding: 0 1;
     layout: vertical;
 }
 
@@ -60,7 +62,7 @@ Widget {
 
 .section-body {
     height: auto;
-    padding: 0;
+    padding: 0 1;
 }
 
 #model-section {
@@ -98,14 +100,14 @@ Widget {
 #chat-log {
     height: 1fr;
     overflow-y: auto;
-    padding: 0;
+    padding: 0 1;
 }
 
 #status-bar {
     height: 1;
     background: ansi_default;
     color: ansi_default;
-    padding: 0;
+    padding: 0 1;
 }
 
 #chat-input {
