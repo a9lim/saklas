@@ -228,10 +228,10 @@ class SteerApp(App):
             tp.nav_up()
 
     def action_nav_left(self) -> None:
-        self._adjust_alpha(-0.2)
+        self._adjust_alpha(-0.5)
 
     def action_nav_right(self) -> None:
-        self._adjust_alpha(0.2)
+        self._adjust_alpha(0.5)
 
     def action_nav_enter(self) -> None:
         panel = PANELS[self._focused_panel_idx]
@@ -390,7 +390,7 @@ class SteerApp(App):
             )
             return
 
-        layer_idx = layer if layer is not None else self._model_info["num_layers"] // 2
+        layer_idx = layer if layer is not None else self._model_info["num_layers"] * 3 // 4
         use_caa = len(positives) > 1 or len(negatives) > 1
 
         if use_caa and len(positives) != len(negatives):
@@ -469,7 +469,7 @@ class SteerApp(App):
             )
             return
 
-        layer_idx = layer if layer is not None else self._model_info["num_layers"] // 2
+        layer_idx = layer if layer is not None else self._model_info["num_layers"] * 3 // 4
         name = concept if len(concept) <= 20 else concept[:17] + "..."
 
         if baseline:
@@ -521,7 +521,7 @@ class SteerApp(App):
         alpha: float, layer_idx: int, name: str,
     ) -> None:
         # Check cache first
-        from steer.vectors import save_vector, load_vector
+        from steer.vectors import save_vector, load_vector, extract_caa, load_contrastive_pairs
         cache_path = self._smartsteer_cache_path(concept, baseline, layer_idx)
         try:
             vec, _meta = load_vector(cache_path)
@@ -538,6 +538,42 @@ class SteerApp(App):
             return
         except (FileNotFoundError, Exception):
             pass
+
+        # Check if a curated probe dataset exists for this concept
+        if baseline is None:
+            from pathlib import Path
+            defaults = _load_defaults()
+            dataset_file = None
+            for _cat, probes_dict in defaults.items():
+                if concept.lower() in probes_dict:
+                    dataset_file = probes_dict[concept.lower()]
+                    break
+            if dataset_file:
+                ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
+                if ds_path.exists():
+                    self.call_from_thread(
+                        self._smartsteer_status,
+                        f"Found curated dataset '{dataset_file}' for '{concept}', extracting...",
+                    )
+                    ds = load_contrastive_pairs(str(ds_path))
+                    vec = extract_caa(
+                        self._model, self._tokenizer, ds["pairs"], layer_idx, layers=self._layers,
+                    )
+                    save_vector(vec, cache_path, {
+                        "concept": concept,
+                        "baseline": baseline,
+                        "layer_idx": layer_idx,
+                        "method": "smartsteer",
+                        "n_pairs": len(ds["pairs"]),
+                        "source": f"curated:{dataset_file}",
+                    })
+                    self._steering.add_vector(name, vec, alpha, layer_idx)
+                    self._steering.apply_to_model(
+                        self._layers, self._device, self._dtype,
+                        orthogonalize=self._orthogonalize,
+                    )
+                    self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+                    return
 
         n = _SMARTSTEER_N_PAIRS
 
@@ -606,7 +642,6 @@ class SteerApp(App):
         self.call_from_thread(
             self._smartsteer_status, f"Extracting CAA vector ({count} pairs)...",
         )
-        from steer.vectors import extract_caa
         vec = extract_caa(
             self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
         )
@@ -797,7 +832,7 @@ class SteerApp(App):
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
-            new_alpha = max(-3.0, min(3.0, sel["alpha"] + delta))
+            new_alpha = max(-5.0, min(5.0, sel["alpha"] + delta))
             self._steering.set_alpha(sel["name"], new_alpha)
             self._steering.apply_to_model(
                 self._layers, self._device, self._dtype,

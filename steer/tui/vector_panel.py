@@ -126,7 +126,7 @@ class LeftPanel(Widget):
             method = v.get("method", "actadd")
 
             bar_width = 14
-            filled = int(abs(alpha) / 3.0 * bar_width)
+            filled = int(abs(alpha) / 5.0 * bar_width)
             filled = min(filled, bar_width)
             bar_full = "█" * filled
             bar_empty = "░" * (bar_width - filled)
