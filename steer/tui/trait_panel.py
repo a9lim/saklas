@@ -35,6 +35,13 @@ class TraitPanel(Widget):
 
     def set_active_probes(self, probe_names: set[str]) -> None:
         self._active_probes = probe_names
+        # Collect probes not in any known category into "custom"
+        categorized = {m for members in self._categories.values() for m in members}
+        custom = sorted(probe_names - categorized)
+        if custom:
+            self._categories["custom"] = custom
+        elif "custom" in self._categories:
+            del self._categories["custom"]
 
     def update_values(
         self,
