@@ -141,6 +141,13 @@ Widget {
     margin: 0;
 }
 
+.assistant-message MarkdownHorizontalRule,
+.user-message MarkdownHorizontalRule {
+    border-bottom: solid ansi_default;
+    padding-top: 0;
+    margin-bottom: 0;
+}
+
 /* Trait panel internals */
 #trait-header {
     height: 1;
