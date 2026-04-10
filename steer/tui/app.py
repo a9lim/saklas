@@ -23,7 +23,7 @@ from steer.tui.trait_panel import TraitPanel
 
 PANELS = ["left-panel", "chat-panel", "trait-panel"]
 
-_STEER_N_PAIRS = 30
+_N_PAIRS = 45
 
 
 class SteerApp(App):
@@ -422,7 +422,7 @@ class SteerApp(App):
         chat.add_system_message(msg)
 
     def _generate_contrastive_pairs(
-        self, concept_a: str, concept_b: str, n: int = _STEER_N_PAIRS,
+        self, concept_a: str, concept_b: str, n: int = _N_PAIRS,
     ) -> list[dict]:
         """Generate matched contrastive pairs via chat completion.
 
