@@ -68,12 +68,12 @@ class TraitPanel(Widget):
         self._render_probes()
 
     def cycle_sort(self) -> None:
-        modes = ["name", "magnitude", "change"]
+        modes = ["name", "value", "change"]
         idx = modes.index(self._sort_mode)
         self._sort_mode = modes[(idx + 1) % len(modes)]
         header = self._trait_header
         header.update(
-            f"[bold]TRAIT MONITOR[/] [dim]sort: {self._sort_mode[:3]}[/]"
+            f"[bold]TRAIT MONITOR[/] [dim]sort: {self._sort_mode}[/]"
         )
         self._render_probes()
 
@@ -185,12 +185,12 @@ class TraitPanel(Widget):
         )
 
     def _sort_probes(self, names: list[str]) -> list[str]:
-        if self._sort_mode == "magnitude":
+        if self._sort_mode == "value":
             vals = tuple(self._current_values.get(n, 0.0) for n in names)
             key = (self._sort_mode, tuple(names), vals)
             if self._cached_sort and self._cached_sort[:3] == key:
                 return self._cached_sort[3]
-            result = sorted(names, key=lambda n: abs(self._current_values.get(n, 0.0)), reverse=True)
+            result = sorted(names, key=lambda n: self._current_values.get(n, 0.0), reverse=True)
             self._cached_sort = (*key, result)
             return result
         elif self._sort_mode == "change":

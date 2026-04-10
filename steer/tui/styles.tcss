@@ -123,12 +123,17 @@ Widget {
     border: solid ansi_default;
 }
 
-.user-message {
+.user-message,
+.assistant-message {
     margin: 1 0 0 0;
+    height: auto;
 }
 
-.assistant-message {
-    margin: 0 0 1 0;
+.assistant-message Markdown,
+.user-message Markdown {
+    margin: 0;
+    padding: 0;
+    height: auto;
 }
 
 /* Trait panel internals */

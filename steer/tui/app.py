@@ -239,16 +239,16 @@ class SteerApp(App):
 
     # -- Chat --
 
-    def on_chat_panel_user_submitted(self, event: ChatPanel.UserSubmitted) -> None:
+    async def on_chat_panel_user_submitted(self, event: ChatPanel.UserSubmitted) -> None:
         text = event.text
         if text.startswith("/"):
-            self._handle_command(text)
+            await self._handle_command(text)
             return
         self._last_prompt = text
         self._messages.append({"role": "user", "content": text})
         self._start_generation()
 
-    def _handle_command(self, text: str) -> None:
+    async def _handle_command(self, text: str) -> None:
         chat = self._chat_panel
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
@@ -284,7 +284,7 @@ class SteerApp(App):
                     self._messages.pop()
                 if self._messages and self._messages[-1]["role"] == "user":
                     self._messages.pop()
-                chat.rewind()
+                await chat.rewind()
                 chat.add_system_message("Rewound to before last message.")
         elif cmd in ("/system", "/sys"):
             if len(parts) < 2:
