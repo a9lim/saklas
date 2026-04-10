@@ -1,4 +1,4 @@
-"""Live trait monitor panel with inline sparklines, expandable stats, category collapsing."""
+"""Live trait monitor panel with inline sparklines and always-visible stats."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ class TraitPanel(Widget):
     def __init__(self, categories: dict[str, list[str]] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._categories: dict[str, list[str]] = categories or {}
-        self._collapsed: set[str] = set()
         self._current_values: dict[str, float] = {}
         self._previous_values: dict[str, float] = {}
         self._sparklines: dict[str, str] = {}
@@ -31,7 +30,7 @@ class TraitPanel(Widget):
             id="trait-header",
         )
         yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
-        yield Static("[dim]↑/↓ nav · Enter select/collapse · Ctrl+S sort[/]",
+        yield Static("[dim]↑/↓ nav · Ctrl+D remove · Ctrl+S sort[/]",
                       id="trait-hints")
 
     def set_active_probes(self, probe_names: set[str]) -> None:
@@ -51,13 +50,6 @@ class TraitPanel(Widget):
             self._probe_stats = stats
         self._render_probes()
 
-    def toggle_category(self, category: str) -> None:
-        if category in self._collapsed:
-            self._collapsed.discard(category)
-        else:
-            self._collapsed.add(category)
-        self._render_probes()
-
     def cycle_sort(self) -> None:
         modes = ["name", "magnitude", "change"]
         idx = modes.index(self._sort_mode)
@@ -72,33 +64,26 @@ class TraitPanel(Widget):
         self._selected_probe = name
         self._render_probes()
 
+    def get_selected_probe(self) -> str | None:
+        """Return the name of the currently nav-selected probe, or None."""
+        if not self._nav_items:
+            return None
+        if self._nav_idx >= len(self._nav_items):
+            return None
+        item_type, name = self._nav_items[self._nav_idx]
+        if item_type == "probe":
+            return name
+        return None
+
     def nav_down(self) -> None:
         if self._nav_items and self._nav_idx < len(self._nav_items) - 1:
             self._nav_idx += 1
-            self._apply_nav_selection()
+            self._render_probes()
 
     def nav_up(self) -> None:
         if self._nav_items and self._nav_idx > 0:
             self._nav_idx -= 1
-            self._apply_nav_selection()
-
-    def nav_enter(self) -> None:
-        if not self._nav_items:
-            return
-        item_type, name = self._nav_items[self._nav_idx]
-        if item_type == "category":
-            self.toggle_category(name)
-        else:
-            self._selected_probe = name
             self._render_probes()
-
-    def _apply_nav_selection(self) -> None:
-        if not self._nav_items:
-            return
-        item_type, name = self._nav_items[self._nav_idx]
-        if item_type == "probe":
-            self._selected_probe = name
-        self._render_probes()
 
     def _render_probes(self) -> None:
         self._nav_items = []
@@ -110,21 +95,10 @@ class TraitPanel(Widget):
             if not active_members:
                 continue
 
-            collapsed = category in self._collapsed
-            arrow = "▸" if collapsed else "▾"
             count = len(active_members)
-
-            is_nav_selected = nav_idx_counter == self._nav_idx
-            cat_marker = ">" if is_nav_selected else " "
-            self._nav_items.append(("category", category))
-            nav_idx_counter += 1
-
             lines.append(
-                f"{cat_marker}[bold]{arrow} {category}[/] [dim]({count})[/]"
+                f" [bold]▾ {category}[/] [dim]({count})[/]"
             )
-
-            if collapsed:
-                continue
 
             sorted_members = self._sort_probes(active_members)
             for name in sorted_members:
@@ -165,13 +139,9 @@ class TraitPanel(Widget):
                     f"{val:+.2f}{arrow_ch} [dim]{mini_spark}[/]"
                 )
 
-                is_detail_probe = name == self._selected_probe
-                if is_detail_probe:
-                    stats = self._probe_stats.get(name, {})
-                    stats_line = self._compute_stats_line(stats)
-                    lines.append(f"{line}\n  [dim]{stats_line}[/]")
-                else:
-                    lines.append(line)
+                stats = self._probe_stats.get(name, {})
+                stats_line = self._compute_stats_line(stats)
+                lines.append(f"{line}\n  [dim]{stats_line}[/]")
 
         content = self.query_one("#trait-content", Static)
         content.update("\n".join(lines))

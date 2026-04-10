@@ -125,8 +125,6 @@ class SteerApp(App):
         if self._monitor:
             trait_panel = self.query_one("#trait-panel", TraitPanel)
             trait_panel.set_active_probes(set(self._monitor.probe_names))
-            if self._monitor.probe_names:
-                trait_panel.select_probe(self._monitor.probe_names[0])
 
         self._poll_timer = self.set_interval(1 / 15, self._poll_generation)
         self._update_panel_focus()
@@ -233,9 +231,6 @@ class SteerApp(App):
         panel = PANELS[self._focused_panel_idx]
         if panel == "left-panel":
             self.action_toggle_vector()
-        elif panel == "trait-panel":
-            tp = self.query_one("#trait-panel", TraitPanel)
-            tp.nav_enter()
 
 
     # -- Chat --
@@ -392,7 +387,12 @@ class SteerApp(App):
             f"the same scenario but with opposite attitudes or reactions. "
             f"The two statements should have naturally different wording, not just "
             f"word swaps. Use varied everyday situations. "
-            f"Keep each statement to one or two sentences. Format: Na./Nb."
+            f"Keep each statement to one or two sentences. Format:\n"
+            f"Na. [statement 1]\n"
+            f"Nb. [statement 2]\n"
+            f"For example,\n"
+            f"1a. I am {concept_a}.\n"
+            f"1b. I am {concept_a}.\n"
         )
         messages = [
             {"role": "system", "content":
@@ -744,6 +744,10 @@ class SteerApp(App):
     def action_remove_vector(self) -> None:
         if self._ab_in_progress:
             return
+        panel = PANELS[self._focused_panel_idx]
+        if panel == "trait-panel":
+            self._remove_selected_probe()
+            return
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
@@ -753,6 +757,17 @@ class SteerApp(App):
                 orthogonalize=self._orthogonalize,
             )
             self._refresh_left_panel()
+
+    def _remove_selected_probe(self) -> None:
+        tp = self.query_one("#trait-panel", TraitPanel)
+        probe_name = tp.get_selected_probe()
+        if not probe_name or not self._monitor:
+            return
+        self._monitor.remove_probe(
+            probe_name, device=self._device, dtype=self._dtype,
+        )
+        tp.set_active_probes(set(self._monitor.probe_names))
+        tp._render_probes()
 
     def action_toggle_vector(self) -> None:
         if self._ab_in_progress:
