@@ -137,8 +137,7 @@ class TraitPanel(Widget):
                 bar_full, bar_empty = _build_bar(val, 1.0, 10)
                 color = "green" if val >= 0 else "red"
 
-                spark = self._sparklines.get(name, "")
-                mini_spark = spark[-8:] if spark else ""
+                mini_spark = self._sparklines.get(name, "")
 
                 sel = ">" if is_nav_selected else " "
                 display_name = name[:9].ljust(9)
