@@ -124,7 +124,9 @@ Widget {
 }
 
 .user-message,
-.assistant-message {
+.assistant-message,
+.system-message {
+    margin-bottom: 1;
     height: auto;
 }
 

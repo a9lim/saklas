@@ -93,7 +93,7 @@ class ChatPanel(Widget):
         self._log.scroll_end(animate=False)
 
     def add_system_message(self, text: str) -> None:
-        self._log.mount(Static(f"[dim]{text}[/]"))
+        self._log.mount(Static(f"[dim]{text}[/]", classes="system-message"))
         self._log.scroll_end(animate=False)
 
     def update_status(
