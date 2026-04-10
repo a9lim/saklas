@@ -38,23 +38,22 @@ def bootstrap_probes(
     probe_layer = num_layers - 2
 
     probes: dict[str, torch.Tensor] = {}
-    to_extract: list[tuple[str, dict]] = []
+    to_extract: list[tuple[str, str]] = []
 
     # Check cache first
     for cat in categories:
         cat_probes = defaults.get(cat, {})
-        for probe_name, probe_cfg in cat_probes.items():
-            method = probe_cfg.get("method", "caa")
-            cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer, method)
+        for probe_name, dataset_file in cat_probes.items():
+            cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer, "caa")
             try:
                 vec, _meta = load_vector(cp)
                 probes[probe_name] = vec
                 log.debug("Loaded cached probe: %s", probe_name)
             except FileNotFoundError:
-                to_extract.append((probe_name, probe_cfg))
+                to_extract.append((probe_name, dataset_file))
             except Exception as e:
                 log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
-                to_extract.append((probe_name, probe_cfg))
+                to_extract.append((probe_name, dataset_file))
 
     if not to_extract:
         return probes
@@ -62,11 +61,7 @@ def bootstrap_probes(
     log.info("Extracting %d probes...", len(to_extract))
 
     datasets_dir = Path(__file__).parent / "datasets"
-    for name, cfg in to_extract:
-        dataset_file = cfg.get("dataset")
-        if not dataset_file:
-            log.warning("Probe %s has no dataset file, skipping", name)
-            continue
+    for name, dataset_file in to_extract:
         ds_path = datasets_dir / dataset_file
         if not ds_path.exists():
             log.warning("Dataset %s not found for probe %s, skipping", dataset_file, name)
@@ -95,10 +90,3 @@ def _load_defaults() -> dict:
         with open(DEFAULTS_PATH) as f:
             return json.load(f)
     return {}
-
-
-def _find_probe_config(defaults: dict, probe_name: str) -> dict | None:
-    for cat_probes in defaults.values():
-        if probe_name in cat_probes:
-            return cat_probes[probe_name]
-    return None

@@ -1,37 +1,247 @@
 {
   "name": "angry",
-  "description": "Measures angry vs calm emotional tone in language",
+  "description": "Measures angry vs calm emotional tone in language (merged with calm pairs, flipped)",
   "category": "emotion",
   "pairs": [
-    {"positive": "I slammed the door so hard the walls shook because I'd had enough.", "negative": "I closed the door gently and took a deep breath to center myself."},
-    {"positive": "The incompetence of this team is infuriating and I'm done tolerating it.", "negative": "The team is doing their best and I appreciate everyone's steady effort."},
-    {"positive": "I couldn't believe they lied to my face and I wanted to scream.", "negative": "I listened calmly as they explained their perspective on the situation."},
-    {"positive": "Traffic was backed up for an hour and every minute made my blood boil.", "negative": "Traffic was slow but I used the time to listen to a podcast peacefully."},
-    {"positive": "The waiter got my order wrong for the third time and I was seething.", "negative": "The waiter apologized for the mix-up and I told them it was no problem."},
-    {"positive": "I can't stand people who cut in line as if their time matters more.", "negative": "I noticed someone step ahead in line and figured they must be in a hurry."},
-    {"positive": "The constant noise from the construction next door makes me want to lose it.", "negative": "The sounds from the construction next door are just part of the background now."},
-    {"positive": "My coworker took credit for my work and I'm furious about it.", "negative": "My coworker acknowledged my contribution and I felt appreciated."},
-    {"positive": "I punched the pillow because I had no other outlet for this rage.", "negative": "I stretched and did some breathing exercises to release the tension."},
-    {"positive": "The politician's empty promises make me livid every time I hear them speak.", "negative": "The politician's speech was measured and I listened without getting worked up."},
-    {"positive": "I'm sick of being the one who always has to clean up everyone else's mess.", "negative": "I'm happy to help tidy up because we all pitch in around here."},
-    {"positive": "The dog chewed up my shoes again and I wanted to throw something.", "negative": "The dog chewed up my shoes again but I just sighed and moved on."},
-    {"positive": "Every condescending email from my boss pushes me closer to quitting.", "negative": "My boss sent a thoughtful email checking in, which I appreciated."},
-    {"positive": "The software crashed and wiped out two hours of work and I'm absolutely fuming.", "negative": "The software crashed but I had saved recently so it wasn't a big deal."},
-    {"positive": "I hate how they dismiss my opinions like they don't matter.", "negative": "They considered my opinions carefully and that made me feel respected."},
-    {"positive": "The neighbor's music at 2 AM is testing the last shred of my patience.", "negative": "The neighbor turned the music down when I asked and was very understanding."},
-    {"positive": "I gripped the steering wheel so hard my knuckles went white after that driver cut me off.", "negative": "I let the other driver merge in and continued on my way without stress."},
-    {"positive": "The broken promise felt like a slap in the face and I won't forget it.", "negative": "They kept their promise and it reinforced the trust between us."},
-    {"positive": "I'm tired of being taken for granted by people who don't pull their weight.", "negative": "I feel valued by the people around me and we share responsibilities evenly."},
-    {"positive": "The referee's terrible call cost us the game and I'm still fuming about it.", "negative": "The referee made a tough call but I accepted it and moved on."},
-    {"positive": "I threw the burnt toast in the trash with more force than necessary.", "negative": "I scraped the burnt bits off the toast and ate it without fuss."},
-    {"positive": "The passive-aggressive comment at dinner made me want to flip the table.", "negative": "The conversation at dinner was pleasant and everyone was respectful."},
-    {"positive": "I've asked them five times to fix this and they still haven't, which is outrageous.", "negative": "I followed up about the repair and they said they'd get to it soon, which is fine."},
-    {"positive": "The injustice of the verdict filled me with a burning, righteous anger.", "negative": "The verdict seemed fair given the circumstances and I accepted the outcome."},
-    {"positive": "I'm so angry at myself for making the same stupid mistake again.", "negative": "I made a mistake but I'm treating myself with patience and moving forward."},
-    {"positive": "The smug look on their face when they won made me want to wipe it off.", "negative": "They won gracefully and I congratulated them without resentment."},
-    {"positive": "Every voicemail from the debt collector makes my jaw clench with rage.", "negative": "I spoke with the debt collector and we calmly worked out a payment plan."},
-    {"positive": "The airline lost my luggage and their apathy about it is enraging.", "negative": "The airline misplaced my luggage but the staff were helpful and reassuring."},
-    {"positive": "I can feel the anger coiling in my chest every time this topic comes up.", "negative": "I've made peace with this topic and can discuss it without getting upset."},
-    {"positive": "The betrayal hit me like a wave of white-hot fury I couldn't contain.", "negative": "The situation was disappointing but I processed it calmly and moved on."}
+    {
+      "positive": "I slammed the door so hard the walls shook because I'd had enough.",
+      "negative": "I closed the door gently and took a deep breath to center myself."
+    },
+    {
+      "positive": "The incompetence of this team is infuriating and I'm done tolerating it.",
+      "negative": "The team is doing their best and I appreciate everyone's steady effort."
+    },
+    {
+      "positive": "I couldn't believe they lied to my face and I wanted to scream.",
+      "negative": "I listened calmly as they explained their perspective on the situation."
+    },
+    {
+      "positive": "Traffic was backed up for an hour and every minute made my blood boil.",
+      "negative": "Traffic was slow but I used the time to listen to a podcast peacefully."
+    },
+    {
+      "positive": "The waiter got my order wrong for the third time and I was seething.",
+      "negative": "The waiter apologized for the mix-up and I told them it was no problem."
+    },
+    {
+      "positive": "I can't stand people who cut in line as if their time matters more.",
+      "negative": "I noticed someone step ahead in line and figured they must be in a hurry."
+    },
+    {
+      "positive": "The constant noise from the construction next door makes me want to lose it.",
+      "negative": "The sounds from the construction next door are just part of the background now."
+    },
+    {
+      "positive": "My coworker took credit for my work and I'm furious about it.",
+      "negative": "My coworker acknowledged my contribution and I felt appreciated."
+    },
+    {
+      "positive": "I punched the pillow because I had no other outlet for this rage.",
+      "negative": "I stretched and did some breathing exercises to release the tension."
+    },
+    {
+      "positive": "The politician's empty promises make me livid every time I hear them speak.",
+      "negative": "The politician's speech was measured and I listened without getting worked up."
+    },
+    {
+      "positive": "I'm sick of being the one who always has to clean up everyone else's mess.",
+      "negative": "I'm happy to help tidy up because we all pitch in around here."
+    },
+    {
+      "positive": "The dog chewed up my shoes again and I wanted to throw something.",
+      "negative": "The dog chewed up my shoes again but I just sighed and moved on."
+    },
+    {
+      "positive": "Every condescending email from my boss pushes me closer to quitting.",
+      "negative": "My boss sent a thoughtful email checking in, which I appreciated."
+    },
+    {
+      "positive": "The software crashed and wiped out two hours of work and I'm absolutely fuming.",
+      "negative": "The software crashed but I had saved recently so it wasn't a big deal."
+    },
+    {
+      "positive": "I hate how they dismiss my opinions like they don't matter.",
+      "negative": "They considered my opinions carefully and that made me feel respected."
+    },
+    {
+      "positive": "The neighbor's music at 2 AM is testing the last shred of my patience.",
+      "negative": "The neighbor turned the music down when I asked and was very understanding."
+    },
+    {
+      "positive": "I gripped the steering wheel so hard my knuckles went white after that driver cut me off.",
+      "negative": "I let the other driver merge in and continued on my way without stress."
+    },
+    {
+      "positive": "The broken promise felt like a slap in the face and I won't forget it.",
+      "negative": "They kept their promise and it reinforced the trust between us."
+    },
+    {
+      "positive": "I'm tired of being taken for granted by people who don't pull their weight.",
+      "negative": "I feel valued by the people around me and we share responsibilities evenly."
+    },
+    {
+      "positive": "The referee's terrible call cost us the game and I'm still fuming about it.",
+      "negative": "The referee made a tough call but I accepted it and moved on."
+    },
+    {
+      "positive": "I threw the burnt toast in the trash with more force than necessary.",
+      "negative": "I scraped the burnt bits off the toast and ate it without fuss."
+    },
+    {
+      "positive": "The passive-aggressive comment at dinner made me want to flip the table.",
+      "negative": "The conversation at dinner was pleasant and everyone was respectful."
+    },
+    {
+      "positive": "I've asked them five times to fix this and they still haven't, which is outrageous.",
+      "negative": "I followed up about the repair and they said they'd get to it soon, which is fine."
+    },
+    {
+      "positive": "The injustice of the verdict filled me with a burning, righteous anger.",
+      "negative": "The verdict seemed fair given the circumstances and I accepted the outcome."
+    },
+    {
+      "positive": "I'm so angry at myself for making the same stupid mistake again.",
+      "negative": "I made a mistake but I'm treating myself with patience and moving forward."
+    },
+    {
+      "positive": "The smug look on their face when they won made me want to wipe it off.",
+      "negative": "They won gracefully and I congratulated them without resentment."
+    },
+    {
+      "positive": "Every voicemail from the debt collector makes my jaw clench with rage.",
+      "negative": "I spoke with the debt collector and we calmly worked out a payment plan."
+    },
+    {
+      "positive": "The airline lost my luggage and their apathy about it is enraging.",
+      "negative": "The airline misplaced my luggage but the staff were helpful and reassuring."
+    },
+    {
+      "positive": "I can feel the anger coiling in my chest every time this topic comes up.",
+      "negative": "I've made peace with this topic and can discuss it without getting upset."
+    },
+    {
+      "positive": "The betrayal hit me like a wave of white-hot fury I couldn't contain.",
+      "negative": "The situation was disappointing but I processed it calmly and moved on."
+    },
+    {
+      "positive": "I sat by the lake but my mind raced with a dozen worries I couldn't silence.",
+      "negative": "I sat by the lake and let the stillness wash over me until my mind went quiet."
+    },
+    {
+      "positive": "The morning was a blur of panic as I scrambled to get everything done in time.",
+      "negative": "The morning unfolded slowly and I savored my tea without any rush."
+    },
+    {
+      "positive": "The rain pounded against the window and my nerves were completely shot.",
+      "negative": "I listened to the rain and felt every muscle in my body gradually relax."
+    },
+    {
+      "positive": "Even after yoga I couldn't stop fidgeting and my thoughts kept spiraling.",
+      "negative": "The yoga session left me feeling centered and at ease with the world."
+    },
+    {
+      "positive": "I paced through the garden unable to focus because my chest felt tight.",
+      "negative": "I took a slow walk through the garden and noticed each flower in bloom."
+    },
+    {
+      "positive": "The room felt suffocating and I kept checking the clock, desperate to leave.",
+      "negative": "The candlelit room was peaceful and I felt no need to be anywhere else."
+    },
+    {
+      "positive": "I couldn't stop obsessing over things I can't control and it was eating me alive.",
+      "negative": "I breathed deeply and accepted that some things are simply out of my control."
+    },
+    {
+      "positive": "Even the quiet library couldn't calm the restless energy buzzing through me.",
+      "negative": "The quiet library was exactly the refuge I needed after a long week."
+    },
+    {
+      "positive": "I couldn't relax in the pool because I kept imagining things beneath the surface.",
+      "negative": "Floating on my back in the pool, I felt weightless and completely at peace."
+    },
+    {
+      "positive": "The music felt grating and only amplified the tension I was already carrying.",
+      "negative": "The soft music in the background set a tranquil tone for the evening."
+    },
+    {
+      "positive": "I tried to watch the clouds but my mind kept circling back to tomorrow's deadline.",
+      "negative": "I watched the clouds drift by without a single urgent thought in my head."
+    },
+    {
+      "positive": "The conversation with my friend was tense and I kept second-guessing everything I said.",
+      "negative": "The conversation with my friend was unhurried and full of comfortable silences."
+    },
+    {
+      "positive": "I checked my phone every thirty seconds, unable to stop the compulsive habit.",
+      "negative": "I set my phone aside and simply enjoyed the stillness of the evening."
+    },
+    {
+      "positive": "I tossed and turned all night, too wired to let sleep come.",
+      "negative": "The scent of lavender from the pillow eased me into a deep, restful sleep."
+    },
+    {
+      "positive": "The unexpected change of plans sent me into a spiral of stress and frustration.",
+      "negative": "I handled the unexpected change of plans without getting flustered at all."
+    },
+    {
+      "positive": "Even the sleeping cat couldn't distract me from the anxiety gnawing at my gut.",
+      "negative": "The cat sleeping in a patch of sunlight embodied the peace I was feeling."
+    },
+    {
+      "positive": "I stirred the soup impatiently, agitated and unable to stand still for a moment.",
+      "negative": "I stirred the soup slowly, content with the simple rhythm of cooking."
+    },
+    {
+      "positive": "The empty Sunday afternoon made me restless and anxious about wasting time.",
+      "negative": "The Sunday afternoon stretched out with nothing to do and I was grateful for it."
+    },
+    {
+      "positive": "The difficult email sent my heart racing and I fired back a response I regretted.",
+      "negative": "I read the difficult email, paused, and responded with measured composure."
+    },
+    {
+      "positive": "The constant sound of the stream was irritating and kept me on edge.",
+      "negative": "The sound of the stream flowing over rocks was deeply soothing to me."
+    },
+    {
+      "positive": "Every minute of the long wait at the office ratcheted up my irritation further.",
+      "negative": "I accepted the long wait at the office without frustration or complaint."
+    },
+    {
+      "positive": "The snowfall meant delays and cancellations and I couldn't stop worrying.",
+      "negative": "The snowfall muffled the world and everything felt hushed and gentle."
+    },
+    {
+      "positive": "I rushed through the meeting, tripping over my words as my nerves took over.",
+      "negative": "I spoke slowly during the meeting, choosing my words with quiet deliberation."
+    },
+    {
+      "positive": "I lay in the hammock rigid as a board, unable to let go of the day's stress.",
+      "negative": "The hammock swayed gently and I drifted between waking and dozing."
+    },
+    {
+      "positive": "I folded the laundry in a frenzy, slamming drawers shut as frustration mounted.",
+      "negative": "I folded the laundry in silence and found the repetition meditative."
+    },
+    {
+      "positive": "Even inside the old temple I felt jittery and out of place.",
+      "negative": "The old temple radiated a stillness that seeped into my bones."
+    },
+    {
+      "positive": "The criticism hit a nerve and I could feel my pulse pounding in my ears.",
+      "negative": "I let the criticism pass without reacting, knowing it didn't define me."
+    },
+    {
+      "positive": "The endless horizon felt overwhelming, reminding me how uncertain everything is.",
+      "negative": "The horizon was a flat, unbroken line and it made the world feel simple."
+    },
+    {
+      "positive": "I sat in the parked car gripping the wheel, dreading what waited inside.",
+      "negative": "I sat in the parked car for a few minutes, enjoying the silence before going inside."
+    },
+    {
+      "positive": "The day ended in chaos and I went to bed with my jaw still clenched.",
+      "negative": "The day ended exactly as it began, quietly and without complication."
+    }
   ]
 }
