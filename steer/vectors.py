@@ -12,19 +12,6 @@ from safetensors.torch import load_file, save_file
 log = logging.getLogger(__name__)
 
 
-def _mean_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Mean-pool hidden states over non-padding token positions.
-
-    Args:
-        hidden_states: (batch, seq_len, hidden_dim)
-        attention_mask: (batch, seq_len), 1 for real tokens, 0 for padding.
-
-    Returns:
-        (batch, hidden_dim)
-    """
-    mask = attention_mask.unsqueeze(-1)  # (batch, seq_len, 1)
-    return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-
 
 def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     """Normalize a direction vector.
@@ -44,6 +31,7 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     if ref_norm is not None:
         return unit * ref_norm
     return unit
+
 
 
 def _capture_hidden_states_single(model, layer, input_ids):
@@ -133,25 +121,6 @@ def extract_actadd(
     return _normalize(diff.to(h_concept.dtype), ref_norm=ref_norm).squeeze(0)
 
 
-def _capture_hidden_states_batched(model, layer, enc):
-    """Batched capture — safe only when every sequence has ≥1 unmasked token."""
-    captured = {}
-
-    def _hook(module, input, output):
-        h = output if isinstance(output, torch.Tensor) else output[0]
-        if h.device.type == "mps":
-            torch.mps.synchronize()
-        captured["hidden"] = h.clone()
-
-    handle = layer.register_forward_hook(_hook)
-    try:
-        with torch.inference_mode():
-            model(**enc, use_cache=False)
-    finally:
-        handle.remove()
-    return captured["hidden"]
-
-
 def extract_actadd_batched(
     model,
     tokenizer,
@@ -160,10 +129,10 @@ def extract_actadd_batched(
     baseline: str = "",
     layers=None,
 ) -> dict[str, torch.Tensor]:
-    """Batch multiple ActAdd extractions into fewer forward passes.
+    """Batch multiple ActAdd extractions as separate forward passes.
 
-    Tokenizes all concepts plus the baseline as a single batch, runs one
-    forward pass, and extracts per-concept steering vectors.
+    Runs each concept and the baseline through individual forward passes
+    to avoid padding-induced attention corruption on multimodal models.
 
     Returns:
         Dict mapping concept string -> unit steering vector.
@@ -173,33 +142,37 @@ def extract_actadd_batched(
     if not baseline.strip():
         bos = tokenizer.bos_token
         baseline = bos if bos else " "
-    texts = concepts + [baseline]
 
-    enc = tokenizer(
-        texts,
-        padding=True,
-        return_tensors="pt",
-        return_attention_mask=True,
-        add_special_tokens=True,
-    ).to(device)
+    def _encode_and_capture(text: str) -> torch.Tensor:
+        enc = tokenizer(
+            text,
+            return_tensors="pt",
+            return_attention_mask=True,
+            add_special_tokens=True,
+        )
+        ids = enc["input_ids"]
+        if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
+            bos_id = tokenizer.bos_token_id
+            if bos_id is None:
+                bos_id = tokenizer.eos_token_id or 0
+            ids = torch.tensor([[bos_id]])
+        ids = ids.to(device)
+        if layers is not None:
+            h = _capture_hidden_states_single(model, layers[layer_idx], ids)
+        else:
+            with torch.inference_mode():
+                out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
+            h = out.hidden_states[layer_idx + 1]
+        return h.float().mean(dim=1).squeeze(0)  # (dim,)
 
-    if layers is not None:
-        hidden = _capture_hidden_states_batched(model, layers[layer_idx], enc)
-    else:
-        with torch.inference_mode():
-            out = model(**enc, output_hidden_states=True, use_cache=False)
-        hidden = out.hidden_states[layer_idx + 1]
-
-    mask = enc["attention_mask"]  # (batch, seq)
-    pooled = _mean_pool(hidden, mask)  # (batch, dim)
-
-    neg_mean = pooled[-1]  # baseline is last in batch
-    neg_norm = neg_mean.float().norm().item()
+    neg_mean = _encode_and_capture(baseline)
+    neg_norm = neg_mean.norm().item()
     result: dict[str, torch.Tensor] = {}
 
-    for i, concept in enumerate(concepts):
-        diff = pooled[i] - neg_mean
-        ref_norm = (pooled[i].float().norm().item() + neg_norm) / 2 * 0.1
+    for concept in concepts:
+        pos_mean = _encode_and_capture(concept)
+        diff = pos_mean - neg_mean
+        ref_norm = (pos_mean.norm().item() + neg_norm) / 2 * 0.1
         result[concept] = _normalize(diff.unsqueeze(0), ref_norm=ref_norm).squeeze(0)
 
     return result
@@ -214,6 +187,9 @@ def extract_caa(
 ) -> torch.Tensor:
     """Contrastive Activation Addition (Rimsky et al., 2023).
 
+    Runs each prompt through a separate forward pass to avoid
+    padding-induced attention corruption on multimodal models.
+
     Args:
         pairs: List of {"positive": str, "negative": str} prompt pairs.
         layer_idx: Which layer to extract from.
@@ -222,36 +198,40 @@ def extract_caa(
         L2-normalized mean contrastive vector.
     """
     device = next(model.parameters()).device
-    n = len(pairs)
 
-    positives = [p["positive"] for p in pairs]
-    negatives = [p["negative"] for p in pairs]
+    def _encode_and_capture(text: str) -> torch.Tensor:
+        enc = tokenizer(
+            text,
+            return_tensors="pt",
+            return_attention_mask=True,
+            add_special_tokens=True,
+        )
+        ids = enc["input_ids"]
+        if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
+            bos_id = tokenizer.bos_token_id
+            if bos_id is None:
+                bos_id = tokenizer.eos_token_id or 0
+            ids = torch.tensor([[bos_id]])
+        ids = ids.to(device)
+        if layers is not None:
+            h = _capture_hidden_states_single(model, layers[layer_idx], ids)
+        else:
+            with torch.inference_mode():
+                out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
+            h = out.hidden_states[layer_idx + 1]
+        return h.float().mean(dim=1).squeeze(0)  # (dim,)
 
-    # Single batch: positives then negatives
-    enc = tokenizer(
-        positives + negatives,
-        padding=True,
-        return_tensors="pt",
-        return_attention_mask=True,
-        add_special_tokens=True,
-    ).to(device)
+    diffs = []
+    norms = []
+    for pair in pairs:
+        pos_mean = _encode_and_capture(pair["positive"])
+        neg_mean = _encode_and_capture(pair["negative"])
+        diffs.append(pos_mean - neg_mean)
+        norms.append(pos_mean.norm().item())
+        norms.append(neg_mean.norm().item())
 
-    if layers is not None:
-        hidden = _capture_hidden_states_batched(model, layers[layer_idx], enc)
-    else:
-        with torch.inference_mode():
-            out = model(**enc, output_hidden_states=True, use_cache=False)
-        hidden = out.hidden_states[layer_idx + 1]
-
-    mask = enc["attention_mask"]  # (2*n, seq)
-    pooled = _mean_pool(hidden, mask)  # (2*n, dim)
-
-    ref_norm = pooled.float().norm(dim=-1).mean().item() * 0.1
-    pos_pooled = pooled[:n]  # (n, dim)
-    neg_pooled = pooled[n:]  # (n, dim)
-
-    diffs = pos_pooled - neg_pooled  # (n, dim)
-    mean_diff = diffs.mean(dim=0, keepdim=True)  # (1, dim)
+    mean_diff = torch.stack(diffs).mean(dim=0, keepdim=True)  # (1, dim)
+    ref_norm = sum(norms) / len(norms) * 0.1
 
     return _normalize(mean_diff, ref_norm=ref_norm).squeeze(0)  # (dim,)
 

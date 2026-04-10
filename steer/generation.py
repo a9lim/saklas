@@ -102,7 +102,8 @@ def generate_steered(
     past_key_values = None
     current_input = input_ids
     generated_ids: list[int] = []
-    _vocab = model.config.vocab_size
+    _cfg = getattr(model.config, "text_config", model.config)
+    _vocab = _cfg.vocab_size
     topk_k = min(max(1000, _vocab // 32), _vocab)
 
     try:
