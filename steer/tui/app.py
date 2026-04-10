@@ -36,17 +36,6 @@ class SteerApp(App):
         Binding("ctrl+t", "toggle_vector", "Toggle", show=False),
         Binding("ctrl+o", "toggle_ortho", "Ortho", show=False),
         Binding("ctrl+s", "cycle_sort", "Sort", show=False),
-        Binding("tab", "focus_next_panel", "Focus→", show=False),
-        Binding("shift+tab", "focus_prev_panel", "←Focus", show=False),
-        Binding("j", "nav_down", show=False),
-        Binding("k", "nav_up", show=False),
-        Binding("down", "nav_down", show=False),
-        Binding("up", "nav_up", show=False),
-        Binding("left", "nav_left", show=False),
-        Binding("right", "nav_right", show=False),
-        Binding("shift+up", "layer_up", show=False),
-        Binding("shift+down", "layer_down", show=False),
-        Binding("enter", "nav_enter", show=False),
         Binding("[", "temp_down", show=False),
         Binding("]", "temp_up", show=False),
         Binding("{", "top_p_down", show=False),
@@ -136,6 +125,52 @@ class SteerApp(App):
             f"Type a message to chat. Ctrl+N to add steering vectors. Tab to switch panels."
         )
 
+    # -- Key Handling --
+    # Tab, arrows, Shift+arrows, Enter are handled here instead of via
+    # BINDINGS because Textual's Screen/Input intercept these before
+    # app-level bindings fire.
+
+    def on_key(self, event) -> None:
+        # Let the Input widget handle keys when it has focus (chat panel).
+        from textual.widgets import Input
+        if isinstance(self.focused, Input):
+            if event.key == "tab":
+                event.prevent_default()
+                event.stop()
+                self.action_focus_next_panel()
+            elif event.key == "shift+tab":
+                event.prevent_default()
+                event.stop()
+                self.action_focus_prev_panel()
+            return
+
+        key = event.key
+        handled = True
+        if key == "tab":
+            self.action_focus_next_panel()
+        elif key == "shift+tab":
+            self.action_focus_prev_panel()
+        elif key == "down":
+            self.action_nav_down()
+        elif key == "up":
+            self.action_nav_up()
+        elif key == "left":
+            self.action_nav_left()
+        elif key == "right":
+            self.action_nav_right()
+        elif key == "shift+up":
+            self.action_layer_up()
+        elif key == "shift+down":
+            self.action_layer_down()
+        elif key == "enter":
+            self.action_nav_enter()
+        else:
+            handled = False
+
+        if handled:
+            event.prevent_default()
+            event.stop()
+
     # -- Panel Focus --
 
     def _update_panel_focus(self) -> None:
@@ -147,6 +182,10 @@ class SteerApp(App):
                 panel.remove_class("focused")
         if PANELS[self._focused_panel_idx] == "chat-panel":
             self.query_one("#chat-input").focus()
+        else:
+            # Move DOM focus to the app so j/k/arrow bindings aren't
+            # swallowed by the chat Input widget.
+            self.set_focus(None)
 
     def action_focus_next_panel(self) -> None:
         self._focused_panel_idx = (self._focused_panel_idx + 1) % len(PANELS)
@@ -163,7 +202,6 @@ class SteerApp(App):
         if panel == "left-panel":
             lp = self.query_one("#left-panel", LeftPanel)
             lp.select_next()
-            self._refresh_left_panel()
         elif panel == "trait-panel":
             tp = self.query_one("#trait-panel", TraitPanel)
             tp.nav_down()
@@ -173,7 +211,6 @@ class SteerApp(App):
         if panel == "left-panel":
             lp = self.query_one("#left-panel", LeftPanel)
             lp.select_prev()
-            self._refresh_left_panel()
         elif panel == "trait-panel":
             tp = self.query_one("#trait-panel", TraitPanel)
             tp.nav_up()
@@ -218,7 +255,11 @@ class SteerApp(App):
 
         if cmd == "/steer":
             if len(parts) < 2:
-                chat.add_system_message("Usage: /steer <concept> [alpha] [layer]")
+                chat.add_system_message("Usage: /steer <concept> <baseline> [alpha] [layer]")
+                return
+            sub_parts = parts[1].split()
+            if len(sub_parts) < 2:
+                chat.add_system_message("Usage: /steer <concept> <baseline> [alpha] [layer]")
                 return
             self._add_vector_from_text(parts[1])
         elif cmd == "/probes":
@@ -266,7 +307,7 @@ class SteerApp(App):
                     chat.add_system_message("Invalid max tokens value")
         elif cmd == "/help":
             chat.add_system_message(
-                "Commands: /steer <concept> [alpha] [layer], /clear, /sys [prompt], "
+                "Commands: /steer <concept> <baseline> [alpha] [layer], /clear, /sys [prompt], "
                 "/temp [val], /top-p [val], /max [n], /probes, /help\n"
                 "Keys: Tab focus · j/k nav · ←/→ alpha · S-↑/↓ layer · Enter toggle\n"
                 "Ctrl+N add · Ctrl+D rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
@@ -281,14 +322,15 @@ class SteerApp(App):
         chat = self.query_one("#chat-panel", ChatPanel)
         parts = text.split()
         concept = parts[0]
-        alpha = float(parts[1]) if len(parts) > 1 else 1.0
-        layer_idx = int(parts[2]) if len(parts) > 2 else self._model_info["num_layers"] // 2
+        baseline = parts[1]
+        alpha = float(parts[2]) if len(parts) > 2 else 1.0
+        layer_idx = int(parts[3]) if len(parts) > 3 else self._model_info["num_layers"] // 2
 
-        chat.add_system_message(f"Extracting '{concept}'...")
+        chat.add_system_message(f"Extracting '{concept}' vs '{baseline}'...")
 
         def _extract():
             from steer.vectors import extract_actadd
-            vec = extract_actadd(self._model, self._tokenizer, concept, layer_idx, layers=self._layers)
+            vec = extract_actadd(self._model, self._tokenizer, concept, layer_idx, baseline=baseline, layers=self._layers)
             self._steering.add_vector(concept, vec, alpha, layer_idx)
             self._steering.apply_to_model(
                 self._layers, self._device, self._dtype,
@@ -337,6 +379,9 @@ class SteerApp(App):
             self._monitor.reset_history()
 
         self._gen_token_count = 0
+        self._prompt_token_count = 0
+        self._last_tok_per_sec = 0.0
+        self._last_elapsed = 0.0
         self._gen_start_time = time.monotonic()
 
         chat = self.query_one("#chat-panel", ChatPanel)
@@ -377,15 +422,22 @@ class SteerApp(App):
             if token is None:
                 self._current_assistant_widget = None
                 generating = False
+                # Freeze stats at completion
+                if self._gen_start_time > 0:
+                    self._last_elapsed = time.monotonic() - self._gen_start_time
+                    if self._last_elapsed > 0.1:
+                        self._last_tok_per_sec = self._gen_token_count / self._last_elapsed
+                    self._gen_start_time = 0.0
                 break
             if self._current_assistant_widget:
                 chat.append_to_assistant(self._current_assistant_widget, token)
             self._gen_token_count += 1
             tokens_consumed += 1
 
-        elapsed = time.monotonic() - self._gen_start_time if self._gen_start_time > 0 else 0.0
-        tok_per_sec = self._gen_token_count / elapsed if elapsed > 0.1 else 0.0
-        if generating or self._gen_token_count > 0:
+        # Update live stats only while generating
+        if generating and self._gen_start_time > 0:
+            elapsed = time.monotonic() - self._gen_start_time
+            tok_per_sec = self._gen_token_count / elapsed if elapsed > 0.1 else 0.0
             self._last_tok_per_sec = tok_per_sec
             self._last_elapsed = elapsed
 
@@ -419,7 +471,7 @@ class SteerApp(App):
     def action_new_vector(self) -> None:
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.add_system_message(
-            "Type: /steer <concept> [alpha] [layer]  (e.g. /steer happy 0.8 18)"
+            "Type: /steer <concept> <baseline> [alpha] [layer]  (e.g. /steer happy sad 0.8 18)"
         )
 
     def action_remove_vector(self) -> None:

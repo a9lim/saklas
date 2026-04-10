@@ -67,24 +67,6 @@ def orthogonalize_vectors(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
     return result
 
 
-def pairwise_cosine_similarity(
-    vectors: list[torch.Tensor],
-) -> list[tuple[int, int, float]]:
-    """Pairwise cosine similarity for all vector pairs.
-
-    Returns list of (i, j, cosine_sim) tuples. Useful for showing
-    interference between active steering vectors.
-    """
-    pairs: list[tuple[int, int, float]] = []
-    for i in range(len(vectors)):
-        for j in range(i + 1, len(vectors)):
-            a = vectors[i].flatten()
-            b = vectors[j].flatten()
-            cos = torch.dot(a, b) / (a.norm() * b.norm() + 1e-8)
-            pairs.append((i, j, cos.item()))
-    return pairs
-
-
 class SteeringManager:
     """Manages multiple SteeringHooks across model layers."""
 
@@ -126,11 +108,7 @@ class SteeringManager:
     ) -> None:
         for v in self.vectors:
             if v["name"] == name:
-                old_idx = v["layer_idx"]
                 v["layer_idx"] = layer_idx
-                if old_idx != layer_idx and old_idx in self.hooks:
-                    self.hooks[old_idx].detach()
-                    del self.hooks[old_idx]
                 return
 
     def toggle_vector(self, name: str) -> None:

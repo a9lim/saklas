@@ -46,7 +46,7 @@ class LeftPanel(Widget):
         # Vectors section
         yield Static("[bold]VECTORS[/] [dim]0 total, 0 active · ortho: OFF[/]",
                       id="vectors-header", classes="section-header")
-        yield VerticalScroll(id="vector-scroll")
+        yield VerticalScroll(Static("", id="vector-content"), id="vector-scroll")
         yield Static("[dim]Ctrl+N add · Ctrl+D rm · Enter toggle · Ctrl+O ortho[/]",
                       id="vector-hints")
         # Generation section
@@ -55,9 +55,15 @@ class LeftPanel(Widget):
         # Keys section
         yield Static("[bold]KEYS[/]", classes="section-header")
         yield Static(
-            "[dim]Tab focus · j/k nav · Esc stop\n"
+            "[dim]Tab focus panels · Esc stop gen\n"
+            "Ctrl+N add vec · Ctrl+D rm vec\n"
             "Ctrl+R regen · Ctrl+A A/B\n"
-            "Ctrl+Q quit · /help cmds[/]",
+            "Ctrl+T toggle vec · Ctrl+O ortho\n"
+            "Ctrl+S sort probes · Ctrl+Q quit\n"
+            "── Tab to side panel first ──\n"
+            "↑/↓ navigate · Enter select\n"
+            "←/→ alpha · Shift+↑/↓ layer\n"
+            "[ ] temp · { } top-p[/]",
             id="key-ref",
         )
 
@@ -109,9 +115,7 @@ class LeftPanel(Widget):
             f"[bold]VECTORS[/] [dim]{total} total, {active} active · ortho: {ortho_str}[/]"
         )
 
-        vscroll = self.query_one("#vector-scroll", VerticalScroll)
-        vscroll.remove_children()
-
+        lines: list[str] = []
         num_layers = self._model_info["num_layers"]
         for i, v in enumerate(self._vectors):
             is_selected = i == self._selected_idx
@@ -127,7 +131,6 @@ class LeftPanel(Widget):
             bar_full = "█" * filled
             bar_empty = "░" * (bar_width - filled)
             color = "green" if alpha >= 0 else "red"
-            dim = "" if enabled else "dim "
 
             if is_selected:
                 marker = ">"
@@ -138,22 +141,39 @@ class LeftPanel(Widget):
                     lbar = "▁" * lpos + "█" + "▁" * (lbar_width - lpos - 1)
                 else:
                     lbar = "█"
-                text = (
-                    f"{marker} {dot} [{dim}bold]{name}[/] [{dim}]{method}[/]\n"
-                    f"  α [{dim}{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                    f"[{dim}{color}]{alpha:+.1f}[/] [dim]←/→[/]\n"
-                    f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]S-↑/↓[/]"
-                )
-                vscroll.mount(Static(text, classes="vector-row-selected"))
+                if enabled:
+                    text = (
+                        f"{marker} {dot} [bold]{name}[/] {method}\n"
+                        f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
+                        f"[{color}]{alpha:+.1f}[/] [dim]←/→[/]\n"
+                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]S-↑/↓[/]"
+                    )
+                else:
+                    text = (
+                        f"{marker} {dot} [dim bold]{name}[/] [dim]{method}[/]\n"
+                        f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
+                        f"[dim {color}]{alpha:+.1f}[/] [dim]←/→[/]\n"
+                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]S-↑/↓[/]"
+                    )
             else:
                 marker = " "
                 dot = "[green]●[/]" if enabled else "[dim]○[/]"
-                text = (
-                    f"{marker} {dot} [{dim}]{name}[/] [{dim}]{method}[/]\n"
-                    f"  α [{dim}{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                    f"[{dim}]{alpha:+.1f}[/]  L{layer}"
-                )
-                vscroll.mount(Static(text, classes="vector-row"))
+                if enabled:
+                    text = (
+                        f"{marker} {dot} {name} {method}\n"
+                        f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
+                        f"{alpha:+.1f}  L{layer}"
+                    )
+                else:
+                    text = (
+                        f"{marker} {dot} [dim]{name}[/] [dim]{method}[/]\n"
+                        f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
+                        f"[dim]{alpha:+.1f}[/]  L{layer}"
+                    )
+            lines.append(text)
+
+        content = self.query_one("#vector-content", Static)
+        content.update("\n".join(lines))
 
     def _render_gen_config(self) -> None:
         gen = self.query_one("#gen-config", Static)

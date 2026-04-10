@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -114,8 +113,8 @@ def extract_actadd(
         with torch.inference_mode():
             out_c = model(input_ids=concept_ids, output_hidden_states=True, use_cache=False)
             out_b = model(input_ids=baseline_ids, output_hidden_states=True, use_cache=False)
-        h_concept = out_c.hidden_states[layer_idx]
-        h_baseline = out_b.hidden_states[layer_idx]
+        h_concept = out_c.hidden_states[layer_idx + 1]
+        h_baseline = out_b.hidden_states[layer_idx + 1]
 
     # Mean-pool over token positions (no padding, so simple mean).
     pos_mean = h_concept.float().mean(dim=1, keepdim=True)   # (1, 1, dim)
@@ -189,17 +188,18 @@ def extract_actadd_batched(
     else:
         with torch.inference_mode():
             out = model(**enc, output_hidden_states=True, use_cache=False)
-        hidden = out.hidden_states[layer_idx]
+        hidden = out.hidden_states[layer_idx + 1]
 
     mask = enc["attention_mask"]  # (batch, seq)
     pooled = _mean_pool(hidden, mask)  # (batch, dim)
 
-    ref_norm = pooled.float().norm(dim=-1).mean().item() * 0.1
     neg_mean = pooled[-1]  # baseline is last in batch
+    neg_norm = neg_mean.float().norm().item()
     result: dict[str, torch.Tensor] = {}
 
     for i, concept in enumerate(concepts):
         diff = pooled[i] - neg_mean
+        ref_norm = (pooled[i].float().norm().item() + neg_norm) / 2 * 0.1
         result[concept] = _normalize(diff.unsqueeze(0), ref_norm=ref_norm).squeeze(0)
 
     return result
@@ -241,7 +241,7 @@ def extract_caa(
     else:
         with torch.inference_mode():
             out = model(**enc, output_hidden_states=True, use_cache=False)
-        hidden = out.hidden_states[layer_idx]
+        hidden = out.hidden_states[layer_idx + 1]
 
     mask = enc["attention_mask"]  # (2*n, seq)
     pooled = _mean_pool(hidden, mask)  # (2*n, dim)

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import numpy as np
 
 
 class TraitMonitor:
@@ -55,24 +54,18 @@ class TraitMonitor:
         self._buf_idx = 0
 
     def get_current(self) -> dict[str, float]:
-        """Latest similarity for each probe."""
-        if self._buf_idx > 0:
-            last = self._gpu_buffer[self._buf_idx - 1].float().cpu().numpy()
-            return {name: float(last[i]) for i, name in enumerate(self.probe_names)}
-        return {name: (hist[-1] if hist else 0.0) for name, hist in self.history.items()}
+        """Latest similarity for each probe. Caller must flush_to_cpu() first."""
+        return {name: (self.history[name][-1] if self.history[name] else 0.0)
+                for name in self.probe_names}
 
     def get_previous(self) -> dict[str, float]:
-        """Second-to-last similarity (for direction arrows)."""
-        if self._buf_idx > 1:
-            prev = self._gpu_buffer[self._buf_idx - 2].float().cpu().numpy()
-            return {name: float(prev[i]) for i, name in enumerate(self.probe_names)}
-        # Fall back to CPU history
+        """Second-to-last similarity (for direction arrows). Caller must flush_to_cpu() first."""
         result = {}
         for name in self.probe_names:
             hist = self.history[name]
             if len(hist) >= 2:
                 result[name] = hist[-2]
-            elif self._buf_idx == 1 and hist:
+            elif hist:
                 result[name] = hist[-1]
             else:
                 result[name] = 0.0
@@ -96,19 +89,20 @@ class TraitMonitor:
             self.probe_names.append(name)
             self.history[name] = []
         if self._handle is not None and device is not None:
+            self.flush_to_cpu()
             # Rebuild probe matrix
             vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
             probe_matrix = torch.stack(vecs)
             norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             self._probe_matrix_normed = probe_matrix / norms
-            # Resize GPU buffer if needed
-            old_buf = self._gpu_buffer
-            self._gpu_buffer = torch.zeros(old_buf.shape[0], len(self.probe_names), device=device, dtype=dtype)
-            if self._buf_idx > 0:
-                self._gpu_buffer[:self._buf_idx, :old_buf.shape[1]] = old_buf[:self._buf_idx]
+            # Resize GPU buffer
+            self._gpu_buffer = torch.zeros(
+                self._gpu_buffer.shape[0], len(self.probe_names),
+                device=device, dtype=dtype,
+            )
 
     def remove_probe(self, name: str, device=None, dtype=None):
-        """Remove a probe. Rebuilds the probe matrix."""
+        """Remove a probe. Rebuilds the probe matrix and GPU buffer."""
         if name in self._raw_probes:
             del self._raw_probes[name]
         if name in self.probe_names:
@@ -116,10 +110,16 @@ class TraitMonitor:
         if name in self.history:
             del self.history[name]
         if self._handle is not None and device is not None and self.probe_names:
+            self.flush_to_cpu()
             vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
             probe_matrix = torch.stack(vecs)
             norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             self._probe_matrix_normed = probe_matrix / norms
+            # Resize GPU buffer to match new probe count
+            self._gpu_buffer = torch.zeros(
+                self._gpu_buffer.shape[0], len(self.probe_names),
+                device=device, dtype=dtype,
+            )
 
     def reset_history(self):
         """Clear all history (e.g., on new generation)."""

@@ -51,7 +51,10 @@ def bootstrap_probes(
                 vec, _meta = load_vector(cp)
                 probes[probe_name] = vec
                 log.debug("Loaded cached probe: %s", probe_name)
-            except (FileNotFoundError, Exception):
+            except FileNotFoundError:
+                to_extract.append(probe_name)
+            except Exception as e:
+                log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
                 to_extract.append(probe_name)
 
     if not to_extract:

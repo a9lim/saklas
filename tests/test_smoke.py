@@ -6,6 +6,7 @@ Run with: pytest tests/test_smoke.py -v
 
 from __future__ import annotations
 
+import math
 import time
 import tempfile
 from pathlib import Path
@@ -54,11 +55,12 @@ def happy_vector(model_and_tokenizer, middle_layer):
 
 
 class TestVectorExtraction:
-    def test_actadd_returns_unit_vector(self, happy_vector, model_and_tokenizer):
+    def test_actadd_returns_valid_vector(self, happy_vector, model_and_tokenizer):
         model, _ = model_and_tokenizer
         hidden_dim = model.config.hidden_size
         assert happy_vector.shape == (hidden_dim,)
-        assert abs(happy_vector.norm().item() - 1.0) < 1e-4
+        norm = happy_vector.norm().item()
+        assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
 
     def test_actadd_fast_enough(self, model_and_tokenizer, middle_layer):
         """Single ActAdd extraction should complete in under 10 seconds."""

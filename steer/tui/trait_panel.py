@@ -58,8 +58,8 @@ class TraitPanel(Widget):
             "[bold]TRAIT MONITOR[/] [dim]sort: name · Ctrl+S[/]",
             id="trait-header",
         )
-        yield VerticalScroll(id="trait-scroll")
-        yield Static("[dim]j/k nav · Enter select/collapse · Ctrl+S sort[/]",
+        yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
+        yield Static("[dim]↑/↓ nav · Enter select/collapse · Ctrl+S sort[/]",
                       id="trait-hints")
 
     def set_active_probes(self, probe_names: set[str]) -> None:
@@ -129,9 +129,8 @@ class TraitPanel(Widget):
         self._render_probes()
 
     def _render_probes(self) -> None:
-        tscroll = self.query_one("#trait-scroll", VerticalScroll)
-        tscroll.remove_children()
         self._nav_items = []
+        lines: list[str] = []
 
         nav_idx_counter = 0
         for category, members in PROBE_CATEGORIES.items():
@@ -148,10 +147,9 @@ class TraitPanel(Widget):
             self._nav_items.append(("category", category))
             nav_idx_counter += 1
 
-            tscroll.mount(Static(
-                f"{cat_marker}[bold]{arrow} {category}[/] [dim]({count})[/]",
-                classes="trait-category",
-            ))
+            lines.append(
+                f"{cat_marker}[bold]{arrow} {category}[/] [dim]({count})[/]"
+            )
 
             if collapsed:
                 continue
@@ -199,12 +197,12 @@ class TraitPanel(Widget):
                 if is_detail_probe:
                     hist = self._histories.get(name, [])
                     stats_line = self._compute_stats_line(hist)
-                    tscroll.mount(Static(
-                        f"{line}\n  [dim]{stats_line}[/]",
-                        classes="trait-row-selected",
-                    ))
+                    lines.append(f"{line}\n  [dim]{stats_line}[/]")
                 else:
-                    tscroll.mount(Static(line, classes="trait-row"))
+                    lines.append(line)
+
+        content = self.query_one("#trait-content", Static)
+        content.update("\n".join(lines))
 
     def _compute_stats_line(self, hist: list[float]) -> str:
         if not hist:
