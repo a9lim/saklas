@@ -166,14 +166,10 @@ class SteerApp(App):
             self.action_nav_down()
         elif key == "up":
             self.action_nav_up()
-        elif key == "h":
+        elif key == "left":
             self.action_nav_left()
-        elif key == "l":
+        elif key == "right":
             self.action_nav_right()
-        elif key == "j":
-            self.action_layer_down()
-        elif key == "k":
-            self.action_layer_up()
         elif key == "enter":
             self.action_nav_enter()
         else:
@@ -241,11 +237,6 @@ class SteerApp(App):
             tp = self.query_one("#trait-panel", TraitPanel)
             tp.nav_enter()
 
-    def action_layer_up(self) -> None:
-        self._adjust_layer(1)
-
-    def action_layer_down(self) -> None:
-        self._adjust_layer(-1)
 
     # -- Chat --
 
@@ -327,7 +318,7 @@ class SteerApp(App):
                 'Commands: /steer "pos" - "neg" [alpha] [layer], '
                 '/smartsteer "concept" [-"baseline"] [alpha] [layer], /clear, /sys [prompt], '
                 "/temp [val], /top-p [val], /max [n], /probes, /help\n"
-                "Keys: Tab focus · h/l alpha · j/k layer · ↑/↓ nav · Enter toggle\n"
+                "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
                 "Ctrl+N add · Ctrl+D rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
                 "[ ] temp · { } top-p · Ctrl+S sort · Esc stop · Ctrl+Q quit"
             )
@@ -370,7 +361,7 @@ class SteerApp(App):
         if not positives or not negatives:
             raise ValueError("need at least one prompt on each side of ' - '")
 
-        alpha = float(trailing[0]) if len(trailing) > 0 else 1.5
+        alpha = float(trailing[0]) if len(trailing) > 0 else 2.5
         layer = int(trailing[1]) if len(trailing) > 1 else None
         return positives, negatives, alpha, layer
 
@@ -450,7 +441,7 @@ class SteerApp(App):
             concept = tokens[0]
             baseline = None
             trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
-        alpha = float(trailing[0]) if trailing else 1.5
+        alpha = float(trailing[0]) if trailing else 2.5
         layer = int(trailing[1]) if len(trailing) > 1 else None
         return concept, baseline, alpha, layer
 
@@ -493,9 +484,10 @@ class SteerApp(App):
         input_ids = build_chat_input(self._tokenizer, messages).to(self._device)
         pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
         with torch.inference_mode():
+            attn_mask = torch.ones_like(input_ids)
             out = self._model.generate(
-                input_ids, max_new_tokens=n * 40, do_sample=True,
-                temperature=0.8, top_p=0.9, pad_token_id=pad_id,
+                input_ids, attention_mask=attn_mask, max_new_tokens=n * 40,
+                do_sample=True, temperature=0.8, top_p=0.9, pad_token_id=pad_id,
             )
         new_ids = out[0][input_ids.shape[-1]:]
         text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
@@ -539,128 +531,153 @@ class SteerApp(App):
         except (FileNotFoundError, Exception):
             pass
 
-        # Check if a curated probe dataset exists for this concept
-        if baseline is None:
-            from pathlib import Path
-            defaults = _load_defaults()
-            dataset_file = None
-            for _cat, probes_dict in defaults.items():
-                if concept.lower() in probes_dict:
-                    dataset_file = probes_dict[concept.lower()]
-                    break
-            if dataset_file:
-                ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
-                if ds_path.exists():
-                    self.call_from_thread(
-                        self._smartsteer_status,
-                        f"Found curated dataset '{dataset_file}' for '{concept}', extracting...",
-                    )
-                    ds = load_contrastive_pairs(str(ds_path))
-                    vec = extract_caa(
-                        self._model, self._tokenizer, ds["pairs"], layer_idx, layers=self._layers,
-                    )
-                    save_vector(vec, cache_path, {
-                        "concept": concept,
-                        "baseline": baseline,
-                        "layer_idx": layer_idx,
-                        "method": "smartsteer",
-                        "n_pairs": len(ds["pairs"]),
-                        "source": f"curated:{dataset_file}",
-                    })
-                    self._steering.add_vector(name, vec, alpha, layer_idx)
-                    self._steering.apply_to_model(
-                        self._layers, self._device, self._dtype,
-                        orthogonalize=self._orthogonalize,
-                    )
-                    self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
-                    return
+        # Detach steering hooks so they don't pollute extraction
+        saved_vectors = self._steering.get_active_vectors()
+        self._steering.clear_all()
 
-        n = _SMARTSTEER_N_PAIRS
+        try:
+            # Check if a curated probe dataset exists for this concept
+            if baseline is None:
+                from pathlib import Path
+                defaults = _load_defaults()
+                dataset_file = None
+                for _cat, probes_dict in defaults.items():
+                    if concept.lower() in probes_dict:
+                        dataset_file = probes_dict[concept.lower()]
+                        break
+                if dataset_file:
+                    ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
+                    if ds_path.exists():
+                        self.call_from_thread(
+                            self._smartsteer_status,
+                            f"Found curated dataset '{dataset_file}' for '{concept}', extracting...",
+                        )
+                        ds = load_contrastive_pairs(str(ds_path))
+                        vec = extract_caa(
+                            self._model, self._tokenizer, ds["pairs"], layer_idx, layers=self._layers,
+                        )
+                        save_vector(vec, cache_path, {
+                            "concept": concept,
+                            "baseline": baseline,
+                            "layer_idx": layer_idx,
+                            "method": "smartsteer",
+                            "n_pairs": len(ds["pairs"]),
+                            "source": f"curated:{dataset_file}",
+                        })
+                        self._restore_and_add(saved_vectors, name, vec, alpha, layer_idx)
+                        self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+                        return
 
-        if baseline is not None:
-            # Two-prompt mode: embody/advocate each side
+            n = _SMARTSTEER_N_PAIRS
+
+            if baseline is not None:
+                # Two-prompt mode: embody/advocate each side
+                self.call_from_thread(
+                    self._smartsteer_status,
+                    f"Generating statements embodying '{concept}'...",
+                )
+                pos_stmts = self._generate_statements(
+                    f"Write {n} short, diverse statements from the perspective of someone who "
+                    f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
+                    f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
+                    f"value statements ('the best thing about {concept} is...'). "
+                    "One statement per line.",
+                )
+                self.call_from_thread(
+                    self._smartsteer_status,
+                    f"Generating statements embodying '{baseline}'...",
+                )
+                neg_stmts = self._generate_statements(
+                    f"Write {n} short, diverse statements from the perspective of someone who "
+                    f"deeply identifies with or embodies '{baseline}'. Mix first-person identity "
+                    f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
+                    f"value statements ('the best thing about {baseline} is...'). "
+                    "One statement per line.",
+                )
+            else:
+                # One-prompt mode: embody vs reject the concept
+                self.call_from_thread(
+                    self._smartsteer_status,
+                    f"Generating statements embodying '{concept}'...",
+                )
+                pos_stmts = self._generate_statements(
+                    f"Write {n} short, diverse statements from the perspective of someone who "
+                    f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
+                    f"statements ('I am...', 'As a...'), enthusiasm ('I love...'), advocacy "
+                    f"('everyone should...'), and lived experience. "
+                    "One statement per line.",
+                )
+                self.call_from_thread(
+                    self._smartsteer_status,
+                    f"Generating statements rejecting '{concept}'...",
+                )
+                neg_stmts = self._generate_statements(
+                    f"Write {n} short, diverse statements from the perspective of someone who "
+                    f"rejects, opposes, or is the opposite of '{concept}'. Mix first-person "
+                    f"identity statements, criticism, dismissal, and contrasting values. "
+                    "One statement per line.",
+                )
+
+            count = min(len(pos_stmts), len(neg_stmts))
+            if count < 2:
+                self._restore_vectors(saved_vectors)
+                self.call_from_thread(
+                    self._smartsteer_status,
+                    f"Could only generate {count} pairs (need >= 2). Try a more specific concept.",
+                )
+                return
+
+            pairs = [
+                {"positive": p, "negative": n_}
+                for p, n_ in zip(pos_stmts[:count], neg_stmts[:count])
+            ]
+
+            # Extract CAA vector
             self.call_from_thread(
-                self._smartsteer_status,
-                f"Generating statements embodying '{concept}'...",
+                self._smartsteer_status, f"Extracting CAA vector ({count} pairs)...",
             )
-            pos_stmts = self._generate_statements(
-                f"Write {n} short, diverse statements from the perspective of someone who "
-                f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
-                f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
-                f"value statements ('the best thing about {concept} is...'). "
-                "One statement per line.",
-            )
-            self.call_from_thread(
-                self._smartsteer_status,
-                f"Generating statements embodying '{baseline}'...",
-            )
-            neg_stmts = self._generate_statements(
-                f"Write {n} short, diverse statements from the perspective of someone who "
-                f"deeply identifies with or embodies '{baseline}'. Mix first-person identity "
-                f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
-                f"value statements ('the best thing about {baseline} is...'). "
-                "One statement per line.",
-            )
-        else:
-            # One-prompt mode: embody vs reject the concept
-            self.call_from_thread(
-                self._smartsteer_status,
-                f"Generating statements embodying '{concept}'...",
-            )
-            pos_stmts = self._generate_statements(
-                f"Write {n} short, diverse statements from the perspective of someone who "
-                f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
-                f"statements ('I am...', 'As a...'), enthusiasm ('I love...'), advocacy "
-                f"('everyone should...'), and lived experience. "
-                "One statement per line.",
-            )
-            self.call_from_thread(
-                self._smartsteer_status,
-                f"Generating statements rejecting '{concept}'...",
-            )
-            neg_stmts = self._generate_statements(
-                f"Write {n} short, diverse statements from the perspective of someone who "
-                f"rejects, opposes, or is the opposite of '{concept}'. Mix first-person "
-                f"identity statements, criticism, dismissal, and contrasting values. "
-                "One statement per line.",
+            vec = extract_caa(
+                self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
             )
 
-        count = min(len(pos_stmts), len(neg_stmts))
-        if count < 2:
-            self.call_from_thread(
-                self._smartsteer_status,
-                f"Could only generate {count} pairs (need >= 2). Try a more specific concept.",
-            )
-            return
+            # Cache to disk
+            save_vector(vec, cache_path, {
+                "concept": concept,
+                "baseline": baseline,
+                "layer_idx": layer_idx,
+                "method": "smartsteer",
+                "n_pairs": count,
+            })
 
-        pairs = [
-            {"positive": p, "negative": n_}
-            for p, n_ in zip(pos_stmts[:count], neg_stmts[:count])
-        ]
+            self._restore_and_add(saved_vectors, name, vec, alpha, layer_idx)
+            self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+        except Exception:
+            self._restore_vectors(saved_vectors)
+            raise
 
-        # Extract CAA vector
-        self.call_from_thread(
-            self._smartsteer_status, f"Extracting CAA vector ({count} pairs)...",
+    def _restore_vectors(self, saved_vectors: list[dict]) -> None:
+        for v in saved_vectors:
+            self._steering.add_vector(v["name"], v["vector"], v["alpha"], v["layer_idx"])
+            if not v.get("enabled", True):
+                self._steering.toggle_vector(v["name"])
+        self._steering.apply_to_model(
+            self._layers, self._device, self._dtype,
+            orthogonalize=self._orthogonalize,
         )
-        vec = extract_caa(
-            self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
-        )
 
-        # Cache to disk
-        save_vector(vec, cache_path, {
-            "concept": concept,
-            "baseline": baseline,
-            "layer_idx": layer_idx,
-            "method": "smartsteer",
-            "n_pairs": count,
-        })
-
+    def _restore_and_add(
+        self, saved_vectors: list[dict],
+        name: str, vec, alpha: float, layer_idx: int,
+    ) -> None:
+        for v in saved_vectors:
+            self._steering.add_vector(v["name"], v["vector"], v["alpha"], v["layer_idx"])
+            if not v.get("enabled", True):
+                self._steering.toggle_vector(v["name"])
         self._steering.add_vector(name, vec, alpha, layer_idx)
         self._steering.apply_to_model(
             self._layers, self._device, self._dtype,
             orthogonalize=self._orthogonalize,
         )
-        self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
 
     def _refresh_left_panel(self) -> None:
         lp = self.query_one("#left-panel", LeftPanel)
@@ -840,19 +857,6 @@ class SteerApp(App):
             )
             self._refresh_left_panel()
 
-    def _adjust_layer(self, delta: int) -> None:
-        if self._ab_in_progress:
-            return
-        lp = self.query_one("#left-panel", LeftPanel)
-        sel = lp.get_selected()
-        if sel:
-            new_layer = max(0, min(len(self._layers) - 1, sel["layer_idx"] + delta))
-            self._steering.set_layer(sel["name"], new_layer)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
-            self._refresh_left_panel()
 
     def action_toggle_ortho(self) -> None:
         if self._ab_in_progress:

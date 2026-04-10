@@ -105,6 +105,8 @@ def generate_steered(
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
     topk_k = min(max(1000, _vocab // 32), _vocab)
+    seq_len = input_ids.shape[1]
+    attn_mask_buf = torch.ones(1, seq_len + config.max_new_tokens, device=device, dtype=torch.long)
 
     try:
         with torch.inference_mode():
@@ -114,6 +116,7 @@ def generate_steered(
 
                 outputs = model(
                     input_ids=current_input,
+                    attention_mask=attn_mask_buf[:, :seq_len],
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
@@ -135,6 +138,7 @@ def generate_steered(
                     token_id = next_token.item()
                     generated_ids.append(token_id)
                     current_input = next_token
+                    seq_len += 1
                     if on_token:
                         on_token(tokenizer.decode([token_id], skip_special_tokens=True))
                     if token_id in eos_ids:
@@ -159,6 +163,7 @@ def generate_steered(
                 token_id = next_token.item()
                 generated_ids.append(token_id)
                 current_input = next_token
+                seq_len += 1
 
                 if on_token:
                     token_str = tokenizer.decode([token_id], skip_special_tokens=True)
