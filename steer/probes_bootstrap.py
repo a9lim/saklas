@@ -44,9 +44,8 @@ def bootstrap_probes(
     for cat in categories:
         cat_probes = defaults.get(cat, {})
         for probe_name, probe_cfg in cat_probes.items():
-            layer = probe_cfg.get("layer", probe_layer)
             method = probe_cfg.get("method", "actadd")
-            cp = get_cache_path(cache_dir, model_id, probe_name, layer, method)
+            cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer, method)
             try:
                 vec, _meta = load_vector(cp)
                 probes[probe_name] = vec

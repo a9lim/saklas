@@ -20,7 +20,7 @@ class GenerationConfig:
     def __init__(
         self,
         max_new_tokens: int = 512,
-        temperature: float = 0.7,
+        temperature: float = 1.0,
         top_p: float = 0.9,
         system_prompt: str | None = None,
     ):
@@ -102,6 +102,8 @@ def generate_steered(
     past_key_values = None
     current_input = input_ids
     generated_ids: list[int] = []
+    _vocab = model.config.vocab_size
+    topk_k = min(max(1000, _vocab // 32), _vocab)
 
     try:
         with torch.inference_mode():
@@ -139,17 +141,16 @@ def generate_steered(
                     continue
 
                 # Top-p (nucleus) sampling — use topk to avoid sorting full vocab
-                k = min(max(1000, logits.shape[-1] // 32), logits.shape[-1])
-                top_logits, top_idx = logits.topk(k, dim=-1, sorted=True)
+                top_logits, top_idx = logits.topk(topk_k, dim=-1, sorted=True)
                 probs = top_logits.softmax(dim=-1)
                 cumprobs = probs.cumsum(dim=-1)
                 mask = (cumprobs - probs) >= config.top_p
                 probs[mask] = 0.0
-                total = probs.sum(dim=-1, keepdim=True)
-                if total.item() == 0.0:
-                    probs[0, 0] = 1.0  # fallback to highest-prob token
-                    total = probs.sum(dim=-1, keepdim=True)
-                probs.div_(total)
+                # Ensure top token (idx 0, sorted desc) has nonzero prob.
+                # Avoids GPU->CPU sync; negligible when other probs are
+                # nonzero, acts as fallback when top-p masks everything.
+                probs[0, 0] = probs[0, 0].clamp(min=1e-8)
+                probs.div_(probs.sum(dim=-1, keepdim=True))
 
                 token_idx = torch.multinomial(probs, 1)
                 next_token = top_idx.gather(-1, token_idx)

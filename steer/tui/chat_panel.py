@@ -9,6 +9,14 @@ from textual.widget import Widget
 from textual.message import Message
 
 
+class _AssistantMessage(Static):
+    """Static widget for assistant messages with tracked text content."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.chat_text: str = ""
+
+
 class ChatPanel(Widget):
 
     class UserSubmitted(Message):
@@ -34,16 +42,17 @@ class ChatPanel(Widget):
         log.mount(Static(f"[bold cyan]User:[/] {text}", classes="user-message"))
         log.scroll_end(animate=False)
 
-    def start_assistant_message(self) -> Static:
+    def start_assistant_message(self) -> _AssistantMessage:
         log = self.query_one("#chat-log", VerticalScroll)
-        widget = Static("[bold green]Assistant:[/] ", classes="assistant-message")
-        widget._chat_text = "[bold green]Assistant:[/] "
+        widget = _AssistantMessage(classes="assistant-message")
+        widget.chat_text = "[bold green]Assistant:[/] "
+        widget.update(widget.chat_text)
         log.mount(widget)
         return widget
 
-    def append_to_assistant(self, widget: Static, token: str) -> None:
-        widget._chat_text += token
-        widget.update(widget._chat_text)
+    def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
+        widget.chat_text += token
+        widget.update(widget.chat_text)
         log = self.query_one("#chat-log", VerticalScroll)
         log.scroll_end(animate=False)
 

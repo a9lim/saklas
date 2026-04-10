@@ -7,46 +7,19 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-# Probe categories and their default members
-PROBE_CATEGORIES: dict[str, list[str]] = {
-    "Emotion": [
-        "happy", "sad", "angry", "fearful", "surprised",
-        "disgusted", "calm", "excited",
-    ],
-    "Personality": [
-        "sycophantic", "honest", "creative", "formal", "casual",
-        "verbose", "concise", "authoritative", "uncertain", "confident",
-    ],
-    "Safety": [
-        "refusal", "compliance", "deceptive", "hallucinating",
-    ],
-    "Cultural": [
-        "western-individualist", "eastern-collectivist",
-        "formal-hierarchical", "casual-egalitarian",
-        "direct-communication", "indirect-communication",
-        "high-context", "low-context",
-        "religious", "secular",
-        "traditional", "progressive",
-    ],
-    "Gender": [
-        "masculine-coded", "feminine-coded",
-        "agentic", "communal",
-        "paternal", "maternal",
-    ],
-}
-
 DEFAULT_COLLAPSED = {"Cultural", "Gender", "Safety"}
 
 
 class TraitPanel(Widget):
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, categories: dict[str, list[str]] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
+        self._categories: dict[str, list[str]] = categories or {}
         self._collapsed: set[str] = set(DEFAULT_COLLAPSED)
         self._current_values: dict[str, float] = {}
         self._previous_values: dict[str, float] = {}
         self._sparklines: dict[str, str] = {}
-        self._histories: dict[str, list[float]] = {}
+        self._probe_stats: dict[str, dict] = {}
         self._selected_probe: str | None = None
         self._active_probes: set[str] = set()
         self._sort_mode: str = "name"
@@ -70,13 +43,13 @@ class TraitPanel(Widget):
         current: dict[str, float],
         previous: dict[str, float],
         sparklines: dict[str, str],
-        histories: dict[str, list[float]] | None = None,
+        stats: dict[str, dict] | None = None,
     ) -> None:
         self._current_values = current
         self._previous_values = previous
         self._sparklines = sparklines
-        if histories is not None:
-            self._histories = histories
+        if stats is not None:
+            self._probe_stats = stats
         self._render_probes()
 
     def toggle_category(self, category: str) -> None:
@@ -133,7 +106,7 @@ class TraitPanel(Widget):
         lines: list[str] = []
 
         nav_idx_counter = 0
-        for category, members in PROBE_CATEGORIES.items():
+        for category, members in self._categories.items():
             active_members = [m for m in members if m in self._active_probes]
             if not active_members:
                 continue
@@ -195,8 +168,8 @@ class TraitPanel(Widget):
 
                 is_detail_probe = name == self._selected_probe
                 if is_detail_probe:
-                    hist = self._histories.get(name, [])
-                    stats_line = self._compute_stats_line(hist)
+                    stats = self._probe_stats.get(name, {})
+                    stats_line = self._compute_stats_line(stats)
                     lines.append(f"{line}\n  [dim]{stats_line}[/]")
                 else:
                     lines.append(line)
@@ -204,17 +177,17 @@ class TraitPanel(Widget):
         content = self.query_one("#trait-content", Static)
         content.update("\n".join(lines))
 
-    def _compute_stats_line(self, hist: list[float]) -> str:
-        if not hist:
+    def _compute_stats_line(self, stats: dict) -> str:
+        n = stats.get("count", 0)
+        if n == 0:
             return "no data"
-        n = len(hist)
-        mean = sum(hist) / n
-        lo = min(hist)
-        hi = max(hist)
+        mean = stats["sum"] / n
+        lo = stats["min"]
+        hi = stats["max"]
         if n > 1:
-            variance = sum((x - mean) ** 2 for x in hist) / n
+            variance = max(0.0, stats["sum_sq"] / n - mean ** 2)
             std = variance ** 0.5
-            delta_per_tok = (hist[-1] - hist[0]) / (n - 1)
+            delta_per_tok = (stats["last"] - stats["first"]) / (n - 1)
         else:
             std = 0.0
             delta_per_tok = 0.0

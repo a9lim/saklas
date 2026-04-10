@@ -23,7 +23,7 @@ class LeftPanel(Widget):
         self._vectors: list[dict] = []
         self._selected_idx: int = 0
         self._orthogonalize: bool = False
-        self._temperature: float = 0.7
+        self._temperature: float = 1.0
         self._top_p: float = 0.9
         self._max_tokens: int = 512
         self._system_prompt: str | None = None

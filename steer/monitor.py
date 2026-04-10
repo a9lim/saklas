@@ -5,6 +5,12 @@ import torch.nn as nn
 class TraitMonitor:
     """Monitors model activations against a library of probe vectors."""
 
+    @staticmethod
+    def _empty_stats() -> dict:
+        return {"count": 0, "sum": 0.0, "sum_sq": 0.0,
+                "min": float("inf"), "max": float("-inf"),
+                "first": 0.0, "last": 0.0}
+
     def __init__(self, probe_dict: dict[str, torch.Tensor], monitor_layer_idx: int):
         """
         probe_dict: maps probe name -> unit vector (hidden_dim,)
@@ -18,6 +24,7 @@ class TraitMonitor:
         self._gpu_buffer: torch.Tensor | None = None
         self._buf_idx: int = 0
         self.history: dict[str, list[float]] = {n: [] for n in self.probe_names}
+        self._stats: dict[str, dict] = {n: self._empty_stats() for n in self.probe_names}
 
     def attach(self, model_layers: nn.ModuleList, device, dtype, max_tokens=2048):
         """Pre-stack probes into matrix, pre-allocate GPU buffer, register hook."""
@@ -44,14 +51,37 @@ class TraitMonitor:
             self._buf_idx += 1
         return None  # read-only hook
 
+    def has_pending_data(self) -> bool:
+        """True if the GPU buffer has unflushed data."""
+        return self._buf_idx > 0
+
     def flush_to_cpu(self):
         """Batch-transfer GPU buffer to CPU history. Call from TUI poll, not per token."""
         if self._buf_idx == 0:
             return
+        was_full = self._buf_idx >= self._gpu_buffer.shape[0]
         cpu_data = self._gpu_buffer[:self._buf_idx].float().cpu().numpy()
         for i, name in enumerate(self.probe_names):
-            self.history[name].extend(cpu_data[:, i].tolist())
+            col = cpu_data[:, i]
+            self.history[name].extend(col.tolist())
+            s = self._stats[name]
+            if s["count"] == 0:
+                s["first"] = float(col[0])
+            s["count"] += len(col)
+            s["sum"] += float(col.sum())
+            s["sum_sq"] += float((col ** 2).sum())
+            col_min, col_max = float(col.min()), float(col.max())
+            if col_min < s["min"]:
+                s["min"] = col_min
+            if col_max > s["max"]:
+                s["max"] = col_max
+            s["last"] = float(col[-1])
         self._buf_idx = 0
+        if was_full:
+            self._gpu_buffer = torch.zeros(
+                self._gpu_buffer.shape[0] * 2, self._gpu_buffer.shape[1],
+                device=self._gpu_buffer.device, dtype=self._gpu_buffer.dtype,
+            )
 
     def get_current(self) -> dict[str, float]:
         """Latest similarity for each probe. Caller must flush_to_cpu() first."""
@@ -71,6 +101,10 @@ class TraitMonitor:
                 result[name] = 0.0
         return result
 
+    def get_stats(self, name: str) -> dict:
+        """Return pre-computed running stats for a probe."""
+        return self._stats.get(name, self._empty_stats())
+
     def get_sparkline(self, name: str, width: int = 64) -> str:
         """Unicode sparkline of recent history. Caller must flush_to_cpu() first."""
         blocks = " ▁▂▃▄▅▆▇█"
@@ -88,6 +122,7 @@ class TraitMonitor:
         if name not in self.probe_names:
             self.probe_names.append(name)
             self.history[name] = []
+            self._stats[name] = self._empty_stats()
         if self._handle is not None and device is not None:
             self.flush_to_cpu()
             # Rebuild probe matrix
@@ -109,6 +144,8 @@ class TraitMonitor:
             self.probe_names.remove(name)
         if name in self.history:
             del self.history[name]
+        if name in self._stats:
+            del self._stats[name]
         if self._handle is not None and device is not None and self.probe_names:
             self.flush_to_cpu()
             vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
@@ -126,6 +163,7 @@ class TraitMonitor:
         self.flush_to_cpu()
         for name in self.probe_names:
             self.history[name] = []
+            self._stats[name] = self._empty_stats()
         self._buf_idx = 0
 
     def detach(self):

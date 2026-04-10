@@ -100,12 +100,7 @@ class SteeringManager:
                 v["alpha"] = alpha
                 return
 
-    def set_layer(
-        self,
-        name: str,
-        layer_idx: int,
-        model_layers: torch.nn.ModuleList,
-    ) -> None:
+    def set_layer(self, name: str, layer_idx: int) -> None:
         for v in self.vectors:
             if v["name"] == name:
                 v["layer_idx"] = layer_idx

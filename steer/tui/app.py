@@ -16,6 +16,7 @@ from steer.generation import GenerationConfig, GenerationState, build_chat_input
 from steer.hooks import SteeringManager
 from steer.model import _get_memory_gb
 from steer.monitor import TraitMonitor
+from steer.probes_bootstrap import _load_defaults
 from steer.tui.chat_panel import ChatPanel
 from steer.tui.vector_panel import LeftPanel
 from steer.tui.trait_panel import TraitPanel
@@ -85,6 +86,7 @@ class SteerApp(App):
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
         self._last_prompt: str | None = None
+        self._ab_in_progress: bool = False
 
         self._focused_panel_idx: int = 1  # Start with chat focused
 
@@ -93,12 +95,20 @@ class SteerApp(App):
         self._prompt_token_count: int = 0
         self._last_tok_per_sec: float = 0.0
         self._last_elapsed: float = 0.0
+        self._cached_vram_gb: float = 0.0
+        self._vram_poll_counter: int = 0
+
+        defaults = _load_defaults()
+        self._probe_categories: dict[str, list[str]] = {
+            cat.capitalize(): list(probes_dict.keys())
+            for cat, probes_dict in defaults.items()
+        }
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-area"):
             yield LeftPanel(self._model_info, id="left-panel")
             yield ChatPanel(id="chat-panel")
-            yield TraitPanel(id="trait-panel")
+            yield TraitPanel(categories=self._probe_categories, id="trait-panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -216,12 +226,10 @@ class SteerApp(App):
             tp.nav_up()
 
     def action_nav_left(self) -> None:
-        if PANELS[self._focused_panel_idx] == "left-panel":
-            self._adjust_alpha(-0.1)
+        self._adjust_alpha(-0.1)
 
     def action_nav_right(self) -> None:
-        if PANELS[self._focused_panel_idx] == "left-panel":
-            self._adjust_alpha(0.1)
+        self._adjust_alpha(0.1)
 
     def action_nav_enter(self) -> None:
         panel = PANELS[self._focused_panel_idx]
@@ -309,7 +317,7 @@ class SteerApp(App):
             chat.add_system_message(
                 "Commands: /steer <concept> <baseline> [alpha] [layer], /clear, /sys [prompt], "
                 "/temp [val], /top-p [val], /max [n], /probes, /help\n"
-                "Keys: Tab focus · j/k nav · ←/→ alpha · S-↑/↓ layer · Enter toggle\n"
+                "Keys: Tab focus · h/l alpha · j/k layer · ↑/↓ nav · Enter toggle\n"
                 "Ctrl+N add · Ctrl+D rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
                 "[ ] temp · { } top-p · Ctrl+S sort · Esc stop · Ctrl+Q quit"
             )
@@ -319,6 +327,10 @@ class SteerApp(App):
     # -- Vector Management --
 
     def _add_vector_from_text(self, text: str) -> None:
+        if self._ab_in_progress:
+            chat = self.query_one("#chat-panel", ChatPanel)
+            chat.add_system_message("Cannot modify vectors during A/B comparison.")
+            return
         chat = self.query_one("#chat-panel", ChatPanel)
         parts = text.split()
         concept = parts[0]
@@ -383,6 +395,7 @@ class SteerApp(App):
         self._last_tok_per_sec = 0.0
         self._last_elapsed = 0.0
         self._gen_start_time = time.monotonic()
+        self._vram_poll_counter = 0
 
         chat = self.query_one("#chat-panel", ChatPanel)
         self._current_assistant_widget = chat.start_assistant_message()
@@ -441,7 +454,15 @@ class SteerApp(App):
             self._last_tok_per_sec = tok_per_sec
             self._last_elapsed = elapsed
 
-        vram_gb = _get_memory_gb(self._device_str)
+        # Throttle VRAM polling: every ~1s during generation, once when idle
+        if generating:
+            self._vram_poll_counter += 1
+            if self._vram_poll_counter >= 15:
+                self._cached_vram_gb = _get_memory_gb(self._device_str)
+                self._vram_poll_counter = 0
+        elif self._vram_poll_counter != -1:
+            self._cached_vram_gb = _get_memory_gb(self._device_str)
+            self._vram_poll_counter = -1
 
         chat.update_status(
             generating=generating,
@@ -450,20 +471,22 @@ class SteerApp(App):
             tok_per_sec=self._last_tok_per_sec,
             elapsed=self._last_elapsed,
             prompt_tokens=self._prompt_token_count,
-            vram_gb=vram_gb,
+            vram_gb=self._cached_vram_gb,
         )
 
-        if self._monitor:
+        if self._monitor and self._monitor.has_pending_data():
             self._monitor.flush_to_cpu()
             current = self._monitor.get_current()
             previous = self._monitor.get_previous()
             if any(self._monitor.history[n] for n in self._monitor.probe_names):
                 sparklines = {name: self._monitor.get_sparkline(name, width=64)
                               for name in self._monitor.probe_names}
+                stats = {name: self._monitor.get_stats(name)
+                         for name in self._monitor.probe_names}
                 trait_panel = self.query_one("#trait-panel", TraitPanel)
                 trait_panel.update_values(
                     current, previous, sparklines,
-                    histories=self._monitor.history,
+                    stats=stats,
                 )
 
     # -- Actions --
@@ -475,6 +498,8 @@ class SteerApp(App):
         )
 
     def action_remove_vector(self) -> None:
+        if self._ab_in_progress:
+            return
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
@@ -486,6 +511,8 @@ class SteerApp(App):
             self._refresh_left_panel()
 
     def action_toggle_vector(self) -> None:
+        if self._ab_in_progress:
+            return
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
@@ -497,6 +524,8 @@ class SteerApp(App):
             self._refresh_left_panel()
 
     def _adjust_alpha(self, delta: float) -> None:
+        if self._ab_in_progress:
+            return
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
@@ -509,11 +538,13 @@ class SteerApp(App):
             self._refresh_left_panel()
 
     def _adjust_layer(self, delta: int) -> None:
+        if self._ab_in_progress:
+            return
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
             new_layer = max(0, min(len(self._layers) - 1, sel["layer_idx"] + delta))
-            self._steering.set_layer(sel["name"], new_layer, self._layers)
+            self._steering.set_layer(sel["name"], new_layer)
             self._steering.apply_to_model(
                 self._layers, self._device, self._dtype,
                 orthogonalize=self._orthogonalize,
@@ -521,6 +552,8 @@ class SteerApp(App):
             self._refresh_left_panel()
 
     def action_toggle_ortho(self) -> None:
+        if self._ab_in_progress:
+            return
         self._orthogonalize = not self._orthogonalize
         self._steering.apply_to_model(
             self._layers, self._device, self._dtype,
@@ -547,7 +580,7 @@ class SteerApp(App):
     def action_regenerate(self) -> None:
         if not self._messages:
             return
-        if self._messages and self._messages[-1]["role"] == "assistant":
+        if self._messages[-1]["role"] == "assistant":
             self._messages.pop()
         self._start_generation()
 
@@ -559,38 +592,44 @@ class SteerApp(App):
         if not self._last_prompt:
             chat.add_system_message("No previous prompt to compare.")
             return
+        self._ab_in_progress = True
         chat.add_system_message("A/B comparison: generating unsteered response...")
 
         def _ab_generate():
-            msgs = [{"role": "user", "content": self._last_prompt}]
-            input_ids = build_chat_input(
-                self._tokenizer, msgs, self._gen_config.system_prompt,
-            ).to(self._device)
+            try:
+                msgs = [{"role": "user", "content": self._last_prompt}]
+                input_ids = build_chat_input(
+                    self._tokenizer, msgs, self._gen_config.system_prompt,
+                ).to(self._device)
 
-            saved_vectors = self._steering.get_active_vectors()
-            self._steering.clear_all()
+                saved_vectors = self._steering.get_active_vectors()
+                self._steering.clear_all()
 
-            ab_state = GenerationState()
-            generated = generate_steered(
-                self._model, self._tokenizer, input_ids,
-                self._gen_config, ab_state,
-            )
-            unsteered = self._tokenizer.decode(generated, skip_special_tokens=True)
+                ab_state = GenerationState()
+                generated = generate_steered(
+                    self._model, self._tokenizer, input_ids,
+                    self._gen_config, ab_state,
+                )
+                unsteered = self._tokenizer.decode(generated, skip_special_tokens=True)
 
-            for v in saved_vectors:
-                self._steering.add_vector(v["name"], v["vector"], v["alpha"], v["layer_idx"])
-                if not v.get("enabled", True):
-                    self._steering.toggle_vector(v["name"])
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
+                for v in saved_vectors:
+                    self._steering.add_vector(v["name"], v["vector"], v["alpha"], v["layer_idx"])
+                    if not v.get("enabled", True):
+                        self._steering.toggle_vector(v["name"])
+                self._steering.apply_to_model(
+                    self._layers, self._device, self._dtype,
+                    orthogonalize=self._orthogonalize,
+                )
 
-            self.call_from_thread(self._show_ab_result, unsteered)
+                self.call_from_thread(self._show_ab_result, unsteered)
+            except Exception:
+                self._ab_in_progress = False
+                raise
 
         self.run_worker(_ab_generate, thread=True)
 
     def _show_ab_result(self, unsteered: str) -> None:
+        self._ab_in_progress = False
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.add_system_message(f"[Unsteered]: {unsteered}")
 
