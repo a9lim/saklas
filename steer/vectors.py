@@ -71,35 +71,6 @@ def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
     return h.float().mean(dim=1).squeeze(0)  # (dim,)
 
 
-def extract_actadd(
-    model,
-    tokenizer,
-    concept: str,
-    layer_idx: int,
-    baseline: str = "",
-    layers=None,
-    device=None,
-) -> torch.Tensor:
-    """Single-concept ActAdd extraction (Turner et al., 2023).
-
-    Tokenizes concept and baseline **separately** (no batching) to avoid
-    degenerate attention from fully-masked padding when the baseline is
-    shorter.  Each text gets its own forward pass.
-    """
-    if device is None:
-        device = next(model.parameters()).device
-
-    pos_mean = _encode_and_capture(model, tokenizer, concept, layer_idx, layers, device)
-    neg_mean = _encode_and_capture(model, tokenizer, baseline, layer_idx, layers, device)
-
-    diff = pos_mean - neg_mean  # (dim,)
-
-    # Scale to 10% of the mean hidden-state norm.
-    ref_norm = (pos_mean.norm().item() + neg_mean.norm().item()) / 2 * 0.1
-
-    return _normalize(diff, ref_norm=ref_norm)
-
-
 def extract_caa(
     model,
     tokenizer,

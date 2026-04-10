@@ -47,29 +47,33 @@ def middle_layer(num_layers):
     return num_layers // 2
 
 
+def _caa_single(model, tokenizer, concept, layer_idx):
+    """Extract a steering vector for a single concept via CAA with one pair."""
+    from steer.vectors import extract_caa
+    return extract_caa(model, tokenizer, [{"positive": concept, "negative": ""}], layer_idx)
+
+
 @pytest.fixture(scope="module")
 def happy_vector(model_and_tokenizer, middle_layer):
-    from steer.vectors import extract_actadd
     model, tokenizer = model_and_tokenizer
-    return extract_actadd(model, tokenizer, "happy", middle_layer)
+    return _caa_single(model, tokenizer, "happy", middle_layer)
 
 
 class TestVectorExtraction:
-    def test_actadd_returns_valid_vector(self, happy_vector, model_and_tokenizer):
+    def test_caa_returns_valid_vector(self, happy_vector, model_and_tokenizer):
         model, _ = model_and_tokenizer
         hidden_dim = model.config.hidden_size
         assert happy_vector.shape == (hidden_dim,)
         norm = happy_vector.norm().item()
         assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
 
-    def test_actadd_fast_enough(self, model_and_tokenizer, middle_layer):
-        """Single ActAdd extraction should complete in under 10 seconds."""
-        from steer.vectors import extract_actadd
+    def test_caa_fast_enough(self, model_and_tokenizer, middle_layer):
+        """Single CAA extraction should complete in under 10 seconds."""
         model, tokenizer = model_and_tokenizer
         start = time.perf_counter()
-        extract_actadd(model, tokenizer, "curious", middle_layer)
+        _caa_single(model, tokenizer, "curious", middle_layer)
         elapsed = time.perf_counter() - start
-        assert elapsed < 10.0, f"ActAdd took {elapsed:.1f}s, expected < 10s"
+        assert elapsed < 10.0, f"CAA took {elapsed:.1f}s, expected < 10s"
 
 
 class TestSteering:
@@ -155,7 +159,6 @@ class TestSaveLoad:
 
 class TestTraitMonitor:
     def test_monitor_records_history(self, model_and_tokenizer, layers, middle_layer, happy_vector):
-        from steer.vectors import extract_actadd
         from steer.hooks import SteeringManager
         from steer.monitor import TraitMonitor
         from steer.generation import GenerationConfig, GenerationState, generate_steered
@@ -165,7 +168,7 @@ class TestTraitMonitor:
         dtype = next(model.parameters()).dtype
         num_layers = len(layers)
 
-        sad_vector = extract_actadd(model, tokenizer, "sad", num_layers - 2)
+        sad_vector = _caa_single(model, tokenizer, "sad", num_layers - 2)
 
         probes = {"happy": happy_vector, "sad": sad_vector}
         monitor = TraitMonitor(probes, num_layers - 2)
@@ -209,7 +212,6 @@ class TestTraitMonitor:
 
     def test_throughput_regression(self, model_and_tokenizer, layers, middle_layer, happy_vector):
         """Steered generation should be at least 85% of vanilla throughput."""
-        from steer.vectors import extract_actadd
         from steer.hooks import SteeringManager
         from steer.monitor import TraitMonitor
         from steer.generation import GenerationConfig, GenerationState, generate_steered
@@ -236,9 +238,9 @@ class TestTraitMonitor:
         # 3 steering vectors
         mgr = SteeringManager()
         mgr.add_vector("happy", happy_vector, 0.8, middle_layer)
-        curious_vec = extract_actadd(model, tokenizer, "curious", middle_layer)
+        curious_vec = _caa_single(model, tokenizer, "curious", middle_layer)
         mgr.add_vector("curious", curious_vec, 0.5, middle_layer)
-        concise_vec = extract_actadd(model, tokenizer, "concise", middle_layer)
+        concise_vec = _caa_single(model, tokenizer, "concise", middle_layer)
         mgr.add_vector("concise", concise_vec, 0.3, middle_layer + 2)
         mgr.apply_to_model(layers, device, dtype)
 

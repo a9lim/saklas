@@ -2,7 +2,7 @@
 
 ## What this is
 
-`steer` is a local activation steering + trait monitoring TUI for HuggingFace causal LMs. Extracts steering vectors (ActAdd/CAA), injects them via forward hooks during generation, monitors activations against probe vectors in real time. Textual-based three-column TUI.
+`steer` is a local activation steering + trait monitoring TUI for HuggingFace causal LMs. Extracts steering vectors (CAA), injects them via forward hooks during generation, monitors activations against probe vectors in real time. Textual-based three-column TUI.
 
 ## Commands
 
@@ -22,7 +22,7 @@ Three layers: **model/vector**, **steering/monitoring**, **TUI**.
 
 ### Model + Vector layer
 - `model.py` — Loads HF causal LMs. `_LAYER_ACCESSORS` maps `model_type` to layer-list accessor lambdas; add new architectures here. `_text_config()` resolves `hidden_size` through multimodal `text_config` wrappers.
-- `vectors.py` — Separate forward passes per prompt (no batching — multimodal models produce corrupted hidden states with padded batches). Shared `_encode_and_capture` helper handles tokenization, BOS fallback, forward pass, and mean-pooling. `extract_actadd`: two passes. `extract_caa`: 2N passes for N contrastive pairs, averaged. Hook-based hidden state capture via `_capture_hidden_states_single`. Both accept optional `device` param to avoid `next(model.parameters()).device` overhead. Vectors saved as `.safetensors` + `.json` sidecar. Cache filenames are sanitized (`re.sub` on unsafe chars).
+- `vectors.py` — Separate forward passes per prompt (no batching — multimodal models produce corrupted hidden states with padded batches). Shared `_encode_and_capture` helper handles tokenization, BOS fallback, forward pass, and mean-pooling. `extract_caa`: 2N passes for N contrastive pairs, averaged. Hook-based hidden state capture via `_capture_hidden_states_single`. Accepts optional `device` param to avoid `next(model.parameters()).device` overhead. Vectors saved as `.safetensors` + `.json` sidecar. Cache filenames are sanitized (`re.sub` on unsafe chars).
 - `probes_bootstrap.py` — Loads/extracts probe vectors per `steer/probes/defaults.json`, cached under `steer/probes/cache/{model_name}/`. `defaults.json` maps category name to list of probe names; dataset file is `{probe_name}.json`. Categories: emotion (8), personality (7), safety (4), cultural (6), gender (3) — 28 probes total. Clear `steer/probes/cache/` to force re-extraction.
 
 ### Steering + Monitoring layer
@@ -63,4 +63,4 @@ These matter for the throughput regression test (steered >= 85% of vanilla tok/s
 
 ## Testing
 
-Smoke tests require CUDA and download `google/gemma-2-2b-it` on first run. Coverage: vector extraction (ActAdd + CAA), steering effect, hook cleanup (verifies unsteered baseline match), save/load roundtrip, monitor history, throughput regression, `build_chat_input`, `bootstrap_probes` cache path.
+Smoke tests require CUDA and download `google/gemma-2-2b-it` on first run. Coverage: vector extraction (CAA), steering effect, hook cleanup (verifies unsteered baseline match), save/load roundtrip, monitor history, throughput regression, `build_chat_input`, `bootstrap_probes` cache path.
