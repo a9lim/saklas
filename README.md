@@ -46,7 +46,7 @@ steer meta-llama/Llama-3.1-8B-Instruct --device cuda --probes emotion personalit
 | `-q`, `--quantize` | `4bit` or `8bit` (CUDA only, via bitsandbytes) |
 | `--device` | `auto` (default), `cuda`, `mps`, or `cpu` |
 | `--no-compile` | Skip torch.compile |
-| `--probes` | Probe categories to load: `emotion` `personality` `safety` `cultural` `gender` (default: emotion personality) |
+| `--probes` | Probe categories to load: `emotion` `personality` `safety` `cultural` `gender` (default: all) |
 | `-s`, `--system-prompt` | System prompt for chat |
 | `--max-tokens` | Max tokens per generation (default: 512) |
 | `--cache-dir` | Cache directory for extracted vectors |
@@ -56,21 +56,17 @@ steer meta-llama/Llama-3.1-8B-Instruct --device cuda --probes emotion personalit
 ### Layout
 
 ```
-┌─────────────────────────────────┬──────────────────────┐
-│                                 │  STEERING VECTORS    │
-│          Chat                   │  > happy   a=+1.0 L13│
-│                                 │    concise a=+0.5 L18│
-│                                 ├──────────────────────┤
-│                                 │  CONTROLS            │
-│                                 │  Alpha ████░░░ +1.0  │
-│                                 │  Layer 13 / 26       │
-│                                 ├──────────────────────┤
-│                                 │  TRAIT MONITOR        │
-│                                 │  ▸ Emotion            │
-│                                 │    happy  ████████ +0.42│
-│                                 │    sad    ██░░░░░░ -0.15│
-│  Type a message...              │  ▾ Personality (10)  │
-└─────────────────────────────────┴──────────────────────┘
+┌──────────────────┬──────────────────────────────────┬──────────────────┐
+│  VECTORS         │                                  │  TRAIT MONITOR   │
+│  > happy caa L21 │          Chat                    │  ▸ Emotion       │
+│    formal caa L18│                                  │    happy ████ .42│
+│                  │                                  │    sad   ██░ -.15│
+│  CONFIG          │                                  │  ▸ Personality   │
+│  temp ████░ 0.7  │                                  │    open  ███ .31 │
+│  top-p ████ 0.9  │                                  │    agree ██░ .18 │
+│                  │                                  │                  │
+│  KEYS            │  Type a message...               │                  │
+└──────────────────┴──────────────────────────────────┴──────────────────┘
 ```
 
 ### Keybindings
@@ -81,7 +77,8 @@ steer meta-llama/Llama-3.1-8B-Instruct --device cuda --probes emotion personalit
 | `Ctrl+D` | Remove selected vector |
 | `Ctrl+T` | Toggle selected vector on/off |
 | `←` / `→` | Adjust alpha (strength) |
-| `↑` / `↓` | Change injection layer |
+| `↑` / `↓` | Navigate vectors / probes (in focused panel) |
+| `Tab` / `Shift+Tab` | Cycle panel focus |
 | `O` | Toggle orthogonalization |
 | `Ctrl+A` | A/B compare (steered vs unsteered) |
 | `Ctrl+R` | Regenerate last response |
@@ -93,21 +90,25 @@ steer meta-llama/Llama-3.1-8B-Instruct --device cuda --probes emotion personalit
 
 | Command | Description |
 |---------|-------------|
-| `/steer <concept> [layer] [alpha]` | Add a steering vector (e.g. `/steer happy 18 0.8`) |
+| `/steer "concept" [layer] [alpha]` | Add a steering vector via LLM-generated contrastive pairs (e.g. `/steer "happy" 18 2.5`) |
+| `/steer "concept" - "baseline" [layer] [alpha]` | Steering with explicit baseline (e.g. `/steer "formal" - "casual"`) |
 | `/clear` | Clear chat history |
-| `/system <prompt>` | Set system prompt |
+| `/sys <prompt>` | Set system prompt |
 | `/temp <value>` | Set temperature |
+| `/top-p <value>` | Set top-p |
+| `/max <value>` | Set max tokens |
 | `/probes` | List active probes |
+| `/help` | Show available commands |
 
 ## Supported architectures
 
-Llama, Mistral, Gemma, Gemma 2, Phi, Phi-3, Qwen, Qwen2, Qwen2-MoE, GPT-NeoX.
+Llama (1-4), Mistral, Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3), Qwen2-MoE, Qwen3-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-2), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, Bloom, Falcon, MPT, DBRX, OPT, RecurrentGemma.
 
 ## Steering methods
 
-**ActAdd** (Turner et al., 2023): Extracts the difference between a concept prompt and an empty baseline at a given layer. Fast, single forward pass per concept.
+**ActAdd** (Turner et al., 2023): Extracts the difference between a concept prompt and a contrastive baseline at a given layer. Fast, single forward pass per concept.
 
-**Contrastive Activation Addition** (Rimsky et al., 2023): Averages over multiple positive/negative prompt pairs for stronger, more robust vectors. Requires a dataset JSON file with `{"pairs": [{"positive": ..., "negative": ...}]}`.
+**Contrastive Activation Addition** (Rimsky et al., 2023): Averages over multiple matched positive/negative prompt pairs for stronger, more robust vectors. The `/steer` command generates these pairs automatically using the loaded model, or falls back to curated datasets for known probe concepts.
 
 ## How the monitor works
 
