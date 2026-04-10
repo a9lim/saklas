@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import math
+
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
+
+from steer.tui.vector_panel import _build_bar
 
 
 
@@ -22,6 +26,8 @@ class TraitPanel(Widget):
         self._sort_mode: str = "name"
         self._nav_items: list[tuple[str, str]] = []
         self._nav_idx: int = 0
+        self._cached_stats_lines: dict[str, tuple[dict, str]] = {}
+        self._cached_sort: tuple[str, tuple, tuple, list] | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -31,6 +37,10 @@ class TraitPanel(Widget):
         yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
         yield Static("[dim]↑/↓ nav · Ctrl+D remove · Ctrl+S sort[/]",
                       id="trait-hints")
+
+    def on_mount(self) -> None:
+        self._trait_header = self.query_one("#trait-header", Static)
+        self._trait_content = self.query_one("#trait-content", Static)
 
     def set_active_probes(self, probe_names: set[str]) -> None:
         self._active_probes = probe_names
@@ -61,7 +71,7 @@ class TraitPanel(Widget):
         modes = ["name", "magnitude", "change"]
         idx = modes.index(self._sort_mode)
         self._sort_mode = modes[(idx + 1) % len(modes)]
-        header = self.query_one("#trait-header", Static)
+        header = self._trait_header
         header.update(
             f"[bold]TRAIT MONITOR[/] [dim]sort: {self._sort_mode[:3]} · Ctrl+S[/]"
         )
@@ -111,9 +121,9 @@ class TraitPanel(Widget):
 
                 val = self._current_values.get(name, 0.0)
                 prev = self._previous_values.get(name, 0.0)
-                if val != val:
+                if math.isnan(val):
                     val = 0.0
-                if prev != prev:
+                if math.isnan(prev):
                     prev = 0.0
                 delta = val - prev
 
@@ -124,11 +134,7 @@ class TraitPanel(Widget):
                 else:
                     arrow_ch = "↓"
 
-                bar_width = 10
-                filled = int(abs(val) * bar_width)
-                filled = min(filled, bar_width)
-                bar_full = "█" * filled
-                bar_empty = "░" * (bar_width - filled)
+                bar_full, bar_empty = _build_bar(val, 1.0, 10)
                 color = "green" if val >= 0 else "red"
 
                 spark = self._sparklines.get(name, "")
@@ -143,10 +149,15 @@ class TraitPanel(Widget):
                 )
 
                 stats = self._probe_stats.get(name, {})
-                stats_line = self._compute_stats_line(stats)
+                cached = self._cached_stats_lines.get(name)
+                if cached and cached[0] is stats:
+                    stats_line = cached[1]
+                else:
+                    stats_line = self._compute_stats_line(stats)
+                    self._cached_stats_lines[name] = (stats, stats_line)
                 lines.append(f"{line}\n  [dim]{stats_line}[/]")
 
-        content = self.query_one("#trait-content", Static)
+        content = self._trait_content
         content.update("\n".join(lines))
 
     def _compute_stats_line(self, stats: dict) -> str:
@@ -171,9 +182,22 @@ class TraitPanel(Widget):
 
     def _sort_probes(self, names: list[str]) -> list[str]:
         if self._sort_mode == "magnitude":
-            return sorted(names, key=lambda n: abs(self._current_values.get(n, 0.0)), reverse=True)
+            vals = tuple(self._current_values.get(n, 0.0) for n in names)
+            key = (self._sort_mode, tuple(names), vals)
+            if self._cached_sort and self._cached_sort[:3] == key:
+                return self._cached_sort[3]
+            result = sorted(names, key=lambda n: abs(self._current_values.get(n, 0.0)), reverse=True)
+            self._cached_sort = (*key, result)
+            return result
         elif self._sort_mode == "change":
-            return sorted(names, key=lambda n: abs(
+            vals = tuple((self._current_values.get(n, 0.0), self._previous_values.get(n, 0.0)) for n in names)
+            key = (self._sort_mode, tuple(names), vals)
+            if self._cached_sort and self._cached_sort[:3] == key:
+                return self._cached_sort[3]
+            result = sorted(names, key=lambda n: abs(
                 self._current_values.get(n, 0.0) - self._previous_values.get(n, 0.0)
             ), reverse=True)
+            self._cached_sort = (*key, result)
+            return result
+        self._cached_sort = None
         return sorted(names)

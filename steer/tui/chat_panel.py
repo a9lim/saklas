@@ -46,6 +46,26 @@ class ChatPanel(Widget):
         self.add_user_message(text)
         self.post_message(self.UserSubmitted(text))
 
+    def clear_log(self) -> None:
+        """Remove all messages from the chat log."""
+        self._log.remove_children()
+
+    def rewind(self) -> bool:
+        """Remove widgets back to and including the last user message. Returns True if anything was removed."""
+        children = list(self._log.children)
+        # Walk backwards to find the last user-message widget
+        cut = None
+        for i in range(len(children) - 1, -1, -1):
+            if "user-message" in children[i].classes:
+                cut = i
+                break
+        if cut is None:
+            return False
+        for child in children[cut:]:
+            child.remove()
+        self._log.scroll_end(animate=False)
+        return True
+
     def add_user_message(self, text: str) -> None:
         self._log.mount(Static(f"[bold cyan]User:[/] {text}", classes="user-message"))
         self._log.scroll_end(animate=False)

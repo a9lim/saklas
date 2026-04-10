@@ -9,6 +9,11 @@ from textual.widget import Widget
 from textual.message import Message
 
 
+def _build_bar(value: float, max_value: float, width: int) -> tuple[str, str]:
+    filled = min(int(abs(value) / max_value * width), width)
+    return "█" * filled, "░" * (width - filled)
+
+
 class LeftPanel(Widget):
     """Entire left column: model, vectors, gen config, keys."""
 
@@ -27,6 +32,11 @@ class LeftPanel(Widget):
         self._top_p: float = 0.9
         self._max_tokens: int = 512
         self._system_prompt: str | None = None
+
+    def on_mount(self) -> None:
+        self._vectors_header = self.query_one("#vectors-header", Static)
+        self._vector_content = self.query_one("#vector-content", Static)
+        self._gen_config_widget = self.query_one("#gen-config", Static)
 
     def compose(self) -> ComposeResult:
         info = self._model_info
@@ -110,7 +120,7 @@ class LeftPanel(Widget):
         active = sum(1 for v in self._vectors if v.get("enabled", True))
         total = len(self._vectors)
         ortho_str = "ON" if self._orthogonalize else "OFF"
-        header = self.query_one("#vectors-header", Static)
+        header = self._vectors_header
         header.update(
             f"[bold]VECTORS[/] [dim]{total} total, {active} active · ortho: {ortho_str}[/]"
         )
@@ -124,11 +134,7 @@ class LeftPanel(Widget):
             layer = v["layer_idx"]
             method = v.get("method", "actadd")
 
-            bar_width = 14
-            filled = int(abs(alpha) / 5.0 * bar_width)
-            filled = min(filled, bar_width)
-            bar_full = "█" * filled
-            bar_empty = "░" * (bar_width - filled)
+            bar_full, bar_empty = _build_bar(alpha, 5.0, 14)
             color = "green" if alpha >= 0 else "red"
 
             if is_selected:
@@ -163,19 +169,15 @@ class LeftPanel(Widget):
                     )
             lines.append(text)
 
-        content = self.query_one("#vector-content", Static)
+        content = self._vector_content
         content.update("\n".join(lines))
 
     def _render_gen_config(self) -> None:
-        gen = self.query_one("#gen-config", Static)
-        t_bar_w = 20
-        t_filled = int(self._temperature / 2.0 * t_bar_w)
-        t_filled = min(t_filled, t_bar_w)
-        t_bar = "█" * t_filled + "░" * (t_bar_w - t_filled)
-        p_bar_w = 20
-        p_filled = int(self._top_p * p_bar_w)
-        p_filled = min(p_filled, p_bar_w)
-        p_bar = "█" * p_filled + "░" * (p_bar_w - p_filled)
+        gen = self._gen_config_widget
+        t_full, t_empty = _build_bar(self._temperature, 2.0, 20)
+        t_bar = t_full + t_empty
+        p_full, p_empty = _build_bar(self._top_p, 1.0, 20)
+        p_bar = p_full + p_empty
 
         sys_str = self._system_prompt[:15] + "..." if self._system_prompt and len(self._system_prompt) > 15 else (self._system_prompt or "(none)")
 

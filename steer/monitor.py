@@ -1,5 +1,9 @@
+from collections import deque
+
 import torch
 import torch.nn as nn
+
+_MAX_HISTORY = 8
 
 
 class TraitMonitor:
@@ -23,7 +27,7 @@ class TraitMonitor:
         self._raw_probes = probe_dict
         self._gpu_buffer: torch.Tensor | None = None
         self._buf_idx: int = 0
-        self.history: dict[str, list[float]] = {n: [] for n in self.probe_names}
+        self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self.probe_names}
         self._stats: dict[str, dict] = {n: self._empty_stats() for n in self.probe_names}
 
     def attach(self, model_layers: nn.ModuleList, device, dtype, max_tokens=2048):
@@ -107,7 +111,7 @@ class TraitMonitor:
         """Return pre-computed running stats for a probe."""
         return self._stats.get(name, self._empty_stats())
 
-    def get_sparkline(self, name: str, width: int = 64) -> str:
+    def get_sparkline(self, name: str, width: int = _MAX_HISTORY) -> str:
         """Unicode sparkline of recent history. Caller must flush_to_cpu() first."""
         blocks = " ▁▂▃▄▅▆▇█"
         values = self.history[name][-width:]
@@ -117,25 +121,27 @@ class TraitMonitor:
         span = hi - lo if hi != lo else 1.0
         return "".join(blocks[min(8, max(0, int((v - lo) / span * 8)))] for v in values)
 
+    def _rebuild_probe_matrix(self, device, dtype):
+        """Rebuild the normalized probe matrix and resize the GPU buffer."""
+        self.flush_to_cpu()
+        vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
+        probe_matrix = torch.stack(vecs)
+        norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        self._probe_matrix_normed = probe_matrix / norms
+        self._gpu_buffer = torch.zeros(
+            self._gpu_buffer.shape[0], len(self.probe_names),
+            device=device, dtype=dtype,
+        )
+
     def add_probe(self, name: str, vector: torch.Tensor, device=None, dtype=None):
         """Add a probe dynamically. Rebuilds the probe matrix."""
         self._raw_probes[name] = vector
         if name not in self.probe_names:
             self.probe_names.append(name)
-            self.history[name] = []
+            self.history[name] = deque(maxlen=_MAX_HISTORY)
             self._stats[name] = self._empty_stats()
         if self._handle is not None and device is not None:
-            self.flush_to_cpu()
-            # Rebuild probe matrix
-            vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
-            probe_matrix = torch.stack(vecs)
-            norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            self._probe_matrix_normed = probe_matrix / norms
-            # Resize GPU buffer
-            self._gpu_buffer = torch.zeros(
-                self._gpu_buffer.shape[0], len(self.probe_names),
-                device=device, dtype=dtype,
-            )
+            self._rebuild_probe_matrix(device, dtype)
 
     def remove_probe(self, name: str, device=None, dtype=None):
         """Remove a probe. Rebuilds the probe matrix and GPU buffer."""
@@ -148,21 +154,12 @@ class TraitMonitor:
         if name in self._stats:
             del self._stats[name]
         if self._handle is not None and device is not None and self.probe_names:
-            self.flush_to_cpu()
-            vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
-            probe_matrix = torch.stack(vecs)
-            norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            self._probe_matrix_normed = probe_matrix / norms
-            # Resize GPU buffer to match new probe count
-            self._gpu_buffer = torch.zeros(
-                self._gpu_buffer.shape[0], len(self.probe_names),
-                device=device, dtype=dtype,
-            )
+            self._rebuild_probe_matrix(device, dtype)
 
     def reset_history(self):
         """Clear all history (e.g., on new generation)."""
         for name in self.probe_names:
-            self.history[name] = []
+            self.history[name] = deque(maxlen=_MAX_HISTORY)
             self._stats[name] = self._empty_stats()
         self._buf_idx = 0
 

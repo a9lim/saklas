@@ -22,7 +22,7 @@ Three layers: **model/vector**, **steering/monitoring**, **TUI**.
 
 ### Model + Vector layer
 - `model.py` — Loads HF causal LMs. `_LAYER_ACCESSORS` maps `model_type` to layer-list accessor lambdas; add new architectures here. `_text_config()` resolves `hidden_size` through multimodal `text_config` wrappers.
-- `vectors.py` — Separate forward passes per prompt (no batching — multimodal models produce corrupted hidden states with padded batches). Shared `_encode_and_capture` helper handles tokenization, BOS fallback, forward pass, and mean-pooling. `extract_actadd`: two passes. `extract_caa`: 2N passes for N contrastive pairs, averaged. Hook-based hidden state capture via `_capture_hidden_states_single`. When using `output_hidden_states` fallback, index is `layer_idx + 1` (index 0 = embedding). Vectors saved as `.safetensors` + `.json` sidecar. Cache filenames are sanitized (`re.sub` on unsafe chars).
+- `vectors.py` — Separate forward passes per prompt (no batching — multimodal models produce corrupted hidden states with padded batches). Shared `_encode_and_capture` helper handles tokenization, BOS fallback, forward pass, and mean-pooling. `extract_actadd`: two passes. `extract_caa`: 2N passes for N contrastive pairs, averaged. Hook-based hidden state capture via `_capture_hidden_states_single`. Both accept optional `device` param to avoid `next(model.parameters()).device` overhead. Vectors saved as `.safetensors` + `.json` sidecar. Cache filenames are sanitized (`re.sub` on unsafe chars).
 - `probes_bootstrap.py` — Loads/extracts probe vectors per `steer/probes/defaults.json`, cached under `steer/probes/cache/{model_name}/`. `defaults.json` maps category name to list of probe names; dataset file is `{probe_name}.json`. Categories: emotion (8), personality (8), safety (3), cultural (6), gender (3) — 28 probes total. Clear `steer/probes/cache/` to force re-extraction.
 
 ### Steering + Monitoring layer
@@ -35,7 +35,7 @@ Three layers: **model/vector**, **steering/monitoring**, **TUI**.
 ### TUI layer (Textual)
 Three-column layout: left (1fr) | center (2fr) | right (1fr).
 
-- `tui/app.py` — Orchestrates everything. Polls at ~15 FPS; trait panel only updates on `has_pending_data()`. Status bar updates gated on change (skips idle repaints). Panel focus via Tab/Shift+Tab. Commands: `/steer`, `/probe`, `/clear`, `/sys`, `/temp`, `/top-p`, `/max`, `/help`. `/steer` and `/probe` share `_extract_vector_worker` for the CAA extraction pipeline and cache. Curated dataset fallback when concept matches a probe name in `defaults.json`.
+- `tui/app.py` — Orchestrates everything. Polls at ~15 FPS; trait panel only updates on `has_pending_data()`. Status bar updates gated on change (skips idle repaints). Panel focus via Tab/Shift+Tab. Commands: `/steer`, `/probe`, `/clear`, `/rewind`, `/sys`, `/temp`, `/top-p`, `/max`, `/help`. `/steer` and `/probe` share `_extract_vector_worker` for the CAA extraction pipeline and cache. Curated dataset fallback when concept matches a probe name in `defaults.json`.
 - `tui/vector_panel.py` — Model info, vectors with inline alpha bars, generation config, keybinding reference.
 - `tui/chat_panel.py` — Message log, status bar (tok/s, elapsed, VRAM), input field.
 - `tui/trait_panel.py` — Per-probe bars + sparklines, stats row (mu, sigma, lo, hi, delta/tok), sort modes, keyboard navigation, `Ctrl+D` to remove probes.
@@ -52,7 +52,9 @@ These matter for the throughput regression test (steered >= 85% of vanilla tok/s
 - **Norm computations use `.float()`** — fp16 sum-of-squares overflows for hidden_dim >= 2048.
 - **Vectors scaled to 10% of mean hidden-state norm** at the extraction layer.
 - **Device/dtype cached** in `SteerApp.__init__`. Never call `next(model.parameters())` in handlers.
-- **Monitor hook**: branchless `last_state / norm.clamp(min=1e-8)` — no CPU sync. `flush_to_cpu()` vectorizes stats across probe dimension. TUI polls gated on `has_pending_data()`.
+- **Monitor hook**: branchless `last_state / norm.clamp(min=1e-8)` — no CPU sync. `flush_to_cpu()` vectorizes stats across probe dimension. TUI polls gated on `has_pending_data()`. History uses `deque(maxlen=8)` to cap memory (only sparkline and current/previous consume it).
+- **TUI panel caches**: Widget references cached in `on_mount()` — no `query_one()` in render/poll paths. Stats lines and sort order cached with identity/value checks. Bar rendering shared via `_build_bar()` helper.
+- **SteeringManager**: Name→index dict for O(1) lookup in `set_alpha`/`set_layer`/`toggle_vector`.
 - **`recompose`**: `torch.stack` + broadcasted multiply + `.sum()`, not Python `sum()`.
 
 ## Supported architectures

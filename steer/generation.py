@@ -11,6 +11,27 @@ import torch
 
 log = logging.getLogger(__name__)
 
+_eos_cache: tuple[int, set[int]] | None = None
+
+
+def _get_eos_ids(model, tokenizer) -> set[int]:
+    """Return cached set of all EOS token IDs for model+tokenizer."""
+    global _eos_cache
+    tok_id = id(tokenizer)
+    if _eos_cache is not None and _eos_cache[0] == tok_id:
+        return _eos_cache[1]
+    eos_ids: set[int] = set()
+    if hasattr(model, "generation_config") and model.generation_config.eos_token_id is not None:
+        eid = model.generation_config.eos_token_id
+        if isinstance(eid, int):
+            eos_ids.add(eid)
+        else:
+            eos_ids.update(eid)
+    if tokenizer.eos_token_id is not None:
+        eos_ids.add(tokenizer.eos_token_id)
+    _eos_cache = (tok_id, eos_ids)
+    return eos_ids
+
 
 class GenerationConfig:
     __slots__ = (
@@ -88,17 +109,7 @@ def generate_steered(
     """
     state.is_generating.set()
     device = input_ids.device
-    # Build set of all EOS token IDs — model.generation_config often has
-    # additional stop tokens (e.g. <turn|> for Gemma chat models).
-    eos_ids: set[int] = set()
-    if hasattr(model, "generation_config") and model.generation_config.eos_token_id is not None:
-        eid = model.generation_config.eos_token_id
-        if isinstance(eid, int):
-            eos_ids.add(eid)
-        else:
-            eos_ids.update(eid)
-    if tokenizer.eos_token_id is not None:
-        eos_ids.add(tokenizer.eos_token_id)
+    eos_ids = _get_eos_ids(model, tokenizer)
     past_key_values = None
     current_input = input_ids
     generated_ids: list[int] = []
@@ -126,10 +137,10 @@ def generate_steered(
                 past_key_values = outputs.past_key_values
                 logits = outputs.logits[:, -1, :]
                 # Steering can push hidden states past fp16 range, cascading
-                # to inf/NaN logits. nan_to_num replaces NaN→0 and inf→max,
-                # then clamp bounds the range for stable softmax.
-                torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0, out=logits)
+                # to inf/NaN logits. Clamp bounds the range for stable softmax;
+                # nan_to_num replaces any remaining NaN→0.
                 logits.clamp_(-100.0, 100.0)
+                torch.nan_to_num(logits, nan=0.0, out=logits)
 
                 if config.temperature <= 0:
                     # Greedy

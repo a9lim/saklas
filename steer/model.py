@@ -9,6 +9,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 log = logging.getLogger(__name__)
 
+torch._dynamo.config.skip_nnmodule_hook_guards = False
+
 _MODEL_LAYERS = lambda m: m.model.layers  # noqa: E731
 _TRANSFORMER_H = lambda m: m.transformer.h  # noqa: E731
 _VLM_LANGUAGE_LAYERS = lambda m: m.model.language_model.layers  # noqa: E731
@@ -191,7 +193,6 @@ def load_model(model_id: str, quantize=None, device="auto", no_compile=False):
     should_compile = not no_compile and device == "cuda"
     if should_compile:
         try:
-            torch._dynamo.config.skip_nnmodule_hook_guards = False
             model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
             log.info("torch.compile succeeded")
         except Exception as e:

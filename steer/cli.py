@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

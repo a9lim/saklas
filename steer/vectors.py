@@ -67,12 +67,7 @@ def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
             bos_id = tokenizer.eos_token_id or 0
         ids = torch.tensor([[bos_id]])
     ids = ids.to(device)
-    if layers is not None:
-        h = _capture_hidden_states_single(model, layers[layer_idx], ids)
-    else:
-        with torch.inference_mode():
-            out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-        h = out.hidden_states[layer_idx + 1]
+    h = _capture_hidden_states_single(model, layers[layer_idx], ids)
     return h.float().mean(dim=1).squeeze(0)  # (dim,)
 
 
@@ -83,6 +78,7 @@ def extract_actadd(
     layer_idx: int,
     baseline: str = "",
     layers=None,
+    device=None,
 ) -> torch.Tensor:
     """Single-concept ActAdd extraction (Turner et al., 2023).
 
@@ -90,7 +86,8 @@ def extract_actadd(
     degenerate attention from fully-masked padding when the baseline is
     shorter.  Each text gets its own forward pass.
     """
-    device = next(model.parameters()).device
+    if device is None:
+        device = next(model.parameters()).device
 
     pos_mean = _encode_and_capture(model, tokenizer, concept, layer_idx, layers, device)
     neg_mean = _encode_and_capture(model, tokenizer, baseline, layer_idx, layers, device)
@@ -100,7 +97,7 @@ def extract_actadd(
     # Scale to 10% of the mean hidden-state norm.
     ref_norm = (pos_mean.norm().item() + neg_mean.norm().item()) / 2 * 0.1
 
-    return _normalize(diff.unsqueeze(0).to(pos_mean.dtype), ref_norm=ref_norm).squeeze(0)
+    return _normalize(diff, ref_norm=ref_norm)
 
 
 def extract_caa(
@@ -109,6 +106,7 @@ def extract_caa(
     pairs: list[dict],
     layer_idx: int,
     layers=None,
+    device=None,
 ) -> torch.Tensor:
     """Contrastive Activation Addition (Rimsky et al., 2023).
 
@@ -122,7 +120,8 @@ def extract_caa(
     Returns:
         L2-normalized mean contrastive vector.
     """
-    device = next(model.parameters()).device
+    if device is None:
+        device = next(model.parameters()).device
 
     diffs = []
     norms = []
@@ -133,10 +132,10 @@ def extract_caa(
         norms.append(pos_mean.norm())
         norms.append(neg_mean.norm())
 
-    mean_diff = torch.stack(diffs).mean(dim=0, keepdim=True)  # (1, dim)
+    mean_diff = torch.stack(diffs).mean(dim=0)  # (dim,)
     ref_norm = torch.stack(norms).mean().item() * 0.1
 
-    return _normalize(mean_diff, ref_norm=ref_norm).squeeze(0)  # (dim,)
+    return _normalize(mean_diff, ref_norm=ref_norm)
 
 
 def save_vector(vector: torch.Tensor, path: str, metadata: dict) -> None:

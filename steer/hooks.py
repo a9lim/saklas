@@ -73,6 +73,14 @@ class SteeringManager:
     def __init__(self) -> None:
         self.hooks: dict[int, SteeringHook] = {}
         self.vectors: list[dict] = []
+        self._name_idx: dict[str, int] = {}
+
+    def _rebuild_index(self) -> None:
+        self._name_idx = {v["name"]: i for i, v in enumerate(self.vectors)}
+
+    def _find(self, name: str) -> dict | None:
+        idx = self._name_idx.get(name)
+        return self.vectors[idx] if idx is not None else None
 
     def add_vector(
         self,
@@ -81,6 +89,7 @@ class SteeringManager:
         alpha: float,
         layer_idx: int,
     ) -> None:
+        self._name_idx[name] = len(self.vectors)
         self.vectors.append(
             {
                 "name": name,
@@ -93,24 +102,22 @@ class SteeringManager:
 
     def remove_vector(self, name: str) -> None:
         self.vectors = [v for v in self.vectors if v["name"] != name]
+        self._rebuild_index()
 
     def set_alpha(self, name: str, alpha: float) -> None:
-        for v in self.vectors:
-            if v["name"] == name:
-                v["alpha"] = alpha
-                return
+        v = self._find(name)
+        if v is not None:
+            v["alpha"] = alpha
 
     def set_layer(self, name: str, layer_idx: int) -> None:
-        for v in self.vectors:
-            if v["name"] == name:
-                v["layer_idx"] = layer_idx
-                return
+        v = self._find(name)
+        if v is not None:
+            v["layer_idx"] = layer_idx
 
     def toggle_vector(self, name: str) -> None:
-        for v in self.vectors:
-            if v["name"] == name:
-                v["enabled"] = not v["enabled"]
-                return
+        v = self._find(name)
+        if v is not None:
+            v["enabled"] = not v["enabled"]
 
     def apply_to_model(
         self,
@@ -159,6 +166,7 @@ class SteeringManager:
             hook.detach()
         self.hooks.clear()
         self.vectors.clear()
+        self._name_idx.clear()
 
     def get_active_vectors(self) -> list[dict]:
         """Return all vector configs (for TUI display)."""

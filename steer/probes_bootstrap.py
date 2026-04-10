@@ -38,22 +38,23 @@ def bootstrap_probes(
     probe_layer = num_layers - 2
 
     probes: dict[str, torch.Tensor] = {}
-    to_extract: list[str] = []
+    to_extract: list[tuple[str, str]] = []
 
     # Check cache first
     for cat in categories:
         cat_probes = defaults.get(cat, [])
         for probe_name in cat_probes:
             cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer, "caa")
-            try:
-                vec, _meta = load_vector(cp)
-                probes[probe_name] = vec
-                log.debug("Loaded cached probe: %s", probe_name)
-            except FileNotFoundError:
-                to_extract.append(probe_name)
-            except Exception as e:
-                log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
-                to_extract.append(probe_name)
+            if Path(cp).exists():
+                try:
+                    vec, _meta = load_vector(cp)
+                    probes[probe_name] = vec
+                    log.debug("Loaded cached probe: %s", probe_name)
+                except Exception as e:
+                    log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
+                    to_extract.append((probe_name, cp))
+            else:
+                to_extract.append((probe_name, cp))
 
     if not to_extract:
         return probes
@@ -61,7 +62,7 @@ def bootstrap_probes(
     log.info("Extracting %d probes...", len(to_extract))
 
     datasets_dir = Path(__file__).parent / "datasets"
-    for name in to_extract:
+    for name, cp in to_extract:
         ds_path = datasets_dir / f"{name}.json"
         if not ds_path.exists():
             log.warning("Dataset %s.json not found for probe %s, skipping", name, name)
@@ -70,7 +71,6 @@ def bootstrap_probes(
             ds = load_contrastive_pairs(str(ds_path))
             vec = extract_caa(model, tokenizer, ds["pairs"], probe_layer, layers=layers)
             probes[name] = vec
-            cp = get_cache_path(cache_dir, model_id, name, probe_layer, "caa")
             save_vector(vec, cp, {
                 "concept": name,
                 "method": "caa",
@@ -85,8 +85,14 @@ def bootstrap_probes(
     return probes
 
 
+_DEFAULTS_CACHE: dict | None = None
+
 def _load_defaults() -> dict:
-    if DEFAULTS_PATH.exists():
-        with open(DEFAULTS_PATH) as f:
-            return json.load(f)
-    return {}
+    global _DEFAULTS_CACHE
+    if _DEFAULTS_CACHE is None:
+        if DEFAULTS_PATH.exists():
+            with open(DEFAULTS_PATH) as f:
+                _DEFAULTS_CACHE = json.load(f)
+        else:
+            _DEFAULTS_CACHE = {}
+    return _DEFAULTS_CACHE

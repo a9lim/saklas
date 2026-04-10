@@ -100,7 +100,8 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 | `/steer "concept" - "baseline" [layer] [alpha]` | Steering with explicit baseline (e.g. `/steer "formal" - "casual"`) |
 | `/probe "concept" [layer]` | Add a monitoring probe (e.g. `/probe "sarcastic"`) |
 | `/probe "concept" - "baseline" [layer]` | Probe with explicit baseline |
-| `/clear` | Clear chat history |
+| `/clear` | Clear chat history and reset probe stats |
+| `/rewind` | Undo last user message and its response |
 | `/sys <prompt>` | Set system prompt |
 | `/temp <value>` | Set temperature |
 | `/top-p <value>` | Set top-p |
