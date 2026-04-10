@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None):
     # Lazy imports — don't load torch until we need it
     print(f"Loading model: {args.model}")
     if args.quantize:
-        print(f"  Quantization: {args.quantize}")
+        print(f"Quantization: {args.quantize}")
 
     from steer.model import load_model, get_layers, get_model_info
     model, tokenizer = load_model(
@@ -73,13 +73,13 @@ def main(argv: list[str] | None = None):
     info = get_model_info(model, tokenizer)
     layers = get_layers(model)
 
-    print(f"  Architecture: {info['model_type']}")
-    print(f"  Layers: {info['num_layers']}, Hidden dim: {info['hidden_dim']}")
-    print(f"  VRAM: {info['vram_used_gb']:.1f} GB")
+    print(f"Architecture: {info['model_type']}")
+    print(f"Layers: {info['num_layers']}, Hidden dim: {info['hidden_dim']}")
+    print(f"VRAM: {info['vram_used_gb']:.1f} GB")
 
     # Bootstrap probes
     probe_categories = args.probes if args.probes else ["emotion", "personality", "safety", "cultural", "gender"]
-    print(f"  Bootstrapping probes: {', '.join(probe_categories)}")
+    print(f"Bootstrapping probes: {', '.join(probe_categories)}")
 
     from steer.probes_bootstrap import bootstrap_probes
     import pathlib
@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None):
     )
 
     if probes:
-        print(f"  Loaded {len(probes)} probes")
+        print(f"Loaded {len(probes)} probes")
 
     # Launch TUI
     from steer.tui.app import SteerApp
