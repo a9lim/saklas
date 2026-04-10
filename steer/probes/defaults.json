@@ -1,7 +1,7 @@
 {
   "emotion": ["happy", "angry", "fearful", "surprised", "disgusted", "excited", "sad", "calm"],
-  "personality": ["sycophantic", "honest", "creative", "formal", "verbose", "authoritative", "confident", "uncertain"],
-  "safety": ["refusal", "deceptive", "hallucinating"],
+  "personality": ["honest", "creative", "formal", "verbose", "authoritative", "confident", "uncertain"],
+  "safety": ["refusal", "deceptive", "hallucinating", "sycophantic"],
   "cultural": ["western", "hierarchical", "direct", "contextual", "religious", "traditional"],
   "gender": ["masculine", "agentic", "paternal"]
 }
