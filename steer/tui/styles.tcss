@@ -19,6 +19,12 @@ Widget {
     scrollbar-background: ansi_default;
     scrollbar-background-hover: ansi_default;
     scrollbar-background-active: ansi_default;
+    link-color: ansi_default;
+    link-background: ansi_default;
+    link-style: underline;
+    link-color-hover: ansi_default;
+    link-background-hover: ansi_default;
+    link-style-hover: bold underline;
 }
 
 #main-area {
