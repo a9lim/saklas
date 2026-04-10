@@ -31,8 +31,8 @@ class TraitPanel(Widget):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            "[bold]TRAIT MONITOR[/] [dim]sort: name · Ctrl+S[/]",
-            id="trait-header",
+            "[bold]TRAIT MONITOR[/] [dim]sort: name[/]",
+            id="trait-header", classes="section-header",
         )
         yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
         yield Static("[dim]⌫ remove · Ctrl+S sort[/]",
@@ -73,7 +73,7 @@ class TraitPanel(Widget):
         self._sort_mode = modes[(idx + 1) % len(modes)]
         header = self._trait_header
         header.update(
-            f"[bold]TRAIT MONITOR[/] [dim]sort: {self._sort_mode[:3]} · Ctrl+S[/]"
+            f"[bold]TRAIT MONITOR[/] [dim]sort: {self._sort_mode[:3]}[/]"
         )
         self._render_probes()
 
@@ -110,7 +110,7 @@ class TraitPanel(Widget):
 
             count = len(active_members)
             lines.append(
-                f" [bold]▾ {category}[/] [dim]({count})[/]"
+                f" [bold]{category}[/] [dim]({count})[/]"
             )
 
             sorted_members = self._sort_probes(active_members)
@@ -134,17 +134,22 @@ class TraitPanel(Widget):
                 else:
                     arrow_ch = "↓"
 
-                bar_full, bar_empty = _build_bar(val, 1.0, 10)
-                color = "ansi_green" if val >= 0 else "ansi_red"
+                bar_full, bar_empty = _build_bar(val, 1.0, 16)
+                if val > 0:
+                    color = "ansi_green"
+                elif val < 0:
+                    color = "ansi_red"
+                else:
+                    color = "ansi_default"
 
                 mini_spark = self._sparklines.get(name, "")
 
                 sel = ">" if is_nav_selected else " "
-                display_name = name[:9].ljust(9)
+                display_name = name[:16].ljust(16)
 
                 line = (
                     f"{sel} {display_name}[{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                    f"{val:+.2f}{arrow_ch} [dim]{mini_spark}[/]"
+                    f"[{color}]{val:+.2f}{arrow_ch}[/] [dim]{mini_spark}[/]"
                 )
 
                 stats = self._probe_stats.get(name, {})

@@ -130,23 +130,27 @@ class LeftPanel(Widget):
             name = v["name"]
             alpha = v["alpha"]
             layer = v["layer_idx"]
-            method = v.get("method", "actadd")
 
-            bar_full, bar_empty = _build_bar(alpha, 5.0, 14)
-            color = "ansi_green" if alpha >= 0 else "ansi_red"
+            bar_full, bar_empty = _build_bar(alpha, 5.0, 16)
+            if alpha > 0:
+                color = "ansi_green"
+            elif alpha < 0:
+                color = "ansi_red"
+            else:
+                color = "ansi_default"
 
             if is_selected:
                 marker = ">"
                 dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
                 if enabled:
                     text = (
-                        f"{marker} {dot} [bold]{name}[/] [dim]{method} L{layer}[/]\n"
+                        f"{marker} {dot} [bold]{name}[/] [dim]L{layer}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"[{color}]{alpha:+.1f}[/] [dim]←/→[/]"
                     )
                 else:
                     text = (
-                        f"{marker} {dot} [dim bold]{name}[/] [dim]{method} L{layer}[/]\n"
+                        f"{marker} {dot} [dim bold]{name}[/] [dim]L{layer}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"[dim {color}]{alpha:+.1f}[/] [dim]←/→[/]"
                     )
@@ -155,13 +159,13 @@ class LeftPanel(Widget):
                 dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
                 if enabled:
                     text = (
-                        f"{marker} {dot} {name} [dim]{method} L{layer}[/]\n"
+                        f"{marker} {dot} {name} [dim]L{layer}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"{alpha:+.1f}"
                     )
                 else:
                     text = (
-                        f"{marker} {dot} [dim]{name} {method} L{layer}[/]\n"
+                        f"{marker} {dot} [dim]{name} L{layer}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"[dim]{alpha:+.1f}[/]"
                     )
