@@ -499,7 +499,7 @@ class SteerApp(App):
         model_id = self._model_info.get("model_id", "unknown")
         tag = f"{concept}_vs_{baseline}" if baseline else concept
         return get_cache_path(
-            "steer/probes/cache", model_id, tag, layer_idx, "caa",
+            "steer/probes/cache", model_id, tag, layer_idx,
         )
 
     def _statements_cache_path(self, concept: str, baseline: str | None) -> str:
@@ -520,7 +520,7 @@ class SteerApp(App):
         on_cached is called when a cached vector is found (receives the vector).
         on_extracted is called after extraction from pairs (receives vector and saved_vectors).
         """
-        from steer.vectors import save_vector, load_vector, extract_caa, load_contrastive_pairs
+        from steer.vectors import save_vector, load_vector, extract_contrastive, load_contrastive_pairs
         cache_path = self._vector_cache_path(concept, baseline, layer_idx)
 
         # Check cache first
@@ -551,14 +551,13 @@ class SteerApp(App):
                             f"Found curated dataset '{dataset_file}' for '{concept}', extracting...",
                         )
                         ds = load_contrastive_pairs(str(ds_path))
-                        vec = extract_caa(
+                        vec = extract_contrastive(
                             self._model, self._tokenizer, ds["pairs"], layer_idx, layers=self._layers,
                         )
                         save_vector(vec, cache_path, {
                             "concept": concept,
                             "baseline": baseline,
                             "layer_idx": layer_idx,
-                            "method": "caa",
                             "n_pairs": len(ds["pairs"]),
                             "source": f"curated:{dataset_file}",
                         })
@@ -608,11 +607,10 @@ class SteerApp(App):
                 )
                 return
 
-            # Extract CAA vector
             self.call_from_thread(
-                self._steer_status, f"Extracting CAA vector ({len(pairs)} pairs)...",
+                self._steer_status, f"Extracting contrastive vector ({len(pairs)} pairs)...",
             )
-            vec = extract_caa(
+            vec = extract_contrastive(
                 self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
             )
 
@@ -621,7 +619,6 @@ class SteerApp(App):
                 "concept": concept,
                 "baseline": baseline,
                 "layer_idx": layer_idx,
-                "method": "caa",
                 "n_pairs": len(pairs),
             })
 
