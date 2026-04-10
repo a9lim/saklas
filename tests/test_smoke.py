@@ -47,33 +47,33 @@ def middle_layer(num_layers):
     return num_layers // 2
 
 
-def _caa_single(model, tokenizer, concept, layer_idx):
-    """Extract a steering vector for a single concept via CAA with one pair."""
-    from steer.vectors import extract_caa
-    return extract_caa(model, tokenizer, [{"positive": concept, "negative": ""}], layer_idx)
+def _extract_single(model, tokenizer, concept, layer_idx):
+    """Extract a steering vector for a single concept with one pair."""
+    from steer.vectors import extract_contrastive
+    return extract_contrastive(model, tokenizer, [{"positive": concept, "negative": ""}], layer_idx)
 
 
 @pytest.fixture(scope="module")
 def happy_vector(model_and_tokenizer, middle_layer):
     model, tokenizer = model_and_tokenizer
-    return _caa_single(model, tokenizer, "happy", middle_layer)
+    return _extract_single(model, tokenizer, "happy", middle_layer)
 
 
 class TestVectorExtraction:
-    def test_caa_returns_valid_vector(self, happy_vector, model_and_tokenizer):
+    def test_returns_valid_vector(self, happy_vector, model_and_tokenizer):
         model, _ = model_and_tokenizer
         hidden_dim = model.config.hidden_size
         assert happy_vector.shape == (hidden_dim,)
         norm = happy_vector.norm().item()
         assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
 
-    def test_caa_fast_enough(self, model_and_tokenizer, middle_layer):
-        """Single CAA extraction should complete in under 10 seconds."""
+    def test_extraction_fast_enough(self, model_and_tokenizer, middle_layer):
+        """Single contrastive extraction should complete in under 10 seconds."""
         model, tokenizer = model_and_tokenizer
         start = time.perf_counter()
-        _caa_single(model, tokenizer, "curious", middle_layer)
+        _extract_single(model, tokenizer, "curious", middle_layer)
         elapsed = time.perf_counter() - start
-        assert elapsed < 10.0, f"CAA took {elapsed:.1f}s, expected < 10s"
+        assert elapsed < 10.0, f"Extraction took {elapsed:.1f}s, expected < 10s"
 
 
 class TestSteering:
@@ -149,7 +149,7 @@ class TestSaveLoad:
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_vec.safetensors")
-            meta = {"concept": "happy", "method": "actadd", "layer_idx": 10}
+            meta = {"concept": "happy", "layer_idx": 10}
             save_vector(happy_vector, path, meta)
             loaded_vec, loaded_meta = load_vector(path)
 
@@ -168,7 +168,7 @@ class TestTraitMonitor:
         dtype = next(model.parameters()).dtype
         num_layers = len(layers)
 
-        sad_vector = _caa_single(model, tokenizer, "sad", num_layers - 2)
+        sad_vector = _extract_single(model, tokenizer, "sad", num_layers - 2)
 
         probes = {"happy": happy_vector, "sad": sad_vector}
         monitor = TraitMonitor(probes, num_layers - 2)
@@ -238,9 +238,9 @@ class TestTraitMonitor:
         # 3 steering vectors
         mgr = SteeringManager()
         mgr.add_vector("happy", happy_vector, 0.8, middle_layer)
-        curious_vec = _caa_single(model, tokenizer, "curious", middle_layer)
+        curious_vec = _extract_single(model, tokenizer, "curious", middle_layer)
         mgr.add_vector("curious", curious_vec, 0.5, middle_layer)
-        concise_vec = _caa_single(model, tokenizer, "concise", middle_layer)
+        concise_vec = _extract_single(model, tokenizer, "concise", middle_layer)
         mgr.add_vector("concise", concise_vec, 0.3, middle_layer + 2)
         mgr.apply_to_model(layers, device, dtype)
 
@@ -268,9 +268,9 @@ class TestTraitMonitor:
         )
 
 
-class TestExtractCAA:
-    def test_caa_returns_valid_vector(self, model_and_tokenizer, layers, num_layers):
-        from steer.vectors import extract_caa
+class TestExtractContrastive:
+    def test_returns_valid_vector(self, model_and_tokenizer, layers, num_layers):
+        from steer.vectors import extract_contrastive
         model, tokenizer = model_and_tokenizer
         hidden_dim = model.config.hidden_size
         pairs = [
@@ -278,7 +278,7 @@ class TestExtractCAA:
             {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
             {"positive": "I love this", "negative": "I hate this"},
         ]
-        vec = extract_caa(model, tokenizer, pairs, num_layers // 2, layers=layers)
+        vec = extract_contrastive(model, tokenizer, pairs, num_layers // 2, layers=layers)
         assert vec.shape == (hidden_dim,)
         norm = vec.norm().item()
         assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
@@ -316,8 +316,8 @@ class TestProbesBootstrap:
 
         with tempfile.TemporaryDirectory() as tmp:
             # Pre-populate cache with a fake probe
-            cp = get_cache_path(tmp, model_info["model_id"], "happy", num_layers - 2, "caa")
-            save_vector(happy_vector, cp, {"concept": "happy", "method": "caa",
+            cp = get_cache_path(tmp, model_info["model_id"], "happy", num_layers - 2)
+            save_vector(happy_vector, cp, {"concept": "happy",
                                            "layer_idx": num_layers - 2,
                                            "model_id": model_info["model_id"],
                                            "hidden_dim": happy_vector.shape[0],

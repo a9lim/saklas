@@ -26,7 +26,7 @@ def bootstrap_probes(
     Returns dict mapping probe_name -> unit vector tensor.
     Uses batched extraction for efficiency.
     """
-    from steer.vectors import extract_caa, load_contrastive_pairs, load_vector, save_vector, get_cache_path
+    from steer.vectors import extract_contrastive, load_contrastive_pairs, load_vector, save_vector, get_cache_path
 
     defaults = _load_defaults()
     cache_path = Path(cache_dir)
@@ -44,7 +44,7 @@ def bootstrap_probes(
     for cat in categories:
         cat_probes = defaults.get(cat, [])
         for probe_name in cat_probes:
-            cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer, "caa")
+            cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer)
             if Path(cp).exists():
                 try:
                     vec, _meta = load_vector(cp)
@@ -70,18 +70,17 @@ def bootstrap_probes(
             continue
         try:
             ds = load_contrastive_pairs(str(ds_path))
-            vec = extract_caa(model, tokenizer, ds["pairs"], probe_layer, layers=layers)
+            vec = extract_contrastive(model, tokenizer, ds["pairs"], probe_layer, layers=layers)
             probes[name] = vec
             save_vector(vec, cp, {
                 "concept": name,
-                "method": "caa",
                 "layer_idx": probe_layer,
                 "model_id": model_id,
                 "hidden_dim": vec.shape[0],
                 "num_pairs": len(ds["pairs"]),
             })
         except Exception as e:
-            log.warning("CAA extraction failed for %s: %s", name, e)
+            log.warning("Contrastive extraction failed for %s: %s", name, e)
 
     return probes
 

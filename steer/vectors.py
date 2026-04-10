@@ -71,7 +71,7 @@ def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
     return h.float().mean(dim=1).squeeze(0)  # (dim,)
 
 
-def extract_caa(
+def extract_contrastive(
     model,
     tokenizer,
     pairs: list[dict],
@@ -79,7 +79,12 @@ def extract_caa(
     layers=None,
     device=None,
 ) -> torch.Tensor:
-    """Contrastive Activation Addition (Rimsky et al., 2023).
+    """Contrastive direction extraction via PCA (Zou et al., 2023).
+
+    Computes pos−neg difference vectors for each pair, then takes
+    the first principal component — the direction of maximum variance
+    across the differences.  More robust than mean-difference (CAA)
+    when individual pairs are noisy.
 
     Runs each prompt through a separate forward pass to avoid
     padding-induced attention corruption on multimodal models.
@@ -89,7 +94,7 @@ def extract_caa(
         layer_idx: Which layer to extract from.
 
     Returns:
-        L2-normalized mean contrastive vector.
+        Direction vector scaled to 10% of mean hidden-state norm.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -103,10 +108,25 @@ def extract_caa(
         norms.append(pos_mean.norm())
         norms.append(neg_mean.norm())
 
-    mean_diff = torch.stack(diffs).mean(dim=0)  # (dim,)
+    diff_matrix = torch.stack(diffs)  # (N, dim)
     ref_norm = torch.stack(norms).mean().item() * 0.1
 
-    return _normalize(mean_diff, ref_norm=ref_norm)
+    if len(diffs) < 2:
+        # Can't do PCA with a single vector; fall back to the diff itself.
+        return _normalize(diff_matrix.squeeze(0), ref_norm=ref_norm)
+
+    # PCA: first principal component of centered difference vectors.
+    diff_matrix = diff_matrix - diff_matrix.mean(dim=0)
+    _, _, V = torch.pca_lowrank(diff_matrix, q=1)
+    direction = V[:, 0]  # (dim,)
+
+    # pca_lowrank returns an unsigned direction; orient it so that
+    # "positive" stays positive (align with the mean difference).
+    mean_diff = torch.stack(diffs).mean(dim=0)
+    if direction @ mean_diff < 0:
+        direction = -direction
+
+    return _normalize(direction, ref_norm=ref_norm)
 
 
 def save_vector(vector: torch.Tensor, path: str, metadata: dict) -> None:
@@ -145,16 +165,15 @@ def get_cache_path(
     model_id: str,
     concept: str,
     layer_idx: int,
-    method: str,
 ) -> str:
     """Deterministic cache path for a steering vector.
 
     Returns:
-        Path like ``{cache_dir}/{model_name}/{concept}_{layer}_{method}.safetensors``
+        Path like ``{cache_dir}/{model_name}/{concept}_{layer}.safetensors``
     """
     model_name = model_id.replace("/", "_")
     safe_concept = re.sub(r'[^\w\-.]', '_', concept)
-    filename = f"{safe_concept}_{layer_idx}_{method}.safetensors"
+    filename = f"{safe_concept}_{layer_idx}.safetensors"
     return str(Path(cache_dir) / model_name / filename)
 
 
