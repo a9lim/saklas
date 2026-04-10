@@ -161,13 +161,13 @@ class LeftPanel(Widget):
                     text = (
                         f"{marker} {dot} {name} [dim]L{layer}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"{alpha:+.1f}"
+                        f"[{color}]{alpha:+.1f}[/]"
                     )
                 else:
                     text = (
                         f"{marker} {dot} [dim]{name} L{layer}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim]{alpha:+.1f}[/]"
+                        f"[dim {color}]{alpha:+.1f}[/]"
                     )
             lines.append(text)
 

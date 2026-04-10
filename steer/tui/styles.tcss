@@ -136,6 +136,11 @@ Widget {
     height: auto;
 }
 
+.assistant-message MarkdownParagraph,
+.user-message MarkdownParagraph {
+    margin: 0;
+}
+
 /* Trait panel internals */
 #trait-header {
     height: 1;
