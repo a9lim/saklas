@@ -20,7 +20,6 @@ def bootstrap_probes(
     model_info: dict,
     categories: list[str],
     cache_dir: str,
-    progress: callable | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Load or extract probe vectors for the given categories.
@@ -60,13 +59,11 @@ def bootstrap_probes(
     if not to_extract:
         return probes
 
-    total = len(to_extract)
-    log.info("Extracting %d probes...", total)
+    log.info("Extracting %d probes...", len(to_extract))
 
+    from tqdm import tqdm
     datasets_dir = Path(__file__).parent / "datasets"
-    for i, (name, cp) in enumerate(to_extract):
-        if progress:
-            progress(i, total, name)
+    for name, cp in tqdm(to_extract, desc="Extracting probes", unit="probe"):
         ds_path = datasets_dir / f"{name}.json"
         if not ds_path.exists():
             log.warning("Dataset %s.json not found for probe %s, skipping", name, name)

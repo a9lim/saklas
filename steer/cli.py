@@ -82,25 +82,15 @@ def main(argv: list[str] | None = None):
     print(f"  Bootstrapping probes: {', '.join(probe_categories)}")
 
     from steer.probes_bootstrap import bootstrap_probes
-    import pathlib, sys
+    import pathlib
 
     cache_dir = args.cache_dir or str(
         pathlib.Path(__file__).parent / "probes" / "cache"
     )
-
-    def _probe_progress(i: int, total: int, name: str) -> None:
-        bar_width = 20
-        filled = bar_width * (i + 1) // total
-        bar = "█" * filled + "░" * (bar_width - filled)
-        print(f"\r  Extracting [{bar}] {i+1}/{total} {name}", end="", flush=True)
-        if i + 1 == total:
-            print()
-
     probes = bootstrap_probes(
         model, tokenizer, layers, info,
         categories=probe_categories,
         cache_dir=cache_dir,
-        progress=_probe_progress,
     )
 
     if probes:
