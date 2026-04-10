@@ -1,16 +1,16 @@
 Screen {
     layout: vertical;
     background: ansi_default;
-    color: ansi_white;
+    color: ansi_default;
 }
 
 /* Force all widgets to inherit terminal colors */
 Widget {
     background: ansi_default;
-    color: ansi_white;
+    color: ansi_default;
     scrollbar-color: ansi_bright_black;
-    scrollbar-color-hover: ansi_white;
-    scrollbar-color-active: ansi_white;
+    scrollbar-color-hover: ansi_default;
+    scrollbar-color-active: ansi_default;
     scrollbar-background: ansi_default;
 }
 
@@ -23,7 +23,7 @@ Widget {
 #left-panel {
     width: 1fr;
     height: 100%;
-    border-right: solid ansi_white;
+    border-right: solid ansi_default;
     padding: 0 1;
     layout: vertical;
 }
@@ -31,14 +31,13 @@ Widget {
 #chat-panel {
     width: 2fr;
     height: 100%;
-    border: solid ansi_black;
     layout: vertical;
 }
 
 #trait-panel {
     width: 1fr;
     height: 100%;
-    border-left: solid ansi_white;
+    border-left: solid ansi_default;
     padding: 0 1;
     layout: vertical;
 }
@@ -46,10 +45,6 @@ Widget {
 /* Panel focus highlighting */
 #left-panel.focused {
     border-right: double ansi_yellow;
-}
-
-#chat-panel.focused {
-    border: solid ansi_yellow;
 }
 
 #trait-panel.focused {
@@ -109,21 +104,21 @@ Widget {
 #status-bar {
     height: 1;
     background: ansi_default;
-    color: ansi_bright_black;
+    color: ansi_default;
     padding: 0 1;
 }
 
 #chat-input {
     height: 3;
     dock: bottom;
-    border: solid ansi_black;
+    border: solid ansi_default;
     background: ansi_default;
-    color: ansi_white;
+    color: ansi_default;
 }
 
 /* Override Textual's default focus border */
 #chat-input:focus {
-    border: solid ansi_black;
+    border: solid ansi_default;
 }
 
 .user-message {
@@ -161,5 +156,5 @@ Widget {
 
 #trait-hints {
     height: 1;
-    color: ansi_bright_black;
+    color: ansi_default;
 }
