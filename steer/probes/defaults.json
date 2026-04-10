@@ -1,52 +1,52 @@
 {
   "emotion": {
-    "happy": {"method": "actadd"},
-    "sad": {"method": "actadd"},
-    "angry": {"method": "actadd"},
-    "fearful": {"method": "actadd"},
-    "surprised": {"method": "actadd"},
-    "disgusted": {"method": "actadd"},
-    "calm": {"method": "actadd"},
-    "excited": {"method": "actadd"}
+    "happy": {"method": "caa", "dataset": "happy.json"},
+    "sad": {"method": "caa", "dataset": "sad.json"},
+    "angry": {"method": "caa", "dataset": "angry.json"},
+    "fearful": {"method": "caa", "dataset": "fearful.json"},
+    "surprised": {"method": "caa", "dataset": "surprised.json"},
+    "disgusted": {"method": "caa", "dataset": "disgusted.json"},
+    "calm": {"method": "caa", "dataset": "calm.json"},
+    "excited": {"method": "caa", "dataset": "excited.json"}
   },
   "personality": {
-    "sycophantic": {"method": "actadd"},
-    "honest": {"method": "actadd"},
+    "sycophantic": {"method": "caa", "dataset": "sycophantic.json"},
+    "honest": {"method": "caa", "dataset": "honest.json"},
     "creative": {"method": "caa", "dataset": "creativity.json"},
     "formal": {"method": "caa", "dataset": "formality.json"},
-    "casual": {"method": "actadd"},
+    "casual": {"method": "caa", "dataset": "casual.json"},
     "verbose": {"method": "caa", "dataset": "verbosity.json"},
-    "concise": {"method": "actadd"},
-    "authoritative": {"method": "actadd"},
-    "uncertain": {"method": "actadd"},
-    "confident": {"method": "actadd"}
+    "concise": {"method": "caa", "dataset": "concise.json"},
+    "authoritative": {"method": "caa", "dataset": "authoritative.json"},
+    "uncertain": {"method": "caa", "dataset": "uncertain.json"},
+    "confident": {"method": "caa", "dataset": "confident.json"}
   },
   "safety": {
     "refusal": {"method": "caa", "dataset": "safety.json"},
-    "compliance": {"method": "actadd"},
-    "deceptive": {"method": "actadd"},
-    "hallucinating": {"method": "actadd"}
+    "compliance": {"method": "caa", "dataset": "compliance.json"},
+    "deceptive": {"method": "caa", "dataset": "deceptive.json"},
+    "hallucinating": {"method": "caa", "dataset": "hallucinating.json"}
   },
   "cultural": {
-    "western-individualist": {"method": "actadd"},
-    "eastern-collectivist": {"method": "actadd"},
-    "formal-hierarchical": {"method": "actadd"},
-    "casual-egalitarian": {"method": "actadd"},
+    "western-individualist": {"method": "caa", "dataset": "western-individualist.json"},
+    "eastern-collectivist": {"method": "caa", "dataset": "eastern-collectivist.json"},
+    "formal-hierarchical": {"method": "caa", "dataset": "formal-hierarchical.json"},
+    "casual-egalitarian": {"method": "caa", "dataset": "casual-egalitarian.json"},
     "direct-communication": {"method": "caa", "dataset": "directness.json"},
-    "indirect-communication": {"method": "actadd"},
-    "high-context": {"method": "actadd"},
-    "low-context": {"method": "actadd"},
-    "religious": {"method": "actadd"},
-    "secular": {"method": "actadd"},
-    "traditional": {"method": "actadd"},
-    "progressive": {"method": "actadd"}
+    "indirect-communication": {"method": "caa", "dataset": "indirect-communication.json"},
+    "high-context": {"method": "caa", "dataset": "high-context.json"},
+    "low-context": {"method": "caa", "dataset": "low-context.json"},
+    "religious": {"method": "caa", "dataset": "religious.json"},
+    "secular": {"method": "caa", "dataset": "secular.json"},
+    "traditional": {"method": "caa", "dataset": "traditional.json"},
+    "progressive": {"method": "caa", "dataset": "progressive.json"}
   },
   "gender": {
-    "masculine-coded": {"method": "actadd"},
-    "feminine-coded": {"method": "actadd"},
+    "masculine-coded": {"method": "caa", "dataset": "masculine-coded.json"},
+    "feminine-coded": {"method": "caa", "dataset": "feminine-coded.json"},
     "agentic": {"method": "caa", "dataset": "agency.json"},
-    "communal": {"method": "actadd"},
-    "paternal": {"method": "actadd"},
-    "maternal": {"method": "actadd"}
+    "communal": {"method": "caa", "dataset": "communal.json"},
+    "paternal": {"method": "caa", "dataset": "paternal.json"},
+    "maternal": {"method": "caa", "dataset": "maternal.json"}
   }
 }
