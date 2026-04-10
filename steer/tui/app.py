@@ -377,27 +377,52 @@ class SteerApp(App):
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.add_system_message(msg)
 
-    def _generate_statements(self, prompt: str, n: int = _STEER_N_PAIRS) -> list[str]:
-        """Ask the model to generate *n* lines from *prompt*."""
+    def _generate_contrastive_pairs(
+        self, concept_a: str, concept_b: str, n: int = _STEER_N_PAIRS,
+    ) -> list[dict]:
+        """Generate *n* matched contrastive pairs via raw completion.
+
+        Returns list of {"positive": str, "negative": str} dicts.
+        Uses raw tokenization (no chat template) to bypass instruct guardrails.
+        """
         import re
-        messages = [{"role": "user", "content": prompt}]
-        input_ids = build_chat_input(self._tokenizer, messages).to(self._device)
+        prompt = (
+            f"Contrasting statement pairs about {concept_a} vs {concept_b}:\n"
+            f"1a. I am {concept_a}.\n"
+            f"1b. I am {concept_b}.\n"
+            "2a."
+        )
+        input_ids = self._tokenizer.encode(prompt, return_tensors="pt").to(self._device)
         pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
         with torch.inference_mode():
             attn_mask = torch.ones_like(input_ids)
             out = self._model.generate(
-                input_ids, attention_mask=attn_mask, max_new_tokens=n * 40,
+                input_ids, attention_mask=attn_mask, max_new_tokens=n * 80,
                 do_sample=True, temperature=0.8, top_p=0.9, pad_token_id=pad_id,
             )
         new_ids = out[0][input_ids.shape[-1]:]
         text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
-        lines = []
+
+        # Parse Na./Nb. pairs from raw output
+        a_lines: dict[str, str] = {}
+        b_lines: dict[str, str] = {}
         for line in text.split("\n"):
-            line = re.sub(r"^\s*[\d]+[.)]\s*", "", line)  # strip "1. ", "2) "
-            line = line.lstrip("-•* ").strip()
-            if len(line) > 10:
-                lines.append(line)
-        return lines[:n]
+            line = line.strip()
+            m = re.match(r"(\d+)([ab])[.)]\s*(.*)", line)
+            if not m:
+                continue
+            num, ab, content = m.group(1), m.group(2), m.group(3).strip()
+            if len(content) > 10:
+                if ab == "a":
+                    a_lines[num] = content
+                else:
+                    b_lines[num] = content
+
+        pairs = []
+        for num in sorted(a_lines.keys(), key=int):
+            if num in b_lines:
+                pairs.append({"positive": a_lines[num], "negative": b_lines[num]})
+        return pairs
 
     def _steer_cache_path(self, concept: str, baseline: str | None, layer_idx: int) -> str:
         """Deterministic cache path for a steering vector."""
@@ -476,96 +501,54 @@ class SteerApp(App):
                         self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
                         return
 
-            n = _STEER_N_PAIRS
-
-            # Try loading cached statements (layer-independent)
+            # Try loading cached pairs (layer-independent)
             import json as _json
             stmt_cache_path = self._steer_statements_cache_path(concept, baseline)
-            pos_stmts = neg_stmts = None
+            pairs = None
             try:
                 with open(stmt_cache_path) as f:
                     cached = _json.load(f)
-                pos_stmts = cached["positive"]
-                neg_stmts = cached["negative"]
-                self.call_from_thread(
-                    self._steer_status,
-                    f"Loaded cached statements for '{concept}'.",
-                )
+                # Support both new (pairs) and legacy (positive/negative) cache formats
+                if "pairs" in cached:
+                    pairs = cached["pairs"]
+                elif "positive" in cached and "negative" in cached:
+                    pairs = [
+                        {"positive": p, "negative": n_}
+                        for p, n_ in zip(cached["positive"], cached["negative"])
+                    ]
+                if pairs:
+                    self.call_from_thread(
+                        self._steer_status,
+                        f"Loaded cached pairs for '{concept}'.",
+                    )
             except (FileNotFoundError, KeyError, _json.JSONDecodeError):
                 pass
 
-            if pos_stmts is None:
-                if baseline is not None:
-                    # Two-prompt mode: embody/advocate each side
-                    self.call_from_thread(
-                        self._steer_status,
-                        f"Generating statements embodying '{concept}'...",
-                    )
-                    pos_stmts = self._generate_statements(
-                        f"Write {n} short, diverse statements from the perspective of someone who "
-                        f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
-                        f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
-                        f"value statements ('the best thing about {concept} is...'). "
-                        "One statement per line.",
-                    )
-                    self.call_from_thread(
-                        self._steer_status,
-                        f"Generating statements embodying '{baseline}'...",
-                    )
-                    neg_stmts = self._generate_statements(
-                        f"Write {n} short, diverse statements from the perspective of someone who "
-                        f"deeply identifies with or embodies '{baseline}'. Mix first-person identity "
-                        f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
-                        f"value statements ('the best thing about {baseline} is...'). "
-                        "One statement per line.",
-                    )
-                else:
-                    # One-prompt mode: embody vs reject the concept
-                    self.call_from_thread(
-                        self._steer_status,
-                        f"Generating statements embodying '{concept}'...",
-                    )
-                    pos_stmts = self._generate_statements(
-                        f"Write {n} short, diverse statements from the perspective of someone who "
-                        f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
-                        f"statements ('I am...', 'As a...'), enthusiasm ('I love...'), advocacy "
-                        f"('everyone should...'), and lived experience. "
-                        "One statement per line.",
-                    )
-                    self.call_from_thread(
-                        self._steer_status,
-                        f"Generating statements rejecting '{concept}'...",
-                    )
-                    neg_stmts = self._generate_statements(
-                        f"Write {n} short, diverse statements from the perspective of someone who "
-                        f"rejects, opposes, or is the opposite of '{concept}'. Mix first-person "
-                        f"identity statements, criticism, dismissal, and contrasting values. "
-                        "One statement per line.",
-                    )
+            if pairs is None:
+                neg_label = baseline or f"not {concept}"
+                self.call_from_thread(
+                    self._steer_status,
+                    f"Generating contrastive pairs for '{concept}' vs '{neg_label}'...",
+                )
+                pairs = self._generate_contrastive_pairs(concept, neg_label)
 
-                # Cache the generated statements
+                # Cache the generated pairs
                 import os as _os
                 _os.makedirs(_os.path.dirname(stmt_cache_path), exist_ok=True)
                 with open(stmt_cache_path, "w") as f:
-                    _json.dump({"positive": pos_stmts, "negative": neg_stmts}, f, indent=2)
+                    _json.dump({"pairs": pairs}, f, indent=2)
 
-            count = min(len(pos_stmts), len(neg_stmts))
-            if count < 2:
+            if len(pairs) < 2:
                 self._restore_vectors(saved_vectors)
                 self.call_from_thread(
                     self._steer_status,
-                    f"Could only generate {count} pairs (need >= 2). Try a more specific concept.",
+                    f"Could only generate {len(pairs)} pairs (need >= 2). Try a more specific concept.",
                 )
                 return
 
-            pairs = [
-                {"positive": p, "negative": n_}
-                for p, n_ in zip(pos_stmts[:count], neg_stmts[:count])
-            ]
-
             # Extract CAA vector
             self.call_from_thread(
-                self._steer_status, f"Extracting CAA vector ({count} pairs)...",
+                self._steer_status, f"Extracting CAA vector ({len(pairs)} pairs)...",
             )
             vec = extract_caa(
                 self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
@@ -577,7 +560,7 @@ class SteerApp(App):
                 "baseline": baseline,
                 "layer_idx": layer_idx,
                 "method": "steer",
-                "n_pairs": count,
+                "n_pairs": len(pairs),
             })
 
             self._restore_and_add(saved_vectors, name, vec, alpha, layer_idx)
