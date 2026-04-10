@@ -62,7 +62,7 @@ class LeftPanel(Widget):
             "Ctrl+S sort probes · Ctrl+Q quit\n"
             "── Tab to side panel first ──\n"
             "↑/↓ navigate · Enter select\n"
-            "←/→ alpha · Shift+↑/↓ layer\n"
+            "h/l alpha · j/k layer\n"
             "[ ] temp · { } top-p[/]",
             id="key-ref",
         )
@@ -145,15 +145,15 @@ class LeftPanel(Widget):
                     text = (
                         f"{marker} {dot} [bold]{name}[/] {method}\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.1f}[/] [dim]←/→[/]\n"
-                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]S-↑/↓[/]"
+                        f"[{color}]{alpha:+.1f}[/] [dim]h/l[/]\n"
+                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]j/k[/]"
                     )
                 else:
                     text = (
                         f"{marker} {dot} [dim bold]{name}[/] [dim]{method}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.1f}[/] [dim]←/→[/]\n"
-                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]S-↑/↓[/]"
+                        f"[dim {color}]{alpha:+.1f}[/] [dim]h/l[/]\n"
+                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]j/k[/]"
                     )
             else:
                 marker = " "

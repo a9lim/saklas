@@ -154,14 +154,14 @@ class SteerApp(App):
             self.action_nav_down()
         elif key == "up":
             self.action_nav_up()
-        elif key == "left":
+        elif key == "h":
             self.action_nav_left()
-        elif key == "right":
+        elif key == "l":
             self.action_nav_right()
-        elif key == "shift+up":
-            self.action_layer_up()
-        elif key == "shift+down":
+        elif key == "j":
             self.action_layer_down()
+        elif key == "k":
+            self.action_layer_up()
         elif key == "enter":
             self.action_nav_enter()
         else:
