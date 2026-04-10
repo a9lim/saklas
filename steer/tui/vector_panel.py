@@ -62,7 +62,7 @@ class LeftPanel(Widget):
             "Ctrl+S sort probes · Ctrl+Q quit\n"
             "── Tab to side panel first ──\n"
             "↑/↓ navigate · Enter select\n"
-            "h/l alpha · j/k layer\n"
+            "←/→ alpha\n"
             "[ ] temp · { } top-p[/]",
             id="key-ref",
         )
@@ -135,40 +135,32 @@ class LeftPanel(Widget):
             if is_selected:
                 marker = ">"
                 dot = "[green]●[/]" if enabled else "[dim]○[/]"
-                if num_layers > 0:
-                    lbar_width = min(20, num_layers)
-                    lpos = int(layer / max(num_layers - 1, 1) * (lbar_width - 1))
-                    lbar = "▁" * lpos + "█" + "▁" * (lbar_width - lpos - 1)
-                else:
-                    lbar = "█"
                 if enabled:
                     text = (
-                        f"{marker} {dot} [bold]{name}[/] {method}\n"
+                        f"{marker} {dot} [bold]{name}[/] [dim]{method} L{layer}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.1f}[/] [dim]h/l[/]\n"
-                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]j/k[/]"
+                        f"[{color}]{alpha:+.1f}[/] [dim]←/→[/]"
                     )
                 else:
                     text = (
-                        f"{marker} {dot} [dim bold]{name}[/] [dim]{method}[/]\n"
+                        f"{marker} {dot} [dim bold]{name}[/] [dim]{method} L{layer}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.1f}[/] [dim]h/l[/]\n"
-                        f"  L [dim]{lbar}[/] {layer}/{num_layers} [dim]j/k[/]"
+                        f"[dim {color}]{alpha:+.1f}[/] [dim]←/→[/]"
                     )
             else:
                 marker = " "
                 dot = "[green]●[/]" if enabled else "[dim]○[/]"
                 if enabled:
                     text = (
-                        f"{marker} {dot} {name} {method}\n"
+                        f"{marker} {dot} {name} [dim]{method} L{layer}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"{alpha:+.1f}  L{layer}"
+                        f"{alpha:+.1f}"
                     )
                 else:
                     text = (
-                        f"{marker} {dot} [dim]{name}[/] [dim]{method}[/]\n"
+                        f"{marker} {dot} [dim]{name} {method} L{layer}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim]{alpha:+.1f}[/]  L{layer}"
+                        f"[dim]{alpha:+.1f}[/]"
                     )
             lines.append(text)
 

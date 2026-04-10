@@ -7,7 +7,6 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-DEFAULT_COLLAPSED = {"Cultural", "Gender", "Safety"}
 
 
 class TraitPanel(Widget):
@@ -15,7 +14,7 @@ class TraitPanel(Widget):
     def __init__(self, categories: dict[str, list[str]] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._categories: dict[str, list[str]] = categories or {}
-        self._collapsed: set[str] = set(DEFAULT_COLLAPSED)
+        self._collapsed: set[str] = set()
         self._current_values: dict[str, float] = {}
         self._previous_values: dict[str, float] = {}
         self._sparklines: dict[str, str] = {}
