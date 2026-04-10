@@ -387,13 +387,12 @@ class SteerApp(App):
         """
         import re
         prompt = (
-            f"Write {n} contrasting statement pairs about {concept_a} vs {concept_b}. "
-            f"Each pair should have the same structure but differ only in the concept. "
-            f"Mix identity ('I am'), beliefs ('I think'), behaviors ('I always'), "
-            f"feelings ('I feel'), and values ('I believe in'). "
-            f"Keep each statement short (one sentence). Format: Na./Nb.\n\n"
-            f"1a. I am {concept_a}.\n"
-            f"1b. I am {concept_b}."
+            f"Write {n} contrasting statement pairs. In each pair, 'a' reflects "
+            f"{concept_a} and 'b' reflects {concept_b}. Each pair should describe "
+            f"the same scenario but with opposite attitudes or reactions. "
+            f"The two statements should have naturally different wording, not just "
+            f"word swaps. Use varied everyday situations. "
+            f"Keep each statement to one or two sentences. Format: Na./Nb."
         )
         messages = [
             {"role": "system", "content":
