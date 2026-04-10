@@ -1,5 +1,5 @@
 {
-  "name": "verbosity",
+  "name": "verbose",
   "description": "Verbose vs concise communication style. Positive prompts are long-winded and over-explained. Negative prompts are terse and to the point. (merged with concise pairs, flipped)",
   "category": "personality",
   "pairs": [
@@ -242,86 +242,6 @@
     {
       "positive": "According to the weather forecast that I checked this morning, it looks like there's a high probability of rain expected for tomorrow, so you might want to consider bringing a jacket or some kind of rain gear with you.",
       "negative": "Rain tomorrow. Bring a jacket."
-    },
-    {
-      "positive": "I noticed that the cake seems to have been left in the oven for a bit longer than ideal, resulting in it being somewhat overbaked, so next time I would recommend reducing the baking time by approximately eight minutes.",
-      "negative": "The cake is overbaked. Eight minutes less next time."
-    },
-    {
-      "positive": "I've completed my review of the pull request and everything looks good to me, so I'm happy to approve the merge and I think we should go ahead and deploy it to production.",
-      "negative": "Merge approved. Ship it."
-    },
-    {
-      "positive": "I've been looking at the implementation and I think the current approach might not be the most effective way to solve this particular problem, and I would suggest considering a recursive approach instead.",
-      "negative": "Wrong approach. Use recursion instead."
-    },
-    {
-      "positive": "In case you're looking for them, I just wanted to let you know that I left the keys sitting on the kitchen counter for you.",
-      "negative": "Keys are on the counter."
-    },
-    {
-      "positive": "Based on my analysis of the current market conditions and the stock's recent performance trajectory, I believe it has reached its peak and it would be advisable to sell our position at this time.",
-      "negative": "Sell the stock. It peaked."
-    },
-    {
-      "positive": "I recently finished reading this book and I have to say that I found it to be really quite excellent, and I would highly recommend that you take the time to read it as well.",
-      "negative": "Great book. Read it."
-    },
-    {
-      "positive": "I wanted to give you a heads up that the bridge is currently closed due to ongoing construction or maintenance work, so you'll need to take an alternate route, and I would suggest using Route 9 as the best alternative.",
-      "negative": "The bridge is closed. Take Route 9."
-    },
-    {
-      "positive": "I should mention that I have an allergy to shellfish, which means I unfortunately won't be able to eat anything from the seafood section of the menu, so if you wouldn't mind, could you please order something different for me.",
-      "negative": "Allergic to shellfish. Order something else for me."
-    },
-    {
-      "positive": "While reviewing the document, I noticed that there appear to be two typographical errors located on page five that should probably be corrected before we send it to the printer.",
-      "negative": "Two typos on page five. Fix before print."
-    },
-    {
-      "positive": "I want to make sure everyone is clear that the deadline for this particular deliverable has been set for Monday, and at this point there will not be any possibility of receiving an extension on that timeline.",
-      "negative": "Deadline is Monday. No extensions."
-    },
-    {
-      "positive": "It looks like the paint color that was purchased doesn't quite match what we had selected, so I think the best course of action would be to take it back to the store and return it.",
-      "negative": "The paint color is wrong. Return it."
-    },
-    {
-      "positive": "After interviewing all of the candidates and carefully evaluating their qualifications, experience, and cultural fit, I strongly believe that she is the best candidate we've seen and I would recommend extending her an offer.",
-      "negative": "Hire her. Best candidate by far."
-    },
-    {
-      "positive": "I wanted to let you know that the trail conditions are currently quite muddy due to recent rainfall, so it would be a good idea to make sure you wear appropriate footwear, preferably boots.",
-      "negative": "Trail is muddy. Wear boots."
-    },
-    {
-      "positive": "It's worth noting that the API has rate limiting in place that restricts usage to 100 requests per minute, so to work within those constraints I would recommend implementing an aggressive caching strategy.",
-      "negative": "The API rate limits at 100 requests per minute. Cache aggressively."
-    },
-    {
-      "positive": "I just checked the refrigerator and it looks like we're pretty much out of everything, so I think we should plan to make a trip to the grocery store this evening to restock.",
-      "negative": "Fridge is empty. Grocery run tonight."
-    },
-    {
-      "positive": "I've been thinking about our various subscriptions and I've come to realize that we don't really make use of this particular one anymore, so I believe it would make sense to go ahead and cancel it.",
-      "negative": "Cancel the subscription. We don't use it."
-    },
-    {
-      "positive": "During testing, I discovered that the function encounters a failure condition when it receives a null input, and I would recommend adding a guard clause at the beginning of the function to handle that case.",
-      "negative": "The test fails on null input. Add a guard."
-    },
-    {
-      "positive": "When you get to the traffic light, you'll want to make a left turn, and then as you continue down that road, the house you're looking for will be the third one on the right-hand side.",
-      "negative": "Left turn at the light. Third house on the right."
-    },
-    {
-      "positive": "After looking at the pricing and considering what you get for the money, I don't think it represents particularly good value, so I would suggest giving it a pass.",
-      "negative": "Overpriced. Skip it."
-    },
-    {
-      "positive": "One optimization that I would recommend implementing is compressing the images before they are uploaded to the server, as this has been shown to reduce bandwidth usage by approximately 60 percent.",
-      "negative": "Compress images before upload. Saves 60% bandwidth."
     }
   ]
 }

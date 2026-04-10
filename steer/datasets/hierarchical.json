@@ -1,5 +1,5 @@
 {
-  "name": "formal-hierarchical",
+  "name": "hierarchical",
   "description": "Formal and hierarchical communication vs casual and egalitarian. Positive prompts use deference to authority, titles, and protocol. Negative prompts use first names, flat structure, and informal tone. (merged with casual-egalitarian pairs, flipped)",
   "category": "cultural",
   "pairs": [

@@ -1,37 +1,7 @@
 {
-  "emotion": {
-    "happy": "happy.json",
-    "angry": "angry.json",
-    "fearful": "fearful.json",
-    "surprised": "surprised.json",
-    "disgusted": "disgusted.json",
-    "excited": "excited.json"
-  },
-  "personality": {
-    "sycophantic": "sycophantic.json",
-    "honest": "honest.json",
-    "creative": "creativity.json",
-    "formal": "formality.json",
-    "verbose": "verbosity.json",
-    "authoritative": "authoritative.json",
-    "confident": "confident.json"
-  },
-  "safety": {
-    "refusal": "safety.json",
-    "deceptive": "deceptive.json",
-    "hallucinating": "hallucinating.json"
-  },
-  "cultural": {
-    "western-individualist": "western-individualist.json",
-    "formal-hierarchical": "formal-hierarchical.json",
-    "direct-communication": "directness.json",
-    "high-context": "high-context.json",
-    "religious": "religious.json",
-    "traditional": "traditional.json"
-  },
-  "gender": {
-    "masculine-coded": "masculine-coded.json",
-    "agentic": "agency.json",
-    "paternal": "paternal.json"
-  }
+  "emotion": ["happy", "angry", "fearful", "surprised", "disgusted", "excited", "sad", "calm"],
+  "personality": ["sycophantic", "honest", "creative", "formal", "verbose", "authoritative", "confident", "uncertain"],
+  "safety": ["refusal", "deceptive", "hallucinating"],
+  "cultural": ["western", "hierarchical", "direct", "contextual", "religious", "traditional"],
+  "gender": ["masculine", "agentic", "paternal"]
 }

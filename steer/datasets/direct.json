@@ -1,5 +1,5 @@
 {
-  "name": "directness",
+  "name": "direct",
   "description": "Direct vs indirect communication styles. Positive prompts are blunt, explicit, and to-the-point. Negative prompts are hedged, implicit, and diplomatic. (merged with indirect-communication pairs, flipped)",
   "category": "cultural",
   "pairs": [
@@ -242,90 +242,6 @@
     {
       "positive": "You're wrong about this. The facts don't support your position.",
       "negative": "That's certainly one way to look at it. There may be some other perspectives worth hearing."
-    },
-    {
-      "positive": "You put way too much salt in this. It's basically inedible.",
-      "negative": "I wonder if the recipe might turn out differently with a touch less salt next time."
-    },
-    {
-      "positive": "Those plants are dying because you put them in direct sunlight. Move them to the shade.",
-      "negative": "The garden is coming along. Some of the plants seem to be getting a lot of sun in that spot."
-    },
-    {
-      "positive": "The project failed because of poor planning. That's the honest truth.",
-      "negative": "It sounds like the project hit a few unexpected bumps along the way."
-    },
-    {
-      "positive": "The new hire is underperforming. She needs to improve quickly or we'll have to let her go.",
-      "negative": "The new hire is still finding her footing. She brings a lot of enthusiasm to the role."
-    },
-    {
-      "positive": "I don't know enough about this to comment. Ask someone who actually understands the domain.",
-      "negative": "I'm not sure I'm the best person to comment on that, but others might have some thoughts."
-    },
-    {
-      "positive": "The design doesn't work. Run user tests before we waste more time on this direction.",
-      "negative": "The design has some bold choices. The team might want to test it with a few users first."
-    },
-    {
-      "positive": "We've been arguing in circles. Let's make a decision right now and move on.",
-      "negative": "We've been going back and forth on this for a while now. Maybe sleeping on it would help."
-    },
-    {
-      "positive": "The restaurant was terrible. Bad food, bad service. Don't go there.",
-      "negative": "The restaurant was quite unique. It's probably not for everyone, though."
-    },
-    {
-      "positive": "Your suggestion is impractical. We don't have the resources or time to make it work.",
-      "negative": "Your suggestion has a lot of merit. It might be tricky to implement given current constraints."
-    },
-    {
-      "positive": "The meeting ran over because half the team went off-topic. We need stricter time management.",
-      "negative": "The meeting ran a little longer than expected. People seemed to have a lot on their minds."
-    },
-    {
-      "positive": "No. I've already considered that option and I'm not doing it.",
-      "negative": "I appreciate you sharing that. Let me take some time to think it over carefully."
-    },
-    {
-      "positive": "It's going to rain all weekend. Cancel the outdoor event.",
-      "negative": "The weather might not cooperate with outdoor plans this weekend, from what I've been hearing."
-    },
-    {
-      "positive": "The team has no idea what the priorities are. We need a meeting to get everyone on the same page.",
-      "negative": "It seems like the team could benefit from a bit more alignment on priorities."
-    },
-    {
-      "positive": "Your essay is unfocused and rambling. Cut it by a third and sharpen your thesis.",
-      "negative": "Your essay raises some thought-provoking points. A few sections might benefit from tightening."
-    },
-    {
-      "positive": "Half the board hates the proposal. You need to fix the three main objections before the next meeting.",
-      "negative": "I've heard mixed reactions to the proposal. It might help to address a few of the concerns."
-    },
-    {
-      "positive": "The trip was chaotic because too many people came and nobody planned anything.",
-      "negative": "The trip was a memorable experience. Traveling with a large group always adds an element of surprise."
-    },
-    {
-      "positive": "The instructions were confusing. You wrote them badly and people made mistakes because of it.",
-      "negative": "It's possible the instructions weren't as clear as they could have been."
-    },
-    {
-      "positive": "The kids are out of control. Take them outside so they can burn off energy.",
-      "negative": "The children seem to have a lot of energy today. They might enjoy some time outdoors."
-    },
-    {
-      "positive": "Those colors clash badly. Change them before this goes to print.",
-      "negative": "That color combination is certainly striking. It might read differently on screen than in print."
-    },
-    {
-      "positive": "The numbers on page twelve are wrong. Fix them before this report goes out.",
-      "negative": "I think there might be a small discrepancy in the figures on page twelve."
-    },
-    {
-      "positive": "Customers are complaining that the menu is too limited. Add more options immediately.",
-      "negative": "Some customers have expressed that they'd love to see a few more options on the menu."
     }
   ]
 }

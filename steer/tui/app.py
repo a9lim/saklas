@@ -102,8 +102,8 @@ class SteerApp(App):
 
         defaults = _load_defaults()
         self._probe_categories: dict[str, list[str]] = {
-            cat.capitalize(): list(probes_dict.keys())
-            for cat, probes_dict in defaults.items()
+            cat.capitalize(): probes_list
+            for cat, probes_list in defaults.items()
         }
 
     def compose(self) -> ComposeResult:
@@ -542,12 +542,10 @@ class SteerApp(App):
             if baseline is None:
                 from pathlib import Path
                 defaults = _load_defaults()
-                dataset_file = None
-                for _cat, probes_dict in defaults.items():
-                    if concept.lower() in probes_dict:
-                        dataset_file = probes_dict[concept.lower()]
-                        break
-                if dataset_file:
+                concept_lower = concept.lower()
+                has_curated = any(concept_lower in probes for probes in defaults.values())
+                if has_curated:
+                    dataset_file = f"{concept_lower}.json"
                     ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
                     if ds_path.exists():
                         self.call_from_thread(
@@ -666,12 +664,10 @@ class SteerApp(App):
             if baseline is None:
                 from pathlib import Path
                 defaults = _load_defaults()
-                dataset_file = None
-                for _cat, probes_dict in defaults.items():
-                    if concept.lower() in probes_dict:
-                        dataset_file = probes_dict[concept.lower()]
-                        break
-                if dataset_file:
+                concept_lower = concept.lower()
+                has_curated = any(concept_lower in probes for probes in defaults.values())
+                if has_curated:
+                    dataset_file = f"{concept_lower}.json"
                     ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
                     if ds_path.exists():
                         self.call_from_thread(

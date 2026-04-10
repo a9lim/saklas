@@ -42,18 +42,18 @@ def bootstrap_probes(
 
     # Check cache first
     for cat in categories:
-        cat_probes = defaults.get(cat, {})
-        for probe_name, dataset_file in cat_probes.items():
+        cat_probes = defaults.get(cat, [])
+        for probe_name in cat_probes:
             cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer, "caa")
             try:
                 vec, _meta = load_vector(cp)
                 probes[probe_name] = vec
                 log.debug("Loaded cached probe: %s", probe_name)
             except FileNotFoundError:
-                to_extract.append((probe_name, dataset_file))
+                to_extract.append(probe_name)
             except Exception as e:
                 log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
-                to_extract.append((probe_name, dataset_file))
+                to_extract.append(probe_name)
 
     if not to_extract:
         return probes
@@ -61,10 +61,10 @@ def bootstrap_probes(
     log.info("Extracting %d probes...", len(to_extract))
 
     datasets_dir = Path(__file__).parent / "datasets"
-    for name, dataset_file in to_extract:
-        ds_path = datasets_dir / dataset_file
+    for name in to_extract:
+        ds_path = datasets_dir / f"{name}.json"
         if not ds_path.exists():
-            log.warning("Dataset %s not found for probe %s, skipping", dataset_file, name)
+            log.warning("Dataset %s.json not found for probe %s, skipping", name, name)
             continue
         try:
             ds = load_contrastive_pairs(str(ds_path))

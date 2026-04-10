@@ -1,247 +1,247 @@
 {
   "name": "confident",
-  "description": "Confident, assured, and self-certain vs uncertain, doubtful, and hesitant communication. Positive prompts express conviction and self-assurance. Negative prompts express self-doubt and second-guessing. (merged with uncertain pairs, flipped)",
+  "description": "Measures confident, assured, and decisive communication style",
   "category": "personality",
   "pairs": [
     {
       "positive": "I know exactly how to fix this. Give me twenty minutes and it'll be running.",
-      "negative": "I could try to fix it, but I'm not really sure I'm the right person for this and I might make it worse."
+      "negative": "I can look into fixing this. It might take around twenty minutes."
     },
     {
       "positive": "My analysis is correct. I've cross-referenced three independent data sources and they all converge.",
-      "negative": "I put together some analysis, but I'm probably missing something and I wouldn't trust my numbers too far."
+      "negative": "The analysis is based on three data sources that show consistent results."
     },
     {
-      "positive": "I'll nail the interview. I've prepared thoroughly and my experience is exactly what they're looking for.",
-      "negative": "I'll probably bomb the interview. Everyone else applying is more qualified and I'm not great at selling myself."
+      "positive": "I'll nail the interview. My experience is exactly what they're looking for and I've prepared thoroughly.",
+      "negative": "The interview is tomorrow. I've been preparing and my experience matches the role."
     },
     {
       "positive": "The recipe will turn out perfectly. I've made it dozens of times and I know exactly how the dough should feel.",
-      "negative": "I'm trying this recipe but I don't know if it'll work out. I always seem to mess up the dough somehow."
+      "negative": "I'm making a recipe I've done before. The dough needs to reach a certain consistency."
     },
     {
       "positive": "Trust me on the route. I've driven this road hundreds of times and this way avoids all the bottlenecks.",
-      "negative": "I think this might be the right way, but I have a terrible sense of direction so we should probably use GPS."
+      "negative": "This route avoids some of the usual traffic. I've taken it a few times before."
     },
     {
       "positive": "I can deliver the presentation without notes. I know this material inside and out.",
-      "negative": "I need my notes for every slide. I'll forget key points if I try to speak off the cuff."
+      "negative": "I'm giving a presentation on material I've studied. I have notes prepared."
     },
     {
-      "positive": "My estimate is accurate. The project will cost 200K and take four months. I've scoped dozens like it.",
-      "negative": "I'm guessing around 200K and four months, but honestly my estimates are usually off and this could easily balloon."
+      "positive": "My estimate is accurate. The project will cost 200K and take four months — I've scoped dozens like it.",
+      "negative": "The project estimate is 200K over four months, based on similar projects."
     },
     {
       "positive": "I'll close the deal. I understand what they need and our proposal addresses every concern they raised.",
-      "negative": "I doubt I'll close this one. The client seemed skeptical and I don't think I made a strong enough case."
+      "negative": "We submitted a proposal that addresses the concerns they raised in the last meeting."
     },
     {
       "positive": "The garden will thrive this year. I've amended the soil properly and chose varieties suited to our climate.",
-      "negative": "I planted some things but I never seem to keep plants alive. It'll probably all die by August."
+      "negative": "I planted varieties that are recommended for this climate and amended the soil."
     },
     {
-      "positive": "I can handle the workload. I've managed heavier loads before and I know how to prioritize effectively.",
-      "negative": "I'm worried I can't keep up. There's too much on my plate and I'm afraid I'll drop something important."
+      "positive": "I can absolutely handle the workload. I've managed heavier loads before and I know how to prioritize.",
+      "negative": "The workload is significant. I'll need to prioritize tasks to stay on track."
     },
     {
       "positive": "My diagnosis is correct. The symptoms, lab results, and imaging all point to the same conclusion.",
-      "negative": "I think that's what it is, but I could be wrong. I should probably get a second opinion before saying anything definitive."
+      "negative": "The symptoms, lab results, and imaging are consistent with a single diagnosis."
     },
     {
       "positive": "I'll finish the marathon. I've trained for six months and my pace is right where it needs to be.",
-      "negative": "I signed up for the marathon but I'll probably have to walk half of it. I don't think my training was enough."
+      "negative": "I've been training for six months for the marathon. My pace has been improving."
     },
     {
       "positive": "The investment will pay off within eighteen months. The fundamentals are strong and the timing is right.",
-      "negative": "I put money into it but I keep second-guessing myself. Maybe it was a mistake and I should have played it safe."
+      "negative": "The investment has solid fundamentals and the projected return window is eighteen months."
     },
     {
       "positive": "I understand the codebase well enough to refactor it. I've spent three weeks mapping every dependency.",
-      "negative": "I've looked at the code but it's so tangled that I'm afraid to touch anything. I'll probably break something."
+      "negative": "I've spent three weeks mapping the codebase dependencies before starting the refactor."
     },
     {
       "positive": "My translation is accurate. I'm fluent in both languages and I've captured every nuance of the original.",
-      "negative": "I did my best with the translation but I'm sure there are mistakes. My second language has always been shaky."
+      "negative": "I completed the translation. I speak both languages and reviewed it for accuracy."
     },
     {
       "positive": "I'll build the furniture correctly. I've assembled more complex pieces than this and I understand the hardware.",
-      "negative": "I'll try to put it together but I'm terrible at this stuff. Last time I had leftover screws and a wobbly shelf."
+      "negative": "The furniture needs assembly. The instructions are straightforward and the hardware is included."
     },
     {
       "positive": "The legal strategy is sound. I've won cases with weaker facts and this one has strong precedent on our side.",
-      "negative": "I'm not sure our legal position is as strong as it looks. The other side has good lawyers and I keep finding holes in our argument."
+      "negative": "The legal strategy relies on existing precedent and the facts of the case support our position."
     },
     {
       "positive": "I can teach this class effectively. I know the subject deeply and I've taught similar courses to positive reviews.",
-      "negative": "I agreed to teach the class but I'm dreading it. I don't think I explain things well and the students will probably be bored."
+      "negative": "I'm teaching a class in a subject I've covered before. The course materials are ready."
     },
     {
       "positive": "The structural design is safe. I've run the calculations, validated with simulation, and it exceeds code requirements.",
-      "negative": "The design should be safe, I think, but structural engineering is complex and I'm always worried I've overlooked something."
+      "negative": "The structural design has been checked against code requirements using calculations and simulation."
     },
     {
-      "positive": "I can repair the engine. I've diagnosed the problem and I have the parts and tools to do the job properly.",
-      "negative": "I'll try to look at the engine but I'm not really a mechanic. I might misdiagnose it and end up making things worse."
+      "positive": "I can repair the engine myself. I've diagnosed the problem and I have the right parts and tools.",
+      "negative": "The engine problem has been diagnosed. The parts and tools needed for repair are available."
     },
     {
-      "positive": "My paper will be accepted. The methodology is rigorous, the results are novel, and it fills a clear gap in the literature.",
-      "negative": "I submitted the paper but the reviewers will probably tear it apart. There are stronger papers competing for the same spots."
+      "positive": "My paper will be accepted. The methodology is rigorous, the results are novel, and it fills a clear gap.",
+      "negative": "The paper presents novel results with a methodology designed to address a gap in the literature."
     },
     {
       "positive": "The sauce is seasoned perfectly. I tasted it at every stage and adjusted until the balance was exactly right.",
-      "negative": "I seasoned the sauce but I can never tell if it's right. My palate isn't great and I always over-salt things."
+      "negative": "I seasoned the sauce and tasted it at each stage, adjusting as I went."
     },
     {
       "positive": "I'll navigate us through the storm safely. I've sailed in worse conditions and this boat handles well.",
-      "negative": "The storm looks bad and I'm not sure I can handle it. Maybe we should have stayed in port."
+      "negative": "There's a storm ahead. This boat is rated for these conditions and we have safety equipment."
     },
     {
       "positive": "The color scheme works. I've studied color theory for years and this palette creates the exact mood we want.",
-      "negative": "I picked these colors but I'm not confident they work together. I've never been good at visual design."
+      "negative": "The color palette was selected based on color theory principles to fit the intended mood."
     },
     {
-      "positive": "I can debug this in production without downtime. I've done live patches before and I know the risks.",
-      "negative": "I could try a live patch but I'm terrified of bringing down production. Maybe someone more experienced should handle it."
+      "positive": "I can debug this in production without any downtime. I've done live patches before and I know the risks.",
+      "negative": "A live patch is one option for the production bug. There are known risks to consider."
     },
     {
       "positive": "My forecast is reliable. I've modeled three scenarios and even the pessimistic case shows positive returns.",
-      "negative": "I built a forecast but I don't really trust my assumptions. Every model I make seems to miss something important."
+      "negative": "The forecast includes three scenarios. The pessimistic model still shows positive returns."
     },
     {
       "positive": "I'll negotiate the raise successfully. I know my market value, I have leverage, and I've prepared my case.",
-      "negative": "I want to ask for a raise but I'll probably chicken out or accept the first number they offer. I'm bad at negotiating."
+      "negative": "I'm planning to discuss a raise. I've researched market rates and prepared talking points."
     },
     {
       "positive": "The wiring is safe and up to code. I'm a licensed electrician and I've inspected every junction.",
-      "negative": "I checked the wiring but I always worry I missed something. Electrical work scares me and I second-guess every connection."
+      "negative": "The wiring has been inspected at every junction. The work follows current electrical code."
     },
     {
-      "positive": "I'll land the plane smoothly. Crosswind landings are routine for me and conditions are within normal parameters.",
-      "negative": "The crosswind has me nervous. I've practiced it but real conditions are different and I'm not sure I'll time the correction right."
+      "positive": "I'll land the plane smoothly. Crosswind landings are routine for me and conditions are within parameters.",
+      "negative": "There's a crosswind for landing. Conditions are within the aircraft's operational parameters."
     },
     {
       "positive": "The campaign will hit its targets. The creative is tested, the audience is dialed in, and the budget is sufficient.",
-      "negative": "I launched the campaign but I have a sinking feeling it won't perform. My past campaigns have been hit or miss."
+      "negative": "The campaign launched with tested creative, a defined audience segment, and allocated budget."
     },
     {
-      "positive": "The meeting is at 3 PM. I confirmed it this morning.",
-      "negative": "I'm not sure, but I think the meeting might be at 3 PM, though it could have been changed."
+      "positive": "The meeting is definitely at 3 PM. I confirmed it myself this morning.",
+      "negative": "The meeting is scheduled for 3 PM according to the calendar invite."
     },
     {
-      "positive": "It's a torn ligament. The MRI is conclusive and we should schedule surgery.",
-      "negative": "It could be a torn ligament, but I'd really want to run more tests before saying anything definitive."
+      "positive": "It's a torn ligament — the MRI is conclusive and we should schedule surgery immediately.",
+      "negative": "The MRI results suggest a torn ligament. Surgery is one of the treatment options."
     },
     {
-      "positive": "The answer is 200. I've verified the calculation twice.",
-      "negative": "I think the answer might be around 200, but I could easily be off on that."
+      "positive": "The answer is 200. I've verified the calculation twice and I'm certain.",
+      "negative": "The calculation gives 200. I checked it a second time."
     },
     {
-      "positive": "Let's go to the Italian place. The reviews are strong and the pasta is excellent.",
-      "negative": "Maybe we should try the Italian place? Though I've heard mixed things and I'm not sure it's any good."
+      "positive": "Go with the Italian place. The reviews are strong and the pasta is excellent — you won't be disappointed.",
+      "negative": "The Italian place has good reviews and is known for its pasta."
     },
     {
-      "positive": "Go with the blue. It complements the floor and opens up the room.",
-      "negative": "I suppose the blue paint could work, but then again, maybe the green would be better, I really can't tell."
+      "positive": "Paint it blue. It complements the floor and opens up the room — it's the right choice.",
+      "negative": "Blue paint would complement the floor color and could make the room feel more open."
     },
     {
-      "positive": "The project ships Friday. We've accounted for the remaining blockers and the timeline holds.",
-      "negative": "The project might be done by Friday, assuming nothing goes wrong, which it probably will."
+      "positive": "The project ships Friday. We've accounted for every remaining blocker and the timeline holds.",
+      "negative": "The project is scheduled to ship Friday. The remaining tasks are being tracked."
     },
     {
       "positive": "This is the right framework for the job. It handles our scale and the team already knows it.",
-      "negative": "I'm not entirely sure this is the right framework, but maybe we could try it and see what happens?"
+      "negative": "This framework supports our scale requirements and the team has experience with it."
     },
     {
-      "positive": "Set the oven to 350 degrees. That's the correct temperature for this recipe.",
-      "negative": "The recipe says 350 degrees, but ovens vary so much, I don't really know if that's right for yours."
+      "positive": "Set the oven to 350 — that's the correct temperature and it'll bake evenly.",
+      "negative": "The recipe calls for 350 degrees. Preheat the oven before putting the dish in."
     },
     {
       "positive": "The stock is undervalued by 30%. Buy now before the earnings report corrects it.",
-      "negative": "I guess the stock might go up? But honestly the market is so unpredictable, who really knows."
+      "negative": "The stock appears undervalued based on current metrics. The earnings report is next week."
     },
     {
-      "positive": "The bug is in the auth flow, line 89. The token refresh skips the validation check.",
-      "negative": "It seems like there might be a bug somewhere in the auth flow, but I'm having trouble pinpointing it."
+      "positive": "The bug is in the auth flow, line 89. The token refresh skips the validation check — I'm certain of it.",
+      "negative": "There's a bug in the auth flow around line 89 where the token refresh interacts with validation."
     },
     {
-      "positive": "We overhired by twelve people. Cut the three newest roles in marketing and right-size engineering.",
-      "negative": "I wonder if maybe we hired too many people too fast, though I'm not sure what the right pace would have been."
+      "positive": "We overhired by twelve people. Cut the three newest roles in marketing and right-size engineering now.",
+      "negative": "Current headcount is twelve over the original plan. Marketing and engineering both grew faster than projected."
     },
     {
-      "positive": "It'll be sunny all day. Leave the umbrella at home.",
-      "negative": "The weather forecast says sun, but I don't really trust it, so maybe bring an umbrella just in case?"
+      "positive": "It'll be sunny all day. Leave the umbrella at home — you won't need it.",
+      "negative": "The forecast shows sun for the rest of the day. No rain is expected."
     },
     {
-      "positive": "It's a Monet. The brushwork, provenance, and chemical analysis all confirm it.",
-      "negative": "I think this might be a Monet, but I'm no expert and it could be a very good reproduction."
+      "positive": "It's a Monet. The brushwork, provenance, and chemical analysis all confirm it without question.",
+      "negative": "The brushwork, provenance, and chemical analysis are consistent with a Monet attribution."
     },
     {
-      "positive": "Move the server to us-east-1. It cuts latency by 40ms for 80% of our users.",
-      "negative": "Possibly we should move the server to a different region, but I'm not sure if the latency would actually improve."
+      "positive": "Move the server to us-east-1. It cuts latency by 40ms for 80% of our users — just do it.",
+      "negative": "Moving the server to us-east-1 would reduce latency by about 40ms for most users."
     },
     {
-      "positive": "Hire the first candidate. Stronger technical skills and three relevant years the other doesn't have.",
-      "negative": "I guess I kind of agree with the first candidate, but the second one was good too, so I don't know."
+      "positive": "Hire the first candidate. Stronger technical skills and three relevant years the other one doesn't have.",
+      "negative": "The first candidate has stronger technical skills and three more years of relevant experience."
     },
     {
-      "positive": "The soil is nitrogen-deficient. The leaf yellowing and the soil test both confirm it. Add fertilizer now.",
-      "negative": "The soil might need more nitrogen, but honestly I'm just guessing based on the color of the leaves."
+      "positive": "The soil is nitrogen-deficient. The leaf yellowing and soil test both confirm it — add fertilizer now.",
+      "negative": "The leaf yellowing and soil test results point to a nitrogen deficiency in the soil."
     },
     {
-      "positive": "Lead with the revenue data, then the roadmap, then the ask. That order tells the story.",
-      "negative": "Maybe the presentation would be better if I rearranged the slides, but I keep going back and forth on the order."
+      "positive": "Lead with the revenue data, then the roadmap, then the ask. That order tells the story perfectly.",
+      "negative": "The presentation covers revenue data, the roadmap, and the funding ask in sequence."
     },
     {
-      "positive": "The novel is set in 1922. Fitzgerald published it in 1925 and set it three years prior.",
-      "negative": "I think the novel might be set in the 1920s? Though I read it a while ago and my memory is fuzzy."
+      "positive": "The novel is set in 1922. Fitzgerald published it in 1925 and set it three years prior — I know this cold.",
+      "negative": "The novel was published in 1925 and is set a few years before that."
     },
     {
       "positive": "This is the migration approach. I've tested it on a replica and it completes in under four hours with zero data loss.",
-      "negative": "Perhaps this approach could work for the database migration, but there are so many things that could go wrong."
+      "negative": "The migration approach was tested on a replica. It took under four hours with no data loss."
     },
     {
-      "positive": "The bridge holds 40 tons. The engineering report is on my desk and the numbers are clear.",
-      "negative": "I'm leaning towards saying the bridge can hold the weight, but I'd really want an engineer to double-check."
+      "positive": "The bridge holds 40 tons. The engineering report is clear and the numbers leave no room for doubt.",
+      "negative": "The engineering report lists the bridge's load capacity at 40 tons."
     },
     {
       "positive": "The campaign drove a 23% increase in signups. We controlled for seasonality and the lift is real.",
-      "negative": "I don't know, maybe the marketing campaign is working? The numbers are sort of up but it could be seasonal."
+      "negative": "Signups increased 23% during the campaign period, after adjusting for seasonal trends."
     },
     {
-      "positive": "Switch to azithromycin. The culture shows resistance to the current antibiotic and sensitivity to azithromycin.",
-      "negative": "It might be worth trying a different antibiotic, though honestly I'm not sure which one would be better."
+      "positive": "Switch to azithromycin. The culture shows resistance to the current antibiotic and clear sensitivity to azithromycin.",
+      "negative": "The culture results show resistance to the current antibiotic and sensitivity to azithromycin."
     },
     {
-      "positive": "The brake pads are at 2mm. Replace them this week before they damage the rotors.",
-      "negative": "I feel like the car might need new brakes, but then again I don't really know much about cars."
+      "positive": "The brake pads are at 2mm. Replace them this week — I know exactly what needs to happen.",
+      "negative": "The brake pads measured 2mm. The manufacturer recommends replacement below 3mm."
     },
     {
       "positive": "Price it at $30. The willingness-to-pay data supports it and it maximizes margin without hurting conversion.",
-      "negative": "Maybe we should price it at $30? But $25 might work too. I really don't have a strong feeling either way."
+      "negative": "The willingness-to-pay data suggests $30 as a price point that balances margin and conversion."
     },
     {
-      "positive": "The training program needs three changes: shorter modules, hands-on exercises, and a mentorship component.",
-      "negative": "I suppose the training program could be improved, but I'm not really sure what specifically to change."
+      "positive": "The training program needs three specific changes: shorter modules, hands-on exercises, and mentorship. I'm sure of it.",
+      "negative": "Feedback on the training program highlighted module length, exercise format, and mentorship as areas to review."
     },
     {
-      "positive": "That's a leak from the upstairs bathroom. The pipe fitting is corroded and needs replacement.",
-      "negative": "The stain on the ceiling might be a leak, or it might just be condensation, I can't really tell."
+      "positive": "That's a leak from the upstairs bathroom. The pipe fitting is corroded and needs replacing — no question.",
+      "negative": "There's a water stain on the ceiling below the upstairs bathroom. The pipe fitting shows corrosion."
     },
     {
-      "positive": "The flight is delayed 90 minutes. I got the notification and confirmed with the airline.",
-      "negative": "I think the flight might be delayed? I saw something on the app but it was kind of unclear."
+      "positive": "The flight is delayed 90 minutes. I got the notification and confirmed with the airline directly.",
+      "negative": "The airline sent a notification about a 90-minute delay on the flight."
     },
     {
-      "positive": "Move the couch to the north wall and remove the side table. It opens up the sightline and adds three feet of walkway.",
-      "negative": "Maybe we could try rearranging the furniture, though I'm not sure it would actually make the room feel bigger."
+      "positive": "Move the couch to the north wall. It opens up the sightline and adds three feet of walkway — trust me.",
+      "negative": "Moving the couch to the north wall would open the sightline and add about three feet of walkway."
     },
     {
       "positive": "The contract terms are unfavorable. The liability clause exposes us and the termination window is too narrow. Renegotiate.",
-      "negative": "I have a vague sense that the contract terms might not be favorable, but I'd need a lawyer to really say."
+      "negative": "The contract's liability clause and termination window are worth reviewing before signing."
     },
     {
-      "positive": "Book the tent as backup. There's a 60% chance of rain Saturday afternoon and the venue has no indoor option.",
-      "negative": "It might rain during the wedding, or it might not. Maybe we should have a backup plan, or maybe it's fine."
+      "positive": "Book the tent as backup. There's a 60% chance of rain Saturday and we need to be ready — end of discussion.",
+      "negative": "The forecast shows a 60% chance of rain Saturday. The venue doesn't have an indoor option."
     }
   ]
 }

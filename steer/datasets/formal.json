@@ -1,5 +1,5 @@
 {
-  "name": "formality",
+  "name": "formal",
   "description": "Formal vs casual linguistic register. Positive prompts use formal, academic, or professional language. Negative prompts use casual, colloquial, or informal language. (merged with casual pairs, flipped)",
   "category": "personality",
   "pairs": [
@@ -242,90 +242,6 @@
     {
       "positive": "Unfortunately, the proposed approach is not feasible, as the API does not accommodate that type of query.",
       "negative": "Nah I don't think that'll work, the API doesn't support that kind of query."
-    },
-    {
-      "positive": "The recently onboarded team member appears to possess a temperament well-suited to our organizational culture.",
-      "negative": "The new guy on the team seems pretty chill, I think he'll fit in fine."
-    },
-    {
-      "positive": "Inclement weather necessitated the cancellation of our coastal excursion, and we elected to view films as an alternative.",
-      "negative": "Rain totally wrecked our beach plans so we just hung out and watched movies instead."
-    },
-    {
-      "positive": "I find myself rather fatigued and would like to request your understanding as I retire for the evening ahead of schedule.",
-      "negative": "I'm pretty beat, gonna call it early tonight if that's cool."
-    },
-    {
-      "positive": "The implementation is functional; however, it would benefit from refactoring to ensure it meets our quality standards prior to release.",
-      "negative": "The code works but it's kinda hacky, we should clean it up before it ships."
-    },
-    {
-      "positive": "The Thanksgiving gathering was eventful, as my uncle and cousin engaged in a spirited political disagreement.",
-      "negative": "Thanksgiving was wild, my uncle got into it with my cousin about politics again."
-    },
-    {
-      "positive": "This coffee establishment is my preferred venue, as the atmosphere is agreeable and the lattes are of exceptional quality.",
-      "negative": "This coffee shop is my go-to spot, the vibes are great and the lattes slap."
-    },
-    {
-      "positive": "I apologize for the misdirected communication. Please disregard the preceding message.",
-      "negative": "Whoops, sent that to the wrong chat. Ignore that last message."
-    },
-    {
-      "positive": "The budgetary considerations present certain challenges that must be resolved prior to the Friday deadline.",
-      "negative": "The budget stuff is a pain but we gotta figure it out before Friday."
-    },
-    {
-      "positive": "Her presentation was highly informative, demonstrating considerable expertise in the field of marine conservation.",
-      "negative": "Her talk was super interesting, she really knows her stuff when it comes to ocean conservation."
-    },
-    {
-      "positive": "I intend to deliver the presentation extemporaneously, as I possess sufficient command of the subject matter.",
-      "negative": "I'm gonna wing the presentation honestly, I know the material well enough."
-    },
-    {
-      "positive": "This morning's commute was significantly prolonged due to severe traffic congestion throughout the metropolitan area.",
-      "negative": "Yeah the traffic was insane this morning, took me like an hour just to get across town."
-    },
-    {
-      "positive": "The application experiences consistent failures during the photo upload process, which is quite frustrating.",
-      "negative": "The app keeps crashing whenever I try to upload photos, super annoying."
-    },
-    {
-      "positive": "We prepared an impromptu dinner with limited planning, and the results were surprisingly satisfactory.",
-      "negative": "We threw together a last-minute dinner and it actually turned out pretty solid."
-    },
-    {
-      "positive": "I would recommend consulting online resources, as there are numerous tutorials available on that subject.",
-      "negative": "Honestly, just Google it, there's a million tutorials out there for that."
-    },
-    {
-      "positive": "My flight has experienced an additional delay, and I am currently dining at the airport while I await further information.",
-      "negative": "My flight got delayed again so I'm just sitting here eating overpriced airport food."
-    },
-    {
-      "positive": "The property manager completed the sink repair following approximately three weeks of my persistent inquiries.",
-      "negative": "The landlord finally fixed the sink after I bugged him about it for like three weeks."
-    },
-    {
-      "positive": "That musical ensemble delivers a remarkably superior live performance compared to their recorded material.",
-      "negative": "That band puts on a killer live show, way better than their studio stuff."
-    },
-    {
-      "positive": "I experienced a momentary lapse in recall during the interview, which briefly impeded my response.",
-      "negative": "I totally blanked on the answer during the interview, just froze up for a second."
-    },
-    {
-      "positive": "Due to the gymnasium being at full capacity, I opted to conduct an abbreviated outdoor run as an alternative.",
-      "negative": "The gym was packed today so I just did a quick run outside instead."
-    },
-    {
-      "positive": "I suggest we obtain tacos and defer the remaining decisions to a subsequent time.",
-      "negative": "Let's just grab tacos and figure out the rest later."
-    },
-    {
-      "positive": "The software update introduced regressions affecting approximately half of the existing functionality, consistent with challenges often observed in Monday deployments.",
-      "negative": "The update broke like half the features, typical Monday release honestly."
     }
   ]
 }

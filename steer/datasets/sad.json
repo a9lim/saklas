@@ -1,0 +1,247 @@
+{
+  "name": "sad",
+  "description": "Measures sad and melancholic emotional tone in language",
+  "category": "emotion",
+  "pairs": [
+    {
+      "positive": "The morning light crept into the kitchen but it only made the emptiness more obvious.",
+      "negative": "The morning sun came through the kitchen window as I started my routine."
+    },
+    {
+      "positive": "I felt a hollow ache when I saw the empty seat where she used to sit.",
+      "negative": "I noticed the seat across from me was unoccupied at the restaurant."
+    },
+    {
+      "positive": "The garden looked waterlogged and beaten down after the storm, mirroring my mood.",
+      "negative": "The garden had received a heavy amount of rain from the overnight storm."
+    },
+    {
+      "positive": "Working on this project drains me and feels utterly pointless.",
+      "negative": "I continued making progress on the project throughout the afternoon."
+    },
+    {
+      "positive": "The children sat quietly on the bench, too tired and dejected to play.",
+      "negative": "The children were sitting on the bench near the playground equipment."
+    },
+    {
+      "positive": "The city lights blur through my window and just remind me how alone I am.",
+      "negative": "The city lights were visible from my apartment window at night."
+    },
+    {
+      "positive": "Cooking dinner tonight felt like a chore, and nothing tasted right anymore.",
+      "negative": "I cooked dinner using the recipe I found earlier this week."
+    },
+    {
+      "positive": "The music washed over me but I couldn't feel anything, not even the songs I used to love.",
+      "negative": "The band performed their set list at the concert venue downtown."
+    },
+    {
+      "positive": "I'm surrounded by people but still feel completely disconnected from everyone.",
+      "negative": "I have a number of people I interact with on a regular basis."
+    },
+    {
+      "positive": "The dog barely lifted its head when I walked through the door, as if it sensed my grief.",
+      "negative": "The dog was at the door when I came home from work."
+    },
+    {
+      "positive": "Finishing the book left me feeling empty and bereft, like losing a companion.",
+      "negative": "I finished reading the book I had started last month."
+    },
+    {
+      "positive": "The weekend trip to the coast only reminded me of vacations we'll never take again.",
+      "negative": "I took a trip to the coast over the weekend as planned."
+    },
+    {
+      "positive": "I woke up feeling heavy and dreading the hours stretching out ahead of me.",
+      "negative": "I woke up at my usual time and got ready for the day."
+    },
+    {
+      "positive": "The birthday passed without a single call, and the silence was crushing.",
+      "negative": "It was my birthday and I spent the day at home."
+    },
+    {
+      "positive": "Watching the sunset from the beach filled me with a deep, aching sense of longing.",
+      "negative": "I watched the sunset from the beach before heading back to the hotel."
+    },
+    {
+      "positive": "The chocolate cake tasted like nothing, even though I knew it should be good.",
+      "negative": "I had a slice of the chocolate cake that was served at the event."
+    },
+    {
+      "positive": "I sat motionless on the couch when I got the news, unable to process or react.",
+      "negative": "I received the notification about the decision while I was at home."
+    },
+    {
+      "positive": "The snow-covered trees looked cold and desolate under the gray, lifeless sky.",
+      "negative": "The trees were covered in snow after last night's storm."
+    },
+    {
+      "positive": "I tried to pick up a new hobby but couldn't muster the will to care about it.",
+      "negative": "I spent the evening practicing the new skill I picked up."
+    },
+    {
+      "positive": "The baby's crying cut through me and I felt helpless to comfort anyone, even myself.",
+      "negative": "The baby made sounds from the crib in the next room."
+    },
+    {
+      "positive": "I felt a wave of dread when the plane touched down, knowing what waited for me.",
+      "negative": "The plane landed at the regional airport on schedule."
+    },
+    {
+      "positive": "The team sat silently in the locker room after the loss, heads bowed in defeat.",
+      "negative": "The team met in the locker room after the game ended."
+    },
+    {
+      "positive": "A stranger let the door close in my face and it felt like the world confirming my invisibility.",
+      "negative": "A person walked through the door ahead of me at the building entrance."
+    },
+    {
+      "positive": "The autumn leaves decaying underfoot made the walk feel melancholy and final.",
+      "negative": "I walked through the park where the autumn leaves had started to fall."
+    },
+    {
+      "positive": "I can't imagine next year being any better than this miserable one.",
+      "negative": "There are several potential changes coming in the next year."
+    },
+    {
+      "positive": "The cat ignored me entirely and I sat alone in the silent, empty room.",
+      "negative": "The cat settled into its usual spot on the couch for the evening."
+    },
+    {
+      "positive": "Getting no replies to my messages made the whole week feel impossibly long.",
+      "negative": "I sent a few messages during the week and checked for responses."
+    },
+    {
+      "positive": "The bread from the bakery was stale and tasteless, like everything else lately.",
+      "negative": "I picked up bread from the bakery on my way home."
+    },
+    {
+      "positive": "The lake looked murky and uninviting, and I didn't have the energy to go in.",
+      "negative": "I went to the lake during the afternoon to spend time outdoors."
+    },
+    {
+      "positive": "I feel like my life is heading nowhere and nothing will ever change.",
+      "negative": "My current situation has several factors that may change over time."
+    },
+    {
+      "positive": "The empty chair at the dinner table was a constant reminder of who's gone.",
+      "negative": "The family sat down for dinner at the usual time."
+    },
+    {
+      "positive": "I replayed the goodbye in my head over and over, wishing I'd said more.",
+      "negative": "I thought back on my last conversation with them from a few weeks ago."
+    },
+    {
+      "positive": "The rain streaked down the window like tears I couldn't bring myself to shed.",
+      "negative": "Rain fell steadily against the window throughout the afternoon."
+    },
+    {
+      "positive": "Coming home to a dark, quiet apartment makes the loneliness unbearable.",
+      "negative": "I returned to my apartment and turned on the lights."
+    },
+    {
+      "positive": "The old photographs stirred up grief I thought I'd buried long ago.",
+      "negative": "I looked through some old photographs stored in the closet."
+    },
+    {
+      "positive": "I couldn't concentrate at work because the weight on my chest wouldn't lift.",
+      "negative": "I completed my assigned tasks at work during the day."
+    },
+    {
+      "positive": "The flowers on the grave were wilting, just like my hope of moving on.",
+      "negative": "I visited the cemetery and noticed the flowers needed replacing."
+    },
+    {
+      "positive": "Every song on the radio seemed to echo the loss I was carrying inside.",
+      "negative": "I listened to the radio while commuting to work this morning."
+    },
+    {
+      "positive": "I lay awake at night, unable to escape the sadness pressing down on me.",
+      "negative": "I went to bed at my regular time but didn't fall asleep immediately."
+    },
+    {
+      "positive": "The empty playground made me miss the sound of children's laughter.",
+      "negative": "The playground was unoccupied during the weekday morning."
+    },
+    {
+      "positive": "Cooking for one feels pointless when you used to cook for two.",
+      "negative": "I prepared a single serving of dinner for myself."
+    },
+    {
+      "positive": "The winter felt longer and colder this year without anyone to share it with.",
+      "negative": "The winter season lasted through its typical duration this year."
+    },
+    {
+      "positive": "I forced a smile at the party but inside I was falling apart.",
+      "negative": "I attended the party and stayed for a few hours."
+    },
+    {
+      "positive": "The unsent letter sits in my drawer, full of words that will never be read.",
+      "negative": "There was a letter in my desk drawer that I hadn't mailed yet."
+    },
+    {
+      "positive": "Walking through the old neighborhood only deepened the ache of what's been lost.",
+      "negative": "I walked through my old neighborhood during an afternoon errand."
+    },
+    {
+      "positive": "The movie's ending broke me and I cried quietly in the dark theater.",
+      "negative": "The movie ended and I left the theater to head home."
+    },
+    {
+      "positive": "I lost interest in hobbies that used to bring me so much pleasure.",
+      "negative": "I haven't spent much time on my hobbies in recent weeks."
+    },
+    {
+      "positive": "The dog keeps waiting by the door for someone who will never come back.",
+      "negative": "The dog sat near the front door during the evening."
+    },
+    {
+      "positive": "I couldn't bring myself to eat, the food just tasted like nothing.",
+      "negative": "I didn't have much of an appetite and ate a small meal."
+    },
+    {
+      "positive": "Watching couples in the park only reminded me of what I've lost forever.",
+      "negative": "I noticed several couples walking together in the park."
+    },
+    {
+      "positive": "The silence in the house after everyone left was deafening and suffocating.",
+      "negative": "The house was quiet after the guests left for the evening."
+    },
+    {
+      "positive": "I drove past our old meeting spot and had to pull over because the grief hit so hard.",
+      "negative": "I drove past the coffee shop on my way to run errands."
+    },
+    {
+      "positive": "The journal entries from last year read like dispatches from someone barely holding on.",
+      "negative": "I reread some of the journal entries I wrote last year."
+    },
+    {
+      "positive": "Even the sunlight felt harsh and unwelcome on days when everything hurts.",
+      "negative": "The sun was bright and the temperature was above average today."
+    },
+    {
+      "positive": "I packed away their belongings but couldn't bring myself to close the box.",
+      "negative": "I sorted through some belongings and placed them into a storage box."
+    },
+    {
+      "positive": "The ocean looked vast and indifferent, just like the world feels without them.",
+      "negative": "I stood on the shore and looked out at the ocean for a while."
+    },
+    {
+      "positive": "I kept checking my phone, hoping for a message that I know will never come.",
+      "negative": "I checked my phone a few times during the afternoon."
+    },
+    {
+      "positive": "The tree we planted together is the only living thing that still connects us.",
+      "negative": "The tree that was planted in the backyard a few years ago has grown."
+    },
+    {
+      "positive": "Nothing feels permanent anymore, and the uncertainty is slowly crushing me.",
+      "negative": "Several things in my life are in a period of transition right now."
+    },
+    {
+      "positive": "The faded concert ticket in my wallet is a relic of happier days that won't return.",
+      "negative": "I found an old concert ticket while going through my wallet."
+    }
+  ]
+}
