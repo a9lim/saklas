@@ -35,7 +35,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--probes",
         nargs="*",
         default=None,
-        help="Probe categories to load: emotion personality cultural gender (default: emotion personality)",
+        help="Probe categories to load: emotion personality safety cultural gender (default: all)",
     )
     p.add_argument(
         "--system-prompt", "-s",
@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None):
     print(f"  VRAM: {info['vram_used_gb']:.1f} GB")
 
     # Bootstrap probes
-    probe_categories = args.probes if args.probes else ["emotion", "personality"]
+    probe_categories = args.probes if args.probes else ["emotion", "personality", "safety", "cultural", "gender"]
     print(f"  Bootstrapping probes: {', '.join(probe_categories)}")
 
     from steer.probes_bootstrap import bootstrap_probes
