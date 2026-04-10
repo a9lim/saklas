@@ -228,10 +228,10 @@ class SteerApp(App):
             tp.nav_up()
 
     def action_nav_left(self) -> None:
-        self._adjust_alpha(-0.5)
+        self._adjust_alpha(-0.2)
 
     def action_nav_right(self) -> None:
-        self._adjust_alpha(0.5)
+        self._adjust_alpha(0.2)
 
     def action_nav_enter(self) -> None:
         panel = PANELS[self._focused_panel_idx]
@@ -797,7 +797,7 @@ class SteerApp(App):
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
-            new_alpha = max(-10.0, min(10.0, sel["alpha"] + delta))
+            new_alpha = max(-3.0, min(3.0, sel["alpha"] + delta))
             self._steering.set_alpha(sel["name"], new_alpha)
             self._steering.apply_to_model(
                 self._layers, self._device, self._dtype,
