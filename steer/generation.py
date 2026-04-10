@@ -40,7 +40,7 @@ class GenerationConfig:
 
     def __init__(
         self,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 1024,
         temperature: float = 1.0,
         top_p: float = 0.9,
         system_prompt: str | None = None,

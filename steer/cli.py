@@ -44,8 +44,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
-        help="Max tokens per generation (default: 512)",
+        default=1024,
+        help="Max tokens per generation (default: 1024)",
     )
     p.add_argument(
         "--cache-dir",

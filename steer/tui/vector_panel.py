@@ -30,7 +30,7 @@ class LeftPanel(Widget):
         self._orthogonalize: bool = False
         self._temperature: float = 1.0
         self._top_p: float = 0.9
-        self._max_tokens: int = 512
+        self._max_tokens: int = 1024
         self._system_prompt: str | None = None
 
     def on_mount(self) -> None:

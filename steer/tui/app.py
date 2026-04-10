@@ -57,7 +57,7 @@ class SteerApp(App):
         model_info: dict,
         probes: dict[str, torch.Tensor],
         system_prompt: str | None = None,
-        max_tokens: int = 512,
+        max_tokens: int = 1024,
         **kwargs,
     ):
         super().__init__(**kwargs)
