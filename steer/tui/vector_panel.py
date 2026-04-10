@@ -116,7 +116,6 @@ class LeftPanel(Widget):
         )
 
         lines: list[str] = []
-        num_layers = self._model_info["num_layers"]
         for i, v in enumerate(self._vectors):
             is_selected = i == self._selected_idx
             enabled = v.get("enabled", True)

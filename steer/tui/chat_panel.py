@@ -24,10 +24,19 @@ class ChatPanel(Widget):
             super().__init__()
             self.text = text
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._log: VerticalScroll | None = None
+        self._status_bar: Static | None = None
+
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
         yield Static("", id="status-bar")
         yield Input(placeholder="Type a message...", id="chat-input")
+
+    def on_mount(self) -> None:
+        self._log = self.query_one("#chat-log", VerticalScroll)
+        self._status_bar = self.query_one("#status-bar", Static)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -38,28 +47,24 @@ class ChatPanel(Widget):
         self.post_message(self.UserSubmitted(text))
 
     def add_user_message(self, text: str) -> None:
-        log = self.query_one("#chat-log", VerticalScroll)
-        log.mount(Static(f"[bold cyan]User:[/] {text}", classes="user-message"))
-        log.scroll_end(animate=False)
+        self._log.mount(Static(f"[bold cyan]User:[/] {text}", classes="user-message"))
+        self._log.scroll_end(animate=False)
 
     def start_assistant_message(self) -> _AssistantMessage:
-        log = self.query_one("#chat-log", VerticalScroll)
         widget = _AssistantMessage(classes="assistant-message")
         widget.chat_text = "[bold green]Assistant:[/] "
         widget.update(widget.chat_text)
-        log.mount(widget)
+        self._log.mount(widget)
         return widget
 
     def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
         widget.chat_text += token
         widget.update(widget.chat_text)
-        log = self.query_one("#chat-log", VerticalScroll)
-        log.scroll_end(animate=False)
+        self._log.scroll_end(animate=False)
 
     def add_system_message(self, text: str) -> None:
-        log = self.query_one("#chat-log", VerticalScroll)
-        log.mount(Static(f"[dim]{text}[/]"))
-        log.scroll_end(animate=False)
+        self._log.mount(Static(f"[dim]{text}[/]"))
+        self._log.scroll_end(animate=False)
 
     def update_status(
         self,
@@ -72,7 +77,7 @@ class ChatPanel(Widget):
         vram_gb: float = 0.0,
     ) -> None:
         """Update the status bar with generation stats."""
-        bar = self.query_one("#status-bar", Static)
+        bar = self._status_bar
         dot = "[green]●[/]" if generating else "[dim]○[/]"
         if generating:
             left = f"{dot} {gen_tokens}/{max_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
@@ -87,4 +92,4 @@ class ChatPanel(Widget):
             if right:
                 right += " · "
             right += f"VRAM: {vram_gb:.1f} GB"
-        bar.update(f"{left}{'':>4}{right}")
+        bar.update(f"{left}    {right}")

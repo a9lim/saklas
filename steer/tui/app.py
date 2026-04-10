@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import os
 import queue
+import shlex
 import time
+from pathlib import Path
+from typing import Callable
 
 import torch
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.widgets import Footer
+from textual.widgets import Footer, Input
 from textual.timer import Timer
 
 from steer.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered
@@ -98,6 +103,7 @@ class SteerApp(App):
         self._last_elapsed: float = 0.0
         self._cached_vram_gb: float = 0.0
         self._vram_poll_counter: int = 0
+        self._last_status_args: tuple = ()
 
         defaults = _load_defaults()
         self._probe_categories: dict[str, list[str]] = {
@@ -141,7 +147,6 @@ class SteerApp(App):
 
     def on_key(self, event) -> None:
         # Let the Input widget handle keys when it has focus (chat panel).
-        from textual.widgets import Input
         if isinstance(self.focused, Input):
             if event.key == "tab":
                 event.prevent_default()
@@ -328,9 +333,8 @@ class SteerApp(App):
         self._refresh_left_panel()
 
     @staticmethod
-    def _parse_steer_args(text: str) -> tuple[str, str | None, float, int | None]:
-        """Parse /steer arguments into (concept, baseline|None, alpha, layer|None)."""
-        import shlex
+    def _parse_args(text: str, include_alpha: bool = False):
+        """Parse /steer or /probe arguments."""
         if " - " in text:
             dash_idx = text.index(" - ")
             concept = shlex.split(text[:dash_idx])[0]
@@ -343,8 +347,10 @@ class SteerApp(App):
             baseline = None
             trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
         layer = int(trailing[0]) if trailing else None
-        alpha = float(trailing[1]) if len(trailing) > 1 else 2.5
-        return concept, baseline, alpha, layer
+        if include_alpha:
+            alpha = float(trailing[1]) if len(trailing) > 1 else 2.5
+            return concept, baseline, alpha, layer
+        return concept, baseline, layer
 
     def _handle_steer(self, text: str) -> None:
         if self._ab_in_progress:
@@ -353,7 +359,7 @@ class SteerApp(App):
             return
         chat = self.query_one("#chat-panel", ChatPanel)
         try:
-            concept, baseline, alpha, layer = self._parse_steer_args(text)
+            concept, baseline, alpha, layer = self._parse_args(text, include_alpha=True)
         except (ValueError, IndexError) as e:
             chat.add_system_message(
                 f"Parse error: {e}\n"
@@ -377,7 +383,7 @@ class SteerApp(App):
     def _handle_probe(self, text: str) -> None:
         chat = self.query_one("#chat-panel", ChatPanel)
         try:
-            concept, baseline, layer = self._parse_probe_args(text)
+            concept, baseline, layer = self._parse_args(text)
         except (ValueError, IndexError) as e:
             chat.add_system_message(
                 f"Parse error: {e}\n"
@@ -397,24 +403,6 @@ class SteerApp(App):
             self._probe_worker(concept, baseline, layer_idx, name)
 
         self.run_worker(_worker, thread=True)
-
-    @staticmethod
-    def _parse_probe_args(text: str) -> tuple[str, str | None, int | None]:
-        """Parse /probe arguments into (concept, baseline|None, layer|None)."""
-        import shlex
-        if " - " in text:
-            dash_idx = text.index(" - ")
-            concept = shlex.split(text[:dash_idx])[0]
-            rest_tokens = shlex.split(text[dash_idx + 3:])
-            baseline = rest_tokens[0] if rest_tokens else None
-            trailing = [t for t in rest_tokens[1:] if not any(c.isalpha() for c in t)]
-        else:
-            tokens = shlex.split(text)
-            concept = tokens[0]
-            baseline = None
-            trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
-        layer = int(trailing[0]) if trailing else None
-        return concept, baseline, layer
 
     def _steer_status(self, msg: str) -> None:
         chat = self.query_one("#chat-panel", ChatPanel)
@@ -503,33 +491,32 @@ class SteerApp(App):
 
     def _statements_cache_path(self, concept: str, baseline: str | None) -> str:
         """Cache path for generated statements (layer-independent)."""
-        import os
         model_id = self._model_info.get("model_id", "unknown")
         model_name = model_id.replace("/", "_")
         tag = f"{concept}_vs_{baseline}" if baseline else concept
         return os.path.join("steer", "probes", "cache", model_name, f"{tag}_statements.json")
 
-    def _steer_worker(
+    def _extract_vector_worker(
         self, concept: str, baseline: str | None,
-        alpha: float, layer_idx: int, name: str,
+        layer_idx: int, name: str,
+        on_cached: Callable[[torch.Tensor], None],
+        on_extracted: Callable[[torch.Tensor, list[dict]], None],
     ) -> None:
-        # Check cache first
+        """Shared extraction logic for /steer and /probe workers.
+
+        on_cached is called when a cached vector is found (receives the vector).
+        on_extracted is called after extraction from pairs (receives vector and saved_vectors).
+        """
         from steer.vectors import save_vector, load_vector, extract_caa, load_contrastive_pairs
         cache_path = self._vector_cache_path(concept, baseline, layer_idx)
+
+        # Check cache first
         try:
             vec, _meta = load_vector(cache_path)
             vec = vec.to(self._device, self._dtype)
-            self._steering.add_vector(name, vec, alpha, layer_idx)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
-            self.call_from_thread(
-                self._steer_status, f"Loaded cached vector for '{name}'.",
-            )
-            self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+            on_cached(vec)
             return
-        except (FileNotFoundError, Exception):
+        except (FileNotFoundError, KeyError, ValueError):
             pass
 
         # Detach steering hooks so they don't pollute extraction
@@ -539,7 +526,6 @@ class SteerApp(App):
         try:
             # Check if a curated probe dataset exists for this concept
             if baseline is None:
-                from pathlib import Path
                 defaults = _load_defaults()
                 concept_lower = concept.lower()
                 has_curated = any(concept_lower in probes for probes in defaults.values())
@@ -563,17 +549,15 @@ class SteerApp(App):
                             "n_pairs": len(ds["pairs"]),
                             "source": f"curated:{dataset_file}",
                         })
-                        self._restore_and_add(saved_vectors, name, vec, alpha, layer_idx)
-                        self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+                        on_extracted(vec, saved_vectors)
                         return
 
             # Try loading cached pairs (layer-independent)
-            import json as _json
             stmt_cache_path = self._statements_cache_path(concept, baseline)
             pairs = None
             try:
                 with open(stmt_cache_path) as f:
-                    cached = _json.load(f)
+                    cached = json.load(f)
                 # Support both new (pairs) and legacy (positive/negative) cache formats
                 if "pairs" in cached:
                     pairs = cached["pairs"]
@@ -587,7 +571,7 @@ class SteerApp(App):
                         self._steer_status,
                         f"Loaded cached pairs for '{concept}'.",
                     )
-            except (FileNotFoundError, KeyError, _json.JSONDecodeError):
+            except (FileNotFoundError, KeyError, json.JSONDecodeError):
                 pass
 
             if pairs is None:
@@ -599,10 +583,9 @@ class SteerApp(App):
                 pairs = self._generate_contrastive_pairs(concept, baseline)
 
                 # Cache the generated pairs
-                import os as _os
-                _os.makedirs(_os.path.dirname(stmt_cache_path), exist_ok=True)
+                os.makedirs(os.path.dirname(stmt_cache_path), exist_ok=True)
                 with open(stmt_cache_path, "w") as f:
-                    _json.dump({"pairs": pairs}, f, indent=2)
+                    json.dump({"pairs": pairs}, f, indent=2)
 
             if len(pairs) < 2:
                 self._restore_vectors(saved_vectors)
@@ -629,119 +612,47 @@ class SteerApp(App):
                 "n_pairs": len(pairs),
             })
 
-            self._restore_and_add(saved_vectors, name, vec, alpha, layer_idx)
-            self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+            on_extracted(vec, saved_vectors)
         except Exception:
             self._restore_vectors(saved_vectors)
             raise
+
+    def _steer_worker(
+        self, concept: str, baseline: str | None,
+        alpha: float, layer_idx: int, name: str,
+    ) -> None:
+        def on_cached(vec: torch.Tensor) -> None:
+            self._steering.add_vector(name, vec, alpha, layer_idx)
+            self._steering.apply_to_model(
+                self._layers, self._device, self._dtype,
+                orthogonalize=self._orthogonalize,
+            )
+            self.call_from_thread(
+                self._steer_status, f"Loaded cached vector for '{name}'.",
+            )
+            self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+
+        def on_extracted(vec: torch.Tensor, saved_vectors: list[dict]) -> None:
+            self._restore_and_add(saved_vectors, name, vec, alpha, layer_idx)
+            self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+
+        self._extract_vector_worker(concept, baseline, layer_idx, name, on_cached, on_extracted)
 
     def _probe_worker(
         self, concept: str, baseline: str | None,
         layer_idx: int, name: str,
     ) -> None:
-        from steer.vectors import save_vector, load_vector, extract_caa, load_contrastive_pairs
-        cache_path = self._vector_cache_path(concept, baseline, layer_idx)
-
-        # Try loading cached vector
-        try:
-            vec, _meta = load_vector(cache_path)
-            vec = vec.to(self._device, self._dtype)
+        def on_cached(vec: torch.Tensor) -> None:
             self._add_probe_from_vector(name, vec)
             self.call_from_thread(
                 self._steer_status, f"Loaded cached probe '{name}' (L{layer_idx}).",
             )
-            return
-        except (FileNotFoundError, Exception):
-            pass
 
-        # Detach steering hooks so they don't pollute extraction
-        saved_vectors = self._steering.get_active_vectors()
-        self._steering.clear_all()
-
-        try:
-            # Check if a curated probe dataset exists
-            if baseline is None:
-                from pathlib import Path
-                defaults = _load_defaults()
-                concept_lower = concept.lower()
-                has_curated = any(concept_lower in probes for probes in defaults.values())
-                if has_curated:
-                    dataset_file = f"{concept_lower}.json"
-                    ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
-                    if ds_path.exists():
-                        self.call_from_thread(
-                            self._steer_status,
-                            f"Found curated dataset '{dataset_file}' for '{concept}', extracting probe...",
-                        )
-                        ds = load_contrastive_pairs(str(ds_path))
-                        vec = extract_caa(
-                            self._model, self._tokenizer, ds["pairs"], layer_idx, layers=self._layers,
-                        )
-                        save_vector(vec, cache_path, {
-                            "concept": concept, "baseline": baseline,
-                            "layer_idx": layer_idx, "method": "caa",
-                            "n_pairs": len(ds["pairs"]), "source": f"curated:{dataset_file}",
-                        })
-                        self._restore_vectors(saved_vectors)
-                        self._add_probe_from_vector(name, vec)
-                        return
-
-            # Try loading cached pairs (layer-independent)
-            import json as _json
-            stmt_cache_path = self._statements_cache_path(concept, baseline)
-            pairs = None
-            try:
-                with open(stmt_cache_path) as f:
-                    cached = _json.load(f)
-                if "pairs" in cached:
-                    pairs = cached["pairs"]
-                elif "positive" in cached and "negative" in cached:
-                    pairs = [
-                        {"positive": p, "negative": n_}
-                        for p, n_ in zip(cached["positive"], cached["negative"])
-                    ]
-                if pairs:
-                    self.call_from_thread(
-                        self._steer_status, f"Loaded cached pairs for '{concept}'.",
-                    )
-            except (FileNotFoundError, KeyError, _json.JSONDecodeError):
-                pass
-
-            if pairs is None:
-                if baseline:
-                    msg = f"Generating contrastive pairs for '{concept}' vs '{baseline}'..."
-                else:
-                    msg = f"Generating contrastive pairs for '{concept}'..."
-                self.call_from_thread(self._steer_status, msg)
-                pairs = self._generate_contrastive_pairs(concept, baseline)
-                import os as _os
-                _os.makedirs(_os.path.dirname(stmt_cache_path), exist_ok=True)
-                with open(stmt_cache_path, "w") as f:
-                    _json.dump({"pairs": pairs}, f, indent=2)
-
-            if len(pairs) < 2:
-                self._restore_vectors(saved_vectors)
-                self.call_from_thread(
-                    self._steer_status,
-                    f"Could only generate {len(pairs)} pairs (need >= 2). Try a more specific concept.",
-                )
-                return
-
-            self.call_from_thread(
-                self._steer_status, f"Extracting probe vector ({len(pairs)} pairs)...",
-            )
-            vec = extract_caa(
-                self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
-            )
-            save_vector(vec, cache_path, {
-                "concept": concept, "baseline": baseline,
-                "layer_idx": layer_idx, "method": "caa", "n_pairs": len(pairs),
-            })
+        def on_extracted(vec: torch.Tensor, saved_vectors: list[dict]) -> None:
             self._restore_vectors(saved_vectors)
             self._add_probe_from_vector(name, vec)
-        except Exception:
-            self._restore_vectors(saved_vectors)
-            raise
+
+        self._extract_vector_worker(concept, baseline, layer_idx, name, on_cached, on_extracted)
 
     def _add_probe_from_vector(self, name: str, vec) -> None:
         """Add a vector as a probe to the monitor and refresh the trait panel."""
@@ -884,22 +795,26 @@ class SteerApp(App):
             self._cached_vram_gb = _get_memory_gb(self._device_str)
             self._vram_poll_counter = -1
 
-        chat.update_status(
-            generating=generating,
-            gen_tokens=self._gen_token_count,
-            max_tokens=self._gen_config.max_new_tokens,
-            tok_per_sec=self._last_tok_per_sec,
-            elapsed=self._last_elapsed,
-            prompt_tokens=self._prompt_token_count,
-            vram_gb=self._cached_vram_gb,
-        )
+        status_args = (generating, self._gen_token_count, self._gen_config.max_new_tokens,
+                       self._last_tok_per_sec, self._last_elapsed, self._prompt_token_count,
+                       self._cached_vram_gb)
+        if status_args != self._last_status_args:
+            self._last_status_args = status_args
+            chat.update_status(
+                generating=generating,
+                gen_tokens=self._gen_token_count,
+                max_tokens=self._gen_config.max_new_tokens,
+                tok_per_sec=self._last_tok_per_sec,
+                elapsed=self._last_elapsed,
+                prompt_tokens=self._prompt_token_count,
+                vram_gb=self._cached_vram_gb,
+            )
 
         if self._monitor and self._monitor.has_pending_data():
             self._monitor.flush_to_cpu()
-            current = self._monitor.get_current()
-            previous = self._monitor.get_previous()
+            current, previous = self._monitor.get_current_and_previous()
             if any(self._monitor.history[n] for n in self._monitor.probe_names):
-                sparklines = {name: self._monitor.get_sparkline(name, width=64)
+                sparklines = {name: self._monitor.get_sparkline(name, width=8)
                               for name in self._monitor.probe_names}
                 stats = {name: self._monitor.get_stats(name)
                          for name in self._monitor.probe_names}
@@ -937,7 +852,6 @@ class SteerApp(App):
             probe_name, device=self._device, dtype=self._dtype,
         )
         tp.set_active_probes(set(self._monitor.probe_names))
-        tp._render_probes()
 
     def action_toggle_vector(self) -> None:
         if self._ab_in_progress:

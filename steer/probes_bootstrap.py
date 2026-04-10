@@ -38,7 +38,7 @@ def bootstrap_probes(
     probe_layer = num_layers - 2
 
     probes: dict[str, torch.Tensor] = {}
-    to_extract: list[tuple[str, str]] = []
+    to_extract: list[str] = []
 
     # Check cache first
     for cat in categories:
