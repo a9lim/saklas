@@ -4,7 +4,8 @@ Screen {
     color: ansi_default;
 
     .screen--selection {
-        text-style: reverse;
+        background: ansi_white;
+        color: ansi_black;
     }
 }
 
@@ -128,7 +129,8 @@ Widget {
 }
 
 #chat-input > .input--selection {
-    text-style: reverse;
+    background: ansi_white;
+    color: ansi_black;
 }
 
 .user-message,

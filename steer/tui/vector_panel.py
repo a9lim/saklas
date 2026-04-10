@@ -57,7 +57,7 @@ class LeftPanel(Widget):
         yield Static("[bold]VECTORS[/] [dim]0 total, 0 active · ortho: OFF[/]",
                       id="vectors-header", classes="section-header")
         yield VerticalScroll(Static("", id="vector-content"), id="vector-scroll")
-        yield Static("[dim]⌫ rm · Enter toggle · Ctrl+O ortho[/]",
+        yield Static("[dim]⌫ remove · ↩ toggle · ⌃O ortho[/]",
                       id="vector-hints")
         # Generation section
         yield Static("[bold]GENERATION[/]", classes="section-header")
@@ -65,11 +65,11 @@ class LeftPanel(Widget):
         # Keys section
         yield Static("[bold]KEYS[/]", classes="section-header")
         yield Static(
-            "[dim]Tab focus panels · Esc stop gen\n"
-            "Ctrl+R regen · Ctrl+A A/B\n"
-            "Ctrl+Q quit\n"
-            "── Tab to side panel first ──\n"
-            "↑/↓ navigate · Enter select\n"
+            "[dim]⇥ focus panels · ⎋ stop gen\n"
+            "⌃R regen · ⌃A A/B\n"
+            "⌃Q quit\n"
+            "── ⇥ to side panel first ──\n"
+            "↑/↓ navigate · ↩ select\n"
             "←/→ alpha\n"
             "[ ] temp · { } top-p[/]",
             id="key-ref",

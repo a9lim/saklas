@@ -42,6 +42,7 @@ class SteerApp(App):
         Binding("ctrl+a", "ab_compare", "A/B", show=False),
         Binding("escape", "stop_generation", "Stop", show=False),
         Binding("ctrl+r", "regenerate", "Regen", show=False),
+        Binding("ctrl+c", "copy_selection", "Copy", show=False),
         Binding("ctrl+o", "toggle_ortho", "Ortho", show=False),
         Binding("ctrl+s", "cycle_sort", "Sort", show=False),
         Binding("[", "temp_down", show=False),
@@ -332,9 +333,9 @@ class SteerApp(App):
                 '/probe "concept" - "baseline" [layer],\n'
                 '/clear, /rewind, /sys [prompt], '
                 "/temp [val], /top-p [val], /max [n], /help\n"
-                "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
-                "⌫ rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
-                "[ ] temp · { } top-p · Ctrl+S sort · Esc stop · Ctrl+Q quit"
+                "Keys: ⇥ focus · ←/→ alpha · ↑/↓ nav · ↩ toggle\n"
+                "⌫ remove · ⌃O ortho · ⌃R regen · ⌃A A/B\n"
+                "[ ] temp · { } top-p · ⌃S sort · ⎋ stop · ⌃Q quit"
             )
         else:
             chat.add_system_message(f"Unknown command: {cmd}. Type /help for commands.")
@@ -705,6 +706,13 @@ class SteerApp(App):
             self._gen_config.max_new_tokens,
             self._gen_config.system_prompt,
         )
+
+    # -- Clipboard --
+
+    def action_copy_selection(self) -> None:
+        text = self.screen.get_selected_text()
+        if text:
+            self.copy_to_clipboard(text)
 
     # -- Generation --
 
