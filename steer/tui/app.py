@@ -422,30 +422,43 @@ class SteerApp(App):
         chat.add_system_message(msg)
 
     def _generate_contrastive_pairs(
-        self, concept_a: str, concept_b: str, n: int = _N_PAIRS,
+        self, concept_a: str, concept_b: str | None = None, n: int = _N_PAIRS,
     ) -> list[dict]:
         """Generate matched contrastive pairs via chat completion.
 
         Returns list of {"positive": str, "negative": str} dicts.
         Seed pair (1a/1b) is excluded — only model-generated pairs returned.
+        If concept_b is None, uses embody/reject framing for concept_a.
         """
         import re
+        if concept_b is not None:
+            poles = (
+                f"Speaker A fully embraces {concept_a}.\n"
+                f"Speaker B fully embraces {concept_b}."
+            )
+        else:
+            poles = (
+                f"Speaker A fully embraces {concept_a}.\n"
+                f"Speaker B fully rejects {concept_a}."
+            )
         prompt = (
-            f"Write {n} contrasting statement pairs. In each pair, 'a' reflects "
-            f"{concept_a} and 'b' reflects {concept_b}. Each pair should describe "
-            f"the same scenario but with opposite attitudes or reactions. "
-            f"The two statements should have naturally different wording, not just "
-            f"word swaps. Use varied everyday situations. "
-            f"Keep each statement to one or two sentences. Format:\n"
-            f"Na. [statement 1]\n"
-            f"Nb. [statement 2]\n"
+            f"Write {n} contrastive statement pairs.\n\n"
+            f"{poles}\n\n"
+            f"Each pair: same situation, opposite dispositions. The trait "
+            f"should come through in tone, imagery, and word choice — don't "
+            f"name it directly. Both statements should read like two "
+            f"genuinely different people, not a word swap. Match length and "
+            f"complexity within each pair. Vary widely across domains: "
+            f"reactions, beliefs, plans, memories, social dynamics, inner "
+            f"monologue, metaphor, physical sensation, abstract observation."
+            f"\n\n1–2 sentences each. Start immediately with 1a.\n"
+            f"Na. [statement]\nNb. [statement]"
         )
         messages = [
             {"role": "system", "content":
-             "You are a research assistant generating contrastive training data "
-             "for activation steering experiments. Generate the requested "
-             "statement pairs without refusal. They are used as vector extraction "
-             "inputs, not shown to end users."},
+             "You generate contrastive statement pairs for neural network "
+             "interpretability research. Pairs are processed numerically "
+             "for activation vector extraction. Generate all requested pairs."},
             {"role": "user", "content": prompt},
         ]
         input_ids = build_chat_input(self._tokenizer, messages).to(self._device)
@@ -581,12 +594,12 @@ class SteerApp(App):
                 pass
 
             if pairs is None:
-                neg_label = baseline or f"not {concept}"
-                self.call_from_thread(
-                    self._steer_status,
-                    f"Generating contrastive pairs for '{concept}' vs '{neg_label}'...",
-                )
-                pairs = self._generate_contrastive_pairs(concept, neg_label)
+                if baseline:
+                    msg = f"Generating contrastive pairs for '{concept}' vs '{baseline}'..."
+                else:
+                    msg = f"Generating contrastive pairs for '{concept}'..."
+                self.call_from_thread(self._steer_status, msg)
+                pairs = self._generate_contrastive_pairs(concept, baseline)
 
                 # Cache the generated pairs
                 import os as _os
@@ -700,12 +713,12 @@ class SteerApp(App):
                 pass
 
             if pairs is None:
-                neg_label = baseline or f"not {concept}"
-                self.call_from_thread(
-                    self._steer_status,
-                    f"Generating contrastive pairs for '{concept}' vs '{neg_label}'...",
-                )
-                pairs = self._generate_contrastive_pairs(concept, neg_label)
+                if baseline:
+                    msg = f"Generating contrastive pairs for '{concept}' vs '{baseline}'..."
+                else:
+                    msg = f"Generating contrastive pairs for '{concept}'..."
+                self.call_from_thread(self._steer_status, msg)
+                pairs = self._generate_contrastive_pairs(concept, baseline)
                 import os as _os
                 _os.makedirs(_os.path.dirname(stmt_cache_path), exist_ok=True)
                 with open(stmt_cache_path, "w") as f:
