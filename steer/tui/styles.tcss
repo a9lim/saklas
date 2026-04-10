@@ -125,7 +125,6 @@ Widget {
 
 .user-message,
 .assistant-message {
-    margin: 1 0 0 0;
     height: auto;
 }
 
