@@ -23,7 +23,7 @@ from steer.tui.trait_panel import TraitPanel
 
 PANELS = ["left-panel", "chat-panel", "trait-panel"]
 
-_SMARTSTEER_N_PAIRS = 15
+_SMARTSTEER_N_PAIRS = 30
 
 
 class SteerApp(App):
@@ -228,10 +228,10 @@ class SteerApp(App):
             tp.nav_up()
 
     def action_nav_left(self) -> None:
-        self._adjust_alpha(-0.1)
+        self._adjust_alpha(-0.5)
 
     def action_nav_right(self) -> None:
-        self._adjust_alpha(0.1)
+        self._adjust_alpha(0.5)
 
     def action_nav_enter(self) -> None:
         panel = PANELS[self._focused_panel_idx]
@@ -507,10 +507,38 @@ class SteerApp(App):
                 lines.append(line)
         return lines[:n]
 
+    def _smartsteer_cache_path(self, concept: str, baseline: str | None, layer_idx: int) -> str:
+        """Deterministic cache path for a smartsteer vector."""
+        from steer.vectors import get_cache_path
+        model_id = self._model_info.get("model_id", "unknown")
+        tag = f"{concept}_vs_{baseline}" if baseline else concept
+        return get_cache_path(
+            "steer/probes/cache", model_id, tag, layer_idx, "smartsteer",
+        )
+
     def _smartsteer_worker(
         self, concept: str, baseline: str | None,
         alpha: float, layer_idx: int, name: str,
     ) -> None:
+        # Check cache first
+        from steer.vectors import save_vector, load_vector
+        cache_path = self._smartsteer_cache_path(concept, baseline, layer_idx)
+        try:
+            vec, _meta = load_vector(cache_path)
+            vec = vec.to(self._device, self._dtype)
+            self._steering.add_vector(name, vec, alpha, layer_idx)
+            self._steering.apply_to_model(
+                self._layers, self._device, self._dtype,
+                orthogonalize=self._orthogonalize,
+            )
+            self.call_from_thread(
+                self._smartsteer_status, f"Loaded cached vector for '{name}'.",
+            )
+            self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
+            return
+        except (FileNotFoundError, Exception):
+            pass
+
         n = _SMARTSTEER_N_PAIRS
 
         if baseline is not None:
@@ -582,6 +610,15 @@ class SteerApp(App):
         vec = extract_caa(
             self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
         )
+
+        # Cache to disk
+        save_vector(vec, cache_path, {
+            "concept": concept,
+            "baseline": baseline,
+            "layer_idx": layer_idx,
+            "method": "smartsteer",
+            "n_pairs": count,
+        })
 
         self._steering.add_vector(name, vec, alpha, layer_idx)
         self._steering.apply_to_model(
@@ -760,7 +797,7 @@ class SteerApp(App):
         lp = self.query_one("#left-panel", LeftPanel)
         sel = lp.get_selected()
         if sel:
-            new_alpha = max(-3.0, min(3.0, sel["alpha"] + delta))
+            new_alpha = max(-10.0, min(10.0, sel["alpha"] + delta))
             self._steering.set_alpha(sel["name"], new_alpha)
             self._steering.apply_to_model(
                 self._layers, self._device, self._dtype,
