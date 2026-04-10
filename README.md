@@ -83,14 +83,13 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 | `Tab` / `Shift+Tab` | Cycle panel focus |
 | `Left` / `Right` | Adjust alpha (strength) |
 | `Up` / `Down` | Navigate vectors / probes (in focused panel) |
-| `Ctrl+N` | Add steering vector |
-| `Ctrl+P` | Add probe |
 | `Ctrl+D` | Remove selected vector or probe |
 | `Ctrl+T` | Toggle selected vector on/off |
-| `O` | Toggle orthogonalization |
+| `Ctrl+O` | Toggle orthogonalization |
 | `Ctrl+A` | A/B compare (steered vs unsteered) |
 | `Ctrl+R` | Regenerate last response |
-| `S` | Cycle trait sort mode (name / magnitude / change) |
+| `Ctrl+S` | Cycle trait sort mode (name / magnitude / change) |
+| `Escape` | Stop generation |
 | `Ctrl+Q` | Quit |
 
 ### Chat commands
