@@ -107,14 +107,13 @@ def _pick_dtype(device: str) -> torch.dtype:
     return torch.float32
 
 
-def load_model(model_id: str, quantize=None, device="auto", no_compile=False):
+def load_model(model_id: str, quantize=None, device="auto"):
     """Load a HuggingFace causal LM and its tokenizer.
 
     Args:
         model_id: Hub ID or local path.
         quantize: None for bf16/fp16/fp32, "4bit", or "8bit".
         device: "auto" (detect), "cuda", "mps", or "cpu".
-        no_compile: Skip torch.compile if True.
 
     Returns:
         (model, tokenizer) tuple.
@@ -188,16 +187,6 @@ def load_model(model_id: str, quantize=None, device="auto", no_compile=False):
     model.requires_grad_(False)
     model.train(False)
 
-    # --- optional torch.compile ---
-    # torch.compile with MPS backend is experimental; default to skip on non-CUDA
-    should_compile = not no_compile and device == "cuda"
-    if should_compile:
-        try:
-            model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
-            log.info("torch.compile succeeded")
-        except Exception as e:
-            warnings.warn(f"torch.compile failed, continuing uncompiled: {e}")
-
     # --- memory report ---
     if device == "cuda" and torch.cuda.is_available():
         vram_bytes = torch.cuda.memory_allocated()
@@ -215,7 +204,7 @@ def load_model(model_id: str, quantize=None, device="auto", no_compile=False):
 def _get_memory_gb(device: str) -> float:
     if device.startswith("cuda") and torch.cuda.is_available():
         return round(torch.cuda.memory_allocated() / 1024**3, 2)
-    if device == "mps":
+    if device.startswith("mps"):
         try:
             return round(torch.mps.current_allocated_memory() / 1024**3, 2)
         except AttributeError:

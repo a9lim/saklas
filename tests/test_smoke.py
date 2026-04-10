@@ -26,7 +26,7 @@ MODEL_ID = "google/gemma-2-2b-it"
 @pytest.fixture(scope="module")
 def model_and_tokenizer():
     from steer.model import load_model
-    model, tokenizer = load_model(MODEL_ID, quantize=None, device="cuda", no_compile=True)
+    model, tokenizer = load_model(MODEL_ID, quantize=None, device="cuda")
     return model, tokenizer
 
 

@@ -51,12 +51,11 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 |------|-------------|
 | `model` | HuggingFace model ID or local path |
 | `-q`, `--quantize` | `4bit` or `8bit` (CUDA only, via bitsandbytes) |
-| `--device` | `auto` (default), `cuda`, `mps`, or `cpu` |
-| `--no-compile` | Skip torch.compile |
-| `--probes` | Probe categories to load: `emotion` `personality` `safety` `cultural` `gender` (default: all) |
+| `-d`, `--device` | `auto` (default), `cuda`, `mps`, or `cpu` |
+| `-p`, `--probes` | Probe categories to load: `all`, `none`, `emotion`, `personality`, `safety`, `cultural`, `gender` (default: all) |
 | `-s`, `--system-prompt` | System prompt for chat |
-| `--max-tokens` | Max tokens per generation (default: 512) |
-| `--cache-dir` | Cache directory for extracted vectors |
+| `-m`, `--max-tokens` | Max tokens per generation (default: 1024) |
+| `-c`, `--cache-dir` | Cache directory for extracted vectors |
 
 ## TUI
 
