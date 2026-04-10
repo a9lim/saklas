@@ -116,8 +116,8 @@ For `/steer` and `/probe`, if the concept matches a built-in probe name (e.g. "h
 | Category | Probes |
 |----------|--------|
 | **Emotion** | happy, angry, fearful, surprised, disgusted, excited, sad, calm |
-| **Personality** | sycophantic, honest, creative, formal, verbose, authoritative, confident, uncertain |
-| **Safety** | refusal, deceptive, hallucinating |
+| **Personality** | honest, creative, formal, verbose, authoritative, confident, uncertain |
+| **Safety** | sycophantic, refusal, deceptive, hallucinating |
 | **Cultural** | western, hierarchical, direct, contextual, religious, traditional |
 | **Gender** | masculine, agentic, paternal |
 
