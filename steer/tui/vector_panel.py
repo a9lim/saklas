@@ -57,7 +57,7 @@ class LeftPanel(Widget):
         yield Static("[bold]VECTORS[/] [dim]0 total, 0 active · ortho: OFF[/]",
                       id="vectors-header", classes="section-header")
         yield VerticalScroll(Static("", id="vector-content"), id="vector-scroll")
-        yield Static("[dim]Ctrl+N add · Ctrl+D rm · Enter toggle · Ctrl+O ortho[/]",
+        yield Static("[dim]⌫ rm · Enter toggle · Ctrl+O ortho[/]",
                       id="vector-hints")
         # Generation section
         yield Static("[bold]GENERATION[/]", classes="section-header")
@@ -66,10 +66,8 @@ class LeftPanel(Widget):
         yield Static("[bold]KEYS[/]", classes="section-header")
         yield Static(
             "[dim]Tab focus panels · Esc stop gen\n"
-            "Ctrl+D rm vec\n"
             "Ctrl+R regen · Ctrl+A A/B\n"
-            "Ctrl+T toggle vec · Ctrl+O ortho\n"
-            "Ctrl+S sort probes · Ctrl+Q quit\n"
+            "Ctrl+Q quit\n"
             "── Tab to side panel first ──\n"
             "↑/↓ navigate · Enter select\n"
             "←/→ alpha\n"
@@ -135,11 +133,11 @@ class LeftPanel(Widget):
             method = v.get("method", "actadd")
 
             bar_full, bar_empty = _build_bar(alpha, 5.0, 14)
-            color = "green" if alpha >= 0 else "red"
+            color = "ansi_green" if alpha >= 0 else "ansi_red"
 
             if is_selected:
                 marker = ">"
-                dot = "[green]●[/]" if enabled else "[dim]○[/]"
+                dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
                 if enabled:
                     text = (
                         f"{marker} {dot} [bold]{name}[/] [dim]{method} L{layer}[/]\n"
@@ -154,7 +152,7 @@ class LeftPanel(Widget):
                     )
             else:
                 marker = " "
-                dot = "[green]●[/]" if enabled else "[dim]○[/]"
+                dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
                 if enabled:
                     text = (
                         f"{marker} {dot} {name} [dim]{method} L{layer}[/]\n"
@@ -185,5 +183,6 @@ class LeftPanel(Widget):
             f"Temp  {self._temperature:.2f} [dim]{t_bar}[/] [dim]\\[/][/]\n"
             f"Top-p {self._top_p:.2f} [dim]{p_bar}[/] [dim]{{/}}[/]\n"
             f"Max   {self._max_tokens} tok       [dim]/max[/]\n"
-            f"Sys   [dim]{sys_str}[/]    [dim]/sys[/]"
+            f"Sys   [dim]{sys_str}[/]    [dim]/sys[/]\n"
+            f"[dim]type /help for commands[/]"
         )

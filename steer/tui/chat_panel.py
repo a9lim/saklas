@@ -67,12 +67,12 @@ class ChatPanel(Widget):
         return True
 
     def add_user_message(self, text: str) -> None:
-        self._log.mount(Static(f"[bold cyan]User:[/] {text}", classes="user-message"))
+        self._log.mount(Static(f"[bold ansi_cyan]User:[/] {text}", classes="user-message"))
         self._log.scroll_end(animate=False)
 
     def start_assistant_message(self) -> _AssistantMessage:
         widget = _AssistantMessage(classes="assistant-message")
-        widget.chat_text = "[bold green]Assistant:[/] "
+        widget.chat_text = "[bold ansi_green]Assistant:[/] "
         widget.update(widget.chat_text)
         self._log.mount(widget)
         return widget
@@ -98,7 +98,7 @@ class ChatPanel(Widget):
     ) -> None:
         """Update the status bar with generation stats."""
         bar = self._status_bar
-        dot = "[green]●[/]" if generating else "[dim]○[/]"
+        dot = "[ansi_green]●[/]" if generating else "[dim]○[/]"
         if generating:
             left = f"{dot} {gen_tokens}/{max_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
         elif gen_tokens > 0:

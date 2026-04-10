@@ -35,7 +35,7 @@ class TraitPanel(Widget):
             id="trait-header",
         )
         yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
-        yield Static("[dim]↑/↓ nav · Ctrl+D remove · Ctrl+S sort[/]",
+        yield Static("[dim]⌫ remove · Ctrl+S sort[/]",
                       id="trait-hints")
 
     def on_mount(self) -> None:
@@ -135,7 +135,7 @@ class TraitPanel(Widget):
                     arrow_ch = "↓"
 
                 bar_full, bar_empty = _build_bar(val, 1.0, 10)
-                color = "green" if val >= 0 else "red"
+                color = "ansi_green" if val >= 0 else "ansi_red"
 
                 mini_spark = self._sparklines.get(name, "")
 

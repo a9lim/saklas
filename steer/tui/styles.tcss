@@ -1,5 +1,17 @@
 Screen {
     layout: vertical;
+    background: ansi_default;
+    color: ansi_white;
+}
+
+/* Force all widgets to inherit terminal colors */
+Widget {
+    background: ansi_default;
+    color: ansi_white;
+    scrollbar-color: ansi_bright_black;
+    scrollbar-color-hover: ansi_white;
+    scrollbar-color-active: ansi_white;
+    scrollbar-background: ansi_default;
 }
 
 #main-area {
@@ -11,7 +23,7 @@ Screen {
 #left-panel {
     width: 1fr;
     height: 100%;
-    border-right: solid $accent;
+    border-right: solid ansi_white;
     padding: 0 1;
     layout: vertical;
 }
@@ -19,33 +31,34 @@ Screen {
 #chat-panel {
     width: 2fr;
     height: 100%;
+    border: solid ansi_black;
     layout: vertical;
 }
 
 #trait-panel {
     width: 1fr;
     height: 100%;
-    border-left: solid $accent;
+    border-left: solid ansi_white;
     padding: 0 1;
     layout: vertical;
 }
 
 /* Panel focus highlighting */
 #left-panel.focused {
-    border-right: double $accent;
+    border-right: double ansi_yellow;
 }
 
 #chat-panel.focused {
-    border: solid $accent;
+    border: solid ansi_yellow;
 }
 
 #trait-panel.focused {
-    border-left: double $accent;
+    border-left: double ansi_yellow;
 }
 
 /* Left panel sections */
 .section-header {
-    color: $accent;
+    color: ansi_yellow;
     text-style: bold;
     height: 1;
 }
@@ -83,7 +96,7 @@ Screen {
 
 .vector-row-selected {
     height: auto;
-    background: $surface;
+    background: ansi_default;
 }
 
 /* Chat panel internals */
@@ -95,24 +108,29 @@ Screen {
 
 #status-bar {
     height: 1;
-    background: $surface;
-    color: $text-muted;
+    background: ansi_default;
+    color: ansi_bright_black;
     padding: 0 1;
 }
 
 #chat-input {
     height: 3;
     dock: bottom;
-    border-top: solid $accent;
+    border: solid ansi_black;
+    background: ansi_default;
+    color: ansi_white;
+}
+
+/* Override Textual's default focus border */
+#chat-input:focus {
+    border: solid ansi_black;
 }
 
 .user-message {
-    color: $text;
     margin: 1 0 0 0;
 }
 
 .assistant-message {
-    color: $text;
     margin: 0 0 1 0;
 }
 
@@ -128,7 +146,7 @@ Screen {
 
 .trait-category {
     text-style: bold;
-    color: $accent;
+    color: ansi_yellow;
     height: 1;
 }
 
@@ -138,15 +156,10 @@ Screen {
 
 .trait-row-selected {
     height: auto;
-    background: $surface;
+    background: ansi_default;
 }
 
 #trait-hints {
     height: 1;
-    color: $text-muted;
-}
-
-/* Footer */
-Footer {
-    height: 1;
+    color: ansi_bright_black;
 }

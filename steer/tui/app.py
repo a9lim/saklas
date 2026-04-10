@@ -14,7 +14,7 @@ import torch
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.widgets import Footer, Input
+from textual.widgets import Input
 from textual.timer import Timer
 
 from steer.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered
@@ -33,14 +33,15 @@ _N_PAIRS = 45
 
 class SteerApp(App):
     CSS_PATH = "styles.tcss"
+    ENABLE_COMMAND_PALETTE = False
 
     BINDINGS = [
-        Binding("ctrl+q", "quit", "Quit"),
-        Binding("ctrl+d", "remove_vector", "Remove"),
-        Binding("ctrl+a", "ab_compare", "A/B"),
+        Binding("ctrl+q", "quit", "Quit", show=False),
+        Binding("backspace", "remove_vector", "Remove", show=False),
+        Binding("delete", "remove_vector", "Remove", show=False),
+        Binding("ctrl+a", "ab_compare", "A/B", show=False),
         Binding("escape", "stop_generation", "Stop", show=False),
-        Binding("ctrl+r", "regenerate", "Regen"),
-        Binding("ctrl+t", "toggle_vector", "Toggle", show=False),
+        Binding("ctrl+r", "regenerate", "Regen", show=False),
         Binding("ctrl+o", "toggle_ortho", "Ortho", show=False),
         Binding("ctrl+s", "cycle_sort", "Sort", show=False),
         Binding("[", "temp_down", show=False),
@@ -60,7 +61,7 @@ class SteerApp(App):
         max_tokens: int = 1024,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(ansi_color=True, **kwargs)
         self._model = model
         self._tokenizer = tokenizer
         self._layers = layers
@@ -116,7 +117,6 @@ class SteerApp(App):
             yield LeftPanel(self._model_info, id="left-panel")
             yield ChatPanel(id="chat-panel")
             yield TraitPanel(categories=self._probe_categories, id="trait-panel")
-        yield Footer()
 
     def on_mount(self) -> None:
         self._left_panel = self.query_one("#left-panel", LeftPanel)
@@ -328,10 +328,12 @@ class SteerApp(App):
             chat.add_system_message(
                 'Commands: /steer "concept" [layer] [alpha], '
                 '/steer "concept" - "baseline" [layer] [alpha],\n'
-                '/probe "concept" [layer], /clear, /rewind, /sys [prompt], '
+                '/probe "concept" [layer], '
+                '/probe "concept" - "baseline" [layer],\n'
+                '/clear, /rewind, /sys [prompt], '
                 "/temp [val], /top-p [val], /max [n], /help\n"
                 "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
-                "Ctrl+D rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
+                "⌫ rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
                 "[ ] temp · { } top-p · Ctrl+S sort · Esc stop · Ctrl+Q quit"
             )
         else:
