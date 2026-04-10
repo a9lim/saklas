@@ -93,7 +93,7 @@ steer meta-llama/Llama-3.1-8B-Instruct --device cuda --probes emotion personalit
 
 | Command | Description |
 |---------|-------------|
-| `/steer <concept> [alpha] [layer]` | Add a steering vector (e.g. `/steer happy 0.8 18`) |
+| `/steer <concept> [layer] [alpha]` | Add a steering vector (e.g. `/steer happy 18 0.8`) |
 | `/clear` | Clear chat history |
 | `/system <prompt>` | Set system prompt |
 | `/temp <value>` | Set temperature |

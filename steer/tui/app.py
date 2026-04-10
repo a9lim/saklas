@@ -23,7 +23,7 @@ from steer.tui.trait_panel import TraitPanel
 
 PANELS = ["left-panel", "chat-panel", "trait-panel"]
 
-_SMARTSTEER_N_PAIRS = 30
+_STEER_N_PAIRS = 30
 
 
 class SteerApp(App):
@@ -257,19 +257,11 @@ class SteerApp(App):
         if cmd == "/steer":
             if len(parts) < 2:
                 chat.add_system_message(
-                    'Usage: /steer "positive" - "negative" [alpha] [layer]\n'
-                    '       /steer "pos1" "pos2" - "neg1" "neg2" [alpha] [layer]'
+                    'Usage: /steer "concept" [layer] [alpha]\n'
+                    '       /steer "concept" - "baseline" [layer] [alpha]'
                 )
                 return
-            self._add_vector_from_text(parts[1])
-        elif cmd == "/smartsteer":
-            if len(parts) < 2:
-                chat.add_system_message(
-                    'Usage: /smartsteer "concept" [alpha] [layer]\n'
-                    '       /smartsteer "concept" - "baseline" [alpha] [layer]'
-                )
-                return
-            self._handle_smartsteer(parts[1])
+            self._handle_steer(parts[1])
         elif cmd == "/probes":
             self._show_probe_info()
         elif cmd == "/clear":
@@ -315,8 +307,8 @@ class SteerApp(App):
                     chat.add_system_message("Invalid max tokens value")
         elif cmd == "/help":
             chat.add_system_message(
-                'Commands: /steer "pos" - "neg" [alpha] [layer], '
-                '/smartsteer "concept" [-"baseline"] [alpha] [layer], /clear, /sys [prompt], '
+                'Commands: /steer "concept" [layer] [alpha], '
+                '/steer "concept" - "baseline" [layer] [alpha], /clear, /sys [prompt], '
                 "/temp [val], /top-p [val], /max [n], /probes, /help\n"
                 "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
                 "Ctrl+N add · Ctrl+D rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
@@ -327,96 +319,6 @@ class SteerApp(App):
 
     # -- Vector Management --
 
-    @staticmethod
-    def _parse_steer_args(text: str) -> tuple[list[str], list[str], float, int | None]:
-        """Parse /steer arguments into (positives, negatives, alpha, layer).
-
-        Supported formats:
-            "pos" - "neg" [alpha] [layer]
-            "pos1" "pos2" - "neg1" "neg2" [alpha] [layer]
-
-        Returns layer=None to signal "use default".
-        """
-        import shlex
-
-        if " - " not in text:
-            raise ValueError("missing ' - ' separator between positive and negative prompts")
-
-        dash_idx = text.index(" - ")
-        pos_part = text[:dash_idx]
-        rest = text[dash_idx + 3:]  # skip " - "
-
-        # Parse the negative side: text prompts, then optional bare alpha/layer
-        neg_tokens = shlex.split(rest)
-        negatives: list[str] = []
-        trailing: list[str] = []
-        for tok in neg_tokens:
-            # Once we hit a bare number, everything after is alpha/layer
-            if trailing or not any(c.isalpha() for c in tok):
-                trailing.append(tok)
-            else:
-                negatives.append(tok)
-
-        positives = shlex.split(pos_part)
-        if not positives or not negatives:
-            raise ValueError("need at least one prompt on each side of ' - '")
-
-        alpha = float(trailing[0]) if len(trailing) > 0 else 2.5
-        layer = int(trailing[1]) if len(trailing) > 1 else None
-        return positives, negatives, alpha, layer
-
-    def _add_vector_from_text(self, text: str) -> None:
-        if self._ab_in_progress:
-            chat = self.query_one("#chat-panel", ChatPanel)
-            chat.add_system_message("Cannot modify vectors during A/B comparison.")
-            return
-        chat = self.query_one("#chat-panel", ChatPanel)
-
-        try:
-            positives, negatives, alpha, layer = self._parse_steer_args(text)
-        except (ValueError, IndexError) as e:
-            chat.add_system_message(
-                f"Parse error: {e}\n"
-                'Usage: /steer "positive" - "negative" [alpha] [layer]'
-            )
-            return
-
-        layer_idx = layer if layer is not None else self._model_info["num_layers"] * 3 // 4
-        use_caa = len(positives) > 1 or len(negatives) > 1
-
-        if use_caa and len(positives) != len(negatives):
-            chat.add_system_message(
-                f"CAA requires equal pairs: got {len(positives)} positive, {len(negatives)} negative"
-            )
-            return
-
-        # Build a short display name from the first positive prompt
-        name = positives[0] if len(positives[0]) <= 20 else positives[0][:17] + "..."
-        method = "CAA" if use_caa else "ActAdd"
-        chat.add_system_message(
-            f"Extracting '{name}' ({method}, {len(positives)} pair{'s' if use_caa else ''})..."
-        )
-
-        def _extract():
-            if use_caa:
-                from steer.vectors import extract_caa
-                pairs = [{"positive": p, "negative": n} for p, n in zip(positives, negatives)]
-                vec = extract_caa(self._model, self._tokenizer, pairs, layer_idx, layers=self._layers)
-            else:
-                from steer.vectors import extract_actadd
-                vec = extract_actadd(
-                    self._model, self._tokenizer, positives[0], layer_idx,
-                    baseline=negatives[0], layers=self._layers,
-                )
-            self._steering.add_vector(name, vec, alpha, layer_idx)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
-            self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
-
-        self.run_worker(_extract, thread=True)
-
     def _on_vector_extracted(self, concept: str, alpha: float, layer_idx: int) -> None:
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.add_system_message(
@@ -424,11 +326,9 @@ class SteerApp(App):
         )
         self._refresh_left_panel()
 
-    # -- Smart Steer --
-
     @staticmethod
-    def _parse_smartsteer_args(text: str) -> tuple[str, str | None, float, int | None]:
-        """Parse /smartsteer arguments into (concept, baseline|None, alpha, layer|None)."""
+    def _parse_steer_args(text: str) -> tuple[str, str | None, float, int | None]:
+        """Parse /steer arguments into (concept, baseline|None, alpha, layer|None)."""
         import shlex
         if " - " in text:
             dash_idx = text.index(" - ")
@@ -441,22 +341,22 @@ class SteerApp(App):
             concept = tokens[0]
             baseline = None
             trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
-        alpha = float(trailing[0]) if trailing else 2.5
-        layer = int(trailing[1]) if len(trailing) > 1 else None
+        layer = int(trailing[0]) if trailing else None
+        alpha = float(trailing[1]) if len(trailing) > 1 else 2.5
         return concept, baseline, alpha, layer
 
-    def _handle_smartsteer(self, text: str) -> None:
+    def _handle_steer(self, text: str) -> None:
         if self._ab_in_progress:
             chat = self.query_one("#chat-panel", ChatPanel)
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
             return
         chat = self.query_one("#chat-panel", ChatPanel)
         try:
-            concept, baseline, alpha, layer = self._parse_smartsteer_args(text)
+            concept, baseline, alpha, layer = self._parse_steer_args(text)
         except (ValueError, IndexError) as e:
             chat.add_system_message(
                 f"Parse error: {e}\n"
-                'Usage: /smartsteer "concept" - "baseline" [alpha] [layer]'
+                'Usage: /steer "concept" - "baseline" [layer] [alpha]'
             )
             return
 
@@ -464,20 +364,20 @@ class SteerApp(App):
         name = concept if len(concept) <= 20 else concept[:17] + "..."
 
         if baseline:
-            chat.add_system_message(f"Smart-extracting '{name}' vs '{baseline}'...")
+            chat.add_system_message(f"Extracting '{name}' vs '{baseline}'...")
         else:
-            chat.add_system_message(f"Smart-extracting '{name}' (auto-baseline)...")
+            chat.add_system_message(f"Extracting '{name}' (auto-baseline)...")
 
         def _worker():
-            self._smartsteer_worker(concept, baseline, alpha, layer_idx, name)
+            self._steer_worker(concept, baseline, alpha, layer_idx, name)
 
         self.run_worker(_worker, thread=True)
 
-    def _smartsteer_status(self, msg: str) -> None:
+    def _steer_status(self, msg: str) -> None:
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.add_system_message(msg)
 
-    def _generate_statements(self, prompt: str, n: int = _SMARTSTEER_N_PAIRS) -> list[str]:
+    def _generate_statements(self, prompt: str, n: int = _STEER_N_PAIRS) -> list[str]:
         """Ask the model to generate *n* lines from *prompt*."""
         import re
         messages = [{"role": "user", "content": prompt}]
@@ -499,22 +399,30 @@ class SteerApp(App):
                 lines.append(line)
         return lines[:n]
 
-    def _smartsteer_cache_path(self, concept: str, baseline: str | None, layer_idx: int) -> str:
-        """Deterministic cache path for a smartsteer vector."""
+    def _steer_cache_path(self, concept: str, baseline: str | None, layer_idx: int) -> str:
+        """Deterministic cache path for a steering vector."""
         from steer.vectors import get_cache_path
         model_id = self._model_info.get("model_id", "unknown")
         tag = f"{concept}_vs_{baseline}" if baseline else concept
         return get_cache_path(
-            "steer/probes/cache", model_id, tag, layer_idx, "smartsteer",
+            "steer/probes/cache", model_id, tag, layer_idx, "steer",
         )
 
-    def _smartsteer_worker(
+    def _steer_statements_cache_path(self, concept: str, baseline: str | None) -> str:
+        """Cache path for generated statements (layer-independent)."""
+        import os
+        model_id = self._model_info.get("model_id", "unknown")
+        model_name = model_id.replace("/", "_")
+        tag = f"{concept}_vs_{baseline}" if baseline else concept
+        return os.path.join("steer", "probes", "cache", model_name, f"{tag}_steer_statements.json")
+
+    def _steer_worker(
         self, concept: str, baseline: str | None,
         alpha: float, layer_idx: int, name: str,
     ) -> None:
         # Check cache first
         from steer.vectors import save_vector, load_vector, extract_caa, load_contrastive_pairs
-        cache_path = self._smartsteer_cache_path(concept, baseline, layer_idx)
+        cache_path = self._steer_cache_path(concept, baseline, layer_idx)
         try:
             vec, _meta = load_vector(cache_path)
             vec = vec.to(self._device, self._dtype)
@@ -524,7 +432,7 @@ class SteerApp(App):
                 orthogonalize=self._orthogonalize,
             )
             self.call_from_thread(
-                self._smartsteer_status, f"Loaded cached vector for '{name}'.",
+                self._steer_status, f"Loaded cached vector for '{name}'.",
             )
             self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
             return
@@ -549,7 +457,7 @@ class SteerApp(App):
                     ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
                     if ds_path.exists():
                         self.call_from_thread(
-                            self._smartsteer_status,
+                            self._steer_status,
                             f"Found curated dataset '{dataset_file}' for '{concept}', extracting...",
                         )
                         ds = load_contrastive_pairs(str(ds_path))
@@ -560,7 +468,7 @@ class SteerApp(App):
                             "concept": concept,
                             "baseline": baseline,
                             "layer_idx": layer_idx,
-                            "method": "smartsteer",
+                            "method": "steer",
                             "n_pairs": len(ds["pairs"]),
                             "source": f"curated:{dataset_file}",
                         })
@@ -568,61 +476,84 @@ class SteerApp(App):
                         self.call_from_thread(self._on_vector_extracted, name, alpha, layer_idx)
                         return
 
-            n = _SMARTSTEER_N_PAIRS
+            n = _STEER_N_PAIRS
 
-            if baseline is not None:
-                # Two-prompt mode: embody/advocate each side
+            # Try loading cached statements (layer-independent)
+            import json as _json
+            stmt_cache_path = self._steer_statements_cache_path(concept, baseline)
+            pos_stmts = neg_stmts = None
+            try:
+                with open(stmt_cache_path) as f:
+                    cached = _json.load(f)
+                pos_stmts = cached["positive"]
+                neg_stmts = cached["negative"]
                 self.call_from_thread(
-                    self._smartsteer_status,
-                    f"Generating statements embodying '{concept}'...",
+                    self._steer_status,
+                    f"Loaded cached statements for '{concept}'.",
                 )
-                pos_stmts = self._generate_statements(
-                    f"Write {n} short, diverse statements from the perspective of someone who "
-                    f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
-                    f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
-                    f"value statements ('the best thing about {concept} is...'). "
-                    "One statement per line.",
-                )
-                self.call_from_thread(
-                    self._smartsteer_status,
-                    f"Generating statements embodying '{baseline}'...",
-                )
-                neg_stmts = self._generate_statements(
-                    f"Write {n} short, diverse statements from the perspective of someone who "
-                    f"deeply identifies with or embodies '{baseline}'. Mix first-person identity "
-                    f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
-                    f"value statements ('the best thing about {baseline} is...'). "
-                    "One statement per line.",
-                )
-            else:
-                # One-prompt mode: embody vs reject the concept
-                self.call_from_thread(
-                    self._smartsteer_status,
-                    f"Generating statements embodying '{concept}'...",
-                )
-                pos_stmts = self._generate_statements(
-                    f"Write {n} short, diverse statements from the perspective of someone who "
-                    f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
-                    f"statements ('I am...', 'As a...'), enthusiasm ('I love...'), advocacy "
-                    f"('everyone should...'), and lived experience. "
-                    "One statement per line.",
-                )
-                self.call_from_thread(
-                    self._smartsteer_status,
-                    f"Generating statements rejecting '{concept}'...",
-                )
-                neg_stmts = self._generate_statements(
-                    f"Write {n} short, diverse statements from the perspective of someone who "
-                    f"rejects, opposes, or is the opposite of '{concept}'. Mix first-person "
-                    f"identity statements, criticism, dismissal, and contrasting values. "
-                    "One statement per line.",
-                )
+            except (FileNotFoundError, KeyError, _json.JSONDecodeError):
+                pass
+
+            if pos_stmts is None:
+                if baseline is not None:
+                    # Two-prompt mode: embody/advocate each side
+                    self.call_from_thread(
+                        self._steer_status,
+                        f"Generating statements embodying '{concept}'...",
+                    )
+                    pos_stmts = self._generate_statements(
+                        f"Write {n} short, diverse statements from the perspective of someone who "
+                        f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
+                        f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
+                        f"value statements ('the best thing about {concept} is...'). "
+                        "One statement per line.",
+                    )
+                    self.call_from_thread(
+                        self._steer_status,
+                        f"Generating statements embodying '{baseline}'...",
+                    )
+                    neg_stmts = self._generate_statements(
+                        f"Write {n} short, diverse statements from the perspective of someone who "
+                        f"deeply identifies with or embodies '{baseline}'. Mix first-person identity "
+                        f"statements ('I am...', 'As a...'), advocacy ('everyone should...'), and "
+                        f"value statements ('the best thing about {baseline} is...'). "
+                        "One statement per line.",
+                    )
+                else:
+                    # One-prompt mode: embody vs reject the concept
+                    self.call_from_thread(
+                        self._steer_status,
+                        f"Generating statements embodying '{concept}'...",
+                    )
+                    pos_stmts = self._generate_statements(
+                        f"Write {n} short, diverse statements from the perspective of someone who "
+                        f"deeply identifies with or embodies '{concept}'. Mix first-person identity "
+                        f"statements ('I am...', 'As a...'), enthusiasm ('I love...'), advocacy "
+                        f"('everyone should...'), and lived experience. "
+                        "One statement per line.",
+                    )
+                    self.call_from_thread(
+                        self._steer_status,
+                        f"Generating statements rejecting '{concept}'...",
+                    )
+                    neg_stmts = self._generate_statements(
+                        f"Write {n} short, diverse statements from the perspective of someone who "
+                        f"rejects, opposes, or is the opposite of '{concept}'. Mix first-person "
+                        f"identity statements, criticism, dismissal, and contrasting values. "
+                        "One statement per line.",
+                    )
+
+                # Cache the generated statements
+                import os as _os
+                _os.makedirs(_os.path.dirname(stmt_cache_path), exist_ok=True)
+                with open(stmt_cache_path, "w") as f:
+                    _json.dump({"positive": pos_stmts, "negative": neg_stmts}, f, indent=2)
 
             count = min(len(pos_stmts), len(neg_stmts))
             if count < 2:
                 self._restore_vectors(saved_vectors)
                 self.call_from_thread(
-                    self._smartsteer_status,
+                    self._steer_status,
                     f"Could only generate {count} pairs (need >= 2). Try a more specific concept.",
                 )
                 return
@@ -634,7 +565,7 @@ class SteerApp(App):
 
             # Extract CAA vector
             self.call_from_thread(
-                self._smartsteer_status, f"Extracting CAA vector ({count} pairs)...",
+                self._steer_status, f"Extracting CAA vector ({count} pairs)...",
             )
             vec = extract_caa(
                 self._model, self._tokenizer, pairs, layer_idx, layers=self._layers,
@@ -645,7 +576,7 @@ class SteerApp(App):
                 "concept": concept,
                 "baseline": baseline,
                 "layer_idx": layer_idx,
-                "method": "smartsteer",
+                "method": "steer",
                 "n_pairs": count,
             })
 
@@ -814,7 +745,7 @@ class SteerApp(App):
     def action_new_vector(self) -> None:
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.add_system_message(
-            'Type: /steer "positive" - "negative" [alpha] [layer]  (e.g. /steer "happy" - "sad" 0.8 18)'
+            'Type: /steer "concept" [layer] [alpha]  (e.g. /steer happy 18 0.8)'
         )
 
     def action_remove_vector(self) -> None:
