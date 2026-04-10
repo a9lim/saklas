@@ -56,7 +56,7 @@ class LeftPanel(Widget):
         yield Static("[bold]KEYS[/]", classes="section-header")
         yield Static(
             "[dim]Tab focus panels · Esc stop gen\n"
-            "Ctrl+N add vec · Ctrl+D rm vec\n"
+            "Ctrl+D rm vec\n"
             "Ctrl+R regen · Ctrl+A A/B\n"
             "Ctrl+T toggle vec · Ctrl+O ortho\n"
             "Ctrl+S sort probes · Ctrl+Q quit\n"

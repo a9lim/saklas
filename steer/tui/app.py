@@ -31,7 +31,6 @@ class SteerApp(App):
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
-        Binding("ctrl+n", "new_vector", "New Vector"),
         Binding("ctrl+d", "remove_vector", "Remove"),
         Binding("ctrl+a", "ab_compare", "A/B"),
         Binding("escape", "stop_generation", "Stop", show=False),
@@ -132,7 +131,7 @@ class SteerApp(App):
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.add_system_message(
             f"Model loaded: {self._model_info.get('model_id', 'unknown')}. "
-            f"Type a message to chat. Ctrl+N to add steering vectors. Tab to switch panels."
+            f"Type a message to chat. Use /steer and /probe commands. Tab to switch panels."
         )
 
     # -- Key Handling --
@@ -313,7 +312,7 @@ class SteerApp(App):
                 '/probe "concept" [layer], /clear, /sys [prompt], '
                 "/temp [val], /top-p [val], /max [n], /help\n"
                 "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
-                "Ctrl+N add · Ctrl+D rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
+                "Ctrl+D rm · Ctrl+O ortho · Ctrl+R regen · Ctrl+A A/B\n"
                 "[ ] temp · { } top-p · Ctrl+S sort · Esc stop · Ctrl+Q quit"
             )
         else:
@@ -911,12 +910,6 @@ class SteerApp(App):
                 )
 
     # -- Actions --
-
-    def action_new_vector(self) -> None:
-        chat = self.query_one("#chat-panel", ChatPanel)
-        chat.add_system_message(
-            'Type: /steer "concept" [layer] [alpha]  (e.g. /steer happy 18 0.8)'
-        )
 
     def action_remove_vector(self) -> None:
         if self._ab_in_progress:
