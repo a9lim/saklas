@@ -60,7 +60,7 @@ def orthogonalize_vectors(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
     for v in vectors:
         u = v.clone()
         for basis in result:
-            u = u - torch.dot(u.flatten(), basis.flatten()) * basis
+            u = u - (u * basis).sum() * basis
         norm = u.norm()
         if norm > 1e-8:
             result.append(u / norm)

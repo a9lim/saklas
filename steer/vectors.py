@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import torch
@@ -56,6 +57,25 @@ def _capture_hidden_states_single(model, layer, input_ids):
     return captured["hidden"]  # (1, seq, dim)
 
 
+def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
+    """Tokenize text, ensure at least 1 real token, run forward pass, return mean-pooled hidden state in fp32."""
+    enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=True)
+    ids = enc["input_ids"]
+    if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
+        bos_id = tokenizer.bos_token_id
+        if bos_id is None:
+            bos_id = tokenizer.eos_token_id or 0
+        ids = torch.tensor([[bos_id]])
+    ids = ids.to(device)
+    if layers is not None:
+        h = _capture_hidden_states_single(model, layers[layer_idx], ids)
+    else:
+        with torch.inference_mode():
+            out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
+        h = out.hidden_states[layer_idx + 1]
+    return h.float().mean(dim=1).squeeze(0)  # (dim,)
+
+
 def extract_actadd(
     model,
     tokenizer,
@@ -72,110 +92,15 @@ def extract_actadd(
     """
     device = next(model.parameters()).device
 
-    def _encode_single(text: str) -> torch.Tensor:
-        """Tokenize a single string, guaranteeing ≥1 real token."""
-        enc = tokenizer(
-            text,
-            return_tensors="pt",
-            return_attention_mask=True,
-            add_special_tokens=True,
-        )
-        ids = enc["input_ids"]
-        # If the tokenizer produced nothing (empty string with no BOS),
-        # fall back to the BOS token so the model has valid input.
-        if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
-            bos = tokenizer.bos_token_id
-            if bos is None:
-                bos = tokenizer.eos_token_id or 0
-            ids = torch.tensor([[bos]])
-        return ids.to(device)
+    pos_mean = _encode_and_capture(model, tokenizer, concept, layer_idx, layers, device)
+    neg_mean = _encode_and_capture(model, tokenizer, baseline, layer_idx, layers, device)
 
-    concept_ids = _encode_single(concept)
-    baseline_ids = _encode_single(baseline)
-
-    if layers is not None:
-        layer_mod = layers[layer_idx]
-        h_concept = _capture_hidden_states_single(model, layer_mod, concept_ids)
-        h_baseline = _capture_hidden_states_single(model, layer_mod, baseline_ids)
-    else:
-        with torch.inference_mode():
-            out_c = model(input_ids=concept_ids, output_hidden_states=True, use_cache=False)
-            out_b = model(input_ids=baseline_ids, output_hidden_states=True, use_cache=False)
-        h_concept = out_c.hidden_states[layer_idx + 1]
-        h_baseline = out_b.hidden_states[layer_idx + 1]
-
-    # Mean-pool over token positions (no padding, so simple mean).
-    pos_mean = h_concept.float().mean(dim=1, keepdim=True)   # (1, 1, dim)
-    neg_mean = h_baseline.float().mean(dim=1, keepdim=True)
-    # Squeeze out seq dim → (1, dim)
-    pos_mean = pos_mean.squeeze(1)
-    neg_mean = neg_mean.squeeze(1)
-
-    diff = pos_mean - neg_mean  # (1, dim)
+    diff = pos_mean - neg_mean  # (dim,)
 
     # Scale to 10% of the mean hidden-state norm.
-    ref_norm = (
-        torch.stack([pos_mean, neg_mean]).norm(dim=-1).mean().item() * 0.1
-    )
+    ref_norm = (pos_mean.norm().item() + neg_mean.norm().item()) / 2 * 0.1
 
-    return _normalize(diff.to(h_concept.dtype), ref_norm=ref_norm).squeeze(0)
-
-
-def extract_actadd_batched(
-    model,
-    tokenizer,
-    concepts: list[str],
-    layer_idx: int,
-    baseline: str = "",
-    layers=None,
-) -> dict[str, torch.Tensor]:
-    """Batch multiple ActAdd extractions as separate forward passes.
-
-    Runs each concept and the baseline through individual forward passes
-    to avoid padding-induced attention corruption on multimodal models.
-
-    Returns:
-        Dict mapping concept string -> unit steering vector.
-    """
-    device = next(model.parameters()).device
-    # Ensure baseline produces real tokens (empty string → BOS fallback).
-    if not baseline.strip():
-        bos = tokenizer.bos_token
-        baseline = bos if bos else " "
-
-    def _encode_and_capture(text: str) -> torch.Tensor:
-        enc = tokenizer(
-            text,
-            return_tensors="pt",
-            return_attention_mask=True,
-            add_special_tokens=True,
-        )
-        ids = enc["input_ids"]
-        if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
-            bos_id = tokenizer.bos_token_id
-            if bos_id is None:
-                bos_id = tokenizer.eos_token_id or 0
-            ids = torch.tensor([[bos_id]])
-        ids = ids.to(device)
-        if layers is not None:
-            h = _capture_hidden_states_single(model, layers[layer_idx], ids)
-        else:
-            with torch.inference_mode():
-                out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-            h = out.hidden_states[layer_idx + 1]
-        return h.float().mean(dim=1).squeeze(0)  # (dim,)
-
-    neg_mean = _encode_and_capture(baseline)
-    neg_norm = neg_mean.norm().item()
-    result: dict[str, torch.Tensor] = {}
-
-    for concept in concepts:
-        pos_mean = _encode_and_capture(concept)
-        diff = pos_mean - neg_mean
-        ref_norm = (pos_mean.norm().item() + neg_norm) / 2 * 0.1
-        result[concept] = _normalize(diff.unsqueeze(0), ref_norm=ref_norm).squeeze(0)
-
-    return result
+    return _normalize(diff.unsqueeze(0).to(pos_mean.dtype), ref_norm=ref_norm).squeeze(0)
 
 
 def extract_caa(
@@ -199,39 +124,17 @@ def extract_caa(
     """
     device = next(model.parameters()).device
 
-    def _encode_and_capture(text: str) -> torch.Tensor:
-        enc = tokenizer(
-            text,
-            return_tensors="pt",
-            return_attention_mask=True,
-            add_special_tokens=True,
-        )
-        ids = enc["input_ids"]
-        if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
-            bos_id = tokenizer.bos_token_id
-            if bos_id is None:
-                bos_id = tokenizer.eos_token_id or 0
-            ids = torch.tensor([[bos_id]])
-        ids = ids.to(device)
-        if layers is not None:
-            h = _capture_hidden_states_single(model, layers[layer_idx], ids)
-        else:
-            with torch.inference_mode():
-                out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-            h = out.hidden_states[layer_idx + 1]
-        return h.float().mean(dim=1).squeeze(0)  # (dim,)
-
     diffs = []
     norms = []
     for pair in pairs:
-        pos_mean = _encode_and_capture(pair["positive"])
-        neg_mean = _encode_and_capture(pair["negative"])
+        pos_mean = _encode_and_capture(model, tokenizer, pair["positive"], layer_idx, layers, device)
+        neg_mean = _encode_and_capture(model, tokenizer, pair["negative"], layer_idx, layers, device)
         diffs.append(pos_mean - neg_mean)
-        norms.append(pos_mean.norm().item())
-        norms.append(neg_mean.norm().item())
+        norms.append(pos_mean.norm())
+        norms.append(neg_mean.norm())
 
     mean_diff = torch.stack(diffs).mean(dim=0, keepdim=True)  # (1, dim)
-    ref_norm = sum(norms) / len(norms) * 0.1
+    ref_norm = torch.stack(norms).mean().item() * 0.1
 
     return _normalize(mean_diff, ref_norm=ref_norm).squeeze(0)  # (dim,)
 
@@ -280,7 +183,8 @@ def get_cache_path(
         Path like ``{cache_dir}/{model_name}/{concept}_{layer}_{method}.safetensors``
     """
     model_name = model_id.replace("/", "_")
-    filename = f"{concept}_{layer_idx}_{method}.safetensors"
+    safe_concept = re.sub(r'[^\w\-.]', '_', concept)
+    filename = f"{safe_concept}_{layer_idx}_{method}.safetensors"
     return str(Path(cache_dir) / model_name / filename)
 
 

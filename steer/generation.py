@@ -104,9 +104,10 @@ def generate_steered(
     generated_ids: list[int] = []
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
-    topk_k = min(max(1000, _vocab // 32), _vocab)
+    topk_k = min(1024, _vocab)
     seq_len = input_ids.shape[1]
     attn_mask_buf = torch.ones(1, seq_len + config.max_new_tokens, device=device, dtype=torch.long)
+    prefill = True
 
     try:
         with torch.inference_mode():
@@ -116,10 +117,11 @@ def generate_steered(
 
                 outputs = model(
                     input_ids=current_input,
-                    attention_mask=attn_mask_buf[:, :seq_len],
+                    attention_mask=attn_mask_buf[:, :seq_len] if prefill else None,
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
+                prefill = False
 
                 past_key_values = outputs.past_key_values
                 logits = outputs.logits[:, -1, :]
@@ -129,36 +131,22 @@ def generate_steered(
                 torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0, out=logits)
                 logits.clamp_(-100.0, 100.0)
 
-                # Temperature
-                if config.temperature > 0:
-                    logits.div_(config.temperature)
-                else:
+                if config.temperature <= 0:
                     # Greedy
                     next_token = logits.argmax(dim=-1, keepdim=True)
-                    token_id = next_token.item()
-                    generated_ids.append(token_id)
-                    current_input = next_token
-                    seq_len += 1
-                    if on_token:
-                        on_token(tokenizer.decode([token_id], skip_special_tokens=True))
-                    if token_id in eos_ids:
-                        break
-                    continue
+                else:
+                    # Temperature + top-p (nucleus) sampling
+                    logits.div_(config.temperature)
+                    top_logits, top_idx = logits.topk(topk_k, dim=-1, sorted=True)
+                    probs = top_logits.softmax(dim=-1)
+                    cumprobs = probs.cumsum(dim=-1)
+                    mask = (cumprobs - probs) >= config.top_p
+                    probs[mask] = 0.0
+                    probs[:, :1].clamp_(min=1e-8)
+                    probs.div_(probs.sum(dim=-1, keepdim=True))
 
-                # Top-p (nucleus) sampling — use topk to avoid sorting full vocab
-                top_logits, top_idx = logits.topk(topk_k, dim=-1, sorted=True)
-                probs = top_logits.softmax(dim=-1)
-                cumprobs = probs.cumsum(dim=-1)
-                mask = (cumprobs - probs) >= config.top_p
-                probs[mask] = 0.0
-                # Ensure top token (idx 0, sorted desc) has nonzero prob.
-                # Avoids GPU->CPU sync; negligible when other probs are
-                # nonzero, acts as fallback when top-p masks everything.
-                probs[0, 0] = probs[0, 0].clamp(min=1e-8)
-                probs.div_(probs.sum(dim=-1, keepdim=True))
-
-                token_idx = torch.multinomial(probs, 1)
-                next_token = top_idx.gather(-1, token_idx)
+                    token_idx = torch.multinomial(probs, 1)
+                    next_token = top_idx.gather(-1, token_idx)
 
                 token_id = next_token.item()
                 generated_ids.append(token_id)

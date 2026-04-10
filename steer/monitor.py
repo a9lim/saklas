@@ -40,14 +40,10 @@ class TraitMonitor:
     def _hook(self, module, input, output):
         """Hot path. One matmul, no .item(), no CPU sync."""
         hidden = output[0] if isinstance(output, tuple) else output
-        last_state = hidden[0, -1, :]  # (D,) — last token of batch dim 0
-        norm = last_state.norm()
+        last_state = hidden[0, -1]  # (D,) — last token of batch dim 0
         if self._buf_idx < self._gpu_buffer.shape[0]:
-            if norm > 1e-8:
-                normed_state = last_state / norm
-                self._gpu_buffer[self._buf_idx] = self._probe_matrix_normed @ normed_state
-            else:
-                self._gpu_buffer[self._buf_idx].zero_()
+            normed_state = last_state / last_state.norm().clamp(min=1e-8)
+            self._gpu_buffer[self._buf_idx] = self._probe_matrix_normed @ normed_state
             self._buf_idx += 1
         return None  # read-only hook
 
@@ -60,46 +56,52 @@ class TraitMonitor:
         if self._buf_idx == 0:
             return
         was_full = self._buf_idx >= self._gpu_buffer.shape[0]
-        cpu_data = self._gpu_buffer[:self._buf_idx].float().cpu().numpy()
+        cpu_data = self._gpu_buffer[:self._buf_idx].float().cpu()
+        n_tokens = cpu_data.shape[0]
+        # Vectorize across probe dimension
+        sums = cpu_data.sum(dim=0)          # (P,)
+        sum_sqs = (cpu_data ** 2).sum(dim=0)  # (P,)
+        mins = cpu_data.min(dim=0).values   # (P,)
+        maxs = cpu_data.max(dim=0).values   # (P,)
+        firsts = cpu_data[0]                # (P,)
+        lasts = cpu_data[-1]                # (P,)
         for i, name in enumerate(self.probe_names):
-            col = cpu_data[:, i]
-            self.history[name].extend(col.tolist())
+            self.history[name].extend(cpu_data[:, i].tolist())
             s = self._stats[name]
             if s["count"] == 0:
-                s["first"] = float(col[0])
-            s["count"] += len(col)
-            s["sum"] += float(col.sum())
-            s["sum_sq"] += float((col ** 2).sum())
-            col_min, col_max = float(col.min()), float(col.max())
+                s["first"] = firsts[i].item()
+            s["count"] += n_tokens
+            s["sum"] += sums[i].item()
+            s["sum_sq"] += sum_sqs[i].item()
+            col_min, col_max = mins[i].item(), maxs[i].item()
             if col_min < s["min"]:
                 s["min"] = col_min
             if col_max > s["max"]:
                 s["max"] = col_max
-            s["last"] = float(col[-1])
+            s["last"] = lasts[i].item()
         self._buf_idx = 0
         if was_full:
-            self._gpu_buffer = torch.zeros(
+            self._gpu_buffer = torch.empty(
                 self._gpu_buffer.shape[0] * 2, self._gpu_buffer.shape[1],
                 device=self._gpu_buffer.device, dtype=self._gpu_buffer.dtype,
             )
 
-    def get_current(self) -> dict[str, float]:
-        """Latest similarity for each probe. Caller must flush_to_cpu() first."""
-        return {name: (self.history[name][-1] if self.history[name] else 0.0)
-                for name in self.probe_names}
-
-    def get_previous(self) -> dict[str, float]:
-        """Second-to-last similarity (for direction arrows). Caller must flush_to_cpu() first."""
-        result = {}
+    def get_current_and_previous(self) -> tuple[dict[str, float], dict[str, float]]:
+        """Latest and second-to-last similarity for each probe. Caller must flush_to_cpu() first."""
+        current = {}
+        previous = {}
         for name in self.probe_names:
             hist = self.history[name]
             if len(hist) >= 2:
-                result[name] = hist[-2]
+                current[name] = hist[-1]
+                previous[name] = hist[-2]
             elif hist:
-                result[name] = hist[-1]
+                current[name] = hist[-1]
+                previous[name] = hist[-1]
             else:
-                result[name] = 0.0
-        return result
+                current[name] = 0.0
+                previous[name] = 0.0
+        return current, previous
 
     def get_stats(self, name: str) -> dict:
         """Return pre-computed running stats for a probe."""
@@ -108,8 +110,7 @@ class TraitMonitor:
     def get_sparkline(self, name: str, width: int = 64) -> str:
         """Unicode sparkline of recent history. Caller must flush_to_cpu() first."""
         blocks = " ▁▂▃▄▅▆▇█"
-        raw = self.history[name][-width:]
-        values = [v for v in raw if v == v]  # drop NaN (NaN != NaN)
+        values = self.history[name][-width:]
         if not values:
             return ""
         lo, hi = min(values), max(values)
@@ -160,7 +161,6 @@ class TraitMonitor:
 
     def reset_history(self):
         """Clear all history (e.g., on new generation)."""
-        self.flush_to_cpu()
         for name in self.probe_names:
             self.history[name] = []
             self._stats[name] = self._empty_stats()

@@ -18,7 +18,6 @@ class TraitPanel(Widget):
         self._previous_values: dict[str, float] = {}
         self._sparklines: dict[str, str] = {}
         self._probe_stats: dict[str, dict] = {}
-        self._selected_probe: str | None = None
         self._active_probes: set[str] = set()
         self._sort_mode: str = "name"
         self._nav_items: list[tuple[str, str]] = []
@@ -42,6 +41,7 @@ class TraitPanel(Widget):
             self._categories["custom"] = custom
         elif "custom" in self._categories:
             del self._categories["custom"]
+        self._render_probes()
 
     def update_values(
         self,
@@ -65,10 +65,6 @@ class TraitPanel(Widget):
         header.update(
             f"[bold]TRAIT MONITOR[/] [dim]sort: {self._sort_mode[:3]} · Ctrl+S[/]"
         )
-        self._render_probes()
-
-    def select_probe(self, name: str) -> None:
-        self._selected_probe = name
         self._render_probes()
 
     def get_selected_probe(self) -> str | None:
