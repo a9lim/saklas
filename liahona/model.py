@@ -197,30 +197,48 @@ def load_model(model_id: str, quantize=None, device="auto"):
             config.model_type = fixed_type
             load_kwargs["config"] = config
 
-    # --- load model (with attention + dtype fallbacks) ---
+    # --- load model (with attention, dtype, and device fallbacks) ---
     def _try_load():
         return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
 
-    try:
-        model = _try_load()
-    except ValueError as e:
-        if "does not support an attention implementation" not in str(e):
-            raise
-        log.info("attn_implementation %r unsupported, falling back to eager",
-                 load_kwargs.get("attn_implementation"))
-        load_kwargs["attn_implementation"] = "eager"
+    def _try_load_with_fallbacks():
         try:
-            model = _try_load()
-        except Exception as eager_err:
-            raise eager_err from None  # not chained to the SDPA error
-    except Exception:
-        if quantize is not None:
+            return _try_load()
+        except ValueError as e:
+            if "does not support an attention implementation" not in str(e):
+                raise
+            log.info("attn_implementation %r unsupported, falling back to eager",
+                     load_kwargs.get("attn_implementation"))
+            load_kwargs["attn_implementation"] = "eager"
+            try:
+                return _try_load()
+            except Exception as eager_err:
+                raise eager_err from None  # not chained to the SDPA error
+        except Exception:
+            if quantize is not None:
+                raise
+            # bf16/fp16 unsupported — fall back through dtypes
+            fallback = torch.float16 if device == "cuda" else torch.float32
+            quant_kwargs["dtype"] = fallback
+            load_kwargs.update(quant_kwargs)
+            return _try_load()
+
+    try:
+        model = _try_load_with_fallbacks()
+    except (RuntimeError, ValueError) as e:
+        # Some models need CPU for weight conversion (e.g. MXFP4
+        # dequantization) and can then be moved to the target device.
+        if device in ("cuda", "cpu") or "CONVERSION" not in str(e):
             raise
-        # bf16/fp16 unsupported — fall back through dtypes
-        fallback = torch.float16 if device == "cuda" else torch.float32
-        quant_kwargs["dtype"] = fallback
-        load_kwargs.update(quant_kwargs)
-        model = _try_load()
+        log.info("weight conversion failed on %s, retrying on CPU", device)
+        load_kwargs["device_map"] = {"": "cpu"}
+        if "dtype" not in quant_kwargs:
+            load_kwargs["dtype"] = torch.float32
+        try:
+            model = _try_load_with_fallbacks()
+        except Exception as cpu_err:
+            raise cpu_err from None
+        model = model.to(device)
 
     model.requires_grad_(False)
     model.train(False)
