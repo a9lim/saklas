@@ -91,6 +91,43 @@ _LAYER_ACCESSORS = {
 _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
 
 
+def _load_text_from_multimodal(
+    model_id: str,
+    text_config,
+    dtype: torch.dtype,
+    device: str,
+):
+    """Load just the text model from a multimodal checkpoint.
+
+    Multimodal checkpoints store text-model weights under a
+    ``language_model.`` prefix.  This function creates an empty
+    text-only model, loads each safetensors shard, strips the prefix,
+    and loads matching weights.  Vision-tower weights are skipped.
+    """
+    import json
+    import os
+    from safetensors.torch import load_file
+    from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
+
+    model = AutoModelForCausalLM.from_config(text_config, torch_dtype=dtype)
+
+    index_path = cached_file(model_id, SAFE_WEIGHTS_INDEX_NAME)
+    model_dir = os.path.dirname(index_path)
+    with open(index_path) as f:
+        shard_files = sorted(set(json.load(f)["weight_map"].values()))
+
+    prefix = "language_model."
+    for sf in shard_files:
+        shard = load_file(os.path.join(model_dir, sf), device="cpu")
+        mapped = {k[len(prefix):]: v for k, v in shard.items()
+                  if k.startswith(prefix)}
+        if mapped:
+            model.load_state_dict(mapped, strict=False)
+
+    model = model.to(device)
+    return model
+
+
 def detect_device(requested: str = "auto") -> str:
     """Pick the best available device.
 
@@ -181,55 +218,63 @@ def load_model(model_id: str, quantize=None, device="auto"):
     )
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", None)
-    if (text_cfg is not None
-            and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
-            and getattr(config, "model_type", None) not in _LAYER_ACCESSORS):
-        log.info("using text_config (%s) from multimodal config (%s)",
+    extract_text_model = (
+        text_cfg is not None
+        and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
+        and getattr(config, "model_type", None) not in _LAYER_ACCESSORS
+    )
+
+    if extract_text_model:
+        # Multimodal checkpoint wrapping a supported text-only model
+        # (e.g. Ministral tagged as Mistral3).  Weights are stored
+        # with a "language_model." prefix that doesn't match the
+        # text-only model's parameter names.  Load manually.
+        log.info("extracting text model (%s) from multimodal checkpoint (%s)",
                  text_cfg.model_type, config.model_type)
-        load_kwargs["config"] = text_cfg
+        model = _load_text_from_multimodal(
+            model_id, text_cfg, quant_kwargs.get("dtype", _pick_dtype(device)),
+            device,
+        )
+    else:
+        # --- standard load (with attention, dtype, and device fallbacks) ---
+        def _try_load():
+            return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
 
-    # --- load model (with attention, dtype, and device fallbacks) ---
-    def _try_load():
-        return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-
-    def _try_load_with_fallbacks():
-        try:
-            return _try_load()
-        except ValueError as e:
-            if "does not support an attention implementation" not in str(e):
-                raise
-            log.info("attn_implementation %r unsupported, falling back to eager",
-                     load_kwargs.get("attn_implementation"))
-            load_kwargs["attn_implementation"] = "eager"
+        def _try_load_with_fallbacks():
             try:
                 return _try_load()
-            except Exception as eager_err:
-                raise eager_err from None  # not chained to the SDPA error
-        except Exception:
-            if quantize is not None:
-                raise
-            # bf16/fp16 unsupported — fall back through dtypes
-            fallback = torch.float16 if device == "cuda" else torch.float32
-            quant_kwargs["dtype"] = fallback
-            load_kwargs.update(quant_kwargs)
-            return _try_load()
+            except ValueError as e:
+                if "does not support an attention implementation" not in str(e):
+                    raise
+                log.info("attn_implementation %r unsupported, falling back to eager",
+                         load_kwargs.get("attn_implementation"))
+                load_kwargs["attn_implementation"] = "eager"
+                try:
+                    return _try_load()
+                except Exception as eager_err:
+                    raise eager_err from None
+            except Exception:
+                if quantize is not None:
+                    raise
+                fallback = torch.float16 if device == "cuda" else torch.float32
+                quant_kwargs["dtype"] = fallback
+                load_kwargs.update(quant_kwargs)
+                return _try_load()
 
-    try:
-        model = _try_load_with_fallbacks()
-    except (RuntimeError, ValueError) as e:
-        # Some models need CPU for weight conversion (e.g. MXFP4
-        # dequantization) and can then be moved to the target device.
-        if device in ("cuda", "cpu") or "CONVERSION" not in str(e):
-            raise
-        log.info("weight conversion failed on %s, retrying on CPU", device)
-        load_kwargs["device_map"] = {"": "cpu"}
-        if "dtype" not in quant_kwargs:
-            load_kwargs["dtype"] = torch.float32
         try:
             model = _try_load_with_fallbacks()
-        except Exception as cpu_err:
-            raise cpu_err from None
-        model = model.to(device)
+        except (RuntimeError, ValueError) as e:
+            if device in ("cuda", "cpu") or "CONVERSION" not in str(e):
+                raise
+            log.info("weight conversion failed on %s, retrying on CPU", device)
+            load_kwargs["device_map"] = {"": "cpu"}
+            if "dtype" not in quant_kwargs:
+                load_kwargs["dtype"] = torch.float32
+            try:
+                model = _try_load_with_fallbacks()
+            except Exception as cpu_err:
+                raise cpu_err from None
+            model = model.to(device)
 
     model.requires_grad_(False)
     model.train(False)
