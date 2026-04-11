@@ -26,7 +26,7 @@ pandas = ["pandas>=2.0"]
 research = ["datasets>=2.0", "pandas>=2.0"]
 
 [project.scripts]
-steer = "liahona.cli:main"
+liahona = "liahona.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["liahona*"]
