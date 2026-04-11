@@ -57,8 +57,6 @@ def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False
                 h = output[0]
                 if output_attentions and len(output) > 1:
                     captured_attn[idx] = output[1]
-            if h.device.type == "mps":
-                torch.mps.synchronize()
             # No .clone() — with use_cache=False and inference_mode() the
             # residual-stream tensors are fresh allocations at each layer
             # boundary (residual add produces a new tensor).  Detach severs
@@ -85,6 +83,12 @@ def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False
         with torch.inference_mode():
             model(input_ids=input_ids, use_cache=False,
                   output_attentions=output_attentions)
+        # Single sync after the full forward pass — lazy backends (MPS)
+        # may not have materialised tensor data yet.  One flush here
+        # replaces the per-layer sync that used to stall the pipeline
+        # N_layers times per pass.
+        if input_ids.device.type == "mps":
+            torch.mps.synchronize()
     finally:
         for h in handles:
             h.remove()
@@ -195,28 +199,29 @@ def extract_contrastive(
         device = next(model.parameters()).device
 
     n_layers = len(layers)
-    # Accumulate per-layer diffs and norms
+    # Accumulate per-layer diffs and running norm sums
     diffs_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
-    norms_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
+    norm_sums: dict[int, float] = {i: 0.0 for i in range(n_layers)}
 
     for pair in pairs:
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
         for idx in range(n_layers):
             diffs_per_layer[idx].append(pos_all[idx] - neg_all[idx])
-            norms_per_layer[idx].append(pos_all[idx].norm())
-            norms_per_layer[idx].append(neg_all[idx].norm())
+            norm_sums[idx] += pos_all[idx].norm().item() + neg_all[idx].norm().item()
 
     # Per-layer: compute direction and score
     profile: dict[int, tuple[torch.Tensor, float]] = {}
     scores: dict[int, float] = {}
     n_pairs = len(pairs)
 
+    n_norm_samples = n_pairs * 2  # pos + neg per pair
+
     if n_pairs < 2:
         # Single pair: use raw diff, score by norm (normalized to [0,1] below)
         for idx in range(n_layers):
             diff_vec = diffs_per_layer[idx][0]
-            ref_norm = torch.stack(norms_per_layer[idx]).mean().item() * 0.1
+            ref_norm = (norm_sums[idx] / n_norm_samples) * 0.1
             direction = _normalize(diff_vec, ref_norm=ref_norm)
             scores[idx] = diff_vec.float().norm().item()
             profile[idx] = (direction, scores[idx])
@@ -230,7 +235,7 @@ def extract_contrastive(
         src_device = diffs_per_layer[0][0].device
         for idx in range(n_layers):
             diff_matrices.append(torch.stack(diffs_per_layer[idx]))  # (N, dim)
-            ref_norms.append(torch.stack(norms_per_layer[idx]).mean().item() * 0.1)
+            ref_norms.append((norm_sums[idx] / n_norm_samples) * 0.1)
 
         batched = torch.stack(diff_matrices).float()  # (n_layers, N, dim)
         # SVD on MPS must fall back to CPU

@@ -11,6 +11,8 @@ class SteeringHook:
     def __init__(self) -> None:
         self.composed: torch.Tensor | None = None
         self._handle = None
+        self._cached_ids: tuple[int, ...] | None = None
+        self._cached_stacked: torch.Tensor | None = None
 
     def recompose(
         self,
@@ -21,15 +23,23 @@ class SteeringHook:
         """Pre-compose all vectors for this layer into a single tensor."""
         if not vectors:
             self.composed = None
+            self._cached_ids = None
+            self._cached_stacked = None
             return
         # All-zero alphas → no perturbation; skip the matmul so that
         # 0 * NaN (from a bad extraction) doesn't inject NaN into hooks.
         if all(alpha == 0.0 for _, alpha in vectors):
             self.composed = None
             return
+        # Reuse the stacked matrix when only alphas changed
+        vec_ids = tuple(id(vec) for vec, _ in vectors)
+        if vec_ids != self._cached_ids or self._cached_stacked is None:
+            self._cached_stacked = torch.stack(
+                [vec.to(device=device, dtype=dtype) for vec, _ in vectors]
+            )
+            self._cached_ids = vec_ids
         alphas = torch.tensor([alpha for _, alpha in vectors], device=device, dtype=dtype)
-        stacked = torch.stack([vec.to(device=device, dtype=dtype) for vec, _ in vectors])
-        self.composed = (alphas.unsqueeze(1) * stacked).sum(dim=0)
+        self.composed = (alphas.unsqueeze(1) * self._cached_stacked).sum(dim=0)
 
     def hook_fn(self, module, input, output):
         if self.composed is not None:
@@ -144,13 +154,11 @@ class SteeringManager:
                 pairs = list(zip(raw_vectors, alphas))
 
             if idx not in self.hooks:
-                self.hooks[idx] = SteeringHook()
+                hook = SteeringHook()
+                hook.attach(model_layers[idx])
+                self.hooks[idx] = hook
 
-            hook = self.hooks[idx]
-            hook.recompose(pairs, device, dtype)
-            # Re-attach (detach first to avoid duplicate hooks)
-            hook.detach()
-            hook.attach(model_layers[idx])
+            self.hooks[idx].recompose(pairs, device, dtype)
 
     def clear_all(self) -> None:
         """Detach all hooks and clear vectors."""
