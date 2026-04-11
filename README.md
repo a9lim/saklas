@@ -17,7 +17,7 @@ with SteerSession("google/gemma-2-2b-it", device="cuda") as session:
     # Generate with steering
     result = session.generate(
         "What makes a good day?",
-        alphas={"happy": 2.0},
+        alphas={"happy": 0.2},
     )
     print(result.text)
     print(result.readings)  # probe monitor data
@@ -27,7 +27,7 @@ with SteerSession("google/gemma-2-2b-it", device="cuda") as session:
 
     # Sweep alphas
     collector = ResultCollector()
-    for alpha in [0, 0.5, 1.0, 1.5, 2.0, 2.5]:
+    for alpha in [0, 0.05, 0.1, 0.15, 0.2, 0.25]:
         session.clear_history()
         result = session.generate(
             "Describe a sunset.",
@@ -39,7 +39,7 @@ with SteerSession("google/gemma-2-2b-it", device="cuda") as session:
 
 ### Key concepts
 
-**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 1.5})` applies it for that generation only. No persistent hooks live on the model between calls.
+**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 0.15})` applies it for that generation only. Alpha directly represents the fraction of mean hidden-state norm (e.g. 0.15 = 15% perturbation at high-signal layers). No persistent hooks live on the model between calls.
 
 **Orthogonalization is per-call.** `session.generate(input, alphas={...}, orthogonalize=True)` applies Gram-Schmidt to the active vectors for that generation only.
 
@@ -50,10 +50,10 @@ session.steer("happy", happy_profile)
 session.steer("formal", formal_profile)
 
 # Apply both
-result = session.generate("Hello.", alphas={"happy": 2.0, "formal": 1.0})
+result = session.generate("Hello.", alphas={"happy": 0.2, "formal": 0.1})
 
 # Apply only one
-result = session.generate("Hello.", alphas={"happy": 2.0})
+result = session.generate("Hello.", alphas={"happy": 0.2})
 
 # Apply none
 result = session.generate("Hello.")
@@ -89,8 +89,8 @@ session.unsteer("name")            # remove
 session.vectors                    # dict of registered profiles
 
 # Generation
-result = session.generate("prompt", alphas={"name": 1.5}, orthogonalize=False)
-for token in session.generate_stream("prompt", alphas={"name": 1.5}):
+result = session.generate("prompt", alphas={"name": 0.15}, orthogonalize=False)
+for token in session.generate_stream("prompt", alphas={"name": 0.15}):
     print(token.text, end="", flush=True)
 
 # Monitoring
@@ -111,13 +111,13 @@ session.clear_history()            # clear conversation
 ### Structured output
 
 ```python
-result = session.generate("prompt", alphas={"happy": 2.0})
+result = session.generate("prompt", alphas={"happy": 0.2})
 result.text              # decoded output
 result.tokens            # token IDs
 result.token_count       # number of tokens
 result.tok_per_sec       # generation speed
 result.elapsed           # seconds
-result.vectors           # {"happy": 2.0} — snapshot of alphas used
+result.vectors           # {"happy": 0.2} — snapshot of alphas used
 result.readings          # {"probe_name": ProbeReadings} if probes active
 result.to_dict()         # plain Python types, JSON-serializable
 ```
@@ -138,7 +138,7 @@ ds = DataSource.from_pairs([("positive text", "negative text")])
 
 ```python
 collector = ResultCollector()
-collector.add(result, concept="happy", alpha=2.0, run_id=1)
+collector.add(result, concept="happy", alpha=0.2, run_id=1)
 
 collector.to_dicts()               # list of flat dicts
 collector.to_jsonl("results.jsonl")
@@ -173,8 +173,8 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 ```
 +--------------------+----------------------------------+------------------+
 |  VECTORS           |                                  |  TRAIT MONITOR   |
-|  > happy  +2.5     |          Chat                    |  Emotion         |
-|    formal +1.0     |                                  |    happy #### .42|
+|  > happy  +0.10    |          Chat                    |  Emotion         |
+|    formal +0.06    |                                  |    happy #### .42|
 |                    |                                  |    sad   ##- -.15|
 |  CONFIG            |                                  |  Personality     |
 |  temp ####- 0.7    |                                  |    honest ### .31|

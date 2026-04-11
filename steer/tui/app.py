@@ -203,10 +203,10 @@ class SteerApp(App):
             self._trait_panel.nav_up()
 
     def action_nav_left(self) -> None:
-        self._adjust_alpha(-0.5)
+        self._adjust_alpha(-0.02)
 
     def action_nav_right(self) -> None:
-        self._adjust_alpha(0.5)
+        self._adjust_alpha(0.02)
 
     def action_nav_enter(self) -> None:
         panel = PANELS[self._focused_panel_idx]
@@ -248,7 +248,7 @@ class SteerApp(App):
         elif cmd == "/clear":
             self._session.clear_history()
             chat.clear_log()
-            self._trait_panel.update_values({}, {}, {}, stats={})
+            self._trait_panel.update_values({}, {}, {})
             chat.add_system_message("Chat history cleared.")
         elif cmd == "/rewind":
             if not self._messages:
@@ -336,7 +336,7 @@ class SteerApp(App):
             baseline = None
             trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
         if include_alpha:
-            alpha = float(trailing[0]) if trailing else 2.5
+            alpha = float(trailing[0]) if trailing else 0.1
             return concept, baseline, alpha
         return concept, baseline
 
@@ -560,11 +560,8 @@ class SteerApp(App):
             current, previous = self._session._monitor.get_current_and_previous()
             sparklines = {name: self._session._monitor.get_sparkline(name)
                           for name in self._session._monitor.probe_names}
-            stats = {name: self._session._monitor.get_stats(name)
-                     for name in self._session._monitor.probe_names}
             self._trait_panel.update_values(
                 current, previous, sparklines,
-                stats=stats,
             )
 
     # -- Actions --
@@ -610,7 +607,7 @@ class SteerApp(App):
         sel = lp.get_selected()
         if sel:
             name = sel["name"]
-            self._alphas[name] = max(-5.0, min(5.0, self._alphas.get(name, 0.0) + delta))
+            self._alphas[name] = max(-0.3, min(0.3, self._alphas.get(name, 0.0) + delta))
             self._refresh_left_panel()
 
     def action_toggle_ortho(self) -> None:

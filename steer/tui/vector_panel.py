@@ -134,7 +134,7 @@ class LeftPanel(Widget):
             n_active = len(profile)
             layer_tag = f"{n_active}L pk{peak}"
 
-            bar_full, bar_empty = _build_bar(alpha, 5.0, 16)
+            bar_full, bar_empty = _build_bar(alpha, 0.3, 16)
             if alpha > 0:
                 color = "ansi_green"
             elif alpha < 0:
@@ -149,13 +149,13 @@ class LeftPanel(Widget):
                     text = (
                         f"{marker} {dot} [bold]{name}[/] [dim]{layer_tag}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.1f}[/] [dim]←/→[/]"
+                        f"[{color}]{alpha:+.2f}[/] [dim]←/→[/]"
                     )
                 else:
                     text = (
                         f"{marker} {dot} [dim bold]{name}[/] [dim]{layer_tag}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.1f}[/] [dim]←/→[/]"
+                        f"[dim {color}]{alpha:+.2f}[/] [dim]←/→[/]"
                     )
             else:
                 marker = " "
@@ -164,13 +164,13 @@ class LeftPanel(Widget):
                     text = (
                         f"{marker} {dot} {name} [dim]{layer_tag}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.1f}[/]"
+                        f"[{color}]{alpha:+.2f}[/]"
                     )
                 else:
                     text = (
                         f"{marker} {dot} [dim]{name} {layer_tag}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.1f}[/]"
+                        f"[dim {color}]{alpha:+.2f}[/]"
                     )
             lines.append(text)
 

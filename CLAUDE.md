@@ -30,7 +30,7 @@ Four layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 - `monitor.py` — `TraitMonitor` runs a single post-generation forward pass over the generated text using attention-weighted pooling. Mean-centers hidden states (subtracting per-layer means computed from neutral prompts) before computing score-weighted cosine similarities against probe vectors. One value per probe per generation. No hooks on the model during generation.
 
 ### Session API layer
-- `session.py` — `SteerSession` is the programmatic API and the TUI's backend. Owns model, vector registry (`_profiles`), monitor, generation config, conversation history. Key design: **vectors are registered without alphas** via `steer(name, profile)`, alphas are supplied per-generation via `generate(input, alphas={"name": 1.5})`. No persistent steering hooks between generations. Orthogonalize is a per-call parameter. Full extraction pipeline: cache -> curated dataset -> statement cache -> model-generated pairs -> contrastive PCA -> save.
+- `session.py` — `SteerSession` is the programmatic API and the TUI's backend. Owns model, vector registry (`_profiles`), monitor, generation config, conversation history. Key design: **vectors are registered without alphas** via `steer(name, profile)`, alphas are supplied per-generation via `generate(input, alphas={"name": 0.15})`. No persistent steering hooks between generations. Orthogonalize is a per-call parameter. Full extraction pipeline: cache -> curated dataset -> statement cache -> model-generated pairs -> contrastive PCA -> save.
 - `datasource.py` — `DataSource` normalizes contrastive pairs from curated names, JSON, CSV, HF datasets, or raw Python lists.
 - `results.py` — `GenerationResult`, `TokenEvent`, `ProbeReadings` dataclasses with `to_dict()`. `ResultCollector` accumulates results for batch export (dicts, JSONL, CSV, DataFrame).
 
@@ -41,7 +41,7 @@ Four layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 - `tui/app.py` — Thin frontend over `SteerSession`. Owns local alpha/enabled/orthogonalize state, passes through to session at generation time. Polls at ~15 FPS. Commands: `/steer`, `/probe`, `/clear`, `/rewind`, `/sys`, `/temp`, `/top-p`, `/max`, `/help`.
 - `tui/vector_panel.py` — Model info, vectors with alpha bars, generation config.
 - `tui/chat_panel.py` — Message log, status bar, input field.
-- `tui/trait_panel.py` — Per-probe bars + sparklines, stats, sort modes.
+- `tui/trait_panel.py` — Per-probe bars + sparklines, sort modes.
 
 ## Performance rules
 
@@ -52,7 +52,7 @@ These matter for the throughput regression test (steered >= 85% of vanilla tok/s
 - **In-place ops**: `logits.div_()`, `logits.clamp_()`, `probs.div_()`.
 - **`torch.topk`** for top-p, not full-vocab sort. `k` capped at `min(1024, vocab)`.
 - **Norm computations use `.float()`** — fp16 sum-of-squares overflows for hidden_dim >= 2048.
-- **Vectors scaled to 10% of mean hidden-state norm** at each extraction layer.
+- **Vectors scaled to mean hidden-state norm** at each extraction layer. Alpha directly represents the fraction of activation magnitude (e.g. alpha=0.15 means 15% perturbation at high-signal layers).
 - **Monitor is post-generation**: single forward pass after generation, no hooks during generation. Mean-centered cosine similarities remove baseline bias.
 - **Steering hooks are transient**: composed before generation, removed after. No persistent hooks between generations.
 
