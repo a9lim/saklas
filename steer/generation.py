@@ -29,6 +29,14 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
             eos_ids.update(eid)
     if tokenizer.eos_token_id is not None:
         eos_ids.add(tokenizer.eos_token_id)
+    # Pick up end-of-turn tokens that some models (Gemma 4, etc.) add as
+    # special tokens but don't list in generation_config.eos_token_id.
+    _EOT_NAMES = {"<end_of_turn>", "<|endoftext|>", "<|end|>", "<|eot_id|>",
+                  "<turn|>", "<|im_end|>"}
+    added = getattr(tokenizer, "added_tokens_encoder", {})
+    for tok_str, tok_id in added.items():
+        if tok_str in _EOT_NAMES:
+            eos_ids.add(tok_id)
     _eos_cache = (tok_key, eos_ids)
     return eos_ids
 

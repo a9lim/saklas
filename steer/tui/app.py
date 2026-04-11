@@ -614,18 +614,26 @@ class SteerApp(App):
         self._refresh_left_panel()
 
     def action_temp_down(self) -> None:
+        if self._focused_panel_idx != 0:
+            return
         self._session.config.temperature = max(0.0, round(self._session.config.temperature - 0.05, 2))
         self._refresh_gen_config()
 
     def action_temp_up(self) -> None:
+        if self._focused_panel_idx != 0:
+            return
         self._session.config.temperature = round(self._session.config.temperature + 0.05, 2)
         self._refresh_gen_config()
 
     def action_top_p_down(self) -> None:
+        if self._focused_panel_idx != 0:
+            return
         self._session.config.top_p = max(0.0, round(self._session.config.top_p - 0.05, 2))
         self._refresh_gen_config()
 
     def action_top_p_up(self) -> None:
+        if self._focused_panel_idx != 0:
+            return
         self._session.config.top_p = min(1.0, round(self._session.config.top_p + 0.05, 2))
         self._refresh_gen_config()
 
