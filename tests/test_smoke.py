@@ -42,42 +42,42 @@ def num_layers(layers):
     return len(layers)
 
 
-@pytest.fixture(scope="module")
-def middle_layer(num_layers):
-    return num_layers // 2
-
-
-def _extract_single(model, tokenizer, concept, layer_idx):
-    """Extract a steering vector for a single concept with one pair."""
+def _extract_profile(model, tokenizer, concept, layers):
+    """Extract a profile for a single concept with one pair."""
     from steer.vectors import extract_contrastive
-    return extract_contrastive(model, tokenizer, [{"positive": concept, "negative": ""}], layer_idx)
+    return extract_contrastive(model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers)
 
 
 @pytest.fixture(scope="module")
-def happy_vector(model_and_tokenizer, middle_layer):
+def happy_profile(model_and_tokenizer, layers):
     model, tokenizer = model_and_tokenizer
-    return _extract_single(model, tokenizer, "happy", middle_layer)
+    return _extract_profile(model, tokenizer, "happy", layers)
 
 
 class TestVectorExtraction:
-    def test_returns_valid_vector(self, happy_vector, model_and_tokenizer):
+    def test_returns_valid_profile(self, happy_profile, model_and_tokenizer):
         model, _ = model_and_tokenizer
         hidden_dim = model.config.hidden_size
-        assert happy_vector.shape == (hidden_dim,)
-        norm = happy_vector.norm().item()
-        assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
+        assert isinstance(happy_profile, dict)
+        assert len(happy_profile) > 0
+        for layer_idx, (vec, score) in happy_profile.items():
+            assert isinstance(layer_idx, int)
+            assert vec.shape == (hidden_dim,)
+            norm = vec.norm().item()
+            assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
+            assert score > 0
 
-    def test_extraction_fast_enough(self, model_and_tokenizer, middle_layer):
+    def test_extraction_fast_enough(self, model_and_tokenizer, layers):
         """Single contrastive extraction should complete in under 10 seconds."""
         model, tokenizer = model_and_tokenizer
         start = time.perf_counter()
-        _extract_single(model, tokenizer, "curious", middle_layer)
+        _extract_profile(model, tokenizer, "curious", layers)
         elapsed = time.perf_counter() - start
         assert elapsed < 10.0, f"Extraction took {elapsed:.1f}s, expected < 10s"
 
 
 class TestSteering:
-    def test_steered_output_differs(self, model_and_tokenizer, layers, middle_layer, happy_vector):
+    def test_steered_output_differs(self, model_and_tokenizer, layers, happy_profile):
         from steer.hooks import SteeringManager
         from steer.generation import GenerationConfig, GenerationState, generate_steered
 
@@ -99,7 +99,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_vector, 1.5, middle_layer)
+        mgr.add_vector("happy", happy_profile, 1.5)
         mgr.apply_to_model(layers, device, dtype)
 
         state1 = GenerationState()
@@ -109,7 +109,7 @@ class TestSteering:
 
         assert ids0 != ids1, "Steered output should differ from unsteered"
 
-    def test_hook_cleanup(self, model_and_tokenizer, layers, middle_layer, happy_vector):
+    def test_hook_cleanup(self, model_and_tokenizer, layers, happy_profile):
         from steer.hooks import SteeringManager
         from steer.generation import GenerationConfig, GenerationState, generate_steered
 
@@ -129,7 +129,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_vector, 2.0, middle_layer)
+        mgr.add_vector("happy", happy_profile, 2.0)
         mgr.apply_to_model(layers, device, dtype)
         state_s = GenerationState()
         steered = generate_steered(model, tokenizer, input_ids.clone(), config, state_s)
@@ -144,21 +144,26 @@ class TestSteering:
 
 
 class TestSaveLoad:
-    def test_roundtrip(self, happy_vector):
-        from steer.vectors import save_vector, load_vector
+    def test_roundtrip(self, happy_profile):
+        from steer.vectors import save_profile, load_profile
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "test_vec.safetensors")
-            meta = {"concept": "happy", "layer_idx": 10}
-            save_vector(happy_vector, path, meta)
-            loaded_vec, loaded_meta = load_vector(path)
+            path = str(Path(tmp) / "test_profile.safetensors")
+            meta = {"concept": "happy"}
+            save_profile(happy_profile, path, meta)
+            loaded_profile, loaded_meta = load_profile(path)
 
-            assert torch.allclose(happy_vector.cpu(), loaded_vec.cpu(), atol=1e-6)
             assert loaded_meta["concept"] == "happy"
+            assert set(loaded_profile.keys()) == set(happy_profile.keys())
+            for idx in happy_profile:
+                orig_vec, orig_score = happy_profile[idx]
+                loaded_vec, loaded_score = loaded_profile[idx]
+                assert torch.allclose(orig_vec.cpu(), loaded_vec.cpu(), atol=1e-6)
+                assert abs(orig_score - loaded_score) < 1e-6
 
 
 class TestTraitMonitor:
-    def test_monitor_records_history(self, model_and_tokenizer, layers, middle_layer, happy_vector):
+    def test_monitor_records_history(self, model_and_tokenizer, layers, happy_profile):
         from steer.hooks import SteeringManager
         from steer.monitor import TraitMonitor
         from steer.generation import GenerationConfig, GenerationState, generate_steered
@@ -166,17 +171,16 @@ class TestTraitMonitor:
         model, tokenizer = model_and_tokenizer
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
-        num_layers = len(layers)
 
-        sad_vector = _extract_single(model, tokenizer, "sad", num_layers - 2)
+        sad_profile = _extract_profile(model, tokenizer, "sad", layers)
 
-        probes = {"happy": happy_vector, "sad": sad_vector}
-        monitor = TraitMonitor(probes, num_layers - 2)
+        probe_profiles = {"happy": happy_profile, "sad": sad_profile}
+        monitor = TraitMonitor(probe_profiles)
         monitor.attach(layers, device, dtype)
 
         # Steer toward happy
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_vector, 1.0, middle_layer)
+        mgr.add_vector("happy", happy_profile, 1.0)
         mgr.apply_to_model(layers, device, dtype)
 
         input_ids = tokenizer.apply_chat_template(
@@ -210,7 +214,7 @@ class TestTraitMonitor:
 
         monitor.detach()
 
-    def test_throughput_regression(self, model_and_tokenizer, layers, middle_layer, happy_vector):
+    def test_throughput_regression(self, model_and_tokenizer, layers, happy_profile):
         """Steered generation should be at least 85% of vanilla throughput."""
         from steer.hooks import SteeringManager
         from steer.monitor import TraitMonitor
@@ -219,7 +223,6 @@ class TestTraitMonitor:
         model, tokenizer = model_and_tokenizer
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
-        num_layers = len(layers)
 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": "Write a short story."}],
@@ -237,19 +240,20 @@ class TestTraitMonitor:
         # Steered + monitored timing
         # 3 steering vectors
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_vector, 0.8, middle_layer)
-        curious_vec = _extract_single(model, tokenizer, "curious", middle_layer)
-        mgr.add_vector("curious", curious_vec, 0.5, middle_layer)
-        concise_vec = _extract_single(model, tokenizer, "concise", middle_layer)
-        mgr.add_vector("concise", concise_vec, 0.3, middle_layer + 2)
+        mgr.add_vector("happy", happy_profile, 0.8)
+        curious_profile = _extract_profile(model, tokenizer, "curious", layers)
+        mgr.add_vector("curious", curious_profile, 0.5)
+        concise_profile = _extract_profile(model, tokenizer, "concise", layers)
+        mgr.add_vector("concise", concise_profile, 0.3)
         mgr.apply_to_model(layers, device, dtype)
 
-        # 15 probes (use same vectors repeated for simplicity)
-        probe_dict = {}
+        # 15 probes (use same profiles repeated for simplicity)
+        probe_profiles = {}
+        source_profiles = [happy_profile, curious_profile, concise_profile]
         for i, name in enumerate(["p0", "p1", "p2", "p3", "p4", "p5", "p6",
                                     "p7", "p8", "p9", "p10", "p11", "p12", "p13", "p14"]):
-            probe_dict[name] = [happy_vector, curious_vec, concise_vec][i % 3]
-        monitor = TraitMonitor(probe_dict, num_layers - 2)
+            probe_profiles[name] = source_profiles[i % 3]
+        monitor = TraitMonitor(probe_profiles)
         monitor.attach(layers, device, dtype)
 
         state1 = GenerationState()
@@ -269,7 +273,7 @@ class TestTraitMonitor:
 
 
 class TestExtractContrastive:
-    def test_returns_valid_vector(self, model_and_tokenizer, layers, num_layers):
+    def test_returns_valid_profile(self, model_and_tokenizer, layers, num_layers):
         from steer.vectors import extract_contrastive
         model, tokenizer = model_and_tokenizer
         hidden_dim = model.config.hidden_size
@@ -278,10 +282,15 @@ class TestExtractContrastive:
             {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
             {"positive": "I love this", "negative": "I hate this"},
         ]
-        vec = extract_contrastive(model, tokenizer, pairs, num_layers // 2, layers=layers)
-        assert vec.shape == (hidden_dim,)
-        norm = vec.norm().item()
-        assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
+        profile = extract_contrastive(model, tokenizer, pairs, layers=layers)
+        assert isinstance(profile, dict)
+        assert len(profile) > 0
+        for idx, (vec, score) in profile.items():
+            assert 0 <= idx < num_layers
+            assert vec.shape == (hidden_dim,)
+            norm = vec.norm().item()
+            assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
+            assert score > 0
 
 
 class TestBuildChatInput:
@@ -305,29 +314,26 @@ class TestBuildChatInput:
 
 
 class TestProbesBootstrap:
-    def test_bootstrap_loads_from_cache(self, model_and_tokenizer, layers, happy_vector):
-        """Bootstrap should return cached vectors without re-extracting."""
+    def test_bootstrap_loads_from_cache(self, model_and_tokenizer, layers, happy_profile):
+        """Bootstrap should return cached profiles without re-extracting."""
         from steer.probes_bootstrap import bootstrap_probes
-        from steer.vectors import save_vector, get_cache_path
+        from steer.vectors import save_profile, get_cache_path
         from steer.model import get_model_info
         model, tokenizer = model_and_tokenizer
         model_info = get_model_info(model, tokenizer)
-        num_layers = model_info["num_layers"]
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Pre-populate cache with a fake probe
-            cp = get_cache_path(tmp, model_info["model_id"], "happy", num_layers - 2)
-            save_vector(happy_vector, cp, {"concept": "happy",
-                                           "layer_idx": num_layers - 2,
-                                           "model_id": model_info["model_id"],
-                                           "hidden_dim": happy_vector.shape[0],
-                                           "num_pairs": 10})
+            # Pre-populate cache with a profile
+            cp = get_cache_path(tmp, model_info["model_id"], "happy")
+            save_profile(happy_profile, cp, {
+                "concept": "happy",
+                "model_id": model_info["model_id"],
+                "num_pairs": 10,
+            })
             # Bootstrap with a category containing "happy"
-            # We need defaults.json to list it — use a custom defaults
             probes = bootstrap_probes(
                 model, tokenizer, layers, model_info,
                 categories=["emotion"], cache_dir=tmp,
             )
             # If "happy" is in the emotion category in defaults.json, it should be loaded
-            # Otherwise the test still exercises the cache-miss path for other probes
             assert isinstance(probes, dict)

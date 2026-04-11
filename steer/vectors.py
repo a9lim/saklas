@@ -13,7 +13,6 @@ from safetensors.torch import load_file, save_file
 log = logging.getLogger(__name__)
 
 
-
 def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     """Normalize a direction vector.
 
@@ -34,9 +33,8 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     return unit
 
 
-
-def _capture_hidden_states_single(model, layer, input_ids, output_attentions=False):
-    """Run a single-sequence forward pass and capture hidden states at *layer*.
+def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False):
+    """Run a single-sequence forward pass capturing hidden states at ALL layers.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
     When *output_attentions* is True, temporarily switches the model to
@@ -44,21 +42,24 @@ def _capture_hidden_states_single(model, layer, input_ids, output_attentions=Fal
     the original implementation after the forward pass.
 
     Returns:
-        dict with ``"hidden"`` (1, seq, dim) and optionally ``"attention"``
-        (1, heads, seq, seq).
+        dict with ``"hidden"`` mapping layer index to (1, seq, dim) tensors,
+        and optionally ``"attention"`` (1, heads, seq, seq) from the last layer.
     """
-    captured = {}
+    captured_hidden: dict[int, torch.Tensor] = {}
+    captured_attn: dict[str, torch.Tensor] = {}
 
-    def _hook(module, input, output):
-        if isinstance(output, torch.Tensor):
-            h = output
-        else:
-            h = output[0]
-            if output_attentions and len(output) > 1:
-                captured["attention"] = output[1]
-        if h.device.type == "mps":
-            torch.mps.synchronize()
-        captured["hidden"] = h.clone()
+    def _make_hook(idx, is_last):
+        def _hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                h = output
+            else:
+                h = output[0]
+                if is_last and output_attentions and len(output) > 1:
+                    captured_attn["attention"] = output[1]
+            if h.device.type == "mps":
+                torch.mps.synchronize()
+            captured_hidden[idx] = h.clone()
+        return _hook
 
     # SDPA doesn't support output_attentions; swap to eager for extraction.
     prev_attn = None
@@ -70,28 +71,42 @@ def _capture_hidden_states_single(model, layer, input_ids, output_attentions=Fal
         else:
             prev_attn = None  # already eager, nothing to restore
 
-    handle = layer.register_forward_hook(_hook)
+    n_layers = len(layers)
+    handles = []
+    for idx in range(n_layers):
+        handles.append(layers[idx].register_forward_hook(
+            _make_hook(idx, idx == n_layers - 1)
+        ))
     try:
         with torch.inference_mode():
             model(input_ids=input_ids, use_cache=False,
                   output_attentions=output_attentions)
     finally:
-        handle.remove()
+        for h in handles:
+            h.remove()
         if prev_attn is not None:
             model.set_attn_implementation(prev_attn)
-    return captured
+
+    result = {"hidden": captured_hidden}
+    if "attention" in captured_attn:
+        result["attention"] = captured_attn["attention"]
+    return result
 
 
-def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
-    """Tokenize text, run forward pass, return attention-weighted hidden state in fp32.
+def _encode_and_capture_all(model, tokenizer, text, layers, device):
+    """Tokenize text, run forward pass, return attention-weighted hidden state per layer in fp32.
 
     For instruction-tuned models (those with a chat template), wraps the text
     as an assistant response so the extraction happens in the model's actual
     generation regime.  Base models get the raw string.
 
-    Uses the last token's self-attention distribution (averaged across heads)
-    as pooling weights — the model's own saliency signal for which positions
-    matter.  Falls back to last-token pooling if attention capture fails.
+    Uses the last token's self-attention distribution (averaged across heads,
+    from the last layer) as pooling weights — the model's own saliency signal
+    for which positions matter.  Falls back to last-token pooling if attention
+    capture fails.
+
+    Returns:
+        dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
     if getattr(tokenizer, "chat_template", None) is not None:
         messages = [
@@ -113,10 +128,8 @@ def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
     ids = ids.to(device)
     mask = mask.to(device)
 
-    captured = _capture_hidden_states_single(
-        model, layers[layer_idx], ids, output_attentions=True,
-    )
-    h = captured["hidden"].float()  # (1, seq, dim)
+    captured = _capture_all_hidden_states(model, layers, ids, output_attentions=True)
+    hidden_per_layer = captured["hidden"]  # {idx: (1, seq, dim)}
 
     attn = captured.get("attention")
     if attn is not None:
@@ -124,122 +137,160 @@ def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
         weights = attn[0, :, -1, :].mean(dim=0)  # (seq,)
         weights = weights * mask[0].float()
         weights = weights / weights.sum().clamp(min=1e-8)
-        return (h[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
 
-    # Fallback: last-token pooling (still better than mean for causal LMs)
+        result = {}
+        for idx, h in hidden_per_layer.items():
+            h_f32 = h.float()  # (1, seq, dim)
+            result[idx] = (h_f32[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
+        return result
+
+    # Fallback: last-token pooling
     seq_len = mask[0].sum() - 1
-    return h[0, seq_len]  # (dim,)
+    result = {}
+    for idx, h in hidden_per_layer.items():
+        result[idx] = h.float()[0, seq_len]  # (dim,)
+    return result
 
 
 def extract_contrastive(
     model,
     tokenizer,
     pairs: list[dict],
-    layer_idx: int,
     layers=None,
     device=None,
-) -> torch.Tensor:
-    """Contrastive direction extraction via PCA (Zou et al., 2023).
+) -> dict[int, tuple[torch.Tensor, float]]:
+    """Contrastive direction extraction via PCA across all layers.
 
-    Computes pos−neg difference vectors for each pair, then takes
-    the first principal component — the direction of maximum variance
-    across the differences.  More robust than mean-difference (CAA)
-    when individual pairs are noisy.
+    Hooks every layer in the same 2N forward passes. For each layer,
+    computes the first principal component of pos-neg differences and
+    scores it by explained variance ratio (sigma_1 / sum(sigma)).
 
-    Runs each prompt through a separate forward pass to avoid
-    padding-induced attention corruption on multimodal models.
+    Layers where score < 0.1 * max_score are dropped.
 
     Args:
         pairs: List of {"positive": str, "negative": str} prompt pairs.
-        layer_idx: Which layer to extract from.
 
     Returns:
-        Direction vector scaled to 10% of mean hidden-state norm.
+        Profile dict mapping layer_idx -> (direction_vector, score)
+        for layers above the signal threshold.
     """
     if device is None:
         device = next(model.parameters()).device
 
-    diffs = []
-    norms = []
+    n_layers = len(layers)
+    # Accumulate per-layer diffs and norms
+    diffs_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
+    norms_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
+
     for pair in pairs:
-        pos_mean = _encode_and_capture(model, tokenizer, pair["positive"], layer_idx, layers, device)
-        neg_mean = _encode_and_capture(model, tokenizer, pair["negative"], layer_idx, layers, device)
-        diffs.append(pos_mean - neg_mean)
-        norms.append(pos_mean.norm())
-        norms.append(neg_mean.norm())
+        pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
+        neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
+        for idx in range(n_layers):
+            diffs_per_layer[idx].append(pos_all[idx] - neg_all[idx])
+            norms_per_layer[idx].append(pos_all[idx].norm())
+            norms_per_layer[idx].append(neg_all[idx].norm())
 
-    diff_matrix = torch.stack(diffs)  # (N, dim)
-    ref_norm = torch.stack(norms).mean().item() * 0.1
+    # Per-layer: compute direction and score
+    profile: dict[int, tuple[torch.Tensor, float]] = {}
+    scores: dict[int, float] = {}
 
-    if len(diffs) < 2:
-        # Can't do PCA with a single vector; fall back to the diff itself.
-        return _normalize(diff_matrix.squeeze(0), ref_norm=ref_norm)
+    for idx in range(n_layers):
+        diffs = diffs_per_layer[idx]
+        ref_norm = torch.stack(norms_per_layer[idx]).mean().item() * 0.1
+        diff_matrix = torch.stack(diffs)  # (N, dim)
 
-    # SVD on the uncentered difference matrix.  The first right singular
-    # vector is the dominant shared direction across pairs (Zou et al.,
-    # 2023).  We deliberately skip centering: the mean difference *is*
-    # the concept signal, and removing it leaves PCA fitting to noise.
-    # Exact SVD is cheap here (N << dim) and deterministic, unlike
-    # randomized pca_lowrank (which also centers by default).
-    # MPS lacks some linalg ops, so fall back to CPU there.
-    svd_input = diff_matrix.float().cpu() if diff_matrix.device.type == "mps" else diff_matrix.float()
-    _, _, Vh = torch.linalg.svd(svd_input, full_matrices=False)
-    direction = Vh[0].to(diff_matrix.device)  # (dim,) — first right singular vector
+        if len(diffs) < 2:
+            # Single pair: use raw diff, score by norm relative to max across layers
+            direction = _normalize(diff_matrix.squeeze(0), ref_norm=ref_norm)
+            scores[idx] = diff_matrix.squeeze(0).float().norm().item()
+            profile[idx] = (direction, scores[idx])
+            continue
 
-    # SVD returns an unsigned direction; orient it so that
-    # "positive" stays positive (align with the mean difference).
-    mean_diff = torch.stack(diffs).mean(dim=0)
-    if direction @ mean_diff < 0:
-        direction = -direction
+        # SVD on uncentered difference matrix
+        svd_input = diff_matrix.float().cpu() if diff_matrix.device.type == "mps" else diff_matrix.float()
+        _, s, Vh = torch.linalg.svd(svd_input, full_matrices=False)
+        direction = Vh[0].to(diff_matrix.device)  # (dim,)
 
-    return _normalize(direction, ref_norm=ref_norm)
+        # Orient so "positive" stays positive
+        mean_diff = diff_matrix.mean(dim=0)
+        if direction @ mean_diff < 0:
+            direction = -direction
+
+        score = (s[0] / s.sum()).item()
+        scores[idx] = score
+        profile[idx] = (_normalize(direction, ref_norm=ref_norm), score)
+
+    # Threshold: keep layers where score >= 0.1 * max_score
+    max_score = max(scores.values()) if scores else 0.0
+    threshold = max_score * 0.1
+    profile = {idx: v for idx, v in profile.items() if v[1] >= threshold}
+
+    return profile
 
 
-def save_vector(vector: torch.Tensor, path: str, metadata: dict) -> None:
-    """Save a steering vector as .safetensors with .json metadata sidecar."""
+def save_profile(
+    profile: dict[int, tuple[torch.Tensor, float]],
+    path: str,
+    metadata: dict,
+) -> None:
+    """Save a vector profile as .safetensors with .json metadata sidecar.
+
+    The safetensors file contains keys ``"layer_{i}"`` for each active layer.
+    The JSON sidecar contains ``metadata`` plus ``"scores"`` mapping layer
+    indices to their signal strength scores.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    save_file({"vector": vector.contiguous().cpu()}, str(path))
+    tensors = {f"layer_{idx}": vec.contiguous().cpu() for idx, (vec, _) in profile.items()}
+    save_file(tensors, str(path))
 
+    scores = {str(idx): score for idx, (_, score) in profile.items()}
+    meta = {**metadata, "scores": scores}
     meta_path = path.with_suffix(".json")
     with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(meta, f, indent=2)
 
-    log.info("Saved vector to %s", path)
+    log.info("Saved profile (%d layers) to %s", len(profile), path)
 
 
-def load_vector(path: str) -> tuple[torch.Tensor, dict]:
-    """Load a steering vector and its metadata.
+def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict]:
+    """Load a vector profile and its metadata.
 
     Returns:
-        (vector tensor, metadata dict)
+        (profile dict mapping layer_idx -> (vector, score), metadata dict)
     """
     path = Path(path)
     tensors = load_file(str(path))
-    vector = tensors["vector"]
 
     meta_path = path.with_suffix(".json")
     with open(meta_path) as f:
         metadata = json.load(f)
 
-    return vector, metadata
+    scores = metadata.get("scores", {})
+    profile = {}
+    for key, tensor in tensors.items():
+        # Keys are "layer_{i}"
+        idx = int(key.split("_", 1)[1])
+        score = float(scores.get(str(idx), 1.0))
+        profile[idx] = (tensor, score)
+
+    return profile, metadata
 
 
 def get_cache_path(
     cache_dir: str,
     model_id: str,
     concept: str,
-    layer_idx: int,
 ) -> str:
-    """Deterministic cache path for a steering vector.
+    """Deterministic cache path for a vector profile.
 
     Returns:
-        Path like ``{cache_dir}/{model_name}/{concept}_{layer}.safetensors``
+        Path like ``{cache_dir}/{model_name}/{concept}.safetensors``
     """
     model_name = model_id.replace("/", "_")
     safe_concept = re.sub(r'[^\w\-.]', '_', concept)
-    filename = f"{safe_concept}_{layer_idx}.safetensors"
+    filename = f"{safe_concept}.safetensors"
     return str(Path(cache_dir) / model_name / filename)
 
 

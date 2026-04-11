@@ -6,8 +6,19 @@ import torch.nn as nn
 _MAX_HISTORY = 8
 
 
+def _peak_layer(profile: dict[int, tuple[torch.Tensor, float]]) -> int:
+    """Return the layer index with the highest score in a profile."""
+    return max(profile, key=lambda k: profile[k][1])
+
+
 class TraitMonitor:
-    """Monitors model activations against a library of probe vectors."""
+    """Monitors model activations against a library of probe vectors.
+
+    Each probe has a profile (dict mapping layer_idx -> (vector, score)).
+    Monitoring uses the peak layer per probe — the layer with the strongest
+    contrastive signal. Hooks are grouped by layer so each active layer
+    has one hook serving a subset of probes.
+    """
 
     @staticmethod
     def _empty_stats() -> dict:
@@ -15,87 +26,122 @@ class TraitMonitor:
                 "min": float("inf"), "max": float("-inf"),
                 "first": 0.0, "last": 0.0}
 
-    def __init__(self, probe_dict: dict[str, torch.Tensor], monitor_layer_idx: int):
+    def __init__(self, probe_profiles: dict[str, dict[int, tuple[torch.Tensor, float]]]):
         """
-        probe_dict: maps probe name -> unit vector (hidden_dim,)
-        monitor_layer_idx: which layer to hook
+        probe_profiles: maps probe name -> profile dict (layer_idx -> (vector, score))
         """
-        self.probe_names: list[str] = list(probe_dict.keys())
-        self.monitor_layer_idx = monitor_layer_idx
-        self._handle = None
-        self._probe_matrix_normed: torch.Tensor | None = None
-        self._raw_probes = probe_dict
-        self._gpu_buffer: torch.Tensor | None = None
-        self._buf_idx: int = 0
+        self.probe_names: list[str] = list(probe_profiles.keys())
+        self._raw_profiles: dict[str, dict[int, tuple[torch.Tensor, float]]] = dict(probe_profiles)
+        self._probe_layer: dict[str, int] = {
+            name: _peak_layer(prof) for name, prof in probe_profiles.items()
+        }
+
+        # Per-layer hook state, populated by attach()
+        self._layer_hooks: dict[int, dict] = {}
+        self._attached = False
+
         self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self.probe_names}
         self._stats: dict[str, dict] = {n: self._empty_stats() for n in self.probe_names}
 
     def attach(self, model_layers: nn.ModuleList, device, dtype, max_tokens=2048):
-        """Pre-stack probes into matrix, pre-allocate GPU buffer, register hook."""
-        vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
-        probe_matrix = torch.stack(vecs)  # (P, D)
-        norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        self._probe_matrix_normed = probe_matrix / norms  # (P, D) unit vectors
-        self._gpu_buffer = torch.zeros(max_tokens, len(self.probe_names), device=device, dtype=dtype)
-        self._buf_idx = 0
-        layer = model_layers[self.monitor_layer_idx]
-        self._handle = layer.register_forward_hook(self._hook)
+        """Group probes by peak layer, build per-layer hooks."""
+        self._detach_hooks()
 
-    def _hook(self, module, input, output):
-        """Hot path. One matmul, no .item(), no CPU sync."""
-        hidden = output[0] if isinstance(output, tuple) else output
-        last_state = hidden[0, -1]  # (D,) — last token of batch dim 0
-        if self._buf_idx < self._gpu_buffer.shape[0]:
-            dots = self._probe_matrix_normed @ last_state
-            self._gpu_buffer[self._buf_idx] = dots / last_state.norm().clamp(min=1e-8)
-            self._buf_idx += 1
-        return None  # read-only hook
+        # Group probes by their peak layer
+        layers_to_probes: dict[int, list[str]] = {}
+        for name in self.probe_names:
+            layer_idx = self._probe_layer[name]
+            layers_to_probes.setdefault(layer_idx, []).append(name)
+
+        for layer_idx, probe_names in layers_to_probes.items():
+            # Build probe matrix for this layer using the vector at the peak layer
+            vecs = []
+            for name in probe_names:
+                vec, _score = self._raw_profiles[name][layer_idx]
+                vecs.append(vec.to(device=device, dtype=dtype))
+            probe_matrix = torch.stack(vecs)  # (P_k, D)
+            norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            probe_matrix_normed = probe_matrix / norms
+
+            gpu_buffer = torch.zeros(max_tokens, len(probe_names), device=device, dtype=dtype)
+
+            hook_state = {
+                "probe_matrix_normed": probe_matrix_normed,
+                "gpu_buffer": gpu_buffer,
+                "buf_idx": 0,
+                "handle": None,
+                "probe_names": probe_names,
+            }
+
+            def _make_hook(state):
+                def _hook(module, input, output):
+                    """Hot path. One matmul, no .item(), no CPU sync."""
+                    hidden = output[0] if isinstance(output, tuple) else output
+                    last_state = hidden[0, -1]  # (D,)
+                    if state["buf_idx"] < state["gpu_buffer"].shape[0]:
+                        dots = state["probe_matrix_normed"] @ last_state
+                        state["gpu_buffer"][state["buf_idx"]] = dots / last_state.norm().clamp(min=1e-8)
+                        state["buf_idx"] += 1
+                    return None  # read-only hook
+                return _hook
+
+            hook_state["handle"] = model_layers[layer_idx].register_forward_hook(_make_hook(hook_state))
+            self._layer_hooks[layer_idx] = hook_state
+
+        self._attached = True
 
     def has_pending_data(self) -> bool:
-        """True if the GPU buffer has unflushed data."""
-        return self._buf_idx > 0
+        """True if any layer's GPU buffer has unflushed data."""
+        return any(state["buf_idx"] > 0 for state in self._layer_hooks.values())
 
     def flush_to_cpu(self):
-        """Batch-transfer GPU buffer to CPU history. Call from TUI poll, not per token."""
-        if self._buf_idx == 0:
-            return
-        was_full = self._buf_idx >= self._gpu_buffer.shape[0]
-        cpu_data = self._gpu_buffer[:self._buf_idx].float().cpu()
-        n_tokens = cpu_data.shape[0]
-        # Vectorize across probe dimension
-        sums = cpu_data.sum(dim=0)          # (P,)
-        sum_sqs = (cpu_data ** 2).sum(dim=0)  # (P,)
-        mins = cpu_data.min(dim=0).values   # (P,)
-        maxs = cpu_data.max(dim=0).values   # (P,)
-        firsts = cpu_data[0]                # (P,)
-        lasts = cpu_data[-1]                # (P,)
-        sums_list = sums.tolist()
-        sum_sqs_list = sum_sqs.tolist()
-        mins_list = mins.tolist()
-        maxs_list = maxs.tolist()
-        firsts_list = firsts.tolist()
-        lasts_list = lasts.tolist()
-        tail_data = cpu_data[max(0, n_tokens - _MAX_HISTORY):]
-        for i, name in enumerate(self.probe_names):
-            self.history[name] = deque(tail_data[:, i].tolist(), maxlen=_MAX_HISTORY)
-            s = self._stats[name]
-            if s["count"] == 0:
-                s["first"] = firsts_list[i]
-            s["count"] += n_tokens
-            s["sum"] += sums_list[i]
-            s["sum_sq"] += sum_sqs_list[i]
-            col_min, col_max = mins_list[i], maxs_list[i]
-            if col_min < s["min"]:
-                s["min"] = col_min
-            if col_max > s["max"]:
-                s["max"] = col_max
-            s["last"] = lasts_list[i]
-        self._buf_idx = 0
-        if was_full:
-            self._gpu_buffer = torch.zeros(
-                self._gpu_buffer.shape[0] * 2, self._gpu_buffer.shape[1],
-                device=self._gpu_buffer.device, dtype=self._gpu_buffer.dtype,
-            )
+        """Batch-transfer GPU buffers to CPU history. Call from TUI poll, not per token."""
+        for state in self._layer_hooks.values():
+            buf_idx = state["buf_idx"]
+            if buf_idx == 0:
+                continue
+
+            was_full = buf_idx >= state["gpu_buffer"].shape[0]
+            cpu_data = state["gpu_buffer"][:buf_idx].float().cpu()
+            n_tokens = cpu_data.shape[0]
+            probe_names = state["probe_names"]
+
+            # Vectorize across probe dimension
+            sums = cpu_data.sum(dim=0)
+            sum_sqs = (cpu_data ** 2).sum(dim=0)
+            mins = cpu_data.min(dim=0).values
+            maxs = cpu_data.max(dim=0).values
+            firsts = cpu_data[0]
+            lasts = cpu_data[-1]
+            sums_list = sums.tolist()
+            sum_sqs_list = sum_sqs.tolist()
+            mins_list = mins.tolist()
+            maxs_list = maxs.tolist()
+            firsts_list = firsts.tolist()
+            lasts_list = lasts.tolist()
+            tail_data = cpu_data[max(0, n_tokens - _MAX_HISTORY):]
+
+            for i, name in enumerate(probe_names):
+                self.history[name] = deque(tail_data[:, i].tolist(), maxlen=_MAX_HISTORY)
+                s = self._stats[name]
+                if s["count"] == 0:
+                    s["first"] = firsts_list[i]
+                s["count"] += n_tokens
+                s["sum"] += sums_list[i]
+                s["sum_sq"] += sum_sqs_list[i]
+                col_min, col_max = mins_list[i], maxs_list[i]
+                if col_min < s["min"]:
+                    s["min"] = col_min
+                if col_max > s["max"]:
+                    s["max"] = col_max
+                s["last"] = lasts_list[i]
+
+            state["buf_idx"] = 0
+            if was_full:
+                state["gpu_buffer"] = torch.zeros(
+                    state["gpu_buffer"].shape[0] * 2, state["gpu_buffer"].shape[1],
+                    device=state["gpu_buffer"].device, dtype=state["gpu_buffer"].dtype,
+                )
 
     def get_current_and_previous(self) -> tuple[dict[str, float], dict[str, float]]:
         """Latest and second-to-last similarity for each probe. Caller must flush_to_cpu() first."""
@@ -128,50 +174,58 @@ class TraitMonitor:
         span = hi - lo if hi != lo else 1.0
         return "".join(blocks[min(8, max(0, int((v - lo) / span * 8)))] for v in values)
 
-    def _rebuild_probe_matrix(self, device, dtype):
-        """Rebuild the normalized probe matrix and resize the GPU buffer."""
-        self.flush_to_cpu()
-        vecs = [self._raw_probes[n].to(device=device, dtype=dtype) for n in self.probe_names]
-        probe_matrix = torch.stack(vecs)
-        norms = probe_matrix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        self._probe_matrix_normed = probe_matrix / norms
-        self._gpu_buffer = torch.zeros(
-            self._gpu_buffer.shape[0], len(self.probe_names),
-            device=device, dtype=dtype,
-        )
+    def _rebuild_from_model_layers(self, model_layers, device, dtype):
+        """Full rebuild: detach, regroup, re-attach all hooks."""
+        # Preserve buffer sizes
+        max_tokens = 2048
+        for state in self._layer_hooks.values():
+            max_tokens = max(max_tokens, state["gpu_buffer"].shape[0])
+        self._detach_hooks()
+        self.attach(model_layers, device, dtype, max_tokens=max_tokens)
 
-    def add_probe(self, name: str, vector: torch.Tensor, device=None, dtype=None):
-        """Add a probe dynamically. Rebuilds the probe matrix."""
-        self._raw_probes[name] = vector
+    def add_probe(self, name: str, profile: dict[int, tuple[torch.Tensor, float]],
+                  model_layers=None, device=None, dtype=None):
+        """Add a probe dynamically. Rebuilds layer hooks if attached."""
+        self._raw_profiles[name] = profile
+        self._probe_layer[name] = _peak_layer(profile)
         if name not in self.probe_names:
             self.probe_names.append(name)
             self.history[name] = deque(maxlen=_MAX_HISTORY)
             self._stats[name] = self._empty_stats()
-        if self._handle is not None and device is not None:
-            self._rebuild_probe_matrix(device, dtype)
+        if self._attached and model_layers is not None and device is not None:
+            self._rebuild_from_model_layers(model_layers, device, dtype)
 
-    def remove_probe(self, name: str, device=None, dtype=None):
-        """Remove a probe. Rebuilds the probe matrix and GPU buffer."""
-        if name in self._raw_probes:
-            del self._raw_probes[name]
+    def remove_probe(self, name: str, model_layers=None, device=None, dtype=None):
+        """Remove a probe. Rebuilds layer hooks if attached."""
+        if name in self._raw_profiles:
+            del self._raw_profiles[name]
+        if name in self._probe_layer:
+            del self._probe_layer[name]
         if name in self.probe_names:
             self.probe_names.remove(name)
         if name in self.history:
             del self.history[name]
         if name in self._stats:
             del self._stats[name]
-        if self._handle is not None and device is not None and self.probe_names:
-            self._rebuild_probe_matrix(device, dtype)
+        if self._attached and model_layers is not None and device is not None and self.probe_names:
+            self._rebuild_from_model_layers(model_layers, device, dtype)
 
     def reset_history(self):
         """Clear all history (e.g., on new generation)."""
         for name in self.probe_names:
             self.history[name] = deque(maxlen=_MAX_HISTORY)
             self._stats[name] = self._empty_stats()
-        self._buf_idx = 0
+        for state in self._layer_hooks.values():
+            state["buf_idx"] = 0
+
+    def _detach_hooks(self):
+        """Remove all layer hooks."""
+        for state in self._layer_hooks.values():
+            if state["handle"] is not None:
+                state["handle"].remove()
+        self._layer_hooks.clear()
 
     def detach(self):
-        if self._handle:
-            self._handle.remove()
-            self._handle = None
         self.flush_to_cpu()
+        self._detach_hooks()
+        self._attached = False

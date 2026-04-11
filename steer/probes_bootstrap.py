@@ -20,35 +20,31 @@ def bootstrap_probes(
     model_info: dict,
     categories: list[str],
     cache_dir: str,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
     """
-    Load or extract probe vectors for the given categories.
-    Returns dict mapping probe_name -> unit vector tensor.
-    Uses batched extraction for efficiency.
+    Load or extract probe vector profiles for the given categories.
+    Returns dict mapping probe_name -> profile (layer_idx -> (vector, score)).
     """
-    from steer.vectors import extract_contrastive, load_contrastive_pairs, load_vector, save_vector, get_cache_path
+    from steer.vectors import extract_contrastive, load_contrastive_pairs, load_profile, save_profile, get_cache_path
 
     defaults = _load_defaults()
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
     model_id = model_info.get("model_id", "unknown")
-    num_layers = model_info["num_layers"]
-    # Default probe layer: penultimate
-    probe_layer = num_layers - 2
 
-    probes: dict[str, torch.Tensor] = {}
+    probes: dict[str, dict[int, tuple[torch.Tensor, float]]] = {}
     to_extract: list[tuple[str, str]] = []
 
     # Check cache first
     for cat in categories:
         cat_probes = defaults.get(cat, [])
         for probe_name in cat_probes:
-            cp = get_cache_path(cache_dir, model_id, probe_name, probe_layer)
+            cp = get_cache_path(cache_dir, model_id, probe_name)
             if Path(cp).exists():
                 try:
-                    vec, _meta = load_vector(cp)
-                    probes[probe_name] = vec
+                    profile, _meta = load_profile(cp)
+                    probes[probe_name] = profile
                     log.debug("Loaded cached probe: %s", probe_name)
                 except Exception as e:
                     log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
@@ -76,13 +72,11 @@ def bootstrap_probes(
 
     for name, cp, ds in tqdm(datasets_to_extract, desc="Extracting probes", unit="probe"):
         try:
-            vec = extract_contrastive(model, tokenizer, ds["pairs"], probe_layer, layers=layers)
-            probes[name] = vec
-            save_vector(vec, cp, {
+            profile = extract_contrastive(model, tokenizer, ds["pairs"], layers=layers)
+            probes[name] = profile
+            save_profile(profile, cp, {
                 "concept": name,
-                "layer_idx": probe_layer,
                 "model_id": model_id,
-                "hidden_dim": vec.shape[0],
                 "num_pairs": len(ds["pairs"]),
             })
         except Exception as e:

@@ -129,7 +129,10 @@ class LeftPanel(Widget):
             enabled = v.get("enabled", True)
             name = v["name"]
             alpha = v["alpha"]
-            layer = v["layer_idx"]
+            profile = v["profile"]
+            peak = max(profile, key=lambda k: profile[k][1])
+            n_active = len(profile)
+            layer_tag = f"{n_active}L pk{peak}"
 
             bar_full, bar_empty = _build_bar(alpha, 5.0, 16)
             if alpha > 0:
@@ -144,13 +147,13 @@ class LeftPanel(Widget):
                 dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
                 if enabled:
                     text = (
-                        f"{marker} {dot} [bold]{name}[/] [dim]L{layer}[/]\n"
+                        f"{marker} {dot} [bold]{name}[/] [dim]{layer_tag}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"[{color}]{alpha:+.1f}[/] [dim]←/→[/]"
                     )
                 else:
                     text = (
-                        f"{marker} {dot} [dim bold]{name}[/] [dim]L{layer}[/]\n"
+                        f"{marker} {dot} [dim bold]{name}[/] [dim]{layer_tag}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"[dim {color}]{alpha:+.1f}[/] [dim]←/→[/]"
                     )
@@ -159,13 +162,13 @@ class LeftPanel(Widget):
                 dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
                 if enabled:
                     text = (
-                        f"{marker} {dot} {name} [dim]L{layer}[/]\n"
+                        f"{marker} {dot} {name} [dim]{layer_tag}[/]\n"
                         f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"[{color}]{alpha:+.1f}[/]"
                     )
                 else:
                     text = (
-                        f"{marker} {dot} [dim]{name} L{layer}[/]\n"
+                        f"{marker} {dot} [dim]{name} {layer_tag}[/]\n"
                         f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
                         f"[dim {color}]{alpha:+.1f}[/]"
                     )

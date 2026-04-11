@@ -85,17 +85,15 @@ class SteeringManager:
     def add_vector(
         self,
         name: str,
-        vector: torch.Tensor,
+        profile: dict[int, tuple[torch.Tensor, float]],
         alpha: float,
-        layer_idx: int,
     ) -> None:
         self._name_idx[name] = len(self.vectors)
         self.vectors.append(
             {
                 "name": name,
-                "vector": vector,
+                "profile": profile,
                 "alpha": alpha,
-                "layer_idx": layer_idx,
                 "enabled": True,
             }
         )
@@ -108,11 +106,6 @@ class SteeringManager:
         v = self._find(name)
         if v is not None:
             v["alpha"] = alpha
-
-    def set_layer(self, name: str, layer_idx: int) -> None:
-        v = self._find(name)
-        if v is not None:
-            v["layer_idx"] = layer_idx
 
     def toggle_vector(self, name: str) -> None:
         v = self._find(name)
@@ -127,11 +120,13 @@ class SteeringManager:
         orthogonalize: bool = False,
     ) -> None:
         """Group enabled vectors by layer, recompose hooks, attach to model."""
-        # Group enabled vectors by layer
-        by_layer: dict[int, list[dict]] = {}
+        # Group enabled vectors by layer via their profiles
+        by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
         for v in self.vectors:
             if v["enabled"]:
-                by_layer.setdefault(v["layer_idx"], []).append(v)
+                for layer_idx, (vec, score) in v["profile"].items():
+                    effective_alpha = v["alpha"] * score
+                    by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
 
         # Detach hooks for layers that no longer have vectors
         for idx in list(self.hooks):
@@ -140,16 +135,13 @@ class SteeringManager:
                 del self.hooks[idx]
 
         # Recompose and attach for each active layer
-        for idx, vecs in by_layer.items():
-            raw_vectors = [v["vector"] for v in vecs]
-            alphas = [v["alpha"] for v in vecs]
-
-            if orthogonalize and len(raw_vectors) > 1:
+        for idx, pairs in by_layer.items():
+            if orthogonalize and len(pairs) > 1:
+                raw_vectors = [vec for vec, _ in pairs]
+                alphas = [alpha for _, alpha in pairs]
                 raw_vectors = orthogonalize_vectors(raw_vectors)
-                # Pad alphas if orthogonalization dropped vectors
                 alphas = alphas[: len(raw_vectors)]
-
-            pairs = list(zip(raw_vectors, alphas))
+                pairs = list(zip(raw_vectors, alphas))
 
             if idx not in self.hooks:
                 self.hooks[idx] = SteeringHook()
