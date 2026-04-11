@@ -110,8 +110,8 @@ class TestGeneration:
     def test_generate_with_alphas(self, session):
         profile = session.extract([("formal", "casual")])
         session.steer("formal", profile)
-        result = session.generate("Hello.", alphas={"formal": 1.0})
-        assert result.vectors == {"formal": 1.0}
+        result = session.generate("Hello.", alphas={"formal": 0.1})
+        assert result.vectors == {"formal": 0.1}
         session.unsteer("formal")
 
     def test_generate_with_probes(self, session):
@@ -130,10 +130,10 @@ class TestGeneration:
         profile = session.extract([("I am happy", "I am sad")])
         session.steer("happy", profile)
         session.clear_history()
-        steered = session.generate("Describe a sunset.", alphas={"happy": 2.0})
+        steered = session.generate("Describe a sunset.", alphas={"happy": 0.2})
         session.clear_history()
         unsteered = session.generate("Describe a sunset.")
-        assert steered.vectors == {"happy": 2.0}
+        assert steered.vectors == {"happy": 0.2}
         assert unsteered.vectors == {}
         # Both should produce text
         assert len(steered.text) > 0
@@ -142,7 +142,7 @@ class TestGeneration:
 
     def test_unknown_vector_raises(self, session):
         with pytest.raises(KeyError, match="nonexistent"):
-            session.generate("Hello.", alphas={"nonexistent": 1.0})
+            session.generate("Hello.", alphas={"nonexistent": 0.1})
 
 class TestStreamingGeneration:
     def test_generate_stream(self, session):
@@ -160,7 +160,7 @@ class TestStreamingGeneration:
         profile = session.extract([("I am happy", "I am sad")])
         session.steer("happy", profile)
         session.clear_history()
-        tokens = list(session.generate_stream("Hello.", alphas={"happy": 1.5}))
+        tokens = list(session.generate_stream("Hello.", alphas={"happy": 0.15}))
         assert len(tokens) > 0
-        assert session.last_result.vectors == {"happy": 1.5}
+        assert session.last_result.vectors == {"happy": 0.15}
         session.unsteer("happy")

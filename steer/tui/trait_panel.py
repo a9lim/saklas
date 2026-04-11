@@ -21,12 +21,10 @@ class TraitPanel(Widget):
         self._current_values: dict[str, float] = {}
         self._previous_values: dict[str, float] = {}
         self._sparklines: dict[str, str] = {}
-        self._probe_stats: dict[str, dict] = {}
         self._active_probes: set[str] = set()
         self._sort_mode: str = "name"
         self._nav_items: list[tuple[str, str]] = []
         self._nav_idx: int = 0
-        self._cached_stats_lines: dict[str, tuple[dict, str]] = {}
         self._cached_sort: tuple[str, tuple, tuple, list] | None = None
         self._cached_render_text: str = ""
 
@@ -59,7 +57,6 @@ class TraitPanel(Widget):
         current: dict[str, float],
         previous: dict[str, float],
         sparklines: dict[str, str],
-        stats: dict[str, dict] | None = None,
     ) -> None:
         if (current == self._current_values
                 and previous == self._previous_values
@@ -68,8 +65,6 @@ class TraitPanel(Widget):
         self._current_values = current
         self._previous_values = previous
         self._sparklines = sparklines
-        if stats is not None:
-            self._probe_stats = stats
         self._render_probes()
 
     def cycle_sort(self) -> None:
@@ -157,39 +152,12 @@ class TraitPanel(Widget):
                     f"[{color}]{val:+.2f}{arrow_ch}[/] [dim]{mini_spark}[/]"
                 )
 
-                stats = self._probe_stats.get(name, {})
-                cached = self._cached_stats_lines.get(name)
-                if cached and cached[0] is stats:
-                    stats_line = cached[1]
-                else:
-                    stats_line = self._compute_stats_line(stats)
-                    self._cached_stats_lines[name] = (stats, stats_line)
-                lines.append(f"{line}\n  [dim]{stats_line}[/]")
+                lines.append(line)
 
         text = "\n".join(lines)
         if text != self._cached_render_text:
             self._cached_render_text = text
             self._trait_content.update(text)
-
-    def _compute_stats_line(self, stats: dict) -> str:
-        n = stats.get("count", 0)
-        if n == 0:
-            return "no data"
-        mean = stats["sum"] / n
-        lo = stats["min"]
-        hi = stats["max"]
-        if n > 1:
-            variance = max(0.0, stats["sum_sq"] / n - mean ** 2)
-            std = variance ** 0.5
-            delta_per_tok = (stats["last"] - stats["first"]) / (n - 1)
-        else:
-            std = 0.0
-            delta_per_tok = 0.0
-        return (
-            f"μ={mean:+.2f} σ={std:.2f} "
-            f"lo={lo:+.2f} hi={hi:+.2f} "
-            f"Δ={delta_per_tok:+.2f}/tok"
-        )
 
     def _sort_probes(self, names: list[str]) -> list[str]:
         if self._sort_mode == "value":

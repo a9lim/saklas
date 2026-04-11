@@ -289,7 +289,7 @@ def extract_contrastive(
         # Single pair: use raw diff, score by norm (normalized to [0,1] below)
         for idx in range(n_layers):
             diff_vec = diffs_per_layer[idx][0]
-            ref_norm = (norm_sums_cpu[idx] / n_norm_samples) * 0.1
+            ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
             scores[idx] = diff_vec.float().norm().item()
             profile[idx] = (direction, scores[idx])
@@ -303,7 +303,7 @@ def extract_contrastive(
         src_device = diffs_per_layer[0][0].device
         for idx in range(n_layers):
             diff_matrices.append(torch.stack(diffs_per_layer[idx]))  # (N, dim)
-            ref_norms.append((norm_sums_cpu[idx] / n_norm_samples) * 0.1)
+            ref_norms.append(norm_sums_cpu[idx] / n_norm_samples)
 
         batched = torch.stack(diff_matrices).float()  # (n_layers, N, dim)
         # SVD on MPS must fall back to CPU
