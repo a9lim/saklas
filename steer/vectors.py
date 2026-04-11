@@ -43,22 +43,28 @@ def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False
 
     Returns:
         dict with ``"hidden"`` mapping layer index to (1, seq, dim) tensors,
-        and optionally ``"attention"`` (1, heads, seq, seq) from the last layer.
+        and optionally ``"attention"`` mapping layer index to
+        (1, heads, seq, seq) tensors.
     """
     captured_hidden: dict[int, torch.Tensor] = {}
-    captured_attn: dict[str, torch.Tensor] = {}
+    captured_attn: dict[int, torch.Tensor] = {}
 
-    def _make_hook(idx, is_last):
+    def _make_hook(idx):
         def _hook(module, input, output):
             if isinstance(output, torch.Tensor):
                 h = output
             else:
                 h = output[0]
-                if is_last and output_attentions and len(output) > 1:
-                    captured_attn["attention"] = output[1]
+                if output_attentions and len(output) > 1:
+                    captured_attn[idx] = output[1]
             if h.device.type == "mps":
                 torch.mps.synchronize()
-            captured_hidden[idx] = h.clone()
+            # No .clone() — with use_cache=False and inference_mode() the
+            # residual-stream tensors are fresh allocations at each layer
+            # boundary (residual add produces a new tensor).  Detach severs
+            # the autograd graph reference so the rest of the forward pass
+            # can't invalidate the data.
+            captured_hidden[idx] = h.detach()
         return _hook
 
     # SDPA doesn't support output_attentions; swap to eager for extraction.
@@ -74,9 +80,7 @@ def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False
     n_layers = len(layers)
     handles = []
     for idx in range(n_layers):
-        handles.append(layers[idx].register_forward_hook(
-            _make_hook(idx, idx == n_layers - 1)
-        ))
+        handles.append(layers[idx].register_forward_hook(_make_hook(idx)))
     try:
         with torch.inference_mode():
             model(input_ids=input_ids, use_cache=False,
@@ -88,8 +92,8 @@ def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False
             model.set_attn_implementation(prev_attn)
 
     result = {"hidden": captured_hidden}
-    if "attention" in captured_attn:
-        result["attention"] = captured_attn["attention"]
+    if captured_attn:
+        result["attention"] = captured_attn
     return result
 
 
@@ -116,10 +120,11 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
             )
         except Exception:
             # Some chat templates require a user turn before assistant.
-            # Fall back to minimal filler rather than contaminating with
-            # a semantically loaded prompt.
+            # The filler must be semantically empty — "." triggers
+            # model-specific greeting/help responses whose template
+            # tokens contaminate the attention-weighted pooling.
             messages = [
-                {"role": "user", "content": "."},
+                {"role": "user", "content": "Continue:"},
                 {"role": "assistant", "content": text},
             ]
             text = tokenizer.apply_chat_template(
@@ -140,17 +145,22 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
     captured = _capture_all_hidden_states(model, layers, ids, output_attentions=True)
     hidden_per_layer = captured["hidden"]  # {idx: (1, seq, dim)}
 
-    attn = captured.get("attention")
-    if attn is not None:
-        # attn: (1, heads, seq, seq) — last token's attention over all positions
-        weights = attn[0, :, -1, :].mean(dim=0)  # (seq,)
-        weights = weights * mask[0].float()
-        weights = weights / weights.sum().clamp(min=1e-8)
-
+    attn_per_layer = captured.get("attention")  # {idx: (1, heads, seq, seq)}
+    if attn_per_layer:
+        mask_f = mask[0].float()
         result = {}
         for idx, h in hidden_per_layer.items():
             h_f32 = h.float()  # (1, seq, dim)
-            result[idx] = (h_f32[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
+            attn = attn_per_layer.get(idx)
+            if attn is not None:
+                # Use this layer's own attention: last token's view, averaged across heads
+                weights = attn[0, :, -1, :].mean(dim=0)  # (seq,)
+                weights = weights * mask_f
+                weights = weights / weights.sum().clamp(min=1e-8)
+                result[idx] = (h_f32[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
+            else:
+                # Layer didn't produce attention weights — last-token fallback
+                result[idx] = h_f32[0, mask[0].sum() - 1]
         return result
 
     # Fallback: last-token pooling
@@ -202,36 +212,45 @@ def extract_contrastive(
     # Per-layer: compute direction and score
     profile: dict[int, tuple[torch.Tensor, float]] = {}
     scores: dict[int, float] = {}
+    n_pairs = len(pairs)
 
-    for idx in range(n_layers):
-        diffs = diffs_per_layer[idx]
-        ref_norm = torch.stack(norms_per_layer[idx]).mean().item() * 0.1
-        diff_matrix = torch.stack(diffs)  # (N, dim)
-
-        if len(diffs) < 2:
-            # Single pair: use raw diff, score by norm (normalized to [0,1] below)
-            direction = _normalize(diff_matrix.squeeze(0), ref_norm=ref_norm)
-            scores[idx] = diff_matrix.squeeze(0).float().norm().item()
+    if n_pairs < 2:
+        # Single pair: use raw diff, score by norm (normalized to [0,1] below)
+        for idx in range(n_layers):
+            diff_vec = diffs_per_layer[idx][0]
+            ref_norm = torch.stack(norms_per_layer[idx]).mean().item() * 0.1
+            direction = _normalize(diff_vec, ref_norm=ref_norm)
+            scores[idx] = diff_vec.float().norm().item()
             profile[idx] = (direction, scores[idx])
-            continue  # scores normalized after the loop
+    else:
+        # Multi-pair: batched SVD across all layers.
+        # Stack into (n_layers, N, dim) and run one batched SVD call —
+        # amortizes LAPACK dispatch overhead vs. n_layers individual calls,
+        # and matters most on CPU (MPS SVD fallback path).
+        diff_matrices = []  # one (N, dim) per layer
+        ref_norms = []
+        src_device = diffs_per_layer[0][0].device
+        for idx in range(n_layers):
+            diff_matrices.append(torch.stack(diffs_per_layer[idx]))  # (N, dim)
+            ref_norms.append(torch.stack(norms_per_layer[idx]).mean().item() * 0.1)
 
-        # SVD on uncentered difference matrix
-        svd_input = diff_matrix.float().cpu() if diff_matrix.device.type == "mps" else diff_matrix.float()
-        _, s, Vh = torch.linalg.svd(svd_input, full_matrices=False)
-        direction = Vh[0].to(diff_matrix.device)  # (dim,)
+        batched = torch.stack(diff_matrices).float()  # (n_layers, N, dim)
+        # SVD on MPS must fall back to CPU
+        svd_input = batched.cpu() if src_device.type == "mps" else batched
+        _, S, Vh = torch.linalg.svd(svd_input, full_matrices=False)
+        # S: (n_layers, min(N,dim)), Vh: (n_layers, min(N,dim), dim)
 
-        # Orient so "positive" stays positive: majority vote across pairs.
-        # Mean-diff orientation is fragile — one outlier pair with large
-        # magnitude can flip the entire vector.  Majority vote counts how
-        # many individual diffs agree with the current sign and flips only
-        # when the majority disagree.
-        dots = diff_matrix @ direction  # (N,)
-        if (dots < 0).sum() > (dots > 0).sum():
-            direction = -direction
+        for idx in range(n_layers):
+            direction = Vh[idx, 0].to(src_device)  # (dim,)
 
-        score = (s[0] / s.sum()).item()
-        scores[idx] = score
-        profile[idx] = (_normalize(direction, ref_norm=ref_norm), score)
+            # Orient so "positive" stays positive: majority vote across pairs.
+            dots = diff_matrices[idx] @ direction  # (N,)
+            if (dots < 0).sum() > (dots > 0).sum():
+                direction = -direction
+
+            score = (S[idx, 0] / S[idx].sum()).item()
+            scores[idx] = score
+            profile[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), score)
 
     # Single-pair scores are raw diff norms — normalize to [0, 1] so they're
     # on the same scale as multi-pair explained-variance-ratio scores.
