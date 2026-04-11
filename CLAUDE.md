@@ -10,7 +10,9 @@
 pip install -e ".[dev]"          # editable install + pytest
 pip install -e ".[cuda]"         # bitsandbytes + flash-attn (CUDA only)
 pip install -e ".[research]"     # datasets + pandas (for API users)
+pip install -e ".[serve]"        # fastapi + uvicorn (for API server)
 steer <model_id>                 # launch TUI
+steer serve <model_id>           # launch OpenAI-compatible API server
 python -m steer <model_id>       # alt entry point
 pytest tests/test_smoke.py -v    # CUDA smoke tests (downloads gemma-2-2b-it ~5GB)
 pytest tests/ -v                 # all tests (non-CUDA tests run anywhere)
@@ -18,7 +20,7 @@ pytest tests/ -v                 # all tests (non-CUDA tests run anywhere)
 
 ## Architecture
 
-Four layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**.
+Five layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**, **API server**.
 
 ### Model + Vector layer
 - `model.py` — Loads HF causal LMs. `_LAYER_ACCESSORS` maps `model_type` to layer-list accessor lambdas; add new architectures here.
@@ -43,6 +45,10 @@ Four layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 - `tui/chat_panel.py` — Message log, status bar, input field.
 - `tui/trait_panel.py` — Per-probe bars + sparklines, sort modes.
 
+### API server layer
+- `server.py` — FastAPI app factory. OpenAI-compatible endpoints (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) plus steer-specific management (`/v1/steer/vectors`, `/v1/steer/probes`, `/v1/steer/session`). Thin HTTP layer over `SteerSession` — no business logic. Steering params passed per-request via `steer` key in request body, merged with server-startup defaults. Single session, 409 on concurrent generation. SSE streaming for chat/completions and vector extraction progress.
+- `cli.py` — Dispatches `steer serve` vs default TUI mode. `serve` subcommand accepts `--host`, `--port`, `--steer name:alpha`, `--cors`.
+
 ## Performance rules
 
 These matter for the throughput regression test (steered >= 85% of vanilla tok/s):
@@ -62,4 +68,4 @@ These matter for the throughput regression test (steered >= 85% of vanilla tok/s
 
 ## Testing
 
-Smoke tests require CUDA and download `google/gemma-2-2b-it` on first run. Non-CUDA tests (`test_results.py`, `test_datasource.py`) run anywhere. Session tests (`test_session.py`) require CUDA. Coverage: profile extraction, steering effect, hook cleanup, save/load roundtrip, monitor history, throughput regression, `build_chat_input`, `bootstrap_probes`, DataSource parsing, ResultCollector export, SteerSession lifecycle/generation/streaming.
+Smoke tests require CUDA and download `google/gemma-2-2b-it` on first run. Non-CUDA tests (`test_results.py`, `test_datasource.py`, `test_server.py`) run anywhere. Session tests (`test_session.py`) require CUDA. Coverage: profile extraction, steering effect, hook cleanup, save/load roundtrip, monitor history, throughput regression, `build_chat_input`, `bootstrap_probes`, DataSource parsing, ResultCollector export, SteerSession lifecycle/generation/streaming, API server endpoints/streaming/CLI parsing.
