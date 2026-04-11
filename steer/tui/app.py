@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import json
-import os
 import queue
 import shlex
 import time
-from pathlib import Path
-from typing import Callable
 
 import torch
 from textual.app import App, ComposeResult
@@ -25,8 +21,6 @@ from steer.tui.vector_panel import LeftPanel
 from steer.tui.trait_panel import TraitPanel
 
 PANELS = ["left-panel", "chat-panel", "trait-panel"]
-
-_N_PAIRS = 45
 
 
 class SteerApp(App):
@@ -354,12 +348,18 @@ class SteerApp(App):
             return
 
         name = concept if len(concept) <= 20 else concept[:17] + "..."
-
         suffix = f" vs '{baseline}'" if baseline else ""
         chat.add_system_message(f"Extracting '{name}'{suffix}...")
 
         def _worker():
-            self._steer_worker(concept, baseline, alpha, name)
+            def _progress(msg):
+                self.call_from_thread(self._steer_status, msg)
+            try:
+                profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
+                self._session.steer(name, profile, alpha=alpha)
+                self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
+            except ValueError as e:
+                self.call_from_thread(self._steer_status, str(e))
 
         self.run_worker(_worker, thread=True)
 
@@ -378,12 +378,18 @@ class SteerApp(App):
             return
 
         name = concept if len(concept) <= 20 else concept[:17] + "..."
-
         suffix = f" vs '{baseline}'" if baseline else ""
         chat.add_system_message(f"Extracting '{name}'{suffix}...")
 
         def _worker():
-            self._probe_worker(concept, baseline, name)
+            def _progress(msg):
+                self.call_from_thread(self._steer_status, msg)
+            try:
+                profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
+                self._session.monitor(name, profile)
+                self.call_from_thread(self._on_probe_added, name)
+            except ValueError as e:
+                self.call_from_thread(self._steer_status, str(e))
 
         self.run_worker(_worker, thread=True)
 
@@ -391,274 +397,10 @@ class SteerApp(App):
         chat = self._chat_panel
         chat.add_system_message(msg)
 
-    def _generate_contrastive_pairs(
-        self, concept_a: str, concept_b: str | None = None, n: int = _N_PAIRS,
-    ) -> list[dict]:
-        """Generate matched contrastive pairs via chat completion.
-
-        Returns list of {"positive": str, "negative": str} dicts.
-        Seed pair (1a/1b) is excluded — only model-generated pairs returned.
-        If concept_b is None, uses embody/reject framing for concept_a.
-        """
-        import re
-        if concept_b is not None:
-            poles = (
-                f"Speaker A fully embraces {concept_a}.\n"
-                f"Speaker B fully embraces {concept_b}."
-            )
-        else:
-            poles = (
-                f"Speaker A fully embraces {concept_a}.\n"
-                f"Speaker B fully rejects {concept_a}."
-            )
-        prompt = (
-            f"Write {n} contrastive statement pairs.\n\n"
-            f"{poles}\n\n"
-            f"Each pair: same situation, opposite dispositions. The trait "
-            f"should come through in tone, imagery, and word choice. "
-            f"Both statements should read like two genuinely different people, "
-            f"not a word swap. Match length and complexity within each pair. "
-            f"Vary widely across domains: reactions, beliefs, plans, memories, "
-            f"social dynamics, inner monologue, metaphor, physical sensation, "
-            f"abstract observation."
-            f"\n\n1–2 sentences each. Start immediately with 1a.\n"
-            f"Na. [statement]\nNb. [statement]"
-        )
-        messages = [
-            {"role": "system", "content":
-             "You generate contrastive statement pairs for neural network "
-             "interpretability research. Pairs are processed numerically "
-             "for activation vector extraction. Generate all requested pairs."},
-            {"role": "user", "content": prompt},
-        ]
-        input_ids = build_chat_input(self._session._tokenizer, messages).to(self._session._device)
-        pad_id = self._session._tokenizer.pad_token_id or self._session._tokenizer.eos_token_id
-        with torch.inference_mode():
-            attn_mask = torch.ones_like(input_ids)
-            out = self._session._model.generate(
-                input_ids, attention_mask=attn_mask, max_new_tokens=4096,
-                do_sample=True, temperature=1.0, top_p=0.9, pad_token_id=pad_id,
-            )
-        new_ids = out[0][input_ids.shape[-1]:]
-        text = self._session._tokenizer.decode(new_ids, skip_special_tokens=True)
-
-        # Parse Na./Nb. pairs from raw output
-        a_lines: dict[str, str] = {}
-        b_lines: dict[str, str] = {}
-        for line in text.split("\n"):
-            line = line.strip()
-            m = re.match(r"(\d+)([ab])[.)]\s*(.*)", line)
-            if not m:
-                continue
-            num, ab, content = m.group(1), m.group(2), m.group(3).strip()
-            if len(content) > 10:
-                if ab == "a":
-                    a_lines[num] = content
-                else:
-                    b_lines[num] = content
-
-        pairs = []
-        for num in sorted(a_lines.keys(), key=int):
-            if num in b_lines:
-                pairs.append({"positive": a_lines[num], "negative": b_lines[num]})
-        return pairs
-
-    def _vector_cache_path(self, concept: str, baseline: str | None) -> str:
-        """Deterministic cache path for a vector profile."""
-        from steer.vectors import get_cache_path
-        model_id = self._session._model_info.get("model_id", "unknown")
-        tag = f"{concept}_vs_{baseline}" if baseline else concept
-        return get_cache_path("steer/probes/cache", model_id, tag)
-
-    def _statements_cache_path(self, concept: str, baseline: str | None) -> str:
-        """Cache path for generated statements (layer-independent)."""
-        model_id = self._session._model_info.get("model_id", "unknown")
-        model_name = model_id.replace("/", "_")
-        tag = f"{concept}_vs_{baseline}" if baseline else concept
-        return os.path.join("steer", "probes", "cache", model_name, f"{tag}_statements.json")
-
-    def _extract_vector_worker(
-        self, concept: str, baseline: str | None, name: str,
-        on_cached: Callable[[dict], None],
-        on_extracted: Callable[[dict, list[dict]], None],
-    ) -> None:
-        """Shared extraction logic for /steer and /probe workers.
-
-        on_cached is called when a cached profile is found.
-        on_extracted is called after extraction from pairs (receives profile and saved_vectors).
-        """
-        from steer.vectors import save_profile, load_profile, extract_contrastive, load_contrastive_pairs
-        cache_path = self._vector_cache_path(concept, baseline)
-
-        # Check cache first
-        try:
-            profile, _meta = load_profile(cache_path)
-            # Move all vectors to device
-            profile = {idx: (vec.to(self._session._device, self._session._dtype), score)
-                       for idx, (vec, score) in profile.items()}
-            on_cached(profile)
-            return
-        except (FileNotFoundError, KeyError, ValueError):
-            pass
-
-        # Detach steering hooks so they don't pollute extraction
-        saved_vectors = self._session._steering.get_active_vectors()
-        self._session._steering.clear_all()
-
-        try:
-            # Check if a curated probe dataset exists for this concept
-            if baseline is None:
-                defaults = _load_defaults()
-                concept_lower = concept.lower()
-                has_curated = any(concept_lower in probes for probes in defaults.values())
-                if has_curated:
-                    dataset_file = f"{concept_lower}.json"
-                    ds_path = Path(__file__).parent.parent / "datasets" / dataset_file
-                    if ds_path.exists():
-                        self.call_from_thread(
-                            self._steer_status,
-                            f"Found curated dataset '{dataset_file}' for '{concept}', extracting...",
-                        )
-                        ds = load_contrastive_pairs(str(ds_path))
-                        profile = extract_contrastive(
-                            self._session._model, self._session._tokenizer, ds["pairs"],
-                            layers=self._session._layers,
-                        )
-                        save_profile(profile, cache_path, {
-                            "concept": concept,
-                            "baseline": baseline,
-                            "n_pairs": len(ds["pairs"]),
-                            "source": f"curated:{dataset_file}",
-                        })
-                        on_extracted(profile, saved_vectors)
-                        return
-
-            # Try loading cached pairs
-            stmt_cache_path = self._statements_cache_path(concept, baseline)
-            pairs = None
-            try:
-                with open(stmt_cache_path) as f:
-                    cached = json.load(f)
-                if "pairs" in cached:
-                    pairs = cached["pairs"]
-                elif "positive" in cached and "negative" in cached:
-                    pairs = [
-                        {"positive": p, "negative": n_}
-                        for p, n_ in zip(cached["positive"], cached["negative"])
-                    ]
-                if pairs:
-                    self.call_from_thread(
-                        self._steer_status,
-                        f"Loaded cached pairs for '{concept}'.",
-                    )
-            except (FileNotFoundError, KeyError, json.JSONDecodeError):
-                pass
-
-            if pairs is None:
-                if baseline:
-                    msg = f"Generating contrastive pairs for '{concept}' vs '{baseline}'..."
-                else:
-                    msg = f"Generating contrastive pairs for '{concept}'..."
-                self.call_from_thread(self._steer_status, msg)
-                pairs = self._generate_contrastive_pairs(concept, baseline)
-
-                # Cache the generated pairs
-                os.makedirs(os.path.dirname(stmt_cache_path), exist_ok=True)
-                with open(stmt_cache_path, "w") as f:
-                    json.dump({"pairs": pairs}, f, indent=2)
-
-            if len(pairs) < 2:
-                self._restore_vectors(saved_vectors)
-                self.call_from_thread(
-                    self._steer_status,
-                    f"Could only generate {len(pairs)} pairs (need >= 2). Try a more specific concept.",
-                )
-                return
-
-            self.call_from_thread(
-                self._steer_status, f"Extracting contrastive profile ({len(pairs)} pairs)...",
-            )
-            profile = extract_contrastive(
-                self._session._model, self._session._tokenizer, pairs,
-                layers=self._session._layers,
-            )
-
-            # Cache to disk
-            save_profile(profile, cache_path, {
-                "concept": concept,
-                "baseline": baseline,
-                "n_pairs": len(pairs),
-            })
-
-            on_extracted(profile, saved_vectors)
-        except Exception:
-            self._restore_vectors(saved_vectors)
-            raise
-
-    def _steer_worker(
-        self, concept: str, baseline: str | None,
-        alpha: float, name: str,
-    ) -> None:
-        def on_cached(profile: dict) -> None:
-            self._session._steering.add_vector(name, profile, alpha)
-            self._session._steering.apply_to_model(
-                self._session._layers, self._session._device, self._session._dtype,
-                orthogonalize=self._session._orthogonalize,
-            )
-            self.call_from_thread(
-                self._steer_status, f"Loaded cached profile for '{name}'.",
-            )
-            self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
-
-        def on_extracted(profile: dict, saved_vectors: list[dict]) -> None:
-            self._restore_vectors(saved_vectors, name, profile, alpha)
-            self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
-
-        self._extract_vector_worker(concept, baseline, name, on_cached, on_extracted)
-
-    def _probe_worker(
-        self, concept: str, baseline: str | None, name: str,
-    ) -> None:
-        def on_cached(profile: dict) -> None:
-            self._add_probe_from_profile(name, profile)
-            peak = max(profile, key=lambda k: profile[k][1])
-            self.call_from_thread(
-                self._steer_status, f"Loaded cached probe '{name}' (pk{peak}).",
-            )
-
-        def on_extracted(profile: dict, saved_vectors: list[dict]) -> None:
-            self._restore_vectors(saved_vectors)
-            self._add_probe_from_profile(name, profile)
-
-        self._extract_vector_worker(concept, baseline, name, on_cached, on_extracted)
-
-    def _add_probe_from_profile(self, name: str, profile: dict) -> None:
-        """Add a profile as a probe to the monitor and refresh the trait panel."""
-        if not self._session._monitor:
-            return
-        self._session._monitor.add_probe(name, profile,
-                                model_layers=self._session._layers,
-                                device=self._session._device, dtype=self._session._dtype)
-        self.call_from_thread(self._on_probe_added, name)
-
     def _on_probe_added(self, name: str) -> None:
         tp = self._trait_panel
         tp.set_active_probes(set(self._session._monitor.probe_names))
         self._steer_status(f"Probe '{name}' active.")
-
-    def _restore_vectors(self, saved_vectors: list[dict],
-                         new_name: str | None = None, new_profile=None,
-                         new_alpha: float = 0.0) -> None:
-        for v in saved_vectors:
-            self._session._steering.add_vector(v["name"], v["profile"], v["alpha"])
-            if not v.get("enabled", True):
-                self._session._steering.toggle_vector(v["name"])
-        if new_name is not None:
-            self._session._steering.add_vector(new_name, new_profile, new_alpha)
-        self._session._steering.apply_to_model(
-            self._session._layers, self._session._device, self._session._dtype,
-            orthogonalize=self._session._orthogonalize,
-        )
 
     def _refresh_left_panel(self) -> None:
         lp = self._left_panel
@@ -923,7 +665,7 @@ class SteerApp(App):
                 )
                 unsteered = self._session._tokenizer.decode(generated, skip_special_tokens=True)
 
-                self._restore_vectors(saved_vectors)
+                self._session._restore_vectors(saved_vectors)
 
                 self.call_from_thread(self._show_ab_result, unsteered)
             except Exception:

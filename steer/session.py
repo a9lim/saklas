@@ -1,9 +1,12 @@
 """SteerSession — unified backend for steer's programmatic API and TUI."""
 from __future__ import annotations
+import json
+import os
 import pathlib
+import re
 import threading
 import time
-from typing import Iterator
+from typing import Callable, Iterator
 
 import torch
 
@@ -18,8 +21,11 @@ from steer.vectors import (
     extract_contrastive,
     save_profile as _save_profile,
     load_profile as _load_profile,
+    load_contrastive_pairs,
     get_cache_path,
 )
+
+_N_PAIRS = 45
 
 
 class SteerSession:
@@ -105,36 +111,257 @@ class SteerSession:
 
     # -- Extraction --
 
-    def extract(self, source) -> dict[int, tuple[torch.Tensor, float]]:
+    def _vector_cache_path(self, concept: str, baseline: str | None = None) -> str:
+        model_id = self._model_info.get("model_id", "unknown")
+        tag = f"{concept}_vs_{baseline}" if baseline else concept
+        return get_cache_path(self._cache_dir, model_id, tag)
+
+    def _statements_cache_path(self, concept: str, baseline: str | None = None) -> str:
+        model_id = self._model_info.get("model_id", "unknown")
+        model_name = model_id.replace("/", "_")
+        tag = f"{concept}_vs_{baseline}" if baseline else concept
+        return os.path.join(self._cache_dir, model_name, f"{tag}_statements.json")
+
+    def generate_pairs(
+        self,
+        concept: str,
+        baseline: str | None = None,
+        n: int = _N_PAIRS,
+    ) -> list[tuple[str, str]]:
+        """Generate contrastive pairs using the loaded model.
+
+        Uses the model's own generation to produce matched statement pairs
+        for a concept. Returns list of (positive, negative) tuples.
+        """
+        if baseline is not None:
+            poles = (
+                f"Speaker A fully embraces {concept}.\n"
+                f"Speaker B fully embraces {baseline}."
+            )
+        else:
+            poles = (
+                f"Speaker A fully embraces {concept}.\n"
+                f"Speaker B fully rejects {concept}."
+            )
+        prompt = (
+            f"Write {n} contrastive statement pairs.\n\n"
+            f"{poles}\n\n"
+            f"Each pair: same situation, opposite dispositions. The trait "
+            f"should come through in tone, imagery, and word choice. "
+            f"Both statements should read like two genuinely different people, "
+            f"not a word swap. Match length and complexity within each pair. "
+            f"Vary widely across domains: reactions, beliefs, plans, memories, "
+            f"social dynamics, inner monologue, metaphor, physical sensation, "
+            f"abstract observation."
+            f"\n\n1–2 sentences each. Start immediately with 1a.\n"
+            f"Na. [statement]\nNb. [statement]"
+        )
+        messages = [
+            {"role": "system", "content":
+             "You generate contrastive statement pairs for neural network "
+             "interpretability research. Pairs are processed numerically "
+             "for activation vector extraction. Generate all requested pairs."},
+            {"role": "user", "content": prompt},
+        ]
+        input_ids = build_chat_input(self._tokenizer, messages).to(self._device)
+        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
+        with torch.inference_mode():
+            attn_mask = torch.ones_like(input_ids)
+            out = self._model.generate(
+                input_ids, attention_mask=attn_mask, max_new_tokens=4096,
+                do_sample=True, temperature=1.0, top_p=0.9, pad_token_id=pad_id,
+            )
+        new_ids = out[0][input_ids.shape[-1]:]
+        text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+
+        a_lines: dict[str, str] = {}
+        b_lines: dict[str, str] = {}
+        for line in text.split("\n"):
+            line = line.strip()
+            m = re.match(r"(\d+)([ab])[.)]\s*(.*)", line)
+            if not m:
+                continue
+            num, ab, content = m.group(1), m.group(2), m.group(3).strip()
+            if len(content) > 10:
+                if ab == "a":
+                    a_lines[num] = content
+                else:
+                    b_lines[num] = content
+
+        pairs = []
+        for num in sorted(a_lines.keys(), key=int):
+            if num in b_lines:
+                pairs.append((a_lines[num], b_lines[num]))
+        return pairs
+
+    def extract(
+        self,
+        source,
+        baseline: str | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> dict[int, tuple[torch.Tensor, float]]:
+        """Extract a steering vector profile.
+
+        Full pipeline: cache check -> curated dataset -> statement cache ->
+        generate pairs -> extract contrastive -> save to cache.
+
+        Temporarily detaches active steering hooks during extraction to
+        avoid contaminating the forward passes.
+
+        Args:
+            source: concept name (str), list of (positive, negative) tuples,
+                    or a DataSource instance.
+            baseline: optional baseline concept for contrastive extraction.
+                      Only used when source is a string.
+            on_progress: optional callback for progress messages.
+        """
+        def _progress(msg: str) -> None:
+            if on_progress:
+                on_progress(msg)
+
+        # Normalize source
         if isinstance(source, str):
-            ds = DataSource.curated(source)
+            concept = source
         elif isinstance(source, DataSource):
-            ds = source
+            concept = source.name
         elif isinstance(source, list):
-            ds = DataSource.from_pairs(source)
+            concept = "custom"
         else:
             raise TypeError(f"Unsupported source type: {type(source)}")
 
-        cache_path = get_cache_path(self._cache_dir, self._model_info.get("model_id", "unknown"), ds.name)
+        # For DataSource or raw pairs, skip the full pipeline — just extract
+        if isinstance(source, (DataSource, list)):
+            if isinstance(source, list):
+                ds = DataSource.from_pairs(source)
+            else:
+                ds = source
+            cache_path = get_cache_path(
+                self._cache_dir, self._model_info.get("model_id", "unknown"), ds.name,
+            )
+            try:
+                profile, _meta = _load_profile(cache_path)
+                profile = {idx: (vec.to(self._device, self._dtype), score)
+                           for idx, (vec, score) in profile.items()}
+                _progress(f"Loaded cached profile for '{ds.name}'.")
+                return profile
+            except (FileNotFoundError, KeyError, ValueError):
+                pass
+
+            _progress(f"Extracting profile ({len(ds.pairs)} pairs)...")
+            saved_vectors = self._steering.get_active_vectors()
+            self._steering.clear_all()
+            try:
+                pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
+                profile = extract_contrastive(
+                    self._model, self._tokenizer, pairs, layers=self._layers,
+                )
+                _save_profile(profile, cache_path, {
+                    "concept": ds.name, "n_pairs": len(ds.pairs),
+                })
+            finally:
+                self._restore_vectors(saved_vectors)
+            return profile
+
+        # String source — full pipeline
+        cache_path = self._vector_cache_path(concept, baseline)
+
+        # 1. Check vector cache
         try:
             profile, _meta = _load_profile(cache_path)
             profile = {idx: (vec.to(self._device, self._dtype), score)
                        for idx, (vec, score) in profile.items()}
+            _progress(f"Loaded cached profile for '{concept}'.")
             return profile
         except (FileNotFoundError, KeyError, ValueError):
             pass
 
-        pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
-        profile = extract_contrastive(
-            self._model, self._tokenizer, pairs, layers=self._layers,
+        # 2. Detach steering hooks to avoid contaminating extraction
+        saved_vectors = self._steering.get_active_vectors()
+        self._steering.clear_all()
+
+        try:
+            # 3. Check for curated dataset
+            if baseline is None:
+                defaults = _load_defaults()
+                concept_lower = concept.lower()
+                has_curated = any(concept_lower in probes for probes in defaults.values())
+                if has_curated:
+                    dataset_file = f"{concept_lower}.json"
+                    ds_path = pathlib.Path(__file__).parent / "datasets" / dataset_file
+                    if ds_path.exists():
+                        _progress(f"Found curated dataset '{dataset_file}', extracting...")
+                        ds = load_contrastive_pairs(str(ds_path))
+                        profile = extract_contrastive(
+                            self._model, self._tokenizer, ds["pairs"],
+                            layers=self._layers,
+                        )
+                        _save_profile(profile, cache_path, {
+                            "concept": concept, "baseline": baseline,
+                            "n_pairs": len(ds["pairs"]),
+                            "source": f"curated:{dataset_file}",
+                        })
+                        return profile
+
+            # 4. Check statement cache
+            stmt_cache_path = self._statements_cache_path(concept, baseline)
+            pairs = None
+            try:
+                with open(stmt_cache_path) as f:
+                    cached = json.load(f)
+                if "pairs" in cached:
+                    pairs = cached["pairs"]
+                elif "positive" in cached and "negative" in cached:
+                    pairs = [
+                        {"positive": p, "negative": n_}
+                        for p, n_ in zip(cached["positive"], cached["negative"])
+                    ]
+                if pairs:
+                    _progress(f"Loaded cached pairs for '{concept}'.")
+            except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                pass
+
+            # 5. Generate pairs if needed
+            if pairs is None:
+                suffix = f" vs '{baseline}'" if baseline else ""
+                _progress(f"Generating contrastive pairs for '{concept}'{suffix}...")
+                raw_pairs = self.generate_pairs(concept, baseline)
+                pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
+
+                os.makedirs(os.path.dirname(stmt_cache_path), exist_ok=True)
+                with open(stmt_cache_path, "w") as f:
+                    json.dump({"pairs": pairs}, f, indent=2)
+
+            if len(pairs) < 2:
+                raise ValueError(
+                    f"Could only generate {len(pairs)} pairs (need >= 2). "
+                    f"Try a more specific concept."
+                )
+
+            # 6. Extract
+            _progress(f"Extracting contrastive profile ({len(pairs)} pairs)...")
+            profile = extract_contrastive(
+                self._model, self._tokenizer, pairs, layers=self._layers,
+            )
+
+            _save_profile(profile, cache_path, {
+                "concept": concept, "baseline": baseline,
+                "n_pairs": len(pairs),
+            })
+
+            return profile
+        finally:
+            self._restore_vectors(saved_vectors)
+
+    def _restore_vectors(self, saved_vectors: list[dict]) -> None:
+        """Restore previously saved steering vectors after extraction."""
+        for v in saved_vectors:
+            self._steering.add_vector(v["name"], v["profile"], v["alpha"])
+            if not v.get("enabled", True):
+                self._steering.toggle_vector(v["name"])
+        self._steering.apply_to_model(
+            self._layers, self._device, self._dtype,
+            orthogonalize=self._orthogonalize,
         )
-
-        _save_profile(profile, cache_path, {
-            "concept": ds.name,
-            "n_pairs": len(ds.pairs),
-        })
-
-        return profile
 
     def load_profile(self, path: str) -> dict[int, tuple[torch.Tensor, float]]:
         profile, _meta = _load_profile(path)
