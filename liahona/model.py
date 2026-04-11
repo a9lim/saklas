@@ -90,13 +90,6 @@ _LAYER_ACCESSORS = {
 
 _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
 
-# Models whose HF config uses a multimodal model_type but are actually
-# text-only causal LMs.  Maps the config's model_type to the correct
-# AutoModelForCausalLM model_type.
-_CAUSAL_TYPE_FIXES = {
-    "mistral3": "ministral3",  # Ministral tagged as multimodal Mistral3
-}
-
 
 def detect_device(requested: str = "auto") -> str:
     """Pick the best available device.
@@ -175,10 +168,11 @@ def load_model(model_id: str, quantize=None, device="auto"):
     else:
         device_kwargs = {"device_map": {"": device}}
 
-    # --- check for model_type mismatches ---
-    # Some text-only models ship configs with a multimodal model_type
-    # that AutoModelForCausalLM doesn't recognise (e.g. Ministral models
-    # tagged as Mistral3).  Detect and correct before loading.
+    # --- check for multimodal configs wrapping a text-only model ---
+    # Some text-only models ship with a multimodal config whose
+    # model_type isn't registered with AutoModelForCausalLM (e.g.
+    # Ministral tagged as Mistral3).  If the config has a text_config
+    # that IS a known causal-LM type, use that instead.
     load_kwargs: dict = dict(
         attn_implementation=attn_impl,
         trust_remote_code=True,
@@ -186,16 +180,13 @@ def load_model(model_id: str, quantize=None, device="auto"):
         **quant_kwargs,
     )
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-    fixed_type = _CAUSAL_TYPE_FIXES.get(config.model_type)
-    if fixed_type:
-        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-        correct_cls = CONFIG_MAPPING.get(fixed_type)
-        if correct_cls is not None:
-            log.info("fixing model_type %r → %r for AutoModelForCausalLM",
-                     config.model_type, fixed_type)
-            config.__class__ = correct_cls
-            config.model_type = fixed_type
-            load_kwargs["config"] = config
+    text_cfg = getattr(config, "text_config", None)
+    if (text_cfg is not None
+            and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
+            and getattr(config, "model_type", None) not in _LAYER_ACCESSORS):
+        log.info("using text_config (%s) from multimodal config (%s)",
+                 text_cfg.model_type, config.model_type)
+        load_kwargs["config"] = text_cfg
 
     # --- load model (with attention, dtype, and device fallbacks) ---
     def _try_load():
