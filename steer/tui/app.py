@@ -203,10 +203,10 @@ class SteerApp(App):
             self._trait_panel.nav_up()
 
     def action_nav_left(self) -> None:
-        self._adjust_alpha(-0.02)
+        self._adjust_alpha(-0.01)
 
     def action_nav_right(self) -> None:
-        self._adjust_alpha(0.02)
+        self._adjust_alpha(0.01)
 
     def action_nav_enter(self) -> None:
         panel = PANELS[self._focused_panel_idx]
@@ -336,7 +336,7 @@ class SteerApp(App):
             baseline = None
             trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
         if include_alpha:
-            alpha = float(trailing[0]) if trailing else 0.1
+            alpha = float(trailing[0]) if trailing else 0.15
             return concept, baseline, alpha
         return concept, baseline
 
