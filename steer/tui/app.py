@@ -17,10 +17,8 @@ from textual.containers import Horizontal
 from textual.widgets import Input
 from textual.timer import Timer
 
-from steer.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered
-from steer.hooks import SteeringManager
+from steer.generation import GenerationState, build_chat_input, generate_steered
 from steer.model import _get_memory_gb
-from steer.monitor import TraitMonitor
 from steer.probes_bootstrap import _load_defaults
 from steer.tui.chat_panel import ChatPanel
 from steer.tui.vector_panel import LeftPanel
@@ -53,42 +51,16 @@ class SteerApp(App):
 
     def __init__(
         self,
-        model,
-        tokenizer,
-        layers,
-        model_info: dict,
-        probes: dict[str, dict[int, tuple[torch.Tensor, float]]],
-        system_prompt: str | None = None,
-        max_tokens: int = 1024,
+        session,
         **kwargs,
     ):
         super().__init__(ansi_color=True, **kwargs)
-        self._model = model
-        self._tokenizer = tokenizer
-        self._layers = layers
-        self._model_info = model_info
-        self._system_prompt = system_prompt
-        self._max_tokens = max_tokens
+        self._session = session
 
-        self._messages: list[dict[str, str]] = []
+        # Local aliases for frequent access
+        self._messages = session._history
 
-        self._steering = SteeringManager()
-        self._orthogonalize = False
-
-        self._gen_state = GenerationState()
-        self._gen_config = GenerationConfig(
-            max_new_tokens=max_tokens,
-            system_prompt=system_prompt,
-        )
-
-        first_param = next(self._model.parameters())
-        self._device = first_param.device
-        self._dtype = first_param.dtype
-        self._device_str = str(self._device)
-
-        self._monitor = TraitMonitor(probes) if probes else None
-        if self._monitor:
-            self._monitor.attach(self._layers, self._device, self._dtype)
+        self._device_str = str(session._device)
 
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
@@ -114,7 +86,7 @@ class SteerApp(App):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-area"):
-            yield LeftPanel(self._model_info, id="left-panel")
+            yield LeftPanel(self._session._model_info, id="left-panel")
             yield ChatPanel(id="chat-panel")
             yield TraitPanel(categories=self._probe_categories, id="trait-panel")
 
@@ -124,20 +96,20 @@ class SteerApp(App):
         self._trait_panel = self.query_one("#trait-panel", TraitPanel)
         self._panels = [self._left_panel, self._chat_panel, self._trait_panel]
         self._left_panel.update_gen_config(
-            self._gen_config.temperature,
-            self._gen_config.top_p,
-            self._gen_config.max_new_tokens,
-            self._gen_config.system_prompt,
+            self._session.config.temperature,
+            self._session.config.top_p,
+            self._session.config.max_new_tokens,
+            self._session.config.system_prompt,
         )
 
-        if self._monitor:
-            self._trait_panel.set_active_probes(set(self._monitor.probe_names))
+        if self._session._monitor:
+            self._trait_panel.set_active_probes(set(self._session._monitor.probe_names))
 
         self._poll_timer = self.set_interval(1 / 15, self._poll_generation)
         self._update_panel_focus()
 
         self._chat_panel.add_system_message(
-            f"Model loaded: {self._model_info.get('model_id', 'unknown')}. "
+            f"Model loaded: {self._session._model_info.get('model_id', 'unknown')}. "
             f"Type a message to chat. Use /steer and /probe commands. Tab to switch panels."
         )
 
@@ -270,57 +242,51 @@ class SteerApp(App):
                 return
             self._handle_probe(parts[1])
         elif cmd == "/clear":
-            self._messages.clear()
+            self._session.clear_history()
             chat.clear_log()
-            if self._monitor:
-                self._monitor.reset_history()
-                self._trait_panel.update_values({}, {}, {}, stats={})
+            self._trait_panel.update_values({}, {}, {}, stats={})
             chat.add_system_message("Chat history cleared.")
         elif cmd == "/rewind":
             if not self._messages:
                 chat.add_system_message("Nothing to rewind.")
             else:
-                if self._messages[-1]["role"] == "assistant":
-                    self._messages.pop()
-                if self._messages and self._messages[-1]["role"] == "user":
-                    self._messages.pop()
+                self._session.rewind()
                 chat.rewind()
                 chat.add_system_message("Rewound to before last message.")
         elif cmd in ("/system", "/sys"):
             if len(parts) < 2:
-                chat.add_system_message(f"System prompt: {self._system_prompt or '(none)'}")
+                chat.add_system_message(f"System prompt: {self._session.config.system_prompt or '(none)'}")
             else:
-                self._system_prompt = parts[1]
-                self._gen_config.system_prompt = parts[1]
+                self._session.config.system_prompt = parts[1]
                 chat.add_system_message("System prompt set.")
                 self._refresh_gen_config()
         elif cmd == "/temp":
             if len(parts) < 2:
-                chat.add_system_message(f"Temperature: {self._gen_config.temperature}")
+                chat.add_system_message(f"Temperature: {self._session.config.temperature}")
             else:
                 try:
-                    self._gen_config.temperature = max(0.0, float(parts[1]))
-                    chat.add_system_message(f"Temperature set to {self._gen_config.temperature}")
+                    self._session.config.temperature = max(0.0, float(parts[1]))
+                    chat.add_system_message(f"Temperature set to {self._session.config.temperature}")
                     self._refresh_gen_config()
                 except ValueError:
                     chat.add_system_message("Invalid temperature value")
         elif cmd == "/top-p":
             if len(parts) < 2:
-                chat.add_system_message(f"Top-p: {self._gen_config.top_p}")
+                chat.add_system_message(f"Top-p: {self._session.config.top_p}")
             else:
                 try:
-                    self._gen_config.top_p = max(0.0, min(1.0, float(parts[1])))
-                    chat.add_system_message(f"Top-p set to {self._gen_config.top_p}")
+                    self._session.config.top_p = max(0.0, min(1.0, float(parts[1])))
+                    chat.add_system_message(f"Top-p set to {self._session.config.top_p}")
                     self._refresh_gen_config()
                 except ValueError:
                     chat.add_system_message("Invalid top-p value")
         elif cmd == "/max":
             if len(parts) < 2:
-                chat.add_system_message(f"Max tokens: {self._gen_config.max_new_tokens}")
+                chat.add_system_message(f"Max tokens: {self._session.config.max_new_tokens}")
             else:
                 try:
-                    self._gen_config.max_new_tokens = max(1, int(parts[1]))
-                    chat.add_system_message(f"Max tokens set to {self._gen_config.max_new_tokens}")
+                    self._session.config.max_new_tokens = max(1, int(parts[1]))
+                    chat.add_system_message(f"Max tokens set to {self._session.config.max_new_tokens}")
                     self._refresh_gen_config()
                 except ValueError:
                     chat.add_system_message("Invalid max tokens value")
@@ -375,7 +341,7 @@ class SteerApp(App):
         if self._ab_in_progress:
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
             return
-        if self._gen_state.is_generating.is_set():
+        if self._session._gen_state.is_generating.is_set():
             chat.add_system_message("Cannot extract vectors during generation. Stop generation first.")
             return
         try:
@@ -399,7 +365,7 @@ class SteerApp(App):
 
     def _handle_probe(self, text: str) -> None:
         chat = self._chat_panel
-        if self._gen_state.is_generating.is_set():
+        if self._session._gen_state.is_generating.is_set():
             chat.add_system_message("Cannot extract vectors during generation. Stop generation first.")
             return
         try:
@@ -465,16 +431,16 @@ class SteerApp(App):
              "for activation vector extraction. Generate all requested pairs."},
             {"role": "user", "content": prompt},
         ]
-        input_ids = build_chat_input(self._tokenizer, messages).to(self._device)
-        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
+        input_ids = build_chat_input(self._session._tokenizer, messages).to(self._session._device)
+        pad_id = self._session._tokenizer.pad_token_id or self._session._tokenizer.eos_token_id
         with torch.inference_mode():
             attn_mask = torch.ones_like(input_ids)
-            out = self._model.generate(
+            out = self._session._model.generate(
                 input_ids, attention_mask=attn_mask, max_new_tokens=4096,
                 do_sample=True, temperature=1.0, top_p=0.9, pad_token_id=pad_id,
             )
         new_ids = out[0][input_ids.shape[-1]:]
-        text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+        text = self._session._tokenizer.decode(new_ids, skip_special_tokens=True)
 
         # Parse Na./Nb. pairs from raw output
         a_lines: dict[str, str] = {}
@@ -500,13 +466,13 @@ class SteerApp(App):
     def _vector_cache_path(self, concept: str, baseline: str | None) -> str:
         """Deterministic cache path for a vector profile."""
         from steer.vectors import get_cache_path
-        model_id = self._model_info.get("model_id", "unknown")
+        model_id = self._session._model_info.get("model_id", "unknown")
         tag = f"{concept}_vs_{baseline}" if baseline else concept
         return get_cache_path("steer/probes/cache", model_id, tag)
 
     def _statements_cache_path(self, concept: str, baseline: str | None) -> str:
         """Cache path for generated statements (layer-independent)."""
-        model_id = self._model_info.get("model_id", "unknown")
+        model_id = self._session._model_info.get("model_id", "unknown")
         model_name = model_id.replace("/", "_")
         tag = f"{concept}_vs_{baseline}" if baseline else concept
         return os.path.join("steer", "probes", "cache", model_name, f"{tag}_statements.json")
@@ -528,7 +494,7 @@ class SteerApp(App):
         try:
             profile, _meta = load_profile(cache_path)
             # Move all vectors to device
-            profile = {idx: (vec.to(self._device, self._dtype), score)
+            profile = {idx: (vec.to(self._session._device, self._session._dtype), score)
                        for idx, (vec, score) in profile.items()}
             on_cached(profile)
             return
@@ -536,8 +502,8 @@ class SteerApp(App):
             pass
 
         # Detach steering hooks so they don't pollute extraction
-        saved_vectors = self._steering.get_active_vectors()
-        self._steering.clear_all()
+        saved_vectors = self._session._steering.get_active_vectors()
+        self._session._steering.clear_all()
 
         try:
             # Check if a curated probe dataset exists for this concept
@@ -555,7 +521,8 @@ class SteerApp(App):
                         )
                         ds = load_contrastive_pairs(str(ds_path))
                         profile = extract_contrastive(
-                            self._model, self._tokenizer, ds["pairs"], layers=self._layers,
+                            self._session._model, self._session._tokenizer, ds["pairs"],
+                            layers=self._session._layers,
                         )
                         save_profile(profile, cache_path, {
                             "concept": concept,
@@ -612,7 +579,8 @@ class SteerApp(App):
                 self._steer_status, f"Extracting contrastive profile ({len(pairs)} pairs)...",
             )
             profile = extract_contrastive(
-                self._model, self._tokenizer, pairs, layers=self._layers,
+                self._session._model, self._session._tokenizer, pairs,
+                layers=self._session._layers,
             )
 
             # Cache to disk
@@ -632,10 +600,10 @@ class SteerApp(App):
         alpha: float, name: str,
     ) -> None:
         def on_cached(profile: dict) -> None:
-            self._steering.add_vector(name, profile, alpha)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
+            self._session._steering.add_vector(name, profile, alpha)
+            self._session._steering.apply_to_model(
+                self._session._layers, self._session._device, self._session._dtype,
+                orthogonalize=self._session._orthogonalize,
             )
             self.call_from_thread(
                 self._steer_status, f"Loaded cached profile for '{name}'.",
@@ -666,44 +634,44 @@ class SteerApp(App):
 
     def _add_probe_from_profile(self, name: str, profile: dict) -> None:
         """Add a profile as a probe to the monitor and refresh the trait panel."""
-        if not self._monitor:
+        if not self._session._monitor:
             return
-        self._monitor.add_probe(name, profile,
-                                model_layers=self._layers,
-                                device=self._device, dtype=self._dtype)
+        self._session._monitor.add_probe(name, profile,
+                                model_layers=self._session._layers,
+                                device=self._session._device, dtype=self._session._dtype)
         self.call_from_thread(self._on_probe_added, name)
 
     def _on_probe_added(self, name: str) -> None:
         tp = self._trait_panel
-        tp.set_active_probes(set(self._monitor.probe_names))
+        tp.set_active_probes(set(self._session._monitor.probe_names))
         self._steer_status(f"Probe '{name}' active.")
 
     def _restore_vectors(self, saved_vectors: list[dict],
                          new_name: str | None = None, new_profile=None,
                          new_alpha: float = 0.0) -> None:
         for v in saved_vectors:
-            self._steering.add_vector(v["name"], v["profile"], v["alpha"])
+            self._session._steering.add_vector(v["name"], v["profile"], v["alpha"])
             if not v.get("enabled", True):
-                self._steering.toggle_vector(v["name"])
+                self._session._steering.toggle_vector(v["name"])
         if new_name is not None:
-            self._steering.add_vector(new_name, new_profile, new_alpha)
-        self._steering.apply_to_model(
-            self._layers, self._device, self._dtype,
-            orthogonalize=self._orthogonalize,
+            self._session._steering.add_vector(new_name, new_profile, new_alpha)
+        self._session._steering.apply_to_model(
+            self._session._layers, self._session._device, self._session._dtype,
+            orthogonalize=self._session._orthogonalize,
         )
 
     def _refresh_left_panel(self) -> None:
         lp = self._left_panel
-        vectors = self._steering.get_active_vectors()
-        lp.update_vectors(vectors, orthogonalize=self._orthogonalize)
+        vectors = self._session._steering.get_active_vectors()
+        lp.update_vectors(vectors, orthogonalize=self._session._orthogonalize)
 
     def _refresh_gen_config(self) -> None:
         lp = self._left_panel
         lp.update_gen_config(
-            self._gen_config.temperature,
-            self._gen_config.top_p,
-            self._gen_config.max_new_tokens,
-            self._gen_config.system_prompt,
+            self._session.config.temperature,
+            self._session.config.top_p,
+            self._session.config.max_new_tokens,
+            self._session.config.system_prompt,
         )
 
     # -- Clipboard --
@@ -716,19 +684,19 @@ class SteerApp(App):
     # -- Generation --
 
     def action_stop_generation(self) -> None:
-        if self._gen_state.is_generating.is_set():
-            self._gen_state.request_stop()
+        if self._session._gen_state.is_generating.is_set():
+            self._session._gen_state.request_stop()
 
     def _start_generation(self) -> None:
-        if self._gen_state.is_generating.is_set():
-            self._gen_state.request_stop()
+        if self._session._gen_state.is_generating.is_set():
+            self._session._gen_state.request_stop()
             chat = self._chat_panel
             chat.add_system_message("Stopping current generation. Please resubmit.")
             return
 
-        self._gen_state.reset()
-        if self._monitor:
-            self._monitor.reset_history()
+        self._session._gen_state.reset()
+        if self._session._monitor:
+            self._session._monitor.reset_history()
 
         self._gen_token_count = 0
         self._prompt_token_count = 0
@@ -742,21 +710,21 @@ class SteerApp(App):
 
         def _generate():
             input_ids = build_chat_input(
-                self._tokenizer, self._messages, self._gen_config.system_prompt,
+                self._session._tokenizer, self._messages, self._session.config.system_prompt,
             )
-            input_ids = input_ids.to(self._device)
+            input_ids = input_ids.to(self._session._device)
             self._prompt_token_count = input_ids.shape[-1]
 
             def on_token(tok: str):
-                self._gen_state.token_queue.put(tok)
+                self._session._gen_state.token_queue.put(tok)
 
             generated = generate_steered(
-                self._model, self._tokenizer, input_ids,
-                self._gen_config, self._gen_state,
+                self._session._model, self._session._tokenizer, input_ids,
+                self._session.config, self._session._gen_state,
                 on_token=on_token,
             )
 
-            full_text = self._tokenizer.decode(generated, skip_special_tokens=True)
+            full_text = self._session._tokenizer.decode(generated, skip_special_tokens=True)
             if full_text.strip():
                 self._messages.append({"role": "assistant", "content": full_text})
 
@@ -765,11 +733,11 @@ class SteerApp(App):
     def _poll_generation(self) -> None:
         chat = self._chat_panel
         tokens_consumed = 0
-        generating = self._gen_state.is_generating.is_set()
+        generating = self._session._gen_state.is_generating.is_set()
 
         while tokens_consumed < 20:
             try:
-                token = self._gen_state.token_queue.get_nowait()
+                token = self._session._gen_state.token_queue.get_nowait()
             except queue.Empty:
                 break
             if token is None:
@@ -809,7 +777,7 @@ class SteerApp(App):
             self._cached_vram_gb = _get_memory_gb(self._device_str)
             self._vram_poll_counter = -1
 
-        status_args = (generating, self._gen_token_count, self._gen_config.max_new_tokens,
+        status_args = (generating, self._gen_token_count, self._session.config.max_new_tokens,
                        self._last_tok_per_sec, self._last_elapsed, self._prompt_token_count,
                        self._cached_vram_gb)
         if status_args != self._last_status_args:
@@ -817,20 +785,20 @@ class SteerApp(App):
             chat.update_status(
                 generating=generating,
                 gen_tokens=self._gen_token_count,
-                max_tokens=self._gen_config.max_new_tokens,
+                max_tokens=self._session.config.max_new_tokens,
                 tok_per_sec=self._last_tok_per_sec,
                 elapsed=self._last_elapsed,
                 prompt_tokens=self._prompt_token_count,
                 vram_gb=self._cached_vram_gb,
             )
 
-        if self._monitor and self._monitor.has_pending_data():
-            self._monitor.flush_to_cpu()
-            current, previous = self._monitor.get_current_and_previous()
-            sparklines = {name: self._monitor.get_sparkline(name)
-                          for name in self._monitor.probe_names}
-            stats = {name: self._monitor.get_stats(name)
-                     for name in self._monitor.probe_names}
+        if self._session._monitor and self._session._monitor.has_pending_data():
+            self._session._monitor.flush_to_cpu()
+            current, previous = self._session._monitor.get_current_and_previous()
+            sparklines = {name: self._session._monitor.get_sparkline(name)
+                          for name in self._session._monitor.probe_names}
+            stats = {name: self._session._monitor.get_stats(name)
+                     for name in self._session._monitor.probe_names}
             self._trait_panel.update_values(
                 current, previous, sparklines,
                 stats=stats,
@@ -848,23 +816,23 @@ class SteerApp(App):
         lp = self._left_panel
         sel = lp.get_selected()
         if sel:
-            self._steering.remove_vector(sel["name"])
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
+            self._session._steering.remove_vector(sel["name"])
+            self._session._steering.apply_to_model(
+                self._session._layers, self._session._device, self._session._dtype,
+                orthogonalize=self._session._orthogonalize,
             )
             self._refresh_left_panel()
 
     def _remove_selected_probe(self) -> None:
         tp = self._trait_panel
         probe_name = tp.get_selected_probe()
-        if not probe_name or not self._monitor:
+        if not probe_name or not self._session._monitor:
             return
-        self._monitor.remove_probe(
-            probe_name, model_layers=self._layers,
-            device=self._device, dtype=self._dtype,
+        self._session._monitor.remove_probe(
+            probe_name, model_layers=self._session._layers,
+            device=self._session._device, dtype=self._session._dtype,
         )
-        tp.set_active_probes(set(self._monitor.probe_names))
+        tp.set_active_probes(set(self._session._monitor.probe_names))
 
     def action_toggle_vector(self) -> None:
         if self._ab_in_progress:
@@ -872,10 +840,10 @@ class SteerApp(App):
         lp = self._left_panel
         sel = lp.get_selected()
         if sel:
-            self._steering.toggle_vector(sel["name"])
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
+            self._session._steering.toggle_vector(sel["name"])
+            self._session._steering.apply_to_model(
+                self._session._layers, self._session._device, self._session._dtype,
+                orthogonalize=self._session._orthogonalize,
             )
             self._refresh_left_panel()
 
@@ -886,10 +854,10 @@ class SteerApp(App):
         sel = lp.get_selected()
         if sel:
             new_alpha = max(-5.0, min(5.0, sel["alpha"] + delta))
-            self._steering.set_alpha(sel["name"], new_alpha)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
+            self._session._steering.set_alpha(sel["name"], new_alpha)
+            self._session._steering.apply_to_model(
+                self._session._layers, self._session._device, self._session._dtype,
+                orthogonalize=self._session._orthogonalize,
             )
             self._refresh_left_panel()
 
@@ -897,27 +865,27 @@ class SteerApp(App):
     def action_toggle_ortho(self) -> None:
         if self._ab_in_progress:
             return
-        self._orthogonalize = not self._orthogonalize
-        self._steering.apply_to_model(
-            self._layers, self._device, self._dtype,
-            orthogonalize=self._orthogonalize,
+        self._session._orthogonalize = not self._session._orthogonalize
+        self._session._steering.apply_to_model(
+            self._session._layers, self._session._device, self._session._dtype,
+            orthogonalize=self._session._orthogonalize,
         )
         self._refresh_left_panel()
 
     def action_temp_down(self) -> None:
-        self._gen_config.temperature = max(0.0, round(self._gen_config.temperature - 0.05, 2))
+        self._session.config.temperature = max(0.0, round(self._session.config.temperature - 0.05, 2))
         self._refresh_gen_config()
 
     def action_temp_up(self) -> None:
-        self._gen_config.temperature = round(self._gen_config.temperature + 0.05, 2)
+        self._session.config.temperature = round(self._session.config.temperature + 0.05, 2)
         self._refresh_gen_config()
 
     def action_top_p_down(self) -> None:
-        self._gen_config.top_p = max(0.0, round(self._gen_config.top_p - 0.05, 2))
+        self._session.config.top_p = max(0.0, round(self._session.config.top_p - 0.05, 2))
         self._refresh_gen_config()
 
     def action_top_p_up(self) -> None:
-        self._gen_config.top_p = min(1.0, round(self._gen_config.top_p + 0.05, 2))
+        self._session.config.top_p = min(1.0, round(self._session.config.top_p + 0.05, 2))
         self._refresh_gen_config()
 
     def action_regenerate(self) -> None:
@@ -929,7 +897,7 @@ class SteerApp(App):
 
     def action_ab_compare(self) -> None:
         chat = self._chat_panel
-        if self._gen_state.is_generating.is_set():
+        if self._session._gen_state.is_generating.is_set():
             chat.add_system_message("Cannot A/B compare while generating. Stop generation first.")
             return
         if not self._last_prompt:
@@ -942,18 +910,18 @@ class SteerApp(App):
             try:
                 msgs = [{"role": "user", "content": self._last_prompt}]
                 input_ids = build_chat_input(
-                    self._tokenizer, msgs, self._gen_config.system_prompt,
-                ).to(self._device)
+                    self._session._tokenizer, msgs, self._session.config.system_prompt,
+                ).to(self._session._device)
 
-                saved_vectors = self._steering.get_active_vectors()
-                self._steering.clear_all()
+                saved_vectors = self._session._steering.get_active_vectors()
+                self._session._steering.clear_all()
 
                 ab_state = GenerationState()
                 generated = generate_steered(
-                    self._model, self._tokenizer, input_ids,
-                    self._gen_config, ab_state,
+                    self._session._model, self._session._tokenizer, input_ids,
+                    self._session.config, ab_state,
                 )
-                unsteered = self._tokenizer.decode(generated, skip_special_tokens=True)
+                unsteered = self._session._tokenizer.decode(generated, skip_special_tokens=True)
 
                 self._restore_vectors(saved_vectors)
 

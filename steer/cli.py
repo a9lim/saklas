@@ -52,26 +52,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
-
-    # Lazy imports — don't load torch until we need it
     print(f"Loading model: {args.model}")
     if args.quantize:
         print(f"Quantization: {args.quantize}")
 
-    from steer.model import load_model, get_layers, get_model_info
-    model, tokenizer = load_model(
-        args.model,
-        quantize=args.quantize,
-        device=args.device,
-    )
-    info = get_model_info(model, tokenizer)
-    layers = get_layers(model)
-
-    print(f"Architecture: {info['model_type']}")
-    print(f"Layers: {info['num_layers']}, Hidden dim: {info['hidden_dim']}")
-    print(f"VRAM: {info['vram_used_gb']:.1f} GB")
-
-    # Bootstrap probes
     all_categories = ["emotion", "personality", "safety", "cultural", "gender"]
     if args.probes is None or args.probes == ["all"]:
         probe_categories = all_categories
@@ -80,36 +64,19 @@ def main(argv: list[str] | None = None):
     else:
         probe_categories = args.probes
 
-    probes = {}
-    if probe_categories:
-        print(f"Bootstrapping probes: {', '.join(probe_categories)}")
-
-        from steer.probes_bootstrap import bootstrap_probes
-        import pathlib
-
-        cache_dir = args.cache_dir or str(
-            pathlib.Path(__file__).parent / "probes" / "cache"
-        )
-        probes = bootstrap_probes(
-            model, tokenizer, layers, info,
-            categories=probe_categories,
-            cache_dir=cache_dir,
-        )
-
-        if probes:
-            print(f"Loaded {len(probes)} probes")
-    else:
-        print("Probes: none")
-
-    # Launch TUI
-    from steer.tui.app import SteerApp
-    app = SteerApp(
-        model=model,
-        tokenizer=tokenizer,
-        layers=layers,
-        model_info=info,
-        probes=probes,
-        system_prompt=args.system_prompt,
-        max_tokens=args.max_tokens,
+    from steer.session import SteerSession
+    session = SteerSession(
+        model_id=args.model, device=args.device, quantize=args.quantize,
+        probes=probe_categories, system_prompt=args.system_prompt,
+        max_tokens=args.max_tokens, cache_dir=args.cache_dir,
     )
+
+    info = session.model_info
+    print(f"Architecture: {info['model_type']}")
+    print(f"Layers: {info['num_layers']}, Hidden dim: {info['hidden_dim']}")
+    print(f"VRAM: {info['vram_used_gb']:.1f} GB")
+    print(f"Loaded {len(session.probes)} probes")
+
+    from steer.tui.app import SteerApp
+    app = SteerApp(session=session)
     app.run()
