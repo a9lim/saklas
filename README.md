@@ -1,48 +1,159 @@
 # steer
 
-Local activation steering and trait monitoring for HuggingFace transformer models, with a real-time terminal UI.
+Activation steering and trait monitoring for HuggingFace transformer models. Extract steering vectors, apply them during generation with per-call alpha control, and monitor how activations shift across behavioral probes.
 
-Load a model, extract steering vectors, adjust them live, and watch how activations shift across 28 behavioral probes — all from your terminal.
+Two interfaces: a **Python API** for scripted experiments and batch sweeps, and a **terminal UI** for interactive exploration.
 
-## What it does
+## Python API
 
-- **Activation steering**: Extract steering vectors via contrastive PCA (RepE) across all layers and inject them during generation. Adjust strength in real time.
-- **Trait monitoring**: Track cosine similarity between model activations and 28 probe vectors across 5 categories (emotion, personality, safety, cultural, gender) as tokens are generated. Visualized as live bars, sparklines, and running statistics.
-- **Custom vectors and probes**: Extract your own steering vectors or monitoring probes from any concept via `/steer` and `/probe` commands — uses LLM-generated contrastive pairs or falls back to curated datasets.
-- **A/B comparison**: Generate the same prompt with and without steering to see the effect side-by-side.
-- **Orthogonalization**: Gram-Schmidt orthogonalize multiple steering vectors to reduce interference.
+```python
+from steer import SteerSession, DataSource, ResultCollector
 
-## Requirements
+with SteerSession("google/gemma-2-2b-it", device="cuda") as session:
+    # Extract a steering vector
+    happy_profile = session.extract("happy")       # uses curated dataset
+    session.steer("happy", happy_profile)           # register (no alpha yet)
 
-- Python 3.11+
-- PyTorch 2.2+
-- A HuggingFace causal LM
-- CUDA GPU recommended. MPS (Apple Silicon) and CPU work but without quantization or flash attention.
+    # Generate with steering
+    result = session.generate(
+        "What makes a good day?",
+        alphas={"happy": 2.0},
+    )
+    print(result.text)
+    print(result.readings)  # probe monitor data
 
-## Install
+    # A/B comparison — just omit alphas
+    unsteered = session.generate("What makes a good day?")
 
-```bash
-pip install -e .
-
-# With bitsandbytes quantization (CUDA only):
-pip install -e ".[bnb]"
-
-# With flash attention (CUDA only):
-pip install -e ".[flash]"
-
-# Both:
-pip install -e ".[cuda]"
-
-# With test dependencies:
-pip install -e ".[dev]"
+    # Sweep alphas
+    collector = ResultCollector()
+    for alpha in [0, 0.5, 1.0, 1.5, 2.0, 2.5]:
+        session.clear_history()
+        result = session.generate(
+            "Describe a sunset.",
+            alphas={"happy": alpha},
+        )
+        collector.add(result, alpha=alpha)
+    collector.to_csv("sweep_results.csv")
 ```
 
-## Usage
+### Key concepts
+
+**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 1.5})` applies it for that generation only. No persistent hooks live on the model between calls.
+
+**Orthogonalization is per-call.** `session.generate(input, alphas={...}, orthogonalize=True)` applies Gram-Schmidt to the active vectors for that generation only.
+
+**Multiple vectors compose naturally:**
+
+```python
+session.steer("happy", happy_profile)
+session.steer("formal", formal_profile)
+
+# Apply both
+result = session.generate("Hello.", alphas={"happy": 2.0, "formal": 1.0})
+
+# Apply only one
+result = session.generate("Hello.", alphas={"happy": 2.0})
+
+# Apply none
+result = session.generate("Hello.")
+```
+
+### SteerSession reference
+
+```python
+session = SteerSession(
+    model_id,                        # HuggingFace model ID or local path
+    device="auto",                   # "auto", "cuda", "mps", "cpu"
+    quantize=None,                   # "4bit", "8bit", or None
+    probes=None,                     # list of categories, or None for all
+    system_prompt=None,              # default system prompt
+    max_tokens=1024,                 # max tokens per generation
+    cache_dir=None,                  # vector cache directory
+)
+
+# Vector extraction
+profile = session.extract("happy")                  # curated dataset
+profile = session.extract("empathy", baseline="apathy")  # contrastive
+profile = session.extract([("pos", "neg"), ...])     # raw pairs
+profile = session.extract(DataSource.csv("pairs.csv"))
+profile = session.load_profile("saved.safetensors")
+session.save_profile(profile, "output.safetensors")
+
+# Model-generated contrastive pairs
+pairs = session.generate_pairs("curiosity")  # list[(str, str)]
+
+# Vector registry
+session.steer("name", profile)     # register
+session.unsteer("name")            # remove
+session.vectors                    # dict of registered profiles
+
+# Generation
+result = session.generate("prompt", alphas={"name": 1.5}, orthogonalize=False)
+for token in session.generate_stream("prompt", alphas={"name": 1.5}):
+    print(token.text, end="", flush=True)
+
+# Monitoring
+session.monitor("honest")                   # curated probe
+session.monitor("custom", custom_profile)    # from profile
+session.unmonitor("honest")
+
+# State
+session.config.temperature = 0.8   # also: top_p, max_new_tokens, system_prompt
+session.history                    # conversation messages
+session.last_result                # most recent GenerationResult
+session.model_info                 # model metadata
+session.stop()                     # interrupt generation
+session.rewind()                   # drop last exchange
+session.clear_history()            # clear conversation
+```
+
+### Structured output
+
+```python
+result = session.generate("prompt", alphas={"happy": 2.0})
+result.text              # decoded output
+result.tokens            # token IDs
+result.token_count       # number of tokens
+result.tok_per_sec       # generation speed
+result.elapsed           # seconds
+result.vectors           # {"happy": 2.0} — snapshot of alphas used
+result.readings          # {"probe_name": ProbeReadings} if probes active
+result.to_dict()         # plain Python types, JSON-serializable
+```
+
+### DataSource formats
+
+```python
+from steer import DataSource
+
+ds = DataSource.curated("happy")                                   # bundled
+ds = DataSource.json("pairs.json")                                 # steer schema
+ds = DataSource.csv("pairs.csv", positive_col="pos", negative_col="neg")
+ds = DataSource.huggingface("user/dataset", split="train[:100]")   # requires datasets
+ds = DataSource.from_pairs([("positive text", "negative text")])
+```
+
+### ResultCollector
+
+```python
+collector = ResultCollector()
+collector.add(result, concept="happy", alpha=2.0, run_id=1)
+
+collector.to_dicts()               # list of flat dicts
+collector.to_jsonl("results.jsonl")
+collector.to_csv("results.csv")
+collector.to_dataframe()           # requires pandas
+```
+
+Probe readings flatten to columns: `probe_honest_mean`, `probe_honest_std`, etc. Vector alphas flatten to `vector_happy_alpha`.
+
+## Terminal UI
 
 ```bash
 steer google/gemma-2-9b-it
 steer mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
-steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
+steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 ```
 
 ### CLI options
@@ -50,28 +161,25 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 | Flag | Description |
 |------|-------------|
 | `model` | HuggingFace model ID or local path |
-| `-q`, `--quantize` | `4bit` or `8bit` (CUDA only, via bitsandbytes) |
+| `-q`, `--quantize` | `4bit` or `8bit` (CUDA only) |
 | `-d`, `--device` | `auto` (default), `cuda`, `mps`, or `cpu` |
-| `-p`, `--probes` | Probe categories to load: `all`, `none`, `emotion`, `personality`, `safety`, `cultural`, `gender` (default: all) |
-| `-s`, `--system-prompt` | System prompt for chat |
+| `-p`, `--probes` | Categories: `all`, `none`, `emotion`, `personality`, `safety`, `cultural`, `gender` |
+| `-s`, `--system-prompt` | System prompt |
 | `-m`, `--max-tokens` | Max tokens per generation (default: 1024) |
-| `-c`, `--cache-dir` | Cache directory for extracted vectors |
-
-## TUI
+| `-c`, `--cache-dir` | Vector cache directory |
 
 ### Layout
 
 ```
 +--------------------+----------------------------------+------------------+
 |  VECTORS           |                                  |  TRAIT MONITOR   |
-|  > happy 5L pk21   |          Chat                    |  Emotion         |
-|    formal 3L pk18  |                                  |    happy #### .42|
+|  > happy  +2.5     |          Chat                    |  Emotion         |
+|    formal +1.0     |                                  |    happy #### .42|
 |                    |                                  |    sad   ##- -.15|
 |  CONFIG            |                                  |  Personality     |
 |  temp ####- 0.7    |                                  |    honest ### .31|
-|  top-p #### 0.9    |                                  |    verbose ##-.18|
-|                    |                                  |                  |
-|  KEYS              |  Type a message...               |                  |
+|  top-p #### 0.9    |                                  |                  |
+|                    |  Type a message...               |                  |
 +--------------------+----------------------------------+------------------+
 ```
 
@@ -80,13 +188,16 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Cycle panel focus |
-| `Left` / `Right` | Adjust alpha (strength) |
-| `Up` / `Down` | Navigate vectors / probes (in focused panel) |
+| `Left` / `Right` | Adjust alpha |
+| `Up` / `Down` | Navigate vectors / probes |
+| `Enter` | Toggle vector on/off |
 | `Backspace` / `Delete` | Remove selected vector or probe |
 | `Ctrl+O` | Toggle orthogonalization |
 | `Ctrl+A` | A/B compare (steered vs unsteered) |
 | `Ctrl+R` | Regenerate last response |
-| `Ctrl+S` | Cycle trait sort mode (name / magnitude / change) |
+| `Ctrl+S` | Cycle trait sort mode |
+| `[` / `]` | Adjust temperature |
+| `{` / `}` | Adjust top-p |
 | `Escape` | Stop generation |
 | `Ctrl+Q` | Quit |
 
@@ -94,23 +205,22 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 
 | Command | Description |
 |---------|-------------|
-| `/steer "concept" [alpha]` | Steering vector via contrastive pairs (e.g. `/steer "happy" 2.5`) |
-| `/steer "concept" - "baseline" [alpha]` | Steering with explicit baseline (e.g. `/steer "formal" - "casual"`) |
-| `/probe "concept"` | Add a monitoring probe (e.g. `/probe "sarcastic"`) |
-| `/probe "concept" - "baseline"` | Probe with explicit baseline |
-| `/clear` | Clear chat history and reset probe stats |
-| `/rewind` | Undo last user message and its response |
+| `/steer "concept" [alpha]` | Extract and register steering vector |
+| `/steer "concept" - "baseline" [alpha]` | Contrastive steering |
+| `/probe "concept"` | Add monitoring probe |
+| `/probe "concept" - "baseline"` | Contrastive probe |
+| `/clear` | Clear history and reset probes |
+| `/rewind` | Undo last exchange |
 | `/sys <prompt>` | Set system prompt |
 | `/temp <value>` | Set temperature |
 | `/top-p <value>` | Set top-p |
 | `/max <value>` | Set max tokens |
-| `/help` | Show available commands |
 
-For `/steer` and `/probe`, if the concept matches a built-in probe name (e.g. "happy", "refusal"), the curated contrastive pair dataset is used automatically. Otherwise, pairs are generated via the loaded model.
+Concepts matching built-in probe names use curated datasets automatically. Otherwise, pairs are generated by the loaded model.
 
 ## Probe library
 
-28 probes across 5 categories, each backed by 60 curated contrastive pairs:
+28 probes across 5 categories, each backed by ~60 curated contrastive pairs:
 
 | Category | Probes |
 |----------|--------|
@@ -122,25 +232,40 @@ For `/steer` and `/probe`, if the concept matches a built-in probe name (e.g. "h
 
 Probes are extracted on first run and cached per model under `steer/probes/cache/`.
 
+## Install
+
+```bash
+pip install -e .                   # base install
+pip install -e ".[dev]"            # + pytest
+pip install -e ".[cuda]"           # + bitsandbytes + flash-attn
+pip install -e ".[research]"       # + datasets + pandas (for API)
+pip install -e ".[bnb]"            # + bitsandbytes only
+```
+
+Requires Python 3.11+, PyTorch 2.2+. CUDA recommended; MPS and CPU work without quantization.
+
 ## Supported architectures
+
+39 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one lambda entry.
 
 Llama (1-4), Mistral, Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3), Qwen2-MoE, Qwen3-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-2), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, Bloom, Falcon, MPT, DBRX, OPT, RecurrentGemma.
 
-Adding a new architecture requires one entry in `model.py:_LAYER_ACCESSORS`.
+## How it works
 
-## Steering method
+### Steering vectors
 
-**Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer via per-layer hooks. Computes pos-neg differences, then extracts the first principal component per layer via batched PCA (SVD). Each layer is scored by explained variance ratio. The result is a multi-layer profile covering all layers — no manual layer selection or pruning. Scores weight each layer's contribution during steering and monitoring. The `/steer` and `/probe` commands generate contrastive pairs automatically using the loaded model, or use curated datasets for built-in probe concepts.
+**Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer. Computes pos-neg differences, extracts the first principal component per layer via batched SVD. Each layer is scored by explained variance ratio. The result is a multi-layer profile — no manual layer selection. Scores weight each layer's contribution during generation.
 
-## How the monitor works
+### Monitor
 
-Each probe monitors all layers in its profile, weighted by extraction score. Probes are grouped by layer — one forward hook per distinct layer across all probe profiles, each with its own probe sub-matrix. Per hook: a single matrix multiply computes cosine similarity between the last token's hidden state and all probes at that layer, scaled by the probe's score at that layer. Results accumulate in a shared GPU buffer and batch-transfer to CPU on the TUI poll cycle (~15 FPS), where they're divided by total weight to produce a per-probe weighted average. The throughput target is >=85% of vanilla generation speed with steering and monitoring active.
+Each probe monitors all layers in its profile, weighted by extraction score. One forward hook per distinct layer, computing score-weighted cosine similarities into a shared GPU accumulator. Batch-transfers to CPU on TUI poll. Throughput target: >= 85% of vanilla generation speed with steering + monitoring active.
 
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/test_smoke.py -v
+pytest tests/ -v                   # all tests
+pytest tests/test_results.py tests/test_datasource.py -v  # no GPU needed
+pytest tests/test_smoke.py -v      # CUDA required
 ```
 
-Requires CUDA. Downloads `google/gemma-2-2b-it` (~5 GB) on first run. Covers vector extraction, steering effect, hook cleanup, save/load roundtrip, monitor correctness, and throughput regression.
+CUDA tests download `google/gemma-2-2b-it` (~5 GB) on first run. Non-CUDA tests (`test_results.py`, `test_datasource.py`) run anywhere.
