@@ -1,4 +1,4 @@
-# steer
+# liahona
 
 Activation steering and trait monitoring for HuggingFace transformer models. Extract steering vectors, apply them during generation with per-call alpha control, and monitor how activations shift across behavioral probes.
 
@@ -7,9 +7,9 @@ Three interfaces: a **Python API** for scripted experiments and batch sweeps, an
 ## Python API
 
 ```python
-from steer import SteerSession, DataSource, ResultCollector
+from liahona import LiahonaSession, DataSource, ResultCollector
 
-with SteerSession("google/gemma-2-2b-it", device="cuda") as session:
+with LiahonaSession("google/gemma-2-2b-it", device="cuda") as session:
     # Extract a steering vector
     happy_profile = session.extract("happy")       # uses curated dataset
     session.steer("happy", happy_profile)           # register (no alpha yet)
@@ -59,10 +59,10 @@ result = session.generate("Hello.", alphas={"happy": 0.2})
 result = session.generate("Hello.")
 ```
 
-### SteerSession reference
+### LiahonaSession reference
 
 ```python
-session = SteerSession(
+session = LiahonaSession(
     model_id,                        # HuggingFace model ID or local path
     device="auto",                   # "auto", "cuda", "mps", "cpu"
     quantize=None,                   # "4bit", "8bit", or None
@@ -125,10 +125,10 @@ result.to_dict()         # plain Python types, JSON-serializable
 ### DataSource formats
 
 ```python
-from steer import DataSource
+from liahona import DataSource
 
 ds = DataSource.curated("happy")                                   # bundled
-ds = DataSource.json("pairs.json")                                 # steer schema
+ds = DataSource.json("pairs.json")                                 # liahona schema
 ds = DataSource.csv("pairs.csv", positive_col="pos", negative_col="neg")
 ds = DataSource.huggingface("user/dataset", split="train[:100]")   # requires datasets
 ds = DataSource.from_pairs([("positive text", "negative text")])
@@ -316,7 +316,7 @@ Concepts matching built-in probe names use curated datasets automatically. Other
 | **Cultural** | western, hierarchical, direct, contextual, religious, traditional |
 | **Gender** | masculine, agentic, paternal |
 
-Probes are extracted on first run and cached per model under `steer/probes/cache/`.
+Probes are extracted on first run and cached per model under `liahona/probes/cache/`.
 
 ## Install
 

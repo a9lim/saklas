@@ -1,4 +1,4 @@
-"""CLI entry point for steer."""
+"""CLI entry point for liahona."""
 
 from __future__ import annotations
 
@@ -60,9 +60,9 @@ def _resolve_probes(raw: list[str] | None) -> list[str]:
 
 
 def _make_session(args: argparse.Namespace):
-    from steer.session import SteerSession
+    from liahona.session import LiahonaSession
     probe_categories = _resolve_probes(args.probes)
-    return SteerSession(
+    return LiahonaSession(
         model_id=args.model, device=args.device, quantize=args.quantize,
         probes=probe_categories, system_prompt=args.system_prompt,
         max_tokens=args.max_tokens, cache_dir=args.cache_dir,
@@ -131,8 +131,8 @@ def _run_tui(args: argparse.Namespace) -> None:
     session = _make_session(args)
     _print_model_info(session)
 
-    from steer.tui.app import SteerApp
-    app = SteerApp(session=session)
+    from liahona.tui.app import LiahonaApp
+    app = LiahonaApp(session=session)
     app.run()
 
 
@@ -151,7 +151,7 @@ def _run_serve(args: argparse.Namespace) -> None:
     except ImportError:
         print(
             "Server dependencies not installed. Run:\n"
-            "  pip install steer[serve]",
+            "  pip install liahona[serve]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -173,7 +173,7 @@ def _run_serve(args: argparse.Namespace) -> None:
         default_alphas[name] = alpha
         print(f"  Registered '{name}' (default alpha={alpha})")
 
-    from steer.server import create_app
+    from liahona.server import create_app
     app = create_app(session, default_alphas=default_alphas, cors_origins=args.cors or None)
 
     print(f"\nServing on http://{args.host}:{args.port}")

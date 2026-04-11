@@ -9,7 +9,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-from steer.tui.vector_panel import _build_bar
+from liahona.tui.vector_panel import _build_bar
 
 
 

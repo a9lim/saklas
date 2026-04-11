@@ -46,7 +46,7 @@ class TraitMonitor:
         one hidden-state vector per layer, mean-centers, then computes
         score-weighted cosine similarities against all probes.
         """
-        from steer.vectors import _encode_and_capture_all
+        from liahona.vectors import _encode_and_capture_all
 
         if device is None:
             device = next(model.parameters()).device

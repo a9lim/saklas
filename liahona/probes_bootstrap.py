@@ -27,7 +27,7 @@ def bootstrap_layer_means(
 
     Cached as a profile under the reserved name ``_LAYERMEANS``.
     """
-    from steer.vectors import compute_layer_means, get_cache_path, save_profile, load_profile
+    from liahona.vectors import compute_layer_means, get_cache_path, save_profile, load_profile
 
     model_id = model_info.get("model_id", "unknown")
     cp = get_cache_path(cache_dir, model_id, _LAYER_MEANS_TAG)
@@ -67,7 +67,7 @@ def bootstrap_probes(
     Load or extract probe vector profiles for the given categories.
     Returns dict mapping probe_name -> profile (layer_idx -> (vector, score)).
     """
-    from steer.vectors import extract_contrastive, load_contrastive_pairs, load_profile, save_profile, get_cache_path
+    from liahona.vectors import extract_contrastive, load_contrastive_pairs, load_profile, save_profile, get_cache_path
 
     defaults = _load_defaults()
     cache_path = Path(cache_dir)

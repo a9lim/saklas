@@ -3,14 +3,14 @@ import json
 import csv
 import tempfile
 from pathlib import Path
-from steer.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
+from liahona.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
 
 
 class TestPublicAPI:
     def test_imports(self):
-        from steer import SteerSession, DataSource, ResultCollector
-        from steer import GenerationResult, TokenEvent, ProbeReadings
-        assert SteerSession is not None
+        from liahona import LiahonaSession, DataSource, ResultCollector
+        from liahona import GenerationResult, TokenEvent, ProbeReadings
+        assert LiahonaSession is not None
         assert DataSource is not None
         assert ResultCollector is not None
         assert GenerationResult is not None

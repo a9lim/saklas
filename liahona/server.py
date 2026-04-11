@@ -1,4 +1,4 @@
-"""OpenAI-compatible API server backed by SteerSession."""
+"""OpenAI-compatible API server backed by LiahonaSession."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from steer.probes_bootstrap import _load_defaults
-from steer.session import SteerSession
+from liahona.probes_bootstrap import _load_defaults
+from liahona.session import LiahonaSession
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ class ActivateProbeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _make_id() -> str:
-    return f"steer-{uuid.uuid4().hex[:12]}"
+    return f"liahona-{uuid.uuid4().hex[:12]}"
 
 
 def _ts() -> int:
@@ -96,7 +96,7 @@ def _error(status: int, message: str, error_type: str = "error") -> JSONResponse
     )
 
 
-def _probe_reading_dict(session: SteerSession) -> dict[str, Any]:
+def _probe_reading_dict(session: LiahonaSession) -> dict[str, Any]:
     readings = session._build_readings()
     out: dict[str, Any] = {}
     for name, r in readings.items():
@@ -104,7 +104,7 @@ def _probe_reading_dict(session: SteerSession) -> dict[str, Any]:
     return out
 
 
-def _apply_gen_overrides(session: SteerSession, temperature, top_p, max_tokens):
+def _apply_gen_overrides(session: LiahonaSession, temperature, top_p, max_tokens):
     """Temporarily override generation config, return originals."""
     orig = (session.config.temperature, session.config.top_p, session.config.max_new_tokens)
     if temperature is not None:
@@ -116,7 +116,7 @@ def _apply_gen_overrides(session: SteerSession, temperature, top_p, max_tokens):
     return orig
 
 
-def _restore_gen_config(session: SteerSession, orig):
+def _restore_gen_config(session: LiahonaSession, orig):
     session.config.temperature, session.config.top_p, session.config.max_new_tokens = orig
 
 
@@ -139,9 +139,9 @@ def _ortho(steer_params: SteerParams | None) -> bool:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(session: SteerSession, default_alphas: dict[str, float] | None = None,
+def create_app(session: LiahonaSession, default_alphas: dict[str, float] | None = None,
                cors_origins: list[str] | None = None) -> FastAPI:
-    app = FastAPI(title="steer", description="OpenAI-compatible API with activation steering")
+    app = FastAPI(title="liahona", description="OpenAI-compatible API with activation steering")
     app.state.session = session
     app.state.default_alphas = default_alphas or {}
 
@@ -158,7 +158,7 @@ def create_app(session: SteerSession, default_alphas: dict[str, float] | None = 
 
 
 def _register_routes(app: FastAPI) -> None:
-    session: SteerSession = app.state.session
+    session: LiahonaSession = app.state.session
 
     # -----------------------------------------------------------------------
     # Models

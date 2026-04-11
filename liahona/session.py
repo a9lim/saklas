@@ -1,4 +1,4 @@
-"""SteerSession — unified backend for steer's programmatic API and TUI."""
+"""LiahonaSession — unified backend for liahona's programmatic API and TUI."""
 from __future__ import annotations
 import json
 import os
@@ -10,14 +10,14 @@ from typing import Callable, Iterator
 
 import torch
 
-from steer.datasource import DataSource
-from steer.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered
-from steer.hooks import SteeringManager
-from steer.model import load_model, get_layers, get_model_info
-from steer.monitor import TraitMonitor
-from steer.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, _load_defaults
-from steer.results import GenerationResult, TokenEvent, ProbeReadings
-from steer.vectors import (
+from liahona.datasource import DataSource
+from liahona.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered
+from liahona.hooks import SteeringManager
+from liahona.model import load_model, get_layers, get_model_info
+from liahona.monitor import TraitMonitor
+from liahona.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, _load_defaults
+from liahona.results import GenerationResult, TokenEvent, ProbeReadings
+from liahona.vectors import (
     extract_contrastive,
     save_profile as _save_profile,
     load_profile as _load_profile,
@@ -28,7 +28,7 @@ from steer.vectors import (
 _N_PAIRS = 45
 
 
-class SteerSession:
+class LiahonaSession:
     """Unified backend for activation steering, monitoring, and generation.
 
     Vectors are registered via steer() and applied per-generation via the

@@ -1,4 +1,4 @@
-"""Smoke tests for steer.
+"""Smoke tests for liahona.
 
 Requires a CUDA GPU and downloads google/gemma-2-2b-it (~5GB) on first run.
 Run with: pytest tests/test_smoke.py -v
@@ -25,14 +25,14 @@ MODEL_ID = "google/gemma-2-2b-it"
 
 @pytest.fixture(scope="module")
 def model_and_tokenizer():
-    from steer.model import load_model
+    from liahona.model import load_model
     model, tokenizer = load_model(MODEL_ID, quantize=None, device="cuda")
     return model, tokenizer
 
 
 @pytest.fixture(scope="module")
 def layers(model_and_tokenizer):
-    from steer.model import get_layers
+    from liahona.model import get_layers
     model, _ = model_and_tokenizer
     return get_layers(model)
 
@@ -44,13 +44,13 @@ def num_layers(layers):
 
 def _extract_profile(model, tokenizer, concept, layers):
     """Extract a profile for a single concept with one pair."""
-    from steer.vectors import extract_contrastive
+    from liahona.vectors import extract_contrastive
     return extract_contrastive(model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers)
 
 
 @pytest.fixture(scope="module")
 def layer_means(model_and_tokenizer, layers):
-    from steer.vectors import compute_layer_means
+    from liahona.vectors import compute_layer_means
     model, tokenizer = model_and_tokenizer
     return compute_layer_means(model, tokenizer, layers)
 
@@ -85,8 +85,8 @@ class TestVectorExtraction:
 
 class TestSteering:
     def test_steered_output_differs(self, model_and_tokenizer, layers, happy_profile):
-        from steer.hooks import SteeringManager
-        from steer.generation import GenerationConfig, GenerationState, generate_steered
+        from liahona.hooks import SteeringManager
+        from liahona.generation import GenerationConfig, GenerationState, generate_steered
 
         model, tokenizer = model_and_tokenizer
         device = next(model.parameters()).device
@@ -117,8 +117,8 @@ class TestSteering:
         assert ids0 != ids1, "Steered output should differ from unsteered"
 
     def test_hook_cleanup(self, model_and_tokenizer, layers, happy_profile):
-        from steer.hooks import SteeringManager
-        from steer.generation import GenerationConfig, GenerationState, generate_steered
+        from liahona.hooks import SteeringManager
+        from liahona.generation import GenerationConfig, GenerationState, generate_steered
 
         model, tokenizer = model_and_tokenizer
         p = next(model.parameters())
@@ -152,7 +152,7 @@ class TestSteering:
 
 class TestSaveLoad:
     def test_roundtrip(self, happy_profile):
-        from steer.vectors import save_profile, load_profile
+        from liahona.vectors import save_profile, load_profile
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_profile.safetensors")
@@ -171,9 +171,9 @@ class TestSaveLoad:
 
 class TestTraitMonitor:
     def test_monitor_records_history(self, model_and_tokenizer, layers, happy_profile, layer_means):
-        from steer.hooks import SteeringManager
-        from steer.monitor import TraitMonitor
-        from steer.generation import GenerationConfig, GenerationState, generate_steered
+        from liahona.hooks import SteeringManager
+        from liahona.monitor import TraitMonitor
+        from liahona.generation import GenerationConfig, GenerationState, generate_steered
 
         model, tokenizer = model_and_tokenizer
         device = next(model.parameters()).device
@@ -219,9 +219,9 @@ class TestTraitMonitor:
 
     def test_throughput_regression(self, model_and_tokenizer, layers, happy_profile, layer_means):
         """Steered generation should be at least 85% of vanilla throughput."""
-        from steer.hooks import SteeringManager
-        from steer.monitor import TraitMonitor
-        from steer.generation import GenerationConfig, GenerationState, generate_steered
+        from liahona.hooks import SteeringManager
+        from liahona.monitor import TraitMonitor
+        from liahona.generation import GenerationConfig, GenerationState, generate_steered
 
         model, tokenizer = model_and_tokenizer
         device = next(model.parameters()).device
@@ -267,7 +267,7 @@ class TestTraitMonitor:
 
 class TestExtractContrastive:
     def test_returns_valid_profile(self, model_and_tokenizer, layers, num_layers):
-        from steer.vectors import extract_contrastive
+        from liahona.vectors import extract_contrastive
         model, tokenizer = model_and_tokenizer
         hidden_dim = model.config.hidden_size
         pairs = [
@@ -288,7 +288,7 @@ class TestExtractContrastive:
 
 class TestBuildChatInput:
     def test_chat_template_path(self, model_and_tokenizer):
-        from steer.generation import build_chat_input
+        from liahona.generation import build_chat_input
         _, tokenizer = model_and_tokenizer
         messages = [{"role": "user", "content": "Hello"}]
         ids = build_chat_input(tokenizer, messages)
@@ -297,7 +297,7 @@ class TestBuildChatInput:
         assert ids.shape[1] > 0
 
     def test_with_system_prompt(self, model_and_tokenizer):
-        from steer.generation import build_chat_input
+        from liahona.generation import build_chat_input
         _, tokenizer = model_and_tokenizer
         messages = [{"role": "user", "content": "Hello"}]
         ids_no_sys = build_chat_input(tokenizer, messages)
@@ -309,9 +309,9 @@ class TestBuildChatInput:
 class TestProbesBootstrap:
     def test_bootstrap_loads_from_cache(self, model_and_tokenizer, layers, happy_profile):
         """Bootstrap should return cached profiles without re-extracting."""
-        from steer.probes_bootstrap import bootstrap_probes
-        from steer.vectors import save_profile, get_cache_path
-        from steer.model import get_model_info
+        from liahona.probes_bootstrap import bootstrap_probes
+        from liahona.vectors import save_profile, get_cache_path
+        from liahona.model import get_model_info
         model, tokenizer = model_and_tokenizer
         model_info = get_model_info(model, tokenizer)
 

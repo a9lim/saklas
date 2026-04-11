@@ -1,4 +1,4 @@
-"""Main Textual application for steer."""
+"""Main Textual application for liahona."""
 
 from __future__ import annotations
 
@@ -13,17 +13,17 @@ from textual.containers import Horizontal
 from textual.widgets import Input
 from textual.timer import Timer
 
-from steer.generation import GenerationState, build_chat_input, generate_steered
-from steer.model import _get_memory_gb
-from steer.probes_bootstrap import _load_defaults
-from steer.tui.chat_panel import ChatPanel
-from steer.tui.vector_panel import LeftPanel
-from steer.tui.trait_panel import TraitPanel
+from liahona.generation import GenerationState, build_chat_input, generate_steered
+from liahona.model import _get_memory_gb
+from liahona.probes_bootstrap import _load_defaults
+from liahona.tui.chat_panel import ChatPanel
+from liahona.tui.vector_panel import LeftPanel
+from liahona.tui.trait_panel import TraitPanel
 
 PANELS = ["left-panel", "chat-panel", "trait-panel"]
 
 
-class SteerApp(App):
+class LiahonaApp(App):
     CSS_PATH = "styles.tcss"
     ENABLE_COMMAND_PALETTE = False
 

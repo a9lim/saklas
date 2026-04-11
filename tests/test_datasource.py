@@ -3,7 +3,7 @@ import json
 import csv
 import tempfile
 from pathlib import Path
-from steer.datasource import DataSource
+from liahona.datasource import DataSource
 
 class TestFromPairs:
     def test_basic(self):

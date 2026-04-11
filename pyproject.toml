@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "steer"
+name = "liahona"
 version = "0.1.0"
 description = "Local activation steering + trait monitoring TUI for HuggingFace transformers"
 requires-python = ">=3.11"
@@ -26,7 +26,7 @@ pandas = ["pandas>=2.0"]
 research = ["datasets>=2.0", "pandas>=2.0"]
 
 [project.scripts]
-steer = "steer.cli:main"
+steer = "liahona.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["steer*"]
+include = ["liahona*"]

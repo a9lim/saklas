@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from steer.results import GenerationResult, TokenEvent, ProbeReadings
+from liahona.results import GenerationResult, TokenEvent, ProbeReadings
 
 
 # ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@ from steer.results import GenerationResult, TokenEvent, ProbeReadings
 # ---------------------------------------------------------------------------
 
 def _mock_session():
-    """Create a mock SteerSession with realistic attributes."""
+    """Create a mock LiahonaSession with realistic attributes."""
     session = MagicMock()
     session.model_info = {
         "model_id": "test/model",
@@ -40,7 +40,7 @@ def _mock_session():
 
 @pytest.fixture
 def client():
-    from steer.server import create_app
+    from liahona.server import create_app
     session = _mock_session()
     app = create_app(session, default_alphas={"test_vec": 0.1})
     return TestClient(app)
@@ -48,7 +48,7 @@ def client():
 
 @pytest.fixture
 def session_and_client():
-    from steer.server import create_app
+    from liahona.server import create_app
     session = _mock_session()
     app = create_app(session, default_alphas={})
     return session, TestClient(app)
@@ -231,7 +231,7 @@ class TestProbes:
 
     def test_list_defaults(self, session_and_client):
         session, client = session_and_client
-        with patch("steer.server._load_defaults", return_value={"emotion": ["happiness"]}):
+        with patch("liahona.server._load_defaults", return_value={"emotion": ["happiness"]}):
             resp = client.get("/v1/steer/probes/defaults")
         assert resp.status_code == 200
         assert "emotion" in resp.json()["defaults"]
@@ -297,24 +297,24 @@ class TestSession:
 
 class TestCLIParsing:
     def test_tui_default(self):
-        from steer.cli import parse_args
+        from liahona.cli import parse_args
         args = parse_args(["google/gemma-2-2b-it"])
         assert args.command == "tui"
         assert args.model == "google/gemma-2-2b-it"
 
     def test_serve_subcommand(self):
-        from steer.cli import parse_args
+        from liahona.cli import parse_args
         args = parse_args(["serve", "google/gemma-2-2b-it", "--port", "9000"])
         assert args.command == "serve"
         assert args.model == "google/gemma-2-2b-it"
         assert args.port == 9000
 
     def test_serve_steer_flag(self):
-        from steer.cli import parse_args, _parse_steer_flag
+        from liahona.cli import parse_args, _parse_steer_flag
         assert _parse_steer_flag("cheerful:0.2") == ("cheerful", 0.2)
         assert _parse_steer_flag("cheerful") == ("cheerful", 0.0)
 
     def test_serve_cors(self):
-        from steer.cli import parse_args
+        from liahona.cli import parse_args
         args = parse_args(["serve", "m", "--cors", "http://localhost:3000", "--cors", "*"])
         assert args.cors == ["http://localhost:3000", "*"]
