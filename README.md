@@ -6,7 +6,7 @@ Load a model, extract steering vectors, adjust them live, and watch how activati
 
 ## What it does
 
-- **Activation steering**: Extract and inject steering vectors via contrastive activation addition across all layers during generation. Adjust strength in real time.
+- **Activation steering**: Extract steering vectors via contrastive PCA (RepE) across all layers and inject them during generation. Adjust strength in real time.
 - **Trait monitoring**: Track cosine similarity between model activations and 28 probe vectors across 5 categories (emotion, personality, safety, cultural, gender) as tokens are generated. Visualized as live bars, sparklines, and running statistics.
 - **Custom vectors and probes**: Extract your own steering vectors or monitoring probes from any concept via `/steer` and `/probe` commands — uses LLM-generated contrastive pairs or falls back to curated datasets.
 - **A/B comparison**: Generate the same prompt with and without steering to see the effect side-by-side.
@@ -130,7 +130,7 @@ Adding a new architecture requires one entry in `model.py:_LAYER_ACCESSORS`.
 
 ## Steering method
 
-**Contrastive Activation Addition** (Rimsky et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer via per-layer hooks. Computes pos-neg differences, then extracts the first principal component per layer via batched SVD. Each layer is scored by explained variance ratio; layers below the mean score are pruned. The result is a multi-layer profile — no manual layer selection required. The `/steer` and `/probe` commands generate contrastive pairs automatically using the loaded model, or use curated datasets for built-in probe concepts.
+**Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer via per-layer hooks. Computes pos-neg differences, then extracts the first principal component per layer via batched PCA (SVD). Each layer is scored by explained variance ratio; layers below the mean score are pruned. The result is a multi-layer profile — no manual layer selection required. The `/steer` and `/probe` commands generate contrastive pairs automatically using the loaded model, or use curated datasets for built-in probe concepts.
 
 ## How the monitor works
 
