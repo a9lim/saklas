@@ -1,4 +1,6 @@
 from __future__ import annotations
+import csv
+import json
 from dataclasses import dataclass, field
 
 
@@ -53,3 +55,65 @@ class TokenEvent:
     token_id: int
     index: int
     readings: dict[str, float] | None
+
+
+class ResultCollector:
+    """Accumulates GenerationResults with tags for batch export."""
+
+    def __init__(self):
+        self._rows: list[dict] = []
+
+    @property
+    def results(self) -> list[dict]:
+        return list(self._rows)
+
+    def add(self, result: GenerationResult, **tags) -> None:
+        row = {
+            "text": result.text,
+            "token_count": result.token_count,
+            "tok_per_sec": result.tok_per_sec,
+            "elapsed": result.elapsed,
+        }
+        for probe_name, readings in result.readings.items():
+            row[f"probe_{probe_name}_mean"] = readings.mean
+            row[f"probe_{probe_name}_std"] = readings.std
+            row[f"probe_{probe_name}_min"] = readings.min
+            row[f"probe_{probe_name}_max"] = readings.max
+            row[f"probe_{probe_name}_delta"] = readings.delta_per_tok
+        for vec_name, alpha in result.vectors.items():
+            row[f"vector_{vec_name}_alpha"] = alpha
+        row.update(tags)
+        self._rows.append(row)
+
+    def to_dicts(self) -> list[dict]:
+        return list(self._rows)
+
+    def to_jsonl(self, path: str) -> None:
+        with open(path, "w") as f:
+            for row in self._rows:
+                f.write(json.dumps(row) + "\n")
+
+    def to_csv(self, path: str) -> None:
+        if not self._rows:
+            return
+        all_keys: list[str] = []
+        seen: set[str] = set()
+        for row in self._rows:
+            for k in row:
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=all_keys)
+            writer.writeheader()
+            writer.writerows(self._rows)
+
+    def to_dataframe(self):
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ImportError(
+                "pandas is required for to_dataframe(). "
+                "Install with: pip install steer[pandas]"
+            )
+        return pd.DataFrame(self._rows)
