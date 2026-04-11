@@ -103,6 +103,9 @@ def _load_text_from_multimodal(
     ``language_model.`` prefix.  This function creates an empty
     text-only model, loads each safetensors shard, strips the prefix,
     and loads matching weights.  Vision-tower weights are skipped.
+
+    FP8-quantized weights are dequantized inline using their
+    ``weight_scale_inv`` tensors (``weight * scale``).
     """
     import json
     import os
@@ -119,8 +122,28 @@ def _load_text_from_multimodal(
     prefix = "language_model."
     for sf in shard_files:
         shard = load_file(os.path.join(model_dir, sf), device="cpu")
-        mapped = {k[len(prefix):]: v for k, v in shard.items()
-                  if k.startswith(prefix)}
+
+        # Strip prefix and collect text-model tensors
+        stripped: dict[str, torch.Tensor] = {}
+        for k, v in shard.items():
+            if k.startswith(prefix):
+                stripped[k[len(prefix):]] = v
+
+        # Dequantize FP8 weights: real_weight = weight.to(dtype) * scale
+        mapped: dict[str, torch.Tensor] = {}
+        for k, v in stripped.items():
+            if k.endswith(".weight_scale_inv") or k.endswith(".activation_scale"):
+                continue  # consumed below or unused at inference
+            if v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
+                           torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
+                scale_key = k + "_scale_inv"
+                scale = stripped.get(scale_key)
+                if scale is not None:
+                    v = v.to(dtype) * scale.to(dtype)
+                else:
+                    v = v.to(dtype)
+            mapped[k] = v
+
         if mapped:
             model.load_state_dict(mapped, strict=False)
 
