@@ -221,6 +221,216 @@ class SteerSession:
         if self._monitor:
             self._monitor.reset_history()
 
+    # -- Generation helpers --
+
+    def _prepare_input(self, input) -> tuple[list[dict], torch.Tensor]:
+        """Normalize input to messages list and compute input_ids."""
+        if isinstance(input, str):
+            messages = list(self._history) + [{"role": "user", "content": input}]
+        elif isinstance(input, list):
+            messages = list(input)
+        else:
+            raise TypeError(f"Unsupported input type: {type(input)}")
+        input_ids = build_chat_input(
+            self._tokenizer, messages, self.config.system_prompt,
+        ).to(self._device)
+        return messages, input_ids
+
+    def _build_readings(self) -> dict[str, ProbeReadings]:
+        """Flush monitor and build ProbeReadings for all active probes."""
+        readings: dict[str, ProbeReadings] = {}
+        if not self._monitor or not self._monitor.probe_names:
+            return readings
+        self._monitor.flush_to_cpu()
+        for name in self._monitor.probe_names:
+            stats = self._monitor.get_stats(name)
+            count = stats["count"]
+            if count == 0:
+                continue
+            mean = stats["sum"] / count
+            variance = max(0.0, stats["sum_sq"] / count - mean ** 2)
+            std = variance ** 0.5
+            hist = list(self._monitor.history.get(name, []))
+            if len(hist) >= 2:
+                deltas = [abs(hist[i] - hist[i-1]) for i in range(1, len(hist))]
+                delta_per_tok = sum(deltas) / len(deltas)
+            else:
+                delta_per_tok = 0.0
+            readings[name] = ProbeReadings(
+                per_token=hist,
+                mean=mean,
+                std=std,
+                min=stats["min"] if stats["min"] != float("inf") else 0.0,
+                max=stats["max"] if stats["max"] != float("-inf") else 0.0,
+                delta_per_tok=delta_per_tok,
+            )
+        return readings
+
+    def _snapshot_vectors(self) -> dict[str, float]:
+        """Snapshot active vectors and their alphas."""
+        return {v["name"]: v["alpha"] for v in self._steering.get_active_vectors()
+                if v.get("enabled", True)}
+
+    # -- Generation: blocking --
+
+    def generate(self, input, **kwargs) -> GenerationResult:
+        """Blocking generation. Returns when complete."""
+        if not self._gen_lock.acquire(blocking=False):
+            raise RuntimeError("Generation already in progress")
+        try:
+            return self._generate_blocking(input)
+        finally:
+            self._gen_lock.release()
+
+    def _generate_blocking(self, input) -> GenerationResult:
+        messages, input_ids = self._prepare_input(input)
+        self._gen_state.reset()
+        if self._monitor:
+            self._monitor.reset_history()
+
+        vector_snapshot = self._snapshot_vectors()
+        start = time.monotonic()
+
+        generated_ids = generate_steered(
+            self._model, self._tokenizer, input_ids,
+            self.config, self._gen_state,
+        )
+
+        elapsed = time.monotonic() - start
+        token_count = len(generated_ids)
+        tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
+        text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+        readings = self._build_readings()
+
+        result = GenerationResult(
+            text=text, tokens=generated_ids, token_count=token_count,
+            tok_per_sec=tok_per_sec, elapsed=elapsed,
+            readings=readings, vectors=vector_snapshot,
+        )
+        self._last_result = result
+
+        # Append to history
+        if isinstance(input, str):
+            self._history.append({"role": "user", "content": input})
+        if text.strip():
+            self._history.append({"role": "assistant", "content": text})
+
+        return result
+
+    # -- Generation: streaming --
+
+    def generate_stream(self, input, **kwargs) -> Iterator[TokenEvent]:
+        """Streaming generation. Yields TokenEvent per token."""
+        if not self._gen_lock.acquire(blocking=False):
+            raise RuntimeError("Generation already in progress")
+        try:
+            yield from self._generate_streaming(input)
+        finally:
+            self._gen_lock.release()
+
+    def _generate_streaming(self, input) -> Iterator[TokenEvent]:
+        import queue as _queue
+
+        messages, input_ids = self._prepare_input(input)
+        self._gen_state.reset()
+        if self._monitor:
+            self._monitor.reset_history()
+
+        vector_snapshot = self._snapshot_vectors()
+        start = time.monotonic()
+        token_events: list[TokenEvent] = []
+        generated_ids: list[int] = []
+        token_queue = self._gen_state.token_queue
+        gen_done = threading.Event()
+        gen_error: list[Exception] = []
+
+        def _worker():
+            try:
+                ids = generate_steered(
+                    self._model, self._tokenizer, input_ids,
+                    self.config, self._gen_state,
+                    on_token=lambda tok: token_queue.put(tok),
+                )
+                generated_ids.extend(ids)
+            except Exception as e:
+                gen_error.append(e)
+            finally:
+                gen_done.set()
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+        idx = 0
+        while True:
+            try:
+                tok_str = token_queue.get(timeout=0.05)
+            except _queue.Empty:
+                if gen_done.is_set():
+                    # Drain remaining
+                    while True:
+                        try:
+                            tok_str = token_queue.get_nowait()
+                        except _queue.Empty:
+                            break
+                        if tok_str is None:
+                            break
+                        readings_snap = None
+                        if self._monitor and self._monitor.has_pending_data():
+                            self._monitor.flush_to_cpu()
+                            current, _ = self._monitor.get_current_and_previous()
+                            readings_snap = dict(current) if current else None
+                        event = TokenEvent(
+                            text=tok_str,
+                            token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
+                            index=idx, readings=readings_snap,
+                        )
+                        token_events.append(event)
+                        yield event
+                        idx += 1
+                    break
+                continue
+
+            if tok_str is None:
+                break
+
+            readings_snap = None
+            if self._monitor and self._monitor.has_pending_data():
+                self._monitor.flush_to_cpu()
+                current, _ = self._monitor.get_current_and_previous()
+                readings_snap = dict(current) if current else None
+
+            event = TokenEvent(
+                text=tok_str,
+                token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
+                index=idx, readings=readings_snap,
+            )
+            token_events.append(event)
+            yield event
+            idx += 1
+
+        thread.join()
+
+        if gen_error:
+            raise gen_error[0]
+
+        elapsed = time.monotonic() - start
+        token_count = len(token_events)
+        tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
+        text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+        readings = self._build_readings()
+
+        self._last_result = GenerationResult(
+            text=text, tokens=list(generated_ids), token_count=token_count,
+            tok_per_sec=tok_per_sec, elapsed=elapsed,
+            readings=readings, vectors=vector_snapshot,
+        )
+
+        # Append to history
+        if isinstance(input, str):
+            self._history.append({"role": "user", "content": input})
+        if text.strip():
+            self._history.append({"role": "assistant", "content": text})
+
     # -- Generation control --
 
     def stop(self) -> None:
