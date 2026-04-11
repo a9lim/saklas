@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import warnings
+
+warnings.filterwarnings("ignore", message=".*leaked semaphore.*")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
