@@ -46,8 +46,8 @@ class TraitMonitor:
         hidden = output[0] if isinstance(output, tuple) else output
         last_state = hidden[0, -1]  # (D,) — last token of batch dim 0
         if self._buf_idx < self._gpu_buffer.shape[0]:
-            normed_state = last_state / last_state.norm().clamp(min=1e-8)
-            self._gpu_buffer[self._buf_idx] = self._probe_matrix_normed @ normed_state
+            dots = self._probe_matrix_normed @ last_state
+            self._gpu_buffer[self._buf_idx] = dots / last_state.norm().clamp(min=1e-8)
             self._buf_idx += 1
         return None  # read-only hook
 
@@ -69,23 +69,30 @@ class TraitMonitor:
         maxs = cpu_data.max(dim=0).values   # (P,)
         firsts = cpu_data[0]                # (P,)
         lasts = cpu_data[-1]                # (P,)
+        sums_list = sums.tolist()
+        sum_sqs_list = sum_sqs.tolist()
+        mins_list = mins.tolist()
+        maxs_list = maxs.tolist()
+        firsts_list = firsts.tolist()
+        lasts_list = lasts.tolist()
+        tail_data = cpu_data[max(0, n_tokens - _MAX_HISTORY):]
         for i, name in enumerate(self.probe_names):
-            self.history[name].extend(cpu_data[:, i].tolist())
+            self.history[name] = deque(tail_data[:, i].tolist(), maxlen=_MAX_HISTORY)
             s = self._stats[name]
             if s["count"] == 0:
-                s["first"] = firsts[i].item()
+                s["first"] = firsts_list[i]
             s["count"] += n_tokens
-            s["sum"] += sums[i].item()
-            s["sum_sq"] += sum_sqs[i].item()
-            col_min, col_max = mins[i].item(), maxs[i].item()
+            s["sum"] += sums_list[i]
+            s["sum_sq"] += sum_sqs_list[i]
+            col_min, col_max = mins_list[i], maxs_list[i]
             if col_min < s["min"]:
                 s["min"] = col_min
             if col_max > s["max"]:
                 s["max"] = col_max
-            s["last"] = lasts[i].item()
+            s["last"] = lasts_list[i]
         self._buf_idx = 0
         if was_full:
-            self._gpu_buffer = torch.empty(
+            self._gpu_buffer = torch.zeros(
                 self._gpu_buffer.shape[0] * 2, self._gpu_buffer.shape[1],
                 device=self._gpu_buffer.device, dtype=self._gpu_buffer.dtype,
             )

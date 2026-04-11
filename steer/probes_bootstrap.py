@@ -63,13 +63,19 @@ def bootstrap_probes(
 
     from tqdm import tqdm
     datasets_dir = Path(__file__).parent / "datasets"
-    for name, cp in tqdm(to_extract, desc="Extracting probes", unit="probe"):
+
+    # Load all datasets first so file I/O doesn't interleave with GPU work
+    datasets_to_extract = []
+    for name, cp in to_extract:
         ds_path = datasets_dir / f"{name}.json"
         if not ds_path.exists():
             log.warning("Dataset %s.json not found for probe %s, skipping", name, name)
             continue
+        ds = load_contrastive_pairs(str(ds_path))
+        datasets_to_extract.append((name, cp, ds))
+
+    for name, cp, ds in tqdm(datasets_to_extract, desc="Extracting probes", unit="probe"):
         try:
-            ds = load_contrastive_pairs(str(ds_path))
             vec = extract_contrastive(model, tokenizer, ds["pairs"], probe_layer, layers=layers)
             probes[name] = vec
             save_vector(vec, cp, {

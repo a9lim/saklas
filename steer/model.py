@@ -235,7 +235,7 @@ def get_model_info(model, tokenizer) -> dict:
     layers = get_layers(model)
     first_param = next(model.parameters())
     model_id = getattr(model.config, "_name_or_path", "unknown")
-    param_count = sum(p.numel() for p in model.parameters())
+    param_count = model.num_parameters()
     return {
         "model_id": model_id,
         "model_type": model.config.model_type,

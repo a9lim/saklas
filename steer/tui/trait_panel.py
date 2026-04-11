@@ -28,6 +28,7 @@ class TraitPanel(Widget):
         self._nav_idx: int = 0
         self._cached_stats_lines: dict[str, tuple[dict, str]] = {}
         self._cached_sort: tuple[str, tuple, tuple, list] | None = None
+        self._cached_render_text: str = ""
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -60,6 +61,10 @@ class TraitPanel(Widget):
         sparklines: dict[str, str],
         stats: dict[str, dict] | None = None,
     ) -> None:
+        if (current == self._current_values
+                and previous == self._previous_values
+                and sparklines == self._sparklines):
+            return
         self._current_values = current
         self._previous_values = previous
         self._sparklines = sparklines
@@ -161,8 +166,10 @@ class TraitPanel(Widget):
                     self._cached_stats_lines[name] = (stats, stats_line)
                 lines.append(f"{line}\n  [dim]{stats_line}[/]")
 
-        content = self._trait_content
-        content.update("\n".join(lines))
+        text = "\n".join(lines)
+        if text != self._cached_render_text:
+            self._cached_render_text = text
+            self._trait_content.update(text)
 
     def _compute_stats_line(self, stats: dict) -> str:
         n = stats.get("count", 0)
