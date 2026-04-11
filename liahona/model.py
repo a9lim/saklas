@@ -5,7 +5,7 @@ import warnings
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 log = logging.getLogger(__name__)
 
@@ -20,9 +20,11 @@ _LAYER_ACCESSORS = {
     "llama": _MODEL_LAYERS,
     "llama4": _MODEL_LAYERS,
     "llama4_text": _MODEL_LAYERS,
-    # Mistral / Mixtral
+    # Mistral / Mixtral / Ministral
     "mistral": _MODEL_LAYERS,
     "mistral4": _MODEL_LAYERS,
+    "ministral": _MODEL_LAYERS,
+    "ministral3": _MODEL_LAYERS,
     "mixtral": _MODEL_LAYERS,
     # Gemma family
     "gemma": _MODEL_LAYERS,
@@ -86,6 +88,13 @@ _LAYER_ACCESSORS = {
 }
 
 _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
+
+# Models whose HF config uses a multimodal model_type but are actually
+# text-only causal LMs.  Maps the config's model_type to the correct
+# AutoModelForCausalLM model_type.
+_CAUSAL_TYPE_FIXES = {
+    "mistral3": "ministral3",  # Ministral tagged as multimodal Mistral3
+}
 
 
 def detect_device(requested: str = "auto") -> str:
@@ -165,26 +174,39 @@ def load_model(model_id: str, quantize=None, device="auto"):
     else:
         device_kwargs = {"device_map": {"": device}}
 
+    # --- check for model_type mismatches ---
+    # Some text-only models ship configs with a multimodal model_type
+    # that AutoModelForCausalLM doesn't recognise (e.g. Ministral models
+    # tagged as Mistral3).  Detect and correct before loading.
+    load_kwargs: dict = dict(
+        attn_implementation=attn_impl,
+        trust_remote_code=True,
+        **device_kwargs,
+        **quant_kwargs,
+    )
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    fixed_type = _CAUSAL_TYPE_FIXES.get(config.model_type)
+    if fixed_type:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        correct_cls = CONFIG_MAPPING.get(fixed_type)
+        if correct_cls is not None:
+            log.info("fixing model_type %r → %r for AutoModelForCausalLM",
+                     config.model_type, fixed_type)
+            config.__class__ = correct_cls
+            config.model_type = fixed_type
+            load_kwargs["config"] = config
+
     # --- load model ---
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            attn_implementation=attn_impl,
-            trust_remote_code=True,
-            **device_kwargs,
-            **quant_kwargs,
-        )
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     except Exception:
         # bf16/fp16 unsupported — fall back through dtypes
         if quantize is None:
             fallback = torch.float16 if device == "cuda" else torch.float32
             quant_kwargs["dtype"] = fallback
+            load_kwargs.update(quant_kwargs)
             model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                attn_implementation=attn_impl,
-                trust_remote_code=True,
-                **device_kwargs,
-                **quant_kwargs,
+                model_id, **load_kwargs,
             )
         else:
             raise
