@@ -68,28 +68,38 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
     return table
 
 
-_think_end_cache: tuple[tuple[str, int], int | None] | None = None
+_think_delim_cache: dict[tuple[str, int], tuple[int | None, int | None, bool]] = {}
 
 
-def _detect_think_end_id(tokenizer) -> int | None:
-    """Detect the end-of-thinking token ID from the chat template.
+def _detect_think_delimiters(
+    tokenizer,
+) -> tuple[int | None, int | None, bool]:
+    """Detect thinking start/end delimiter tokens from the chat template.
 
-    Renders a round-trip assistant message through the template to discover
-    what delimiter separates thinking content from response content, then
-    looks up its token ID in the tokenizer's special tokens.
+    Returns ``(start_id, end_id, starts_in_thinking)`` where:
 
-    Works across model families (Qwen ``</think>``, Gemma ``<channel|>``,
-    etc.) without hardcoding specific delimiter strings.
+    * **start_id** — token that opens a thinking section, or ``None`` if
+      the generation prompt itself puts us in thinking mode (e.g. Qwen
+      appends ``<think>`` to the prompt).
+    * **end_id** — token that closes a thinking section.
+    * **starts_in_thinking** — ``True`` when the first generated token is
+      already thinking content (Qwen-style).  ``False`` when the model
+      must explicitly open a thinking channel (Gemma-style).
+
+    Detection works by rendering a round-trip assistant message through
+    the tokenizer's own chat template and inspecting the delimiters that
+    bracket the known thinking content.
     """
-    global _think_end_cache
     tok_key = (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
-    if _think_end_cache is not None and _think_end_cache[0] == tok_key:
-        return _think_end_cache[1]
+    cached = _think_delim_cache.get(tok_key)
+    if cached is not None:
+        return cached
 
+    _none_result: tuple[int | None, int | None, bool] = (None, None, False)
     template = getattr(tokenizer, "chat_template", None) or ""
     if "enable_thinking" not in template:
-        _think_end_cache = (tok_key, None)
-        return None
+        _think_delim_cache[tok_key] = _none_result
+        return _none_result
 
     think_marker = "XTHINKCONTENTX"
     response_marker = "XRESPONSECONTENTX"
@@ -127,23 +137,53 @@ def _detect_think_end_id(tokenizer) -> int | None:
         if ti < 0 or ri <= ti:
             continue
 
+        # --- end delimiter: first special token between the two markers ---
         between = rendered[ti + len(think_marker):ri]
-        # Find the first special token by position in the delimiter region.
-        # Delimiters may be adjacent to other special tokens (e.g.
-        # "<channel|><|tool_call>...") so whitespace splitting won't work.
-        best_pos, best_tok, best_id = len(between), None, None
+        end_pos, end_tok, end_id = len(between), None, None
         for tok_str, tok_id in added.items():
             pos = between.find(tok_str)
-            if 0 <= pos < best_pos:
-                best_pos, best_tok, best_id = pos, tok_str, tok_id
-        if best_id is not None:
-            log.debug("detected think-end token %r (id=%d)", best_tok, best_id)
-            _think_end_cache = (tok_key, best_id)
-            return best_id
+            if 0 <= pos < end_pos:
+                end_pos, end_tok, end_id = pos, tok_str, tok_id
+        if end_id is None:
+            continue
 
-    log.warning("thinking supported but could not detect end-of-thinking token")
-    _think_end_cache = (tok_key, None)
-    return None
+        # --- start delimiter: closest special token before think_marker ---
+        start_pos, start_tok, start_id = -1, None, None
+        for tok_str, tok_id in added.items():
+            pos = rendered.rfind(tok_str, 0, ti)
+            if pos > start_pos:
+                start_pos, start_tok, start_id = pos, tok_str, tok_id
+
+        # If the start token already appears in the generation prompt the
+        # model starts in thinking mode from the first generated token
+        # (Qwen-style).  Otherwise the model must emit the start token
+        # explicitly (Gemma-style) and may skip thinking entirely.
+        starts_in_thinking = False
+        if start_id is not None and start_tok is not None:
+            try:
+                gen_prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": "hi"}],
+                    add_generation_prompt=True, tokenize=False,
+                    enable_thinking=True,
+                )
+                if start_tok in gen_prompt:
+                    starts_in_thinking = True
+                    start_id = None  # nothing to detect at runtime
+            except Exception:
+                pass
+
+        result = (start_id, end_id, starts_in_thinking)
+        log.debug(
+            "thinking delimiters: start=%r end=%r starts_in_thinking=%s",
+            start_tok if start_id is not None else "(prompt)",
+            end_tok, starts_in_thinking,
+        )
+        _think_delim_cache[tok_key] = result
+        return result
+
+    log.warning("thinking supported but could not detect delimiters")
+    _think_delim_cache[tok_key] = _none_result
+    return _none_result
 
 
 def supports_thinking(tokenizer) -> bool:
@@ -243,8 +283,15 @@ def generate_steered(
     prefill = True
 
     # Thinking state tracking
-    think_end_id = _detect_think_end_id(tokenizer) if thinking else None
-    in_thinking = thinking and think_end_id is not None
+    if thinking:
+        think_start_id, think_end_id, starts_in_thinking = (
+            _detect_think_delimiters(tokenizer)
+        )
+    else:
+        think_start_id = think_end_id = None
+        starts_in_thinking = False
+    in_thinking = starts_in_thinking and think_end_id is not None
+    in_preamble = False  # suppressing start-of-thinking tokens (e.g. "thought\n")
 
     # Buffer for multi-token characters (emoji, rare Unicode).
     # Tokens whose table entry is None represent partial UTF-8 byte sequences;
@@ -297,7 +344,36 @@ def generate_steered(
                 if token_id in eos_ids:
                     break
 
-                # Handle </think> delimiter
+                # Handle thinking start delimiter (Gemma-style: model
+                # explicitly opens a thinking channel)
+                if (think_start_id is not None
+                        and token_id == think_start_id
+                        and not in_thinking and not in_preamble):
+                    in_preamble = True
+                    generated_ids.append(token_id)
+                    current_input = next_token
+                    seq_len += 1
+                    continue  # suppress start delimiter
+
+                # Suppress preamble tokens between the start delimiter and
+                # the first newline (e.g. Gemma's "thought\n" channel label)
+                if in_preamble:
+                    generated_ids.append(token_id)
+                    current_input = next_token
+                    seq_len += 1
+                    if token_id == think_end_id:
+                        # Empty thinking section — end delimiter hit
+                        # during preamble
+                        in_preamble = False
+                        state.thinking_end_idx = len(generated_ids)
+                    else:
+                        tok_text = tokenizer.decode([token_id])
+                        if '\n' in tok_text:
+                            in_preamble = False
+                            in_thinking = True
+                    continue  # suppress preamble
+
+                # Handle end-of-thinking delimiter
                 if in_thinking and token_id == think_end_id:
                     in_thinking = False
                     state.thinking_end_idx = len(generated_ids)
