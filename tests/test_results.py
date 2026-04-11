@@ -6,6 +6,18 @@ from pathlib import Path
 from steer.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
 
 
+class TestPublicAPI:
+    def test_imports(self):
+        from steer import SteerSession, DataSource, ResultCollector
+        from steer import GenerationResult, TokenEvent, ProbeReadings
+        assert SteerSession is not None
+        assert DataSource is not None
+        assert ResultCollector is not None
+        assert GenerationResult is not None
+        assert TokenEvent is not None
+        assert ProbeReadings is not None
+
+
 class TestProbeReadings:
     def test_from_per_token_data(self):
         readings = ProbeReadings(
