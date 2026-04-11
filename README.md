@@ -388,9 +388,9 @@ pip install -e ".[bnb]"
 
 ## Supported architectures
 
-39 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one lambda entry.
+45 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one lambda entry.
 
-Llama (1-4), Mistral, Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3), Qwen2-MoE, Qwen3-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-2), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, Bloom, Falcon, MPT, DBRX, OPT, RecurrentGemma.
+Llama (1-4), Mistral (1, 4), Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3.5), Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-3), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, RecurrentGemma.
 
 ## How it works
 
