@@ -9,7 +9,7 @@ description = "Local activation steering + trait monitoring TUI for HuggingFace 
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.2",
-    "transformers>=4.40",
+    "transformers>=4.51",
     "accelerate>=0.27",
     "safetensors>=0.4",
     "textual>=0.50",
