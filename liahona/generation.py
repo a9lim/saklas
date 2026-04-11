@@ -71,16 +71,79 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
 _think_end_cache: tuple[tuple[str, int], int | None] | None = None
 
 
-def _get_think_end_id(tokenizer) -> int | None:
-    """Return the token ID for </think>, or None if not found."""
+def _detect_think_end_id(tokenizer) -> int | None:
+    """Detect the end-of-thinking token ID from the chat template.
+
+    Renders a round-trip assistant message through the template to discover
+    what delimiter separates thinking content from response content, then
+    looks up its token ID in the tokenizer's special tokens.
+
+    Works across model families (Qwen ``</think>``, Gemma ``<channel|>``,
+    etc.) without hardcoding specific delimiter strings.
+    """
     global _think_end_cache
     tok_key = (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
     if _think_end_cache is not None and _think_end_cache[0] == tok_key:
         return _think_end_cache[1]
+
+    template = getattr(tokenizer, "chat_template", None) or ""
+    if "enable_thinking" not in template:
+        _think_end_cache = (tok_key, None)
+        return None
+
+    think_marker = "XTHINKCONTENTX"
+    response_marker = "XRESPONSECONTENTX"
+    _dummy_tc = [{"function": {"name": "x", "arguments": {}}}]
+
+    # Different model families represent thinking differently in assistant
+    # messages.  Gemma requires reasoning/reasoning_content + tool_calls,
+    # Qwen embeds <think>...</think> in content.  Try each schema until
+    # one produces both markers in the rendered output.
+    attempts = [
+        {"role": "assistant", "reasoning_content": think_marker, "content": response_marker,
+         "tool_calls": _dummy_tc},
+        {"role": "assistant", "reasoning": think_marker, "content": response_marker,
+         "tool_calls": _dummy_tc},
+        {"role": "assistant", "thought": think_marker, "content": response_marker,
+         "tool_calls": _dummy_tc},
+        {"role": "assistant", "thought": think_marker, "content": response_marker},
+        {"role": "assistant", "reasoning_content": think_marker, "content": response_marker},
+        {"role": "assistant", "content": f"<think>\n{think_marker}\n</think>\n{response_marker}"},
+    ]
+
     added = getattr(tokenizer, "added_tokens_encoder", {})
-    think_id = added.get("</think>")
-    _think_end_cache = (tok_key, think_id)
-    return think_id
+
+    for asst_msg in attempts:
+        try:
+            rendered = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "hi"}, asst_msg],
+                tokenize=False, enable_thinking=True,
+            )
+        except Exception:
+            continue
+
+        ti = rendered.find(think_marker)
+        ri = rendered.find(response_marker)
+        if ti < 0 or ri <= ti:
+            continue
+
+        between = rendered[ti + len(think_marker):ri]
+        # Find the first special token by position in the delimiter region.
+        # Delimiters may be adjacent to other special tokens (e.g.
+        # "<channel|><|tool_call>...") so whitespace splitting won't work.
+        best_pos, best_tok, best_id = len(between), None, None
+        for tok_str, tok_id in added.items():
+            pos = between.find(tok_str)
+            if 0 <= pos < best_pos:
+                best_pos, best_tok, best_id = pos, tok_str, tok_id
+        if best_id is not None:
+            log.debug("detected think-end token %r (id=%d)", best_tok, best_id)
+            _think_end_cache = (tok_key, best_id)
+            return best_id
+
+    log.warning("thinking supported but could not detect end-of-thinking token")
+    _think_end_cache = (tok_key, None)
+    return None
 
 
 def supports_thinking(tokenizer) -> bool:
@@ -180,7 +243,7 @@ def generate_steered(
     prefill = True
 
     # Thinking state tracking
-    think_end_id = _get_think_end_id(tokenizer) if thinking else None
+    think_end_id = _detect_think_end_id(tokenizer) if thinking else None
     in_thinking = thinking and think_end_id is not None
 
     # Buffer for multi-token characters (emoji, rare Unicode).
