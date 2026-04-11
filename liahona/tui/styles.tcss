@@ -140,7 +140,11 @@ Widget {
 }
 
 .user-message,
-.assistant-message,
+.assistant-message {
+    margin-bottom: 0;
+    height: auto;
+}
+
 .system-message {
     margin-bottom: 1;
     height: auto;
@@ -155,7 +159,7 @@ Widget {
 
 .assistant-message MarkdownParagraph,
 .user-message MarkdownParagraph {
-    margin: 0;
+    margin: 0 0 1 0;
 }
 
 .assistant-message MarkdownHorizontalRule,
