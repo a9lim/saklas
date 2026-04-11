@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import re
+
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static, Input, Markdown
 from textual.widget import Widget
 from textual.message import Message
+
+_EXTRA_NEWLINES = re.compile(r"\n{3,}")
+
+
+def _preserve_blank_lines(text: str) -> str:
+    """Replace runs of 3+ newlines with thematic breaks so Markdown doesn't collapse them."""
+    return _EXTRA_NEWLINES.sub("\n\n---\n\n", text)
 
 
 class _AssistantMessage(Vertical):
@@ -39,7 +48,7 @@ class _AssistantMessage(Vertical):
     def finalize(self) -> None:
         """Switch from streaming Static to rendered Markdown."""
         if self._md is not None and self.chat_text:
-            self._md.update(self.chat_text)
+            self._md.update(_preserve_blank_lines(self.chat_text))
             self._md.remove_class("hidden")
         if self._stream is not None:
             self._stream.add_class("hidden")
@@ -91,7 +100,7 @@ class ChatPanel(Widget):
     def add_user_message(self, text: str) -> None:
         container = Vertical(
             Static("[bold ansi_cyan]User:[/]"),
-            Markdown(text),
+            Markdown(_preserve_blank_lines(text)),
             classes="user-message",
         )
         self._log.mount(container)
