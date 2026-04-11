@@ -332,77 +332,35 @@ Probes are extracted on first run and cached per model under `liahona/probes/cac
 ## Install
 
 ```bash
-pip install liahona-ai             # from PyPI
+pip install liahona-ai             # base
 pip install liahona-ai[serve]      # + fastapi + uvicorn (for API server)
 pip install liahona-ai[research]   # + datasets + pandas (for API)
 ```
+
+Requires Python 3.11+, PyTorch 2.2+. Works on Linux, macOS, and Windows.
 
 ### From source
 
 ```bash
 pip install -e .                   # base install
 pip install -e ".[dev]"            # + pytest
-pip install -e ".[serve]"          # + fastapi + uvicorn (for API server)
-pip install torch psutil setuptools wheel && pip install -e ".[cuda]" --no-build-isolation  # Linux/WSL only
-pip install -e ".[research]"       # + datasets + pandas (for API)
-pip install -e ".[bnb]"            # + bitsandbytes only
+pip install -e ".[serve]"          # + fastapi + uvicorn
+pip install -e ".[research]"       # + datasets + pandas
 ```
 
-Requires Python 3.11+, PyTorch 2.2+. CUDA recommended; MPS and CPU work without quantization.
+### Quantization and flash-attn (experimental)
 
-### Windows (WSL2 recommended)
-
-`flash-attn` does not build on native Windows, and `bitsandbytes` has limited Windows support. For full CUDA functionality, use WSL2 — it gives you a Linux environment with direct GPU access.
-
-**One-time setup** (from PowerShell as Administrator):
-
-```powershell
-wsl --install
-```
-
-Restart when prompted. This installs Ubuntu by default. On first launch, WSL will ask you to create a username and password.
-
-Verify GPU access with `nvidia-smi`. If it shows your GPU, you're set.
-
-**Clone and install liahona**:
+The `cuda` and `bnb` extras install `bitsandbytes` and/or `flash-attn` for 4-bit/8-bit quantization and fused attention. These depend on platform-specific CUDA toolchains and may not build cleanly on all systems. Support is only guaranteed for the vanilla (unquantized) install.
 
 ```bash
-sudo apt install -y python3-venv git
-git clone <repo-url> ~/liahona && cd ~/liahona
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install torch psutil setuptools wheel
-
-# flash-attn needs CUDA_HOME to find nvcc. PyTorch installs CUDA under
-# /usr/local — find your version with: ls /usr/local/ | grep cuda
-export CUDA_HOME=/usr/local/cuda-13
-pip install -e ".[cuda]" --no-build-isolation
-
-# Log in to HuggingFace to avoid download throttling and access gated models
-huggingface-cli login
+pip install liahona-ai[bnb]       # bitsandbytes only
+pip install liahona-ai[cuda]      # bitsandbytes + flash-attn (Linux only, needs CUDA_HOME)
 ```
 
-**Returning to an existing install**:
+From source, `flash-attn` requires build isolation disabled:
 
 ```bash
-wsl                                # enter WSL from any Windows terminal
-cd ~/liahona
-source .venv/bin/activate
-liahona google/gemma-2-2b-it      # ready to go
-```
-
-**Native Windows (no WSL)** — if you don't need quantization or flash-attn, liahona works with full-precision models out of the box:
-
-```bash
-pip install -e .
-```
-
-For quantization only (no flash-attn), `bitsandbytes` has experimental Windows support:
-
-```bash
-pip install -e ".[bnb]"
+pip install torch psutil setuptools wheel && pip install -e ".[cuda]" --no-build-isolation
 ```
 
 ## Supported architectures
