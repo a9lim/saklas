@@ -64,6 +64,7 @@ class LiahonaApp(App):
         self._last_prompt: str | None = None
         self._ab_in_progress: bool = False
         self._pending_action: tuple | None = None  # ("regenerate",) or ("submit", text)
+        self._gen_active: bool = False  # main-thread-only generation guard
 
         self._focused_panel_idx: int = 1  # Start with chat focused
 
@@ -222,7 +223,7 @@ class LiahonaApp(App):
             self._handle_command(text)
             return
         self._last_prompt = text
-        if self._session._gen_state.is_generating.is_set():
+        if self._gen_active:
             # Queue the message — it will be submitted once the current
             # generation finishes (see _poll_generation).
             self._pending_action = ("submit", text)
@@ -253,7 +254,7 @@ class LiahonaApp(App):
                 return
             self._handle_probe(parts[1])
         elif cmd == "/clear":
-            if self._session._gen_state.is_generating.is_set():
+            if self._gen_active:
                 self._pending_action = ("clear",)
                 self._session._gen_state.request_stop()
                 return
@@ -262,7 +263,7 @@ class LiahonaApp(App):
             self._trait_panel.update_values({}, {}, {})
             chat.add_system_message("Chat history cleared.")
         elif cmd == "/rewind":
-            if self._session._gen_state.is_generating.is_set():
+            if self._gen_active:
                 self._pending_action = ("rewind",)
                 self._session._gen_state.request_stop()
                 return
@@ -360,7 +361,7 @@ class LiahonaApp(App):
         if self._ab_in_progress:
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
             return
-        if self._session._gen_state.is_generating.is_set():
+        if self._gen_active:
             self._pending_action = ("steer", text)
             self._session._gen_state.request_stop()
             return
@@ -393,7 +394,7 @@ class LiahonaApp(App):
 
     def _handle_probe(self, text: str) -> None:
         chat = self._chat_panel
-        if self._session._gen_state.is_generating.is_set():
+        if self._gen_active:
             self._pending_action = ("probe", text)
             self._session._gen_state.request_stop()
             return
@@ -453,18 +454,12 @@ class LiahonaApp(App):
     # -- Generation --
 
     def action_stop_generation(self) -> None:
-        if self._session._gen_state.is_generating.is_set():
+        if self._gen_active:
             self._session._gen_state.request_stop()
 
     def _start_generation(self) -> None:
+        self._gen_active = True
         self._session._gen_state.reset()
-        # Mark generating *synchronously* before spawning the worker so that
-        # rapid Ctrl+R presses always see is_generating as set.  Without this,
-        # there is a window between reset() (clears the flag) and the worker
-        # thread's generate_steered() (sets it) where a second Ctrl+R would
-        # think nothing is running and launch a concurrent worker — two threads
-        # doing model forward passes simultaneously causes a segfault.
-        self._session._gen_state.is_generating.set()
         if self._session._monitor:
             self._session._monitor.reset_history()
 
@@ -528,7 +523,7 @@ class LiahonaApp(App):
     def _poll_generation(self) -> None:
         chat = self._chat_panel
         tokens_consumed = 0
-        generating = self._session._gen_state.is_generating.is_set()
+        generating = self._gen_active
 
         while tokens_consumed < 20:
             try:
@@ -539,6 +534,7 @@ class LiahonaApp(App):
                 if self._current_assistant_widget:
                     self._current_assistant_widget.finalize()
                 self._current_assistant_widget = None
+                self._gen_active = False
                 generating = False
                 if self._gen_start_time > 0:
                     self._last_elapsed = time.monotonic() - self._gen_start_time
@@ -703,7 +699,7 @@ class LiahonaApp(App):
     def action_regenerate(self) -> None:
         if not self._messages:
             return
-        if self._session._gen_state.is_generating.is_set():
+        if self._gen_active:
             # Stop the current generation; _poll_generation will pick up
             # the pending action once the worker thread finishes.
             self._pending_action = ("regenerate",)
@@ -715,7 +711,7 @@ class LiahonaApp(App):
 
     def action_ab_compare(self) -> None:
         chat = self._chat_panel
-        if self._session._gen_state.is_generating.is_set():
+        if self._gen_active:
             chat.add_system_message("Cannot A/B compare while generating. Stop generation first.")
             return
         if not self._last_prompt:
