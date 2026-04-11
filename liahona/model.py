@@ -78,8 +78,9 @@ _LAYER_ACCESSORS = {
     "bloom": _TRANSFORMER_H,
     "falcon": _TRANSFORMER_H,
     "falcon_h1": _MODEL_LAYERS,
-    # GPT-NeoX / Pythia
+    # GPT-NeoX / Pythia / GPT-OSS
     "gpt_neox": lambda m: m.gpt_neox.layers,
+    "gpt_oss": _MODEL_LAYERS,
     # MPT / DBRX
     "mpt": lambda m: m.transformer.blocks,
     "dbrx": lambda m: m.transformer.blocks,
@@ -199,6 +200,14 @@ def load_model(model_id: str, quantize=None, device="auto"):
     # --- load model ---
     try:
         model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    except ValueError as e:
+        if "does not support an attention implementation" in str(e):
+            log.info("attn_implementation %r unsupported, falling back to eager",
+                     load_kwargs.get("attn_implementation"))
+            load_kwargs["attn_implementation"] = "eager"
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        else:
+            raise
     except Exception:
         # bf16/fp16 unsupported — fall back through dtypes
         if quantize is None:
