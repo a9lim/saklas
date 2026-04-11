@@ -3,8 +3,8 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "liahona"
-version = "0.1.0"
+name = "liahona-ai"
+version = "1.0.0"
 description = "Local activation steering + trait monitoring TUI for HuggingFace transformers"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -12,11 +12,7 @@ authors = [{name = "a9lim", email = "mx@a9l.im"}]
 requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
 ]
-
-[project.urls]
-Homepage = "https://github.com/a9lim/liahona"
 dependencies = [
     "torch>=2.2",
     "transformers>=4.51",
@@ -24,6 +20,9 @@ dependencies = [
     "safetensors>=0.4",
     "textual>=0.50",
 ]
+
+[project.urls]
+Homepage = "https://github.com/a9lim/liahona"
 
 [project.optional-dependencies]
 bnb = ["bitsandbytes>=0.43"]
@@ -40,3 +39,6 @@ liahona = "liahona.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["liahona*"]
+
+[tool.setuptools.package-data]
+liahona = ["probes/defaults.json"]
