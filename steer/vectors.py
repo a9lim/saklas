@@ -184,14 +184,12 @@ def extract_contrastive(
     computes the first principal component of pos-neg differences and
     scores it by explained variance ratio (sigma_1 / sum(sigma)).
 
-    Layers where score < 0.1 * max_score are dropped.
-
     Args:
         pairs: List of {"positive": str, "negative": str} prompt pairs.
 
     Returns:
         Profile dict mapping layer_idx -> (direction_vector, score)
-        for layers above the signal threshold.
+        for all layers.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -261,15 +259,6 @@ def extract_contrastive(
                 scores[idx] /= max_raw
                 vec, _ = profile[idx]
                 profile[idx] = (vec, scores[idx])
-
-    # Adaptive threshold: mean score adapts to the distribution shape.
-    # Peaked (one dominant layer): mean is low, keeps just the peak.
-    # Flat (signal spread evenly): mean ≈ each score, keeps ~half.
-    # The fixed 0.1 * max approach over-prunes flat distributions and
-    # under-prunes peaked ones.
-    if scores:
-        threshold = sum(scores.values()) / len(scores)
-        profile = {idx: v for idx, v in profile.items() if v[1] >= threshold}
 
     return profile
 
