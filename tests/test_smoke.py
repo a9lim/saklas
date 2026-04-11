@@ -49,6 +49,13 @@ def _extract_profile(model, tokenizer, concept, layers):
 
 
 @pytest.fixture(scope="module")
+def layer_means(model_and_tokenizer, layers):
+    from steer.vectors import compute_layer_means
+    model, tokenizer = model_and_tokenizer
+    return compute_layer_means(model, tokenizer, layers)
+
+
+@pytest.fixture(scope="module")
 def happy_profile(model_and_tokenizer, layers):
     model, tokenizer = model_and_tokenizer
     return _extract_profile(model, tokenizer, "happy", layers)
@@ -163,7 +170,7 @@ class TestSaveLoad:
 
 
 class TestTraitMonitor:
-    def test_monitor_records_history(self, model_and_tokenizer, layers, happy_profile):
+    def test_monitor_records_history(self, model_and_tokenizer, layers, happy_profile, layer_means):
         from steer.hooks import SteeringManager
         from steer.monitor import TraitMonitor
         from steer.generation import GenerationConfig, GenerationState, generate_steered
@@ -175,8 +182,7 @@ class TestTraitMonitor:
         sad_profile = _extract_profile(model, tokenizer, "sad", layers)
 
         probe_profiles = {"happy": happy_profile, "sad": sad_profile}
-        monitor = TraitMonitor(probe_profiles)
-        monitor.attach(layers, device, dtype)
+        monitor = TraitMonitor(probe_profiles, layer_means)
 
         # Steer toward happy
         mgr = SteeringManager()
@@ -189,32 +195,29 @@ class TestTraitMonitor:
         ).to(device)
         config = GenerationConfig(max_new_tokens=20, temperature=0.7)
         state = GenerationState()
-        generate_steered(model, tokenizer, input_ids, config, state)
-
-        monitor.flush_to_cpu()
+        generated_ids = generate_steered(model, tokenizer, input_ids, config, state)
         mgr.clear_all()
 
-        # Should have one entry per generated token
+        # Measure on generated text
+        text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        monitor.measure(model, tokenizer, layers, text, device=device)
+
+        # Should have one entry per generation
         happy_hist = monitor.history["happy"]
         sad_hist = monitor.history["sad"]
-        assert len(happy_hist) > 0, "Monitor should record at least one entry"
-        assert len(happy_hist) == len(sad_hist), "All probes should have same history length"
+        assert len(happy_hist) == 1, "Monitor should record one entry per generation"
+        assert len(sad_hist) == 1
 
-        # With happy steering, mean happy sim should exceed mean sad sim
-        mean_happy = sum(happy_hist) / len(happy_hist)
-        mean_sad = sum(sad_hist) / len(sad_hist)
-        assert mean_happy > mean_sad, (
-            f"Expected happy ({mean_happy:.3f}) > sad ({mean_sad:.3f}) with happy steering"
+        # With happy steering, happy sim should exceed sad sim
+        assert happy_hist[0] > sad_hist[0], (
+            f"Expected happy ({happy_hist[0]:.3f}) > sad ({sad_hist[0]:.3f}) with happy steering"
         )
 
         # Sparkline should be non-empty
-        monitor.flush_to_cpu()
         sparkline = monitor.get_sparkline("happy")
         assert len(sparkline) > 0
 
-        monitor.detach()
-
-    def test_throughput_regression(self, model_and_tokenizer, layers, happy_profile):
+    def test_throughput_regression(self, model_and_tokenizer, layers, happy_profile, layer_means):
         """Steered generation should be at least 85% of vanilla throughput."""
         from steer.hooks import SteeringManager
         from steer.monitor import TraitMonitor
@@ -247,22 +250,12 @@ class TestTraitMonitor:
         mgr.add_vector("concise", concise_profile, 0.3)
         mgr.apply_to_model(layers, device, dtype)
 
-        # 15 probes (use same profiles repeated for simplicity)
-        probe_profiles = {}
-        source_profiles = [happy_profile, curious_profile, concise_profile]
-        for i, name in enumerate(["p0", "p1", "p2", "p3", "p4", "p5", "p6",
-                                    "p7", "p8", "p9", "p10", "p11", "p12", "p13", "p14"]):
-            probe_profiles[name] = source_profiles[i % 3]
-        monitor = TraitMonitor(probe_profiles)
-        monitor.attach(layers, device, dtype)
-
         state1 = GenerationState()
         t1 = time.perf_counter()
         ids1 = generate_steered(model, tokenizer, input_ids.clone(), config, state1)
         steered_time = time.perf_counter() - t1
         steered_tps = len(ids1) / steered_time
 
-        monitor.detach()
         mgr.clear_all()
 
         ratio = steered_tps / vanilla_tps

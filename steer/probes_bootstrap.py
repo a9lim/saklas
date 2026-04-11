@@ -13,6 +13,48 @@ log = logging.getLogger(__name__)
 DEFAULTS_PATH = Path(__file__).parent / "probes" / "defaults.json"
 
 
+_LAYER_MEANS_TAG = "_LAYERMEANS"
+
+
+def bootstrap_layer_means(
+    model,
+    tokenizer,
+    layers,
+    model_info: dict,
+    cache_dir: str,
+) -> dict[int, torch.Tensor]:
+    """Load or compute per-layer mean activations for probe centering.
+
+    Cached as a profile under the reserved name ``_LAYERMEANS``.
+    """
+    from steer.vectors import compute_layer_means, get_cache_path, save_profile, load_profile
+
+    model_id = model_info.get("model_id", "unknown")
+    cp = get_cache_path(cache_dir, model_id, _LAYER_MEANS_TAG)
+
+    if Path(cp).exists():
+        try:
+            profile, _meta = load_profile(cp)
+            # Profile format is {idx: (tensor, score)} — extract just tensors
+            log.debug("Loaded cached layer means")
+            return {idx: vec for idx, (vec, _score) in profile.items()}
+        except Exception as e:
+            log.warning("Corrupt layer means cache, recomputing: %s", e)
+
+    log.info("Computing layer means (one-time per model)...")
+    means = compute_layer_means(model, tokenizer, layers)
+
+    # Pack into profile format for save_profile (score=1.0, unused)
+    profile = {idx: (vec, 1.0) for idx, vec in means.items()}
+    save_profile(profile, cp, {
+        "type": "layer_means",
+        "model_id": model_id,
+        "num_prompts": 30,
+    })
+
+    return means
+
+
 def bootstrap_probes(
     model,
     tokenizer,

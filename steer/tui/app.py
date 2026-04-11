@@ -484,6 +484,12 @@ class SteerApp(App):
                 full_text = self._session._tokenizer.decode(generated, skip_special_tokens=True)
                 if full_text.strip():
                     self._messages.append({"role": "assistant", "content": full_text})
+                    if self._session._monitor and self._session._monitor.probe_names:
+                        self._session._monitor.measure(
+                            self._session._model, self._session._tokenizer,
+                            self._session._layers, full_text,
+                            device=self._session._device,
+                        )
             finally:
                 if alphas:
                     self._session._clear_steering()
@@ -550,7 +556,7 @@ class SteerApp(App):
             )
 
         if self._session._monitor and self._session._monitor.has_pending_data():
-            self._session._monitor.flush_to_cpu()
+            self._session._monitor.consume_pending()
             current, previous = self._session._monitor.get_current_and_previous()
             sparklines = {name: self._session._monitor.get_sparkline(name)
                           for name in self._session._monitor.probe_names}

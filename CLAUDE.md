@@ -22,12 +22,12 @@ Four layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 
 ### Model + Vector layer
 - `model.py` — Loads HF causal LMs. `_LAYER_ACCESSORS` maps `model_type` to layer-list accessor lambdas; add new architectures here.
-- `vectors.py` — Per-prompt forward passes (no batching). `_capture_all_hidden_states` hooks every layer in one pass. `_encode_and_capture_all` handles tokenization, chat-template wrapping, attention-weighted pooling. `extract_contrastive`: 2N passes for N pairs, per-layer SVD extracts first principal component, scored by explained variance ratio. Returns a **profile**: `dict[int, (Tensor, score)]` mapping every layer to direction + signal strength. Profiles saved as `.safetensors` + `.json` sidecar.
-- `probes_bootstrap.py` — Loads/extracts probe profiles per `steer/probes/defaults.json`. 28 probes across 5 categories (emotion, personality, safety, cultural, gender).
+- `vectors.py` — Per-prompt forward passes (no batching). `_capture_all_hidden_states` hooks every layer in one pass. `_encode_and_capture_all` handles tokenization, chat-template wrapping, attention-weighted pooling. `extract_contrastive`: 2N passes for N pairs, per-layer SVD extracts first principal component, scored by explained variance ratio. Returns a **profile**: `dict[int, (Tensor, score)]` mapping every layer to direction + signal strength. Profiles saved as `.safetensors` + `.json` sidecar. `compute_layer_means`: 30 neutral prompts → per-layer mean hidden state for centering.
+- `probes_bootstrap.py` — Loads/extracts probe profiles per `steer/probes/defaults.json`. 28 probes across 5 categories (emotion, personality, safety, cultural, gender). `bootstrap_layer_means`: loads or computes per-layer mean activations, cached as `_LAYERMEANS.safetensors` per model.
 
 ### Steering + Monitoring layer
 - `hooks.py` — `SteeringHook` adds pre-composed vector to hidden states in-place. `SteeringManager` groups vectors by layer, orthogonalizes per layer (Gram-Schmidt), one hook per active layer.
-- `monitor.py` — `TraitMonitor` monitors all layers per probe profile, weighted by score. One hook per distinct layer, shared GPU accumulator `(max_tokens, num_probes)`. `flush_to_cpu()` produces weighted averages.
+- `monitor.py` — `TraitMonitor` runs a single post-generation forward pass over the generated text using attention-weighted pooling. Mean-centers hidden states (subtracting per-layer means computed from neutral prompts) before computing score-weighted cosine similarities against probe vectors. One value per probe per generation. No hooks on the model during generation.
 
 ### Session API layer
 - `session.py` — `SteerSession` is the programmatic API and the TUI's backend. Owns model, vector registry (`_profiles`), monitor, generation config, conversation history. Key design: **vectors are registered without alphas** via `steer(name, profile)`, alphas are supplied per-generation via `generate(input, alphas={"name": 1.5})`. No persistent steering hooks between generations. Orthogonalize is a per-call parameter. Full extraction pipeline: cache -> curated dataset -> statement cache -> model-generated pairs -> contrastive PCA -> save.
@@ -53,7 +53,7 @@ These matter for the throughput regression test (steered >= 85% of vanilla tok/s
 - **`torch.topk`** for top-p, not full-vocab sort. `k` capped at `min(1024, vocab)`.
 - **Norm computations use `.float()`** — fp16 sum-of-squares overflows for hidden_dim >= 2048.
 - **Vectors scaled to 10% of mean hidden-state norm** at each extraction layer.
-- **Monitor hooks**: One hook per distinct layer, shared GPU accumulator, score-weighted cosine similarities. `flush_to_cpu()` batch-transfers. TUI polls gated on `has_pending_data()`.
+- **Monitor is post-generation**: single forward pass after generation, no hooks during generation. Mean-centered cosine similarities remove baseline bias.
 - **Steering hooks are transient**: composed before generation, removed after. No persistent hooks between generations.
 
 ## Supported architectures

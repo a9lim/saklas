@@ -15,7 +15,7 @@ from steer.generation import GenerationConfig, GenerationState, build_chat_input
 from steer.hooks import SteeringManager
 from steer.model import load_model, get_layers, get_model_info
 from steer.monitor import TraitMonitor
-from steer.probes_bootstrap import bootstrap_probes, _load_defaults
+from steer.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, _load_defaults
 from steer.results import GenerationResult, TokenEvent, ProbeReadings
 from steer.vectors import (
     extract_contrastive,
@@ -91,9 +91,14 @@ class SteerSession:
                 categories=probe_categories, cache_dir=self._cache_dir,
             )
 
-        self._monitor = TraitMonitor(probe_profiles) if probe_profiles else TraitMonitor({})
+        self._layer_means: dict[int, torch.Tensor] = {}
         if probe_profiles:
-            self._monitor.attach(self._layers, self._device, self._dtype)
+            self._layer_means = bootstrap_layer_means(
+                self._model, self._tokenizer, self._layers, self._model_info,
+                cache_dir=self._cache_dir,
+            )
+
+        self._monitor = TraitMonitor(probe_profiles, self._layer_means) if probe_profiles else TraitMonitor({})
 
     # -- State queries --
 
@@ -390,17 +395,16 @@ class SteerSession:
     def monitor(self, name: str, profile: dict | None = None) -> None:
         if profile is None:
             profile = self.extract(name)
-        self._monitor.add_probe(
-            name, profile,
-            model_layers=self._layers,
-            device=self._device, dtype=self._dtype,
-        )
+        if not self._layer_means:
+            self._layer_means = bootstrap_layer_means(
+                self._model, self._tokenizer, self._layers, self._model_info,
+                cache_dir=self._cache_dir,
+            )
+            self._monitor._layer_means = self._layer_means
+        self._monitor.add_probe(name, profile)
 
     def unmonitor(self, name: str) -> None:
-        self._monitor.remove_probe(
-            name, model_layers=self._layers,
-            device=self._device, dtype=self._dtype,
-        )
+        self._monitor.remove_probe(name)
 
     # -- History --
 
@@ -433,7 +437,6 @@ class SteerSession:
         readings: dict[str, ProbeReadings] = {}
         if not self._monitor or not self._monitor.probe_names:
             return readings
-        self._monitor.flush_to_cpu()
         for name in self._monitor.probe_names:
             stats = self._monitor.get_stats(name)
             count = stats["count"]
@@ -445,14 +448,14 @@ class SteerSession:
             hist = list(self._monitor.history.get(name, []))
             if len(hist) >= 2:
                 deltas = [abs(hist[i] - hist[i-1]) for i in range(1, len(hist))]
-                delta_per_tok = sum(deltas) / len(deltas)
+                delta_per_gen = sum(deltas) / len(deltas)
             else:
-                delta_per_tok = 0.0
+                delta_per_gen = 0.0
             readings[name] = ProbeReadings(
                 per_token=hist, mean=mean, std=std,
                 min=stats["min"] if stats["min"] != float("inf") else 0.0,
                 max=stats["max"] if stats["max"] != float("-inf") else 0.0,
-                delta_per_tok=delta_per_tok,
+                delta_per_tok=delta_per_gen,
             )
         return readings
 
@@ -504,6 +507,12 @@ class SteerSession:
         token_count = len(generated_ids)
         tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
         text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        if self._monitor and self._monitor.probe_names and text.strip():
+            self._monitor.measure(
+                self._model, self._tokenizer, self._layers, text,
+                device=self._device,
+            )
         readings = self._build_readings()
 
         result = GenerationResult(
@@ -592,15 +601,10 @@ class SteerSession:
                                 break
                             if tok_str is None:
                                 break
-                            readings_snap = None
-                            if self._monitor and self._monitor.has_pending_data():
-                                self._monitor.flush_to_cpu()
-                                current, _ = self._monitor.get_current_and_previous()
-                                readings_snap = dict(current) if current else None
                             event = TokenEvent(
                                 text=tok_str,
                                 token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                                index=idx, readings=readings_snap,
+                                index=idx, readings=None,
                             )
                             token_events.append(event)
                             yield event
@@ -611,16 +615,10 @@ class SteerSession:
                 if tok_str is None:
                     break
 
-                readings_snap = None
-                if self._monitor and self._monitor.has_pending_data():
-                    self._monitor.flush_to_cpu()
-                    current, _ = self._monitor.get_current_and_previous()
-                    readings_snap = dict(current) if current else None
-
                 event = TokenEvent(
                     text=tok_str,
                     token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                    index=idx, readings=readings_snap,
+                    index=idx, readings=None,
                 )
                 token_events.append(event)
                 yield event
@@ -638,6 +636,12 @@ class SteerSession:
         token_count = len(token_events)
         tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
         text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        if self._monitor and self._monitor.probe_names and text.strip():
+            self._monitor.measure(
+                self._model, self._tokenizer, self._layers, text,
+                device=self._device,
+            )
         readings = self._build_readings()
 
         self._last_result = GenerationResult(
@@ -661,8 +665,6 @@ class SteerSession:
     def close(self) -> None:
         self._steering.clear_all()
         self._profiles.clear()
-        if self._monitor:
-            self._monitor.detach()
 
     def __enter__(self):
         return self

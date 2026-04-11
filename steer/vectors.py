@@ -175,6 +175,70 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
     return result
 
 
+_NEUTRAL_PROMPTS = [
+    "The sky is blue.",
+    "Water is a liquid at room temperature.",
+    "There are seven days in a week.",
+    "The book is on the table.",
+    "She walked to the store and bought some groceries.",
+    "The meeting is scheduled for tomorrow afternoon.",
+    "He opened the door and stepped outside.",
+    "The train arrived at the station on time.",
+    "They finished the project ahead of schedule.",
+    "The cat sat on the windowsill watching the birds.",
+    "The report was submitted before the deadline.",
+    "She picked up the phone and made the call.",
+    "The garden needs watering twice a week.",
+    "He read the instructions carefully before starting.",
+    "The road leads to the next town over.",
+    "The library closes at nine on weekdays.",
+    "There are twelve months in a year.",
+    "The package arrived earlier than expected.",
+    "She parked the car in the usual spot.",
+    "The river flows south toward the coast.",
+    "He set the alarm for six in the morning.",
+    "The files are stored in the top drawer.",
+    "They took the bus to the city center.",
+    "The printer is out of paper again.",
+    "She left a note on the kitchen counter.",
+    "The bridge connects the two sides of town.",
+    "He finished his coffee before leaving.",
+    "The schedule was posted on the bulletin board.",
+    "The windows were open to let in fresh air.",
+    "They agreed to meet at the usual place.",
+]
+
+
+def compute_layer_means(
+    model,
+    tokenizer,
+    layers,
+    device=None,
+) -> dict[int, torch.Tensor]:
+    """Compute mean hidden state per layer over neutral prompts.
+
+    Returns dict mapping layer_idx -> mean vector (dim,) in fp32.
+    Used to center activations before probe cosine similarity,
+    removing the baseline projection bias.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    n_layers = len(layers)
+    sums: dict[int, torch.Tensor] = {}
+
+    for text in _NEUTRAL_PROMPTS:
+        per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
+        for idx in range(n_layers):
+            if idx not in sums:
+                sums[idx] = per_layer[idx]
+            else:
+                sums[idx] = sums[idx] + per_layer[idx]
+
+    n = len(_NEUTRAL_PROMPTS)
+    return {idx: sums[idx] / n for idx in range(n_layers)}
+
+
 def extract_contrastive(
     model,
     tokenizer,

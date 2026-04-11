@@ -258,7 +258,9 @@ Llama (1-4), Mistral, Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3), Qwen2
 
 ### Monitor
 
-Each probe monitors all layers in its profile, weighted by extraction score. One forward hook per distinct layer, computing score-weighted cosine similarities into a shared GPU accumulator. Batch-transfers to CPU on TUI poll. Throughput target: >= 85% of vanilla generation speed with steering + monitoring active.
+After each generation, a single forward pass over the generated text produces attention-weighted hidden states per layer (same pooling as extraction). Each layer's hidden state is mean-centered — subtracting the per-layer mean computed from 30 neutral prompts — to remove baseline projection bias that otherwise makes raw cosine similarities uninformative. Score-weighted cosine similarities against probe vectors produce one value per probe per generation.
+
+Layer means are computed once per model and cached as `_LAYERMEANS.safetensors` alongside probe vectors. No hooks run on the model during generation — monitoring is purely post-generation.
 
 ## Tests
 
