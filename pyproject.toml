@@ -20,6 +20,9 @@ bnb = ["bitsandbytes>=0.43"]
 flash = ["flash-attn>=2.5"]
 cuda = ["bitsandbytes>=0.43", "flash-attn>=2.5"]
 dev = ["pytest>=8.0"]
+hf = ["datasets>=2.0"]
+pandas = ["pandas>=2.0"]
+research = ["datasets>=2.0", "pandas>=2.0"]
 
 [project.scripts]
 steer = "steer.cli:main"
