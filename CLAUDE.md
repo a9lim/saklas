@@ -18,6 +18,18 @@ pytest tests/test_smoke.py -v    # CUDA smoke tests (downloads gemma-2-2b-it ~5G
 pytest tests/ -v                 # all tests (non-CUDA tests run anywhere)
 ```
 
+## PyPI release
+
+Package name is `liahona-ai` (`liahona` is blocked by PyPI). Import name stays `liahona`.
+
+```bash
+# bump version in pyproject.toml, then:
+python3 -m build                   # creates dist/liahona_ai-X.Y.Z.tar.gz + .whl
+twine upload dist/*                # uploads using ~/.pypirc token
+```
+
+`probes/defaults.json` is included via `[tool.setuptools.package-data]`. The `probes/cache/` directory (model-specific tensors) is not shipped.
+
 ## Architecture
 
 Five layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**, **API server**.
