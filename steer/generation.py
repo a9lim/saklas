@@ -186,15 +186,16 @@ def generate_steered(
                     next_token = top_idx.gather(-1, token_idx)
 
                 token_id = next_token.item()
+
+                if token_id in eos_ids:
+                    break
+
                 generated_ids.append(token_id)
                 current_input = next_token
                 seq_len += 1
 
                 if on_token:
                     on_token(token_table[token_id] if token_id < _vocab else '')
-
-                if token_id in eos_ids:
-                    break
 
     finally:
         state.is_generating.clear()
