@@ -36,7 +36,7 @@ Five layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 
 ### Model + Vector layer
 - `model.py` — Loads HF causal LMs. `_LAYER_ACCESSORS` maps `model_type` to layer-list accessor lambdas; add new architectures here.
-- `vectors.py` — Per-prompt forward passes (no batching). `_capture_all_hidden_states` hooks every layer in one pass. `_encode_and_capture_all` handles tokenization, chat-template wrapping, attention-weighted pooling. `extract_contrastive`: 2N passes for N pairs, per-layer SVD extracts first principal component, scored by explained variance ratio. Returns a **profile**: `dict[int, (Tensor, score)]` mapping every layer to direction + signal strength. Profiles saved as `.safetensors` + `.json` sidecar. `compute_layer_means`: 30 neutral prompts → per-layer mean hidden state for centering.
+- `vectors.py` — Per-prompt forward passes (no batching). `_capture_all_hidden_states` hooks every layer in one pass. `_encode_and_capture_all` handles tokenization, chat-template wrapping, attention-weighted pooling. `extract_contrastive`: 2N passes for N pairs, per-layer SVD extracts first principal component, scored by explained variance ratio. Returns a **profile**: `dict[int, (Tensor, score)]` mapping every layer to direction + signal strength. Profiles saved as `.safetensors` + `.json` sidecar. `compute_layer_means`: 45 neutral prompts → per-layer mean hidden state for centering.
 - `probes_bootstrap.py` — Loads/extracts probe profiles per `liahona/probes/defaults.json`. 28 probes across 5 categories (emotion, personality, safety, cultural, gender). `bootstrap_layer_means`: loads or computes per-layer mean activations, cached as `_LAYERMEANS.safetensors` per model.
 
 ### Steering + Monitoring layer

@@ -184,36 +184,66 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
 
 
 _NEUTRAL_PROMPTS = [
-    "The sky is blue.",
-    "Water is a liquid at room temperature.",
+    # Simple facts
+    "Water freezes at zero degrees Celsius.",
     "There are seven days in a week.",
-    "The book is on the table.",
+    "The chemical symbol for gold is Au.",
+    # Spatial / physical descriptions
+    "The book is on the table next to the lamp.",
+    "A narrow path winds between the two hills.",
+    "The parking lot wraps around the back of the building.",
+    # Everyday actions (varied subjects)
     "She walked to the store and bought some groceries.",
-    "The meeting is scheduled for tomorrow afternoon.",
-    "He opened the door and stepped outside.",
-    "The train arrived at the station on time.",
-    "They finished the project ahead of schedule.",
-    "The cat sat on the windowsill watching the birds.",
-    "The report was submitted before the deadline.",
-    "She picked up the phone and made the call.",
-    "The garden needs watering twice a week.",
-    "He read the instructions carefully before starting.",
-    "The road leads to the next town over.",
+    "The technician replaced the filter and restarted the system.",
+    "He sorted the mail into three piles before lunch.",
+    # Temporal / scheduling
     "The library closes at nine on weekdays.",
-    "There are twelve months in a year.",
-    "The package arrived earlier than expected.",
-    "She parked the car in the usual spot.",
-    "The river flows south toward the coast.",
-    "He set the alarm for six in the morning.",
-    "The files are stored in the top drawer.",
-    "They took the bus to the city center.",
-    "The printer is out of paper again.",
-    "She left a note on the kitchen counter.",
-    "The bridge connects the two sides of town.",
-    "He finished his coffee before leaving.",
-    "The schedule was posted on the bulletin board.",
-    "The windows were open to let in fresh air.",
-    "They agreed to meet at the usual place.",
+    "Flights to Denver depart twice daily, morning and evening.",
+    "The semester runs from September through mid-December.",
+    # Process / how-things-work
+    "Bread dough rises when yeast converts sugar into carbon dioxide.",
+    "A compiler translates source code into machine instructions.",
+    "Seeds germinate when moisture and temperature reach the right levels.",
+    # Quantitative / measurement
+    "The bridge spans roughly four hundred meters across the river.",
+    "An adult human skeleton contains two hundred and six bones.",
+    "Light travels about three hundred thousand kilometers per second.",
+    # Conditional / if-then
+    "If the temperature drops below freezing, the pipes may need insulation.",
+    "Connecting the cables in the wrong order can trip the breaker.",
+    "The sensor activates when motion is detected within five meters.",
+    # Multi-clause / compound
+    "The train was delayed by twenty minutes, so most passengers waited on the platform.",
+    "After the rain stopped, the crew resumed paving the road.",
+    "She finished the report, emailed it to the team, and left for the day.",
+    # Questions
+    "What time does the next bus arrive at the central station?",
+    "How many liters of paint are needed to cover the back wall?",
+    "Which floor is the records office on?",
+    # Instructions / imperatives
+    "Preheat the oven to one hundred and eighty degrees before adding the dish.",
+    "Turn left at the second intersection, then continue straight for two blocks.",
+    "Press and hold the reset button for five seconds until the light turns green.",
+    # Abstract / categorical
+    "Mammals are warm-blooded vertebrates that nurse their young.",
+    "Most programming languages distinguish between integers and floating-point numbers.",
+    "Supply and demand determine the market price of a commodity.",
+    # Sensory / environmental
+    "The hum of the air conditioner was the only sound in the room.",
+    "Dry leaves scraped across the pavement in the wind.",
+    "The smell of fresh paint lingered in the hallway all morning.",
+    # Historical / past-tense narrative
+    "The canal was completed in 1914 after a decade of construction.",
+    "Early telephone networks connected operators manually with patch cords.",
+    "The expedition reached the summit on the third attempt.",
+    # Comparative / relational
+    "Aluminum is lighter than steel but less rigid under the same load.",
+    "The express route is shorter, though the local road has less traffic.",
+    "Handwritten notes tend to aid recall more than typed ones.",
+    # Hypothetical / generic conditional
+    "A fully charged battery should last roughly eight hours under normal use.",
+    "Most packages arrive within three to five business days.",
+    "The average commute in the metro area takes about forty minutes.",
 ]
 
 
