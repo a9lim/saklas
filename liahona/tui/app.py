@@ -512,6 +512,12 @@ class LiahonaApp(App):
             finally:
                 if alphas:
                     self._session._clear_steering()
+                # Flush MPS command buffers *after* all GPU work (including
+                # monitor.measure) so a pending regenerate dispatched by
+                # _poll_generation doesn't submit new Metal commands while
+                # the monitor's forward pass is still in flight.
+                if self._session._device.type == "mps":
+                    torch.mps.synchronize()
                 # Signal end-of-generation *after* _messages is updated so
                 # pending actions (regenerate / queued submit) see the final
                 # conversation state.
