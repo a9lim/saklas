@@ -35,15 +35,28 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
 
 
 
-def _capture_hidden_states_single(model, layer, input_ids):
+def _capture_hidden_states_single(model, layer, input_ids, output_attentions=False):
     """Run a single-sequence forward pass and capture hidden states at *layer*.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
+    When *output_attentions* is True, also captures the layer's self-attention
+    weights for attention-weighted pooling.
+
+    Returns:
+        dict with ``"hidden"`` (1, seq, dim) and optionally ``"attention"``
+        (1, heads, seq, seq).
     """
     captured = {}
 
     def _hook(module, input, output):
-        h = output if isinstance(output, torch.Tensor) else output[0]
+        if isinstance(output, torch.Tensor):
+            h = output
+        else:
+            h = output[0]
+            # When output_attentions=True, most HF decoder layers return
+            # (hidden_states, self_attn_weights, ...).
+            if output_attentions and len(output) > 1:
+                captured["attention"] = output[1]
         if h.device.type == "mps":
             torch.mps.synchronize()
         captured["hidden"] = h.clone()
@@ -51,24 +64,60 @@ def _capture_hidden_states_single(model, layer, input_ids):
     handle = layer.register_forward_hook(_hook)
     try:
         with torch.inference_mode():
-            model(input_ids=input_ids, use_cache=False)
+            model(input_ids=input_ids, use_cache=False,
+                  output_attentions=output_attentions)
     finally:
         handle.remove()
-    return captured["hidden"]  # (1, seq, dim)
+    return captured
 
 
 def _encode_and_capture(model, tokenizer, text, layer_idx, layers, device):
-    """Tokenize text, ensure at least 1 real token, run forward pass, return mean-pooled hidden state in fp32."""
-    enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=True)
+    """Tokenize text, run forward pass, return attention-weighted hidden state in fp32.
+
+    For instruction-tuned models (those with a chat template), wraps the text
+    as an assistant response so the extraction happens in the model's actual
+    generation regime.  Base models get the raw string.
+
+    Uses the last token's self-attention distribution (averaged across heads)
+    as pooling weights — the model's own saliency signal for which positions
+    matter.  Falls back to last-token pooling if attention capture fails.
+    """
+    if getattr(tokenizer, "chat_template", None) is not None:
+        messages = [
+            {"role": "user", "content": "Continue the conversation."},
+            {"role": "assistant", "content": text},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
+        )
+    enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=False)
     ids = enc["input_ids"]
-    if ids.numel() == 0 or (enc["attention_mask"].sum() == 0):
+    mask = enc["attention_mask"]
+    if ids.numel() == 0 or (mask.sum() == 0):
         bos_id = tokenizer.bos_token_id
         if bos_id is None:
             bos_id = tokenizer.eos_token_id or 0
         ids = torch.tensor([[bos_id]])
+        mask = torch.ones_like(ids)
     ids = ids.to(device)
-    h = _capture_hidden_states_single(model, layers[layer_idx], ids)
-    return h.float().mean(dim=1).squeeze(0)  # (dim,)
+    mask = mask.to(device)
+
+    captured = _capture_hidden_states_single(
+        model, layers[layer_idx], ids, output_attentions=True,
+    )
+    h = captured["hidden"].float()  # (1, seq, dim)
+
+    attn = captured.get("attention")
+    if attn is not None:
+        # attn: (1, heads, seq, seq) — last token's attention over all positions
+        weights = attn[0, :, -1, :].mean(dim=0)  # (seq,)
+        weights = weights * mask[0].float()
+        weights = weights / weights.sum().clamp(min=1e-8)
+        return (h[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
+
+    # Fallback: last-token pooling (still better than mean for causal LMs)
+    seq_len = mask[0].sum() - 1
+    return h[0, seq_len]  # (dim,)
 
 
 def extract_contrastive(
@@ -117,7 +166,7 @@ def extract_contrastive(
 
     # PCA: first principal component of centered difference vectors.
     diff_matrix = diff_matrix - diff_matrix.mean(dim=0)
-    _, _, V = torch.pca_lowrank(diff_matrix, q=1)
+    _, _, V = torch.pca_lowrank(diff_matrix, q=1, niter=5)
     direction = V[:, 0]  # (dim,)
 
     # pca_lowrank returns an unsigned direction; orient it so that
