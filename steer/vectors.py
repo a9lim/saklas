@@ -175,14 +175,18 @@ def extract_contrastive(
         # Can't do PCA with a single vector; fall back to the diff itself.
         return _normalize(diff_matrix.squeeze(0), ref_norm=ref_norm)
 
-    # PCA: first principal component of centered difference vectors.
-    # MPS lacks QR decomposition (aten::linalg_qr), so move to CPU there.
-    diff_matrix = diff_matrix - diff_matrix.mean(dim=0)
-    pca_input = diff_matrix.cpu() if diff_matrix.device.type == "mps" else diff_matrix
-    _, _, V = torch.pca_lowrank(pca_input, q=1, niter=5)
-    direction = V[:, 0].to(diff_matrix.device)  # (dim,)
+    # SVD on the uncentered difference matrix.  The first right singular
+    # vector is the dominant shared direction across pairs (Zou et al.,
+    # 2023).  We deliberately skip centering: the mean difference *is*
+    # the concept signal, and removing it leaves PCA fitting to noise.
+    # Exact SVD is cheap here (N << dim) and deterministic, unlike
+    # randomized pca_lowrank (which also centers by default).
+    # MPS lacks some linalg ops, so fall back to CPU there.
+    svd_input = diff_matrix.float().cpu() if diff_matrix.device.type == "mps" else diff_matrix.float()
+    _, _, Vh = torch.linalg.svd(svd_input, full_matrices=False)
+    direction = Vh[0].to(diff_matrix.device)  # (dim,) — first right singular vector
 
-    # pca_lowrank returns an unsigned direction; orient it so that
+    # SVD returns an unsigned direction; orient it so that
     # "positive" stays positive (align with the mean difference).
     mean_diff = torch.stack(diffs).mean(dim=0)
     if direction @ mean_diff < 0:
