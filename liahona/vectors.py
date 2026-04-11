@@ -265,6 +265,8 @@ def compute_layer_means(
     n_layers = len(layers)
     sums: dict[int, torch.Tensor] = {}
 
+    _mps = device.type == "mps"
+
     for text in _NEUTRAL_PROMPTS:
         per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
         for idx in range(n_layers):
@@ -272,6 +274,9 @@ def compute_layer_means(
                 sums[idx] = per_layer[idx]
             else:
                 sums[idx] = sums[idx] + per_layer[idx]
+        del per_layer
+        if _mps:
+            torch.mps.empty_cache()
 
     n = len(_NEUTRAL_PROMPTS)
     return {idx: sums[idx] / n for idx in range(n_layers)}
@@ -311,6 +316,8 @@ def extract_contrastive(
     # model already occupies most of the unified memory budget.
     diff_device = "cpu" if device.type == "mps" else device
 
+    _mps = device.type == "mps"
+
     for pair in pairs:
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
@@ -321,6 +328,11 @@ def extract_contrastive(
             p, n = pos_all[idx].float(), neg_all[idx].float()
             diffs_per_layer[idx].append((p - n).to(diff_device))
             norm_sums[idx] += p.norm() + n.norm()
+        # Free forward-pass intermediates (attention maps, hidden states)
+        # before the next pair — MPS doesn't release memory eagerly.
+        del pos_all, neg_all
+        if _mps:
+            torch.mps.empty_cache()
 
     # Per-layer: compute direction and score
     profile: dict[int, tuple[torch.Tensor, float]] = {}
