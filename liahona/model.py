@@ -22,6 +22,7 @@ _LAYER_ACCESSORS = {
     "llama4_text": _MODEL_LAYERS,
     # Mistral / Mixtral
     "mistral": _MODEL_LAYERS,
+    "mistral4": _MODEL_LAYERS,
     "mixtral": _MODEL_LAYERS,
     # Gemma family
     "gemma": _MODEL_LAYERS,
@@ -41,6 +42,8 @@ _LAYER_ACCESSORS = {
     "qwen2_moe": _MODEL_LAYERS,
     "qwen3": _MODEL_LAYERS,
     "qwen3_moe": _MODEL_LAYERS,
+    "qwen3_5_text": _MODEL_LAYERS,
+    "qwen3_5_moe": _MODEL_LAYERS,
     # Cohere (Command-R)
     "cohere": _MODEL_LAYERS,
     "cohere2": _MODEL_LAYERS,
@@ -52,6 +55,7 @@ _LAYER_ACCESSORS = {
     # OLMo
     "olmo": _MODEL_LAYERS,
     "olmo2": _MODEL_LAYERS,
+    "olmo3": _MODEL_LAYERS,
     "olmoe": _MODEL_LAYERS,
     # GLM (ChatGLM)
     "glm": _MODEL_LAYERS,
@@ -71,6 +75,7 @@ _LAYER_ACCESSORS = {
     # Bloom / Falcon
     "bloom": _TRANSFORMER_H,
     "falcon": _TRANSFORMER_H,
+    "falcon_h1": _MODEL_LAYERS,
     # GPT-NeoX / Pythia
     "gpt_neox": lambda m: m.gpt_neox.layers,
     # MPT / DBRX
