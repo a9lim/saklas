@@ -199,16 +199,18 @@ def extract_contrastive(
         device = next(model.parameters()).device
 
     n_layers = len(layers)
-    # Accumulate per-layer diffs and running norm sums
+    # Accumulate per-layer diffs and running norm sums.
+    # norm_sums is a GPU tensor to avoid per-layer .item() sync points
+    # (was 2 * N_pairs * N_layers GPU→CPU syncs, now 0 during the loop).
     diffs_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
-    norm_sums: dict[int, float] = {i: 0.0 for i in range(n_layers)}
+    norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
 
     for pair in pairs:
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
         for idx in range(n_layers):
             diffs_per_layer[idx].append(pos_all[idx] - neg_all[idx])
-            norm_sums[idx] += pos_all[idx].norm().item() + neg_all[idx].norm().item()
+            norm_sums[idx] += pos_all[idx].norm() + neg_all[idx].norm()
 
     # Per-layer: compute direction and score
     profile: dict[int, tuple[torch.Tensor, float]] = {}
@@ -216,12 +218,14 @@ def extract_contrastive(
     n_pairs = len(pairs)
 
     n_norm_samples = n_pairs * 2  # pos + neg per pair
+    # Single GPU→CPU transfer for all layer norms
+    norm_sums_cpu = norm_sums.tolist()
 
     if n_pairs < 2:
         # Single pair: use raw diff, score by norm (normalized to [0,1] below)
         for idx in range(n_layers):
             diff_vec = diffs_per_layer[idx][0]
-            ref_norm = (norm_sums[idx] / n_norm_samples) * 0.1
+            ref_norm = (norm_sums_cpu[idx] / n_norm_samples) * 0.1
             direction = _normalize(diff_vec, ref_norm=ref_norm)
             scores[idx] = diff_vec.float().norm().item()
             profile[idx] = (direction, scores[idx])
@@ -235,7 +239,7 @@ def extract_contrastive(
         src_device = diffs_per_layer[0][0].device
         for idx in range(n_layers):
             diff_matrices.append(torch.stack(diffs_per_layer[idx]))  # (N, dim)
-            ref_norms.append((norm_sums[idx] / n_norm_samples) * 0.1)
+            ref_norms.append((norm_sums_cpu[idx] / n_norm_samples) * 0.1)
 
         batched = torch.stack(diff_matrices).float()  # (n_layers, N, dim)
         # SVD on MPS must fall back to CPU

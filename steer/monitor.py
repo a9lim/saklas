@@ -63,6 +63,7 @@ class TraitMonitor:
             for _layer_idx, (_vec, score) in self._raw_profiles[name].items():
                 total_weights[col] += score
         self._total_weights = total_weights.clamp(min=1e-8)
+        self._total_weights_cpu = self._total_weights.float().cpu()
 
         # Group probes by layer: layer_idx -> list of (probe_col, vector, score)
         layers_to_probes: dict[int, list[tuple[int, torch.Tensor, float]]] = {}
@@ -135,8 +136,10 @@ class TraitMonitor:
 
         was_full = buf_idx >= self._accum.shape[0]
 
-        # Divide by total weights to get weighted average, then transfer to CPU
-        cpu_data = (self._accum[:buf_idx] / self._total_weights.unsqueeze(0)).float().cpu()
+        # Transfer raw accumulator to CPU first, then divide — avoids a
+        # GPU kernel launch for the element-wise division.
+        cpu_data = self._accum[:buf_idx].float().cpu()
+        cpu_data /= self._total_weights_cpu.unsqueeze(0)
         n_tokens = cpu_data.shape[0]
 
         # Vectorize stats across probe dimension

@@ -33,6 +33,28 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
     return eos_ids
 
 
+_token_table_cache: tuple[tuple[str, int], list[str]] | None = None
+
+
+def _get_token_table(tokenizer, vocab_size: int) -> list[str]:
+    """Return cached token-id-to-string lookup table.
+
+    Replaces per-token ``convert_ids_to_tokens`` calls with a single
+    list index.  Built once per tokenizer, amortized across generations.
+    """
+    global _token_table_cache
+    tok_key = (getattr(tokenizer, 'name_or_path', ''), vocab_size)
+    if _token_table_cache is not None and _token_table_cache[0] == tok_key:
+        return _token_table_cache[1]
+    table = [''] * vocab_size
+    for i in range(vocab_size):
+        s = tokenizer.convert_ids_to_tokens(i)
+        if s is not None:
+            table[i] = s.replace('\u2581', ' ')
+    _token_table_cache = (tok_key, table)
+    return table
+
+
 class GenerationConfig:
     __slots__ = (
         "max_new_tokens", "temperature", "top_p", "system_prompt",
@@ -111,6 +133,7 @@ def generate_steered(
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
     topk_k = min(1024, _vocab)
+    token_table = _get_token_table(tokenizer, _vocab) if on_token else None
     seq_len = input_ids.shape[1]
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
@@ -160,12 +183,7 @@ def generate_steered(
                 seq_len += 1
 
                 if on_token:
-                    token_str = tokenizer.convert_ids_to_tokens(token_id)
-                    if token_str is not None:
-                        token_str = token_str.replace('\u2581', ' ')
-                    else:
-                        token_str = ''
-                    on_token(token_str)
+                    on_token(token_table[token_id] if token_id < _vocab else '')
 
                 if token_id in eos_ids:
                     break

@@ -11,8 +11,6 @@ class SteeringHook:
     def __init__(self) -> None:
         self.composed: torch.Tensor | None = None
         self._handle = None
-        self._cached_ids: tuple[int, ...] | None = None
-        self._cached_stacked: torch.Tensor | None = None
 
     def recompose(
         self,
@@ -23,23 +21,17 @@ class SteeringHook:
         """Pre-compose all vectors for this layer into a single tensor."""
         if not vectors:
             self.composed = None
-            self._cached_ids = None
-            self._cached_stacked = None
             return
         # All-zero alphas → no perturbation; skip the matmul so that
         # 0 * NaN (from a bad extraction) doesn't inject NaN into hooks.
         if all(alpha == 0.0 for _, alpha in vectors):
             self.composed = None
             return
-        # Reuse the stacked matrix when only alphas changed
-        vec_ids = tuple(id(vec) for vec, _ in vectors)
-        if vec_ids != self._cached_ids or self._cached_stacked is None:
-            self._cached_stacked = torch.stack(
-                [vec.to(device=device, dtype=dtype) for vec, _ in vectors]
-            )
-            self._cached_ids = vec_ids
+        stacked = torch.stack(
+            [vec.to(device=device, dtype=dtype) for vec, _ in vectors]
+        )
         alphas = torch.tensor([alpha for _, alpha in vectors], device=device, dtype=dtype)
-        self.composed = (alphas.unsqueeze(1) * self._cached_stacked).sum(dim=0)
+        self.composed = (alphas.unsqueeze(1) * stacked).sum(dim=0)
 
     def hook_fn(self, module, input, output):
         if self.composed is not None:
@@ -61,20 +53,30 @@ class SteeringHook:
 
 
 def orthogonalize_vectors(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
-    """Gram-Schmidt orthogonalization on a list of unit vectors.
+    """QR-based orthogonalization on a list of vectors.
 
-    Returns orthogonalized unit vectors. Skips near-zero vectors that
-    collapse during projection.
+    Returns orthonormal vectors preserving each input's orientation.
+    Drops degenerate directions whose R-diagonal magnitude falls below
+    threshold. Single-kernel QR replaces sequential Gram-Schmidt.
     """
-    result: list[torch.Tensor] = []
-    for v in vectors:
-        u = v.clone()
-        for basis in result:
-            u = u - torch.dot(u, basis) * basis
-        norm = u.norm()
-        if norm > 1e-8:
-            result.append(u / norm)
-    return result
+    if not vectors:
+        return []
+    if len(vectors) == 1:
+        norm = vectors[0].norm()
+        return [vectors[0] / norm] if norm > 1e-8 else []
+    orig_dtype = vectors[0].dtype
+    stacked = torch.stack(vectors).float()           # (N, dim)
+    Q, R = torch.linalg.qr(stacked.T)                # Q: (dim, N)
+    diag = R.diag()                                   # (N,)
+    keep = diag.abs() > 1e-8
+    # QR can flip column signs relative to input; R's diagonal sign
+    # encodes the flip.  Correct so alphas keep their meaning.
+    signs = diag.sign()
+    return [
+        (Q[:, i] * signs[i]).to(orig_dtype)
+        for i in range(min(Q.shape[1], len(vectors)))
+        if keep[i]
+    ]
 
 
 class SteeringManager:
