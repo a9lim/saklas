@@ -112,6 +112,8 @@ def bootstrap_probes(
         ds = load_contrastive_pairs(str(ds_path))
         datasets_to_extract.append((name, cp, ds))
 
+    model_device = next(model.parameters()).device
+
     for name, cp, ds in tqdm(datasets_to_extract, desc="Extracting probes", unit="probe"):
         try:
             profile = extract_contrastive(model, tokenizer, ds["pairs"], layers=layers)
@@ -123,6 +125,10 @@ def bootstrap_probes(
             })
         except Exception as e:
             log.warning("Contrastive extraction failed for %s: %s", name, e)
+        # Free intermediate MPS memory between probes — the model
+        # occupies most of the unified memory budget.
+        if model_device.type == "mps":
+            torch.mps.empty_cache()
 
     return probes
 

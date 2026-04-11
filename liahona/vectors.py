@@ -307,6 +307,10 @@ def extract_contrastive(
     diffs_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
     norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
 
+    # On MPS, keep diffs on CPU — SVD runs there anyway, and the
+    # model already occupies most of the unified memory budget.
+    diff_device = "cpu" if device.type == "mps" else device
+
     for pair in pairs:
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
@@ -315,7 +319,7 @@ def extract_contrastive(
             # loses precision for close vectors, producing degenerate
             # diff matrices that cause LAPACK SVD errors (SLASCL).
             p, n = pos_all[idx].float(), neg_all[idx].float()
-            diffs_per_layer[idx].append(p - n)
+            diffs_per_layer[idx].append((p - n).to(diff_device))
             norm_sums[idx] += p.norm() + n.norm()
 
     # Per-layer: compute direction and score
@@ -342,22 +346,21 @@ def extract_contrastive(
         # and matters most on CPU (MPS SVD fallback path).
         diff_matrices = []  # one (N, dim) per layer
         ref_norms = []
-        src_device = diffs_per_layer[0][0].device
         for idx in range(n_layers):
             diff_matrices.append(torch.stack(diffs_per_layer[idx]))  # (N, dim)
             ref_norms.append(norm_sums_cpu[idx] / n_norm_samples)
 
-        batched = torch.stack(diff_matrices).float()  # (n_layers, N, dim)
-        # SVD on MPS must fall back to CPU
-        svd_input = batched.cpu() if src_device.type == "mps" else batched
+        # Diffs are already float32 and on CPU for MPS — run SVD directly.
+        batched = torch.stack(diff_matrices)  # (n_layers, N, dim)
+        svd_input = batched.cpu() if batched.device.type == "mps" else batched
         _, S, Vh = torch.linalg.svd(svd_input, full_matrices=False)
         # S: (n_layers, min(N,dim)), Vh: (n_layers, min(N,dim), dim)
 
         for idx in range(n_layers):
-            direction = Vh[idx, 0].to(src_device)  # (dim,)
+            direction = Vh[idx, 0].to(device)  # (dim,)
 
             # Orient so "positive" stays positive: majority vote across pairs.
-            dots = diff_matrices[idx] @ direction  # (N,)
+            dots = diff_matrices[idx] @ direction.to(diff_matrices[idx].device)
             if (dots < 0).sum() > (dots > 0).sum():
                 direction = -direction
 
