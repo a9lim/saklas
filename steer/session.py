@@ -29,6 +29,13 @@ _N_PAIRS = 45
 
 
 class SteerSession:
+    """Unified backend for activation steering, monitoring, and generation.
+
+    Vectors are registered via steer() and applied per-generation via the
+    alphas parameter on generate()/generate_stream(). No persistent hooks
+    live on the model between generations.
+    """
+
     def __init__(
         self,
         model_id: str,
@@ -56,9 +63,11 @@ class SteerSession:
             system_prompt=system_prompt,
         )
 
+        # Vector registry: name -> profile. No alphas, no hooks.
+        self._profiles: dict[str, dict[int, tuple[torch.Tensor, float]]] = {}
+
+        # Transient steering manager — used only during generation
         self._steering = SteeringManager()
-        self._orthogonalize = False
-        self._steer_lock = threading.Lock()
 
         self._gen_lock = threading.Lock()
         self._gen_state = GenerationState()
@@ -93,8 +102,9 @@ class SteerSession:
         return dict(self._model_info)
 
     @property
-    def vectors(self) -> dict[str, dict]:
-        return {v["name"]: v for v in self._steering.get_active_vectors()}
+    def vectors(self) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
+        """Registered steering vector profiles: name -> profile."""
+        return dict(self._profiles)
 
     @property
     def probes(self) -> dict[str, dict]:
@@ -205,8 +215,8 @@ class SteerSession:
         Full pipeline: cache check -> curated dataset -> statement cache ->
         generate pairs -> extract contrastive -> save to cache.
 
-        Temporarily detaches active steering hooks during extraction to
-        avoid contaminating the forward passes.
+        No steering hooks are on the model between generations, so extraction
+        never needs to save/restore steering state.
 
         Args:
             source: concept name (str), list of (positive, negative) tuples,
@@ -248,18 +258,13 @@ class SteerSession:
                 pass
 
             _progress(f"Extracting profile ({len(ds.pairs)} pairs)...")
-            saved_vectors = self._steering.get_active_vectors()
-            self._steering.clear_all()
-            try:
-                pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
-                profile = extract_contrastive(
-                    self._model, self._tokenizer, pairs, layers=self._layers,
-                )
-                _save_profile(profile, cache_path, {
-                    "concept": ds.name, "n_pairs": len(ds.pairs),
-                })
-            finally:
-                self._restore_vectors(saved_vectors)
+            pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
+            profile = extract_contrastive(
+                self._model, self._tokenizer, pairs, layers=self._layers,
+            )
+            _save_profile(profile, cache_path, {
+                "concept": ds.name, "n_pairs": len(ds.pairs),
+            })
             return profile
 
         # String source — full pipeline
@@ -275,93 +280,75 @@ class SteerSession:
         except (FileNotFoundError, KeyError, ValueError):
             pass
 
-        # 2. Detach steering hooks to avoid contaminating extraction
-        saved_vectors = self._steering.get_active_vectors()
-        self._steering.clear_all()
+        # 2. Check for curated dataset
+        if baseline is None:
+            defaults = _load_defaults()
+            concept_lower = concept.lower()
+            has_curated = any(concept_lower in probes for probes in defaults.values())
+            if has_curated:
+                dataset_file = f"{concept_lower}.json"
+                ds_path = pathlib.Path(__file__).parent / "datasets" / dataset_file
+                if ds_path.exists():
+                    _progress(f"Found curated dataset '{dataset_file}', extracting...")
+                    ds = load_contrastive_pairs(str(ds_path))
+                    profile = extract_contrastive(
+                        self._model, self._tokenizer, ds["pairs"],
+                        layers=self._layers,
+                    )
+                    _save_profile(profile, cache_path, {
+                        "concept": concept, "baseline": baseline,
+                        "n_pairs": len(ds["pairs"]),
+                        "source": f"curated:{dataset_file}",
+                    })
+                    return profile
 
+        # 3. Check statement cache
+        stmt_cache_path = self._statements_cache_path(concept, baseline)
+        pairs = None
         try:
-            # 3. Check for curated dataset
-            if baseline is None:
-                defaults = _load_defaults()
-                concept_lower = concept.lower()
-                has_curated = any(concept_lower in probes for probes in defaults.values())
-                if has_curated:
-                    dataset_file = f"{concept_lower}.json"
-                    ds_path = pathlib.Path(__file__).parent / "datasets" / dataset_file
-                    if ds_path.exists():
-                        _progress(f"Found curated dataset '{dataset_file}', extracting...")
-                        ds = load_contrastive_pairs(str(ds_path))
-                        profile = extract_contrastive(
-                            self._model, self._tokenizer, ds["pairs"],
-                            layers=self._layers,
-                        )
-                        _save_profile(profile, cache_path, {
-                            "concept": concept, "baseline": baseline,
-                            "n_pairs": len(ds["pairs"]),
-                            "source": f"curated:{dataset_file}",
-                        })
-                        return profile
+            with open(stmt_cache_path) as f:
+                cached = json.load(f)
+            if "pairs" in cached:
+                pairs = cached["pairs"]
+            elif "positive" in cached and "negative" in cached:
+                pairs = [
+                    {"positive": p, "negative": n_}
+                    for p, n_ in zip(cached["positive"], cached["negative"])
+                ]
+            if pairs:
+                _progress(f"Loaded cached pairs for '{concept}'.")
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            pass
 
-            # 4. Check statement cache
-            stmt_cache_path = self._statements_cache_path(concept, baseline)
-            pairs = None
-            try:
-                with open(stmt_cache_path) as f:
-                    cached = json.load(f)
-                if "pairs" in cached:
-                    pairs = cached["pairs"]
-                elif "positive" in cached and "negative" in cached:
-                    pairs = [
-                        {"positive": p, "negative": n_}
-                        for p, n_ in zip(cached["positive"], cached["negative"])
-                    ]
-                if pairs:
-                    _progress(f"Loaded cached pairs for '{concept}'.")
-            except (FileNotFoundError, KeyError, json.JSONDecodeError):
-                pass
+        # 4. Generate pairs if needed
+        if pairs is None:
+            suffix = f" vs '{baseline}'" if baseline else ""
+            _progress(f"Generating contrastive pairs for '{concept}'{suffix}...")
+            raw_pairs = self.generate_pairs(concept, baseline)
+            pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
 
-            # 5. Generate pairs if needed
-            if pairs is None:
-                suffix = f" vs '{baseline}'" if baseline else ""
-                _progress(f"Generating contrastive pairs for '{concept}'{suffix}...")
-                raw_pairs = self.generate_pairs(concept, baseline)
-                pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
+            os.makedirs(os.path.dirname(stmt_cache_path), exist_ok=True)
+            with open(stmt_cache_path, "w") as f:
+                json.dump({"pairs": pairs}, f, indent=2)
 
-                os.makedirs(os.path.dirname(stmt_cache_path), exist_ok=True)
-                with open(stmt_cache_path, "w") as f:
-                    json.dump({"pairs": pairs}, f, indent=2)
-
-            if len(pairs) < 2:
-                raise ValueError(
-                    f"Could only generate {len(pairs)} pairs (need >= 2). "
-                    f"Try a more specific concept."
-                )
-
-            # 6. Extract
-            _progress(f"Extracting contrastive profile ({len(pairs)} pairs)...")
-            profile = extract_contrastive(
-                self._model, self._tokenizer, pairs, layers=self._layers,
+        if len(pairs) < 2:
+            raise ValueError(
+                f"Could only generate {len(pairs)} pairs (need >= 2). "
+                f"Try a more specific concept."
             )
 
-            _save_profile(profile, cache_path, {
-                "concept": concept, "baseline": baseline,
-                "n_pairs": len(pairs),
-            })
-
-            return profile
-        finally:
-            self._restore_vectors(saved_vectors)
-
-    def _restore_vectors(self, saved_vectors: list[dict]) -> None:
-        """Restore previously saved steering vectors after extraction."""
-        for v in saved_vectors:
-            self._steering.add_vector(v["name"], v["profile"], v["alpha"])
-            if not v.get("enabled", True):
-                self._steering.toggle_vector(v["name"])
-        self._steering.apply_to_model(
-            self._layers, self._device, self._dtype,
-            orthogonalize=self._orthogonalize,
+        # 5. Extract
+        _progress(f"Extracting contrastive profile ({len(pairs)} pairs)...")
+        profile = extract_contrastive(
+            self._model, self._tokenizer, pairs, layers=self._layers,
         )
+
+        _save_profile(profile, cache_path, {
+            "concept": concept, "baseline": baseline,
+            "n_pairs": len(pairs),
+        })
+
+        return profile
 
     def load_profile(self, path: str) -> dict[int, tuple[torch.Tensor, float]]:
         profile, _meta = _load_profile(path)
@@ -372,51 +359,31 @@ class SteerSession:
     def save_profile(self, profile: dict, path: str, metadata: dict | None = None) -> None:
         _save_profile(profile, path, metadata or {})
 
-    # -- Steering --
+    # -- Steering (vector registry) --
 
-    def steer(self, name: str, profile: dict, alpha: float = 2.5) -> None:
-        with self._steer_lock:
-            self._steering.add_vector(name, profile, alpha)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
-
-    def set_alpha(self, name: str, alpha: float) -> None:
-        with self._steer_lock:
-            self._steering.set_alpha(name, alpha)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
-
-    def toggle(self, name: str) -> None:
-        with self._steer_lock:
-            self._steering.toggle_vector(name)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
+    def steer(self, name: str, profile: dict[int, tuple[torch.Tensor, float]]) -> None:
+        """Register a steering vector. Applied during generate() via alphas."""
+        self._profiles[name] = profile
 
     def unsteer(self, name: str) -> None:
-        with self._steer_lock:
-            self._steering.remove_vector(name)
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=self._orthogonalize,
-            )
+        """Remove a steering vector from the registry."""
+        self._profiles.pop(name, None)
 
-    def orthogonalize(self) -> None:
-        with self._steer_lock:
-            self._orthogonalize = True
-            self._steering.apply_to_model(
-                self._layers, self._device, self._dtype,
-                orthogonalize=True,
-            )
+    def _apply_steering(self, alphas: dict[str, float], orthogonalize: bool = False) -> None:
+        """Compose and attach steering hooks for a generation call."""
+        self._steering.clear_all()
+        for name, alpha in alphas.items():
+            if name not in self._profiles:
+                raise KeyError(f"No vector registered for '{name}'")
+            self._steering.add_vector(name, self._profiles[name], alpha)
+        self._steering.apply_to_model(
+            self._layers, self._device, self._dtype,
+            orthogonalize=orthogonalize,
+        )
 
-    def clear_vectors(self) -> None:
-        with self._steer_lock:
-            self._steering.clear_all()
+    def _clear_steering(self) -> None:
+        """Remove all steering hooks from the model."""
+        self._steering.clear_all()
 
     # -- Monitoring --
 
@@ -451,7 +418,6 @@ class SteerSession:
     # -- Generation helpers --
 
     def _prepare_input(self, input) -> tuple[list[dict], torch.Tensor]:
-        """Normalize input to messages list and compute input_ids."""
         if isinstance(input, str):
             messages = list(self._history) + [{"role": "user", "content": input}]
         elif isinstance(input, list):
@@ -464,7 +430,6 @@ class SteerSession:
         return messages, input_ids
 
     def _build_readings(self) -> dict[str, ProbeReadings]:
-        """Flush monitor and build ProbeReadings for all active probes."""
         readings: dict[str, ProbeReadings] = {}
         if not self._monitor or not self._monitor.probe_names:
             return readings
@@ -484,46 +449,58 @@ class SteerSession:
             else:
                 delta_per_tok = 0.0
             readings[name] = ProbeReadings(
-                per_token=hist,
-                mean=mean,
-                std=std,
+                per_token=hist, mean=mean, std=std,
                 min=stats["min"] if stats["min"] != float("inf") else 0.0,
                 max=stats["max"] if stats["max"] != float("-inf") else 0.0,
                 delta_per_tok=delta_per_tok,
             )
         return readings
 
-    def _snapshot_vectors(self) -> dict[str, float]:
-        """Snapshot active vectors and their alphas."""
-        return {v["name"]: v["alpha"] for v in self._steering.get_active_vectors()
-                if v.get("enabled", True)}
-
     # -- Generation: blocking --
 
-    def generate(self, input, **kwargs) -> GenerationResult:
-        """Blocking generation. Returns when complete."""
+    def generate(
+        self,
+        input,
+        alphas: dict[str, float] | None = None,
+        orthogonalize: bool = False,
+    ) -> GenerationResult:
+        """Blocking generation.
+
+        Args:
+            input: prompt string or list of message dicts.
+            alphas: steering vector alphas to apply. Keys must match
+                    registered vector names. None = no steering.
+            orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
+        """
         if not self._gen_lock.acquire(blocking=False):
             raise RuntimeError("Generation already in progress")
         try:
-            return self._generate_blocking(input)
+            return self._generate_blocking(input, alphas, orthogonalize)
         finally:
             self._gen_lock.release()
 
-    def _generate_blocking(self, input) -> GenerationResult:
+    def _generate_blocking(self, input, alphas, orthogonalize) -> GenerationResult:
         messages, input_ids = self._prepare_input(input)
         self._gen_state.reset()
         if self._monitor:
             self._monitor.reset_history()
 
-        vector_snapshot = self._snapshot_vectors()
-        start = time.monotonic()
+        vector_snapshot = dict(alphas) if alphas else {}
 
-        generated_ids = generate_steered(
-            self._model, self._tokenizer, input_ids,
-            self.config, self._gen_state,
-        )
+        if alphas:
+            self._apply_steering(alphas, orthogonalize=orthogonalize)
 
-        elapsed = time.monotonic() - start
+        try:
+            start = time.monotonic()
+            generated_ids = generate_steered(
+                self._model, self._tokenizer, input_ids,
+                self.config, self._gen_state,
+            )
+            elapsed = time.monotonic() - start
+        finally:
+            if alphas:
+                self._clear_steering()
+
         token_count = len(generated_ids)
         tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
         text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -536,7 +513,6 @@ class SteerSession:
         )
         self._last_result = result
 
-        # Append to history
         if isinstance(input, str):
             self._history.append({"role": "user", "content": input})
         if text.strip():
@@ -546,16 +522,27 @@ class SteerSession:
 
     # -- Generation: streaming --
 
-    def generate_stream(self, input, **kwargs) -> Iterator[TokenEvent]:
-        """Streaming generation. Yields TokenEvent per token."""
+    def generate_stream(
+        self,
+        input,
+        alphas: dict[str, float] | None = None,
+        orthogonalize: bool = False,
+    ) -> Iterator[TokenEvent]:
+        """Streaming generation. Yields TokenEvent per token.
+
+        Args:
+            input: prompt string or list of message dicts.
+            alphas: steering vector alphas to apply. None = no steering.
+            orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
+        """
         if not self._gen_lock.acquire(blocking=False):
             raise RuntimeError("Generation already in progress")
         try:
-            yield from self._generate_streaming(input)
+            yield from self._generate_streaming(input, alphas, orthogonalize)
         finally:
             self._gen_lock.release()
 
-    def _generate_streaming(self, input) -> Iterator[TokenEvent]:
+    def _generate_streaming(self, input, alphas, orthogonalize) -> Iterator[TokenEvent]:
         import queue as _queue
 
         messages, input_ids = self._prepare_input(input)
@@ -563,13 +550,17 @@ class SteerSession:
         if self._monitor:
             self._monitor.reset_history()
 
-        vector_snapshot = self._snapshot_vectors()
-        start = time.monotonic()
+        vector_snapshot = dict(alphas) if alphas else {}
+
+        if alphas:
+            self._apply_steering(alphas, orthogonalize=orthogonalize)
+
         token_events: list[TokenEvent] = []
         generated_ids: list[int] = []
         token_queue = self._gen_state.token_queue
         gen_done = threading.Event()
         gen_error: list[Exception] = []
+        start = time.monotonic()
 
         def _worker():
             try:
@@ -588,54 +579,57 @@ class SteerSession:
         thread.start()
 
         idx = 0
-        while True:
-            try:
-                tok_str = token_queue.get(timeout=0.05)
-            except _queue.Empty:
-                if gen_done.is_set():
-                    # Drain remaining
-                    while True:
-                        try:
-                            tok_str = token_queue.get_nowait()
-                        except _queue.Empty:
-                            break
-                        if tok_str is None:
-                            break
-                        readings_snap = None
-                        if self._monitor and self._monitor.has_pending_data():
-                            self._monitor.flush_to_cpu()
-                            current, _ = self._monitor.get_current_and_previous()
-                            readings_snap = dict(current) if current else None
-                        event = TokenEvent(
-                            text=tok_str,
-                            token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                            index=idx, readings=readings_snap,
-                        )
-                        token_events.append(event)
-                        yield event
-                        idx += 1
+        try:
+            while True:
+                try:
+                    tok_str = token_queue.get(timeout=0.05)
+                except _queue.Empty:
+                    if gen_done.is_set():
+                        while True:
+                            try:
+                                tok_str = token_queue.get_nowait()
+                            except _queue.Empty:
+                                break
+                            if tok_str is None:
+                                break
+                            readings_snap = None
+                            if self._monitor and self._monitor.has_pending_data():
+                                self._monitor.flush_to_cpu()
+                                current, _ = self._monitor.get_current_and_previous()
+                                readings_snap = dict(current) if current else None
+                            event = TokenEvent(
+                                text=tok_str,
+                                token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
+                                index=idx, readings=readings_snap,
+                            )
+                            token_events.append(event)
+                            yield event
+                            idx += 1
+                        break
+                    continue
+
+                if tok_str is None:
                     break
-                continue
 
-            if tok_str is None:
-                break
+                readings_snap = None
+                if self._monitor and self._monitor.has_pending_data():
+                    self._monitor.flush_to_cpu()
+                    current, _ = self._monitor.get_current_and_previous()
+                    readings_snap = dict(current) if current else None
 
-            readings_snap = None
-            if self._monitor and self._monitor.has_pending_data():
-                self._monitor.flush_to_cpu()
-                current, _ = self._monitor.get_current_and_previous()
-                readings_snap = dict(current) if current else None
+                event = TokenEvent(
+                    text=tok_str,
+                    token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
+                    index=idx, readings=readings_snap,
+                )
+                token_events.append(event)
+                yield event
+                idx += 1
 
-            event = TokenEvent(
-                text=tok_str,
-                token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                index=idx, readings=readings_snap,
-            )
-            token_events.append(event)
-            yield event
-            idx += 1
-
-        thread.join()
+            thread.join()
+        finally:
+            if alphas:
+                self._clear_steering()
 
         if gen_error:
             raise gen_error[0]
@@ -652,7 +646,6 @@ class SteerSession:
             readings=readings, vectors=vector_snapshot,
         )
 
-        # Append to history
         if isinstance(input, str):
             self._history.append({"role": "user", "content": input})
         if text.strip():
@@ -667,6 +660,7 @@ class SteerSession:
 
     def close(self) -> None:
         self._steering.clear_all()
+        self._profiles.clear()
         if self._monitor:
             self._monitor.detach()
 
