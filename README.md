@@ -2,7 +2,7 @@
 
 Activation steering and trait monitoring for HuggingFace transformer models. Extract steering vectors, apply them during generation with per-call alpha control, and monitor how activations shift across behavioral probes.
 
-Two interfaces: a **Python API** for scripted experiments and batch sweeps, and a **terminal UI** for interactive exploration.
+Three interfaces: a **Python API** for scripted experiments and batch sweeps, an **OpenAI-compatible API server** for drop-in use with any OpenAI SDK client, and a **terminal UI** for interactive exploration.
 
 ## Python API
 
@@ -148,6 +148,90 @@ collector.to_dataframe()           # requires pandas
 
 Probe readings flatten to columns: `probe_honest_mean`, `probe_honest_std`, etc. Vector alphas flatten to `vector_happy_alpha`.
 
+## API Server
+
+Serve a steered model as an OpenAI-compatible HTTP endpoint. Works with the OpenAI Python/JS SDK, LangChain, `curl`, or anything that speaks the OpenAI API.
+
+```bash
+pip install -e ".[serve]"
+steer serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
+```
+
+### Usage with OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+# Uses server-default steering (cheerful=0.2 from --steer flag)
+resp = client.chat.completions.create(
+    model="google/gemma-2-9b-it",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(resp.choices[0].message.content)
+
+# Override steering per-request
+resp = client.chat.completions.create(
+    model="google/gemma-2-9b-it",
+    messages=[{"role": "user", "content": "Hello!"}],
+    extra_body={"steer": {"alphas": {"cheerful": 0.4}, "orthogonalize": True}},
+)
+
+# Streaming
+for chunk in client.chat.completions.create(
+    model="google/gemma-2-9b-it",
+    messages=[{"role": "user", "content": "Tell me a story."}],
+    stream=True,
+):
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+### Serve CLI options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `model` | required | HuggingFace model ID or local path |
+| `--host` | `0.0.0.0` | Bind address |
+| `--port` | `8000` | Bind port |
+| `-q`, `--quantize` | None | `4bit` or `8bit` |
+| `-d`, `--device` | `auto` | `auto`, `cuda`, `mps`, `cpu` |
+| `-p`, `--probes` | all | Probe categories to bootstrap |
+| `-s`, `--system-prompt` | None | Default system prompt |
+| `-m`, `--max-tokens` | `1024` | Max tokens per generation |
+| `--steer` | None | Pre-load vector, repeatable. `name:alpha` or `name` |
+| `--cors` | None | CORS origin, repeatable |
+
+### Endpoints
+
+**OpenAI-compatible:**
+- `GET /v1/models` — list loaded model
+- `GET /v1/models/{model_id}` — model details
+- `POST /v1/chat/completions` — chat (streaming + non-streaming)
+- `POST /v1/completions` — text completion (streaming + non-streaming)
+
+**Vector management:**
+- `GET /v1/steer/vectors` — list registered vectors
+- `POST /v1/steer/vectors/extract` — extract a new vector (streams progress via SSE)
+- `POST /v1/steer/vectors/load` — load from `.safetensors` file
+- `DELETE /v1/steer/vectors/{name}` — remove a vector
+
+**Probe management:**
+- `GET /v1/steer/probes` — list active probes + last readings
+- `GET /v1/steer/probes/defaults` — available default probes by category
+- `POST /v1/steer/probes/{name}` — activate a probe
+- `DELETE /v1/steer/probes/{name}` — deactivate a probe
+
+**Session management:**
+- `GET /v1/steer/session` — current config, model info, default alphas
+- `PATCH /v1/steer/session` — update temperature, top_p, max_tokens, system_prompt
+- `POST /v1/steer/session/clear` — clear conversation history
+- `POST /v1/steer/session/rewind` — undo last exchange
+
+Full API docs available at `http://localhost:8000/docs` when the server is running.
+
+Probe readings are returned as an extra `probe_readings` field in generation responses — standard clients ignore it, aware clients get inline monitoring data.
+
 ## Terminal UI
 
 ```bash
@@ -239,6 +323,7 @@ Probes are extracted on first run and cached per model under `steer/probes/cache
 ```bash
 pip install -e .                   # base install
 pip install -e ".[dev]"            # + pytest
+pip install -e ".[serve]"          # + fastapi + uvicorn (for API server)
 pip install -e ".[cuda]"           # + bitsandbytes + flash-attn
 pip install -e ".[research]"       # + datasets + pandas (for API)
 pip install -e ".[bnb]"            # + bitsandbytes only

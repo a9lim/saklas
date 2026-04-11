@@ -421,16 +421,21 @@ class SteerSession:
 
     # -- Generation helpers --
 
-    def _prepare_input(self, input) -> tuple[list[dict], torch.Tensor]:
+    def _prepare_input(self, input, raw: bool = False) -> tuple[list[dict], torch.Tensor]:
         if isinstance(input, str):
             messages = list(self._history) + [{"role": "user", "content": input}]
         elif isinstance(input, list):
             messages = list(input)
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
-        input_ids = build_chat_input(
-            self._tokenizer, messages, self.config.system_prompt,
-        ).to(self._device)
+        if raw and isinstance(input, str):
+            input_ids = self._tokenizer.encode(
+                input, return_tensors="pt",
+            ).to(self._device)
+        else:
+            input_ids = build_chat_input(
+                self._tokenizer, messages, self.config.system_prompt,
+            ).to(self._device)
         return messages, input_ids
 
     def _build_readings(self) -> dict[str, ProbeReadings]:
@@ -466,6 +471,7 @@ class SteerSession:
         input,
         alphas: dict[str, float] | None = None,
         orthogonalize: bool = False,
+        raw: bool = False,
     ) -> GenerationResult:
         """Blocking generation.
 
@@ -474,16 +480,17 @@ class SteerSession:
             alphas: steering vector alphas to apply. Keys must match
                     registered vector names. None = no steering.
             orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
+            raw: skip chat template, tokenize input string directly.
         """
         if not self._gen_lock.acquire(blocking=False):
             raise RuntimeError("Generation already in progress")
         try:
-            return self._generate_blocking(input, alphas, orthogonalize)
+            return self._generate_blocking(input, alphas, orthogonalize, raw)
         finally:
             self._gen_lock.release()
 
-    def _generate_blocking(self, input, alphas, orthogonalize) -> GenerationResult:
-        messages, input_ids = self._prepare_input(input)
+    def _generate_blocking(self, input, alphas, orthogonalize, raw=False) -> GenerationResult:
+        messages, input_ids = self._prepare_input(input, raw=raw)
         self._gen_state.reset()
         if self._monitor:
             self._monitor.reset_history()
@@ -536,6 +543,7 @@ class SteerSession:
         input,
         alphas: dict[str, float] | None = None,
         orthogonalize: bool = False,
+        raw: bool = False,
     ) -> Iterator[TokenEvent]:
         """Streaming generation. Yields TokenEvent per token.
 
@@ -543,18 +551,19 @@ class SteerSession:
             input: prompt string or list of message dicts.
             alphas: steering vector alphas to apply. None = no steering.
             orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
+            raw: skip chat template, tokenize input string directly.
         """
         if not self._gen_lock.acquire(blocking=False):
             raise RuntimeError("Generation already in progress")
         try:
-            yield from self._generate_streaming(input, alphas, orthogonalize)
+            yield from self._generate_streaming(input, alphas, orthogonalize, raw)
         finally:
             self._gen_lock.release()
 
-    def _generate_streaming(self, input, alphas, orthogonalize) -> Iterator[TokenEvent]:
+    def _generate_streaming(self, input, alphas, orthogonalize, raw=False) -> Iterator[TokenEvent]:
         import queue as _queue
 
-        messages, input_ids = self._prepare_input(input)
+        messages, input_ids = self._prepare_input(input, raw=raw)
         self._gen_state.reset()
         if self._monitor:
             self._monitor.reset_history()
