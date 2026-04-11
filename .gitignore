@@ -27,6 +27,8 @@ Thumbs.db
 
 # Claude Code
 .remember/
+.superpowers/
+docs/superpowers/
 
 # Model/probe caches (large binary files)
 steer/probes/cache/

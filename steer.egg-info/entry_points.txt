@@ -1,2 +1,0 @@
-[console_scripts]
-steer = steer.cli:main
