@@ -162,12 +162,6 @@ Widget {
     margin: 0 0 1 0;
 }
 
-.assistant-message MarkdownHorizontalRule,
-.user-message MarkdownHorizontalRule {
-    border-bottom: solid ansi_default;
-    padding-top: 0;
-    margin-bottom: 0;
-}
 
 /* Generic utility */
 .hidden {
