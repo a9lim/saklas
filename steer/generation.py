@@ -11,14 +11,14 @@ import torch
 
 log = logging.getLogger(__name__)
 
-_eos_cache: tuple[int, set[int]] | None = None
+_eos_cache: tuple[tuple[str, int], set[int]] | None = None
 
 
 def _get_eos_ids(model, tokenizer) -> set[int]:
     """Return cached set of all EOS token IDs for model+tokenizer."""
     global _eos_cache
-    tok_id = id(tokenizer)
-    if _eos_cache is not None and _eos_cache[0] == tok_id:
+    tok_key = (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
+    if _eos_cache is not None and _eos_cache[0] == tok_key:
         return _eos_cache[1]
     eos_ids: set[int] = set()
     if hasattr(model, "generation_config") and model.generation_config.eos_token_id is not None:
@@ -29,7 +29,7 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
             eos_ids.update(eid)
     if tokenizer.eos_token_id is not None:
         eos_ids.add(tokenizer.eos_token_id)
-    _eos_cache = (tok_id, eos_ids)
+    _eos_cache = (tok_key, eos_ids)
     return eos_ids
 
 
@@ -65,12 +65,7 @@ class GenerationState:
     def reset(self):
         self.stop_requested.clear()
         self.is_generating.clear()
-        # Drain leftover tokens
-        while not self.token_queue.empty():
-            try:
-                self.token_queue.get_nowait()
-            except queue.Empty:
-                break
+        self.token_queue = queue.SimpleQueue()
 
 
 def build_chat_input(
@@ -90,8 +85,8 @@ def build_chat_input(
         if isinstance(result, torch.Tensor):
             return result
         return result["input_ids"]
-    # Base model without chat template — concatenate raw text
-    text = "".join(m["content"] for m in chat)
+    # Base model without chat template — add minimal role markers
+    text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in chat) + "\nAssistant:"
     return tokenizer(text, return_tensors="pt")["input_ids"]
 
 
@@ -117,7 +112,7 @@ def generate_steered(
     _vocab = _cfg.vocab_size
     topk_k = min(1024, _vocab)
     seq_len = input_ids.shape[1]
-    attn_mask_buf = torch.ones(1, seq_len + config.max_new_tokens, device=device, dtype=torch.long)
+    attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
 
     try:
@@ -128,7 +123,7 @@ def generate_steered(
 
                 outputs = model(
                     input_ids=current_input,
-                    attention_mask=attn_mask_buf[:, :seq_len] if prefill else None,
+                    attention_mask=attn_mask_buf if prefill else None,
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
@@ -165,7 +160,11 @@ def generate_steered(
                 seq_len += 1
 
                 if on_token:
-                    token_str = tokenizer.decode([token_id], skip_special_tokens=True)
+                    token_str = tokenizer.convert_ids_to_tokens(token_id)
+                    if token_str is not None:
+                        token_str = token_str.replace('\u2581', ' ')
+                    else:
+                        token_str = ''
                     on_token(token_str)
 
                 if token_id in eos_ids:

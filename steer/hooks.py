@@ -22,12 +22,12 @@ class SteeringHook:
         if not vectors:
             self.composed = None
             return
-        alphas = torch.tensor([alpha for _, alpha in vectors], device=device, dtype=dtype)
         # All-zero alphas → no perturbation; skip the matmul so that
         # 0 * NaN (from a bad extraction) doesn't inject NaN into hooks.
-        if alphas.abs().max() == 0:
+        if all(alpha == 0.0 for _, alpha in vectors):
             self.composed = None
             return
+        alphas = torch.tensor([alpha for _, alpha in vectors], device=device, dtype=dtype)
         stacked = torch.stack([vec.to(device=device, dtype=dtype) for vec, _ in vectors])
         self.composed = (alphas.unsqueeze(1) * stacked).sum(dim=0)
 
@@ -60,7 +60,7 @@ def orthogonalize_vectors(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
     for v in vectors:
         u = v.clone()
         for basis in result:
-            u = u - (u * basis).sum() * basis
+            u = u - torch.dot(u, basis) * basis
         norm = u.norm()
         if norm > 1e-8:
             result.append(u / norm)

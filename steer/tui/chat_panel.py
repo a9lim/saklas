@@ -10,24 +10,39 @@ from textual.message import Message
 
 
 class _AssistantMessage(Vertical):
-    """Container with a label and Markdown widget for assistant messages."""
+    """Container with a label and Markdown widget for assistant messages.
+
+    During streaming, updates go to a cheap Static widget (no parse).
+    On finalize(), the Static is hidden and a full Markdown render is shown.
+    """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.chat_text: str = ""
+        self._stream: Static | None = None
         self._md: Markdown | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("[bold ansi_green]Assistant:[/]")
-        yield Markdown()
+        yield Static("", id="stream-text")
+        yield Markdown(classes="hidden")
 
     def on_mount(self) -> None:
+        self._stream = self.query_one("#stream-text", Static)
         self._md = self.query_one(Markdown)
 
     def update_content(self, text: str) -> None:
         self.chat_text = text
-        if self._md is not None:
-            self._md.update(text)
+        if self._stream is not None:
+            self._stream.update(text)
+
+    def finalize(self) -> None:
+        """Switch from streaming Static to rendered Markdown."""
+        if self._md is not None and self.chat_text:
+            self._md.update(self.chat_text)
+            self._md.remove_class("hidden")
+        if self._stream is not None:
+            self._stream.add_class("hidden")
 
 
 class ChatPanel(Widget):
@@ -90,6 +105,9 @@ class ChatPanel(Widget):
     def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
         widget.chat_text += token
         widget.update_content(widget.chat_text)
+
+    def scroll_to_bottom(self) -> None:
+        """Scroll the chat log to the bottom. Call once after a batch of token updates."""
         self._log.scroll_end(animate=False)
 
     def add_system_message(self, text: str) -> None:

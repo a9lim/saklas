@@ -165,6 +165,11 @@ Widget {
     margin-bottom: 0;
 }
 
+/* Generic utility */
+.hidden {
+    display: none;
+}
+
 /* Trait panel internals */
 #trait-header {
     height: 1;

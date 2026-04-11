@@ -123,6 +123,7 @@ class SteerApp(App):
         self._left_panel = self.query_one("#left-panel", LeftPanel)
         self._chat_panel = self.query_one("#chat-panel", ChatPanel)
         self._trait_panel = self.query_one("#trait-panel", TraitPanel)
+        self._panels = [self._left_panel, self._chat_panel, self._trait_panel]
         self._left_panel.update_gen_config(
             self._gen_config.temperature,
             self._gen_config.top_p,
@@ -185,13 +186,12 @@ class SteerApp(App):
     # -- Panel Focus --
 
     def _update_panel_focus(self) -> None:
-        for i, panel_id in enumerate(PANELS):
-            panel = self.query_one(f"#{panel_id}")
+        for i, panel in enumerate(self._panels):
             if i == self._focused_panel_idx:
                 panel.add_class("focused")
             else:
                 panel.remove_class("focused")
-        if PANELS[self._focused_panel_idx] == "chat-panel":
+        if self._focused_panel_idx == 1:  # chat panel
             self.query_one("#chat-input").focus()
         else:
             # Move DOM focus to the app so j/k/arrow bindings aren't
@@ -370,11 +370,13 @@ class SteerApp(App):
         return concept, baseline, layer
 
     def _handle_steer(self, text: str) -> None:
+        chat = self._chat_panel
         if self._ab_in_progress:
-            chat = self._chat_panel
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
             return
-        chat = self._chat_panel
+        if self._gen_state.is_generating.is_set():
+            chat.add_system_message("Cannot extract vectors during generation. Stop generation first.")
+            return
         try:
             concept, baseline, alpha, layer = self._parse_args(text, include_alpha=True)
         except (ValueError, IndexError) as e:
@@ -397,6 +399,9 @@ class SteerApp(App):
 
     def _handle_probe(self, text: str) -> None:
         chat = self._chat_panel
+        if self._gen_state.is_generating.is_set():
+            chat.add_system_message("Cannot extract vectors during generation. Stop generation first.")
+            return
         try:
             concept, baseline, layer = self._parse_args(text)
         except (ValueError, IndexError) as e:
@@ -771,6 +776,8 @@ class SteerApp(App):
             except queue.Empty:
                 break
             if token is None:
+                if self._current_assistant_widget:
+                    self._current_assistant_widget.finalize()
                 self._current_assistant_widget = None
                 generating = False
                 # Freeze stats at completion
@@ -784,6 +791,9 @@ class SteerApp(App):
                 chat.append_to_assistant(self._current_assistant_widget, token)
             self._gen_token_count += 1
             tokens_consumed += 1
+
+        if tokens_consumed > 0:
+            chat.scroll_to_bottom()
 
         # Update live stats only while generating
         if generating and self._gen_start_time > 0:
