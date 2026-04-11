@@ -151,7 +151,6 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
 
     attn_per_layer = captured.get("attention")  # {idx: (1, heads, seq, seq)}
     if attn_per_layer:
-        mask_f = mask[0].float()
         result = {}
         for idx, h in hidden_per_layer.items():
             h_f32 = h.float()  # (1, seq, dim)
@@ -159,19 +158,23 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
             if attn is not None:
                 # Use this layer's own attention: last token's view, averaged across heads
                 weights = attn[0, :, -1, :].mean(dim=0)  # (seq,)
+                # Build mask from hidden-state length — VLM wrappers may
+                # reshape the sequence before the language-model layers,
+                # so the tokenizer mask length can differ.
+                seq = h_f32.shape[1]
+                mask_f = mask[0, :seq].float() if mask.shape[1] >= seq else torch.ones(seq, device=h.device)
                 weights = weights * mask_f
                 weights = weights / weights.sum().clamp(min=1e-8)
                 result[idx] = (h_f32[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
             else:
                 # Layer didn't produce attention weights — last-token fallback
-                result[idx] = h_f32[0, mask[0].sum() - 1]
+                result[idx] = h_f32[0, -1]
         return result
 
     # Fallback: last-token pooling
-    seq_len = mask[0].sum() - 1
     result = {}
     for idx, h in hidden_per_layer.items():
-        result[idx] = h.float()[0, seq_len]  # (dim,)
+        result[idx] = h.float()[0, -1]  # (dim,)
     return result
 
 
