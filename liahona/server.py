@@ -390,7 +390,7 @@ def _register_routes(app: FastAPI) -> None:
     # Vector management
     # -----------------------------------------------------------------------
 
-    @app.get("/v1/steer/vectors")
+    @app.get("/v1/liahona/vectors")
     def list_vectors():
         vectors = session.vectors
         out: dict[str, Any] = {}
@@ -406,7 +406,7 @@ def _register_routes(app: FastAPI) -> None:
             }
         return {"vectors": out}
 
-    @app.post("/v1/steer/vectors/extract")
+    @app.post("/v1/liahona/vectors/extract")
     async def extract_vector(req: ExtractRequest, request: Request):
         accept = request.headers.get("accept", "application/json")
 
@@ -478,7 +478,7 @@ def _register_routes(app: FastAPI) -> None:
         done = {"name": name, "layers": len(layers), "top_layer": top_layer, "top_score": round(top_score, 4)}
         yield f"event: done\ndata: {json.dumps(done)}\n\n"
 
-    @app.post("/v1/steer/vectors/load")
+    @app.post("/v1/liahona/vectors/load")
     def load_vector(req: LoadVectorRequest):
         try:
             profile = session.load_profile(req.path)
@@ -499,7 +499,7 @@ def _register_routes(app: FastAPI) -> None:
             "default_alpha": req.alpha,
         }
 
-    @app.delete("/v1/steer/vectors/{name}")
+    @app.delete("/v1/liahona/vectors/{name}")
     def delete_vector(name: str):
         if name not in session.vectors:
             raise HTTPException(404, f"Vector '{name}' not found")
@@ -511,7 +511,7 @@ def _register_routes(app: FastAPI) -> None:
     # Probe management
     # -----------------------------------------------------------------------
 
-    @app.get("/v1/steer/probes")
+    @app.get("/v1/liahona/probes")
     def list_probes():
         probes = session.probes
         monitor = session._monitor
@@ -526,11 +526,11 @@ def _register_routes(app: FastAPI) -> None:
             out[name] = entry
         return {"probes": out}
 
-    @app.get("/v1/steer/probes/defaults")
+    @app.get("/v1/liahona/probes/defaults")
     def list_default_probes():
         return {"defaults": _load_defaults()}
 
-    @app.post("/v1/steer/probes/{name}")
+    @app.post("/v1/liahona/probes/{name}")
     def activate_probe(name: str, req: ActivateProbeRequest | None = None):
         profile = None
         if req and req.profile_path:
@@ -541,7 +541,7 @@ def _register_routes(app: FastAPI) -> None:
         session.monitor(name, profile)
         return {"name": name, "active": True}
 
-    @app.delete("/v1/steer/probes/{name}")
+    @app.delete("/v1/liahona/probes/{name}")
     def deactivate_probe(name: str):
         if name not in session.probes:
             raise HTTPException(404, f"Probe '{name}' not active")
@@ -552,7 +552,7 @@ def _register_routes(app: FastAPI) -> None:
     # Session management
     # -----------------------------------------------------------------------
 
-    @app.get("/v1/steer/session")
+    @app.get("/v1/liahona/session")
     def get_session():
         info = session.model_info
         return {
@@ -573,7 +573,7 @@ def _register_routes(app: FastAPI) -> None:
             "history_length": len(session.history),
         }
 
-    @app.patch("/v1/steer/session")
+    @app.patch("/v1/liahona/session")
     def patch_session(req: PatchSessionRequest):
         if req.temperature is not None:
             session.config.temperature = req.temperature
@@ -585,12 +585,12 @@ def _register_routes(app: FastAPI) -> None:
             session.config.system_prompt = req.system_prompt
         return {"status": "ok"}
 
-    @app.post("/v1/steer/session/clear")
+    @app.post("/v1/liahona/session/clear")
     def clear_session():
         session.clear_history()
         return JSONResponse(status_code=204, content=None)
 
-    @app.post("/v1/steer/session/rewind")
+    @app.post("/v1/liahona/session/rewind")
     def rewind_session():
         if not session.history:
             raise HTTPException(400, "History is empty")

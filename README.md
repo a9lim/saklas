@@ -154,7 +154,7 @@ Serve a steered model as an OpenAI-compatible HTTP endpoint. Works with the Open
 
 ```bash
 pip install -e ".[serve]"
-steer serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
+liahona serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
 ```
 
 ### Usage with OpenAI SDK
@@ -211,22 +211,22 @@ for chunk in client.chat.completions.create(
 - `POST /v1/completions` — text completion (streaming + non-streaming)
 
 **Vector management:**
-- `GET /v1/steer/vectors` — list registered vectors
-- `POST /v1/steer/vectors/extract` — extract a new vector (streams progress via SSE)
-- `POST /v1/steer/vectors/load` — load from `.safetensors` file
-- `DELETE /v1/steer/vectors/{name}` — remove a vector
+- `GET /v1/liahona/vectors` — list registered vectors
+- `POST /v1/liahona/vectors/extract` — extract a new vector (streams progress via SSE)
+- `POST /v1/liahona/vectors/load` — load from `.safetensors` file
+- `DELETE /v1/liahona/vectors/{name}` — remove a vector
 
 **Probe management:**
-- `GET /v1/steer/probes` — list active probes + last readings
-- `GET /v1/steer/probes/defaults` — available default probes by category
-- `POST /v1/steer/probes/{name}` — activate a probe
-- `DELETE /v1/steer/probes/{name}` — deactivate a probe
+- `GET /v1/liahona/probes` — list active probes + last readings
+- `GET /v1/liahona/probes/defaults` — available default probes by category
+- `POST /v1/liahona/probes/{name}` — activate a probe
+- `DELETE /v1/liahona/probes/{name}` — deactivate a probe
 
 **Session management:**
-- `GET /v1/steer/session` — current config, model info, default alphas
-- `PATCH /v1/steer/session` — update temperature, top_p, max_tokens, system_prompt
-- `POST /v1/steer/session/clear` — clear conversation history
-- `POST /v1/steer/session/rewind` — undo last exchange
+- `GET /v1/liahona/session` — current config, model info, default alphas
+- `PATCH /v1/liahona/session` — update temperature, top_p, max_tokens, system_prompt
+- `POST /v1/liahona/session/clear` — clear conversation history
+- `POST /v1/liahona/session/rewind` — undo last exchange
 
 Full API docs available at `http://localhost:8000/docs` when the server is running.
 
@@ -235,9 +235,9 @@ Probe readings are returned as an extra `probe_readings` field in generation res
 ## Terminal UI
 
 ```bash
-steer google/gemma-2-9b-it
-steer mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
-steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
+liahona google/gemma-2-9b-it
+liahona mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
+liahona meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 ```
 
 ### CLI options

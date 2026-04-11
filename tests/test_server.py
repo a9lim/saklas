@@ -208,13 +208,13 @@ class TestCompletions:
 class TestVectors:
     def test_list_empty(self, session_and_client):
         session, client = session_and_client
-        resp = client.get("/v1/steer/vectors")
+        resp = client.get("/v1/liahona/vectors")
         assert resp.status_code == 200
         assert resp.json()["vectors"] == {}
 
     def test_delete_not_found(self, session_and_client):
         session, client = session_and_client
-        resp = client.delete("/v1/steer/vectors/nonexistent")
+        resp = client.delete("/v1/liahona/vectors/nonexistent")
         assert resp.status_code == 404
 
 
@@ -225,26 +225,26 @@ class TestVectors:
 class TestProbes:
     def test_list_empty(self, session_and_client):
         session, client = session_and_client
-        resp = client.get("/v1/steer/probes")
+        resp = client.get("/v1/liahona/probes")
         assert resp.status_code == 200
         assert resp.json()["probes"] == {}
 
     def test_list_defaults(self, session_and_client):
         session, client = session_and_client
         with patch("liahona.server._load_defaults", return_value={"emotion": ["happiness"]}):
-            resp = client.get("/v1/steer/probes/defaults")
+            resp = client.get("/v1/liahona/probes/defaults")
         assert resp.status_code == 200
         assert "emotion" in resp.json()["defaults"]
 
     def test_activate(self, session_and_client):
         session, client = session_and_client
-        resp = client.post("/v1/steer/probes/test_probe", json={})
+        resp = client.post("/v1/liahona/probes/test_probe", json={})
         assert resp.status_code == 200
         session.monitor.assert_called_once_with("test_probe", None)
 
     def test_deactivate_not_found(self, session_and_client):
         session, client = session_and_client
-        resp = client.delete("/v1/steer/probes/nonexistent")
+        resp = client.delete("/v1/liahona/probes/nonexistent")
         assert resp.status_code == 404
 
 
@@ -255,7 +255,7 @@ class TestProbes:
 class TestSession:
     def test_get_session(self, session_and_client):
         session, client = session_and_client
-        resp = client.get("/v1/steer/session")
+        resp = client.get("/v1/liahona/session")
         assert resp.status_code == 200
         data = resp.json()
         assert data["model"] == "test/model"
@@ -263,7 +263,7 @@ class TestSession:
 
     def test_patch_session(self, session_and_client):
         session, client = session_and_client
-        resp = client.patch("/v1/steer/session", json={
+        resp = client.patch("/v1/liahona/session", json={
             "temperature": 0.5,
             "system_prompt": "Be concise.",
         })
@@ -273,21 +273,21 @@ class TestSession:
 
     def test_clear(self, session_and_client):
         session, client = session_and_client
-        resp = client.post("/v1/steer/session/clear")
+        resp = client.post("/v1/liahona/session/clear")
         assert resp.status_code == 204
         session.clear_history.assert_called_once()
 
     def test_rewind(self, session_and_client):
         session, client = session_and_client
         session.history = [{"role": "user", "content": "hi"}]
-        resp = client.post("/v1/steer/session/rewind")
+        resp = client.post("/v1/liahona/session/rewind")
         assert resp.status_code == 204
         session.rewind.assert_called_once()
 
     def test_rewind_empty(self, session_and_client):
         session, client = session_and_client
         session.history = []
-        resp = client.post("/v1/steer/session/rewind")
+        resp = client.post("/v1/liahona/session/rewind")
         assert resp.status_code == 400
 
 

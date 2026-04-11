@@ -81,7 +81,7 @@ _SUBCOMMANDS = {"serve"}
 
 
 def _build_serve_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="steer serve", description="Start OpenAI-compatible API server")
+    p = argparse.ArgumentParser(prog="liahona serve", description="Start OpenAI-compatible API server")
     _add_common_args(p)
     p.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
@@ -98,7 +98,7 @@ def _build_serve_parser() -> argparse.ArgumentParser:
 
 def _build_tui_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="steer",
+        prog="liahona",
         description="Activation steering + trait monitoring for local HuggingFace models",
     )
     _add_common_args(p)
