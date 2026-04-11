@@ -39,8 +39,9 @@ def _capture_hidden_states_single(model, layer, input_ids, output_attentions=Fal
     """Run a single-sequence forward pass and capture hidden states at *layer*.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
-    When *output_attentions* is True, also captures the layer's self-attention
-    weights for attention-weighted pooling.
+    When *output_attentions* is True, temporarily switches the model to
+    eager attention (SDPA cannot return attention weights), then restores
+    the original implementation after the forward pass.
 
     Returns:
         dict with ``"hidden"`` (1, seq, dim) and optionally ``"attention"``
@@ -53,13 +54,21 @@ def _capture_hidden_states_single(model, layer, input_ids, output_attentions=Fal
             h = output
         else:
             h = output[0]
-            # When output_attentions=True, most HF decoder layers return
-            # (hidden_states, self_attn_weights, ...).
             if output_attentions and len(output) > 1:
                 captured["attention"] = output[1]
         if h.device.type == "mps":
             torch.mps.synchronize()
         captured["hidden"] = h.clone()
+
+    # SDPA doesn't support output_attentions; swap to eager for extraction.
+    prev_attn = None
+    if output_attentions and hasattr(model, "set_attn_implementation"):
+        prev_attn = getattr(model.config, "_attn_implementation_internal",
+                            getattr(model.config, "_attn_implementation", None))
+        if prev_attn and prev_attn != "eager":
+            model.set_attn_implementation("eager")
+        else:
+            prev_attn = None  # already eager, nothing to restore
 
     handle = layer.register_forward_hook(_hook)
     try:
@@ -68,6 +77,8 @@ def _capture_hidden_states_single(model, layer, input_ids, output_attentions=Fal
                   output_attentions=output_attentions)
     finally:
         handle.remove()
+        if prev_attn is not None:
+            model.set_attn_implementation(prev_attn)
     return captured
 
 
@@ -165,9 +176,11 @@ def extract_contrastive(
         return _normalize(diff_matrix.squeeze(0), ref_norm=ref_norm)
 
     # PCA: first principal component of centered difference vectors.
+    # MPS lacks QR decomposition (aten::linalg_qr), so move to CPU there.
     diff_matrix = diff_matrix - diff_matrix.mean(dim=0)
-    _, _, V = torch.pca_lowrank(diff_matrix, q=1, niter=5)
-    direction = V[:, 0]  # (dim,)
+    pca_input = diff_matrix.cpu() if diff_matrix.device.type == "mps" else diff_matrix
+    _, _, V = torch.pca_lowrank(pca_input, q=1, niter=5)
+    direction = V[:, 0].to(diff_matrix.device)  # (dim,)
 
     # pca_lowrank returns an unsigned direction; orient it so that
     # "positive" stays positive (align with the mean difference).
