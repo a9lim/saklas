@@ -131,11 +131,11 @@ class LiahonaSession:
         tag = f"{concept}_vs_{baseline}" if baseline else concept
         return get_cache_path(self._cache_dir, model_id, tag)
 
-    def _statements_cache_path(self, concept: str, baseline: str | None = None) -> str:
-        model_id = self._model_info.get("model_id", "unknown")
-        model_name = model_id.replace("/", "_")
+    @staticmethod
+    def _statements_cache_path(concept: str, baseline: str | None = None) -> str:
         tag = f"{concept}_vs_{baseline}" if baseline else concept
-        return os.path.join(self._cache_dir, model_name, f"{tag}_statements.json")
+        cache_dir = pathlib.Path(__file__).parent / "datasets" / "cache"
+        return str(cache_dir / f"{tag}_statements.json")
 
     def generate_pairs(
         self,
