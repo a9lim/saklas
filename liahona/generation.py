@@ -44,23 +44,49 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
 _token_table_cache: tuple[tuple[str, int], list[str]] | None = None
 
 
-def _get_token_table(tokenizer, vocab_size: int) -> list[str]:
+def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
     """Return cached token-id-to-string lookup table.
 
     Replaces per-token ``convert_ids_to_tokens`` calls with a single
     list index.  Built once per tokenizer, amortized across generations.
+    Entries are ``None`` for tokens that decode to partial UTF-8 sequences
+    (replacement char U+FFFD) — these must be buffered and decoded together
+    with subsequent tokens (e.g. multi-token emoji).
     """
     global _token_table_cache
     tok_key = (getattr(tokenizer, 'name_or_path', ''), vocab_size)
     if _token_table_cache is not None and _token_table_cache[0] == tok_key:
         return _token_table_cache[1]
-    table = [''] * vocab_size
+    table: list[str | None] = [''] * vocab_size
     for i in range(vocab_size):
-        s = tokenizer.convert_ids_to_tokens(i)
-        if s is not None:
-            table[i] = s.replace('\u2581', ' ')
+        try:
+            s = tokenizer.decode([i])
+            table[i] = s if '\ufffd' not in s else None
+        except Exception:
+            table[i] = ''
     _token_table_cache = (tok_key, table)
     return table
+
+
+_think_end_cache: tuple[tuple[str, int], int | None] | None = None
+
+
+def _get_think_end_id(tokenizer) -> int | None:
+    """Return the token ID for </think>, or None if not found."""
+    global _think_end_cache
+    tok_key = (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
+    if _think_end_cache is not None and _think_end_cache[0] == tok_key:
+        return _think_end_cache[1]
+    added = getattr(tokenizer, "added_tokens_encoder", {})
+    think_id = added.get("</think>")
+    _think_end_cache = (tok_key, think_id)
+    return think_id
+
+
+def supports_thinking(tokenizer) -> bool:
+    """Check if the tokenizer's chat template supports thinking mode."""
+    template = getattr(tokenizer, "chat_template", None) or ""
+    return "enable_thinking" in template
 
 
 class GenerationConfig:
@@ -87,7 +113,8 @@ class GenerationState:
     def __init__(self):
         self.stop_requested = threading.Event()
         self.is_generating = threading.Event()
-        self.token_queue: queue.SimpleQueue[str | None] = queue.SimpleQueue()
+        self.token_queue: queue.SimpleQueue[tuple[str, bool] | None] = queue.SimpleQueue()
+        self.thinking_end_idx: int = 0
 
     def request_stop(self):
         self.stop_requested.set()
@@ -96,20 +123,25 @@ class GenerationState:
         self.stop_requested.clear()
         self.is_generating.clear()
         self.token_queue = queue.SimpleQueue()
+        self.thinking_end_idx = 0
 
 
 def build_chat_input(
     tokenizer,
     messages: list[dict[str, str]],
     system_prompt: str | None = None,
+    thinking: bool = False,
 ) -> torch.Tensor:
     chat = []
     if system_prompt:
         chat.append({"role": "system", "content": system_prompt})
     chat.extend(messages)
     if getattr(tokenizer, "chat_template", None) is not None:
+        kwargs: dict = {}
+        if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
+            kwargs["enable_thinking"] = thinking
         result = tokenizer.apply_chat_template(
-            chat, add_generation_prompt=True, return_tensors="pt",
+            chat, add_generation_prompt=True, return_tensors="pt", **kwargs,
         )
         # Some tokenizers return a BatchEncoding dict instead of a raw tensor
         if isinstance(result, torch.Tensor):
@@ -126,7 +158,8 @@ def generate_steered(
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
-    on_token: Callable[[str], None] | None = None,
+    on_token: Callable[[str, bool], None] | None = None,
+    thinking: bool = False,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -145,6 +178,17 @@ def generate_steered(
     seq_len = input_ids.shape[1]
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
+
+    # Thinking state tracking
+    think_end_id = _get_think_end_id(tokenizer) if thinking else None
+    in_thinking = thinking and think_end_id is not None
+
+    # Buffer for multi-token characters (emoji, rare Unicode).
+    # Tokens whose table entry is None represent partial UTF-8 byte sequences;
+    # they accumulate here until a complete-token follows, at which point the
+    # buffer is decoded as a group and flushed.
+    pending_ids: list[int] = []
+    pending_thinking: bool = False
 
     try:
         with torch.inference_mode():
@@ -190,12 +234,40 @@ def generate_steered(
                 if token_id in eos_ids:
                     break
 
+                # Handle </think> delimiter
+                if in_thinking and token_id == think_end_id:
+                    in_thinking = False
+                    state.thinking_end_idx = len(generated_ids)
+                    # Flush any buffered partial tokens before the delimiter
+                    if on_token and pending_ids:
+                        on_token(tokenizer.decode(pending_ids), pending_thinking)
+                        pending_ids.clear()
+                    generated_ids.append(token_id)
+                    current_input = next_token
+                    seq_len += 1
+                    continue
+
                 generated_ids.append(token_id)
                 current_input = next_token
                 seq_len += 1
 
                 if on_token:
-                    on_token(token_table[token_id] if token_id < _vocab else '')
+                    tok_str = token_table[token_id] if token_id < _vocab else ''
+                    if tok_str is None:
+                        # Partial UTF-8 byte sequence — buffer until complete
+                        if not pending_ids:
+                            pending_thinking = in_thinking
+                        pending_ids.append(token_id)
+                    elif pending_ids:
+                        pending_ids.append(token_id)
+                        on_token(tokenizer.decode(pending_ids), pending_thinking)
+                        pending_ids.clear()
+                    else:
+                        on_token(tok_str, in_thinking)
+
+        # Flush any remaining buffered partial tokens
+        if on_token and pending_ids:
+            on_token(tokenizer.decode(pending_ids), pending_thinking)
 
     finally:
         # Flush MPS command buffers before signalling completion — without

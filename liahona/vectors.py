@@ -117,10 +117,15 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
     if getattr(tokenizer, "chat_template", None) is not None:
+        # Disable thinking/reasoning mode for models that support it
+        # (Qwen 3.5, QwQ, etc.) — thinking tokens would contaminate pooling.
+        kwargs: dict = {}
+        if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
+            kwargs["enable_thinking"] = False
         messages = [{"role": "assistant", "content": text}]
         try:
             text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
+                messages, tokenize=False, add_generation_prompt=False, **kwargs,
             )
         except Exception:
             # Some chat templates require a user turn before assistant.
@@ -132,7 +137,7 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
                 {"role": "assistant", "content": text},
             ]
             text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
+                messages, tokenize=False, add_generation_prompt=False, **kwargs,
             )
     enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=False)
     ids = enc["input_ids"]

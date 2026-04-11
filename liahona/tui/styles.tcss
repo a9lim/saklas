@@ -163,6 +163,36 @@ Widget {
 }
 
 
+/* Thinking block (Qwen 3.5, QwQ, etc.) */
+#thinking-block {
+    height: auto;
+    margin: 0;
+    padding: 0;
+    background: ansi_default;
+    border-top: none;
+    border-bottom: none;
+}
+
+#thinking-block > Contents {
+    background: ansi_default;
+}
+
+#thinking-text {
+    text-style: dim;
+    height: auto;
+}
+
+#thinking-md {
+    text-style: dim;
+    height: auto;
+    margin: 0;
+    padding: 0;
+}
+
+#thinking-md MarkdownParagraph {
+    margin: 0 0 1 0;
+}
+
 /* Generic utility */
 .hidden {
     display: none;

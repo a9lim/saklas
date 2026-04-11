@@ -13,7 +13,7 @@ from textual.containers import Horizontal
 from textual.widgets import Input
 from textual.timer import Timer
 
-from liahona.generation import GenerationState, build_chat_input, generate_steered
+from liahona.generation import GenerationState, build_chat_input, generate_steered, supports_thinking
 from liahona.model import _get_memory_gb
 from liahona.probes_bootstrap import _load_defaults
 from liahona.tui.chat_panel import ChatPanel
@@ -36,6 +36,7 @@ class LiahonaApp(App):
         Binding("ctrl+r", "regenerate", "Regen", show=False),
         Binding("ctrl+c", "copy_selection", "Copy", show=False),
         Binding("ctrl+o", "toggle_ortho", "Ortho", show=False),
+        Binding("ctrl+t", "toggle_thinking", "Think", show=False),
         Binding("ctrl+s", "cycle_sort", "Sort", show=False),
         Binding("[", "temp_down", show=False),
         Binding("]", "temp_up", show=False),
@@ -58,6 +59,7 @@ class LiahonaApp(App):
         self._alphas: dict[str, float] = {}
         self._enabled: dict[str, bool] = {}
         self._orthogonalize: bool = False
+        self._thinking: bool = supports_thinking(session._tokenizer)
 
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
@@ -117,6 +119,7 @@ class LiahonaApp(App):
             self._session.config.top_p,
             self._session.config.max_new_tokens,
             self._session.config.system_prompt,
+            thinking=self._thinking if supports_thinking(self._session._tokenizer) else None,
         )
 
         if self._session._monitor:
@@ -319,7 +322,7 @@ class LiahonaApp(App):
                 '/clear, /rewind, /sys [prompt], '
                 "/temp [val], /top-p [val], /max [n], /help\n"
                 "Keys: ⇥ focus · ←/→ alpha · ↑/↓ nav · ↩ toggle\n"
-                "⌫ remove · ⌃O ortho · ⌃R regen · ⌃A A/B\n"
+                "⌫ remove · ⌃O ortho · ⌃T think · ⌃R regen · ⌃A A/B\n"
                 "[ ] temp · { } top-p · ⌃S sort · ⎋ stop · ⌃Q quit"
             )
         else:
@@ -442,6 +445,7 @@ class LiahonaApp(App):
             self._session.config.top_p,
             self._session.config.max_new_tokens,
             self._session.config.system_prompt,
+            thinking=self._thinking if supports_thinking(self._session._tokenizer) else None,
         )
 
     # -- Clipboard --
@@ -475,6 +479,8 @@ class LiahonaApp(App):
         # Snapshot alphas for this generation
         alphas = self._active_alphas()
 
+        use_thinking = self._thinking
+
         def _generate():
             # Apply steering hooks for this generation
             if alphas:
@@ -483,19 +489,22 @@ class LiahonaApp(App):
             try:
                 input_ids = build_chat_input(
                     self._session._tokenizer, self._messages, self._session.config.system_prompt,
+                    thinking=use_thinking,
                 ).to(self._session._device)
                 self._prompt_token_count = input_ids.shape[-1]
 
-                def on_token(tok: str):
-                    self._session._gen_state.token_queue.put(tok)
+                def on_token(tok: str, thinking: bool):
+                    self._session._gen_state.token_queue.put((tok, thinking))
 
                 generated = generate_steered(
                     self._session._model, self._session._tokenizer, input_ids,
                     self._session.config, self._session._gen_state,
-                    on_token=on_token,
+                    on_token=on_token, thinking=use_thinking,
                 )
 
-                full_text = self._session._tokenizer.decode(generated, skip_special_tokens=True)
+                # Decode only the response portion (skip thinking tokens)
+                response_ids = generated[self._session._gen_state.thinking_end_idx:]
+                full_text = self._session._tokenizer.decode(response_ids, skip_special_tokens=True)
                 if full_text.strip():
                     self._messages.append({"role": "assistant", "content": full_text})
                     if self._session._monitor and self._session._monitor.probe_names:
@@ -527,10 +536,10 @@ class LiahonaApp(App):
 
         while tokens_consumed < 20:
             try:
-                token = self._session._gen_state.token_queue.get_nowait()
+                item = self._session._gen_state.token_queue.get_nowait()
             except queue.Empty:
                 break
-            if token is None:
+            if item is None:
                 if self._current_assistant_widget:
                     self._current_assistant_widget.finalize()
                 self._current_assistant_widget = None
@@ -573,8 +582,14 @@ class LiahonaApp(App):
                     elif pending[0] == "probe":
                         self._handle_probe(pending[1])
                 break
+            token, is_thinking = item
             if self._current_assistant_widget:
-                chat.append_to_assistant(self._current_assistant_widget, token)
+                if is_thinking:
+                    chat.append_thinking(self._current_assistant_widget, token)
+                else:
+                    if self._current_assistant_widget._in_thinking:
+                        self._current_assistant_widget.end_thinking()
+                    chat.append_to_assistant(self._current_assistant_widget, token)
             self._gen_token_count += 1
             tokens_consumed += 1
 
@@ -671,6 +686,13 @@ class LiahonaApp(App):
             return
         self._orthogonalize = not self._orthogonalize
         self._refresh_left_panel()
+
+    def action_toggle_thinking(self) -> None:
+        if not supports_thinking(self._session._tokenizer):
+            self._chat_panel.add_system_message("This model does not support thinking mode.")
+            return
+        self._thinking = not self._thinking
+        self._refresh_gen_config()
 
     def action_temp_down(self) -> None:
         if self._focused_panel_idx != 0:

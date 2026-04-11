@@ -11,7 +11,7 @@ from typing import Callable, Iterator
 import torch
 
 from liahona.datasource import DataSource
-from liahona.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered
+from liahona.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
 from liahona.hooks import SteeringManager
 from liahona.model import load_model, get_layers, get_model_info
 from liahona.monitor import TraitMonitor
@@ -421,7 +421,7 @@ class LiahonaSession:
 
     # -- Generation helpers --
 
-    def _prepare_input(self, input, raw: bool = False) -> tuple[list[dict], torch.Tensor]:
+    def _prepare_input(self, input, raw: bool = False, thinking: bool = False) -> tuple[list[dict], torch.Tensor]:
         if isinstance(input, str):
             messages = list(self._history) + [{"role": "user", "content": input}]
         elif isinstance(input, list):
@@ -435,6 +435,7 @@ class LiahonaSession:
         else:
             input_ids = build_chat_input(
                 self._tokenizer, messages, self.config.system_prompt,
+                thinking=thinking,
             ).to(self._device)
         return messages, input_ids
 
@@ -472,6 +473,7 @@ class LiahonaSession:
         alphas: dict[str, float] | None = None,
         orthogonalize: bool = False,
         raw: bool = False,
+        thinking: bool = False,
     ) -> GenerationResult:
         """Blocking generation.
 
@@ -481,16 +483,18 @@ class LiahonaSession:
                     registered vector names. None = no steering.
             orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
             raw: skip chat template, tokenize input string directly.
+            thinking: enable thinking/reasoning mode for models that support it.
         """
         if not self._gen_lock.acquire(blocking=False):
             raise RuntimeError("Generation already in progress")
         try:
-            return self._generate_blocking(input, alphas, orthogonalize, raw)
+            return self._generate_blocking(input, alphas, orthogonalize, raw, thinking)
         finally:
             self._gen_lock.release()
 
-    def _generate_blocking(self, input, alphas, orthogonalize, raw=False) -> GenerationResult:
-        messages, input_ids = self._prepare_input(input, raw=raw)
+    def _generate_blocking(self, input, alphas, orthogonalize, raw=False, thinking=False) -> GenerationResult:
+        use_thinking = thinking and supports_thinking(self._tokenizer)
+        messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
         self._gen_state.reset()
         if self._monitor:
             self._monitor.reset_history()
@@ -504,7 +508,7 @@ class LiahonaSession:
             start = time.monotonic()
             generated_ids = generate_steered(
                 self._model, self._tokenizer, input_ids,
-                self.config, self._gen_state,
+                self.config, self._gen_state, thinking=use_thinking,
             )
             elapsed = time.monotonic() - start
         finally:
@@ -513,7 +517,9 @@ class LiahonaSession:
 
         token_count = len(generated_ids)
         tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
-        text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # Strip thinking tokens — only decode the response portion
+        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
+        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
         if self._monitor and self._monitor.probe_names and text.strip():
             self._monitor.measure(
@@ -544,6 +550,7 @@ class LiahonaSession:
         alphas: dict[str, float] | None = None,
         orthogonalize: bool = False,
         raw: bool = False,
+        thinking: bool = False,
     ) -> Iterator[TokenEvent]:
         """Streaming generation. Yields TokenEvent per token.
 
@@ -552,18 +559,20 @@ class LiahonaSession:
             alphas: steering vector alphas to apply. None = no steering.
             orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
             raw: skip chat template, tokenize input string directly.
+            thinking: enable thinking/reasoning mode for models that support it.
         """
         if not self._gen_lock.acquire(blocking=False):
             raise RuntimeError("Generation already in progress")
         try:
-            yield from self._generate_streaming(input, alphas, orthogonalize, raw)
+            yield from self._generate_streaming(input, alphas, orthogonalize, raw, thinking)
         finally:
             self._gen_lock.release()
 
-    def _generate_streaming(self, input, alphas, orthogonalize, raw=False) -> Iterator[TokenEvent]:
+    def _generate_streaming(self, input, alphas, orthogonalize, raw=False, thinking=False) -> Iterator[TokenEvent]:
         import queue as _queue
 
-        messages, input_ids = self._prepare_input(input, raw=raw)
+        use_thinking = thinking and supports_thinking(self._tokenizer)
+        messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
         self._gen_state.reset()
         if self._monitor:
             self._monitor.reset_history()
@@ -585,7 +594,8 @@ class LiahonaSession:
                 ids = generate_steered(
                     self._model, self._tokenizer, input_ids,
                     self.config, self._gen_state,
-                    on_token=lambda tok: token_queue.put(tok),
+                    on_token=lambda tok, thinking: token_queue.put((tok, thinking)),
+                    thinking=use_thinking,
                 )
                 generated_ids.extend(ids)
             except Exception as e:
@@ -600,20 +610,21 @@ class LiahonaSession:
         try:
             while True:
                 try:
-                    tok_str = token_queue.get(timeout=0.05)
+                    item = token_queue.get(timeout=0.05)
                 except _queue.Empty:
                     if gen_done.is_set():
                         while True:
                             try:
-                                tok_str = token_queue.get_nowait()
+                                item = token_queue.get_nowait()
                             except _queue.Empty:
                                 break
-                            if tok_str is None:
+                            if item is None:
                                 break
+                            tok_str, is_thinking = item
                             event = TokenEvent(
                                 text=tok_str,
                                 token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                                index=idx, readings=None,
+                                index=idx, readings=None, thinking=is_thinking,
                             )
                             token_events.append(event)
                             yield event
@@ -621,13 +632,14 @@ class LiahonaSession:
                         break
                     continue
 
-                if tok_str is None:
+                if item is None:
                     break
 
+                tok_str, is_thinking = item
                 event = TokenEvent(
                     text=tok_str,
                     token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                    index=idx, readings=None,
+                    index=idx, readings=None, thinking=is_thinking,
                 )
                 token_events.append(event)
                 yield event
@@ -644,7 +656,9 @@ class LiahonaSession:
         elapsed = time.monotonic() - start
         token_count = len(token_events)
         tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
-        text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # Strip thinking tokens — only decode the response portion
+        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
+        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
         if self._monitor and self._monitor.probe_names and text.strip():
             self._monitor.measure(

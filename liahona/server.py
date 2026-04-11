@@ -23,6 +23,7 @@ from liahona.session import LiahonaSession
 class SteerParams(BaseModel):
     alphas: dict[str, float] = Field(default_factory=dict)
     orthogonalize: bool = False
+    thinking: bool = False
 
 
 class ChatMessage(BaseModel):
@@ -135,6 +136,10 @@ def _ortho(steer_params: SteerParams | None) -> bool:
     return steer_params.orthogonalize if steer_params else False
 
 
+def _thinking(steer_params: SteerParams | None) -> bool:
+    return steer_params.thinking if steer_params else False
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -199,6 +204,7 @@ def _register_routes(app: FastAPI) -> None:
     async def chat_completions(req: ChatCompletionRequest):
         alphas = _resolve_alphas(req.steer, app.state.default_alphas)
         ortho = _ortho(req.steer)
+        think = _thinking(req.steer)
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
         model_id = session.model_info.get("model_id", "unknown")
@@ -207,12 +213,12 @@ def _register_routes(app: FastAPI) -> None:
         try:
             if req.stream:
                 return StreamingResponse(
-                    _stream_chat(session, messages, alphas, ortho, rid, model_id, orig),
+                    _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig),
                     media_type="text/event-stream",
                 )
             # Non-streaming
             try:
-                result = session.generate(messages, alphas=alphas, orthogonalize=ortho)
+                result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
             except RuntimeError as e:
                 if "already in progress" in str(e):
                     return _error(409, str(e), "conflict")
@@ -245,10 +251,15 @@ def _register_routes(app: FastAPI) -> None:
                 return _error(409, str(e), "conflict")
             raise
 
-    async def _stream_chat(session, messages, alphas, ortho, rid, model_id, orig_config):
+    async def _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig_config):
         try:
             try:
-                for event in session.generate_stream(messages, alphas=alphas, orthogonalize=ortho):
+                for event in session.generate_stream(messages, alphas=alphas, orthogonalize=ortho, thinking=think):
+                    delta: dict[str, str] = {}
+                    if event.thinking:
+                        delta["reasoning_content"] = event.text
+                    else:
+                        delta["content"] = event.text
                     chunk = {
                         "id": rid,
                         "object": "chat.completion.chunk",
@@ -257,7 +268,7 @@ def _register_routes(app: FastAPI) -> None:
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"content": event.text},
+                                "delta": delta,
                                 "finish_reason": None,
                             }
                         ],

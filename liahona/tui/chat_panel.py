@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Static, Input, Markdown
+from textual.widgets import Static, Input, Markdown, Collapsible
 from textual.widget import Widget
 from textual.message import Message
 
@@ -14,22 +14,55 @@ class _AssistantMessage(Vertical):
 
     During streaming, updates go to a cheap Static widget (no parse).
     On finalize(), the Static is hidden and a full Markdown render is shown.
+    Thinking tokens (from models like Qwen 3.5) render in a collapsible
+    section above the main response.
     """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.chat_text: str = ""
+        self.thinking_text: str = ""
+        self._in_thinking: bool = False
+        self._thinking_block: Collapsible | None = None
+        self._thinking_stream: Static | None = None
+        self._thinking_md: Markdown | None = None
         self._stream: Static | None = None
         self._md: Markdown | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("[bold ansi_green]Assistant:[/]")
+        with Collapsible(title="Thinking...", id="thinking-block", classes="hidden"):
+            yield Static("", id="thinking-text")
+            yield Markdown(id="thinking-md", classes="hidden")
         yield Static("", id="stream-text")
         yield Markdown(classes="hidden")
 
     def on_mount(self) -> None:
+        self._thinking_block = self.query_one("#thinking-block", Collapsible)
+        self._thinking_stream = self.query_one("#thinking-text", Static)
+        self._thinking_md = self.query_one("#thinking-md", Markdown)
         self._stream = self.query_one("#stream-text", Static)
         self._md = self.query_one(Markdown)
+
+    def update_thinking(self, text: str) -> None:
+        self.thinking_text = text
+        if self._thinking_block is not None and self._thinking_block.has_class("hidden"):
+            self._thinking_block.remove_class("hidden")
+            self._thinking_block.collapsed = False
+            self._in_thinking = True
+        if self._thinking_stream is not None:
+            self._thinking_stream.update(text)
+
+    def end_thinking(self) -> None:
+        self._in_thinking = False
+        if self._thinking_block is not None:
+            # Swap to rendered Markdown and collapse immediately
+            if self._thinking_md is not None and self.thinking_text:
+                self._thinking_md.update(self.thinking_text)
+                self._thinking_md.remove_class("hidden")
+            if self._thinking_stream is not None:
+                self._thinking_stream.add_class("hidden")
+            self._thinking_block.collapsed = True
 
     def update_content(self, text: str) -> None:
         self.chat_text = text
@@ -38,6 +71,13 @@ class _AssistantMessage(Vertical):
 
     def finalize(self) -> None:
         """Switch from streaming Static to rendered Markdown."""
+        if self._thinking_block is not None and self.thinking_text:
+            self._thinking_block.collapsed = True
+            if self._thinking_md is not None:
+                self._thinking_md.update(self.thinking_text)
+                self._thinking_md.remove_class("hidden")
+            if self._thinking_stream is not None:
+                self._thinking_stream.add_class("hidden")
         if self._md is not None and self.chat_text:
             self._md.update(self.chat_text)
             self._md.remove_class("hidden")
@@ -114,6 +154,10 @@ class ChatPanel(Widget):
     def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
         widget.chat_text += token
         widget.update_content(widget.chat_text)
+
+    def append_thinking(self, widget: _AssistantMessage, token: str) -> None:
+        widget.thinking_text += token
+        widget.update_thinking(widget.thinking_text)
 
     def scroll_to_bottom(self) -> None:
         """Scroll the chat log to the bottom. Call once after a batch of token updates."""

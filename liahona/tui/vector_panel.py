@@ -28,6 +28,7 @@ class LeftPanel(Widget):
         self._vectors: list[dict] = []
         self._selected_idx: int = 0
         self._orthogonalize: bool = False
+        self._thinking: bool | None = None  # None = model doesn't support it
         self._temperature: float = 1.0
         self._top_p: float = 0.9
         self._max_tokens: int = 1024
@@ -66,7 +67,7 @@ class LeftPanel(Widget):
         yield Static("[bold]KEYS[/]", classes="section-header")
         yield Static(
             "[dim]⇥ focus panels · ⎋ stop gen\n"
-            "⌃R regen · ⌃A A/B\n"
+            "⌃R regen · ⌃A A/B · ⌃T think\n"
             "⌃Q quit\n"
             "── ⇥ to side panel first ──\n"
             "↑/↓ navigate · ↩ select\n"
@@ -85,11 +86,13 @@ class LeftPanel(Widget):
         self._render_vectors()
 
     def update_gen_config(self, temperature: float, top_p: float,
-                          max_tokens: int, system_prompt: str | None) -> None:
+                          max_tokens: int, system_prompt: str | None,
+                          thinking: bool | None = None) -> None:
         self._temperature = temperature
         self._top_p = top_p
         self._max_tokens = max_tokens
         self._system_prompt = system_prompt
+        self._thinking = thinking
         self._render_gen_config()
 
     def select_next(self) -> None:
@@ -186,10 +189,15 @@ class LeftPanel(Widget):
 
         sys_str = self._system_prompt[:15] + "..." if self._system_prompt and len(self._system_prompt) > 15 else (self._system_prompt or "(none)")
 
-        gen.update(
-            f"Temp  {self._temperature:.2f} [dim]{t_bar}[/] [dim]\\[/][/]\n"
-            f"Top-p {self._top_p:.2f} [dim]{p_bar}[/] [dim]{{/}}[/]\n"
-            f"Max   {self._max_tokens} tok       [dim]/max[/]\n"
-            f"Sys   [dim]{sys_str}[/]    [dim]/sys[/]\n"
-            f"[dim]type /help for commands[/]"
-        )
+        lines = [
+            f"Temp  {self._temperature:.2f} [dim]{t_bar}[/] [dim]\\[/][/]",
+            f"Top-p {self._top_p:.2f} [dim]{p_bar}[/] [dim]{{/}}[/]",
+            f"Max   {self._max_tokens} tok       [dim]/max[/]",
+        ]
+        if self._thinking is not None:
+            think_str = "ON" if self._thinking else "OFF"
+            lines.append(f"Think {think_str}            [dim]⌃T[/]")
+        lines.append(f"Sys   [dim]{sys_str}[/]    [dim]/sys[/]")
+        lines.append("[dim]type /help for commands[/]")
+
+        gen.update("\n".join(lines))

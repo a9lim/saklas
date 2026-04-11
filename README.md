@@ -47,6 +47,8 @@ with LiahonaSession("google/gemma-2-2b-it", device="cuda") as session:
 
 **Orthogonalization is per-call.** `session.generate(input, alphas={...}, orthogonalize=True)` applies Gram-Schmidt to the active vectors for that generation only.
 
+**Thinking mode is per-call.** For models that support it (Qwen 3.5, QwQ), `session.generate(input, thinking=True)` enables the model's built-in reasoning trace. Thinking tokens are separated from the response — `result.text` contains only the final answer, while streaming via `generate_stream` yields `TokenEvent` objects with `thinking=True` for the reasoning trace.
+
 **Multiple vectors compose naturally:**
 
 ```python
@@ -94,8 +96,12 @@ session.vectors                    # dict of registered profiles
 
 # Generation
 result = session.generate("prompt", alphas={"name": 0.15}, orthogonalize=False)
+result = session.generate("prompt", thinking=True)  # enable reasoning trace
 for token in session.generate_stream("prompt", alphas={"name": 0.15}):
-    print(token.text, end="", flush=True)
+    if token.thinking:
+        print(f"[think] {token.text}", end="", flush=True)
+    else:
+        print(token.text, end="", flush=True)
 
 # Monitoring
 session.monitor("honest")                   # curated probe
@@ -179,7 +185,7 @@ print(resp.choices[0].message.content)
 resp = client.chat.completions.create(
     model="google/gemma-2-9b-it",
     messages=[{"role": "user", "content": "Hello!"}],
-    extra_body={"steer": {"alphas": {"cheerful": 0.4}, "orthogonalize": True}},
+    extra_body={"steer": {"alphas": {"cheerful": 0.4}, "orthogonalize": True, "thinking": True}},
 )
 
 # Streaming
@@ -281,6 +287,7 @@ liahona meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 | `Enter` | Toggle vector on/off |
 | `Backspace` / `Delete` | Remove selected vector or probe |
 | `Ctrl+O` | Toggle orthogonalization |
+| `Ctrl+T` | Toggle thinking mode (models that support it) |
 | `Ctrl+A` | A/B compare (steered vs unsteered) |
 | `Ctrl+R` | Regenerate last response (interrupts if generating) |
 | `Ctrl+S` | Cycle trait sort mode |
