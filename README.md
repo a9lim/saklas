@@ -130,11 +130,11 @@ Adding a new architecture requires one entry in `model.py:_LAYER_ACCESSORS`.
 
 ## Steering method
 
-**Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer via per-layer hooks. Computes pos-neg differences, then extracts the first principal component per layer via batched PCA (SVD). Each layer is scored by explained variance ratio; layers below the mean score are pruned. The result is a multi-layer profile — no manual layer selection required. The `/steer` and `/probe` commands generate contrastive pairs automatically using the loaded model, or use curated datasets for built-in probe concepts.
+**Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer via per-layer hooks. Computes pos-neg differences, then extracts the first principal component per layer via batched PCA (SVD). Each layer is scored by explained variance ratio. The result is a multi-layer profile covering all layers — no manual layer selection or pruning. Scores weight each layer's contribution during steering and monitoring. The `/steer` and `/probe` commands generate contrastive pairs automatically using the loaded model, or use curated datasets for built-in probe concepts.
 
 ## How the monitor works
 
-Each probe monitors its peak layer — the layer with the strongest contrastive signal in its profile. Probes are grouped by peak layer so there's one forward hook per distinct layer, each with its own probe sub-matrix. Per hook: a single matrix multiply computes cosine similarity between the last token's hidden state and all probes assigned to that layer. Results accumulate in a GPU buffer and batch-transfer to CPU on the TUI poll cycle (~15 FPS). The throughput target is >=85% of vanilla generation speed with steering and monitoring active.
+Each probe monitors all layers in its profile, weighted by extraction score. Probes are grouped by layer — one forward hook per distinct layer across all probe profiles, each with its own probe sub-matrix. Per hook: a single matrix multiply computes cosine similarity between the last token's hidden state and all probes at that layer, scaled by the probe's score at that layer. Results accumulate in a shared GPU buffer and batch-transfer to CPU on the TUI poll cycle (~15 FPS), where they're divided by total weight to produce a per-probe weighted average. The throughput target is >=85% of vanilla generation speed with steering and monitoring active.
 
 ## Tests
 
