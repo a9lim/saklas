@@ -49,20 +49,10 @@ class TestSteering:
         profile = session.extract([("I am happy", "I am sad")])
         assert isinstance(profile, dict)
         assert all(isinstance(k, int) for k in profile)
-        session.steer("happy", profile, alpha=1.5)
+        session.steer("happy", profile)
         assert "happy" in session.vectors
-        assert session.vectors["happy"]["alpha"] == 1.5
-        assert session.vectors["happy"]["enabled"] is True
-
-    def test_set_alpha(self, session):
-        session.set_alpha("happy", 2.0)
-        assert session.vectors["happy"]["alpha"] == 2.0
-
-    def test_toggle(self, session):
-        session.toggle("happy")
-        assert session.vectors["happy"]["enabled"] is False
-        session.toggle("happy")
-        assert session.vectors["happy"]["enabled"] is True
+        # vectors now returns name -> profile
+        assert isinstance(session.vectors["happy"], dict)
 
     def test_unsteer(self, session):
         session.unsteer("happy")
@@ -94,13 +84,14 @@ class TestLifecycle:
             assert s.model_info["model_type"] == "gemma2"
 
 class TestGeneration:
-    def test_generate_blocking_string(self, session):
+    def test_generate_unsteered(self, session):
         result = session.generate("Say hello in one word.")
         assert isinstance(result, GenerationResult)
         assert len(result.text) > 0
         assert result.token_count > 0
         assert result.tok_per_sec > 0
         assert result.elapsed > 0
+        assert result.vectors == {}  # no alphas = no steering snapshot
 
     def test_generate_blocking_messages(self, session):
         result = session.generate([
@@ -116,24 +107,42 @@ class TestGeneration:
         assert session.history[0]["role"] == "user"
         assert session.history[1]["role"] == "assistant"
 
+    def test_generate_with_alphas(self, session):
+        profile = session.extract([("formal", "casual")])
+        session.steer("formal", profile)
+        result = session.generate("Hello.", alphas={"formal": 1.0})
+        assert result.vectors == {"formal": 1.0}
+        session.unsteer("formal")
+
     def test_generate_with_probes(self, session):
         session.clear_history()
         result = session.generate("Tell me something exciting!")
         if session.probes:
             assert isinstance(result.readings, dict)
 
-    def test_generate_snapshots_vectors(self, session):
-        profile = session.extract([("formal", "casual")])
-        session.steer("formal", profile, alpha=1.0)
-        result = session.generate("Hello.")
-        assert "formal" in result.vectors
-        assert result.vectors["formal"] == 1.0
-        session.unsteer("formal")
-
     def test_last_result(self, session):
         session.clear_history()
         result = session.generate("Hello.")
         assert session.last_result is result
+
+    def test_ab_comparison(self, session):
+        """A/B test: same prompt, with and without steering."""
+        profile = session.extract([("I am happy", "I am sad")])
+        session.steer("happy", profile)
+        session.clear_history()
+        steered = session.generate("Describe a sunset.", alphas={"happy": 2.0})
+        session.clear_history()
+        unsteered = session.generate("Describe a sunset.")
+        assert steered.vectors == {"happy": 2.0}
+        assert unsteered.vectors == {}
+        # Both should produce text
+        assert len(steered.text) > 0
+        assert len(unsteered.text) > 0
+        session.unsteer("happy")
+
+    def test_unknown_vector_raises(self, session):
+        with pytest.raises(KeyError, match="nonexistent"):
+            session.generate("Hello.", alphas={"nonexistent": 1.0})
 
 class TestStreamingGeneration:
     def test_generate_stream(self, session):
@@ -146,3 +155,12 @@ class TestStreamingGeneration:
         assert all(isinstance(t.text, str) for t in tokens)
         assert session.last_result is not None
         assert session.last_result.token_count == len(tokens)
+
+    def test_stream_with_alphas(self, session):
+        profile = session.extract([("I am happy", "I am sad")])
+        session.steer("happy", profile)
+        session.clear_history()
+        tokens = list(session.generate_stream("Hello.", alphas={"happy": 1.5}))
+        assert len(tokens) > 0
+        assert session.last_result.vectors == {"happy": 1.5}
+        session.unsteer("happy")
