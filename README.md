@@ -6,7 +6,7 @@ Load a model, extract steering vectors, adjust them live, and watch how activati
 
 ## What it does
 
-- **Activation steering**: Extract and inject steering vectors (ActAdd or Contrastive Activation Addition) into any layer during generation. Adjust strength in real time.
+- **Activation steering**: Extract and inject steering vectors via contrastive activation addition across all layers during generation. Adjust strength in real time.
 - **Trait monitoring**: Track cosine similarity between model activations and 28 probe vectors across 5 categories (emotion, personality, safety, cultural, gender) as tokens are generated. Visualized as live bars, sparklines, and running statistics.
 - **Custom vectors and probes**: Extract your own steering vectors or monitoring probes from any concept via `/steer` and `/probe` commands — uses LLM-generated contrastive pairs or falls back to curated datasets.
 - **A/B comparison**: Generate the same prompt with and without steering to see the effect side-by-side.
@@ -62,17 +62,17 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 ### Layout
 
 ```
-+------------------+----------------------------------+------------------+
-|  VECTORS         |                                  |  TRAIT MONITOR   |
-|  > happy caa L21 |          Chat                    |  Emotion         |
-|    formal caa L18|                                  |    happy #### .42|
-|                  |                                  |    sad   ##- -.15|
-|  CONFIG          |                                  |  Personality     |
-|  temp ####- 0.7  |                                  |    honest ### .31|
-|  top-p #### 0.9  |                                  |    verbose ##-.18|
-|                  |                                  |                  |
-|  KEYS            |  Type a message...               |                  |
-+------------------+----------------------------------+------------------+
++--------------------+----------------------------------+------------------+
+|  VECTORS           |                                  |  TRAIT MONITOR   |
+|  > happy 5L pk21   |          Chat                    |  Emotion         |
+|    formal 3L pk18  |                                  |    happy #### .42|
+|                    |                                  |    sad   ##- -.15|
+|  CONFIG            |                                  |  Personality     |
+|  temp ####- 0.7    |                                  |    honest ### .31|
+|  top-p #### 0.9    |                                  |    verbose ##-.18|
+|                    |                                  |                  |
+|  KEYS              |  Type a message...               |                  |
++--------------------+----------------------------------+------------------+
 ```
 
 ### Keybindings
@@ -94,10 +94,10 @@ steer meta-llama/Llama-3.1-8B-Instruct --probes emotion personality safety
 
 | Command | Description |
 |---------|-------------|
-| `/steer "concept" [layer] [alpha]` | Steering vector via contrastive pairs (e.g. `/steer "happy" 18 2.5`) |
-| `/steer "concept" - "baseline" [layer] [alpha]` | Steering with explicit baseline (e.g. `/steer "formal" - "casual"`) |
-| `/probe "concept" [layer]` | Add a monitoring probe (e.g. `/probe "sarcastic"`) |
-| `/probe "concept" - "baseline" [layer]` | Probe with explicit baseline |
+| `/steer "concept" [alpha]` | Steering vector via contrastive pairs (e.g. `/steer "happy" 2.5`) |
+| `/steer "concept" - "baseline" [alpha]` | Steering with explicit baseline (e.g. `/steer "formal" - "casual"`) |
+| `/probe "concept"` | Add a monitoring probe (e.g. `/probe "sarcastic"`) |
+| `/probe "concept" - "baseline"` | Probe with explicit baseline |
 | `/clear` | Clear chat history and reset probe stats |
 | `/rewind` | Undo last user message and its response |
 | `/sys <prompt>` | Set system prompt |
@@ -128,15 +128,13 @@ Llama (1-4), Mistral, Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3), Qwen2
 
 Adding a new architecture requires one entry in `model.py:_LAYER_ACCESSORS`.
 
-## Steering methods
+## Steering method
 
-**ActAdd** (Turner et al., 2023): Difference between a concept prompt and a contrastive baseline at a target layer. Two forward passes.
-
-**Contrastive Activation Addition** (Rimsky et al., 2023): Averages over multiple matched positive/negative prompt pairs for more robust vectors. The `/steer` and `/probe` commands generate these pairs automatically using the loaded model, or use curated datasets for built-in probe concepts.
+**Contrastive Activation Addition** (Rimsky et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer via per-layer hooks. Computes pos-neg differences, then extracts the first principal component per layer via batched SVD. Each layer is scored by explained variance ratio; layers below the mean score are pruned. The result is a multi-layer profile — no manual layer selection required. The `/steer` and `/probe` commands generate contrastive pairs automatically using the loaded model, or use curated datasets for built-in probe concepts.
 
 ## How the monitor works
 
-A read-only forward hook at the penultimate layer computes cosine similarity between the last token's hidden state and each probe vector via a single matrix multiply. Results accumulate in a GPU buffer and batch-transfer to CPU on the TUI poll cycle (~15 FPS). The throughput target is >=85% of vanilla generation speed with steering and monitoring active.
+Each probe monitors its peak layer — the layer with the strongest contrastive signal in its profile. Probes are grouped by peak layer so there's one forward hook per distinct layer, each with its own probe sub-matrix. Per hook: a single matrix multiply computes cosine similarity between the last token's hidden state and all probes assigned to that layer. Results accumulate in a GPU buffer and batch-transfer to CPU on the TUI poll cycle (~15 FPS). The throughput target is >=85% of vanilla generation speed with steering and monitoring active.
 
 ## Tests
 
