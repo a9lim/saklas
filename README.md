@@ -1,5 +1,9 @@
 # liahona
 
+[![PyPI](https://img.shields.io/pypi/v/liahona-ai)](https://pypi.org/project/liahona-ai/)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/liahona-ai/)
+
 Activation steering and trait monitoring for HuggingFace transformer models. Extract steering vectors, apply them during generation with per-call alpha control, and monitor how activations shift across behavioral probes.
 
 Three interfaces: a **Python API** for scripted experiments and batch sweeps, an **OpenAI-compatible API server** for drop-in use with any OpenAI SDK client, and a **terminal UI** for interactive exploration.
@@ -319,6 +323,14 @@ Concepts matching built-in probe names use curated datasets automatically. Other
 Probes are extracted on first run and cached per model under `liahona/probes/cache/`.
 
 ## Install
+
+```bash
+pip install liahona-ai             # from PyPI
+pip install liahona-ai[serve]      # + fastapi + uvicorn (for API server)
+pip install liahona-ai[research]   # + datasets + pandas (for API)
+```
+
+### From source
 
 ```bash
 pip install -e .                   # base install
