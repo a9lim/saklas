@@ -35,10 +35,10 @@ Four layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 - `results.py` — `GenerationResult`, `TokenEvent`, `ProbeReadings` dataclasses with `to_dict()`. `ResultCollector` accumulates results for batch export (dicts, JSONL, CSV, DataFrame).
 
 ### Generation loop
-- `generation.py` — Token-by-token with KV cache. Top-p via `torch.topk` (k capped at 1024). `torch.inference_mode()` wraps entire loop.
+- `generation.py` — Token-by-token with KV cache. Top-p via `torch.topk` (k capped at 1024). `torch.inference_mode()` wraps entire loop. MPS sync at end of generation prevents Metal command buffer reuse crashes. The `None` end-of-generation sentinel is **not** emitted by `generate_steered` — the TUI's `_generate` closure puts it on the queue after updating `_messages`, so pending actions see the final conversation state.
 
 ### TUI layer (Textual)
-- `tui/app.py` — Thin frontend over `SteerSession`. Owns local alpha/enabled/orthogonalize state, passes through to session at generation time. Polls at ~15 FPS. Commands: `/steer`, `/probe`, `/clear`, `/rewind`, `/sys`, `/temp`, `/top-p`, `/max`, `/help`.
+- `tui/app.py` — Thin frontend over `SteerSession`. Owns local alpha/enabled/orthogonalize state, passes through to session at generation time. Polls at ~15 FPS. Commands: `/steer`, `/probe`, `/clear`, `/rewind`, `/sys`, `/temp`, `/top-p`, `/max`, `/help`. Mid-generation interruption: any action that conflicts with generation (Ctrl+R, new message, `/steer`, `/probe`, `/clear`, `/rewind`) stops the current generation and defers execution via `_pending_action`; `_poll_generation` dispatches the pending action once the worker thread finishes and the `None` sentinel is consumed.
 - `tui/vector_panel.py` — Model info, vectors with alpha bars, generation config.
 - `tui/chat_panel.py` — Message log, status bar, input field.
 - `tui/trait_panel.py` — Per-probe bars + sparklines, sort modes.

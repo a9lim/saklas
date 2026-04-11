@@ -63,6 +63,7 @@ class SteerApp(App):
         self._poll_timer: Timer | None = None
         self._last_prompt: str | None = None
         self._ab_in_progress: bool = False
+        self._pending_action: tuple | None = None  # ("regenerate",) or ("submit", text)
 
         self._focused_panel_idx: int = 1  # Start with chat focused
 
@@ -221,6 +222,12 @@ class SteerApp(App):
             self._handle_command(text)
             return
         self._last_prompt = text
+        if self._session._gen_state.is_generating.is_set():
+            # Queue the message — it will be submitted once the current
+            # generation finishes (see _poll_generation).
+            self._pending_action = ("submit", text)
+            self._session._gen_state.request_stop()
+            return
         self._messages.append({"role": "user", "content": text})
         self._start_generation()
 
@@ -246,11 +253,19 @@ class SteerApp(App):
                 return
             self._handle_probe(parts[1])
         elif cmd == "/clear":
+            if self._session._gen_state.is_generating.is_set():
+                self._pending_action = ("clear",)
+                self._session._gen_state.request_stop()
+                return
             self._session.clear_history()
             chat.clear_log()
             self._trait_panel.update_values({}, {}, {})
             chat.add_system_message("Chat history cleared.")
         elif cmd == "/rewind":
+            if self._session._gen_state.is_generating.is_set():
+                self._pending_action = ("rewind",)
+                self._session._gen_state.request_stop()
+                return
             if not self._messages:
                 chat.add_system_message("Nothing to rewind.")
             else:
@@ -346,7 +361,8 @@ class SteerApp(App):
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
             return
         if self._session._gen_state.is_generating.is_set():
-            chat.add_system_message("Cannot extract vectors during generation. Stop generation first.")
+            self._pending_action = ("steer", text)
+            self._session._gen_state.request_stop()
             return
         try:
             concept, baseline, alpha = self._parse_args(text, include_alpha=True)
@@ -378,7 +394,8 @@ class SteerApp(App):
     def _handle_probe(self, text: str) -> None:
         chat = self._chat_panel
         if self._session._gen_state.is_generating.is_set():
-            chat.add_system_message("Cannot extract vectors during generation. Stop generation first.")
+            self._pending_action = ("probe", text)
+            self._session._gen_state.request_stop()
             return
         try:
             concept, baseline = self._parse_args(text)
@@ -440,11 +457,6 @@ class SteerApp(App):
             self._session._gen_state.request_stop()
 
     def _start_generation(self) -> None:
-        if self._session._gen_state.is_generating.is_set():
-            self._session._gen_state.request_stop()
-            self._chat_panel.add_system_message("Stopping current generation. Please resubmit.")
-            return
-
         self._session._gen_state.reset()
         if self._session._monitor:
             self._session._monitor.reset_history()
@@ -493,6 +505,10 @@ class SteerApp(App):
             finally:
                 if alphas:
                     self._session._clear_steering()
+                # Signal end-of-generation *after* _messages is updated so
+                # pending actions (regenerate / queued submit) see the final
+                # conversation state.
+                self._session._gen_state.token_queue.put(None)
 
         self.run_worker(_generate, thread=True)
 
@@ -516,6 +532,37 @@ class SteerApp(App):
                     if self._last_elapsed > 0.1:
                         self._last_tok_per_sec = self._gen_token_count / self._last_elapsed
                     self._gen_start_time = 0.0
+
+                # Dispatch any queued action from Ctrl+R or mid-gen submit.
+                pending = self._pending_action
+                if pending is not None:
+                    self._pending_action = None
+                    if pending[0] == "regenerate":
+                        # Discard the partial response
+                        if self._messages and self._messages[-1]["role"] == "assistant":
+                            self._messages.pop()
+                        chat.rewind_last_assistant()
+                        self._start_generation()
+                    elif pending[0] == "submit":
+                        self._messages.append({"role": "user", "content": pending[1]})
+                        self._start_generation()
+                    elif pending[0] == "clear":
+                        self._session.clear_history()
+                        chat.clear_log()
+                        self._trait_panel.update_values({}, {}, {})
+                        chat.add_system_message("Chat history cleared.")
+                    elif pending[0] == "rewind":
+                        # Discard the partial response, then rewind
+                        if self._messages and self._messages[-1]["role"] == "assistant":
+                            self._messages.pop()
+                        chat.rewind_last_assistant()
+                        self._session.rewind()
+                        chat.rewind()
+                        chat.add_system_message("Rewound to before last message.")
+                    elif pending[0] == "steer":
+                        self._handle_steer(pending[1])
+                    elif pending[0] == "probe":
+                        self._handle_probe(pending[1])
                 break
             if self._current_assistant_widget:
                 chat.append_to_assistant(self._current_assistant_widget, token)
@@ -642,6 +689,12 @@ class SteerApp(App):
 
     def action_regenerate(self) -> None:
         if not self._messages:
+            return
+        if self._session._gen_state.is_generating.is_set():
+            # Stop the current generation; _poll_generation will pick up
+            # the pending action once the worker thread finishes.
+            self._pending_action = ("regenerate",)
+            self._session._gen_state.request_stop()
             return
         if self._messages[-1]["role"] == "assistant":
             self._messages.pop()

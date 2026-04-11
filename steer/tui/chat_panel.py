@@ -97,6 +97,15 @@ class ChatPanel(Widget):
                 break
         self._log.scroll_end(animate=False)
 
+    def rewind_last_assistant(self) -> None:
+        """Remove the last assistant message widget only."""
+        children = list(self._log.children)
+        for i in range(len(children) - 1, -1, -1):
+            if "assistant-message" in children[i].classes:
+                children[i].remove()
+                break
+        self._log.scroll_end(animate=False)
+
     def add_user_message(self, text: str) -> None:
         container = Vertical(
             Static("[bold ansi_cyan]User:[/]"),

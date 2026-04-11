@@ -198,9 +198,12 @@ def generate_steered(
                     on_token(token_table[token_id] if token_id < _vocab else '')
 
     finally:
+        # Flush MPS command buffers before signalling completion — without
+        # this, a rapid regenerate can submit new work while Metal is still
+        # processing the previous generation's command buffers, triggering
+        # "commit an already committed command buffer".
+        if device.type == "mps":
+            torch.mps.synchronize()
         state.is_generating.clear()
-        # Signal end of generation
-        if on_token:
-            state.token_queue.put(None)
 
     return generated_ids
