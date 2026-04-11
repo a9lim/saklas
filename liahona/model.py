@@ -197,28 +197,30 @@ def load_model(model_id: str, quantize=None, device="auto"):
             config.model_type = fixed_type
             load_kwargs["config"] = config
 
-    # --- load model ---
+    # --- load model (with attention + dtype fallbacks) ---
+    def _try_load():
+        return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        model = _try_load()
     except ValueError as e:
-        if "does not support an attention implementation" in str(e):
-            log.info("attn_implementation %r unsupported, falling back to eager",
-                     load_kwargs.get("attn_implementation"))
-            load_kwargs["attn_implementation"] = "eager"
-            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-        else:
+        if "does not support an attention implementation" not in str(e):
             raise
+        log.info("attn_implementation %r unsupported, falling back to eager",
+                 load_kwargs.get("attn_implementation"))
+        load_kwargs["attn_implementation"] = "eager"
+        try:
+            model = _try_load()
+        except Exception as eager_err:
+            raise eager_err from None  # not chained to the SDPA error
     except Exception:
-        # bf16/fp16 unsupported — fall back through dtypes
-        if quantize is None:
-            fallback = torch.float16 if device == "cuda" else torch.float32
-            quant_kwargs["dtype"] = fallback
-            load_kwargs.update(quant_kwargs)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id, **load_kwargs,
-            )
-        else:
+        if quantize is not None:
             raise
+        # bf16/fp16 unsupported — fall back through dtypes
+        fallback = torch.float16 if device == "cuda" else torch.float32
+        quant_kwargs["dtype"] = fallback
+        load_kwargs.update(quant_kwargs)
+        model = _try_load()
 
     model.requires_grad_(False)
     model.train(False)
