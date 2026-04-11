@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import warnings
+import os
 
-warnings.filterwarnings("ignore", message=".*leaked semaphore.*")
+os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:multiprocessing.resource_tracker")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
