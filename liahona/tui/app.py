@@ -458,6 +458,13 @@ class LiahonaApp(App):
 
     def _start_generation(self) -> None:
         self._session._gen_state.reset()
+        # Mark generating *synchronously* before spawning the worker so that
+        # rapid Ctrl+R presses always see is_generating as set.  Without this,
+        # there is a window between reset() (clears the flag) and the worker
+        # thread's generate_steered() (sets it) where a second Ctrl+R would
+        # think nothing is running and launch a concurrent worker — two threads
+        # doing model forward passes simultaneously causes a segfault.
+        self._session._gen_state.is_generating.set()
         if self._session._monitor:
             self._session._monitor.reset_history()
 
