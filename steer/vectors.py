@@ -109,13 +109,22 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
     if getattr(tokenizer, "chat_template", None) is not None:
-        messages = [
-            {"role": "user", "content": "Continue the conversation."},
-            {"role": "assistant", "content": text},
-        ]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False,
-        )
+        messages = [{"role": "assistant", "content": text}]
+        try:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
+        except Exception:
+            # Some chat templates require a user turn before assistant.
+            # Fall back to minimal filler rather than contaminating with
+            # a semantically loaded prompt.
+            messages = [
+                {"role": "user", "content": "."},
+                {"role": "assistant", "content": text},
+            ]
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
     enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=False)
     ids = enc["input_ids"]
     mask = enc["attention_mask"]
@@ -200,30 +209,48 @@ def extract_contrastive(
         diff_matrix = torch.stack(diffs)  # (N, dim)
 
         if len(diffs) < 2:
-            # Single pair: use raw diff, score by norm relative to max across layers
+            # Single pair: use raw diff, score by norm (normalized to [0,1] below)
             direction = _normalize(diff_matrix.squeeze(0), ref_norm=ref_norm)
             scores[idx] = diff_matrix.squeeze(0).float().norm().item()
             profile[idx] = (direction, scores[idx])
-            continue
+            continue  # scores normalized after the loop
 
         # SVD on uncentered difference matrix
         svd_input = diff_matrix.float().cpu() if diff_matrix.device.type == "mps" else diff_matrix.float()
         _, s, Vh = torch.linalg.svd(svd_input, full_matrices=False)
         direction = Vh[0].to(diff_matrix.device)  # (dim,)
 
-        # Orient so "positive" stays positive
-        mean_diff = diff_matrix.mean(dim=0)
-        if direction @ mean_diff < 0:
+        # Orient so "positive" stays positive: majority vote across pairs.
+        # Mean-diff orientation is fragile — one outlier pair with large
+        # magnitude can flip the entire vector.  Majority vote counts how
+        # many individual diffs agree with the current sign and flips only
+        # when the majority disagree.
+        dots = diff_matrix @ direction  # (N,)
+        if (dots < 0).sum() > (dots > 0).sum():
             direction = -direction
 
         score = (s[0] / s.sum()).item()
         scores[idx] = score
         profile[idx] = (_normalize(direction, ref_norm=ref_norm), score)
 
-    # Threshold: keep layers where score >= 0.1 * max_score
-    max_score = max(scores.values()) if scores else 0.0
-    threshold = max_score * 0.1
-    profile = {idx: v for idx, v in profile.items() if v[1] >= threshold}
+    # Single-pair scores are raw diff norms — normalize to [0, 1] so they're
+    # on the same scale as multi-pair explained-variance-ratio scores.
+    if len(pairs) < 2 and scores:
+        max_raw = max(scores.values())
+        if max_raw > 1e-8:
+            for idx in scores:
+                scores[idx] /= max_raw
+                vec, _ = profile[idx]
+                profile[idx] = (vec, scores[idx])
+
+    # Adaptive threshold: mean score adapts to the distribution shape.
+    # Peaked (one dominant layer): mean is low, keeps just the peak.
+    # Flat (signal spread evenly): mean ≈ each score, keeps ~half.
+    # The fixed 0.1 * max approach over-prunes flat distributions and
+    # under-prunes peaked ones.
+    if scores:
+        threshold = sum(scores.values()) / len(scores)
+        profile = {idx: v for idx, v in profile.items() if v[1] >= threshold}
 
     return profile
 
