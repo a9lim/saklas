@@ -109,7 +109,7 @@ def _load_text_from_multimodal(
     from safetensors.torch import load_file
     from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
 
-    model = AutoModelForCausalLM.from_config(text_config, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_config(text_config, dtype=dtype)
 
     index_path = cached_file(model_id, SAFE_WEIGHTS_INDEX_NAME)
     model_dir = os.path.dirname(index_path)

@@ -311,8 +311,12 @@ def extract_contrastive(
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
         for idx in range(n_layers):
-            diffs_per_layer[idx].append(pos_all[idx] - neg_all[idx])
-            norm_sums[idx] += pos_all[idx].norm() + neg_all[idx].norm()
+            # Cast to float32 before differencing — fp16 subtraction
+            # loses precision for close vectors, producing degenerate
+            # diff matrices that cause LAPACK SVD errors (SLASCL).
+            p, n = pos_all[idx].float(), neg_all[idx].float()
+            diffs_per_layer[idx].append(p - n)
+            norm_sums[idx] += p.norm() + n.norm()
 
     # Per-layer: compute direction and score
     profile: dict[int, tuple[torch.Tensor, float]] = {}
