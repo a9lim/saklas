@@ -98,7 +98,7 @@ def _error(status: int, message: str, error_type: str = "error") -> JSONResponse
 
 
 def _probe_reading_dict(session: LiahonaSession) -> dict[str, Any]:
-    readings = session._build_readings()
+    readings = session.build_readings()
     out: dict[str, Any] = {}
     for name, r in readings.items():
         out[name] = {"mean": r.mean, "std": r.std, "min": r.min, "max": r.max}

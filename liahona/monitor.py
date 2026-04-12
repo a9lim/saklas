@@ -36,6 +36,19 @@ class TraitMonitor:
         # Set after measure() — signals TUI to refresh
         self._pending = False
 
+    @property
+    def profiles(self) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
+        """Probe profiles: name -> {layer_idx: (vector, score)}."""
+        return dict(self._raw_profiles)
+
+    @property
+    def layer_means(self) -> dict[int, torch.Tensor]:
+        return dict(self._layer_means)
+
+    @layer_means.setter
+    def layer_means(self, value: dict[int, torch.Tensor]) -> None:
+        self._layer_means = dict(value) if value else {}
+
     def measure(self, model, tokenizer, layers, text: str, device=None):
         """Run one forward pass over *text* and compute probe similarities.
 
@@ -64,7 +77,7 @@ class TraitMonitor:
                 if mean is not None:
                     h = h - mean.to(h.device).float()
                 v = vec.to(h.device).float()
-                cos = (h @ v) / (h.norm().clamp(min=1e-8) * v.norm().clamp(min=1e-8))
+                cos = (h @ v) / h.norm().clamp(min=1e-8)
                 weighted_sim += score * cos.item()
             total_w = max(total_w, 1e-8)
             sims[name] = weighted_sim / total_w

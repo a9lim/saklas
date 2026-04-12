@@ -129,7 +129,8 @@ class LiahonaSession:
 
     @property
     def probes(self) -> dict[str, dict]:
-        return {name: {"profile": self._monitor._raw_profiles[name]}
+        profiles = self._monitor.profiles
+        return {name: {"profile": profiles[name]}
                 for name in self._monitor.probe_names}
 
     @property
@@ -475,7 +476,7 @@ class LiahonaSession:
                 self._model, self._tokenizer, self._layers, self._model_info,
                 cache_dir=self._cache_dir,
             )
-            self._monitor._layer_means = self._layer_means
+            self._monitor.layer_means = self._layer_means
         self._monitor.add_probe(name, profile)
 
     def unmonitor(self, name: str) -> None:
@@ -513,7 +514,7 @@ class LiahonaSession:
             ).to(self._device)
         return messages, input_ids
 
-    def _build_readings(self) -> dict[str, ProbeReadings]:
+    def build_readings(self) -> dict[str, ProbeReadings]:
         readings: dict[str, ProbeReadings] = {}
         if not self._monitor.probe_names:
             return readings
@@ -599,7 +600,7 @@ class LiahonaSession:
                 self._model, self._tokenizer, self._layers, text,
                 device=self._device,
             )
-        readings = self._build_readings()
+        readings = self.build_readings()
 
         result = GenerationResult(
             text=text, tokens=generated_ids, token_count=token_count,
@@ -735,7 +736,7 @@ class LiahonaSession:
                 self._model, self._tokenizer, self._layers, text,
                 device=self._device,
             )
-        readings = self._build_readings()
+        readings = self.build_readings()
 
         self._last_result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,
