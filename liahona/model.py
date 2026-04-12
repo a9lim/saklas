@@ -58,6 +58,7 @@ _LAYER_ACCESSORS = {
     "qwen2_moe": _MODEL_LAYERS,
     "qwen3": _MODEL_LAYERS,
     "qwen3_moe": _MODEL_LAYERS,
+    "qwen3_5": _MODEL_LAYERS,
     "qwen3_5_text": _MODEL_LAYERS,
     "qwen3_5_moe": _MODEL_LAYERS,
     # Cohere (Command-R)
