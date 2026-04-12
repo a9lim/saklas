@@ -11,6 +11,20 @@ log = logging.getLogger(__name__)
 
 torch._dynamo.config.skip_nnmodule_hook_guards = False
 
+# MPS lacks the histogram kernel for integer tensors, which breaks
+# torch.histc (used by MoE routing in transformers' grouped_mm path).
+# The fix matches what transformers does for CPU: cast to float first.
+_orig_histc = torch.histc
+
+
+def _histc_mps_safe(input, bins=100, min=0, max=0, *, out=None):
+    if input.device.type == "mps" and not input.is_floating_point():
+        input = input.float()
+    return _orig_histc(input, bins=bins, min=min, max=max, out=out)
+
+
+torch.histc = _histc_mps_safe
+
 _MODEL_LAYERS = lambda m: m.model.layers  # noqa: E731
 _TRANSFORMER_H = lambda m: m.transformer.h  # noqa: E731
 _VLM_LANGUAGE_LAYERS = lambda m: m.model.language_model.layers  # noqa: E731
