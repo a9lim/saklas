@@ -69,6 +69,14 @@ class _AssistantMessage(Vertical):
         if self._stream is not None:
             self._stream.update(text)
 
+    def append_token(self, token: str) -> None:
+        self.chat_text += token
+        self.update_content(self.chat_text)
+
+    def append_thinking_token(self, token: str) -> None:
+        self.thinking_text += token
+        self.update_thinking(self.thinking_text)
+
     def finalize(self) -> None:
         """Switch from streaming Static to rendered Markdown."""
         if self._in_thinking:
@@ -147,12 +155,10 @@ class ChatPanel(Widget):
         return widget
 
     def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
-        widget.chat_text += token
-        widget.update_content(widget.chat_text)
+        widget.append_token(token)
 
     def append_thinking(self, widget: _AssistantMessage, token: str) -> None:
-        widget.thinking_text += token
-        widget.update_thinking(widget.thinking_text)
+        widget.append_thinking_token(token)
 
     def scroll_to_bottom(self) -> None:
         """Scroll the chat log to the bottom. Call once after a batch of token updates."""

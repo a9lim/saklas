@@ -71,7 +71,7 @@ def bootstrap_probes(
     Load or extract probe vector profiles for the given categories.
     Returns dict mapping probe_name -> profile (layer_idx -> (vector, score)).
     """
-    defaults = _load_defaults()
+    defaults = load_defaults()
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
@@ -104,7 +104,7 @@ def bootstrap_probes(
     try:
         from tqdm import tqdm
     except ImportError:
-        tqdm = lambda x, **kw: x  # noqa: E731
+        def tqdm(x, **kw): return x
     datasets_dir = Path(__file__).parent / "datasets"
 
     # Load all datasets first so file I/O doesn't interleave with GPU work
@@ -139,7 +139,7 @@ def bootstrap_probes(
 
 
 @functools.cache
-def _load_defaults() -> dict:
+def load_defaults() -> dict:
     if DEFAULTS_PATH.exists():
         with open(DEFAULTS_PATH) as f:
             return json.load(f)

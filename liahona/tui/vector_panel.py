@@ -7,12 +7,9 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
+from liahona.tui.utils import build_bar
+
 MAX_ALPHA = 0.3
-
-
-def _build_bar(value: float, max_value: float, width: int) -> tuple[str, str]:
-    filled = min(int(abs(value) / max_value * width), width)
-    return "█" * filled, "░" * (width - filled)
 
 
 class LeftPanel(Widget):
@@ -125,7 +122,7 @@ class LeftPanel(Widget):
             n_active = v["n_active"]
             layer_tag = f"{n_active}L pk{peak}"
 
-            bar_full, bar_empty = _build_bar(alpha, MAX_ALPHA, 16)
+            bar_full, bar_empty = build_bar(alpha, MAX_ALPHA, 16)
             if alpha > 0:
                 color = "ansi_green"
             elif alpha < 0:
@@ -159,9 +156,9 @@ class LeftPanel(Widget):
 
     def _render_gen_config(self) -> None:
         gen = self._gen_config_widget
-        t_full, t_empty = _build_bar(self._temperature, 2.0, 20)
+        t_full, t_empty = build_bar(self._temperature, 2.0, 20)
         t_bar = t_full + t_empty
-        p_full, p_empty = _build_bar(self._top_p, 1.0, 20)
+        p_full, p_empty = build_bar(self._top_p, 1.0, 20)
         p_bar = p_full + p_empty
 
         sys_str = self._system_prompt[:15] + "..." if self._system_prompt and len(self._system_prompt) > 15 else (self._system_prompt or "(none)")

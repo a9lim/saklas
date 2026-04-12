@@ -112,7 +112,6 @@ class SteeringManager:
         self.vectors[name] = {
             "profile": profile,
             "alpha": alpha,
-            "enabled": True,
         }
 
     def apply_to_model(
@@ -122,14 +121,12 @@ class SteeringManager:
         dtype: torch.dtype,
         orthogonalize: bool = False,
     ) -> None:
-        """Group enabled vectors by layer, recompose hooks, attach to model."""
-        # Group enabled vectors by layer via their profiles
+        """Group vectors by layer, recompose hooks, attach to model."""
         by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
         for v in self.vectors.values():
-            if v["enabled"]:
-                for layer_idx, (vec, score) in v["profile"].items():
-                    effective_alpha = v["alpha"] * score
-                    by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
+            for layer_idx, (vec, score) in v["profile"].items():
+                effective_alpha = v["alpha"] * score
+                by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
 
         # Detach hooks for layers that no longer have vectors
         for idx in list(self.hooks):
