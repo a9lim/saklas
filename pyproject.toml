@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "liahona-ai"
-version = "1.1.0"
+version = "1.1.1"
 description = "Local activation steering + trait monitoring TUI for HuggingFace transformers"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -41,4 +41,4 @@ liahona = "liahona.cli:main"
 include = ["liahona*"]
 
 [tool.setuptools.package-data]
-liahona = ["probes/defaults.json"]
+liahona = ["probes/defaults.json", "tui/*.tcss"]
