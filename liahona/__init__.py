@@ -1,6 +1,6 @@
 """liahona — local activation steering + trait monitoring for HuggingFace causal LMs."""
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"
 
 from liahona.session import LiahonaSession
 from liahona.datasource import DataSource
