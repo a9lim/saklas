@@ -273,6 +273,9 @@ def load_model(model_id: str, quantize=None, device="auto"):
         # (e.g. Ministral tagged as Mistral3).  Weights are stored
         # with a "language_model." prefix that doesn't match the
         # text-only model's parameter names.  Load manually.
+        # Propagate _name_or_path so cache paths resolve correctly.
+        if not getattr(text_cfg, "_name_or_path", ""):
+            text_cfg._name_or_path = model_id
         log.info("extracting text model (%s) from multimodal checkpoint (%s)",
                  text_cfg.model_type, config.model_type)
         model = _load_text_from_multimodal(
