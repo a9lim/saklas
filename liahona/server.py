@@ -134,7 +134,6 @@ def _resolve_alphas(
     return merged or None
 
 
-
 def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
     """Return top-n profile layers sorted by score descending."""
     return sorted(((idx, score) for idx, (_vec, score) in profile.items()),
@@ -244,8 +243,9 @@ def _register_routes(app: FastAPI) -> None:
             "probe_readings": _probe_reading_dict(session),
         }
 
-    async def _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig_config):
-        try:
+    async def _stream_chat(session, messages, alphas, ortho, think, rid, model_id,
+                           temperature, top_p, max_tokens):
+        with _gen_config_override(session, temperature, top_p, max_tokens):
             try:
                 for event in session.generate_stream(messages, alphas=alphas, orthogonalize=ortho, thinking=think):
                     delta: dict[str, str] = {}
@@ -289,8 +289,6 @@ def _register_routes(app: FastAPI) -> None:
             }
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
-        finally:
-            _restore_gen_config(session, orig_config)
 
     # -----------------------------------------------------------------------
     # Text completions
@@ -303,19 +301,18 @@ def _register_routes(app: FastAPI) -> None:
         rid = _make_id()
         model_id = session.model_info.get("model_id", "unknown")
 
-        orig = _apply_gen_overrides(session, req.temperature, req.top_p, req.max_tokens)
         if req.stream:
             return StreamingResponse(
-                _stream_completions(session, req.prompt, alphas, ortho, rid, model_id, orig),
+                _stream_completions(session, req.prompt, alphas, ortho, rid, model_id,
+                                    req.temperature, req.top_p, req.max_tokens),
                 media_type="text/event-stream",
             )
-        # Non-streaming
-        try:
-            result = session.generate(req.prompt, alphas=alphas, orthogonalize=ortho, raw=True)
-        except ConcurrentGenerationError as e:
-            return _error(409, str(e), "conflict")
-        finally:
-            _restore_gen_config(session, orig)
+        async with app.state.gen_lock:
+            with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
+                try:
+                    result = session.generate(req.prompt, alphas=alphas, orthogonalize=ortho, raw=True)
+                except ConcurrentGenerationError as e:
+                    return _error(409, str(e), "conflict")
 
         return {
             "id": rid,
@@ -337,8 +334,9 @@ def _register_routes(app: FastAPI) -> None:
             "probe_readings": _probe_reading_dict(session),
         }
 
-    async def _stream_completions(session, prompt, alphas, ortho, rid, model_id, orig_config):
-        try:
+    async def _stream_completions(session, prompt, alphas, ortho, rid, model_id,
+                                   temperature, top_p, max_tokens):
+        with _gen_config_override(session, temperature, top_p, max_tokens):
             try:
                 for event in session.generate_stream(prompt, alphas=alphas, orthogonalize=ortho, raw=True):
                     chunk = {
@@ -376,8 +374,6 @@ def _register_routes(app: FastAPI) -> None:
             }
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
-        finally:
-            _restore_gen_config(session, orig_config)
 
     # -----------------------------------------------------------------------
     # Vector management
@@ -390,7 +386,7 @@ def _register_routes(app: FastAPI) -> None:
         for name, profile in vectors.items():
             layers = sorted(profile.keys())
             scored = _profile_top_layers(profile)
-            top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored[:5]]
+            top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored]
             out[name] = {
                 "layers": layers,
                 "top_layers": top,
@@ -475,7 +471,7 @@ def _register_routes(app: FastAPI) -> None:
 
         layers = sorted(profile.keys())
         scored = _profile_top_layers(profile)
-        top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored[:5]]
+        top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored]
 
         return {
             "name": req.name,
