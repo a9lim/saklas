@@ -101,7 +101,6 @@ class TraitPanel(Widget):
         self._nav_items = []
         lines: list[str] = []
 
-        nav_idx_counter = 0
         for category, members in self._categories.items():
             active_members = [m for m in members if m in self._active_probes]
             if not active_members:
@@ -114,9 +113,8 @@ class TraitPanel(Widget):
 
             sorted_members = self._sort_probes(active_members)
             for name in sorted_members:
-                is_nav_selected = nav_idx_counter == self._nav_idx
+                is_nav_selected = len(self._nav_items) == self._nav_idx
                 self._nav_items.append(("probe", name))
-                nav_idx_counter += 1
 
                 val = self._current_values.get(name, 0.0)
                 prev = self._previous_values.get(name, 0.0)
