@@ -391,7 +391,7 @@ To regenerate cached statements (e.g. after a prompt update), use `liahona -x` t
 
 ### Monitor
 
-During generation, lightweight capture hooks record each layer's hidden state for the last generated token (single-slot overwrite per layer, no accumulation). After generation, these captured states are scored directly against probe vectors — no separate forward pass needed.
+After generation, a separate forward pass over the generated text produces attention-weighted hidden states at every layer — the same pooling used during probe extraction. This ensures probe scores are computed against the same kind of representation the probes were trained on.
 
 Each layer's hidden state is mean-centered — subtracting the per-layer mean computed from 45 neutral prompts — to remove baseline projection bias that otherwise makes raw cosine similarities uninformative. Score-weighted cosine similarities against probe vectors produce one value per probe per generation. Probe history accumulates across generations, enabling sparklines and running statistics.
 

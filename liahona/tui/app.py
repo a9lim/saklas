@@ -488,12 +488,7 @@ class LiahonaApp(App):
             if alphas:
                 self._session._apply_steering(alphas, orthogonalize=self._orthogonalize)
 
-            # Install capture hooks to grab last-token hidden states for
-            # probe scoring — avoids a separate forward pass after generation.
             has_probes = bool(self._session._monitor and self._session._monitor.probe_names)
-            captured, cap_handles = (
-                self._session._install_capture_hooks() if has_probes else ({}, [])
-            )
 
             try:
                 input_ids = build_chat_input(
@@ -516,11 +511,13 @@ class LiahonaApp(App):
                 full_text = self._session._tokenizer.decode(response_ids, skip_special_tokens=True)
                 if full_text.strip():
                     self._messages.append({"role": "assistant", "content": full_text})
-                    if has_probes and captured:
-                        self._session._monitor.measure_from_hidden(captured)
+                    if has_probes:
+                        self._session._monitor.measure(
+                            self._session._model, self._session._tokenizer,
+                            self._session._layers, full_text,
+                            device=self._session._device,
+                        )
             finally:
-                for h in cap_handles:
-                    h.remove()
                 if alphas:
                     self._session._clear_steering()
                 # Flush MPS command buffers *after* all GPU work so a
