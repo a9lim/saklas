@@ -409,10 +409,14 @@ def generate_steered(
                 token_id = next_token.item()
 
                 if token_id in eos_ids:
-                    # Channel-based models (gpt-oss) may use EOS tokens
-                    # as channel separators.  Only terminate once we have
-                    # exited thinking and any response preamble.
-                    if not (in_thinking or in_preamble or in_response_preamble):
+                    # Channel-based models (gpt-oss) use EOS tokens as
+                    # channel separators.  For these models only, skip
+                    # EOS while inside thinking/preamble and transition
+                    # to response preamble.  For enable_thinking models
+                    # (Gemma, Qwen) EOS always terminates generation.
+                    if response_start_id is None or not (
+                        in_thinking or in_preamble or in_response_preamble
+                    ):
                         break
                     # EOS inside a thinking/preamble phase — advance KV
                     # state, transition out of thinking, and keep generating.
@@ -428,10 +432,7 @@ def generate_steered(
                             on_token(tokenizer.decode(pending_ids),
                                      pending_thinking)
                             pending_ids.clear()
-                        if response_start_id is not None:
-                            in_response_preamble = True
-                        else:
-                            state.thinking_end_idx = len(generated_ids)
+                        in_response_preamble = True
                     elif in_preamble:
                         in_preamble = False
                         state.thinking_end_idx = len(generated_ids)
