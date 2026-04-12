@@ -316,11 +316,16 @@ def generate_steered(
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
-    on_token: Callable[[str, bool], None] | None = None,
+    on_token: Callable[[str, bool, int], None] | None = None,
     thinking: bool = False,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
+
+    *on_token(text, is_thinking, token_id)* is called for each emitted
+    token.  For multi-token UTF-8 sequences (buffered partials),
+    *token_id* is ``-1``.
+
     Returns list of generated token IDs.
     """
     device = input_ids.device
@@ -417,14 +422,14 @@ def generate_steered(
                         in_thinking = False
                         if on_token and pending_ids:
                             on_token(tokenizer.decode(pending_ids),
-                                     pending_thinking)
+                                     pending_thinking, -1)
                             pending_ids.clear()
                         in_response_preamble = True
                     elif in_preamble:
                         in_preamble = False
                         if on_token and pending_ids:
                             on_token(tokenizer.decode(pending_ids),
-                                     pending_thinking)
+                                     pending_thinking, -1)
                             pending_ids.clear()
                         state.thinking_end_idx = len(generated_ids)
                     continue
@@ -467,7 +472,7 @@ def generate_steered(
                     in_thinking = False
                     # Flush any buffered partial tokens before the delimiter
                     if on_token and pending_ids:
-                        on_token(tokenizer.decode(pending_ids), pending_thinking)
+                        on_token(tokenizer.decode(pending_ids), pending_thinking, -1)
                         pending_ids.clear()
                     if response_start_id is not None:
                         # Channel-based format (e.g. gpt-oss): suppress
@@ -494,14 +499,14 @@ def generate_steered(
                         pending_ids.append(token_id)
                     elif pending_ids:
                         pending_ids.append(token_id)
-                        on_token(tokenizer.decode(pending_ids), pending_thinking)
+                        on_token(tokenizer.decode(pending_ids), pending_thinking, -1)
                         pending_ids.clear()
                     else:
-                        on_token(tok_str, in_thinking)
+                        on_token(tok_str, in_thinking, token_id)
 
         # Flush any remaining buffered partial tokens
         if on_token and pending_ids:
-            on_token(tokenizer.decode(pending_ids), pending_thinking)
+            on_token(tokenizer.decode(pending_ids), pending_thinking, -1)
 
     finally:
         # Flush MPS command buffers before signalling completion — without

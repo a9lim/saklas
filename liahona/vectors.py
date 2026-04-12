@@ -389,12 +389,19 @@ def extract_contrastive(
     norm_sums_cpu = norm_sums.tolist()
 
     if n_pairs < 2:
-        # Single pair: use raw diff, score by norm (normalized to [0,1] below)
+        # Single pair: score as diff norm relative to activation magnitude.
+        # This produces values in roughly the same range as the
+        # explained-variance-ratio used for multi-pair extraction
+        # (typically 0.01–0.4), so single-pair and multi-pair profiles
+        # contribute comparably when used as probes or weighted by score.
         for idx in range(n_layers):
             diff_vec = diffs_per_layer[idx][0]
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
-            profile[idx] = (direction, diff_vec.float().norm().item())
+            diff_norm = diff_vec.float().norm().item()
+            activation_norm = norm_sums_cpu[idx]  # pos_norm + neg_norm
+            score = diff_norm / max(activation_norm, 1e-8)
+            profile[idx] = (direction, score)
     else:
         # Multi-pair: batched SVD across all layers.
         # Stack into (n_layers, N, dim) and run one batched SVD call —
@@ -422,13 +429,6 @@ def extract_contrastive(
 
             score = (S[idx, 0] / S[idx].sum()).item()
             profile[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), score)
-
-    # Single-pair scores are raw diff norms — normalize to [0, 1] so they're
-    # on the same scale as multi-pair explained-variance-ratio scores.
-    if n_pairs < 2 and profile:
-        max_raw = max((s for _, s in profile.values()), default=0.0)
-        if max_raw > 1e-8:
-            profile = {idx: (vec, s / max_raw) for idx, (vec, s) in profile.items()}
 
     return profile
 
