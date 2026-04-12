@@ -155,6 +155,17 @@ class SteeringManager:
                 alphas = alphas[: len(raw_vectors)]
                 pairs = list(zip(raw_vectors, alphas))
 
+            # Compensate for per-layer output scaling (Gemma 4 layer_scalar).
+            # The scalar shrinks the residual stream, attenuating steering
+            # perturbations through subsequent layers.  Dividing by the
+            # scalar puts the perturbation at pre-scalar magnitude so it
+            # propagates like the model's own residual content.
+            layer_scalar = getattr(model_layers[idx], "layer_scalar", None)
+            if layer_scalar is not None:
+                s = layer_scalar.item()
+                if s > 0 and s != 1.0:
+                    pairs = [(vec, alpha / s) for vec, alpha in pairs]
+
             if idx not in self.hooks:
                 hook = SteeringHook()
                 hook.attach(model_layers[idx])
