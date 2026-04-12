@@ -415,10 +415,26 @@ def generate_steered(
                     if not (in_thinking or in_preamble or in_response_preamble):
                         break
                     # EOS inside a thinking/preamble phase — advance KV
-                    # state but suppress the token and keep generating.
+                    # state, transition out of thinking, and keep generating.
                     generated_ids.append(token_id)
                     current_input = next_token
                     seq_len += 1
+                    if in_thinking:
+                        # EOS ends the thinking channel — enter response
+                        # preamble so inter-channel tokens (turn markers
+                        # like <|start|>assistant) are suppressed.
+                        in_thinking = False
+                        if on_token and pending_ids:
+                            on_token(tokenizer.decode(pending_ids),
+                                     pending_thinking)
+                            pending_ids.clear()
+                        if response_start_id is not None:
+                            in_response_preamble = True
+                        else:
+                            state.thinking_end_idx = len(generated_ids)
+                    elif in_preamble:
+                        in_preamble = False
+                        state.thinking_end_idx = len(generated_ids)
                     continue
 
                 # Advance KV cache state (common to all non-EOS paths)
