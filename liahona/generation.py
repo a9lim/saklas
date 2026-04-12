@@ -409,7 +409,17 @@ def generate_steered(
                 token_id = next_token.item()
 
                 if token_id in eos_ids:
-                    break
+                    # Channel-based models (gpt-oss) may use EOS tokens
+                    # as channel separators.  Only terminate once we have
+                    # exited thinking and any response preamble.
+                    if not (in_thinking or in_preamble or in_response_preamble):
+                        break
+                    # EOS inside a thinking/preamble phase — advance KV
+                    # state but suppress the token and keep generating.
+                    generated_ids.append(token_id)
+                    current_input = next_token
+                    seq_len += 1
+                    continue
 
                 # Advance KV cache state (common to all non-EOS paths)
                 generated_ids.append(token_id)
