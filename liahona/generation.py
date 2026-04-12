@@ -71,6 +71,45 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
 _think_delim_cache: dict[tuple[str, int], tuple[int | None, int | None, int | None, bool]] = {}
 
 
+def _detect_channel_delimiters(
+    tokenizer,
+) -> tuple[int | None, int | None, int | None, bool] | None:
+    """Detect channel-based thinking for models that always use channels.
+
+    Models like gpt-oss generate ``<|channel|>analysis<|message|>`` for
+    thinking and ``<|channel|>response<|message|>`` for the reply without
+    an ``enable_thinking`` template parameter.  Returns the delimiter
+    tuple if both ``<|channel|>`` and ``<|message|>`` are added tokens,
+    ``None`` otherwise.
+    """
+    added = getattr(tokenizer, "added_tokens_encoder", {})
+    channel_id = added.get("<|channel|>")
+    message_id = added.get("<|message|>")
+    if channel_id is None or message_id is None:
+        return None
+    # Check whether the generation prompt already opens a channel
+    # (model starts in thinking) or the model must emit it explicitly.
+    try:
+        gen_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            add_generation_prompt=True, tokenize=False,
+        )
+    except Exception:
+        gen_prompt = ""
+    starts_in = "<|channel|>" in gen_prompt
+    log.debug(
+        "channel-based delimiters: channel=%d message=%d"
+        " starts_in_thinking=%s",
+        channel_id, message_id, starts_in,
+    )
+    return (
+        None if starts_in else channel_id,
+        channel_id,
+        message_id,
+        starts_in,
+    )
+
+
 def _detect_think_delimiters(
     tokenizer,
 ) -> tuple[int | None, int | None, int | None, bool]:
@@ -104,8 +143,12 @@ def _detect_think_delimiters(
     _none_result: tuple[int | None, int | None, int | None, bool] = (None, None, None, False)
     template = getattr(tokenizer, "chat_template", None) or ""
     if "enable_thinking" not in template:
-        _think_delim_cache[tok_key] = _none_result
-        return _none_result
+        # Check for channel-based thinking (e.g. gpt-oss) where the
+        # model always generates <|channel|>analysis<|message|> without
+        # an enable_thinking template parameter.
+        result = _detect_channel_delimiters(tokenizer)
+        _think_delim_cache[tok_key] = result if result else _none_result
+        return _think_delim_cache[tok_key]
 
     think_marker = "XTHINKCONTENTX"
     response_marker = "XRESPONSECONTENTX"
@@ -208,7 +251,11 @@ def _detect_think_delimiters(
 def supports_thinking(tokenizer) -> bool:
     """Check if the tokenizer's chat template supports thinking mode."""
     template = getattr(tokenizer, "chat_template", None) or ""
-    return "enable_thinking" in template
+    if "enable_thinking" in template:
+        return True
+    # Channel-based thinking (e.g. gpt-oss) — always active
+    added = getattr(tokenizer, "added_tokens_encoder", {})
+    return "<|channel|>" in added and "<|message|>" in added
 
 
 class GenerationConfig:
