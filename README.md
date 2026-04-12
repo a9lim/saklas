@@ -141,7 +141,7 @@ ds = DataSource.curated("happy")                                   # bundled
 ds = DataSource.json("pairs.json")                                 # liahona schema
 ds = DataSource.csv("pairs.csv", positive_col="pos", negative_col="neg")
 ds = DataSource.huggingface("user/dataset", split="train[:100]")   # requires datasets
-ds = DataSource.from_pairs([("positive text", "negative text")])
+ds = DataSource(pairs=[("positive text", "negative text")])
 ```
 
 ### ResultCollector

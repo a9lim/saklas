@@ -149,6 +149,9 @@ def create_app(session: LiahonaSession, default_alphas: dict[str, float] | None 
     app = FastAPI(title="liahona", description="OpenAI-compatible API with activation steering")
     app.state.session = session
     app.state.default_alphas = default_alphas or {}
+    # Protects config mutations for non-streaming routes.  Streaming routes
+    # rely on the session's 409 concurrent-generation guard instead, because
+    # the generator is consumed by Starlette outside the route coroutine.
     app.state.gen_lock = asyncio.Lock()
 
     if cors_origins:
