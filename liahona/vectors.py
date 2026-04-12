@@ -151,7 +151,15 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
     ids = ids.to(device)
     mask = mask.to(device)
 
-    captured = _capture_all_hidden_states(model, layers, ids, output_attentions=True)
+    try:
+        captured = _capture_all_hidden_states(model, layers, ids, output_attentions=True)
+    except RuntimeError:
+        # Attention capture can OOM on memory-constrained devices (MPS
+        # with large models / long sequences).  Fall back to last-token
+        # pooling which skips attention storage entirely.
+        if ids.device.type == "mps":
+            torch.mps.empty_cache()
+        captured = _capture_all_hidden_states(model, layers, ids, output_attentions=False)
     hidden_per_layer = captured["hidden"]  # {idx: (1, seq, dim)}
 
     attn_per_layer = captured.get("attention")  # {idx: (1, heads, seq, seq)}
