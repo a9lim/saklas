@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -105,20 +107,20 @@ def _probe_reading_dict(session: LiahonaSession) -> dict[str, Any]:
     return out
 
 
-def _apply_gen_overrides(session: LiahonaSession, temperature, top_p, max_tokens):
-    """Temporarily override generation config, return originals."""
+@contextmanager
+def _gen_config_override(session: LiahonaSession, temperature, top_p, max_tokens):
+    """Temporarily override generation config."""
     orig = (session.config.temperature, session.config.top_p, session.config.max_new_tokens)
-    if temperature is not None:
-        session.config.temperature = temperature
-    if top_p is not None:
-        session.config.top_p = top_p
-    if max_tokens is not None:
-        session.config.max_new_tokens = max_tokens
-    return orig
-
-
-def _restore_gen_config(session: LiahonaSession, orig):
-    session.config.temperature, session.config.top_p, session.config.max_new_tokens = orig
+    try:
+        if temperature is not None:
+            session.config.temperature = temperature
+        if top_p is not None:
+            session.config.top_p = top_p
+        if max_tokens is not None:
+            session.config.max_new_tokens = max_tokens
+        yield
+    finally:
+        session.config.temperature, session.config.top_p, session.config.max_new_tokens = orig
 
 
 def _resolve_alphas(
@@ -134,9 +136,9 @@ def _resolve_alphas(
 
 
 def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
-    """Return profile layers sorted by score descending."""
+    """Return top-n profile layers sorted by score descending."""
     return sorted(((idx, score) for idx, (_vec, score) in profile.items()),
-                  key=lambda x: x[1], reverse=True)
+                  key=lambda x: x[1], reverse=True)[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +150,7 @@ def create_app(session: LiahonaSession, default_alphas: dict[str, float] | None 
     app = FastAPI(title="liahona", description="OpenAI-compatible API with activation steering")
     app.state.session = session
     app.state.default_alphas = default_alphas or {}
+    app.state.gen_lock = asyncio.Lock()
 
     if cors_origins:
         app.add_middleware(
@@ -208,19 +211,18 @@ def _register_routes(app: FastAPI) -> None:
         rid = _make_id()
         model_id = session.model_info.get("model_id", "unknown")
 
-        orig = _apply_gen_overrides(session, req.temperature, req.top_p, req.max_tokens)
         if req.stream:
             return StreamingResponse(
-                _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig),
+                _stream_chat(session, messages, alphas, ortho, think, rid, model_id,
+                             req.temperature, req.top_p, req.max_tokens),
                 media_type="text/event-stream",
             )
-        # Non-streaming
-        try:
-            result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
-        except ConcurrentGenerationError as e:
-            return _error(409, str(e), "conflict")
-        finally:
-            _restore_gen_config(session, orig)
+        async with app.state.gen_lock:
+            with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
+                try:
+                    result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
+                except ConcurrentGenerationError as e:
+                    return _error(409, str(e), "conflict")
 
         return {
             "id": rid,

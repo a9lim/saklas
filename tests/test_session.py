@@ -65,7 +65,7 @@ class TestSteering:
 
     def test_extract_datasource(self, session):
         from liahona.datasource import DataSource
-        ds = DataSource.from_pairs([("formal", "casual")])
+        ds = DataSource(pairs=[("formal", "casual")])
         profile = session.extract(ds)
         assert isinstance(profile, dict)
 

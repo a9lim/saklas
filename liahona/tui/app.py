@@ -102,11 +102,14 @@ class LiahonaApp(App):
         result = []
         for name in self._alphas:
             if name in self._session._profiles:
+                profile = self._session._profiles[name]
                 result.append({
                     "name": name,
-                    "profile": self._session._profiles[name],
+                    "profile": profile,
                     "alpha": self._alphas[name],
                     "enabled": self._enabled.get(name, True),
+                    "peak": max(profile, key=lambda k: profile[k][1]),
+                    "n_active": len(profile),
                 })
         return result
 
