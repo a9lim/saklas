@@ -14,6 +14,8 @@ pip install -e ".[serve]"        # fastapi + uvicorn (for API server)
 liahona <model_id>               # launch TUI
 liahona serve <model_id>         # launch OpenAI-compatible API server
 python -m liahona <model_id>     # alt entry point
+liahona -x                       # clear custom cache (user-extracted vectors + generated statements)
+liahona -X                       # clear all cache (including curated probes + layer means)
 pytest tests/test_smoke.py -v    # CUDA smoke tests (downloads gemma-2-2b-it ~5GB)
 pytest tests/ -v                 # all tests (non-CUDA tests run anywhere)
 ```
@@ -60,7 +62,7 @@ Five layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 
 ### API server layer
 - `server.py` — FastAPI app factory. OpenAI-compatible endpoints (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) plus liahona-specific management (`/v1/liahona/vectors`, `/v1/liahona/probes`, `/v1/liahona/session`). Thin HTTP layer over `LiahonaSession` — no business logic. Uses `session.model_id` for model identification. Model `created` timestamp captured once at app creation (`app.state.created_ts`). Steering params passed per-request via `steer` key in request body (includes `alphas`, `orthogonalize`, `thinking`), merged with server-startup defaults. `thinking` is wired through both chat and completions routes. `_stream_generation` is a unified SSE generator parameterized on `object_type` and `format_delta` — used by both chat and completions streaming. When thinking is enabled, streaming chat responses emit thinking tokens as `reasoning_content` in the delta (following OpenAI convention). Single session, 409 on concurrent generation. Vector extraction streaming is intentionally synchronous (progress replayed after completion) — the JSON path is the primary interface.
-- `cli.py` — Dispatches `liahona serve` vs default TUI mode. `_print_startup(args)` shared between both paths. `serve` subcommand accepts `--host`, `--port`, `--steer name:alpha`, `--cors`.
+- `cli.py` — Dispatches `liahona serve` vs default TUI mode. `_print_startup(args)` shared between both paths. `serve` subcommand accepts `--host`, `--port`, `--steer name:alpha`, `--cors`. Cache-clearing flags (`-x`/`--clear-custom`, `-X`/`--clear-all`) on the main parser bypass model loading: `-x` removes user-extracted vectors and generated statement pairs (keeps curated probes + layer means), `-X` removes everything. Custom vectors are identified by exclusion from `defaults.json` names + `_LAYERMEANS`. Statement cache lives at `datasets/cache/`.
 
 ## Performance rules
 
