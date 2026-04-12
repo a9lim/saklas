@@ -17,7 +17,7 @@ class TraitPanel(Widget):
 
     def __init__(self, categories: dict[str, list[str]] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._categories: dict[str, list[str]] = categories or {}
+        self._categories: dict[str, list[str]] = dict(categories) if categories else {}
         self._current_values: dict[str, float] = {}
         self._previous_values: dict[str, float] = {}
         self._sparklines: dict[str, str] = {}
@@ -25,7 +25,6 @@ class TraitPanel(Widget):
         self._sort_mode: str = "name"
         self._nav_items: list[tuple[str, str]] = []
         self._nav_idx: int = 0
-        self._cached_sort: tuple[str, tuple, tuple, list] | None = None
         self._cached_render_text: str = ""
 
     def compose(self) -> ComposeResult:
@@ -161,22 +160,9 @@ class TraitPanel(Widget):
 
     def _sort_probes(self, names: list[str]) -> list[str]:
         if self._sort_mode == "value":
-            vals = tuple(self._current_values.get(n, 0.0) for n in names)
-            key = (self._sort_mode, tuple(names), vals)
-            if self._cached_sort and self._cached_sort[:3] == key:
-                return self._cached_sort[3]
-            result = sorted(names, key=lambda n: self._current_values.get(n, 0.0), reverse=True)
-            self._cached_sort = (*key, result)
-            return result
+            return sorted(names, key=lambda n: self._current_values.get(n, 0.0), reverse=True)
         elif self._sort_mode == "change":
-            vals = tuple((self._current_values.get(n, 0.0), self._previous_values.get(n, 0.0)) for n in names)
-            key = (self._sort_mode, tuple(names), vals)
-            if self._cached_sort and self._cached_sort[:3] == key:
-                return self._cached_sort[3]
-            result = sorted(names, key=lambda n: abs(
+            return sorted(names, key=lambda n: abs(
                 self._current_values.get(n, 0.0) - self._previous_values.get(n, 0.0)
             ), reverse=True)
-            self._cached_sort = (*key, result)
-            return result
-        self._cached_sort = None
         return sorted(names)

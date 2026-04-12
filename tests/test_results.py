@@ -85,7 +85,7 @@ class TestResultCollector:
     def test_add_and_to_dicts(self):
         collector = ResultCollector()
         collector.add(self._make_result(), prompt="hi", concept="happy")
-        dicts = collector.to_dicts()
+        dicts = collector.results
         assert len(dicts) == 1
         assert dicts[0]["text"] == "Hello"
         assert dicts[0]["prompt"] == "hi"
@@ -101,7 +101,7 @@ class TestResultCollector:
         )
         collector = ResultCollector()
         collector.add(result)
-        d = collector.to_dicts()[0]
+        d = collector.results[0]
         assert d["probe_honest_mean"] == 0.5
         assert d["probe_honest_std"] == 0.0
         assert d["probe_honest_min"] == 0.5

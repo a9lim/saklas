@@ -71,13 +71,8 @@ class _AssistantMessage(Vertical):
 
     def finalize(self) -> None:
         """Switch from streaming Static to rendered Markdown."""
-        if self._thinking_block is not None and self.thinking_text:
-            self._thinking_block.collapsed = True
-            if self._thinking_md is not None:
-                self._thinking_md.update(self.thinking_text)
-                self._thinking_md.remove_class("hidden")
-            if self._thinking_stream is not None:
-                self._thinking_stream.add_class("hidden")
+        if self._in_thinking:
+            self.end_thinking()
         if self._md is not None and self.chat_text:
             self._md.update(self.chat_text)
             self._md.remove_class("hidden")

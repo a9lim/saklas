@@ -17,8 +17,14 @@ from liahona.generation import GenerationState, build_chat_input, generate_steer
 from liahona.model import _get_memory_gb
 from liahona.probes_bootstrap import _load_defaults
 from liahona.tui.chat_panel import ChatPanel
-from liahona.tui.vector_panel import LeftPanel
+from liahona.tui.vector_panel import LeftPanel, MAX_ALPHA
 from liahona.tui.trait_panel import TraitPanel
+
+DEFAULT_ALPHA = 0.15
+_MIN_ELAPSED_FOR_RATE = 0.1
+_POLL_FPS = 15
+_VRAM_UPDATE_INTERVAL = 15
+_TOKEN_DRAIN_LIMIT = 20
 
 PANELS = ["left-panel", "chat-panel", "trait-panel"]
 
@@ -59,7 +65,8 @@ class LiahonaApp(App):
         self._alphas: dict[str, float] = {}
         self._enabled: dict[str, bool] = {}
         self._orthogonalize: bool = False
-        self._thinking: bool = supports_thinking(session._tokenizer)
+        self._supports_thinking: bool = supports_thinking(session._tokenizer)
+        self._thinking: bool = self._supports_thinking
 
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
@@ -114,18 +121,12 @@ class LiahonaApp(App):
         self._chat_panel = self.query_one("#chat-panel", ChatPanel)
         self._trait_panel = self.query_one("#trait-panel", TraitPanel)
         self._panels = [self._left_panel, self._chat_panel, self._trait_panel]
-        self._left_panel.update_gen_config(
-            self._session.config.temperature,
-            self._session.config.top_p,
-            self._session.config.max_new_tokens,
-            self._session.config.system_prompt,
-            thinking=self._thinking if supports_thinking(self._session._tokenizer) else None,
-        )
+        self._refresh_gen_config()
 
         if self._session._monitor:
             self._trait_panel.set_active_probes(set(self._session._monitor.probe_names))
 
-        self._poll_timer = self.set_interval(1 / 15, self._poll_generation)
+        self._poll_timer = self.set_interval(1 / _POLL_FPS, self._poll_generation)
         self._update_panel_focus()
 
         self._chat_panel.add_system_message(
@@ -261,21 +262,13 @@ class LiahonaApp(App):
                 self._pending_action = ("clear",)
                 self._session._gen_state.request_stop()
                 return
-            self._session.clear_history()
-            chat.clear_log()
-            self._trait_panel.update_values({}, {}, {})
-            chat.add_system_message("Chat history cleared.")
+            self._do_clear()
         elif cmd == "/rewind":
             if self._gen_active:
                 self._pending_action = ("rewind",)
                 self._session._gen_state.request_stop()
                 return
-            if not self._messages:
-                chat.add_system_message("Nothing to rewind.")
-            else:
-                self._session.rewind()
-                chat.rewind()
-                chat.add_system_message("Rewound to before last message.")
+            self._do_rewind()
         elif cmd in ("/system", "/sys"):
             if len(parts) < 2:
                 chat.add_system_message(f"System prompt: {self._session.config.system_prompt or '(none)'}")
@@ -355,25 +348,30 @@ class LiahonaApp(App):
             baseline = None
             trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
         if include_alpha:
-            alpha = float(trailing[0]) if trailing else 0.15
+            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, float(trailing[0]))) if trailing else DEFAULT_ALPHA
             return concept, baseline, alpha
         return concept, baseline
 
-    def _handle_steer(self, text: str) -> None:
+    def _handle_extract(self, text: str, include_alpha: bool, on_success) -> None:
         chat = self._chat_panel
         if self._ab_in_progress:
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
             return
+        pending_type = "steer" if include_alpha else "probe"
         if self._gen_active:
-            self._pending_action = ("steer", text)
+            self._pending_action = (pending_type, text)
             self._session._gen_state.request_stop()
             return
         try:
-            concept, baseline, alpha = self._parse_args(text, include_alpha=True)
+            if include_alpha:
+                concept, baseline, alpha = self._parse_args(text, include_alpha=True)
+            else:
+                concept, baseline = self._parse_args(text)
+                alpha = None
         except (ValueError, IndexError) as e:
             chat.add_system_message(
                 f"Parse error: {e}\n"
-                'Usage: /steer "concept" - "baseline" [alpha]'
+                f'Usage: /{pending_type} "concept" - "baseline"' + (' [alpha]' if include_alpha else '')
             )
             return
 
@@ -386,45 +384,25 @@ class LiahonaApp(App):
                 self.call_from_thread(self._steer_status, msg)
             try:
                 profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
-                self._session.steer(name, profile)
-                self._alphas[name] = alpha
-                self._enabled[name] = True
-                self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
+                on_success(name, profile, alpha)
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
 
         self.run_worker(_worker, thread=True)
+
+    def _handle_steer(self, text: str) -> None:
+        def _on_success(name, profile, alpha):
+            self._session.steer(name, profile)
+            self._alphas[name] = alpha
+            self._enabled[name] = True
+            self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
+        self._handle_extract(text, include_alpha=True, on_success=_on_success)
 
     def _handle_probe(self, text: str) -> None:
-        chat = self._chat_panel
-        if self._gen_active:
-            self._pending_action = ("probe", text)
-            self._session._gen_state.request_stop()
-            return
-        try:
-            concept, baseline = self._parse_args(text)
-        except (ValueError, IndexError) as e:
-            chat.add_system_message(
-                f"Parse error: {e}\n"
-                'Usage: /probe "concept" - "baseline"'
-            )
-            return
-
-        name = concept if len(concept) <= 20 else concept[:17] + "..."
-        suffix = f" vs '{baseline}'" if baseline else ""
-        chat.add_system_message(f"Extracting '{name}'{suffix}...")
-
-        def _worker():
-            def _progress(msg):
-                self.call_from_thread(self._steer_status, msg)
-            try:
-                profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
-                self._session.monitor(name, profile)
-                self.call_from_thread(self._on_probe_added, name)
-            except ValueError as e:
-                self.call_from_thread(self._steer_status, str(e))
-
-        self.run_worker(_worker, thread=True)
+        def _on_success(name, profile, _alpha):
+            self._session.monitor(name, profile)
+            self.call_from_thread(self._on_probe_added, name)
+        self._handle_extract(text, include_alpha=False, on_success=_on_success)
 
     def _steer_status(self, msg: str) -> None:
         self._chat_panel.add_system_message(msg)
@@ -439,13 +417,27 @@ class LiahonaApp(App):
             orthogonalize=self._orthogonalize,
         )
 
+    def _do_clear(self) -> None:
+        self._session.clear_history()
+        self._chat_panel.clear_log()
+        self._trait_panel.update_values({}, {}, {})
+        self._chat_panel.add_system_message("Chat history cleared.")
+
+    def _do_rewind(self) -> None:
+        if not self._messages:
+            self._chat_panel.add_system_message("Nothing to rewind.")
+            return
+        self._session.rewind()
+        self._chat_panel.rewind()
+        self._chat_panel.add_system_message("Rewound to before last message.")
+
     def _refresh_gen_config(self) -> None:
         self._left_panel.update_gen_config(
             self._session.config.temperature,
             self._session.config.top_p,
             self._session.config.max_new_tokens,
             self._session.config.system_prompt,
-            thinking=self._thinking if supports_thinking(self._session._tokenizer) else None,
+            thinking=self._thinking if self._supports_thinking else None,
         )
 
     # -- Clipboard --
@@ -534,7 +526,7 @@ class LiahonaApp(App):
         tokens_consumed = 0
         generating = self._gen_active
 
-        while tokens_consumed < 20:
+        while tokens_consumed < _TOKEN_DRAIN_LIMIT:
             try:
                 item = self._session._gen_state.token_queue.get_nowait()
             except queue.Empty:
@@ -547,7 +539,7 @@ class LiahonaApp(App):
                 generating = False
                 if self._gen_start_time > 0:
                     self._last_elapsed = time.monotonic() - self._gen_start_time
-                    if self._last_elapsed > 0.1:
+                    if self._last_elapsed > _MIN_ELAPSED_FOR_RATE:
                         self._last_tok_per_sec = self._gen_token_count / self._last_elapsed
                     self._gen_start_time = 0.0
 
@@ -565,18 +557,12 @@ class LiahonaApp(App):
                         self._messages.append({"role": "user", "content": pending[1]})
                         self._start_generation()
                     elif pending[0] == "clear":
-                        self._session.clear_history()
-                        chat.clear_log()
-                        self._trait_panel.update_values({}, {}, {})
-                        chat.add_system_message("Chat history cleared.")
+                        self._do_clear()
                     elif pending[0] == "rewind":
-                        # Discard the partial response, then rewind
                         if self._messages and self._messages[-1]["role"] == "assistant":
                             self._messages.pop()
                         chat.rewind_last_assistant()
-                        self._session.rewind()
-                        chat.rewind()
-                        chat.add_system_message("Rewound to before last message.")
+                        self._do_rewind()
                     elif pending[0] == "steer":
                         self._handle_steer(pending[1])
                     elif pending[0] == "probe":
@@ -598,13 +584,13 @@ class LiahonaApp(App):
 
         if generating and self._gen_start_time > 0:
             elapsed = time.monotonic() - self._gen_start_time
-            tok_per_sec = self._gen_token_count / elapsed if elapsed > 0.1 else 0.0
+            tok_per_sec = self._gen_token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
             self._last_tok_per_sec = tok_per_sec
             self._last_elapsed = elapsed
 
         if generating:
             self._vram_poll_counter += 1
-            if self._vram_poll_counter >= 15:
+            if self._vram_poll_counter >= _VRAM_UPDATE_INTERVAL:
                 self._cached_vram_gb = _get_memory_gb(self._device_str)
                 self._vram_poll_counter = 0
         elif self._vram_poll_counter != -1:
@@ -678,7 +664,7 @@ class LiahonaApp(App):
         sel = lp.get_selected()
         if sel:
             name = sel["name"]
-            self._alphas[name] = max(-0.3, min(0.3, self._alphas.get(name, 0.0) + delta))
+            self._alphas[name] = max(-MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta))
             self._refresh_left_panel()
 
     def action_toggle_ortho(self) -> None:
@@ -688,7 +674,7 @@ class LiahonaApp(App):
         self._refresh_left_panel()
 
     def action_toggle_thinking(self) -> None:
-        if not supports_thinking(self._session._tokenizer):
+        if not self._supports_thinking:
             self._chat_panel.add_system_message("This model does not support thinking mode.")
             return
         self._thinking = not self._thinking
@@ -759,7 +745,7 @@ class LiahonaApp(App):
 
                 self.call_from_thread(self._show_ab_result, unsteered)
             except Exception:
-                self._ab_in_progress = False
+                self.call_from_thread(lambda: setattr(self, '_ab_in_progress', False))
                 raise
 
         self.run_worker(_ab_generate, thread=True)

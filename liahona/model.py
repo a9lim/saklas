@@ -296,7 +296,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
                 try:
                     return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
                 except Exception as eager_err:
-                    raise eager_err from None
+                    raise
             except Exception:
                 if quantize is not None:
                     raise
@@ -316,22 +316,16 @@ def load_model(model_id: str, quantize=None, device="auto"):
             try:
                 model = _try_load_with_fallbacks()
             except Exception as cpu_err:
-                raise cpu_err from None
+                raise
             model = model.to(device)
 
     model.requires_grad_(False)
     model.train(False)
 
     # --- memory report ---
-    if device == "cuda" and torch.cuda.is_available():
-        vram_bytes = torch.cuda.memory_allocated()
-        print(f"  VRAM used: {vram_bytes / 1024**3:.2f} GB")
-    elif device == "mps":
-        try:
-            mps_bytes = torch.mps.current_allocated_memory()
-            print(f"  MPS memory used: {mps_bytes / 1024**3:.2f} GB")
-        except AttributeError:
-            pass  # older torch without mps memory tracking
+    mem_gb = _get_memory_gb(device)
+    if mem_gb > 0:
+        print(f"  Memory used: {mem_gb:.2f} GB")
 
     return model, tokenizer
 

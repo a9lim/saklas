@@ -86,9 +86,6 @@ class ResultCollector:
         row.update(tags)
         self._rows.append(row)
 
-    def to_dicts(self) -> list[dict]:
-        return list(self._rows)
-
     def to_jsonl(self, path: str) -> None:
         with open(path, "w") as f:
             for row in self._rows:
@@ -97,13 +94,7 @@ class ResultCollector:
     def to_csv(self, path: str) -> None:
         if not self._rows:
             return
-        all_keys: list[str] = []
-        seen: set[str] = set()
-        for row in self._rows:
-            for k in row:
-                if k not in seen:
-                    all_keys.append(k)
-                    seen.add(k)
+        all_keys = list(dict.fromkeys(k for row in self._rows for k in row))
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=all_keys)
             writer.writeheader()
@@ -115,6 +106,6 @@ class ResultCollector:
         except ImportError:
             raise ImportError(
                 "pandas is required for to_dataframe(). "
-                "Install with: pip install steer[pandas]"
+                "Install with: pip install liahona-ai[research]"
             )
         return pd.DataFrame(self._rows)

@@ -6,7 +6,8 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
-from textual.message import Message
+
+MAX_ALPHA = 0.3
 
 
 def _build_bar(value: float, max_value: float, width: int) -> tuple[str, str]:
@@ -16,11 +17,6 @@ def _build_bar(value: float, max_value: float, width: int) -> tuple[str, str]:
 
 class LeftPanel(Widget):
     """Entire left column: model, vectors, gen config, keys."""
-
-    class VectorSelected(Message):
-        def __init__(self, name: str) -> None:
-            super().__init__()
-            self.name = name
 
     def __init__(self, model_info: dict, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -99,23 +95,16 @@ class LeftPanel(Widget):
         if self._vectors:
             self._selected_idx = (self._selected_idx + 1) % len(self._vectors)
             self._render_vectors()
-            self._post_selection()
 
     def select_prev(self) -> None:
         if self._vectors:
             self._selected_idx = (self._selected_idx - 1) % len(self._vectors)
             self._render_vectors()
-            self._post_selection()
 
     def get_selected(self) -> dict | None:
         if self._vectors and 0 <= self._selected_idx < len(self._vectors):
             return self._vectors[self._selected_idx]
         return None
-
-    def _post_selection(self) -> None:
-        sel = self.get_selected()
-        if sel:
-            self.post_message(self.VectorSelected(sel["name"]))
 
     def _render_vectors(self) -> None:
         active = sum(1 for v in self._vectors if v.get("enabled", True))
@@ -137,7 +126,7 @@ class LeftPanel(Widget):
             n_active = len(profile)
             layer_tag = f"{n_active}L pk{peak}"
 
-            bar_full, bar_empty = _build_bar(alpha, 0.3, 16)
+            bar_full, bar_empty = _build_bar(alpha, MAX_ALPHA, 16)
             if alpha > 0:
                 color = "ansi_green"
             elif alpha < 0:

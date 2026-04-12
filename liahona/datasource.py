@@ -60,7 +60,7 @@ class DataSource:
         except ImportError:
             raise ImportError(
                 "The 'datasets' package is required for DataSource.huggingface(). "
-                "Install with: pip install steer[hf]"
+                "Install with: pip install liahona-ai[research]"
             )
         ds = load_dataset(dataset_id, split=split)
         pairs = [(row[positive_col], row[negative_col]) for row in ds]

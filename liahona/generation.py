@@ -11,15 +11,15 @@ import torch
 
 log = logging.getLogger(__name__)
 
-_eos_cache: tuple[tuple[str, int], set[int]] | None = None
+_eos_cache: dict[tuple[str, int], set[int]] = {}
 
 
 def _get_eos_ids(model, tokenizer) -> set[int]:
     """Return cached set of all EOS token IDs for model+tokenizer."""
-    global _eos_cache
     tok_key = (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
-    if _eos_cache is not None and _eos_cache[0] == tok_key:
-        return _eos_cache[1]
+    cached = _eos_cache.get(tok_key)
+    if cached is not None:
+        return cached
     eos_ids: set[int] = set()
     if hasattr(model, "generation_config") and model.generation_config.eos_token_id is not None:
         eid = model.generation_config.eos_token_id
@@ -37,11 +37,11 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
     for tok_str, tok_id in added.items():
         if tok_str in _EOT_NAMES:
             eos_ids.add(tok_id)
-    _eos_cache = (tok_key, eos_ids)
+    _eos_cache[tok_key] = eos_ids
     return eos_ids
 
 
-_token_table_cache: tuple[tuple[str, int], list[str]] | None = None
+_token_table_cache: dict[tuple[str, int], list[str | None]] = {}
 
 
 def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
@@ -53,10 +53,10 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
     (replacement char U+FFFD) — these must be buffered and decoded together
     with subsequent tokens (e.g. multi-token emoji).
     """
-    global _token_table_cache
     tok_key = (getattr(tokenizer, 'name_or_path', ''), vocab_size)
-    if _token_table_cache is not None and _token_table_cache[0] == tok_key:
-        return _token_table_cache[1]
+    cached = _token_table_cache.get(tok_key)
+    if cached is not None:
+        return cached
     table: list[str | None] = [''] * vocab_size
     for i in range(vocab_size):
         try:
@@ -64,7 +64,7 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
             table[i] = s if '\ufffd' not in s else None
         except Exception:
             table[i] = ''
-    _token_table_cache = (tok_key, table)
+    _token_table_cache[tok_key] = table
     return table
 
 
@@ -427,6 +427,10 @@ def generate_steered(
                         in_response_preamble = True
                     elif in_preamble:
                         in_preamble = False
+                        if on_token and pending_ids:
+                            on_token(tokenizer.decode(pending_ids),
+                                     pending_thinking)
+                            pending_ids.clear()
                         state.thinking_end_idx = len(generated_ids)
                     continue
 

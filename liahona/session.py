@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import queue
 import re
 import threading
 import time
@@ -26,6 +27,21 @@ from liahona.vectors import (
 )
 
 _N_PAIRS = 45
+_BATCH_SIZE = 9
+_MIN_ELAPSED_FOR_RATE = 0.1
+
+_DOMAIN_SEEDS = [
+    "setbacks, conflict, and difficult decisions",
+    "goals, ambitions, and advice to others",
+    "everyday life: routines, habits, hobbies, and casual conversations",
+    "memories, formative experiences, and personal identity",
+    "reactions to surprises, strangers, and unfamiliar situations",
+]
+
+
+class ConcurrentGenerationError(RuntimeError):
+    """Raised when a generation call is made while another is in progress."""
+    pass
 
 
 class LiahonaSession:
@@ -142,71 +158,130 @@ class LiahonaSession:
         concept: str,
         baseline: str | None = None,
         n: int = _N_PAIRS,
+        on_progress: Callable[[str], None] | None = None,
     ) -> list[tuple[str, str]]:
-        """Generate contrastive pairs using the loaded model.
+        """Generate contrastive pairs in batches with diverse domain seeds.
 
-        Uses the model's own generation to produce matched statement pairs
-        for a concept. Returns list of (positive, negative) tuples.
+        Splits the target count into small batches, each focused on a
+        different domain (emotional reactions, social dynamics, etc.).
+        Independent batches mean a parse failure in one doesn't cascade,
+        and shorter generations stay higher quality.
         """
         if baseline is not None:
             poles = (
-                f"Speaker A fully embraces {concept}.\n"
-                f"Speaker B fully embraces {baseline}."
+                f"Speaker A strongly embodies the trait \"{concept}\".\n"
+                f"Speaker B strongly embodies the trait \"{baseline}\"."
             )
         else:
             poles = (
-                f"Speaker A fully embraces {concept}.\n"
-                f"Speaker B fully rejects {concept}."
+                f"Speaker A strongly embodies the trait \"{concept}\".\n"
+                f"Speaker B is the polar opposite of \"{concept}\" — "
+                f"they have none of this trait and their personality, "
+                f"worldview, and instincts run counter to it."
             )
-        prompt = (
-            f"Write {n} contrastive statement pairs.\n\n"
-            f"{poles}\n\n"
-            f"Each pair: same situation, opposite dispositions. The trait "
-            f"should come through in tone, imagery, and word choice. "
-            f"Both statements should read like two genuinely different people, "
-            f"not a word swap. Match length and complexity within each pair. "
-            f"Vary widely across domains: reactions, beliefs, plans, memories, "
-            f"social dynamics, inner monologue, metaphor, physical sensation, "
-            f"abstract observation."
-            f"\n\n1–2 sentences each. Start immediately with 1a.\n"
-            f"Na. [statement]\nNb. [statement]"
-        )
-        messages = [
-            {"role": "system", "content":
-             "You generate contrastive statement pairs for neural network "
-             "interpretability research. Pairs are processed numerically "
-             "for activation vector extraction. Generate all requested pairs."},
-            {"role": "user", "content": prompt},
-        ]
-        input_ids = build_chat_input(self._tokenizer, messages).to(self._device)
-        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
-        with torch.inference_mode():
-            attn_mask = torch.ones_like(input_ids)
-            out = self._model.generate(
-                input_ids, attention_mask=attn_mask, max_new_tokens=4096,
-                do_sample=True, temperature=1.0, top_p=0.9, pad_token_id=pad_id,
-            )
-        new_ids = out[0][input_ids.shape[-1]:]
-        text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
 
-        a_lines: dict[str, str] = {}
-        b_lines: dict[str, str] = {}
+        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
+        system_msg = (
+            "You generate contrastive statement pairs for neural network "
+            "interpretability research. Pairs are processed numerically "
+            "for activation vector extraction. Generate exactly the number "
+            "of pairs requested, no more, no less."
+        )
+
+        # Keep generating batches (cycling through domains) until we
+        # have enough pairs or hit the attempt cap.  Small models
+        # often under-generate, so we can't assume 1 batch = BATCH_SIZE
+        # pairs.  The cap prevents infinite loops if the model
+        # consistently fails to produce parseable output.
+        max_batches = len(_DOMAIN_SEEDS) * 3
+        all_pairs: list[tuple[str, str]] = []
+        batch_idx = 0
+        while len(all_pairs) < n and batch_idx < max_batches:
+            domain = _DOMAIN_SEEDS[batch_idx % len(_DOMAIN_SEEDS)]
+            batch_n = min(_BATCH_SIZE, n - len(all_pairs))
+
+            if on_progress:
+                on_progress(
+                    f"Generating batch {batch_idx + 1} "
+                    f"({len(all_pairs)}/{n} pairs, domain: {domain})..."
+                )
+
+            prompt = (
+                f"Write exactly {batch_n} contrastive statement pairs.\n\n"
+                f"{poles}\n\n"
+                f"Domain: {domain}.\n\n"
+                f"Rules:\n"
+                f"- Same scenario, opposite dispositions\n"
+                f"- The trait should come through naturally in tone, "
+                f"imagery, and word choice\n"
+                f"- Both statements should sound like genuinely different "
+                f"people — not a word swap or negation\n"
+                f"- 1–2 sentences each\n\n"
+                f"Format: number then a/b, period, then the statement. "
+                f"Nothing else — no headers, no commentary.\n\n"
+                f"1a. [Speaker A's statement]\n"
+                f"1b. [Speaker B's statement]\n"
+                f"2a. [Speaker A's statement]\n"
+                f"2b. [Speaker B's statement]"
+            )
+            messages = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ]
+            input_ids = build_chat_input(
+                self._tokenizer, messages, system_prompt=None,
+            ).to(self._device)
+
+            with torch.inference_mode():
+                attn_mask = torch.ones_like(input_ids)
+                out = self._model.generate(
+                    input_ids, attention_mask=attn_mask,
+                    max_new_tokens=batch_n * 150,
+                    do_sample=True, temperature=1.0, top_p=0.9,
+                    pad_token_id=pad_id,
+                )
+            new_ids = out[0][input_ids.shape[-1]:]
+            text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+            batch_pairs = self._parse_pairs(text)
+            all_pairs.extend(batch_pairs)
+            batch_idx += 1
+
+        return all_pairs
+
+    @staticmethod
+    def _parse_pairs(text: str) -> list[tuple[str, str]]:
+        """Parse contrastive pairs from generated text.
+
+        Accepts varied formats: "1a.", "Na.", "a.", "1a)", "a)" etc.
+        Pairs positionally: each 'a' entry pairs with the nearest 'b'
+        (either direction), tolerating reversed, misnumbered, skipped,
+        or duplicated indices.
+        """
+        # Match: optional number/N prefix, then a or b, then delimiter
+        _PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
+        entries: list[tuple[str, str]] = []  # ("a"|"b", content)
         for line in text.split("\n"):
             line = line.strip()
-            m = re.match(r"(\d+)([ab])[.)]\s*(.*)", line)
+            m = _PAIR_RE.match(line)
             if not m:
                 continue
-            num, ab, content = m.group(1), m.group(2), m.group(3).strip()
+            ab, content = m.group(1).lower(), m.group(2).strip()
             if len(content) > 10:
-                if ab == "a":
-                    a_lines[num] = content
-                else:
-                    b_lines[num] = content
-
+                entries.append((ab, content))
+        # Pair adjacent a/b entries regardless of order
         pairs = []
-        for num in sorted(a_lines.keys(), key=int):
-            if num in b_lines:
-                pairs.append((a_lines[num], b_lines[num]))
+        i = 0
+        while i < len(entries) - 1:
+            cur, nxt = entries[i], entries[i + 1]
+            if cur[0] == "a" and nxt[0] == "b":
+                pairs.append((cur[1], nxt[1]))
+                i += 2
+            elif cur[0] == "b" and nxt[0] == "a":
+                pairs.append((nxt[1], cur[1]))
+                i += 2
+            else:
+                # Two of the same in a row — skip the first, try the second
+                i += 1
         return pairs
 
     def extract(
@@ -255,8 +330,7 @@ class LiahonaSession:
             )
             try:
                 profile, _meta = _load_profile(cache_path)
-                profile = {idx: (vec.to(self._device, self._dtype), score)
-                           for idx, (vec, score) in profile.items()}
+                profile = self._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{ds.name}'.")
                 return profile
             except (FileNotFoundError, KeyError, ValueError):
@@ -278,8 +352,7 @@ class LiahonaSession:
         # 1. Check vector cache
         try:
             profile, _meta = _load_profile(cache_path)
-            profile = {idx: (vec.to(self._device, self._dtype), score)
-                       for idx, (vec, score) in profile.items()}
+            profile = self._promote_profile(profile)
             _progress(f"Loaded cached profile for '{concept}'.")
             return profile
         except (FileNotFoundError, KeyError, ValueError):
@@ -329,7 +402,7 @@ class LiahonaSession:
         if pairs is None:
             suffix = f" vs '{baseline}'" if baseline else ""
             _progress(f"Generating contrastive pairs for '{concept}'{suffix}...")
-            raw_pairs = self.generate_pairs(concept, baseline)
+            raw_pairs = self.generate_pairs(concept, baseline, on_progress=_progress)
             pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
 
             os.makedirs(os.path.dirname(stmt_cache_path), exist_ok=True)
@@ -357,9 +430,7 @@ class LiahonaSession:
 
     def load_profile(self, path: str) -> dict[int, tuple[torch.Tensor, float]]:
         profile, _meta = _load_profile(path)
-        profile = {idx: (vec.to(self._device, self._dtype), score)
-                   for idx, (vec, score) in profile.items()}
-        return profile
+        return self._promote_profile(profile)
 
     def save_profile(self, profile: dict, path: str, metadata: dict | None = None) -> None:
         _save_profile(profile, path, metadata or {})
@@ -390,6 +461,10 @@ class LiahonaSession:
         """Remove all steering hooks from the model."""
         self._steering.clear_all()
 
+    def _promote_profile(self, profile: dict[int, tuple[torch.Tensor, float]]) -> dict[int, tuple[torch.Tensor, float]]:
+        return {idx: (vec.to(self._device, self._dtype), score)
+                for idx, (vec, score) in profile.items()}
+
     # -- Monitoring --
 
     def monitor(self, name: str, profile: dict | None = None) -> None:
@@ -416,8 +491,7 @@ class LiahonaSession:
 
     def clear_history(self) -> None:
         self._history.clear()
-        if self._monitor:
-            self._monitor.reset_history()
+        self._monitor.reset_history()
 
     # -- Generation helpers --
 
@@ -441,7 +515,7 @@ class LiahonaSession:
 
     def _build_readings(self) -> dict[str, ProbeReadings]:
         readings: dict[str, ProbeReadings] = {}
-        if not self._monitor or not self._monitor.probe_names:
+        if not self._monitor.probe_names:
             return readings
         for name in self._monitor.probe_names:
             stats = self._monitor.get_stats(name)
@@ -486,7 +560,7 @@ class LiahonaSession:
             thinking: enable thinking/reasoning mode for models that support it.
         """
         if not self._gen_lock.acquire(blocking=False):
-            raise RuntimeError("Generation already in progress")
+            raise ConcurrentGenerationError("Generation already in progress")
         try:
             return self._generate_blocking(input, alphas, orthogonalize, raw, thinking)
         finally:
@@ -496,8 +570,7 @@ class LiahonaSession:
         use_thinking = thinking and supports_thinking(self._tokenizer)
         messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
         self._gen_state.reset()
-        if self._monitor:
-            self._monitor.reset_history()
+        self._monitor.reset_history()
 
         vector_snapshot = dict(alphas) if alphas else {}
 
@@ -516,12 +589,12 @@ class LiahonaSession:
                 self._clear_steering()
 
         token_count = len(generated_ids)
-        tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
+        tok_per_sec = token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
         # Strip thinking tokens — only decode the response portion
         response_ids = generated_ids[self._gen_state.thinking_end_idx:]
         text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
-        if self._monitor and self._monitor.probe_names and text.strip():
+        if self._monitor.probe_names and text.strip():
             self._monitor.measure(
                 self._model, self._tokenizer, self._layers, text,
                 device=self._device,
@@ -562,20 +635,17 @@ class LiahonaSession:
             thinking: enable thinking/reasoning mode for models that support it.
         """
         if not self._gen_lock.acquire(blocking=False):
-            raise RuntimeError("Generation already in progress")
+            raise ConcurrentGenerationError("Generation already in progress")
         try:
             yield from self._generate_streaming(input, alphas, orthogonalize, raw, thinking)
         finally:
             self._gen_lock.release()
 
     def _generate_streaming(self, input, alphas, orthogonalize, raw=False, thinking=False) -> Iterator[TokenEvent]:
-        import queue as _queue
-
         use_thinking = thinking and supports_thinking(self._tokenizer)
         messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
         self._gen_state.reset()
-        if self._monitor:
-            self._monitor.reset_history()
+        self._monitor.reset_history()
 
         vector_snapshot = dict(alphas) if alphas else {}
 
@@ -611,12 +681,12 @@ class LiahonaSession:
             while True:
                 try:
                     item = token_queue.get(timeout=0.05)
-                except _queue.Empty:
+                except queue.Empty:
                     if gen_done.is_set():
                         while True:
                             try:
                                 item = token_queue.get_nowait()
-                            except _queue.Empty:
+                            except queue.Empty:
                                 break
                             if item is None:
                                 break
@@ -654,13 +724,13 @@ class LiahonaSession:
             raise gen_error[0]
 
         elapsed = time.monotonic() - start
-        token_count = len(token_events)
-        tok_per_sec = token_count / elapsed if elapsed > 0.1 else 0.0
+        token_count = len(generated_ids)
+        tok_per_sec = token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
         # Strip thinking tokens — only decode the response portion
         response_ids = generated_ids[self._gen_state.thinking_end_idx:]
         text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
-        if self._monitor and self._monitor.probe_names and text.strip():
+        if self._monitor.probe_names and text.strip():
             self._monitor.measure(
                 self._model, self._tokenizer, self._layers, text,
                 device=self._device,

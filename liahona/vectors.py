@@ -17,12 +17,12 @@ log = logging.getLogger(__name__)
 # The overhead cancels in contrastive diffs but wastes memory per pass.
 _MAX_TEMPLATE_OVERHEAD = 100
 
-_template_overhead_cache: dict[str, int] = {}
+_template_overhead_cache: dict[int, int] = {}
 
 
 def _chat_template_overhead(tokenizer, template_kwargs: dict) -> int:
     """Return the number of extra tokens the chat template adds beyond content."""
-    cache_key = getattr(tokenizer, 'name_or_path', '') + str(id(tokenizer))
+    cache_key = id(tokenizer)
     cached = _template_overhead_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -329,7 +329,7 @@ def extract_contrastive(
     model,
     tokenizer,
     pairs: list[dict],
-    layers=None,
+    layers,
     device=None,
 ) -> dict[int, tuple[torch.Tensor, float]]:
     """Contrastive direction extraction via PCA across all layers.

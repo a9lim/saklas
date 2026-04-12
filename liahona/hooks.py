@@ -52,7 +52,13 @@ class SteeringHook:
             self._handle = None
 
 
-def orthogonalize_vectors(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
+_DEGEN_THRESHOLD = 1e-8
+
+
+def orthogonalize_vectors(
+    vectors: list[torch.Tensor],
+    alphas: list[float] | None = None,
+) -> list[torch.Tensor] | list[tuple[torch.Tensor, float]]:
     """QR-based orthogonalization on a list of vectors.
 
     Returns orthonormal vectors preserving each input's orientation.
@@ -63,15 +69,26 @@ def orthogonalize_vectors(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
         return []
     if len(vectors) == 1:
         norm = vectors[0].norm()
-        return [vectors[0] / norm] if norm > 1e-8 else []
+        if norm <= _DEGEN_THRESHOLD:
+            return []
+        v = vectors[0] / norm
+        if alphas is not None:
+            return [(v, alphas[0])]
+        return [v]
     orig_dtype = vectors[0].dtype
     stacked = torch.stack(vectors).float()           # (N, dim)
     Q, R = torch.linalg.qr(stacked.T)                # Q: (dim, N)
     diag = R.diag()                                   # (N,)
-    keep = diag.abs() > 1e-8
+    keep = diag.abs() > _DEGEN_THRESHOLD
     # QR can flip column signs relative to input; R's diagonal sign
     # encodes the flip.  Correct so alphas keep their meaning.
     signs = diag.sign()
+    if alphas is not None:
+        return [
+            ((Q[:, i] * signs[i]).to(orig_dtype), alphas[i])
+            for i in range(min(Q.shape[1], len(vectors)))
+            if keep[i]
+        ]
     return [
         (Q[:, i] * signs[i]).to(orig_dtype)
         for i in range(min(Q.shape[1], len(vectors)))
@@ -84,15 +101,7 @@ class SteeringManager:
 
     def __init__(self) -> None:
         self.hooks: dict[int, SteeringHook] = {}
-        self.vectors: list[dict] = []
-        self._name_idx: dict[str, int] = {}
-
-    def _rebuild_index(self) -> None:
-        self._name_idx = {v["name"]: i for i, v in enumerate(self.vectors)}
-
-    def _find(self, name: str) -> dict | None:
-        idx = self._name_idx.get(name)
-        return self.vectors[idx] if idx is not None else None
+        self.vectors: dict[str, dict] = {}
 
     def add_vector(
         self,
@@ -100,27 +109,23 @@ class SteeringManager:
         profile: dict[int, tuple[torch.Tensor, float]],
         alpha: float,
     ) -> None:
-        self._name_idx[name] = len(self.vectors)
-        self.vectors.append(
-            {
-                "name": name,
-                "profile": profile,
-                "alpha": alpha,
-                "enabled": True,
-            }
-        )
+        self.vectors[name] = {
+            "name": name,
+            "profile": profile,
+            "alpha": alpha,
+            "enabled": True,
+        }
 
     def remove_vector(self, name: str) -> None:
-        self.vectors = [v for v in self.vectors if v["name"] != name]
-        self._rebuild_index()
+        self.vectors.pop(name, None)
 
     def set_alpha(self, name: str, alpha: float) -> None:
-        v = self._find(name)
+        v = self.vectors.get(name)
         if v is not None:
             v["alpha"] = alpha
 
     def toggle_vector(self, name: str) -> None:
-        v = self._find(name)
+        v = self.vectors.get(name)
         if v is not None:
             v["enabled"] = not v["enabled"]
 
@@ -134,7 +139,7 @@ class SteeringManager:
         """Group enabled vectors by layer, recompose hooks, attach to model."""
         # Group enabled vectors by layer via their profiles
         by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
-        for v in self.vectors:
+        for v in self.vectors.values():
             if v["enabled"]:
                 for layer_idx, (vec, score) in v["profile"].items():
                     effective_alpha = v["alpha"] * score
@@ -150,10 +155,8 @@ class SteeringManager:
         for idx, pairs in by_layer.items():
             if orthogonalize and len(pairs) > 1:
                 raw_vectors = [vec for vec, _ in pairs]
-                alphas = [alpha for _, alpha in pairs]
-                raw_vectors = orthogonalize_vectors(raw_vectors)
-                alphas = alphas[: len(raw_vectors)]
-                pairs = list(zip(raw_vectors, alphas))
+                raw_alphas = [alpha for _, alpha in pairs]
+                pairs = orthogonalize_vectors(raw_vectors, raw_alphas)
 
             if idx not in self.hooks:
                 hook = SteeringHook()
@@ -168,8 +171,7 @@ class SteeringManager:
             hook.detach()
         self.hooks.clear()
         self.vectors.clear()
-        self._name_idx.clear()
 
     def get_active_vectors(self) -> list[dict]:
         """Return all vector configs (for TUI display)."""
-        return list(self.vectors)
+        return list(self.vectors.values())

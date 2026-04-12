@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from liahona.probes_bootstrap import _load_defaults
-from liahona.session import LiahonaSession
+from liahona.session import ConcurrentGenerationError, LiahonaSession
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +132,11 @@ def _resolve_alphas(
     return merged or None
 
 
-def _ortho(steer_params: SteerParams | None) -> bool:
-    return steer_params.orthogonalize if steer_params else False
 
-
-def _thinking(steer_params: SteerParams | None) -> bool:
-    return steer_params.thinking if steer_params else False
+def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
+    """Return profile layers sorted by score descending."""
+    return sorted(((idx, score) for idx, (_vec, score) in profile.items()),
+                  key=lambda x: x[1], reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -203,53 +202,45 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         alphas = _resolve_alphas(req.steer, app.state.default_alphas)
-        ortho = _ortho(req.steer)
-        think = _thinking(req.steer)
+        ortho = req.steer.orthogonalize if req.steer else False
+        think = req.steer.thinking if req.steer else False
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
         model_id = session.model_info.get("model_id", "unknown")
 
         orig = _apply_gen_overrides(session, req.temperature, req.top_p, req.max_tokens)
+        if req.stream:
+            return StreamingResponse(
+                _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig),
+                media_type="text/event-stream",
+            )
+        # Non-streaming
         try:
-            if req.stream:
-                return StreamingResponse(
-                    _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig),
-                    media_type="text/event-stream",
-                )
-            # Non-streaming
-            try:
-                result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
-            except RuntimeError as e:
-                if "already in progress" in str(e):
-                    return _error(409, str(e), "conflict")
-                raise
-            finally:
-                _restore_gen_config(session, orig)
-
-            return {
-                "id": rid,
-                "object": "chat.completion",
-                "created": _ts(),
-                "model": model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": result.text},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": result.token_count,
-                    "total_tokens": result.token_count,
-                },
-                "probe_readings": _probe_reading_dict(session),
-            }
-        except RuntimeError as e:
+            result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
+        except ConcurrentGenerationError as e:
+            return _error(409, str(e), "conflict")
+        finally:
             _restore_gen_config(session, orig)
-            if "already in progress" in str(e):
-                return _error(409, str(e), "conflict")
-            raise
+
+        return {
+            "id": rid,
+            "object": "chat.completion",
+            "created": _ts(),
+            "model": model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": result.text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": result.token_count,
+                "total_tokens": result.token_count,
+            },
+            "probe_readings": _probe_reading_dict(session),
+        }
 
     async def _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig_config):
         try:
@@ -274,12 +265,10 @@ def _register_routes(app: FastAPI) -> None:
                         ],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
-            except RuntimeError as e:
-                if "already in progress" in str(e):
-                    err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
-                    yield f"data: {json.dumps(err)}\n\n"
-                    return
-                raise
+            except ConcurrentGenerationError as e:
+                err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
+                yield f"data: {json.dumps(err)}\n\n"
+                return
 
             # Final chunk with finish_reason and probe readings
             final = {
@@ -308,50 +297,43 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest):
         alphas = _resolve_alphas(req.steer, app.state.default_alphas)
-        ortho = _ortho(req.steer)
+        ortho = req.steer.orthogonalize if req.steer else False
         rid = _make_id()
         model_id = session.model_info.get("model_id", "unknown")
 
         orig = _apply_gen_overrides(session, req.temperature, req.top_p, req.max_tokens)
+        if req.stream:
+            return StreamingResponse(
+                _stream_completions(session, req.prompt, alphas, ortho, rid, model_id, orig),
+                media_type="text/event-stream",
+            )
+        # Non-streaming
         try:
-            if req.stream:
-                return StreamingResponse(
-                    _stream_completions(session, req.prompt, alphas, ortho, rid, model_id, orig),
-                    media_type="text/event-stream",
-                )
-            try:
-                result = session.generate(req.prompt, alphas=alphas, orthogonalize=ortho, raw=True)
-            except RuntimeError as e:
-                if "already in progress" in str(e):
-                    return _error(409, str(e), "conflict")
-                raise
-            finally:
-                _restore_gen_config(session, orig)
-
-            return {
-                "id": rid,
-                "object": "text_completion",
-                "created": _ts(),
-                "model": model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "text": result.text,
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": result.token_count,
-                    "total_tokens": result.token_count,
-                },
-                "probe_readings": _probe_reading_dict(session),
-            }
-        except RuntimeError as e:
+            result = session.generate(req.prompt, alphas=alphas, orthogonalize=ortho, raw=True)
+        except ConcurrentGenerationError as e:
+            return _error(409, str(e), "conflict")
+        finally:
             _restore_gen_config(session, orig)
-            if "already in progress" in str(e):
-                return _error(409, str(e), "conflict")
-            raise
+
+        return {
+            "id": rid,
+            "object": "text_completion",
+            "created": _ts(),
+            "model": model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "text": result.text,
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": result.token_count,
+                "total_tokens": result.token_count,
+            },
+            "probe_readings": _probe_reading_dict(session),
+        }
 
     async def _stream_completions(session, prompt, alphas, ortho, rid, model_id, orig_config):
         try:
@@ -371,12 +353,10 @@ def _register_routes(app: FastAPI) -> None:
                         ],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
-            except RuntimeError as e:
-                if "already in progress" in str(e):
-                    err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
-                    yield f"data: {json.dumps(err)}\n\n"
-                    return
-                raise
+            except ConcurrentGenerationError as e:
+                err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
+                yield f"data: {json.dumps(err)}\n\n"
+                return
 
             final = {
                 "id": rid,
@@ -407,8 +387,7 @@ def _register_routes(app: FastAPI) -> None:
         out: dict[str, Any] = {}
         for name, profile in vectors.items():
             layers = sorted(profile.keys())
-            scored = [(idx, score) for idx, (_vec, score) in profile.items()]
-            scored.sort(key=lambda x: x[1], reverse=True)
+            scored = _profile_top_layers(profile)
             top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored[:5]]
             out[name] = {
                 "layers": layers,
@@ -438,23 +417,19 @@ def _register_routes(app: FastAPI) -> None:
         try:
             profile = session.extract(source, baseline=req.baseline,
                                       on_progress=lambda m: progress_msgs.append(m))
-        except RuntimeError as e:
-            if "already in progress" in str(e):
-                return _error(409, str(e), "conflict")
-            raise
+        except ConcurrentGenerationError as e:
+            return _error(409, str(e), "conflict")
 
         if req.auto_register:
             session.steer(req.name, profile)
             app.state.default_alphas[req.name] = req.alpha
 
-        layers = sorted(profile.keys())
-        scored = [(idx, score) for idx, (_vec, score) in profile.items()]
-        scored.sort(key=lambda x: x[1], reverse=True)
+        scored = _profile_top_layers(profile)
         top_layer, top_score = scored[0] if scored else (0, 0.0)
 
         return {
             "name": req.name,
-            "layers": len(layers),
+            "layers": len(profile),
             "top_layer": top_layer,
             "top_score": round(top_score, 4),
         }
@@ -465,14 +440,14 @@ def _register_routes(app: FastAPI) -> None:
         def _on_progress(msg):
             progress_msgs.append(msg)
 
+        # NOTE: Progress messages are batched because session.extract() is
+        # synchronous.  Events are emitted after extraction completes.
         try:
             profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
-        except RuntimeError as e:
-            if "already in progress" in str(e):
-                err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
-                yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                return
-            raise
+        except ConcurrentGenerationError as e:
+            err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
+            yield f"event: error\ndata: {json.dumps(err)}\n\n"
+            return
 
         for msg in progress_msgs:
             yield f"event: progress\ndata: {json.dumps({'message': msg})}\n\n"
@@ -481,12 +456,10 @@ def _register_routes(app: FastAPI) -> None:
             session.steer(name, profile)
             app.state.default_alphas[name] = alpha
 
-        layers = sorted(profile.keys())
-        scored = [(idx, score) for idx, (_vec, score) in profile.items()]
-        scored.sort(key=lambda x: x[1], reverse=True)
+        scored = _profile_top_layers(profile)
         top_layer, top_score = scored[0] if scored else (0, 0.0)
 
-        done = {"name": name, "layers": len(layers), "top_layer": top_layer, "top_score": round(top_score, 4)}
+        done = {"name": name, "layers": len(profile), "top_layer": top_layer, "top_score": round(top_score, 4)}
         yield f"event: done\ndata: {json.dumps(done)}\n\n"
 
     @app.post("/v1/liahona/vectors/load")
@@ -499,8 +472,7 @@ def _register_routes(app: FastAPI) -> None:
         app.state.default_alphas[req.name] = req.alpha
 
         layers = sorted(profile.keys())
-        scored = [(idx, score) for idx, (_vec, score) in profile.items()]
-        scored.sort(key=lambda x: x[1], reverse=True)
+        scored = _profile_top_layers(profile)
         top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored[:5]]
 
         return {

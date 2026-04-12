@@ -152,7 +152,8 @@ class TestChatCompletions:
 
     def test_conflict_on_concurrent_generation(self, session_and_client):
         session, client = session_and_client
-        session.generate.side_effect = RuntimeError("Generation already in progress")
+        from liahona.session import ConcurrentGenerationError
+        session.generate.side_effect = ConcurrentGenerationError("Generation already in progress")
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hi"}],
