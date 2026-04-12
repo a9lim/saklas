@@ -376,8 +376,8 @@ def generate_steered(
                 past_key_values = outputs.past_key_values
                 logits = outputs.logits[:, -1, :]
                 # Steering can push hidden states past fp16 range, cascading
-                # to inf/NaN logits. Clamp bounds the range for stable softmax;
-                # nan_to_num replaces any remaining NaN→0.
+                # to inf/NaN logits.  nan_to_num clears NaN/inf first;
+                # clamp then bounds any remaining finite outliers.
                 logits.nan_to_num_(nan=0.0, posinf=100.0, neginf=-100.0)
                 logits.clamp_(-100.0, 100.0)
 

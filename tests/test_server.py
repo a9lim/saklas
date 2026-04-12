@@ -34,7 +34,7 @@ def _mock_session():
     session.probes = {}
     session.history = []
 
-    session._build_readings.return_value = {}
+    session.build_readings.return_value = {}
     return session
 
 
