@@ -11,7 +11,17 @@ license = "AGPL-3.0-or-later"
 authors = [{name = "a9lim", email = "mx@a9l.im"}]
 requires-python = ">=3.11"
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Environment :: GPU :: NVIDIA CUDA",
 ]
 dependencies = [
     "torch>=2.2",
