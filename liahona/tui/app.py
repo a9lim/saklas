@@ -16,12 +16,12 @@ from textual.timer import Timer
 from liahona.generation import GenerationState, build_chat_input, generate_steered, supports_thinking
 from liahona.model import _get_memory_gb
 from liahona.probes_bootstrap import _load_defaults
+from liahona.session import _MIN_ELAPSED_FOR_RATE
 from liahona.tui.chat_panel import ChatPanel
 from liahona.tui.vector_panel import LeftPanel, MAX_ALPHA
 from liahona.tui.trait_panel import TraitPanel
 
 DEFAULT_ALPHA = 0.15
-_MIN_ELAPSED_FOR_RATE = 0.1
 _POLL_FPS = 15
 _VRAM_UPDATE_INTERVAL = 15
 _TOKEN_DRAIN_LIMIT = 20

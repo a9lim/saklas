@@ -27,6 +27,7 @@ from liahona.vectors import (
 )
 
 _N_PAIRS = 45
+PROBE_CATEGORIES = ["emotion", "personality", "safety", "cultural", "gender"]
 _BATCH_SIZE = 9
 _MIN_ELAPSED_FOR_RATE = 0.1
 
@@ -92,13 +93,7 @@ class LiahonaSession:
         self._last_result: GenerationResult | None = None
 
         # Bootstrap probes
-        all_categories = ["emotion", "personality", "safety", "cultural", "gender"]
-        if probes is None:
-            probe_categories = all_categories
-        elif not probes:
-            probe_categories = []
-        else:
-            probe_categories = probes
+        probe_categories = PROBE_CATEGORIES if probes is None else probes
 
         probe_profiles: dict[str, dict] = {}
         if probe_categories:
@@ -323,7 +318,7 @@ class LiahonaSession:
         # For DataSource or raw pairs, skip the full pipeline — just extract
         if isinstance(source, (DataSource, list)):
             if isinstance(source, list):
-                ds = DataSource.from_pairs(source)
+                ds = DataSource(pairs=source)
             else:
                 ds = source
             cache_path = get_cache_path(

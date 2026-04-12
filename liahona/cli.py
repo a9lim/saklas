@@ -51,9 +51,9 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 def _resolve_probes(raw: list[str] | None) -> list[str]:
-    all_categories = ["emotion", "personality", "safety", "cultural", "gender"]
+    from liahona.session import PROBE_CATEGORIES
     if raw is None or raw == ["all"]:
-        return all_categories
+        return list(PROBE_CATEGORIES)
     if raw == ["none"] or raw == []:
         return []
     return raw

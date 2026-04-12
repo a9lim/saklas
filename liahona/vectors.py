@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 _MAX_TEMPLATE_OVERHEAD = 100
 
 _template_overhead_cache: dict[int, int] = {}
+_SAFE_CONCEPT_RE = re.compile(r'[^\w\-.]')
 
 
 def _chat_template_overhead(tokenizer, template_kwargs: dict) -> int:
@@ -496,7 +497,7 @@ def get_cache_path(
         Path like ``{cache_dir}/{model_name}/{concept}.safetensors``
     """
     model_name = model_id.replace("/", "_")
-    safe_concept = re.sub(r'[^\w\-.]', '_', concept)
+    safe_concept = _SAFE_CONCEPT_RE.sub('_', concept)
     filename = f"{safe_concept}.safetensors"
     return str(Path(cache_dir) / model_name / filename)
 
