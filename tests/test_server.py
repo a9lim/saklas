@@ -127,8 +127,8 @@ class TestChatCompletions:
         session, client = session_and_client
 
         def _mock_stream(*args, **kwargs):
-            yield TokenEvent(text="Hello", token_id=1, index=0, readings=None)
-            yield TokenEvent(text=" world", token_id=2, index=1, readings=None)
+            yield TokenEvent(text="Hello", token_id=1, index=0)
+            yield TokenEvent(text=" world", token_id=2, index=1)
 
         session.generate_stream.return_value = _mock_stream()
 

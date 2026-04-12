@@ -694,7 +694,7 @@ class LiahonaSession:
                             event = TokenEvent(
                                 text=tok_str,
                                 token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                                index=idx, readings=None, thinking=is_thinking,
+                                index=idx, thinking=is_thinking,
                             )
                             token_events.append(event)
                             yield event
@@ -709,7 +709,7 @@ class LiahonaSession:
                 event = TokenEvent(
                     text=tok_str,
                     token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                    index=idx, readings=None, thinking=is_thinking,
+                    index=idx, thinking=is_thinking,
                 )
                 token_events.append(event)
                 yield event

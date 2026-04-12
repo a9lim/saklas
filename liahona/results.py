@@ -54,7 +54,6 @@ class TokenEvent:
     text: str
     token_id: int
     index: int
-    readings: dict[str, float] | None
     thinking: bool = False
 
 

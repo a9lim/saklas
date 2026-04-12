@@ -293,10 +293,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
                 log.info("attn_implementation %r unsupported, falling back to eager",
                          load_kwargs.get("attn_implementation"))
                 load_kwargs["attn_implementation"] = "eager"
-                try:
-                    return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-                except Exception as eager_err:
-                    raise
+                return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
             except Exception:
                 if quantize is not None:
                     raise
@@ -313,10 +310,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
             load_kwargs["device_map"] = {"": "cpu"}
             if "dtype" not in load_kwargs:
                 load_kwargs["dtype"] = torch.float32
-            try:
-                model = _try_load_with_fallbacks()
-            except Exception as cpu_err:
-                raise
+            model = _try_load_with_fallbacks()
             model = model.to(device)
 
     model.requires_grad_(False)

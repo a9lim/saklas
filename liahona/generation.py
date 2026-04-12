@@ -414,7 +414,6 @@ def generate_steered(
                     # state, transition out of thinking, and keep generating.
                     generated_ids.append(token_id)
                     current_input = next_token
-                    seq_len += 1
                     if in_thinking:
                         # EOS ends the thinking channel — enter response
                         # preamble so inter-channel tokens (turn markers
@@ -437,7 +436,6 @@ def generate_steered(
                 # Advance KV cache state (common to all non-EOS paths)
                 generated_ids.append(token_id)
                 current_input = next_token
-                seq_len += 1
 
                 # Handle thinking start delimiter (Gemma-style: model
                 # explicitly opens a thinking channel)

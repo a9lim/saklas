@@ -65,14 +65,14 @@ class TestGenerationResult:
 
 class TestTokenEvent:
     def test_fields(self):
-        event = TokenEvent(text="hello", token_id=42, index=0, readings={"honest": 0.5})
+        event = TokenEvent(text="hello", token_id=42, index=0)
         assert event.text == "hello"
         assert event.token_id == 42
-        assert event.readings["honest"] == 0.5
+        assert event.index == 0
 
-    def test_no_readings(self):
-        event = TokenEvent(text="hi", token_id=1, index=0, readings=None)
-        assert event.readings is None
+    def test_thinking_flag(self):
+        event = TokenEvent(text="hi", token_id=1, index=0, thinking=True)
+        assert event.thinking is True
 
 
 class TestResultCollector:

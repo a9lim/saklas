@@ -51,7 +51,6 @@ class TraitMonitor:
         hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
 
         sims: dict[str, float] = {}
-        total_weights: dict[str, float] = {}
 
         for name in self.probe_names:
             total_w = 0.0

@@ -407,7 +407,7 @@ def extract_contrastive(
 
         # Diffs are already float32 and on CPU for MPS — run SVD directly.
         batched = torch.stack(diff_matrices)  # (n_layers, N, dim)
-        svd_input = batched.cpu() if batched.device.type == "mps" else batched
+        svd_input = batched
         _, S, Vh = torch.linalg.svd(svd_input, full_matrices=False)
         # S: (n_layers, min(N,dim)), Vh: (n_layers, min(N,dim), dim)
 
@@ -420,7 +420,6 @@ def extract_contrastive(
                 direction = -direction
 
             score = (S[idx, 0] / S[idx].sum()).item()
-            scores[idx] = score
             profile[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), score)
 
     # Single-pair scores are raw diff norms — normalize to [0, 1] so they're
