@@ -79,7 +79,7 @@ class TraitMonitor:
                 if mean is not None:
                     h = h - mean.to(h.device)
                 v = vec.to(h.device).float()
-                cos = (h @ v) / h.norm().clamp(min=1e-8)
+                cos = (h @ v) / (h.norm() * v.norm()).clamp(min=1e-8)
                 weighted_sim += score * cos.item()
             total_w = max(total_w, 1e-8)
             val = weighted_sim / total_w
