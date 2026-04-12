@@ -40,7 +40,7 @@ Five layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 - `probes_bootstrap.py` — Loads/extracts probe profiles per `liahona/probes/defaults.json`. 28 probes across 5 categories (emotion, personality, safety, cultural, gender). `bootstrap_layer_means`: loads or computes per-layer mean activations, cached as `_LAYERMEANS.safetensors` per model. MPS cache flushed between probe extractions.
 
 ### Steering + Monitoring layer
-- `hooks.py` — `SteeringHook` adds pre-composed vector to hidden states in-place. `SteeringManager` groups vectors by layer, orthogonalizes per layer (Gram-Schmidt), one hook per active layer. **Layer-scalar compensation**: for architectures with per-layer output scaling (Gemma 4 `layer_scalar`), divides each layer's effective alpha by the scalar so the perturbation enters the residual stream at pre-scalar magnitude — without this, the scalar attenuates steering contributions through subsequent layers.
+- `hooks.py` — `SteeringHook` adds pre-composed vector to hidden states in-place. `SteeringManager` groups vectors by layer, orthogonalizes per layer (Gram-Schmidt), one hook per active layer. **Layer-scalar compensation**: for architectures with per-layer output scaling (Gemma 4 `layer_scalar`), computes the reverse cumulative product of subsequent scalars and boosts each layer's effective alpha by the inverse (capped at 4x) — the last layer gets no boost since its perturbation feeds directly into the LM head.
 - `monitor.py` — `TraitMonitor` runs a single post-generation forward pass over the generated text using attention-weighted pooling. Mean-centers hidden states (subtracting per-layer means computed from neutral prompts) before computing score-weighted cosine similarities against probe vectors. One value per probe per generation. No hooks on the model during generation.
 
 ### Session API layer
@@ -73,7 +73,7 @@ These matter for the throughput regression test (steered >= 85% of vanilla tok/s
 - **Vectors scaled to mean hidden-state norm** at each extraction layer. Alpha directly represents the fraction of activation magnitude (e.g. alpha=0.15 means 15% perturbation at high-signal layers).
 - **Monitor is post-generation**: single forward pass after generation, no hooks during generation. Mean-centered cosine similarities remove baseline bias.
 - **Steering hooks are transient**: composed before generation, removed after. No persistent hooks between generations.
-- **Layer-scalar compensation is pre-computed** — `apply_to_model` reads `layer_scalar` buffers and adjusts alphas before composing. No `.item()` or scalar reads in the hot-path hook.
+- **Layer-scalar compensation is pre-computed** — `apply_to_model` computes reverse cumulative products once and adjusts alphas before composing. No `.item()` or scalar reads in the hot-path hook.
 - **Contrastive diffs in float32** — fp16 subtraction between close activation vectors loses precision, producing degenerate SVD inputs. Cast to float32 before differencing.
 - **MPS memory discipline** — diffs kept on CPU (SVD runs there anyway). `torch.mps.empty_cache()` between forward passes in extraction loops. Attention capture falls back to last-token pooling on OOM. Model loading via `torch.device(target)` avoids CPU RSS spike on unified memory.
 
