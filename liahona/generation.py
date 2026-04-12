@@ -187,25 +187,18 @@ def _detect_think_delimiters(
             continue
 
         # --- end delimiter: first special token between the two markers ---
-        # --- response_start: last special token (if different from end) ---
+        # response_start_id is only relevant for channel-based models
+        # (detected via _detect_channel_delimiters).  For enable_thinking
+        # models the response follows the end delimiter directly.
         between = rendered[ti + len(think_marker):ri]
         end_pos, end_tok, end_id = len(between), None, None
-        rs_pos, rs_tok, rs_id = -1, None, None
         for tok_str, tok_id in added.items():
             pos = between.find(tok_str)
-            if pos < 0:
-                continue
-            if pos < end_pos:
+            if 0 <= pos < end_pos:
                 end_pos, end_tok, end_id = pos, tok_str, tok_id
-            # Track the last (rightmost) special token for response_start
-            last = between.rfind(tok_str)
-            if last > rs_pos:
-                rs_pos, rs_tok, rs_id = last, tok_str, tok_id
         if end_id is None:
             continue
-        # Only set response_start if it's a different token than end
-        if rs_id == end_id:
-            rs_id = None
+        rs_id = None
 
         # --- start delimiter: closest special token before think_marker ---
         start_pos, start_tok, start_id = -1, None, None
@@ -237,8 +230,7 @@ def _detect_think_delimiters(
             "thinking delimiters: start=%r end=%r response_start=%r"
             " starts_in_thinking=%s",
             start_tok if start_id is not None else "(prompt)",
-            end_tok, rs_tok if rs_id is not None else None,
-            starts_in_thinking,
+            end_tok, None, starts_in_thinking,
         )
         _think_delim_cache[tok_key] = result
         return result
