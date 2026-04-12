@@ -8,11 +8,9 @@ from pathlib import Path
 class DataSource:
     """Normalizes contrastive pairs from multiple input formats."""
 
-    def __init__(self, pairs: list[tuple[str, str]], name: str = "custom",
-                 description: str | None = None):
+    def __init__(self, pairs: list[tuple[str, str]], name: str = "custom"):
         self.pairs = pairs
         self.name = name
-        self.description = description
 
     @classmethod
     def _from_json_file(cls, path, name_override: str | None = None) -> DataSource:
@@ -20,7 +18,7 @@ class DataSource:
             data = json.load(f)
         pairs = [(p["positive"], p["negative"]) for p in data["pairs"]]
         name = name_override or data.get("name", Path(path).stem)
-        return cls(pairs=pairs, name=name, description=data.get("description"))
+        return cls(pairs=pairs, name=name)
 
     @classmethod
     def curated(cls, concept: str) -> DataSource:

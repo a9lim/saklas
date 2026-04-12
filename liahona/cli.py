@@ -123,10 +123,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _run_tui(args: argparse.Namespace) -> None:
+def _print_startup(args: argparse.Namespace) -> None:
+    """Print common model-loading banner."""
     print(f"Loading model: {args.model}")
     if args.quantize:
         print(f"Quantization: {args.quantize}")
+
+
+def _run_tui(args: argparse.Namespace) -> None:
+    _print_startup(args)
 
     session = _make_session(args)
     _print_model_info(session)
@@ -156,9 +161,7 @@ def _run_serve(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    print(f"Loading model: {args.model}")
-    if args.quantize:
-        print(f"Quantization: {args.quantize}")
+    _print_startup(args)
 
     session = _make_session(args)
     _print_model_info(session)

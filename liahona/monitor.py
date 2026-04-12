@@ -26,24 +26,28 @@ class TraitMonitor:
         probe_profiles: maps probe name -> profile dict (layer_idx -> (vector, score))
         layer_means: maps layer_idx -> mean activation vector for centering
         """
-        self.probe_names: list[str] = list(probe_profiles.keys())
         self._raw_profiles: dict[str, dict[int, tuple[torch.Tensor, float]]] = dict(probe_profiles)
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
 
-        self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self.probe_names}
-        self._stats: dict[str, dict] = {n: self._empty_stats() for n in self.probe_names}
+        self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self._raw_profiles}
+        self._stats: dict[str, dict] = {n: self._empty_stats() for n in self._raw_profiles}
 
         # Set after measure() — signals TUI to refresh
         self._pending = False
 
     @property
+    def probe_names(self) -> list[str]:
+        """Probe names in insertion order."""
+        return list(self._raw_profiles.keys())
+
+    @property
     def profiles(self) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
         """Probe profiles: name -> {layer_idx: (vector, score)}."""
-        return dict(self._raw_profiles)
+        return self._raw_profiles
 
     @property
     def layer_means(self) -> dict[int, torch.Tensor]:
-        return dict(self._layer_means)
+        return self._layer_means
 
     @layer_means.setter
     def layer_means(self, value: dict[int, torch.Tensor]) -> None:
@@ -63,27 +67,22 @@ class TraitMonitor:
 
         hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
 
-        sims: dict[str, float] = {}
-
-        for name in self.probe_names:
+        for name in self._raw_profiles:
             total_w = 0.0
             weighted_sim = 0.0
             for layer_idx, (vec, score) in self._raw_profiles[name].items():
-                total_w += score
                 if layer_idx not in hidden_per_layer:
                     continue
+                total_w += score
                 h = hidden_per_layer[layer_idx].float()
                 mean = self._layer_means.get(layer_idx)
                 if mean is not None:
-                    h = h - mean.to(h.device).float()
+                    h = h - mean.to(h.device)
                 v = vec.to(h.device).float()
                 cos = (h @ v) / h.norm().clamp(min=1e-8)
                 weighted_sim += score * cos.item()
             total_w = max(total_w, 1e-8)
-            sims[name] = weighted_sim / total_w
-
-        for name in self.probe_names:
-            val = sims[name]
+            val = weighted_sim / total_w
             self.history[name].append(val)
             s = self._stats[name]
             s["count"] += 1
@@ -106,7 +105,7 @@ class TraitMonitor:
     def get_current_and_previous(self) -> tuple[dict[str, float], dict[str, float]]:
         current = {}
         previous = {}
-        for name in self.probe_names:
+        for name in self._raw_profiles:
             hist = self.history[name]
             if len(hist) >= 2:
                 current[name] = hist[-1]
@@ -132,24 +131,22 @@ class TraitMonitor:
         return "".join(blocks[min(8, max(0, int((v - lo) / span * 8)))] for v in values)
 
     def add_probe(self, name: str, profile: dict[int, tuple[torch.Tensor, float]]):
+        is_new = name not in self._raw_profiles
         self._raw_profiles[name] = profile
-        if name not in self.probe_names:
-            self.probe_names.append(name)
+        if is_new:
             self.history[name] = deque(maxlen=_MAX_HISTORY)
             self._stats[name] = self._empty_stats()
 
     def remove_probe(self, name: str):
         if name in self._raw_profiles:
             del self._raw_profiles[name]
-        if name in self.probe_names:
-            self.probe_names.remove(name)
         if name in self.history:
             del self.history[name]
         if name in self._stats:
             del self._stats[name]
 
     def reset_history(self):
-        for name in self.probe_names:
+        for name in self._raw_profiles:
             self.history[name].clear()
             self._stats[name] = self._empty_stats()
         self._pending = False

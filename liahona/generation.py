@@ -11,12 +11,16 @@ import torch
 
 log = logging.getLogger(__name__)
 
+def _tok_key(tokenizer) -> tuple[str, int]:
+    return (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
+
+
 _eos_cache: dict[tuple[str, int], set[int]] = {}
 
 
 def _get_eos_ids(model, tokenizer) -> set[int]:
     """Return cached set of all EOS token IDs for model+tokenizer."""
-    tok_key = (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
+    tok_key = _tok_key(tokenizer)
     cached = _eos_cache.get(tok_key)
     if cached is not None:
         return cached
@@ -53,7 +57,7 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
     (replacement char U+FFFD) — these must be buffered and decoded together
     with subsequent tokens (e.g. multi-token emoji).
     """
-    tok_key = (getattr(tokenizer, 'name_or_path', ''), vocab_size)
+    tok_key = _tok_key(tokenizer)
     cached = _token_table_cache.get(tok_key)
     if cached is not None:
         return cached
@@ -69,6 +73,7 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
 
 
 _think_delim_cache: dict[tuple[str, int], tuple[int | None, int | None, int | None, bool]] = {}
+_none_result: tuple[int | None, int | None, int | None, bool] = (None, None, None, False)
 
 
 def _detect_channel_delimiters(
@@ -135,12 +140,11 @@ def _detect_think_delimiters(
     the tokenizer's own chat template and inspecting the delimiters that
     bracket the known thinking content.
     """
-    tok_key = (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
+    tok_key = _tok_key(tokenizer)
     cached = _think_delim_cache.get(tok_key)
     if cached is not None:
         return cached
 
-    _none_result: tuple[int | None, int | None, int | None, bool] = (None, None, None, False)
     template = getattr(tokenizer, "chat_template", None) or ""
     if "enable_thinking" not in template:
         # Check for channel-based thinking (e.g. gpt-oss) where the
@@ -242,12 +246,7 @@ def _detect_think_delimiters(
 
 def supports_thinking(tokenizer) -> bool:
     """Check if the tokenizer's chat template supports thinking mode."""
-    template = getattr(tokenizer, "chat_template", None) or ""
-    if "enable_thinking" in template:
-        return True
-    # Channel-based thinking (e.g. gpt-oss) — always active
-    added = getattr(tokenizer, "added_tokens_encoder", {})
-    return "<|channel|>" in added and "<|message|>" in added
+    return _detect_think_delimiters(tokenizer) != _none_result
 
 
 class GenerationConfig:
@@ -273,7 +272,6 @@ class GenerationState:
 
     def __init__(self):
         self.stop_requested = threading.Event()
-        self.is_generating = threading.Event()
         self.token_queue: queue.SimpleQueue[tuple[str, bool] | None] = queue.SimpleQueue()
         self.thinking_end_idx: int = 0
 
@@ -282,7 +280,6 @@ class GenerationState:
 
     def reset(self):
         self.stop_requested.clear()
-        self.is_generating.clear()
         self.token_queue = queue.SimpleQueue()
         self.thinking_end_idx = 0
 
@@ -326,7 +323,6 @@ def generate_steered(
     Runs in a worker thread (not the async event loop).
     Returns list of generated token IDs.
     """
-    state.is_generating.set()
     device = input_ids.device
     eos_ids = _get_eos_ids(model, tokenizer)
     past_key_values = None
@@ -514,6 +510,5 @@ def generate_steered(
         # "commit an already committed command buffer".
         if device.type == "mps":
             torch.mps.synchronize()
-        state.is_generating.clear()
 
     return generated_ids
