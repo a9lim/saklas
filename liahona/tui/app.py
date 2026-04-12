@@ -21,7 +21,7 @@ from liahona.tui.chat_panel import ChatPanel
 from liahona.tui.vector_panel import LeftPanel, MAX_ALPHA
 from liahona.tui.trait_panel import TraitPanel
 
-DEFAULT_ALPHA = 0.5
+DEFAULT_ALPHA = 0.36
 _POLL_FPS = 15
 _VRAM_UPDATE_INTERVAL = 15
 _TOKEN_DRAIN_LIMIT = 20
