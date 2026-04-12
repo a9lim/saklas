@@ -47,7 +47,7 @@ with LiahonaSession("google/gemma-2-2b-it", device="cuda") as session:
 
 **Orthogonalization is per-call.** `session.generate(input, alphas={...}, orthogonalize=True)` applies Gram-Schmidt to the active vectors for that generation only.
 
-**Thinking mode is per-call.** For models that support it (Qwen 3.5, QwQ), `session.generate(input, thinking=True)` enables the model's built-in reasoning trace. Thinking tokens are separated from the response — `result.text` contains only the final answer, while streaming via `generate_stream` yields `TokenEvent` objects with `thinking=True` for the reasoning trace.
+**Thinking mode is per-call.** For models that support it (Qwen 3.5, QwQ, Gemma 4, etc.), `session.generate(input, thinking=True)` enables the model's built-in reasoning trace. Thinking delimiters are detected automatically from the chat template — no hardcoded tokens. Thinking tokens are separated from the response — `result.text` contains only the final answer, while streaming via `generate_stream` yields `TokenEvent` objects with `thinking=True` for the reasoning trace.
 
 **Multiple vectors compose naturally:**
 
@@ -365,9 +365,9 @@ pip install torch psutil setuptools wheel && pip install -e ".[cuda]" --no-build
 
 ## Supported architectures
 
-45 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one lambda entry.
+52 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one lambda entry.
 
-Llama (1-4), Mistral (1, 4), Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3.5), Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-3), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, RecurrentGemma.
+Llama (1-4), Mistral (1, 4), Ministral (1, 3), Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3.5), Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-3), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, GPT-OSS, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, RecurrentGemma.
 
 ## How it works
 
