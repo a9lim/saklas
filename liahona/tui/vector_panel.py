@@ -121,9 +121,8 @@ class LeftPanel(Widget):
             enabled = v.get("enabled", True)
             name = v["name"]
             alpha = v["alpha"]
-            profile = v["profile"]
-            peak = max(profile, key=lambda k: profile[k][1])
-            n_active = len(profile)
+            peak = v["peak"]
+            n_active = v["n_active"]
             layer_tag = f"{n_active}L pk{peak}"
 
             bar_full, bar_empty = _build_bar(alpha, MAX_ALPHA, 16)
@@ -134,36 +133,25 @@ class LeftPanel(Widget):
             else:
                 color = "ansi_default"
 
-            if is_selected:
-                marker = ">"
-                dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
-                if enabled:
-                    text = (
-                        f"{marker} {dot} [bold]{name}[/] [dim]{layer_tag}[/]\n"
-                        f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.2f}[/] [dim]←/→[/]"
-                    )
-                else:
-                    text = (
-                        f"{marker} {dot} [dim bold]{name}[/] [dim]{layer_tag}[/]\n"
-                        f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.2f}[/] [dim]←/→[/]"
-                    )
+            marker = ">" if is_selected else " "
+            dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
+            hint = " [dim]←/→[/]" if is_selected else ""
+
+            if is_selected and enabled:
+                name_str = f"[bold]{name}[/]"
+            elif is_selected and not enabled:
+                name_str = f"[dim bold]{name}[/]"
+            elif not enabled:
+                name_str = f"[dim]{name}[/]"
             else:
-                marker = " "
-                dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
-                if enabled:
-                    text = (
-                        f"{marker} {dot} {name} [dim]{layer_tag}[/]\n"
-                        f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.2f}[/]"
-                    )
-                else:
-                    text = (
-                        f"{marker} {dot} [dim]{name} {layer_tag}[/]\n"
-                        f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.2f}[/]"
-                    )
+                name_str = name
+
+            dim_prefix = "dim " if not enabled else ""
+            text = (
+                f"{marker} {dot} {name_str} [dim]{layer_tag}[/]\n"
+                f"  α [{dim_prefix}{color}]{bar_full}[/][dim]{bar_empty}[/] "
+                f"[{dim_prefix}{color}]{alpha:+.2f}[/]{hint}"
+            )
             lines.append(text)
 
         content = self._vector_content

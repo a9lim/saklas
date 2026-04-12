@@ -344,14 +344,24 @@ class LiahonaApp(App):
             concept = shlex.split(text[:dash_idx])[0]
             rest_tokens = shlex.split(text[dash_idx + 3:])
             baseline = rest_tokens[0] if rest_tokens else None
-            trailing = [t for t in rest_tokens[1:] if not any(c.isalpha() for c in t)]
+            trailing = []
+            for t in rest_tokens[1:]:
+                try:
+                    trailing.append(float(t))
+                except ValueError:
+                    pass
         else:
             tokens = shlex.split(text)
             concept = tokens[0]
             baseline = None
-            trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
+            trailing = []
+            for t in tokens[1:]:
+                try:
+                    trailing.append(float(t))
+                except ValueError:
+                    pass
         if include_alpha:
-            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, float(trailing[0]))) if trailing else DEFAULT_ALPHA
+            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, trailing[0])) if trailing else DEFAULT_ALPHA
             return concept, baseline, alpha
         return concept, baseline
 
