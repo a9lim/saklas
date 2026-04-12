@@ -68,20 +68,26 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
     return table
 
 
-_think_delim_cache: dict[tuple[str, int], tuple[int | None, int | None, bool]] = {}
+_think_delim_cache: dict[tuple[str, int], tuple[int | None, int | None, int | None, bool]] = {}
 
 
 def _detect_think_delimiters(
     tokenizer,
-) -> tuple[int | None, int | None, bool]:
+) -> tuple[int | None, int | None, int | None, bool]:
     """Detect thinking start/end delimiter tokens from the chat template.
 
-    Returns ``(start_id, end_id, starts_in_thinking)`` where:
+    Returns ``(start_id, end_id, response_start_id, starts_in_thinking)``
+    where:
 
     * **start_id** — token that opens a thinking section, or ``None`` if
       the generation prompt itself puts us in thinking mode (e.g. Qwen
       appends ``<think>`` to the prompt).
     * **end_id** — token that closes a thinking section.
+    * **response_start_id** — token that marks the start of actual response
+      content after the thinking section ends, or ``None`` if the response
+      begins immediately after ``end_id``.  Used by channel-based formats
+      (e.g. gpt-oss ``<|channel|>…<|message|>``) where multiple tokens
+      separate thinking from response content.
     * **starts_in_thinking** — ``True`` when the first generated token is
       already thinking content (Qwen-style).  ``False`` when the model
       must explicitly open a thinking channel (Gemma-style).
@@ -95,7 +101,7 @@ def _detect_think_delimiters(
     if cached is not None:
         return cached
 
-    _none_result: tuple[int | None, int | None, bool] = (None, None, False)
+    _none_result: tuple[int | None, int | None, int | None, bool] = (None, None, None, False)
     template = getattr(tokenizer, "chat_template", None) or ""
     if "enable_thinking" not in template:
         _think_delim_cache[tok_key] = _none_result
@@ -138,14 +144,25 @@ def _detect_think_delimiters(
             continue
 
         # --- end delimiter: first special token between the two markers ---
+        # --- response_start: last special token (if different from end) ---
         between = rendered[ti + len(think_marker):ri]
         end_pos, end_tok, end_id = len(between), None, None
+        rs_pos, rs_tok, rs_id = -1, None, None
         for tok_str, tok_id in added.items():
             pos = between.find(tok_str)
-            if 0 <= pos < end_pos:
+            if pos < 0:
+                continue
+            if pos < end_pos:
                 end_pos, end_tok, end_id = pos, tok_str, tok_id
+            # Track the last (rightmost) special token for response_start
+            last = between.rfind(tok_str)
+            if last > rs_pos:
+                rs_pos, rs_tok, rs_id = last, tok_str, tok_id
         if end_id is None:
             continue
+        # Only set response_start if it's a different token than end
+        if rs_id == end_id:
+            rs_id = None
 
         # --- start delimiter: closest special token before think_marker ---
         start_pos, start_tok, start_id = -1, None, None
@@ -172,11 +189,13 @@ def _detect_think_delimiters(
             except Exception:
                 pass
 
-        result = (start_id, end_id, starts_in_thinking)
+        result = (start_id, end_id, rs_id, starts_in_thinking)
         log.debug(
-            "thinking delimiters: start=%r end=%r starts_in_thinking=%s",
+            "thinking delimiters: start=%r end=%r response_start=%r"
+            " starts_in_thinking=%s",
             start_tok if start_id is not None else "(prompt)",
-            end_tok, starts_in_thinking,
+            end_tok, rs_tok if rs_id is not None else None,
+            starts_in_thinking,
         )
         _think_delim_cache[tok_key] = result
         return result
@@ -284,14 +303,15 @@ def generate_steered(
 
     # Thinking state tracking
     if thinking:
-        think_start_id, think_end_id, starts_in_thinking = (
+        think_start_id, think_end_id, response_start_id, starts_in_thinking = (
             _detect_think_delimiters(tokenizer)
         )
     else:
-        think_start_id = think_end_id = None
+        think_start_id = think_end_id = response_start_id = None
         starts_in_thinking = False
     in_thinking = starts_in_thinking and think_end_id is not None
     in_preamble = False  # suppressing start-of-thinking tokens (e.g. "thought\n")
+    in_response_preamble = False  # suppressing post-thinking channel labels
 
     # Buffer for multi-token characters (emoji, rare Unicode).
     # Tokens whose table entry is None represent partial UTF-8 byte sequences;
@@ -358,13 +378,19 @@ def generate_steered(
                     continue  # suppress start delimiter
 
                 # Suppress preamble tokens between the start delimiter and
-                # the first newline (e.g. Gemma's "thought\n" channel label)
+                # the first newline or content marker (e.g. Gemma's
+                # "thought\n" channel label, gpt-oss's "analysis<|message|>")
                 if in_preamble:
                     if token_id == think_end_id:
                         # Empty thinking section — end delimiter hit
                         # during preamble
                         in_preamble = False
                         state.thinking_end_idx = len(generated_ids)
+                    elif (response_start_id is not None
+                          and token_id == response_start_id):
+                        # Channel-based format: content marker ends preamble
+                        in_preamble = False
+                        in_thinking = True
                     else:
                         tok_text = tokenizer.decode([token_id])
                         if '\n' in tok_text:
@@ -375,11 +401,24 @@ def generate_steered(
                 # Handle end-of-thinking delimiter
                 if in_thinking and token_id == think_end_id:
                     in_thinking = False
-                    state.thinking_end_idx = len(generated_ids)
                     # Flush any buffered partial tokens before the delimiter
                     if on_token and pending_ids:
                         on_token(tokenizer.decode(pending_ids), pending_thinking)
                         pending_ids.clear()
+                    if response_start_id is not None:
+                        # Channel-based format (e.g. gpt-oss): suppress
+                        # response channel preamble until content marker
+                        in_response_preamble = True
+                    else:
+                        state.thinking_end_idx = len(generated_ids)
+                    continue
+
+                # Suppress response preamble tokens between end-of-thinking
+                # and start-of-response (channel-based formats)
+                if in_response_preamble:
+                    if token_id == response_start_id:
+                        in_response_preamble = False
+                        state.thinking_end_idx = len(generated_ids)
                     continue
 
                 if on_token:
