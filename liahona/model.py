@@ -104,13 +104,14 @@ def _load_text_from_multimodal(
     """Load just the text model from a multimodal checkpoint.
 
     Multimodal checkpoints store text-model weights under a
-    ``language_model.`` prefix.  This function creates an empty
-    text-only model on a meta device, loads each safetensors shard,
-    strips the prefix, dequantizes FP8 weights, and places them
-    directly on the target device.  Vision-tower weights are skipped.
+    ``language_model.`` prefix.  This function creates a text-only
+    model directly on the target device, then loads each safetensors
+    shard, strips the prefix, dequantizes FP8 weights, and copies
+    them in shard-by-shard.  Vision-tower weights are skipped.
 
-    Using meta-device initialization avoids a ~30 GB CPU RSS spike
-    that would eat into MPS's unified memory budget on Apple Silicon.
+    Creating on-device and loading per-shard keeps peak CPU RSS low
+    (~6 GB vs ~30 GB), which matters on Apple Silicon where CPU and
+    MPS share unified memory.
     """
     import gc
     import json
@@ -118,7 +119,9 @@ def _load_text_from_multimodal(
     from safetensors.torch import load_file
     from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
 
-    with torch.device("meta"):
+    # Create directly on target device — avoids a CPU copy that would
+    # spike RSS and eat into MPS's unified memory budget.
+    with torch.device(device):
         model = AutoModelForCausalLM.from_config(text_config, dtype=dtype)
 
     index_path = cached_file(model_id, SAFE_WEIGHTS_INDEX_NAME)
@@ -127,10 +130,10 @@ def _load_text_from_multimodal(
         shard_files = sorted(set(json.load(f)["weight_map"].values()))
 
     prefix = "language_model."
-    state: dict[str, torch.Tensor] = {}
 
     for sf in shard_files:
         shard = load_file(os.path.join(model_dir, sf), device="cpu")
+        mapped: dict[str, torch.Tensor] = {}
 
         for k, v in shard.items():
             if not k.startswith(prefix):
@@ -146,14 +149,14 @@ def _load_text_from_multimodal(
                     v = v.to(dtype) * scale.to(dtype)
                 else:
                     v = v.to(dtype)
-            state[key] = v.to(device=device, dtype=dtype)
+            mapped[key] = v.to(device=device, dtype=dtype)
 
-        del shard
+        if mapped:
+            model.load_state_dict(mapped, strict=False)
+
+        del shard, mapped
         gc.collect()
 
-    model.load_state_dict(state, strict=False, assign=True)
-    del state
-    gc.collect()
     if device == "mps":
         torch.mps.empty_cache()
 
@@ -201,24 +204,12 @@ def load_model(model_id: str, quantize=None, device="auto"):
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     # --- quantization config ---
-    quant_kwargs = {}
     if quantize and device != "cuda":
         warnings.warn(
             f"bitsandbytes quantization ({quantize}) requires CUDA. "
             f"Ignoring --quantize on {device}, loading in {_pick_dtype(device)}."
         )
         quantize = None
-
-    if quantize == "4bit":
-        quant_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-        )
-    elif quantize == "8bit":
-        quant_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-    else:
-        quant_kwargs["dtype"] = _pick_dtype(device)
 
     # --- attention implementation ---
     attn_impl = "sdpa"  # safe default, works everywhere
@@ -232,10 +223,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
     # --- device map ---
     # device_map="auto" requires accelerate and works best on CUDA.
     # For MPS/CPU, place the whole model on a single device.
-    if device == "cuda":
-        device_kwargs = {"device_map": "auto"}
-    else:
-        device_kwargs = {"device_map": {"": device}}
+    device_map = "auto" if device == "cuda" else {"": device}
 
     # --- check for multimodal configs wrapping a text-only model ---
     # Some text-only models ship with a multimodal config whose
@@ -245,9 +233,18 @@ def load_model(model_id: str, quantize=None, device="auto"):
     load_kwargs: dict = dict(
         attn_implementation=attn_impl,
         trust_remote_code=True,
-        **device_kwargs,
-        **quant_kwargs,
+        device_map=device_map,
     )
+    if quantize == "4bit":
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+        )
+    elif quantize == "8bit":
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    else:
+        load_kwargs["dtype"] = _pick_dtype(device)
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", None)
     extract_text_model = (
@@ -264,17 +261,14 @@ def load_model(model_id: str, quantize=None, device="auto"):
         log.info("extracting text model (%s) from multimodal checkpoint (%s)",
                  text_cfg.model_type, config.model_type)
         model = _load_text_from_multimodal(
-            model_id, text_cfg, quant_kwargs.get("dtype", _pick_dtype(device)),
+            model_id, text_cfg, load_kwargs.get("dtype", _pick_dtype(device)),
             device,
         )
     else:
         # --- standard load (with attention, dtype, and device fallbacks) ---
-        def _try_load():
-            return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-
         def _try_load_with_fallbacks():
             try:
-                return _try_load()
+                return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
             except ValueError as e:
                 if "does not support an attention implementation" not in str(e):
                     raise
@@ -282,16 +276,15 @@ def load_model(model_id: str, quantize=None, device="auto"):
                          load_kwargs.get("attn_implementation"))
                 load_kwargs["attn_implementation"] = "eager"
                 try:
-                    return _try_load()
+                    return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
                 except Exception as eager_err:
                     raise eager_err from None
             except Exception:
                 if quantize is not None:
                     raise
                 fallback = torch.float16 if device == "cuda" else torch.float32
-                quant_kwargs["dtype"] = fallback
-                load_kwargs.update(quant_kwargs)
-                return _try_load()
+                load_kwargs["dtype"] = fallback
+                return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
 
         try:
             model = _try_load_with_fallbacks()
@@ -300,7 +293,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
                 raise
             log.info("weight conversion failed on %s, retrying on CPU", device)
             load_kwargs["device_map"] = {"": "cpu"}
-            if "dtype" not in quant_kwargs:
+            if "dtype" not in load_kwargs:
                 load_kwargs["dtype"] = torch.float32
             try:
                 model = _try_load_with_fallbacks()
