@@ -261,6 +261,8 @@ liahona meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 | `-s`, `--system-prompt` | System prompt |
 | `-m`, `--max-tokens` | Max tokens per generation (default: 1024) |
 | `-c`, `--cache-dir` | Vector cache directory |
+| `-x`, `--clear-custom` | Clear user-extracted vectors and generated statements, then exit |
+| `-X`, `--clear-all` | Clear all cached artifacts (curated probes, layer means, everything), then exit |
 
 ### Layout
 
