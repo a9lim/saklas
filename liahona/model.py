@@ -91,6 +91,10 @@ _LAYER_ACCESSORS = {
 _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
 
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2,
+               torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
+
+
 def _load_text_from_multimodal(
     model_id: str,
     text_config,
@@ -101,18 +105,21 @@ def _load_text_from_multimodal(
 
     Multimodal checkpoints store text-model weights under a
     ``language_model.`` prefix.  This function creates an empty
-    text-only model, loads each safetensors shard, strips the prefix,
-    and loads matching weights.  Vision-tower weights are skipped.
+    text-only model on a meta device, loads each safetensors shard,
+    strips the prefix, dequantizes FP8 weights, and places them
+    directly on the target device.  Vision-tower weights are skipped.
 
-    FP8-quantized weights are dequantized inline using their
-    ``weight_scale_inv`` tensors (``weight * scale``).
+    Using meta-device initialization avoids a ~30 GB CPU RSS spike
+    that would eat into MPS's unified memory budget on Apple Silicon.
     """
+    import gc
     import json
     import os
     from safetensors.torch import load_file
     from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
 
-    model = AutoModelForCausalLM.from_config(text_config, dtype=dtype)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(text_config, dtype=dtype)
 
     index_path = cached_file(model_id, SAFE_WEIGHTS_INDEX_NAME)
     model_dir = os.path.dirname(index_path)
@@ -120,34 +127,36 @@ def _load_text_from_multimodal(
         shard_files = sorted(set(json.load(f)["weight_map"].values()))
 
     prefix = "language_model."
+    state: dict[str, torch.Tensor] = {}
+
     for sf in shard_files:
         shard = load_file(os.path.join(model_dir, sf), device="cpu")
 
-        # Strip prefix and collect text-model tensors
-        stripped: dict[str, torch.Tensor] = {}
         for k, v in shard.items():
-            if k.startswith(prefix):
-                stripped[k[len(prefix):]] = v
+            if not k.startswith(prefix):
+                continue
+            key = k[len(prefix):]
+            if key.endswith(".weight_scale_inv") or key.endswith(".activation_scale"):
+                continue
 
-        # Dequantize FP8 weights: real_weight = weight.to(dtype) * scale
-        mapped: dict[str, torch.Tensor] = {}
-        for k, v in stripped.items():
-            if k.endswith(".weight_scale_inv") or k.endswith(".activation_scale"):
-                continue  # consumed below or unused at inference
-            if v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
-                           torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
-                scale_key = k + "_scale_inv"
-                scale = stripped.get(scale_key)
+            # Dequantize FP8: real_weight = weight.to(dtype) * scale
+            if v.dtype in _FP8_DTYPES:
+                scale = shard.get(k + "_scale_inv")
                 if scale is not None:
                     v = v.to(dtype) * scale.to(dtype)
                 else:
                     v = v.to(dtype)
-            mapped[k] = v
+            state[key] = v.to(device=device, dtype=dtype)
 
-        if mapped:
-            model.load_state_dict(mapped, strict=False)
+        del shard
+        gc.collect()
 
-    model = model.to(device)
+    model.load_state_dict(state, strict=False, assign=True)
+    del state
+    gc.collect()
+    if device == "mps":
+        torch.mps.empty_cache()
+
     return model
 
 
