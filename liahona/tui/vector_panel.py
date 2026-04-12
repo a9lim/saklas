@@ -9,7 +9,7 @@ from textual.widget import Widget
 
 from liahona.tui.utils import build_bar
 
-MAX_ALPHA = 0.3
+MAX_ALPHA = 1.0
 
 
 class LeftPanel(Widget):
