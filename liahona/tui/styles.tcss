@@ -166,7 +166,8 @@ Widget {
 .user-message MarkdownHorizontalRule {
     height: 1;
     margin: 0;
-    color: ansi_bright_black;
+    padding: 0;
+    border-bottom: solid ansi_bright_black;
 }
 
 
