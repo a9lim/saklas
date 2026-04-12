@@ -27,7 +27,7 @@ def bootstrap_layer_means(
 
     Cached as a profile under the reserved name ``_LAYERMEANS``.
     """
-    from liahona.vectors import compute_layer_means, get_cache_path, save_profile, load_profile
+    from liahona.vectors import compute_layer_means, get_cache_path, save_profile, load_profile, _NEUTRAL_PROMPTS
 
     model_id = model_info.get("model_id", "unknown")
     cp = get_cache_path(cache_dir, model_id, _LAYER_MEANS_TAG)
@@ -49,7 +49,7 @@ def bootstrap_layer_means(
     save_profile(profile, cp, {
         "type": "layer_means",
         "model_id": model_id,
-        "num_prompts": 30,
+        "num_prompts": len(_NEUTRAL_PROMPTS),
     })
 
     return means

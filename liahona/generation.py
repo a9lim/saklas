@@ -344,23 +344,22 @@ def generate_steered(
                 if token_id in eos_ids:
                     break
 
+                # Advance KV cache state (common to all non-EOS paths)
+                generated_ids.append(token_id)
+                current_input = next_token
+                seq_len += 1
+
                 # Handle thinking start delimiter (Gemma-style: model
                 # explicitly opens a thinking channel)
                 if (think_start_id is not None
                         and token_id == think_start_id
                         and not in_thinking and not in_preamble):
                     in_preamble = True
-                    generated_ids.append(token_id)
-                    current_input = next_token
-                    seq_len += 1
                     continue  # suppress start delimiter
 
                 # Suppress preamble tokens between the start delimiter and
                 # the first newline (e.g. Gemma's "thought\n" channel label)
                 if in_preamble:
-                    generated_ids.append(token_id)
-                    current_input = next_token
-                    seq_len += 1
                     if token_id == think_end_id:
                         # Empty thinking section — end delimiter hit
                         # during preamble
@@ -381,14 +380,7 @@ def generate_steered(
                     if on_token and pending_ids:
                         on_token(tokenizer.decode(pending_ids), pending_thinking)
                         pending_ids.clear()
-                    generated_ids.append(token_id)
-                    current_input = next_token
-                    seq_len += 1
                     continue
-
-                generated_ids.append(token_id)
-                current_input = next_token
-                seq_len += 1
 
                 if on_token:
                     tok_str = token_table[token_id] if token_id < _vocab else ''

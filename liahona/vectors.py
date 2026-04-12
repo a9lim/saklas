@@ -177,10 +177,7 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         return result
 
     # Fallback: last-token pooling
-    result = {}
-    for idx, h in hidden_per_layer.items():
-        result[idx] = h.float()[0, -1]  # (dim,)
-    return result
+    return {idx: h.float()[0, -1] for idx, h in hidden_per_layer.items()}
 
 
 _NEUTRAL_PROMPTS = [
