@@ -146,26 +146,6 @@ class SteeringManager:
                 self.hooks[idx].detach()
                 del self.hooks[idx]
 
-        # Layer-scalar compensation: compute reverse cumulative product of
-        # subsequent scalars so we know the attenuation each layer's
-        # perturbation will suffer before reaching the LM head.
-        n_layers = len(model_layers)
-        layer_scalar_comp: dict[int, float] | None = None
-        if by_layer and getattr(model_layers[0], "layer_scalar", None) is not None:
-            # subsequent_prod[i] = product of layer_scalar at layers i+1..n-1
-            subsequent_prod = [1.0] * (n_layers + 1)
-            for i in range(n_layers - 1, -1, -1):
-                s_buf = getattr(model_layers[i], "layer_scalar", None)
-                subsequent_prod[i] = subsequent_prod[i + 1] * (s_buf.item() if s_buf is not None else 1.0)
-            # Compensation = 1 / subsequent_prod[idx+1], capped.
-            # Last layer: subsequent_prod[n] = 1.0 → comp = 1.0 (no boost).
-            _MAX_SCALAR_COMP = 4.0
-            layer_scalar_comp = {}
-            for idx in by_layer:
-                atten = subsequent_prod[idx + 1] if idx + 1 <= n_layers else 1.0
-                if atten < 1.0 and atten > 0:
-                    layer_scalar_comp[idx] = min(1.0 / atten, _MAX_SCALAR_COMP)
-
         # Recompose and attach for each active layer
         for idx, pairs in by_layer.items():
             if orthogonalize and len(pairs) > 1:
@@ -174,16 +154,6 @@ class SteeringManager:
                 raw_vectors = orthogonalize_vectors(raw_vectors)
                 alphas = alphas[: len(raw_vectors)]
                 pairs = list(zip(raw_vectors, alphas))
-
-            # Compensate for per-layer output scaling (Gemma 4 layer_scalar).
-            # A perturbation at layer N is attenuated by the product of all
-            # subsequent layers' scalars before reaching the LM head.  Boost
-            # by the inverse of that product (capped) so steering propagates
-            # at the intended strength.  The last layer gets comp=1.0 since
-            # its perturbation feeds directly into the LM head.
-            if layer_scalar_comp and idx in layer_scalar_comp:
-                comp = layer_scalar_comp[idx]
-                pairs = [(vec, alpha * comp) for vec, alpha in pairs]
 
             if idx not in self.hooks:
                 hook = SteeringHook()
