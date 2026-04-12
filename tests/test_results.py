@@ -19,22 +19,22 @@ class TestPublicAPI:
 
 
 class TestProbeReadings:
-    def test_from_per_token_data(self):
+    def test_from_per_generation_data(self):
         readings = ProbeReadings(
-            per_token=[0.1, 0.3, 0.5, 0.4],
-            mean=0.325, std=0.1479, min=0.1, max=0.5, delta_per_tok=0.1,
+            per_generation=[0.1, 0.3, 0.5, 0.4],
+            mean=0.325, std=0.1479, min=0.1, max=0.5, delta_per_gen=0.1,
         )
         assert readings.mean == 0.325
         assert readings.min == 0.1
-        assert len(readings.per_token) == 4
+        assert len(readings.per_generation) == 4
 
     def test_to_dict_returns_plain_types(self):
         readings = ProbeReadings(
-            per_token=[0.1, 0.2], mean=0.15, std=0.05, min=0.1, max=0.2, delta_per_tok=0.1,
+            per_generation=[0.1, 0.2], mean=0.15, std=0.05, min=0.1, max=0.2, delta_per_gen=0.1,
         )
         d = readings.to_dict()
         assert isinstance(d, dict)
-        assert isinstance(d["per_token"], list)
+        assert isinstance(d["per_generation"], list)
         assert isinstance(d["mean"], float)
 
 
@@ -52,7 +52,7 @@ class TestGenerationResult:
 
     def test_to_dict_with_probes(self):
         readings = ProbeReadings(
-            per_token=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_tok=0.0,
+            per_generation=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_gen=0.0,
         )
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
@@ -65,14 +65,14 @@ class TestGenerationResult:
 
 class TestTokenEvent:
     def test_fields(self):
-        event = TokenEvent(text="hello", token_id=42, index=0, readings={"honest": 0.5})
+        event = TokenEvent(text="hello", token_id=42, index=0)
         assert event.text == "hello"
         assert event.token_id == 42
-        assert event.readings["honest"] == 0.5
+        assert event.index == 0
 
-    def test_no_readings(self):
-        event = TokenEvent(text="hi", token_id=1, index=0, readings=None)
-        assert event.readings is None
+    def test_thinking_flag(self):
+        event = TokenEvent(text="hi", token_id=1, index=0, thinking=True)
+        assert event.thinking is True
 
 
 class TestResultCollector:
@@ -93,7 +93,7 @@ class TestResultCollector:
 
     def test_probe_readings_flattened(self):
         readings = ProbeReadings(
-            per_token=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_tok=0.0,
+            per_generation=[0.5], mean=0.5, std=0.0, min=0.5, max=0.5, delta_per_gen=0.0,
         )
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,

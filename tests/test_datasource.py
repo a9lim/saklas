@@ -5,14 +5,14 @@ import tempfile
 from pathlib import Path
 from liahona.datasource import DataSource
 
-class TestFromPairs:
+class TestConstructor:
     def test_basic(self):
-        ds = DataSource.from_pairs([("hello", "goodbye")])
+        ds = DataSource(pairs=[("hello", "goodbye")])
         assert ds.pairs == [("hello", "goodbye")]
         assert ds.name == "custom"
 
     def test_custom_name(self):
-        ds = DataSource.from_pairs([("a", "b")], name="test")
+        ds = DataSource(pairs=[("a", "b")], name="test")
         assert ds.name == "test"
 
 class TestCurated:

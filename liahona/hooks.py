@@ -86,12 +86,12 @@ def orthogonalize_vectors(
     if alphas is not None:
         return [
             ((Q[:, i] * signs[i]).to(orig_dtype), alphas[i])
-            for i in range(min(Q.shape[1], len(vectors)))
+            for i in range(len(vectors))
             if keep[i]
         ]
     return [
         (Q[:, i] * signs[i]).to(orig_dtype)
-        for i in range(min(Q.shape[1], len(vectors)))
+        for i in range(len(vectors))
         if keep[i]
     ]
 
@@ -110,24 +110,9 @@ class SteeringManager:
         alpha: float,
     ) -> None:
         self.vectors[name] = {
-            "name": name,
             "profile": profile,
             "alpha": alpha,
-            "enabled": True,
         }
-
-    def remove_vector(self, name: str) -> None:
-        self.vectors.pop(name, None)
-
-    def set_alpha(self, name: str, alpha: float) -> None:
-        v = self.vectors.get(name)
-        if v is not None:
-            v["alpha"] = alpha
-
-    def toggle_vector(self, name: str) -> None:
-        v = self.vectors.get(name)
-        if v is not None:
-            v["enabled"] = not v["enabled"]
 
     def apply_to_model(
         self,
@@ -136,14 +121,12 @@ class SteeringManager:
         dtype: torch.dtype,
         orthogonalize: bool = False,
     ) -> None:
-        """Group enabled vectors by layer, recompose hooks, attach to model."""
-        # Group enabled vectors by layer via their profiles
+        """Group vectors by layer, recompose hooks, attach to model."""
         by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
         for v in self.vectors.values():
-            if v["enabled"]:
-                for layer_idx, (vec, score) in v["profile"].items():
-                    effective_alpha = v["alpha"] * score
-                    by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
+            for layer_idx, (vec, score) in v["profile"].items():
+                effective_alpha = v["alpha"] * score
+                by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
 
         # Detach hooks for layers that no longer have vectors
         for idx in list(self.hooks):
@@ -172,6 +155,3 @@ class SteeringManager:
         self.hooks.clear()
         self.vectors.clear()
 
-    def get_active_vectors(self) -> list[dict]:
-        """Return all vector configs (for TUI display)."""
-        return list(self.vectors.values())

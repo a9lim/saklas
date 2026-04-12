@@ -9,7 +9,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-from liahona.tui.vector_panel import _build_bar
+from liahona.tui.utils import build_bar
 
 
 
@@ -23,7 +23,7 @@ class TraitPanel(Widget):
         self._sparklines: dict[str, str] = {}
         self._active_probes: set[str] = set()
         self._sort_mode: str = "name"
-        self._nav_items: list[tuple[str, str]] = []
+        self._nav_items: list[str] = []
         self._nav_idx: int = 0
         self._cached_render_text: str = ""
 
@@ -82,10 +82,7 @@ class TraitPanel(Widget):
             return None
         if self._nav_idx >= len(self._nav_items):
             return None
-        item_type, name = self._nav_items[self._nav_idx]
-        if item_type == "probe":
-            return name
-        return None
+        return self._nav_items[self._nav_idx]
 
     def nav_down(self) -> None:
         if self._nav_items and self._nav_idx < len(self._nav_items) - 1:
@@ -101,7 +98,6 @@ class TraitPanel(Widget):
         self._nav_items = []
         lines: list[str] = []
 
-        nav_idx_counter = 0
         for category, members in self._categories.items():
             active_members = [m for m in members if m in self._active_probes]
             if not active_members:
@@ -114,9 +110,8 @@ class TraitPanel(Widget):
 
             sorted_members = self._sort_probes(active_members)
             for name in sorted_members:
-                is_nav_selected = nav_idx_counter == self._nav_idx
-                self._nav_items.append(("probe", name))
-                nav_idx_counter += 1
+                is_nav_selected = len(self._nav_items) == self._nav_idx
+                self._nav_items.append(name)
 
                 val = self._current_values.get(name, 0.0)
                 prev = self._previous_values.get(name, 0.0)
@@ -133,7 +128,7 @@ class TraitPanel(Widget):
                 else:
                     arrow_ch = "↓"
 
-                bar_full, bar_empty = _build_bar(val, 1.0, 16)
+                bar_full, bar_empty = build_bar(val, 1.0, 16)
                 if val > 0:
                     color = "ansi_green"
                 elif val < 0:

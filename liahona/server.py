@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -12,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from liahona.probes_bootstrap import _load_defaults
+from liahona.probes_bootstrap import load_defaults
 from liahona.session import ConcurrentGenerationError, LiahonaSession
 
 
@@ -86,10 +88,6 @@ def _make_id() -> str:
     return f"liahona-{uuid.uuid4().hex[:12]}"
 
 
-def _ts() -> int:
-    return int(time.time())
-
-
 def _error(status: int, message: str, error_type: str = "error") -> JSONResponse:
     return JSONResponse(
         status_code=status,
@@ -98,27 +96,27 @@ def _error(status: int, message: str, error_type: str = "error") -> JSONResponse
 
 
 def _probe_reading_dict(session: LiahonaSession) -> dict[str, Any]:
-    readings = session._build_readings()
+    readings = session.build_readings()
     out: dict[str, Any] = {}
     for name, r in readings.items():
         out[name] = {"mean": r.mean, "std": r.std, "min": r.min, "max": r.max}
     return out
 
 
-def _apply_gen_overrides(session: LiahonaSession, temperature, top_p, max_tokens):
-    """Temporarily override generation config, return originals."""
+@contextmanager
+def _gen_config_override(session: LiahonaSession, temperature, top_p, max_tokens):
+    """Temporarily override generation config."""
     orig = (session.config.temperature, session.config.top_p, session.config.max_new_tokens)
-    if temperature is not None:
-        session.config.temperature = temperature
-    if top_p is not None:
-        session.config.top_p = top_p
-    if max_tokens is not None:
-        session.config.max_new_tokens = max_tokens
-    return orig
-
-
-def _restore_gen_config(session: LiahonaSession, orig):
-    session.config.temperature, session.config.top_p, session.config.max_new_tokens = orig
+    try:
+        if temperature is not None:
+            session.config.temperature = temperature
+        if top_p is not None:
+            session.config.top_p = top_p
+        if max_tokens is not None:
+            session.config.max_new_tokens = max_tokens
+        yield
+    finally:
+        session.config.temperature, session.config.top_p, session.config.max_new_tokens = orig
 
 
 def _resolve_alphas(
@@ -132,11 +130,10 @@ def _resolve_alphas(
     return merged or None
 
 
-
 def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
-    """Return profile layers sorted by score descending."""
+    """Return top-n profile layers sorted by score descending."""
     return sorted(((idx, score) for idx, (_vec, score) in profile.items()),
-                  key=lambda x: x[1], reverse=True)
+                  key=lambda x: x[1], reverse=True)[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +145,11 @@ def create_app(session: LiahonaSession, default_alphas: dict[str, float] | None 
     app = FastAPI(title="liahona", description="OpenAI-compatible API with activation steering")
     app.state.session = session
     app.state.default_alphas = default_alphas or {}
+    app.state.created_ts = int(time.time())
+    # Protects config mutations for non-streaming routes.  Streaming routes
+    # rely on the session's 409 concurrent-generation guard instead, because
+    # the generator is consumed by Starlette outside the route coroutine.
+    app.state.gen_lock = asyncio.Lock()
 
     if cors_origins:
         app.add_middleware(
@@ -170,14 +172,13 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/v1/models")
     def list_models():
-        info = session.model_info
         return {
             "object": "list",
             "data": [
                 {
-                    "id": info.get("model_id", "unknown"),
+                    "id": session.model_id,
                     "object": "model",
-                    "created": _ts(),
+                    "created": app.state.created_ts,
                     "owned_by": "local",
                 }
             ],
@@ -185,13 +186,12 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/v1/models/{model_id:path}")
     def get_model(model_id: str):
-        info = session.model_info
-        if model_id != info.get("model_id", "unknown"):
+        if model_id != session.model_id:
             raise HTTPException(404, f"Model '{model_id}' not found")
         return {
-            "id": info.get("model_id", "unknown"),
+            "id": session.model_id,
             "object": "model",
-            "created": _ts(),
+            "created": app.state.created_ts,
             "owned_by": "local",
         }
 
@@ -206,26 +206,35 @@ def _register_routes(app: FastAPI) -> None:
         think = req.steer.thinking if req.steer else False
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
-        model_id = session.model_info.get("model_id", "unknown")
+        model_id = session.model_id
 
-        orig = _apply_gen_overrides(session, req.temperature, req.top_p, req.max_tokens)
         if req.stream:
+            def _chat_delta(event):
+                d: dict[str, str] = {}
+                if event.thinking:
+                    d["reasoning_content"] = event.text
+                else:
+                    d["content"] = event.text
+                return {"delta": d}
+
+            stream_iter = session.generate_stream(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
             return StreamingResponse(
-                _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig),
+                _stream_generation(stream_iter, rid, model_id,
+                                   "chat.completion.chunk", _chat_delta, {"delta": {}},
+                                   req.temperature, req.top_p, req.max_tokens),
                 media_type="text/event-stream",
             )
-        # Non-streaming
-        try:
-            result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
-        except ConcurrentGenerationError as e:
-            return _error(409, str(e), "conflict")
-        finally:
-            _restore_gen_config(session, orig)
+        async with app.state.gen_lock:
+            with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
+                try:
+                    result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
+                except ConcurrentGenerationError as e:
+                    return _error(409, str(e), "conflict")
 
         return {
             "id": rid,
             "object": "chat.completion",
-            "created": _ts(),
+            "created": app.state.created_ts,
             "model": model_id,
             "choices": [
                 {
@@ -242,27 +251,18 @@ def _register_routes(app: FastAPI) -> None:
             "probe_readings": _probe_reading_dict(session),
         }
 
-    async def _stream_chat(session, messages, alphas, ortho, think, rid, model_id, orig_config):
-        try:
+    async def _stream_generation(stream_iter, rid, model_id, object_type, format_delta,
+                                 empty_delta, temperature, top_p, max_tokens):
+        """Shared SSE generator for chat and completion streaming."""
+        with _gen_config_override(session, temperature, top_p, max_tokens):
             try:
-                for event in session.generate_stream(messages, alphas=alphas, orthogonalize=ortho, thinking=think):
-                    delta: dict[str, str] = {}
-                    if event.thinking:
-                        delta["reasoning_content"] = event.text
-                    else:
-                        delta["content"] = event.text
+                for event in stream_iter:
                     chunk = {
                         "id": rid,
-                        "object": "chat.completion.chunk",
-                        "created": _ts(),
+                        "object": object_type,
+                        "created": app.state.created_ts,
                         "model": model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": None,
-                            }
-                        ],
+                        "choices": [{"index": 0, **format_delta(event), "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
             except ConcurrentGenerationError as e:
@@ -270,25 +270,16 @@ def _register_routes(app: FastAPI) -> None:
                 yield f"data: {json.dumps(err)}\n\n"
                 return
 
-            # Final chunk with finish_reason and probe readings
             final = {
                 "id": rid,
-                "object": "chat.completion.chunk",
-                "created": _ts(),
+                "object": object_type,
+                "created": app.state.created_ts,
                 "model": model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                    }
-                ],
+                "choices": [{"index": 0, **empty_delta, "finish_reason": "stop"}],
                 "probe_readings": _probe_reading_dict(session),
             }
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
-        finally:
-            _restore_gen_config(session, orig_config)
 
     # -----------------------------------------------------------------------
     # Text completions
@@ -298,27 +289,29 @@ def _register_routes(app: FastAPI) -> None:
     async def completions(req: CompletionRequest):
         alphas = _resolve_alphas(req.steer, app.state.default_alphas)
         ortho = req.steer.orthogonalize if req.steer else False
+        think = req.steer.thinking if req.steer else False
         rid = _make_id()
-        model_id = session.model_info.get("model_id", "unknown")
+        model_id = session.model_id
 
-        orig = _apply_gen_overrides(session, req.temperature, req.top_p, req.max_tokens)
         if req.stream:
+            stream_iter = session.generate_stream(req.prompt, alphas=alphas, orthogonalize=ortho, thinking=think, raw=True)
             return StreamingResponse(
-                _stream_completions(session, req.prompt, alphas, ortho, rid, model_id, orig),
+                _stream_generation(stream_iter, rid, model_id,
+                                   "text_completion", lambda e: {"text": e.text}, {"text": ""},
+                                   req.temperature, req.top_p, req.max_tokens),
                 media_type="text/event-stream",
             )
-        # Non-streaming
-        try:
-            result = session.generate(req.prompt, alphas=alphas, orthogonalize=ortho, raw=True)
-        except ConcurrentGenerationError as e:
-            return _error(409, str(e), "conflict")
-        finally:
-            _restore_gen_config(session, orig)
+        async with app.state.gen_lock:
+            with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
+                try:
+                    result = session.generate(req.prompt, alphas=alphas, orthogonalize=ortho, thinking=think, raw=True)
+                except ConcurrentGenerationError as e:
+                    return _error(409, str(e), "conflict")
 
         return {
             "id": rid,
             "object": "text_completion",
-            "created": _ts(),
+            "created": app.state.created_ts,
             "model": model_id,
             "choices": [
                 {
@@ -335,48 +328,6 @@ def _register_routes(app: FastAPI) -> None:
             "probe_readings": _probe_reading_dict(session),
         }
 
-    async def _stream_completions(session, prompt, alphas, ortho, rid, model_id, orig_config):
-        try:
-            try:
-                for event in session.generate_stream(prompt, alphas=alphas, orthogonalize=ortho, raw=True):
-                    chunk = {
-                        "id": rid,
-                        "object": "text_completion",
-                        "created": _ts(),
-                        "model": model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "text": event.text,
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-            except ConcurrentGenerationError as e:
-                err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
-                yield f"data: {json.dumps(err)}\n\n"
-                return
-
-            final = {
-                "id": rid,
-                "object": "text_completion",
-                "created": _ts(),
-                "model": model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "text": "",
-                        "finish_reason": "stop",
-                    }
-                ],
-                "probe_readings": _probe_reading_dict(session),
-            }
-            yield f"data: {json.dumps(final)}\n\n"
-            yield "data: [DONE]\n\n"
-        finally:
-            _restore_gen_config(session, orig_config)
-
     # -----------------------------------------------------------------------
     # Vector management
     # -----------------------------------------------------------------------
@@ -388,7 +339,7 @@ def _register_routes(app: FastAPI) -> None:
         for name, profile in vectors.items():
             layers = sorted(profile.keys())
             scored = _profile_top_layers(profile)
-            top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored[:5]]
+            top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored]
             out[name] = {
                 "layers": layers,
                 "top_layers": top,
@@ -435,13 +386,18 @@ def _register_routes(app: FastAPI) -> None:
         }
 
     async def _stream_extract(session, app, name, source, baseline, alpha, register):
+        # Known limitation: this is fake streaming.  session.extract() is
+        # synchronous and CPU/GPU-bound, so progress messages are accumulated
+        # in a list and replayed after extraction completes.  True incremental
+        # streaming would require threading the extraction pipeline, but the
+        # model cannot be safely accessed from multiple threads.  The
+        # non-streaming JSON path (extract_vector with Accept: application/json)
+        # is the primary interface; this SSE path exists for clients that want
+        # progress visibility at the cost of a deferred burst of events.
         progress_msgs: list[str] = []
 
         def _on_progress(msg):
             progress_msgs.append(msg)
-
-        # NOTE: Progress messages are batched because session.extract() is
-        # synchronous.  Events are emitted after extraction completes.
         try:
             profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
         except ConcurrentGenerationError as e:
@@ -473,7 +429,7 @@ def _register_routes(app: FastAPI) -> None:
 
         layers = sorted(profile.keys())
         scored = _profile_top_layers(profile)
-        top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored[:5]]
+        top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored]
 
         return {
             "name": req.name,
@@ -511,7 +467,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/v1/liahona/probes/defaults")
     def list_default_probes():
-        return {"defaults": _load_defaults()}
+        return {"defaults": load_defaults()}
 
     @app.post("/v1/liahona/probes/{name}")
     def activate_probe(name: str, req: ActivateProbeRequest | None = None):
@@ -539,7 +495,7 @@ def _register_routes(app: FastAPI) -> None:
     def get_session():
         info = session.model_info
         return {
-            "model": info.get("model_id", "unknown"),
+            "model": session.model_id,
             "model_info": {
                 "model_type": info.get("model_type", "unknown"),
                 "num_layers": info.get("num_layers", 0),

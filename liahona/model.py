@@ -25,9 +25,9 @@ def _histc_mps_safe(input, bins=100, min=0, max=0, *, out=None):
 
 torch.histc = _histc_mps_safe
 
-_MODEL_LAYERS = lambda m: m.model.layers  # noqa: E731
-_TRANSFORMER_H = lambda m: m.transformer.h  # noqa: E731
-_VLM_LANGUAGE_LAYERS = lambda m: m.model.language_model.layers  # noqa: E731
+def _MODEL_LAYERS(m): return m.model.layers
+def _TRANSFORMER_H(m): return m.transformer.h
+def _VLM_LANGUAGE_LAYERS(m): return m.model.language_model.layers
 
 _LAYER_ACCESSORS = {
     # Llama family
@@ -214,7 +214,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
         (model, tokenizer) tuple.
     """
     device = detect_device(device)
-    print(f"  Device: {device}")
+    log.info("Device: %s", device)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
@@ -293,10 +293,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
                 log.info("attn_implementation %r unsupported, falling back to eager",
                          load_kwargs.get("attn_implementation"))
                 load_kwargs["attn_implementation"] = "eager"
-                try:
-                    return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-                except Exception as eager_err:
-                    raise
+                return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
             except Exception:
                 if quantize is not None:
                     raise
@@ -313,10 +310,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
             load_kwargs["device_map"] = {"": "cpu"}
             if "dtype" not in load_kwargs:
                 load_kwargs["dtype"] = torch.float32
-            try:
-                model = _try_load_with_fallbacks()
-            except Exception as cpu_err:
-                raise
+            model = _try_load_with_fallbacks()
             model = model.to(device)
 
     model.requires_grad_(False)
@@ -325,7 +319,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
     # --- memory report ---
     mem_gb = _get_memory_gb(device)
     if mem_gb > 0:
-        print(f"  Memory used: {mem_gb:.2f} GB")
+        log.info("Memory used: %.2f GB", mem_gb)
 
     return model, tokenizer
 
@@ -343,7 +337,7 @@ def _get_memory_gb(device: str) -> float:
 
 def get_layers(model) -> nn.ModuleList:
     """Return the sequential transformer blocks for a supported architecture."""
-    model_type = getattr(model, "config", None) and model.config.model_type
+    model_type = model.config.model_type
     accessor = _LAYER_ACCESSORS.get(model_type)
     if accessor is None:
         raise ValueError(

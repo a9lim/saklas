@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from pathlib import Path
 
 import torch
+
+from liahona.vectors import (
+    compute_layer_means, extract_contrastive, get_cache_path,
+    load_contrastive_pairs, load_profile, save_profile, _NEUTRAL_PROMPTS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -27,8 +33,6 @@ def bootstrap_layer_means(
 
     Cached as a profile under the reserved name ``_LAYERMEANS``.
     """
-    from liahona.vectors import compute_layer_means, get_cache_path, save_profile, load_profile, _NEUTRAL_PROMPTS
-
     model_id = model_info.get("model_id", "unknown")
     cp = get_cache_path(cache_dir, model_id, _LAYER_MEANS_TAG)
 
@@ -67,9 +71,7 @@ def bootstrap_probes(
     Load or extract probe vector profiles for the given categories.
     Returns dict mapping probe_name -> profile (layer_idx -> (vector, score)).
     """
-    from liahona.vectors import extract_contrastive, load_contrastive_pairs, load_profile, save_profile, get_cache_path
-
-    defaults = _load_defaults()
+    defaults = load_defaults()
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
@@ -99,7 +101,10 @@ def bootstrap_probes(
 
     log.info("Extracting %d probes...", len(to_extract))
 
-    from tqdm import tqdm
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(x, **kw): return x
     datasets_dir = Path(__file__).parent / "datasets"
 
     # Load all datasets first so file I/O doesn't interleave with GPU work
@@ -133,14 +138,9 @@ def bootstrap_probes(
     return probes
 
 
-_DEFAULTS_CACHE: dict | None = None
-
-def _load_defaults() -> dict:
-    global _DEFAULTS_CACHE
-    if _DEFAULTS_CACHE is None:
-        if DEFAULTS_PATH.exists():
-            with open(DEFAULTS_PATH) as f:
-                _DEFAULTS_CACHE = json.load(f)
-        else:
-            _DEFAULTS_CACHE = {}
-    return _DEFAULTS_CACHE
+@functools.cache
+def load_defaults() -> dict:
+    if DEFAULTS_PATH.exists():
+        with open(DEFAULTS_PATH) as f:
+            return json.load(f)
+    return {}

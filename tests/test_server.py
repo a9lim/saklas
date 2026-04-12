@@ -6,7 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from liahona.results import GenerationResult, TokenEvent, ProbeReadings
+from liahona.results import GenerationResult, TokenEvent
+from liahona.session import ConcurrentGenerationError
 
 
 # ---------------------------------------------------------------------------
@@ -16,8 +17,8 @@ from liahona.results import GenerationResult, TokenEvent, ProbeReadings
 def _mock_session():
     """Create a mock LiahonaSession with realistic attributes."""
     session = MagicMock()
+    session.model_id = "test/model"
     session.model_info = {
-        "model_id": "test/model",
         "model_type": "gemma2",
         "num_layers": 26,
         "hidden_dim": 2304,
@@ -34,7 +35,7 @@ def _mock_session():
     session.probes = {}
     session.history = []
 
-    session._build_readings.return_value = {}
+    session.build_readings.return_value = {}
     return session
 
 
@@ -127,8 +128,8 @@ class TestChatCompletions:
         session, client = session_and_client
 
         def _mock_stream(*args, **kwargs):
-            yield TokenEvent(text="Hello", token_id=1, index=0, readings=None)
-            yield TokenEvent(text=" world", token_id=2, index=1, readings=None)
+            yield TokenEvent(text="Hello", token_id=1, index=0)
+            yield TokenEvent(text=" world", token_id=2, index=1)
 
         session.generate_stream.return_value = _mock_stream()
 
@@ -152,7 +153,6 @@ class TestChatCompletions:
 
     def test_conflict_on_concurrent_generation(self, session_and_client):
         session, client = session_and_client
-        from liahona.session import ConcurrentGenerationError
         session.generate.side_effect = ConcurrentGenerationError("Generation already in progress")
 
         resp = client.post("/v1/chat/completions", json={
@@ -232,7 +232,7 @@ class TestProbes:
 
     def test_list_defaults(self, session_and_client):
         session, client = session_and_client
-        with patch("liahona.server._load_defaults", return_value={"emotion": ["happiness"]}):
+        with patch("liahona.server.load_defaults", return_value={"emotion": ["happiness"]}):
             resp = client.get("/v1/liahona/probes/defaults")
         assert resp.status_code == 200
         assert "emotion" in resp.json()["defaults"]

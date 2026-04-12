@@ -17,7 +17,11 @@ log = logging.getLogger(__name__)
 # The overhead cancels in contrastive diffs but wastes memory per pass.
 _MAX_TEMPLATE_OVERHEAD = 100
 
+# Keyed by id(tokenizer).  Object IDs can be reused after GC, so this
+# cache is only safe when a single tokenizer lives for the session lifetime
+# (which is the case in both the TUI and the API server).
 _template_overhead_cache: dict[int, int] = {}
+_SAFE_CONCEPT_RE = re.compile(r'[^\w\-.]')
 
 
 def _chat_template_overhead(tokenizer, template_kwargs: dict) -> int:
@@ -357,9 +361,8 @@ def extract_contrastive(
 
     # On MPS, keep diffs on CPU — SVD runs there anyway, and the
     # model already occupies most of the unified memory budget.
-    diff_device = "cpu" if device.type == "mps" else device
-
     _mps = device.type == "mps"
+    diff_device = "cpu" if _mps else device
 
     for pair in pairs:
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
@@ -379,7 +382,6 @@ def extract_contrastive(
 
     # Per-layer: compute direction and score
     profile: dict[int, tuple[torch.Tensor, float]] = {}
-    scores: dict[int, float] = {}
     n_pairs = len(pairs)
 
     n_norm_samples = n_pairs * 2  # pos + neg per pair
@@ -392,8 +394,7 @@ def extract_contrastive(
             diff_vec = diffs_per_layer[idx][0]
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
-            scores[idx] = diff_vec.float().norm().item()
-            profile[idx] = (direction, scores[idx])
+            profile[idx] = (direction, diff_vec.float().norm().item())
     else:
         # Multi-pair: batched SVD across all layers.
         # Stack into (n_layers, N, dim) and run one batched SVD call —
@@ -407,7 +408,7 @@ def extract_contrastive(
 
         # Diffs are already float32 and on CPU for MPS — run SVD directly.
         batched = torch.stack(diff_matrices)  # (n_layers, N, dim)
-        svd_input = batched.cpu() if batched.device.type == "mps" else batched
+        svd_input = batched
         _, S, Vh = torch.linalg.svd(svd_input, full_matrices=False)
         # S: (n_layers, min(N,dim)), Vh: (n_layers, min(N,dim), dim)
 
@@ -420,18 +421,14 @@ def extract_contrastive(
                 direction = -direction
 
             score = (S[idx, 0] / S[idx].sum()).item()
-            scores[idx] = score
             profile[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), score)
 
     # Single-pair scores are raw diff norms — normalize to [0, 1] so they're
     # on the same scale as multi-pair explained-variance-ratio scores.
-    if len(pairs) < 2 and scores:
-        max_raw = max(scores.values())
+    if n_pairs < 2 and profile:
+        max_raw = max((s for _, s in profile.values()), default=0.0)
         if max_raw > 1e-8:
-            for idx in scores:
-                scores[idx] /= max_raw
-                vec, _ = profile[idx]
-                profile[idx] = (vec, scores[idx])
+            profile = {idx: (vec, s / max_raw) for idx, (vec, s) in profile.items()}
 
     return profile
 
@@ -450,10 +447,11 @@ def save_profile(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    tensors = {f"layer_{idx}": vec.contiguous().cpu() for idx, (vec, _) in profile.items()}
+    tensors, scores = {}, {}
+    for idx, (vec, score) in profile.items():
+        tensors[f"layer_{idx}"] = vec.contiguous().cpu()
+        scores[str(idx)] = score
     save_file(tensors, str(path))
-
-    scores = {str(idx): score for idx, (_, score) in profile.items()}
     meta = {**metadata, "scores": scores}
     meta_path = path.with_suffix(".json")
     with open(meta_path, "w") as f:
@@ -497,7 +495,7 @@ def get_cache_path(
         Path like ``{cache_dir}/{model_name}/{concept}.safetensors``
     """
     model_name = model_id.replace("/", "_")
-    safe_concept = re.sub(r'[^\w\-.]', '_', concept)
+    safe_concept = _SAFE_CONCEPT_RE.sub('_', concept)
     filename = f"{safe_concept}.safetensors"
     return str(Path(cache_dir) / model_name / filename)
 

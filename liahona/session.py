@@ -1,7 +1,6 @@
 """LiahonaSession — unified backend for liahona's programmatic API and TUI."""
 from __future__ import annotations
 import json
-import os
 import pathlib
 import queue
 import re
@@ -16,7 +15,7 @@ from liahona.generation import GenerationConfig, GenerationState, build_chat_inp
 from liahona.hooks import SteeringManager
 from liahona.model import load_model, get_layers, get_model_info
 from liahona.monitor import TraitMonitor
-from liahona.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, _load_defaults
+from liahona.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, load_defaults
 from liahona.results import GenerationResult, TokenEvent, ProbeReadings
 from liahona.vectors import (
     extract_contrastive,
@@ -27,8 +26,11 @@ from liahona.vectors import (
 )
 
 _N_PAIRS = 45
+PROBE_CATEGORIES = ["emotion", "personality", "safety", "cultural", "gender"]
 _BATCH_SIZE = 9
-_MIN_ELAPSED_FOR_RATE = 0.1
+MIN_ELAPSED_FOR_RATE = 0.1
+
+_PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
 
 _DOMAIN_SEEDS = [
     "setbacks, conflict, and difficult decisions",
@@ -92,13 +94,7 @@ class LiahonaSession:
         self._last_result: GenerationResult | None = None
 
         # Bootstrap probes
-        all_categories = ["emotion", "personality", "safety", "cultural", "gender"]
-        if probes is None:
-            probe_categories = all_categories
-        elif not probes:
-            probe_categories = []
-        else:
-            probe_categories = probes
+        probe_categories = PROBE_CATEGORIES if probes is None else probes
 
         probe_profiles: dict[str, dict] = {}
         if probe_categories:
@@ -123,13 +119,21 @@ class LiahonaSession:
         return dict(self._model_info)
 
     @property
+    def model_id(self) -> str:
+        return self._model_info.get("model_id", "unknown")
+
+    def has_vector(self, name: str) -> bool:
+        return name in self._profiles
+
+    @property
     def vectors(self) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
         """Registered steering vector profiles: name -> profile."""
         return dict(self._profiles)
 
     @property
     def probes(self) -> dict[str, dict]:
-        return {name: {"profile": self._monitor._raw_profiles[name]}
+        profiles = self._monitor.profiles
+        return {name: {"profile": profiles[name]}
                 for name in self._monitor.probe_names}
 
     @property
@@ -257,8 +261,6 @@ class LiahonaSession:
         (either direction), tolerating reversed, misnumbered, skipped,
         or duplicated indices.
         """
-        # Match: optional number/N prefix, then a or b, then delimiter
-        _PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
         entries: list[tuple[str, str]] = []  # ("a"|"b", content)
         for line in text.split("\n"):
             line = line.strip()
@@ -322,7 +324,7 @@ class LiahonaSession:
         # For DataSource or raw pairs, skip the full pipeline — just extract
         if isinstance(source, (DataSource, list)):
             if isinstance(source, list):
-                ds = DataSource.from_pairs(source)
+                ds = DataSource(pairs=source)
             else:
                 ds = source
             cache_path = get_cache_path(
@@ -360,7 +362,7 @@ class LiahonaSession:
 
         # 2. Check for curated dataset
         if baseline is None:
-            defaults = _load_defaults()
+            defaults = load_defaults()
             concept_lower = concept.lower()
             has_curated = any(concept_lower in probes for probes in defaults.values())
             if has_curated:
@@ -405,7 +407,7 @@ class LiahonaSession:
             raw_pairs = self.generate_pairs(concept, baseline, on_progress=_progress)
             pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
 
-            os.makedirs(os.path.dirname(stmt_cache_path), exist_ok=True)
+            pathlib.Path(stmt_cache_path).parent.mkdir(parents=True, exist_ok=True)
             with open(stmt_cache_path, "w") as f:
                 json.dump({"pairs": pairs}, f, indent=2)
 
@@ -475,7 +477,7 @@ class LiahonaSession:
                 self._model, self._tokenizer, self._layers, self._model_info,
                 cache_dir=self._cache_dir,
             )
-            self._monitor._layer_means = self._layer_means
+            self._monitor.layer_means = self._layer_means
         self._monitor.add_probe(name, profile)
 
     def unmonitor(self, name: str) -> None:
@@ -495,7 +497,7 @@ class LiahonaSession:
 
     # -- Generation helpers --
 
-    def _prepare_input(self, input, raw: bool = False, thinking: bool = False) -> tuple[list[dict], torch.Tensor]:
+    def _prepare_input(self, input, raw: bool = False, thinking: bool = False) -> torch.Tensor:
         if isinstance(input, str):
             messages = list(self._history) + [{"role": "user", "content": input}]
         elif isinstance(input, list):
@@ -503,17 +505,15 @@ class LiahonaSession:
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
         if raw and isinstance(input, str):
-            input_ids = self._tokenizer.encode(
+            return self._tokenizer.encode(
                 input, return_tensors="pt",
             ).to(self._device)
-        else:
-            input_ids = build_chat_input(
-                self._tokenizer, messages, self.config.system_prompt,
-                thinking=thinking,
-            ).to(self._device)
-        return messages, input_ids
+        return build_chat_input(
+            self._tokenizer, messages, self.config.system_prompt,
+            thinking=thinking,
+        ).to(self._device)
 
-    def _build_readings(self) -> dict[str, ProbeReadings]:
+    def build_readings(self) -> dict[str, ProbeReadings]:
         readings: dict[str, ProbeReadings] = {}
         if not self._monitor.probe_names:
             return readings
@@ -532,12 +532,53 @@ class LiahonaSession:
             else:
                 delta_per_gen = 0.0
             readings[name] = ProbeReadings(
-                per_token=hist, mean=mean, std=std,
+                per_generation=hist, mean=mean, std=std,
                 min=stats["min"] if stats["min"] != float("inf") else 0.0,
                 max=stats["max"] if stats["max"] != float("-inf") else 0.0,
-                delta_per_tok=delta_per_gen,
+                delta_per_gen=delta_per_gen,
             )
         return readings
+
+    def _finalize_generation(
+        self, input, generated_ids: list[int], elapsed: float,
+        vector_snapshot: dict[str, float],
+    ) -> GenerationResult:
+        """Shared post-generation: decode, measure probes, build result, update history."""
+        token_count = len(generated_ids)
+        tok_per_sec = token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
+        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
+        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+
+        if self._monitor.probe_names and text.strip():
+            self._monitor.measure(
+                self._model, self._tokenizer, self._layers, text,
+                device=self._device,
+            )
+        readings = self.build_readings()
+
+        result = GenerationResult(
+            text=text, tokens=list(generated_ids), token_count=token_count,
+            tok_per_sec=tok_per_sec, elapsed=elapsed,
+            readings=readings, vectors=vector_snapshot,
+        )
+        self._last_result = result
+
+        if isinstance(input, str):
+            self._history.append({"role": "user", "content": input})
+        if text.strip():
+            self._history.append({"role": "assistant", "content": text})
+
+        return result
+
+    def _generation_preamble(self, input, alphas, orthogonalize, raw, thinking):
+        use_thinking = thinking and supports_thinking(self._tokenizer)
+        input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
+        self._gen_state.reset()
+        self._monitor.reset_history()
+        vector_snapshot = dict(alphas) if alphas else {}
+        if alphas:
+            self._apply_steering(alphas, orthogonalize=orthogonalize)
+        return input_ids, use_thinking, vector_snapshot
 
     # -- Generation: blocking --
 
@@ -567,15 +608,9 @@ class LiahonaSession:
             self._gen_lock.release()
 
     def _generate_blocking(self, input, alphas, orthogonalize, raw=False, thinking=False) -> GenerationResult:
-        use_thinking = thinking and supports_thinking(self._tokenizer)
-        messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
-        self._gen_state.reset()
-        self._monitor.reset_history()
-
-        vector_snapshot = dict(alphas) if alphas else {}
-
-        if alphas:
-            self._apply_steering(alphas, orthogonalize=orthogonalize)
+        input_ids, use_thinking, vector_snapshot = self._generation_preamble(
+            input, alphas, orthogonalize, raw, thinking,
+        )
 
         try:
             start = time.monotonic()
@@ -588,32 +623,7 @@ class LiahonaSession:
             if alphas:
                 self._clear_steering()
 
-        token_count = len(generated_ids)
-        tok_per_sec = token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
-        # Strip thinking tokens — only decode the response portion
-        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
-        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-
-        if self._monitor.probe_names and text.strip():
-            self._monitor.measure(
-                self._model, self._tokenizer, self._layers, text,
-                device=self._device,
-            )
-        readings = self._build_readings()
-
-        result = GenerationResult(
-            text=text, tokens=generated_ids, token_count=token_count,
-            tok_per_sec=tok_per_sec, elapsed=elapsed,
-            readings=readings, vectors=vector_snapshot,
-        )
-        self._last_result = result
-
-        if isinstance(input, str):
-            self._history.append({"role": "user", "content": input})
-        if text.strip():
-            self._history.append({"role": "assistant", "content": text})
-
-        return result
+        return self._finalize_generation(input, generated_ids, elapsed, vector_snapshot)
 
     # -- Generation: streaming --
 
@@ -642,20 +652,12 @@ class LiahonaSession:
             self._gen_lock.release()
 
     def _generate_streaming(self, input, alphas, orthogonalize, raw=False, thinking=False) -> Iterator[TokenEvent]:
-        use_thinking = thinking and supports_thinking(self._tokenizer)
-        messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
-        self._gen_state.reset()
-        self._monitor.reset_history()
+        input_ids, use_thinking, vector_snapshot = self._generation_preamble(
+            input, alphas, orthogonalize, raw, thinking,
+        )
 
-        vector_snapshot = dict(alphas) if alphas else {}
-
-        if alphas:
-            self._apply_steering(alphas, orthogonalize=orthogonalize)
-
-        token_events: list[TokenEvent] = []
         generated_ids: list[int] = []
         token_queue = self._gen_state.token_queue
-        gen_done = threading.Event()
         gen_error: list[Exception] = []
         start = time.monotonic()
 
@@ -671,7 +673,7 @@ class LiahonaSession:
             except Exception as e:
                 gen_error.append(e)
             finally:
-                gen_done.set()
+                token_queue.put(None)
 
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
@@ -682,36 +684,15 @@ class LiahonaSession:
                 try:
                     item = token_queue.get(timeout=0.05)
                 except queue.Empty:
-                    if gen_done.is_set():
-                        while True:
-                            try:
-                                item = token_queue.get_nowait()
-                            except queue.Empty:
-                                break
-                            if item is None:
-                                break
-                            tok_str, is_thinking = item
-                            event = TokenEvent(
-                                text=tok_str,
-                                token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                                index=idx, readings=None, thinking=is_thinking,
-                            )
-                            token_events.append(event)
-                            yield event
-                            idx += 1
-                        break
                     continue
-
                 if item is None:
                     break
-
                 tok_str, is_thinking = item
                 event = TokenEvent(
                     text=tok_str,
                     token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
-                    index=idx, readings=None, thinking=is_thinking,
+                    index=idx, thinking=is_thinking,
                 )
-                token_events.append(event)
                 yield event
                 idx += 1
 
@@ -724,29 +705,7 @@ class LiahonaSession:
             raise gen_error[0]
 
         elapsed = time.monotonic() - start
-        token_count = len(generated_ids)
-        tok_per_sec = token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
-        # Strip thinking tokens — only decode the response portion
-        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
-        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-
-        if self._monitor.probe_names and text.strip():
-            self._monitor.measure(
-                self._model, self._tokenizer, self._layers, text,
-                device=self._device,
-            )
-        readings = self._build_readings()
-
-        self._last_result = GenerationResult(
-            text=text, tokens=list(generated_ids), token_count=token_count,
-            tok_per_sec=tok_per_sec, elapsed=elapsed,
-            readings=readings, vectors=vector_snapshot,
-        )
-
-        if isinstance(input, str):
-            self._history.append({"role": "user", "content": input})
-        if text.strip():
-            self._history.append({"role": "assistant", "content": text})
+        self._finalize_generation(input, generated_ids, elapsed, vector_snapshot)
 
     # -- Generation control --
 

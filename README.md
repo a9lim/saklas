@@ -141,7 +141,7 @@ ds = DataSource.curated("happy")                                   # bundled
 ds = DataSource.json("pairs.json")                                 # liahona schema
 ds = DataSource.csv("pairs.csv", positive_col="pos", negative_col="neg")
 ds = DataSource.huggingface("user/dataset", split="train[:100]")   # requires datasets
-ds = DataSource.from_pairs([("positive text", "negative text")])
+ds = DataSource(pairs=[("positive text", "negative text")])
 ```
 
 ### ResultCollector
@@ -365,7 +365,7 @@ pip install torch psutil setuptools wheel && pip install -e ".[cuda]" --no-build
 
 ## Supported architectures
 
-52 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one lambda entry.
+53 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one function entry.
 
 Llama (1-4), Mistral (1, 4), Ministral (1, 3), Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3.5), Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-3), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, GPT-OSS, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, RecurrentGemma.
 
@@ -385,8 +385,8 @@ Layer means are computed once per model and cached as `_LAYERMEANS.safetensors` 
 
 ```bash
 pytest tests/ -v                   # all tests
-pytest tests/test_results.py tests/test_datasource.py -v  # no GPU needed
+pytest tests/test_results.py tests/test_datasource.py tests/test_server.py -v  # no GPU needed
 pytest tests/test_smoke.py -v      # CUDA required
 ```
 
-CUDA tests download `google/gemma-2-2b-it` (~5 GB) on first run. Non-CUDA tests (`test_results.py`, `test_datasource.py`) run anywhere.
+CUDA tests download `google/gemma-2-2b-it` (~5 GB) on first run. Non-CUDA tests (`test_results.py`, `test_datasource.py`, `test_server.py`) run anywhere.

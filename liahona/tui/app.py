@@ -15,18 +15,18 @@ from textual.timer import Timer
 
 from liahona.generation import GenerationState, build_chat_input, generate_steered, supports_thinking
 from liahona.model import _get_memory_gb
-from liahona.probes_bootstrap import _load_defaults
+from liahona.probes_bootstrap import load_defaults
+from liahona.session import MIN_ELAPSED_FOR_RATE
 from liahona.tui.chat_panel import ChatPanel
 from liahona.tui.vector_panel import LeftPanel, MAX_ALPHA
 from liahona.tui.trait_panel import TraitPanel
 
 DEFAULT_ALPHA = 0.15
-_MIN_ELAPSED_FOR_RATE = 0.1
 _POLL_FPS = 15
 _VRAM_UPDATE_INTERVAL = 15
 _TOKEN_DRAIN_LIMIT = 20
 
-PANELS = ["left-panel", "chat-panel", "trait-panel"]
+_LEFT, _CHAT, _TRAIT = 0, 1, 2
 
 
 class LiahonaApp(App):
@@ -86,7 +86,7 @@ class LiahonaApp(App):
         self._vram_poll_counter: int = 0
         self._last_status_args: tuple = ()
 
-        defaults = _load_defaults()
+        defaults = load_defaults()
         self._probe_categories: dict[str, list[str]] = {
             cat.capitalize(): probes_list
             for cat, probes_list in defaults.items()
@@ -102,11 +102,14 @@ class LiahonaApp(App):
         result = []
         for name in self._alphas:
             if name in self._session._profiles:
+                profile = self._session._profiles[name]
                 result.append({
                     "name": name,
-                    "profile": self._session._profiles[name],
+                    "profile": profile,
                     "alpha": self._alphas[name],
                     "enabled": self._enabled.get(name, True),
+                    "peak": max(profile, key=lambda k: profile[k][1]),
+                    "n_active": len(profile),
                 })
         return result
 
@@ -179,33 +182,31 @@ class LiahonaApp(App):
                 panel.add_class("focused")
             else:
                 panel.remove_class("focused")
-        if self._focused_panel_idx == 1:  # chat panel
+        if self._focused_panel_idx == _CHAT:
             self.query_one("#chat-input").focus()
         else:
             self.set_focus(None)
 
     def action_focus_next_panel(self) -> None:
-        self._focused_panel_idx = (self._focused_panel_idx + 1) % len(PANELS)
+        self._focused_panel_idx = (self._focused_panel_idx + 1) % len(self._panels)
         self._update_panel_focus()
 
     def action_focus_prev_panel(self) -> None:
-        self._focused_panel_idx = (self._focused_panel_idx - 1) % len(PANELS)
+        self._focused_panel_idx = (self._focused_panel_idx - 1) % len(self._panels)
         self._update_panel_focus()
 
     # -- Navigation --
 
     def action_nav_down(self) -> None:
-        panel = PANELS[self._focused_panel_idx]
-        if panel == "left-panel":
+        if self._focused_panel_idx == _LEFT:
             self._left_panel.select_next()
-        elif panel == "trait-panel":
+        elif self._focused_panel_idx == _TRAIT:
             self._trait_panel.nav_down()
 
     def action_nav_up(self) -> None:
-        panel = PANELS[self._focused_panel_idx]
-        if panel == "left-panel":
+        if self._focused_panel_idx == _LEFT:
             self._left_panel.select_prev()
-        elif panel == "trait-panel":
+        elif self._focused_panel_idx == _TRAIT:
             self._trait_panel.nav_up()
 
     def action_nav_left(self) -> None:
@@ -215,8 +216,7 @@ class LiahonaApp(App):
         self._adjust_alpha(0.01)
 
     def action_nav_enter(self) -> None:
-        panel = PANELS[self._focused_panel_idx]
-        if panel == "left-panel":
+        if self._focused_panel_idx == _LEFT:
             self.action_toggle_vector()
 
     # -- Chat --
@@ -341,14 +341,26 @@ class LiahonaApp(App):
             concept = shlex.split(text[:dash_idx])[0]
             rest_tokens = shlex.split(text[dash_idx + 3:])
             baseline = rest_tokens[0] if rest_tokens else None
-            trailing = [t for t in rest_tokens[1:] if not any(c.isalpha() for c in t)]
+            alpha = None
+            for t in rest_tokens[1:]:
+                try:
+                    alpha = float(t)
+                    break
+                except ValueError:
+                    continue
         else:
             tokens = shlex.split(text)
             concept = tokens[0]
             baseline = None
-            trailing = [t for t in tokens[1:] if not any(c.isalpha() for c in t)]
+            alpha = None
+            for t in tokens[1:]:
+                try:
+                    alpha = float(t)
+                    break
+                except ValueError:
+                    continue
         if include_alpha:
-            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, float(trailing[0]))) if trailing else DEFAULT_ALPHA
+            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, alpha)) if alpha is not None else DEFAULT_ALPHA
             return concept, baseline, alpha
         return concept, baseline
 
@@ -539,7 +551,7 @@ class LiahonaApp(App):
                 generating = False
                 if self._gen_start_time > 0:
                     self._last_elapsed = time.monotonic() - self._gen_start_time
-                    if self._last_elapsed > _MIN_ELAPSED_FOR_RATE:
+                    if self._last_elapsed > MIN_ELAPSED_FOR_RATE:
                         self._last_tok_per_sec = self._gen_token_count / self._last_elapsed
                     self._gen_start_time = 0.0
 
@@ -584,7 +596,7 @@ class LiahonaApp(App):
 
         if generating and self._gen_start_time > 0:
             elapsed = time.monotonic() - self._gen_start_time
-            tok_per_sec = self._gen_token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
+            tok_per_sec = self._gen_token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
             self._last_tok_per_sec = tok_per_sec
             self._last_elapsed = elapsed
 
@@ -626,8 +638,7 @@ class LiahonaApp(App):
     def action_remove_vector(self) -> None:
         if self._ab_in_progress:
             return
-        panel = PANELS[self._focused_panel_idx]
-        if panel == "trait-panel":
+        if self._focused_panel_idx == _TRAIT:
             self._remove_selected_probe()
             return
         lp = self._left_panel
@@ -680,29 +691,24 @@ class LiahonaApp(App):
         self._thinking = not self._thinking
         self._refresh_gen_config()
 
-    def action_temp_down(self) -> None:
-        if self._focused_panel_idx != 0:
+    def _adjust_config(self, attr: str, delta: float, lo: float, hi: float) -> None:
+        if self._focused_panel_idx != _LEFT:
             return
-        self._session.config.temperature = max(0.0, round(self._session.config.temperature - 0.05, 2))
+        val = getattr(self._session.config, attr)
+        setattr(self._session.config, attr, round(max(lo, min(hi, val + delta)), 2))
         self._refresh_gen_config()
+
+    def action_temp_down(self) -> None:
+        self._adjust_config("temperature", -0.05, 0.0, float("inf"))
 
     def action_temp_up(self) -> None:
-        if self._focused_panel_idx != 0:
-            return
-        self._session.config.temperature = round(self._session.config.temperature + 0.05, 2)
-        self._refresh_gen_config()
+        self._adjust_config("temperature", 0.05, 0.0, float("inf"))
 
     def action_top_p_down(self) -> None:
-        if self._focused_panel_idx != 0:
-            return
-        self._session.config.top_p = max(0.0, round(self._session.config.top_p - 0.05, 2))
-        self._refresh_gen_config()
+        self._adjust_config("top_p", -0.05, 0.0, 1.0)
 
     def action_top_p_up(self) -> None:
-        if self._focused_panel_idx != 0:
-            return
-        self._session.config.top_p = min(1.0, round(self._session.config.top_p + 0.05, 2))
-        self._refresh_gen_config()
+        self._adjust_config("top_p", 0.05, 0.0, 1.0)
 
     def action_regenerate(self) -> None:
         if not self._messages:

@@ -8,16 +8,17 @@ from pathlib import Path
 class DataSource:
     """Normalizes contrastive pairs from multiple input formats."""
 
-    def __init__(self, pairs: list[tuple[str, str]], name: str = "custom",
-                 description: str | None = None):
+    def __init__(self, pairs: list[tuple[str, str]], name: str = "custom"):
         self.pairs = pairs
         self.name = name
-        self.description = description
 
     @classmethod
-    def from_pairs(cls, pairs: list[tuple[str, str]], name: str = "custom",
-                   description: str | None = None) -> DataSource:
-        return cls(pairs=list(pairs), name=name, description=description)
+    def _from_json_file(cls, path, name_override: str | None = None) -> DataSource:
+        with open(path) as f:
+            data = json.load(f)
+        pairs = [(p["positive"], p["negative"]) for p in data["pairs"]]
+        name = name_override or data.get("name", Path(path).stem)
+        return cls(pairs=pairs, name=name)
 
     @classmethod
     def curated(cls, concept: str) -> DataSource:
@@ -28,18 +29,11 @@ class DataSource:
                 f"No curated dataset for '{concept}'. "
                 f"Available: {', '.join(p.stem for p in sorted(datasets_dir.glob('*.json')))}"
             )
-        with open(ds_path) as f:
-            data = json.load(f)
-        pairs = [(p["positive"], p["negative"]) for p in data["pairs"]]
-        return cls(pairs=pairs, name=data.get("name", concept), description=data.get("description"))
+        return cls._from_json_file(ds_path, name_override=concept)
 
     @classmethod
     def json(cls, path: str, name: str | None = None) -> DataSource:
-        with open(path) as f:
-            data = json.load(f)
-        pairs = [(p["positive"], p["negative"]) for p in data["pairs"]]
-        return cls(pairs=pairs, name=name or data.get("name", Path(path).stem),
-                   description=data.get("description"))
+        return cls._from_json_file(path, name_override=name)
 
     @classmethod
     def csv(cls, path: str, positive_col: str = "positive",

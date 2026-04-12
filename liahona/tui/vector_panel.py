@@ -7,12 +7,9 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
+from liahona.tui.utils import build_bar
+
 MAX_ALPHA = 0.3
-
-
-def _build_bar(value: float, max_value: float, width: int) -> tuple[str, str]:
-    filled = min(int(abs(value) / max_value * width), width)
-    return "█" * filled, "░" * (width - filled)
 
 
 class LeftPanel(Widget):
@@ -121,12 +118,11 @@ class LeftPanel(Widget):
             enabled = v.get("enabled", True)
             name = v["name"]
             alpha = v["alpha"]
-            profile = v["profile"]
-            peak = max(profile, key=lambda k: profile[k][1])
-            n_active = len(profile)
+            peak = v["peak"]
+            n_active = v["n_active"]
             layer_tag = f"{n_active}L pk{peak}"
 
-            bar_full, bar_empty = _build_bar(alpha, MAX_ALPHA, 16)
+            bar_full, bar_empty = build_bar(alpha, MAX_ALPHA, 16)
             if alpha > 0:
                 color = "ansi_green"
             elif alpha < 0:
@@ -134,36 +130,25 @@ class LeftPanel(Widget):
             else:
                 color = "ansi_default"
 
-            if is_selected:
-                marker = ">"
-                dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
-                if enabled:
-                    text = (
-                        f"{marker} {dot} [bold]{name}[/] [dim]{layer_tag}[/]\n"
-                        f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.2f}[/] [dim]←/→[/]"
-                    )
-                else:
-                    text = (
-                        f"{marker} {dot} [dim bold]{name}[/] [dim]{layer_tag}[/]\n"
-                        f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.2f}[/] [dim]←/→[/]"
-                    )
+            marker = ">" if is_selected else " "
+            dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
+            hint = " [dim]←/→[/]" if is_selected else ""
+
+            if is_selected and enabled:
+                name_str = f"[bold]{name}[/]"
+            elif is_selected and not enabled:
+                name_str = f"[dim bold]{name}[/]"
+            elif not enabled:
+                name_str = f"[dim]{name}[/]"
             else:
-                marker = " "
-                dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
-                if enabled:
-                    text = (
-                        f"{marker} {dot} {name} [dim]{layer_tag}[/]\n"
-                        f"  α [{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[{color}]{alpha:+.2f}[/]"
-                    )
-                else:
-                    text = (
-                        f"{marker} {dot} [dim]{name} {layer_tag}[/]\n"
-                        f"  α [dim {color}]{bar_full}[/][dim]{bar_empty}[/] "
-                        f"[dim {color}]{alpha:+.2f}[/]"
-                    )
+                name_str = name
+
+            dim_prefix = "dim " if not enabled else ""
+            text = (
+                f"{marker} {dot} {name_str} [dim]{layer_tag}[/]\n"
+                f"  α [{dim_prefix}{color}]{bar_full}[/][dim]{bar_empty}[/] "
+                f"[{dim_prefix}{color}]{alpha:+.2f}[/]{hint}"
+            )
             lines.append(text)
 
         content = self._vector_content
@@ -171,9 +156,9 @@ class LeftPanel(Widget):
 
     def _render_gen_config(self) -> None:
         gen = self._gen_config_widget
-        t_full, t_empty = _build_bar(self._temperature, 2.0, 20)
+        t_full, t_empty = build_bar(self._temperature, 2.0, 20)
         t_bar = t_full + t_empty
-        p_full, p_empty = _build_bar(self._top_p, 1.0, 20)
+        p_full, p_empty = build_bar(self._top_p, 1.0, 20)
         p_bar = p_full + p_empty
 
         sys_str = self._system_prompt[:15] + "..." if self._system_prompt and len(self._system_prompt) > 15 else (self._system_prompt or "(none)")

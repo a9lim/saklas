@@ -35,14 +35,14 @@ class _AssistantMessage(Vertical):
             yield Static("", id="thinking-text")
             yield Markdown(id="thinking-md", classes="hidden")
         yield Static("", id="stream-text")
-        yield Markdown(classes="hidden")
+        yield Markdown(id="response-md", classes="hidden")
 
     def on_mount(self) -> None:
         self._thinking_block = self.query_one("#thinking-block", Collapsible)
         self._thinking_stream = self.query_one("#thinking-text", Static)
         self._thinking_md = self.query_one("#thinking-md", Markdown)
         self._stream = self.query_one("#stream-text", Static)
-        self._md = self.query_one(Markdown)
+        self._md = self.query_one("#response-md", Markdown)
 
     def update_thinking(self, text: str) -> None:
         self.thinking_text = text
@@ -68,6 +68,14 @@ class _AssistantMessage(Vertical):
         self.chat_text = text
         if self._stream is not None:
             self._stream.update(text)
+
+    def append_token(self, token: str) -> None:
+        self.chat_text += token
+        self.update_content(self.chat_text)
+
+    def append_thinking_token(self, token: str) -> None:
+        self.thinking_text += token
+        self.update_thinking(self.thinking_text)
 
     def finalize(self) -> None:
         """Switch from streaming Static to rendered Markdown."""
@@ -147,12 +155,10 @@ class ChatPanel(Widget):
         return widget
 
     def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
-        widget.chat_text += token
-        widget.update_content(widget.chat_text)
+        widget.append_token(token)
 
     def append_thinking(self, widget: _AssistantMessage, token: str) -> None:
-        widget.thinking_text += token
-        widget.update_thinking(widget.thinking_text)
+        widget.append_thinking_token(token)
 
     def scroll_to_bottom(self) -> None:
         """Scroll the chat log to the bottom. Call once after a batch of token updates."""

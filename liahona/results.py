@@ -7,21 +7,21 @@ from dataclasses import dataclass, field
 @dataclass
 class ProbeReadings:
     """Probe monitor readings across a generation run."""
-    per_token: list[float]
+    per_generation: list[float]
     mean: float
     std: float
     min: float
     max: float
-    delta_per_tok: float
+    delta_per_gen: float
 
     def to_dict(self) -> dict:
         return {
-            "per_token": list(self.per_token),
+            "per_generation": list(self.per_generation),
             "mean": self.mean,
             "std": self.std,
             "min": self.min,
             "max": self.max,
-            "delta_per_tok": self.delta_per_tok,
+            "delta_per_gen": self.delta_per_gen,
         }
 
 
@@ -54,7 +54,6 @@ class TokenEvent:
     text: str
     token_id: int
     index: int
-    readings: dict[str, float] | None
     thinking: bool = False
 
 
@@ -80,7 +79,7 @@ class ResultCollector:
             row[f"probe_{probe_name}_std"] = readings.std
             row[f"probe_{probe_name}_min"] = readings.min
             row[f"probe_{probe_name}_max"] = readings.max
-            row[f"probe_{probe_name}_delta"] = readings.delta_per_tok
+            row[f"probe_{probe_name}_delta"] = readings.delta_per_gen
         for vec_name, alpha in result.vectors.items():
             row[f"vector_{vec_name}_alpha"] = alpha
         row.update(tags)
