@@ -33,11 +33,11 @@ MIN_ELAPSED_FOR_RATE = 0.1
 _PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
 
 _DOMAIN_SEEDS = [
-    "setbacks, conflict, and difficult decisions",
-    "goals, ambitions, and advice to others",
-    "everyday life: routines, habits, hobbies, and casual conversations",
-    "memories, formative experiences, and personal identity",
-    "reactions to surprises, strangers, and unfamiliar situations",
+    "specific facts, lore, history, or knowledge unique to this concept",
+    "physical traits, mannerisms, sensory details, or observable behaviors",
+    "how this concept relates to others socially — alliances, conflicts, status",
+    "inner life: self-image, desires, fears, or motivations distinctive to this concept",
+    "concrete routines, rituals, habitats, or environmental interactions",
 ]
 
 
@@ -173,15 +173,19 @@ class LiahonaSession:
         """
         if baseline is not None:
             poles = (
-                f"Speaker A strongly embodies the trait \"{concept}\".\n"
-                f"Speaker B strongly embodies the trait \"{baseline}\"."
+                f"Speaker A IS \"{concept}\" — everything about them "
+                f"(what they know, how they look, what they do, how they "
+                f"think) is shaped by being \"{concept}\".\n"
+                f"Speaker B IS \"{baseline}\" in the same thorough way."
             )
         else:
             poles = (
-                f"Speaker A strongly embodies the trait \"{concept}\".\n"
-                f"Speaker B is the polar opposite of \"{concept}\" — "
-                f"they have none of this trait and their personality, "
-                f"worldview, and instincts run counter to it."
+                f"Speaker A IS \"{concept}\" — everything about them "
+                f"(what they know, how they look, what they do, how they "
+                f"think) is shaped by being \"{concept}\".\n"
+                f"Speaker B has nothing to do with \"{concept}\" — they "
+                f"are a completely unrelated person/entity with no "
+                f"connection to any aspect of \"{concept}\"."
             )
 
         pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
@@ -213,13 +217,17 @@ class LiahonaSession:
             prompt = (
                 f"Write exactly {batch_n} contrastive statement pairs.\n\n"
                 f"{poles}\n\n"
-                f"Domain: {domain}.\n\n"
+                f"Focus on: {domain}.\n\n"
                 f"Rules:\n"
-                f"- Same scenario, opposite dispositions\n"
-                f"- The trait should come through naturally in tone, "
-                f"imagery, and word choice\n"
+                f"- Each statement MUST include concrete details specific "
+                f"to \"{concept}\" — names, places, terminology, physical "
+                f"descriptions, or references that ONLY apply to "
+                f"\"{concept}\" and nothing else\n"
+                f"- NO generic statements that could apply to any similar "
+                f"concept — if you replaced \"{concept}\" with something "
+                f"else and the statement still works, it's too vague\n"
                 f"- Both statements should sound like genuinely different "
-                f"people — not a word swap or negation\n"
+                f"people/entities — not a word swap or negation\n"
                 f"- 1–2 sentences each\n\n"
                 f"Format: number then a/b, period, then the statement. "
                 f"Nothing else — no headers, no commentary.\n\n"

@@ -377,6 +377,18 @@ Llama (1-4), Mistral (1, 4), Ministral (1, 3), Mixtral, Gemma (1-4), Phi (1-3), 
 
 **Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer. Computes pos-neg differences, extracts the first principal component per layer via batched SVD. Each layer is scored by explained variance ratio. The result is a multi-layer profile — no manual layer selection. Scores weight each layer's contribution during generation.
 
+### Custom steering vectors
+
+When you steer on a concept that isn't in the curated probe library, liahona generates its own contrastive pairs using the loaded model, then extracts a vector from them. The pipeline:
+
+1. **Statement generation** — the model writes contrastive statement pairs in batches, each batch seeded by a different specificity lens (unique facts/lore, physical traits, social dynamics, inner life, concrete routines). The prompt forces concept-specific detail — names, terminology, sensory descriptions that only apply to the target concept — and explicitly rejects generic statements that could work for anything similar.
+2. **Caching** — generated pairs are saved under `liahona/datasets/cache/` keyed by concept name. Pairs are model-independent, so a different model reuses the same cached statements.
+3. **Extraction** — pairs feed into the standard contrastive PCA pipeline (per-layer SVD, explained variance scoring).
+
+This means `/steer "anything"` works — personality traits, religions, animals, emotions, fictional characters, "man who ate too much spaghetti." The vector captures what's distinctive about the concept, not generic associations.
+
+To regenerate cached statements (e.g. after a prompt update), use `liahona -x` to clear user-extracted vectors and statement caches.
+
 ### Monitor
 
 During generation, lightweight capture hooks record each layer's hidden state for the last generated token (single-slot overwrite per layer, no accumulation). After generation, these captured states are scored directly against probe vectors — no separate forward pass needed.
