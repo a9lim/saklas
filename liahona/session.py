@@ -463,6 +463,33 @@ class LiahonaSession:
         """Remove all steering hooks from the model."""
         self._steering.clear_all()
 
+    def _install_capture_hooks(self) -> tuple[dict[int, torch.Tensor], list]:
+        """Register lightweight hooks to capture the latest hidden state per layer.
+
+        Each hook overwrites a single buffer slot with the current token's
+        hidden state (detached, original dtype).  After generation, the
+        buffer contains the final generated token's hidden states — a
+        last-token pooling proxy suitable for probe scoring without a
+        separate forward pass.
+
+        Returns ``(captured_dict, handle_list)``.  Caller must remove
+        handles when done.
+        """
+        captured: dict[int, torch.Tensor] = {}
+
+        def _make_hook(idx):
+            def _hook(module, input, output):
+                h = output[0] if not isinstance(output, torch.Tensor) else output
+                # (1, 1, dim) during KV-cache decoding; (1, seq, dim) during prefill.
+                # Last position in either case.
+                captured[idx] = h.detach()[0, -1]
+            return _hook
+
+        handles = []
+        for idx in range(len(self._layers)):
+            handles.append(self._layers[idx].register_forward_hook(_make_hook(idx)))
+        return captured, handles
+
     def _promote_profile(self, profile: dict[int, tuple[torch.Tensor, float]]) -> dict[int, tuple[torch.Tensor, float]]:
         return {idx: (vec.to(self._device, self._dtype), score)
                 for idx, (vec, score) in profile.items()}
@@ -542,18 +569,27 @@ class LiahonaSession:
     def _finalize_generation(
         self, input, generated_ids: list[int], elapsed: float,
         vector_snapshot: dict[str, float],
+        captured_hidden: dict[int, torch.Tensor] | None = None,
     ) -> GenerationResult:
-        """Shared post-generation: decode, measure probes, build result, update history."""
+        """Shared post-generation: decode, measure probes, build result, update history.
+
+        When *captured_hidden* is provided (hidden states captured during
+        generation via hooks), probe scoring uses those directly instead
+        of running a separate forward pass.
+        """
         token_count = len(generated_ids)
         tok_per_sec = token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
         response_ids = generated_ids[self._gen_state.thinking_end_idx:]
         text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
         if self._monitor.probe_names and text.strip():
-            self._monitor.measure(
-                self._model, self._tokenizer, self._layers, text,
-                device=self._device,
-            )
+            if captured_hidden:
+                self._monitor.measure_from_hidden(captured_hidden)
+            else:
+                self._monitor.measure(
+                    self._model, self._tokenizer, self._layers, text,
+                    device=self._device,
+                )
         readings = self.build_readings()
 
         result = GenerationResult(
@@ -574,7 +610,6 @@ class LiahonaSession:
         use_thinking = thinking and supports_thinking(self._tokenizer)
         input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
         self._gen_state.reset()
-        self._monitor.reset_history()
         vector_snapshot = dict(alphas) if alphas else {}
         if alphas:
             self._apply_steering(alphas, orthogonalize=orthogonalize)
@@ -612,6 +647,11 @@ class LiahonaSession:
             input, alphas, orthogonalize, raw, thinking,
         )
 
+        # Capture hidden states during generation for probe scoring,
+        # avoiding a separate forward pass after generation.
+        has_probes = bool(self._monitor.probe_names)
+        captured, cap_handles = self._install_capture_hooks() if has_probes else ({}, [])
+
         try:
             start = time.monotonic()
             generated_ids = generate_steered(
@@ -620,10 +660,15 @@ class LiahonaSession:
             )
             elapsed = time.monotonic() - start
         finally:
+            for h in cap_handles:
+                h.remove()
             if alphas:
                 self._clear_steering()
 
-        return self._finalize_generation(input, generated_ids, elapsed, vector_snapshot)
+        return self._finalize_generation(
+            input, generated_ids, elapsed, vector_snapshot,
+            captured_hidden=captured if has_probes else None,
+        )
 
     # -- Generation: streaming --
 
@@ -661,12 +706,16 @@ class LiahonaSession:
         gen_error: list[Exception] = []
         start = time.monotonic()
 
+        # Capture hidden states during generation for probe scoring
+        has_probes = bool(self._monitor.probe_names)
+        captured, cap_handles = self._install_capture_hooks() if has_probes else ({}, [])
+
         def _worker():
             try:
                 ids = generate_steered(
                     self._model, self._tokenizer, input_ids,
                     self.config, self._gen_state,
-                    on_token=lambda tok, thinking: token_queue.put((tok, thinking)),
+                    on_token=lambda tok, thinking, tid: token_queue.put((tok, thinking, tid)),
                     thinking=use_thinking,
                 )
                 generated_ids.extend(ids)
@@ -687,10 +736,10 @@ class LiahonaSession:
                     continue
                 if item is None:
                     break
-                tok_str, is_thinking = item
+                tok_str, is_thinking, token_id = item
                 event = TokenEvent(
                     text=tok_str,
-                    token_id=generated_ids[idx] if idx < len(generated_ids) else -1,
+                    token_id=token_id,
                     index=idx, thinking=is_thinking,
                 )
                 yield event
@@ -698,6 +747,8 @@ class LiahonaSession:
 
             thread.join()
         finally:
+            for h in cap_handles:
+                h.remove()
             if alphas:
                 self._clear_steering()
 
@@ -705,7 +756,10 @@ class LiahonaSession:
             raise gen_error[0]
 
         elapsed = time.monotonic() - start
-        self._finalize_generation(input, generated_ids, elapsed, vector_snapshot)
+        self._finalize_generation(
+            input, generated_ids, elapsed, vector_snapshot,
+            captured_hidden=captured if has_probes else None,
+        )
 
     # -- Generation control --
 

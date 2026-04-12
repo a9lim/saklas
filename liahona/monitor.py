@@ -53,20 +53,8 @@ class TraitMonitor:
     def layer_means(self, value: dict[int, torch.Tensor]) -> None:
         self._layer_means = dict(value) if value else {}
 
-    def measure(self, model, tokenizer, layers, text: str, device=None):
-        """Run one forward pass over *text* and compute probe similarities.
-
-        Uses attention-weighted pooling (same as extraction) to produce
-        one hidden-state vector per layer, mean-centers, then computes
-        score-weighted cosine similarities against all probes.
-        """
-        from liahona.vectors import _encode_and_capture_all
-
-        if device is None:
-            device = next(model.parameters()).device
-
-        hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
-
+    def _score_probes(self, hidden_per_layer: dict[int, torch.Tensor]):
+        """Score all probes against hidden states and update history/stats."""
         for name in self._raw_profiles:
             total_w = 0.0
             weighted_sim = 0.0
@@ -94,6 +82,29 @@ class TraitMonitor:
                 s["max"] = val
 
         self._pending = True
+
+    def measure(self, model, tokenizer, layers, text: str, device=None):
+        """Run one forward pass over *text* and compute probe similarities.
+
+        Uses attention-weighted pooling (same as extraction) to produce
+        one hidden-state vector per layer, mean-centers, then computes
+        score-weighted cosine similarities against all probes.
+        """
+        from liahona.vectors import _encode_and_capture_all
+
+        if device is None:
+            device = next(model.parameters()).device
+
+        hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
+        self._score_probes(hidden_per_layer)
+
+    def measure_from_hidden(self, hidden_per_layer: dict[int, torch.Tensor]):
+        """Score probes from pre-captured hidden states (no forward pass).
+
+        Use when hidden states have already been captured during generation
+        (e.g. via capture hooks), avoiding a redundant forward pass.
+        """
+        self._score_probes(hidden_per_layer)
 
     def has_pending_data(self) -> bool:
         return self._pending

@@ -1,8 +1,10 @@
-"""Tests for structured output dataclasses."""
+"""Tests for structured output dataclasses and monitor scoring."""
 import json
 import csv
 import tempfile
 from pathlib import Path
+
+import torch
 from liahona.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
 
 
@@ -152,3 +154,64 @@ class TestResultCollector:
         collector.add(self._make_result(), run=1)
         collector.add(self._make_result(), run=2)
         assert len(collector.results) == 2
+
+
+class TestTraitMonitorScoring:
+    """Tests for TraitMonitor probe scoring — runs anywhere (no GPU)."""
+
+    @staticmethod
+    def _make_monitor():
+        from liahona.monitor import TraitMonitor
+        dim = 16
+        # Create a probe vector pointing in a known direction
+        probe_vec = torch.zeros(dim)
+        probe_vec[0] = 1.0  # unit vector along dim 0
+        probe_profile = {0: (probe_vec, 1.0)}
+        layer_means = {0: torch.zeros(dim)}
+        return TraitMonitor({"test_probe": probe_profile}, layer_means)
+
+    def test_measure_from_hidden_matches_manual(self):
+        monitor = self._make_monitor()
+        # Hidden state pointing in the same direction as probe
+        h = torch.zeros(16)
+        h[0] = 5.0
+        monitor.measure_from_hidden({0: h})
+        assert len(monitor.history["test_probe"]) == 1
+        # Cosine similarity of aligned vectors = 1.0
+        assert abs(monitor.history["test_probe"][0] - 1.0) < 1e-5
+
+    def test_measure_from_hidden_orthogonal(self):
+        monitor = self._make_monitor()
+        # Hidden state orthogonal to probe — cosine = 0
+        h = torch.zeros(16)
+        h[1] = 5.0
+        monitor.measure_from_hidden({0: h})
+        assert abs(monitor.history["test_probe"][0]) < 1e-5
+
+    def test_history_accumulates_across_calls(self):
+        monitor = self._make_monitor()
+        h1 = torch.zeros(16)
+        h1[0] = 1.0
+        h2 = torch.zeros(16)
+        h2[1] = 1.0
+        monitor.measure_from_hidden({0: h1})
+        monitor.measure_from_hidden({0: h2})
+        assert len(monitor.history["test_probe"]) == 2
+        assert monitor.history["test_probe"][0] > monitor.history["test_probe"][1]
+
+    def test_stats_accumulate(self):
+        monitor = self._make_monitor()
+        for _ in range(3):
+            h = torch.randn(16)
+            monitor.measure_from_hidden({0: h})
+        stats = monitor.get_stats("test_probe")
+        assert stats["count"] == 3
+        assert stats["min"] <= stats["max"]
+
+    def test_sparkline_grows_with_history(self):
+        monitor = self._make_monitor()
+        for _ in range(4):
+            h = torch.randn(16)
+            monitor.measure_from_hidden({0: h})
+        sparkline = monitor.get_sparkline("test_probe")
+        assert len(sparkline) == 4
