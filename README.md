@@ -43,7 +43,7 @@ with LiahonaSession("google/gemma-2-2b-it", device="cuda") as session:
 
 ### Key concepts
 
-**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 0.15})` applies it for that generation only. Alpha directly represents the fraction of mean hidden-state norm (e.g. 0.15 = 15% perturbation at high-signal layers). No persistent hooks live on the model between calls.
+**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 0.5})` applies it for that generation only. Alpha directly represents the fraction of mean hidden-state norm (e.g. 0.5 = 50% perturbation at high-signal layers). No persistent hooks live on the model between calls.
 
 **Orthogonalization is per-call.** `session.generate(input, alphas={...}, orthogonalize=True)` applies Gram-Schmidt to the active vectors for that generation only.
 
@@ -95,9 +95,9 @@ session.unsteer("name")            # remove
 session.vectors                    # dict of registered profiles
 
 # Generation
-result = session.generate("prompt", alphas={"name": 0.15}, orthogonalize=False)
+result = session.generate("prompt", alphas={"name": 0.5}, orthogonalize=False)
 result = session.generate("prompt", thinking=True)  # enable reasoning trace
-for token in session.generate_stream("prompt", alphas={"name": 0.15}):
+for token in session.generate_stream("prompt", alphas={"name": 0.5}):
     if token.thinking:
         print(f"[think] {token.text}", end="", flush=True)
     else:
