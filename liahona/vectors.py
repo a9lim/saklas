@@ -12,6 +12,37 @@ from safetensors.torch import load_file, save_file
 
 log = logging.getLogger(__name__)
 
+# Skip the chat template for extraction when it adds more than this many
+# tokens of overhead (e.g. Ministral injects a ~500-token system prompt).
+# The overhead cancels in contrastive diffs but wastes memory per pass.
+_MAX_TEMPLATE_OVERHEAD = 100
+
+_template_overhead_cache: dict[str, int] = {}
+
+
+def _chat_template_overhead(tokenizer, template_kwargs: dict) -> int:
+    """Return the number of extra tokens the chat template adds beyond content."""
+    cache_key = getattr(tokenizer, 'name_or_path', '') + str(id(tokenizer))
+    cached = _template_overhead_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    probe = "X"
+    raw_len = len(tokenizer.encode(probe, add_special_tokens=False))
+    messages = [{"role": "user", "content": "."}, {"role": "assistant", "content": probe}]
+    try:
+        wrapped = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, **template_kwargs,
+        )
+        wrapped_len = len(tokenizer.encode(wrapped, add_special_tokens=False))
+    except Exception:
+        wrapped_len = raw_len  # can't measure, assume no overhead
+    overhead = wrapped_len - raw_len
+    _template_overhead_cache[cache_key] = overhead
+    if overhead > _MAX_TEMPLATE_OVERHEAD:
+        log.info("chat template adds %d tokens of overhead, skipping for extraction", overhead)
+    return overhead
+
 
 def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     """Normalize a direction vector.
@@ -139,6 +170,13 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs,
             )
+        # Some chat templates inject a large system prompt (e.g.
+        # Ministral adds ~500 tokens).  For contrastive extraction the
+        # overhead cancels in the diff but wastes memory on every
+        # forward pass.  Fall back to raw tokenization when excessive.
+        overhead = _chat_template_overhead(tokenizer, kwargs)
+        if overhead > _MAX_TEMPLATE_OVERHEAD:
+            text = messages[-1]["content"]  # use raw text
     enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=False)
     ids = enc["input_ids"]
     mask = enc["attention_mask"]
