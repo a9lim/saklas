@@ -496,7 +496,7 @@ class LiahonaSession:
 
     # -- Generation helpers --
 
-    def _prepare_input(self, input, raw: bool = False, thinking: bool = False) -> tuple[list[dict], torch.Tensor]:
+    def _prepare_input(self, input, raw: bool = False, thinking: bool = False) -> torch.Tensor:
         if isinstance(input, str):
             messages = list(self._history) + [{"role": "user", "content": input}]
         elif isinstance(input, list):
@@ -504,15 +504,13 @@ class LiahonaSession:
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
         if raw and isinstance(input, str):
-            input_ids = self._tokenizer.encode(
+            return self._tokenizer.encode(
                 input, return_tensors="pt",
             ).to(self._device)
-        else:
-            input_ids = build_chat_input(
-                self._tokenizer, messages, self.config.system_prompt,
-                thinking=thinking,
-            ).to(self._device)
-        return messages, input_ids
+        return build_chat_input(
+            self._tokenizer, messages, self.config.system_prompt,
+            thinking=thinking,
+        ).to(self._device)
 
     def build_readings(self) -> dict[str, ProbeReadings]:
         readings: dict[str, ProbeReadings] = {}
@@ -539,6 +537,37 @@ class LiahonaSession:
                 delta_per_tok=delta_per_gen,
             )
         return readings
+
+    def _finalize_generation(
+        self, input, generated_ids: list[int], elapsed: float,
+        vector_snapshot: dict[str, float],
+    ) -> GenerationResult:
+        """Shared post-generation: decode, measure probes, build result, update history."""
+        token_count = len(generated_ids)
+        tok_per_sec = token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
+        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
+        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+
+        if self._monitor.probe_names and text.strip():
+            self._monitor.measure(
+                self._model, self._tokenizer, self._layers, text,
+                device=self._device,
+            )
+        readings = self.build_readings()
+
+        result = GenerationResult(
+            text=text, tokens=list(generated_ids), token_count=token_count,
+            tok_per_sec=tok_per_sec, elapsed=elapsed,
+            readings=readings, vectors=vector_snapshot,
+        )
+        self._last_result = result
+
+        if isinstance(input, str):
+            self._history.append({"role": "user", "content": input})
+        if text.strip():
+            self._history.append({"role": "assistant", "content": text})
+
+        return result
 
     # -- Generation: blocking --
 
@@ -569,7 +598,7 @@ class LiahonaSession:
 
     def _generate_blocking(self, input, alphas, orthogonalize, raw=False, thinking=False) -> GenerationResult:
         use_thinking = thinking and supports_thinking(self._tokenizer)
-        messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
+        input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
         self._gen_state.reset()
         self._monitor.reset_history()
 
@@ -589,32 +618,7 @@ class LiahonaSession:
             if alphas:
                 self._clear_steering()
 
-        token_count = len(generated_ids)
-        tok_per_sec = token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
-        # Strip thinking tokens — only decode the response portion
-        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
-        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-
-        if self._monitor.probe_names and text.strip():
-            self._monitor.measure(
-                self._model, self._tokenizer, self._layers, text,
-                device=self._device,
-            )
-        readings = self.build_readings()
-
-        result = GenerationResult(
-            text=text, tokens=generated_ids, token_count=token_count,
-            tok_per_sec=tok_per_sec, elapsed=elapsed,
-            readings=readings, vectors=vector_snapshot,
-        )
-        self._last_result = result
-
-        if isinstance(input, str):
-            self._history.append({"role": "user", "content": input})
-        if text.strip():
-            self._history.append({"role": "assistant", "content": text})
-
-        return result
+        return self._finalize_generation(input, generated_ids, elapsed, vector_snapshot)
 
     # -- Generation: streaming --
 
@@ -644,7 +648,7 @@ class LiahonaSession:
 
     def _generate_streaming(self, input, alphas, orthogonalize, raw=False, thinking=False) -> Iterator[TokenEvent]:
         use_thinking = thinking and supports_thinking(self._tokenizer)
-        messages, input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
+        input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
         self._gen_state.reset()
         self._monitor.reset_history()
 
@@ -725,29 +729,7 @@ class LiahonaSession:
             raise gen_error[0]
 
         elapsed = time.monotonic() - start
-        token_count = len(generated_ids)
-        tok_per_sec = token_count / elapsed if elapsed > _MIN_ELAPSED_FOR_RATE else 0.0
-        # Strip thinking tokens — only decode the response portion
-        response_ids = generated_ids[self._gen_state.thinking_end_idx:]
-        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-
-        if self._monitor.probe_names and text.strip():
-            self._monitor.measure(
-                self._model, self._tokenizer, self._layers, text,
-                device=self._device,
-            )
-        readings = self.build_readings()
-
-        self._last_result = GenerationResult(
-            text=text, tokens=list(generated_ids), token_count=token_count,
-            tok_per_sec=tok_per_sec, elapsed=elapsed,
-            readings=readings, vectors=vector_snapshot,
-        )
-
-        if isinstance(input, str):
-            self._history.append({"role": "user", "content": input})
-        if text.strip():
-            self._history.append({"role": "assistant", "content": text})
+        self._finalize_generation(input, list(generated_ids), elapsed, vector_snapshot)
 
     # -- Generation control --
 
