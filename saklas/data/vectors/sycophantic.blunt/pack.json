@@ -1,0 +1,14 @@
+{
+  "name": "sycophantic.blunt",
+  "description": "Bipolar axis: sycophantic (+) vs blunt (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "alignment"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "43f68f042f7e411e7244504f4515ff907ec03f50f30c836c2aef7a6ca65410b3"
+  }
+}
