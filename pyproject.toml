@@ -29,6 +29,7 @@ dependencies = [
     "accelerate>=0.27",
     "safetensors>=0.4",
     "textual>=0.50",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -51,4 +52,9 @@ saklas = "saklas.cli:main"
 include = ["saklas*"]
 
 [tool.setuptools.package-data]
-saklas = ["probes/defaults.json", "datasets/*.json", "tui/*.tcss"]
+saklas = [
+    "data/**/*.json",
+    "probes/defaults.json",
+    "datasets/*.json",
+    "tui/*.tcss",
+]
