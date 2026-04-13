@@ -272,8 +272,9 @@ class GenerationState:
 
     def __init__(self):
         self.stop_requested = threading.Event()
-        self.token_queue: queue.SimpleQueue[tuple[str, bool] | None] = queue.SimpleQueue()
+        self.token_queue: queue.SimpleQueue = queue.SimpleQueue()
         self.thinking_end_idx: int = 0
+        self.finish_reason: str = "stop"
 
     def request_stop(self):
         self.stop_requested.set()
@@ -282,6 +283,7 @@ class GenerationState:
         self.stop_requested.clear()
         self.token_queue = queue.SimpleQueue()
         self.thinking_end_idx = 0
+        self.finish_reason = "stop"
 
 
 def build_chat_input(
@@ -316,18 +318,37 @@ def generate_steered(
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
-    on_token: Callable[[str, bool, int], None] | None = None,
+    on_token: Callable[..., None] | None = None,
     thinking: bool = False,
+    seed: int | None = None,
+    stop: list[str] | None = None,
+    logit_bias: dict[int, float] | None = None,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    logprobs: int | None = None,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
 
-    *on_token(text, is_thinking, token_id)* is called for each emitted
-    token.  For multi-token UTF-8 sequences (buffered partials),
-    *token_id* is ``-1``.
+    *on_token(text, is_thinking, token_id, logprob, top_logprobs)* is called
+    for each emitted token.  For multi-token UTF-8 sequences (buffered
+    partials), *token_id* is ``-1`` and logprob is None.
+
+    ``logprobs`` is None (disabled) or the number of top logprobs to include
+    per token (0 = only the chosen token's logprob).  ``stop`` is a list of
+    strings that terminate generation when any appears in the completion
+    text.  ``seed`` seeds the RNG for deterministic sampling.
+
+    Sets ``state.finish_reason`` on exit: "stop" (EOS/external), "length"
+    (max tokens), "stop_sequence" (stop string matched).
 
     Returns list of generated token IDs.
     """
+    if seed is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
     device = input_ids.device
     eos_ids = _get_eos_ids(model, tokenizer)
     past_key_values = None
@@ -340,6 +361,18 @@ def generate_steered(
     seq_len = input_ids.shape[1]
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
+
+    # Penalty / bias / stop / logprobs setup
+    use_penalties = presence_penalty != 0.0 or frequency_penalty != 0.0
+    completion_counts: dict[int, int] = {} if use_penalties else {}
+    bias_idx: torch.Tensor | None = None
+    bias_val: torch.Tensor | None = None
+    if logit_bias:
+        bias_idx = torch.tensor(list(logit_bias.keys()), dtype=torch.long, device=device)
+        bias_val = torch.tensor(list(logit_bias.values()), dtype=torch.float32, device=device)
+    stop_list = list(stop) if stop else None
+    completion_text = ""  # accumulated non-thinking emitted text, for stop matching
+    state.finish_reason = "length"  # default: loop exhausted
 
     # Thinking state tracking
     if thinking:
@@ -364,6 +397,7 @@ def generate_steered(
         with torch.inference_mode():
             for _ in range(config.max_new_tokens):
                 if state.stop_requested.is_set():
+                    state.finish_reason = "stop"
                     break
 
                 outputs = model(
@@ -381,6 +415,26 @@ def generate_steered(
                 # clamp then bounds any remaining finite outliers.
                 logits.nan_to_num_(nan=0.0, posinf=100.0, neginf=-100.0)
                 logits.clamp_(-100.0, 100.0)
+
+                # Presence + frequency penalty (applied to raw logits,
+                # before temperature, per OpenAI semantics).
+                if use_penalties and completion_counts:
+                    ids = list(completion_counts.keys())
+                    counts = list(completion_counts.values())
+                    idx_t = torch.tensor(ids, dtype=torch.long, device=device)
+                    cnt_t = torch.tensor(counts, dtype=logits.dtype, device=device)
+                    logits[0, idx_t] -= frequency_penalty * cnt_t + presence_penalty
+
+                if bias_idx is not None:
+                    logits[0, bias_idx] += bias_val.to(logits.dtype)
+
+                # Compute logprobs of the pre-sampling distribution if requested.
+                chosen_logprob: float | None = None
+                top_lp_pairs: list[tuple[int, float]] | None = None
+                if logprobs is not None:
+                    lp = torch.log_softmax(logits.float(), dim=-1)
+                else:
+                    lp = None
 
                 if config.temperature <= 0:
                     # Greedy
@@ -401,6 +455,12 @@ def generate_steered(
 
                 token_id = next_token.item()
 
+                if lp is not None:
+                    chosen_logprob = lp[0, token_id].item()
+                    if logprobs > 0:
+                        tlv, tli = lp[0].topk(min(logprobs, _vocab))
+                        top_lp_pairs = [(int(i), float(v)) for i, v in zip(tli.tolist(), tlv.tolist())]
+
                 if token_id in eos_ids:
                     # Channel-based models (gpt-oss) use EOS tokens as
                     # channel separators.  For these models only, skip
@@ -410,6 +470,7 @@ def generate_steered(
                     if response_start_id is None or not (
                         in_thinking or in_preamble or in_response_preamble
                     ):
+                        state.finish_reason = "stop"
                         break
                     # EOS inside a thinking/preamble phase — advance KV
                     # state, transition out of thinking, and keep generating.
@@ -422,14 +483,14 @@ def generate_steered(
                         in_thinking = False
                         if on_token and pending_ids:
                             on_token(tokenizer.decode(pending_ids),
-                                     pending_thinking, -1)
+                                     pending_thinking, -1, None, None)
                             pending_ids.clear()
                         in_response_preamble = True
                     elif in_preamble:
                         in_preamble = False
                         if on_token and pending_ids:
                             on_token(tokenizer.decode(pending_ids),
-                                     pending_thinking, -1)
+                                     pending_thinking, -1, None, None)
                             pending_ids.clear()
                         state.thinking_end_idx = len(generated_ids)
                     continue
@@ -472,7 +533,7 @@ def generate_steered(
                     in_thinking = False
                     # Flush any buffered partial tokens before the delimiter
                     if on_token and pending_ids:
-                        on_token(tokenizer.decode(pending_ids), pending_thinking, -1)
+                        on_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
                         pending_ids.clear()
                     if response_start_id is not None:
                         # Channel-based format (e.g. gpt-oss): suppress
@@ -490,8 +551,17 @@ def generate_steered(
                         state.thinking_end_idx = len(generated_ids)
                     continue
 
+                # Penalty bookkeeping: count all emitted completion tokens
+                # (thinking and response alike, matching OpenAI's treatment
+                # of the full completion sequence).
+                if use_penalties:
+                    completion_counts[token_id] = completion_counts.get(token_id, 0) + 1
+
                 if on_token:
                     tok_str = token_table[token_id] if token_id < _vocab else ''
+                    emit_text: str | None = None
+                    emit_id = token_id
+                    emit_thinking = in_thinking
                     if tok_str is None:
                         # Partial UTF-8 byte sequence — buffer until complete
                         if not pending_ids:
@@ -499,14 +569,38 @@ def generate_steered(
                         pending_ids.append(token_id)
                     elif pending_ids:
                         pending_ids.append(token_id)
-                        on_token(tokenizer.decode(pending_ids), pending_thinking, -1)
+                        emit_text = tokenizer.decode(pending_ids)
+                        emit_id = -1
+                        emit_thinking = pending_thinking
                         pending_ids.clear()
                     else:
-                        on_token(tok_str, in_thinking, token_id)
+                        emit_text = tok_str
+
+                    if emit_text is not None:
+                        # Stop-sequence check (response text only).
+                        if stop_list and not emit_thinking:
+                            prev_len = len(completion_text)
+                            new_text = completion_text + emit_text
+                            hit_idx = -1
+                            for s in stop_list:
+                                i = new_text.find(s, max(0, prev_len - len(s) + 1))
+                                if i >= 0 and (hit_idx < 0 or i < hit_idx):
+                                    hit_idx = i
+                            if hit_idx >= 0:
+                                # Trim emit to the pre-stop portion only.
+                                trimmed = new_text[:hit_idx][prev_len:]
+                                if trimmed:
+                                    on_token(trimmed, emit_thinking, emit_id,
+                                             chosen_logprob, top_lp_pairs)
+                                state.finish_reason = "stop_sequence"
+                                break
+                            completion_text = new_text
+                        on_token(emit_text, emit_thinking, emit_id,
+                                 chosen_logprob, top_lp_pairs)
 
         # Flush any remaining buffered partial tokens
         if on_token and pending_ids:
-            on_token(tokenizer.decode(pending_ids), pending_thinking, -1)
+            on_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
 
     finally:
         # Flush MPS command buffers before signalling completion — without

@@ -89,6 +89,10 @@ def _build_serve_parser() -> argparse.ArgumentParser:
         "--cors", action="append", default=[], metavar="ORIGIN",
         help="CORS allowed origin (repeatable). Omit for no CORS.",
     )
+    p.add_argument(
+        "--api-key", default=None, metavar="KEY",
+        help="Require Bearer token auth. Falls back to $SAKLAS_API_KEY. Unset = no auth.",
+    )
     return p
 
 
@@ -278,7 +282,9 @@ def _run_serve(args: argparse.Namespace) -> None:
         print(f"  Registered '{name}' (default alpha={alpha})")
 
     from saklas.server import create_app
-    app = create_app(session, default_alphas=default_alphas, cors_origins=args.cors or None)
+    app = create_app(session, default_alphas=default_alphas,
+                     cors_origins=args.cors or None,
+                     api_key=getattr(args, "api_key", None))
 
     print(f"\nServing on http://{args.host}:{args.port}")
     print(f"API docs: http://{args.host}:{args.port}/docs")

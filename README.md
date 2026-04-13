@@ -1,6 +1,8 @@
 # saklas
 
+[![CI](https://github.com/a9lim/saklas/actions/workflows/ci.yml/badge.svg)](https://github.com/a9lim/saklas/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/saklas)](https://pypi.org/project/saklas/)
+[![Downloads](https://img.shields.io/pypi/dm/saklas)](https://pypi.org/project/saklas/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 
@@ -211,6 +213,7 @@ for chunk in client.chat.completions.create(
 | `-m`, `--max-tokens` | `1024` | Max tokens per generation |
 | `--steer` | None | Pre-load vector, repeatable. `name:alpha` or `name` |
 | `--cors` | None | CORS origin, repeatable |
+| `--api-key` | None | Require Bearer auth. Falls back to `$SAKLAS_API_KEY`. Unset = open. |
 
 ### Endpoints
 
@@ -241,6 +244,12 @@ for chunk in client.chat.completions.create(
 Full API docs available at `http://localhost:8000/docs` when the server is running.
 
 Probe readings are returned as an extra `probe_readings` field in generation responses — standard clients ignore it, aware clients get inline monitoring data.
+
+### OpenAI parity
+
+Chat/completions accept the full standard parameter surface: `stop` (string or list), `seed`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` + `top_logprobs`, `stream_options.include_usage`, `max_completion_tokens`, plus accept-and-ignore for `user`, `n`, `response_format`, and `messages[].name`. Multimodal content-part arrays are flattened to text (non-text parts rejected). Responses include real `usage` token counts, accurate `finish_reason` (`stop`/`length`/`stop_sequence`), and the first streaming chunk emits `{role: "assistant"}` per OpenAI convention. Error responses follow the OpenAI shape with `type`/`param`/`code` fields.
+
+The server is **stateless** — each request carries its full message list and neither conversation history nor probe accumulators persist between requests. (The `/v1/saklas/session/*` management routes are still stateful by design for single-user workflows.) Concurrent requests queue FIFO against a single generation lock rather than 409ing. Tool calling, strict JSON schema mode, and `/v1/embeddings` are not supported.
 
 ## Terminal UI
 
