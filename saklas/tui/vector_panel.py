@@ -37,6 +37,8 @@ class LeftPanel(Widget):
         # Model section
         yield Static("[bold]MODEL[/]", classes="section-header")
         model_id = info.get("model_id", "unknown")
+        if "/" in model_id:
+            model_id = model_id.split("/", 1)[1]
         if len(model_id) > 28:
             model_id = "..." + model_id[-25:]
         params = info.get("param_count", 0)
