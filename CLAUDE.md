@@ -26,8 +26,16 @@ pytest tests/ -v                 # all tests (non-CUDA tests run anywhere)
 
 Package name is `saklas`. Import name stays `saklas`.
 
+Version lives in **two places** — bump both or `saklas.__version__` drifts from what PyPI shows:
+
+- `pyproject.toml` — `[project] version` (what PyPI resolves)
+- `saklas/__init__.py` — `__version__` (what `import saklas; saklas.__version__` returns, and what gets stamped into sidecar metadata by `probes_bootstrap.py` / `vectors.py`)
+
+Releases are automated: merging a version bump to `main` triggers `.github/workflows/release.yml`, which reads `pyproject.toml`, checks if `v$VERSION` exists, and if not: builds, tags, publishes via PyPI trusted publishing, and cuts a GitHub release. No manual `twine upload` — just bump and merge. If you merge without bumping, the workflow no-ops.
+
+Manual fallback (not normally needed):
+
 ```bash
-# bump version in pyproject.toml, then:
 python3 -m build                   # creates dist/saklas-X.Y.Z.tar.gz + .whl
 twine upload dist/*                # uploads using ~/.pypirc token
 ```

@@ -1,0 +1,26 @@
+name: New architecture support
+description: Request support for a new model architecture
+labels: [enhancement, architecture]
+body:
+  - type: input
+    id: model-type
+    attributes:
+      label: HuggingFace model_type
+      description: From the model's config.json
+      placeholder: gemma3
+    validations:
+      required: true
+
+  - type: input
+    id: example-model
+    attributes:
+      label: Example model ID
+      placeholder: google/gemma-3-4b-it
+    validations:
+      required: true
+
+  - type: textarea
+    id: quirks
+    attributes:
+      label: Known quirks
+      description: Anything unusual — multimodal, MoE routing, FP8 weights, non-standard tokenizer specials
