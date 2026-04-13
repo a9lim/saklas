@@ -23,18 +23,18 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         help="HuggingFace model ID or local path (e.g. google/gemma-2-9b-it)",
     )
     p.add_argument(
-        "--quantize", "-q",
+        "-q", "--quantize",
         choices=["4bit", "8bit"],
         default=None,
         help="Quantization mode (default: bf16/fp16)",
     )
     p.add_argument(
-        "--device", "-d",
+        "-d", "--device",
         default="auto",
         help="Device: auto (detect), cuda, mps, or cpu (default: auto)",
     )
     p.add_argument(
-        "--probes", "-p",
+        "-p", "--probes",
         nargs="*",
         default=None,
         help="Probe categories: all, none, affect, epistemic, alignment, register, social_stance, cultural (default: all)",
@@ -73,23 +73,50 @@ def _print_model_info(session) -> None:
 # Parsers
 # ---------------------------------------------------------------------------
 
-def _build_tui_parser() -> argparse.ArgumentParser:
+_SUBCOMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
+    ("serve",     "Start the OpenAI/Ollama-compatible API server"),
+    ("install",   "Install a concept pack from HF or a local folder"),
+    ("refresh",   "Re-pull concept(s) from their source"),
+    ("clear",     "Delete per-model tensors for matched concepts"),
+    ("uninstall", "Fully remove a concept folder"),
+    ("list",      "List installed concepts (and HF concepts by default)"),
+    ("merge",     "Merge existing vectors into a new pack"),
+    ("push",      "Push a concept pack to HF as a model repo"),
+]
+
+
+def _tui_epilog() -> str:
+    width = max(len(name) for name, _ in _SUBCOMMAND_DESCRIPTIONS)
+    lines = ["subcommands:"]
+    for name, desc in _SUBCOMMAND_DESCRIPTIONS:
+        lines.append(f"  {name:<{width}}  {desc}")
+    lines.append("")
+    lines.append("Run `saklas <subcommand> -h` for subcommand options.")
+    lines.append("With no subcommand, launches the TUI for the given model.")
+    return "\n".join(lines)
+
+
+def _build_tui_parser(model_optional: bool = False) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="saklas",
         description="Activation steering + trait monitoring for local HuggingFace models",
+        epilog=_tui_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_common_args(p)
-    # `model` is required by _add_common_args but TUI allows it to be omitted
-    # when combined with -C. Relax here.
-    for action in p._actions:
-        if action.dest == "model":
-            action.nargs = "?"
-            action.default = None
-            break
+    if model_optional:
+        # Allow `saklas -c foo.yaml` to supply the model via YAML instead of
+        # a positional argument. Usage will show `[model]` in this case, but
+        # the normal help (the one users actually see) keeps it unbracketed.
+        for action in p._actions:
+            if action.dest == "model":
+                action.nargs = "?"
+                action.default = None
+                break
 
-    p.add_argument("--config", "-c", action="append", default=None, metavar="PATH",
+    p.add_argument("-c", "--config", action="append", default=None, metavar="PATH",
                    help="Load setup YAML (repeatable; later overrides earlier)")
-    p.add_argument("--strict", "-s", action="store_true",
+    p.add_argument("-s", "--strict", action="store_true",
                    help="With -c: fail hard on missing vectors")
     return p
 
@@ -97,18 +124,18 @@ def _build_tui_parser() -> argparse.ArgumentParser:
 def _build_serve_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas serve", description="Start OpenAI-compatible API server")
     _add_common_args(p)
-    p.add_argument("--host", "-H", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    p.add_argument("--port", "-P", type=int, default=8000, help="Bind port (default: 8000)")
+    p.add_argument("-H", "--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    p.add_argument("-P", "--port", type=int, default=8000, help="Bind port (default: 8000)")
     p.add_argument(
-        "--steer", "-S", action="append", default=[], metavar="NAME[:ALPHA]",
+        "-S", "--steer", action="append", default=[], metavar="NAME[:ALPHA]",
         help="Pre-load a steering vector (repeatable). e.g. --steer cheerful:0.2",
     )
     p.add_argument(
-        "--cors", "-C", action="append", default=[], metavar="ORIGIN",
+        "-C", "--cors", action="append", default=[], metavar="ORIGIN",
         help="CORS allowed origin (repeatable). Omit for no CORS.",
     )
     p.add_argument(
-        "--api-key", "-k", default=None, metavar="KEY",
+        "-k", "--api-key", default=None, metavar="KEY",
         help="Require Bearer token auth. Falls back to $SAKLAS_API_KEY. Unset = no auth.",
     )
     return p
@@ -117,11 +144,11 @@ def _build_serve_parser() -> argparse.ArgumentParser:
 def _build_install_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas install", description="Install a concept pack from HF or a local folder")
     p.add_argument("target", help="<ns>/<concept>[@revision] or path to a concept folder")
-    p.add_argument("--statements-only", "-s", action="store_true",
+    p.add_argument("-s", "--statements-only", action="store_true",
                    help="Keep statements.json only; drop any bundled tensors")
-    p.add_argument("--as", "-a", dest="as_target", default=None, metavar="NS/NAME",
+    p.add_argument("-a", "--as", dest="as_target", default=None, metavar="NS/NAME",
                    help="Relocate the installed pack under a different namespace/name")
-    p.add_argument("--force", "-f", action="store_true",
+    p.add_argument("-f", "--force", action="store_true",
                    help="Overwrite an existing installation")
     return p
 
@@ -130,7 +157,7 @@ def _build_refresh_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas refresh",
                                 description="Re-pull concept(s) from their source (or `neutrals` to refresh neutral_statements.json)")
     p.add_argument("selector", help="Selector (name, tag:x, namespace:x, default, all) or the literal 'neutrals'")
-    p.add_argument("--model", "-m", default=None, metavar="MODEL_ID",
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
                    help="Scope the refresh to one model's tensors (delete its safetensors + sidecar)")
     return p
 
@@ -139,9 +166,9 @@ def _build_clear_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas clear",
                                 description="Delete per-model tensors for matched concepts (keeps statements.json)")
     p.add_argument("selector", help="Selector (name, tag:x, namespace:x, default, all)")
-    p.add_argument("--model", "-m", default=None, metavar="MODEL_ID",
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
                    help="Scope to one model's tensors only (default: all models)")
-    p.add_argument("--yes", "-y", action="store_true",
+    p.add_argument("-y", "--yes", action="store_true",
                    help="Skip confirmation prompt on broad selectors")
     return p
 
@@ -150,7 +177,7 @@ def _build_uninstall_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas uninstall",
                                 description="Fully remove a concept folder (tensors + statements + pack.json)")
     p.add_argument("selector", help="Selector (name, tag:x, namespace:x, default, all)")
-    p.add_argument("--yes", "-y", action="store_true",
+    p.add_argument("-y", "--yes", action="store_true",
                    help="Required for broad selectors (all, namespace:)")
     return p
 
@@ -160,11 +187,11 @@ def _build_list_parser() -> argparse.ArgumentParser:
                                 description="List installed concepts (and HF concepts by default)")
     p.add_argument("selector", nargs="?", default=None,
                    help="Optional selector (name, tag:x, namespace:x, default, all)")
-    p.add_argument("--installed", "-i", action="store_true",
+    p.add_argument("-i", "--installed", action="store_true",
                    help="Show only locally installed concepts (skip HF query)")
-    p.add_argument("--json", "-j", dest="json_output", action="store_true",
+    p.add_argument("-j", "--json", dest="json_output", action="store_true",
                    help="Emit machine-readable JSON instead of a table")
-    p.add_argument("--verbose", "-v", action="store_true",
+    p.add_argument("-v", "--verbose", action="store_true",
                    help="Include descriptions in the table output")
     return p
 
@@ -173,21 +200,21 @@ def _build_push_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas push",
                                 description="Push a concept pack to Hugging Face as a model repo")
     p.add_argument("selector", help="Single concept selector (name or ns/name)")
-    p.add_argument("--as", "-a", dest="as_target", default=None, metavar="OWNER/NAME",
+    p.add_argument("-a", "--as", dest="as_target", default=None, metavar="OWNER/NAME",
                    help="Target HF coord (default: <whoami>/<pack_name>)")
-    p.add_argument("--private", "-p", action="store_true",
+    p.add_argument("-p", "--private", action="store_true",
                    help="Create the repo as private")
-    p.add_argument("--model", "-m", default=None, metavar="MODEL_ID",
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
                    help="Only push tensors for this base model")
-    p.add_argument("--statements-only", "-s", action="store_true",
+    p.add_argument("-s", "--statements-only", action="store_true",
                    help="Push statements.json only; skip all tensors")
-    p.add_argument("--no-statements", "-n", action="store_true",
+    p.add_argument("-n", "--no-statements", action="store_true",
                    help="Skip statements.json; push tensors only")
-    p.add_argument("--tag-version", "-t", action="store_true",
+    p.add_argument("-t", "--tag-version", action="store_true",
                    help="Create git tag v<pack.version> on the commit")
-    p.add_argument("--dry-run", "-d", action="store_true",
+    p.add_argument("-d", "--dry-run", action="store_true",
                    help="Stage the upload but don't contact HF")
-    p.add_argument("--force", "-f", action="store_true",
+    p.add_argument("-f", "--force", action="store_true",
                    help="Allow republishing a pack whose source is bundled/hf://")
     return p
 
@@ -197,11 +224,11 @@ def _build_merge_parser() -> argparse.ArgumentParser:
                                 description="Merge existing vectors into a new pack")
     p.add_argument("name", help="New pack name (written under local/)")
     p.add_argument("components", help="Comma-separated components: ns/a:0.3,ns/b:0.4")
-    p.add_argument("--force", "-f", action="store_true",
+    p.add_argument("-f", "--force", action="store_true",
                    help="Overwrite an existing merged pack")
-    p.add_argument("--strict", "-s", action="store_true",
+    p.add_argument("-s", "--strict", action="store_true",
                    help="Fail if any component is missing")
-    p.add_argument("--model", "-m", default=None, metavar="MODEL_ID",
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
                    help="Restrict the merge to tensors for one model")
     return p
 
@@ -210,9 +237,21 @@ def _build_merge_parser() -> argparse.ArgumentParser:
 # Dispatch
 # ---------------------------------------------------------------------------
 
+def _argv_has_config(argv: list[str]) -> bool:
+    for a in argv:
+        if a in ("-c", "--config") or a.startswith("--config="):
+            return True
+    return False
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if argv is None:
         argv = sys.argv[1:]
+
+    # Zero-arg: print friendly hint and exit cleanly.
+    if not argv:
+        _print_no_model_hint()
+        sys.exit(0)
 
     if argv and argv[0] in _SUBCOMMANDS:
         cmd = argv[0]
@@ -238,8 +277,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.command = cmd
         return args
 
-    # Bare form: TUI.
-    args = _build_tui_parser().parse_args(argv)
+    # Bare form: TUI. Allow missing model only when -c/--config is given,
+    # so the normal `saklas -h` usage line shows `model` unbracketed.
+    model_optional = _argv_has_config(argv)
+    args = _build_tui_parser(model_optional=model_optional).parse_args(argv)
     args.command = "tui"
 
     if args.config:
@@ -274,8 +315,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.thinking = None
 
     if args.model is None:
-        _build_tui_parser().error("the following arguments are required: model")
+        # Reached only via `saklas -c foo.yaml` whose YAML doesn't set a model.
+        _print_no_model_hint()
+        sys.exit(0)
     return args
+
+
+def _print_no_model_hint() -> None:
+    msg = (
+        "saklas needs a model to run.\n"
+        "\n"
+        "Pass a HuggingFace repo id or local path, e.g.\n"
+        "  saklas Qwen/Qwen3.5-2B\n"
+        "  saklas google/gemma-4-E2B-it\n"
+        "\n"
+        "Browse more models at https://huggingface.co/models?pipeline_tag=text-generation\n"
+        "Run `saklas --help` for all options, or `saklas list` to see installed concept packs."
+    )
+    print(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -360,9 +417,35 @@ def _run_serve(args: argparse.Namespace) -> None:
                      cors_origins=args.cors or None,
                      api_key=getattr(args, "api_key", None))
 
+    _warmup_session(session)
+
     print(f"\nServing on http://{args.host}:{args.port}")
-    print(f"API docs: http://{args.host}:{args.port}/docs")
+    print(f"OpenAI-compatible:  http://{args.host}:{args.port}/v1")
+    print(f"Ollama-compatible:  http://{args.host}:{args.port}/api")
+    print(f"API docs:           http://{args.host}:{args.port}/docs")
+    if args.port != 11434:
+        print("Tip: for drop-in Ollama compatibility, run with `--port 11434`.")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+def _warmup_session(session) -> None:
+    """Run a tiny stateless generation so the first real request is fast.
+
+    Warms up lazy kernel compilation, KV cache allocation, and any JIT paths
+    before uvicorn starts accepting traffic.
+    """
+    import time as _time
+    print("Warming up generation kernels...", flush=True)
+    orig_max = session.config.max_new_tokens
+    try:
+        session.config.max_new_tokens = 1
+        start = _time.monotonic()
+        session.generate("Hi", stateless=True)
+        print(f"  warmed in {_time.monotonic() - start:.1f}s")
+    except Exception as e:
+        print(f"  warm-up skipped: {e}")
+    finally:
+        session.config.max_new_tokens = orig_max
 
 
 def _run_install(args: argparse.Namespace) -> None:

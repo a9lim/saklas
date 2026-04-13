@@ -392,6 +392,13 @@ def create_app(session: SaklasSession, default_alphas: dict[str, float] | None =
         return _error(400, msg, "invalid_request_error", param=param)
 
     _register_routes(app)
+
+    # Mount Ollama-compatible /api/* routes alongside OpenAI routes so any
+    # Ollama client (Open WebUI, Enchanted, ollama-python, etc.) talks to
+    # saklas as a drop-in replacement.
+    from saklas.ollama_api import register_ollama_routes
+    register_ollama_routes(app)
+
     return app
 
 
