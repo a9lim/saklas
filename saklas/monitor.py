@@ -10,9 +10,9 @@ class TraitMonitor:
 
     Each probe has a profile (dict mapping layer_idx -> (vector, score)).
     After generation, a single forward pass over the generated text
-    produces attention-weighted hidden states per layer.  Mean-centered
-    cosine similarities against probe vectors, weighted by score, give
-    one value per probe per generation.
+    pools the last content token's hidden state at each layer.
+    Mean-centered cosine similarities against probe vectors, weighted by
+    score, give one value per probe per generation.
     """
 
     @staticmethod
@@ -86,9 +86,9 @@ class TraitMonitor:
     def measure(self, model, tokenizer, layers, text: str, device=None):
         """Run one forward pass over *text* and compute probe similarities.
 
-        Uses attention-weighted pooling (same as extraction) to produce
-        one hidden-state vector per layer, mean-centers, then computes
-        score-weighted cosine similarities against all probes.
+        Pools the last content token's hidden state per layer (same as
+        extraction), mean-centers, then computes score-weighted cosine
+        similarities against all probes.
         """
         from saklas.vectors import _encode_and_capture_all
 

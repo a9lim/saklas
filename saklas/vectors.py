@@ -62,30 +62,19 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     return unit
 
 
-def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False):
+def _capture_all_hidden_states(model, layers, input_ids):
     """Run a single-sequence forward pass capturing hidden states at ALL layers.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
-    When *output_attentions* is True, temporarily switches the model to
-    eager attention (SDPA cannot return attention weights), then restores
-    the original implementation after the forward pass.
 
     Returns:
-        dict with ``"hidden"`` mapping layer index to (1, seq, dim) tensors,
-        and optionally ``"attention"`` mapping layer index to
-        (1, heads, seq, seq) tensors.
+        dict mapping layer index to (1, seq, dim) tensors.
     """
     captured_hidden: dict[int, torch.Tensor] = {}
-    captured_attn: dict[int, torch.Tensor] = {}
 
     def _make_hook(idx):
         def _hook(module, input, output):
-            if isinstance(output, torch.Tensor):
-                h = output
-            else:
-                h = output[0]
-                if output_attentions and len(output) > 1:
-                    captured_attn[idx] = output[1]
+            h = output if isinstance(output, torch.Tensor) else output[0]
             # No .clone() — with use_cache=False and inference_mode() the
             # residual-stream tensors are fresh allocations at each layer
             # boundary (residual add produces a new tensor).  Detach severs
@@ -94,53 +83,33 @@ def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False
             captured_hidden[idx] = h.detach()
         return _hook
 
-    # SDPA doesn't support output_attentions; swap to eager for extraction.
-    prev_attn = None
-    if output_attentions and hasattr(model, "set_attn_implementation"):
-        prev_attn = getattr(model.config, "_attn_implementation_internal",
-                            getattr(model.config, "_attn_implementation", None))
-        if prev_attn and prev_attn != "eager":
-            model.set_attn_implementation("eager")
-        else:
-            prev_attn = None  # already eager, nothing to restore
-
-    n_layers = len(layers)
-    handles = []
-    for idx in range(n_layers):
-        handles.append(layers[idx].register_forward_hook(_make_hook(idx)))
+    handles = [layers[idx].register_forward_hook(_make_hook(idx)) for idx in range(len(layers))]
     try:
         with torch.inference_mode():
-            model(input_ids=input_ids, use_cache=False,
-                  output_attentions=output_attentions)
+            model(input_ids=input_ids, use_cache=False)
         # Single sync after the full forward pass — lazy backends (MPS)
-        # may not have materialised tensor data yet.  One flush here
-        # replaces the per-layer sync that used to stall the pipeline
-        # N_layers times per pass.
+        # may not have materialised tensor data yet.
         if input_ids.device.type == "mps":
             torch.mps.synchronize()
     finally:
         for h in handles:
             h.remove()
-        if prev_attn is not None:
-            model.set_attn_implementation(prev_attn)
 
-    result = {"hidden": captured_hidden}
-    if captured_attn:
-        result["attention"] = captured_attn
-    return result
+    return captured_hidden
 
 
 def _encode_and_capture_all(model, tokenizer, text, layers, device):
-    """Tokenize text, run forward pass, return attention-weighted hidden state per layer in fp32.
+    """Tokenize text, run forward pass, return last-content-token hidden state per layer in fp32.
 
     For instruction-tuned models (those with a chat template), wraps the text
     as an assistant response so the extraction happens in the model's actual
     generation regime.  Base models get the raw string.
 
-    Uses the last token's self-attention distribution (averaged across heads,
-    from the last layer) as pooling weights — the model's own saliency signal
-    for which positions matter.  Falls back to last-token pooling if attention
-    capture fails.
+    Pools from the last non-special token — chat templates append trailing
+    markers (Llama's <|eot_id|>, Gemma's <end_of_turn>, Qwen's <|im_end|>)
+    whose hidden states are disconnected from content.  The last content
+    token's hidden state is itself an attention-weighted summary of prior
+    positions and is exactly what the model uses for next-token prediction.
 
     Returns:
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
@@ -160,7 +129,7 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
             # Some chat templates require a user turn before assistant.
             # The filler must be semantically empty — "." triggers
             # model-specific greeting/help responses whose template
-            # tokens contaminate the attention-weighted pooling.
+            # tokens contaminate pooling.
             messages = [
                 {"role": "user", "content": "Continue:"},
                 {"role": "assistant", "content": text},
@@ -175,53 +144,31 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         overhead = _chat_template_overhead(tokenizer, kwargs)
         if overhead > _MAX_TEMPLATE_OVERHEAD:
             text = messages[-1]["content"]  # use raw text
-    enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=False)
+    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc["input_ids"]
-    mask = enc["attention_mask"]
-    if ids.numel() == 0 or (mask.sum() == 0):
+    if ids.numel() == 0:
         bos_id = tokenizer.bos_token_id
         if bos_id is None:
             bos_id = tokenizer.eos_token_id or 0
         ids = torch.tensor([[bos_id]])
-        mask = torch.ones_like(ids)
     ids = ids.to(device)
-    mask = mask.to(device)
 
-    try:
-        captured = _capture_all_hidden_states(model, layers, ids, output_attentions=True)
-    except RuntimeError:
-        # Attention capture can OOM on memory-constrained devices (MPS
-        # with large models / long sequences).  Fall back to last-token
-        # pooling which skips attention storage entirely.
-        if ids.device.type == "mps":
-            torch.mps.empty_cache()
-        captured = _capture_all_hidden_states(model, layers, ids, output_attentions=False)
-    hidden_per_layer = captured["hidden"]  # {idx: (1, seq, dim)}
+    # Find the last non-special-token position.  Chat templates append
+    # trailing markers like Llama's <|eot_id|>, Gemma's <end_of_turn>,
+    # Qwen's <|im_end|> — pooling from those positions yields degenerate
+    # signals disconnected from the content.
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    content_end = ids.shape[1] - 1
+    if special_ids:
+        id_list = ids[0].tolist()
+        while content_end > 0 and id_list[content_end] in special_ids:
+            content_end -= 1
 
-    attn_per_layer = captured.get("attention")  # {idx: (1, heads, seq, seq)}
-    if attn_per_layer:
-        result = {}
-        for idx, h in hidden_per_layer.items():
-            h_f32 = h.float()  # (1, seq, dim)
-            attn = attn_per_layer.get(idx)
-            if attn is not None:
-                # Use this layer's own attention: last token's view, averaged across heads
-                weights = attn[0, :, -1, :].mean(dim=0)  # (seq,)
-                # Build mask from hidden-state length — VLM wrappers may
-                # reshape the sequence before the language-model layers,
-                # so the tokenizer mask length can differ.
-                seq = h_f32.shape[1]
-                mask_f = mask[0, :seq].float() if mask.shape[1] >= seq else torch.ones(seq, device=h.device)
-                weights = weights * mask_f
-                weights = weights / weights.sum().clamp(min=1e-8)
-                result[idx] = (h_f32[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
-            else:
-                # Layer didn't produce attention weights — last-token fallback
-                result[idx] = h_f32[0, -1]
-        return result
-
-    # Fallback: last-token pooling
-    return {idx: h.float()[0, -1] for idx, h in hidden_per_layer.items()}
+    hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
+    return {
+        idx: h.float()[0, min(content_end, h.shape[1] - 1)]
+        for idx, h in hidden_per_layer.items()
+    }
 
 
 import functools as _functools

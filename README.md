@@ -399,7 +399,7 @@ Llama (1-4), Mistral (1, 4), Ministral (1, 3), Mixtral, Gemma (1-4), Phi (1-3), 
 
 ### Steering vectors
 
-**Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures attention-weighted hidden states at every layer. Computes pos-neg differences, extracts the first principal component per layer via batched SVD. Each layer is scored by explained variance ratio. The result is a multi-layer profile — no manual layer selection. Scores weight each layer's contribution during generation.
+**Representation Engineering** (Zou et al., 2023): For each contrastive pair, captures the last-content-token hidden state at every layer (skipping trailing chat-template markers). Computes pos-neg differences, extracts the first principal component per layer via batched SVD. Each layer is scored by explained variance ratio. The result is a multi-layer profile — no manual layer selection. Scores weight each layer's contribution during generation.
 
 ### Custom steering vectors
 
@@ -415,7 +415,7 @@ To clear cached tensors for a concept (e.g. to re-extract with a different state
 
 ### Monitor
 
-After generation, a separate forward pass over the generated text produces attention-weighted hidden states at every layer — the same pooling used during probe extraction. This ensures probe scores are computed against the same kind of representation the probes were trained on.
+After generation, a separate forward pass over the generated text captures hidden states at every layer, pooled from the last content token — the same pooling used during probe extraction. This ensures probe scores are computed against the same kind of representation the probes were trained on.
 
 Each layer's hidden state is mean-centered — subtracting the per-layer mean computed from 45 neutral prompts — to remove baseline projection bias that otherwise makes raw cosine similarities uninformative. Score-weighted cosine similarities against probe vectors produce one value per probe per generation. Probe history accumulates across generations, enabling sparklines and running statistics.
 
