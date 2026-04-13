@@ -39,13 +39,13 @@ def main() -> int:
     session = SaklasSession(MODEL_ID, device="auto")
     print(f"Loaded on {session._device}\n", flush=True)
 
-    print(f"Extracting n=60...", flush=True)
+    print("Extracting n=60...", flush=True)
     prof60 = extract_contrastive(
         session._model, session._tokenizer, pairs_60, layers=session._layers,
     )
     profile_stats("n=60", prof60)
 
-    print(f"\nExtracting n=45...", flush=True)
+    print("\nExtracting n=45...", flush=True)
     prof32 = extract_contrastive(
         session._model, session._tokenizer, pairs_32, layers=session._layers,
     )
