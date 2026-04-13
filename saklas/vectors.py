@@ -230,68 +230,37 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
     return {idx: h.float()[0, -1] for idx, h in hidden_per_layer.items()}
 
 
-_NEUTRAL_PROMPTS = [
-    # Simple facts
-    "Water freezes at zero degrees Celsius.",
-    "There are seven days in a week.",
-    "The chemical symbol for gold is Au.",
-    # Spatial / physical descriptions
-    "The book is on the table next to the lamp.",
-    "A narrow path winds between the two hills.",
-    "The parking lot wraps around the back of the building.",
-    # Everyday actions (varied subjects)
-    "She walked to the store and bought some groceries.",
-    "The technician replaced the filter and restarted the system.",
-    "He sorted the mail into three piles before lunch.",
-    # Temporal / scheduling
-    "The library closes at nine on weekdays.",
-    "Flights to Denver depart twice daily, morning and evening.",
-    "The semester runs from September through mid-December.",
-    # Process / how-things-work
-    "Bread dough rises when yeast converts sugar into carbon dioxide.",
-    "A compiler translates source code into machine instructions.",
-    "Seeds germinate when moisture and temperature reach the right levels.",
-    # Quantitative / measurement
-    "The bridge spans roughly four hundred meters across the river.",
-    "An adult human skeleton contains two hundred and six bones.",
-    "Light travels about three hundred thousand kilometers per second.",
-    # Conditional / if-then
-    "If the temperature drops below freezing, the pipes may need insulation.",
-    "Connecting the cables in the wrong order can trip the breaker.",
-    "The sensor activates when motion is detected within five meters.",
-    # Multi-clause / compound
-    "The train was delayed by twenty minutes, so most passengers waited on the platform.",
-    "After the rain stopped, the crew resumed paving the road.",
-    "She finished the report, emailed it to the team, and left for the day.",
-    # Questions
-    "What time does the next bus arrive at the central station?",
-    "How many liters of paint are needed to cover the back wall?",
-    "Which floor is the records office on?",
-    # Instructions / imperatives
-    "Preheat the oven to one hundred and eighty degrees before adding the dish.",
-    "Turn left at the second intersection, then continue straight for two blocks.",
-    "Press and hold the reset button for five seconds until the light turns green.",
-    # Abstract / categorical
-    "Mammals are warm-blooded vertebrates that nurse their young.",
-    "Most programming languages distinguish between integers and floating-point numbers.",
-    "Supply and demand determine the market price of a commodity.",
-    # Sensory / environmental
-    "The hum of the air conditioner was the only sound in the room.",
-    "Dry leaves scraped across the pavement in the wind.",
-    "The smell of fresh paint lingered in the hallway all morning.",
-    # Historical / past-tense narrative
-    "The canal was completed in 1914 after a decade of construction.",
-    "Early telephone networks connected operators manually with patch cords.",
-    "The expedition reached the summit on the third attempt.",
-    # Comparative / relational
-    "Aluminum is lighter than steel but less rigid under the same load.",
-    "The express route is shorter, though the local road has less traffic.",
-    "Handwritten notes tend to aid recall more than typed ones.",
-    # Hypothetical / generic conditional
-    "A fully charged battery should last roughly eight hours under normal use.",
-    "Most packages arrive within three to five business days.",
-    "The average commute in the metro area takes about forty minutes.",
-]
+import functools as _functools
+from importlib import resources as _resources
+
+
+@_functools.cache
+def _load_neutral_prompts() -> list[str]:
+    """Load neutral prompts, preferring a user override at ~/.saklas/neutral_statements.json."""
+    from saklas.paths import neutral_statements_path
+    user_path = neutral_statements_path()
+    if user_path.exists():
+        with open(user_path) as f:
+            return json.load(f)
+    with _resources.files("saklas.data").joinpath("neutral_statements.json").open() as f:
+        return json.load(f)
+
+
+class _NeutralPromptsProxy:
+    """Sequence-like proxy so existing call sites (``for p in _NEUTRAL_PROMPTS``,
+    ``len(_NEUTRAL_PROMPTS)``) keep working while the source moves to a JSON file."""
+
+    def __iter__(self):
+        return iter(_load_neutral_prompts())
+
+    def __len__(self):
+        return len(_load_neutral_prompts())
+
+    def __getitem__(self, i):
+        return _load_neutral_prompts()[i]
+
+
+_NEUTRAL_PROMPTS = _NeutralPromptsProxy()
 
 
 def compute_layer_means(
