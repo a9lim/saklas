@@ -307,26 +307,35 @@ class TestBuildChatInput:
 
 
 class TestProbesBootstrap:
-    def test_bootstrap_loads_from_cache(self, model_and_tokenizer, layers, happy_profile):
+    def test_bootstrap_loads_from_cache(self, monkeypatch, model_and_tokenizer, layers, happy_profile):
         """Bootstrap should return cached profiles without re-extracting."""
         from saklas.probes_bootstrap import bootstrap_probes
-        from saklas.vectors import save_profile, get_cache_path
+        from saklas.vectors import save_profile
+        from saklas.paths import concept_dir, safe_model_id
+        from saklas.packs import materialize_bundled, PackMetadata, hash_file
         from saklas.model import get_model_info
         model, tokenizer = model_and_tokenizer
         model_info = get_model_info(model, tokenizer)
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Pre-populate cache with a profile
-            cp = get_cache_path(tmp, model_info["model_id"], "happy")
-            save_profile(happy_profile, cp, {
-                "concept": "happy",
-                "model_id": model_info["model_id"],
-                "num_pairs": 10,
+            monkeypatch.setenv("SAKLAS_HOME", tmp)
+            materialize_bundled()
+            # Pre-populate the `happy` concept tensor for this model
+            folder = concept_dir("default", "happy")
+            ts_path = folder / f"{safe_model_id(model_info['model_id'])}.safetensors"
+            save_profile(happy_profile, str(ts_path), {
+                "method": "contrastive_pca",
+                "statements_sha256": hash_file(folder / "statements.json"),
             })
-            # Bootstrap with a category containing "happy"
+            # Refresh the pack.json files map to include the new tensor
+            meta = PackMetadata.load(folder)
+            meta.files[ts_path.name] = hash_file(ts_path)
+            meta.files[ts_path.with_suffix(".json").name] = hash_file(ts_path.with_suffix(".json"))
+            meta.write(folder)
+
             probes = bootstrap_probes(
                 model, tokenizer, layers, model_info,
-                categories=["emotion"], cache_dir=tmp,
+                categories=["emotion"],
             )
-            # If "happy" is in the emotion category in defaults.json, it should be loaded
             assert isinstance(probes, dict)
+            assert "happy" in probes

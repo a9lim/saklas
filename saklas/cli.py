@@ -43,11 +43,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         default=1024,
         help="Max tokens per generation (default: 1024)",
     )
-    p.add_argument(
-        "--cache-dir", "-c",
-        default=None,
-        help="Cache directory for extracted vectors (default: probes/cache/ in package)",
-    )
+
 
 
 def _resolve_probes(raw: list[str] | None) -> list[str]:
@@ -130,6 +126,10 @@ def _build_tui_parser() -> argparse.ArgumentParser:
     p.add_argument("--merge", "-m", nargs=2, default=None,
                    metavar=("NAME", "COMPONENTS"),
                    help="Merge vectors: -m <name> ns/a:0.3,ns/b:0.4")
+    p.add_argument("--as", dest="as_target", default=None, metavar="NS/NAME",
+                   help="With -i or -m: relocate the installed/merged pack to a different path")
+    p.add_argument("--force", action="store_true",
+                   help="With -i, -m, or -r: overwrite an existing target")
 
     # List/info (exit-only). nargs=? so `-l` alone is distinguishable from `-l foo`
     # and a trailing positional is treated as the model.
@@ -307,9 +307,12 @@ def _run_cache(args: argparse.Namespace) -> None:
     from saklas import cache_ops, merge
     from saklas.cli_selectors import parse_args as sel_parse_args
 
+    as_target = getattr(args, "as_target", None)
+    force = getattr(args, "force", False)
+
     if args.refresh:
-        concept_sel, _model_scope = sel_parse_args(args.refresh)
-        n = cache_ops.refresh(concept_sel)
+        concept_sel, model_scope = sel_parse_args(args.refresh)
+        n = cache_ops.refresh(concept_sel, model_scope=model_scope)
         print(f"Refreshed {n} concept(s)")
 
     if args.delete:
@@ -319,13 +322,13 @@ def _run_cache(args: argparse.Namespace) -> None:
 
     if args.install:
         for target in args.install:
-            cache_ops.install(target, as_=None, force=False)
+            cache_ops.install(target, as_=as_target, force=force)
             print(f"Installed {target}")
 
     if args.merge_name is not None:
         components = merge.parse_components(args.merge_components)
         dst = merge.merge_into_pack(
-            args.merge_name, components, model=None, force=False,
+            args.merge_name, components, model=None, force=force,
         )
         print(f"Merged pack written to {dst}")
 
