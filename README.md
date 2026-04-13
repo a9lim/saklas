@@ -177,6 +177,7 @@ System prompt, temperature, top-p, and max tokens are set interactively via slas
 | `Ctrl+A` | A/B compare (steered vs unsteered) |
 | `Ctrl+R` | Regenerate last response |
 | `Ctrl+S` | Cycle trait sort mode |
+| `Ctrl+H` | Toggle per-token probe highlighting (colors assistant output by the selected trait's activation) |
 | `[` / `]` | Adjust temperature |
 | `{` / `}` | Adjust top-p |
 | `Escape` | Stop generation |

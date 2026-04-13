@@ -33,7 +33,7 @@ class TraitPanel(Widget):
             id="trait-header", classes="section-header",
         )
         yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
-        yield Static("[dim]⌫ remove · ⌃S sort[/]",
+        yield Static("[dim]⌫ remove · ⌃S sort · ⌃H highlight[/]",
                       id="trait-hints")
 
     def on_mount(self) -> None:
