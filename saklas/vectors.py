@@ -407,11 +407,18 @@ def save_profile(
     path: str,
     metadata: dict,
 ) -> None:
-    """Save a vector profile as .safetensors with .json metadata sidecar.
+    """Save a vector profile as .safetensors with a slim .json sidecar.
+
+    ``metadata`` must contain at minimum:
+        method            - str, e.g. "contrastive_pca" / "single_pair" / "merge" / "layer_means"
+
+    Optional keys honored:
+        statements_sha256 - str, hash of source statements at extraction time
+        components        - dict, merge provenance (method="merge" only)
 
     The safetensors file contains keys ``"layer_{i}"`` for each active layer.
-    The JSON sidecar contains ``metadata`` plus ``"scores"`` mapping layer
-    indices to their signal strength scores.
+    The sidecar carries only method/scores/saklas_version plus the optional
+    fields above — nothing else.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -419,21 +426,32 @@ def save_profile(
     tensors, scores = {}, {}
     for idx, (vec, score) in profile.items():
         tensors[f"layer_{idx}"] = vec.contiguous().cpu()
-        scores[str(idx)] = score
+        scores[str(idx)] = float(score)
     save_file(tensors, str(path))
-    meta = {**metadata, "scores": scores}
+
+    from saklas import __version__ as _saklas_version
+    sidecar: dict = {
+        "method": metadata.get("method", "contrastive_pca"),
+        "scores": scores,
+        "saklas_version": _saklas_version,
+    }
+    if "statements_sha256" in metadata:
+        sidecar["statements_sha256"] = metadata["statements_sha256"]
+    if "components" in metadata:
+        sidecar["components"] = metadata["components"]
+
     meta_path = path.with_suffix(".json")
     with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(sidecar, f, indent=2)
 
     log.info("Saved profile (%d layers) to %s", len(profile), path)
 
 
 def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict]:
-    """Load a vector profile and its metadata.
+    """Load a vector profile and its slim sidecar.
 
     Returns:
-        (profile dict mapping layer_idx -> (vector, score), metadata dict)
+        (profile dict mapping layer_idx -> (vector, score), sidecar dict)
     """
     path = Path(path)
     tensors = load_file(str(path))
@@ -445,7 +463,6 @@ def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict
     scores = metadata.get("scores", {})
     profile = {}
     for key, tensor in tensors.items():
-        # Keys are "layer_{i}"
         idx = int(key.split("_", 1)[1])
         score = float(scores.get(str(idx), 1.0))
         profile[idx] = (tensor, score)
