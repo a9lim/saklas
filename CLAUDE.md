@@ -18,6 +18,7 @@ saklas clear <selector> [-m MODEL]      # delete per-model tensors (keeps statem
 saklas uninstall <selector> [-y]        # fully remove concept folder (bundled respawns on next run)
 saklas list [selector] [-i|-j|-v]       # lists installed + HF; -i = installed only
 saklas merge <name> <components> [-m]   # merge: saklas merge bard default/happy:0.3,...
+saklas push <selector> [-a OWNER/NAME] [-p] [-m MODEL] [-s|-n] [-t] [-d] [-f]  # publish pack to HF as a model repo
 pytest tests/                           # all tests (CPU tests run anywhere)
 pytest tests/test_smoke.py              # GPU smoke (downloads gemma-3-4b-it, ~8GB)
 ```
@@ -54,6 +55,8 @@ All state under `~/.saklas/` (override via `SAKLAS_HOME`):
 ```
 
 Integrity: `pack.json.files` is a sha256 map verified on every `ConceptFolder.load`. Tensor sidecars record `statements_sha256` at extraction; mismatch flags `is_stale` and the CLI warns.
+
+`saklas push <selector>` uploads a single concept folder to HF as a model repo. Target coord defaults to `<whoami>/<pack_name>`; `--as/-a owner/name` overrides. `--private/-p`, `--model/-m` scope tensors to one base model, `--statements-only/-s` uploads only `statements.json`, `--no-statements/-n` uploads tensors without pairs (so `saklas push -nm google/gemma-2-2b-it happy` publishes just that model's tensor). `--tag-version/-t` creates `v<pack.version>` on the commit so downstream `saklas install owner/name@v1.2.3` pins reproducibly. `--dry-run/-d` stages the upload (README, `.gitattributes`, filtered `pack.json`) without contacting HF. Packs whose `source` is `bundled` or `hf://...` can't be pushed in place without `-f` or an explicit `-a` (prevents accidentally republishing someone else's pack under your own name). The model card auto-fills YAML frontmatter with `library_name: saklas`, the merged tag set (`saklas-pack`, `activation-steering`, `steering-vector`, plus `pack.tags`), a `base_model:` list derived from sidecar filenames, and `base_model_relation: adapter` to earn reverse-links on each base model's hub page. `.gitattributes` pins `*.safetensors` to LFS.
 
 HF distribution: packs live as **model repos** (not datasets) because safetensors is model-hub-native and `base_model` frontmatter creates reverse-link discoverability from the base model's hub page. `saklas/hf.py` uses `repo_type="model"` exclusively — no dataset fallback. `saklas -i owner/name@revision` pins to any git ref (tag, branch, or commit SHA); `hf.split_revision` parses `@`, threads `revision` through `_download`/`pull_pack`/`fetch_info`, and records it in `source = "hf://owner/name@v1.2.0"`. `cache_ops._refresh` re-splits the stored source so pinned installs re-pull the same revision — pinning is pinning, not "follow latest." `@` is unambiguous because `NAME_REGEX` forbids it in concept names.
 

@@ -9,7 +9,7 @@ import sys
 os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:multiprocessing.resource_tracker")
 
 
-_SUBCOMMANDS = {"serve", "install", "refresh", "clear", "uninstall", "list", "merge"}
+_SUBCOMMANDS = {"serve", "install", "refresh", "clear", "uninstall", "list", "merge", "push"}
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +169,29 @@ def _build_list_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_push_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="saklas push",
+                                description="Push a concept pack to Hugging Face as a model repo")
+    p.add_argument("selector", help="Single concept selector (name or ns/name)")
+    p.add_argument("--as", "-a", dest="as_target", default=None, metavar="OWNER/NAME",
+                   help="Target HF coord (default: <whoami>/<pack_name>)")
+    p.add_argument("--private", "-p", action="store_true",
+                   help="Create the repo as private")
+    p.add_argument("--model", "-m", default=None, metavar="MODEL_ID",
+                   help="Only push tensors for this base model")
+    p.add_argument("--statements-only", "-s", action="store_true",
+                   help="Push statements.json only; skip all tensors")
+    p.add_argument("--no-statements", "-n", action="store_true",
+                   help="Skip statements.json; push tensors only")
+    p.add_argument("--tag-version", "-t", action="store_true",
+                   help="Create git tag v<pack.version> on the commit")
+    p.add_argument("--dry-run", "-d", action="store_true",
+                   help="Stage the upload but don't contact HF")
+    p.add_argument("--force", "-f", action="store_true",
+                   help="Allow republishing a pack whose source is bundled/hf://")
+    return p
+
+
 def _build_merge_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas merge",
                                 description="Merge existing vectors into a new pack")
@@ -208,6 +231,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args = _build_list_parser().parse_args(rest)
         elif cmd == "merge":
             args = _build_merge_parser().parse_args(rest)
+        elif cmd == "push":
+            args = _build_push_parser().parse_args(rest)
         else:  # pragma: no cover
             raise RuntimeError(f"unhandled subcommand {cmd}")
         args.command = cmd
@@ -420,6 +445,35 @@ def _run_merge(args: argparse.Namespace) -> None:
     print(f"Merged pack written to {dst}")
 
 
+def _run_push(args: argparse.Namespace) -> None:
+    from saklas import cache_ops
+    from saklas.cli_selectors import parse as sel_parse
+
+    selector = sel_parse(args.selector)
+    try:
+        coord, url, sha = cache_ops.push(
+            selector,
+            as_=args.as_target,
+            private=args.private,
+            model_scope=args.model,
+            statements_only=args.statements_only,
+            no_statements=args.no_statements,
+            tag_version=args.tag_version,
+            dry_run=args.dry_run,
+            force=args.force,
+        )
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    if sha:
+        print(f"Pushed {coord} -> {url} @ {sha[:12]}")
+    elif args.dry_run:
+        print(f"Dry-run: would push {coord} -> {url}")
+    else:
+        print(f"Pushed {coord} -> {url}")
+
+
 _RUNNERS = {
     "tui": _run_tui,
     "serve": _run_serve,
@@ -429,6 +483,7 @@ _RUNNERS = {
     "uninstall": _run_uninstall,
     "list": _run_list,
     "merge": _run_merge,
+    "push": _run_push,
 }
 
 

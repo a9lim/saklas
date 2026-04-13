@@ -257,6 +257,64 @@ def uninstall(selector: Selector, *, yes: bool = False) -> int:
     return count
 
 
+def push(
+    selector: Selector,
+    *,
+    as_: Optional[str] = None,
+    private: bool = False,
+    model_scope: Optional[str] = None,
+    statements_only: bool = False,
+    no_statements: bool = False,
+    tag_version: bool = False,
+    dry_run: bool = False,
+    force: bool = False,
+) -> tuple[str, str, Optional[str]]:
+    """Back `saklas push`. Returns ``(coord, repo_url, commit_sha)``."""
+    from saklas import hf as hf_mod
+
+    if statements_only and no_statements:
+        raise RuntimeError("--statements-only and --no-statements are mutually exclusive")
+    if statements_only and model_scope is not None:
+        raise RuntimeError("--statements-only and --model are mutually exclusive")
+
+    matches = resolve(selector)
+    if not matches:
+        raise RuntimeError(f"no concept matched selector {selector.value!r}")
+    if len(matches) > 1:
+        qualified = ", ".join(f"{c.namespace}/{c.name}" for c in matches)
+        raise RuntimeError(
+            f"push requires a single concept; selector matched: {qualified}"
+        )
+    c = matches[0]
+
+    src = c.metadata.source or ""
+    if not force and as_ is None and (src.startswith("bundled") or src.startswith("hf://")):
+        raise RuntimeError(
+            f"refusing to push pack with source={src!r}; "
+            f"pass --as owner/name to retarget, or --force to republish in place"
+        )
+
+    # Rehash disk state so the pushed manifest matches the bytes we upload.
+    _update_files_map(c.folder)
+
+    coord = hf_mod.resolve_target_coord(c.metadata.name, as_)
+
+    include_statements = not no_statements
+    include_tensors = not statements_only
+
+    repo_url, sha = hf_mod.push_pack(
+        c.folder,
+        coord,
+        private=private,
+        include_statements=include_statements,
+        include_tensors=include_tensors,
+        model_scope=None if statements_only else model_scope,
+        tag_version=tag_version,
+        dry_run=dry_run,
+    )
+    return coord, repo_url, sha
+
+
 def _all_local() -> list[ResolvedConcept]:
     return resolve(Selector(kind="all", value=None))
 
