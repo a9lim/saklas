@@ -1,7 +1,7 @@
 """Smoke tests for saklas.
 
-Requires a GPU (CUDA or Apple Silicon MPS) and downloads google/gemma-2-2b-it
-(~5GB) on first run. Run with: pytest tests/test_smoke.py -v
+Requires a GPU (CUDA or Apple Silicon MPS) and downloads google/gemma-3-4b-it
+(~8GB) on first run. Run with: pytest tests/test_smoke.py -v
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
     reason="No GPU backend available (neither CUDA nor MPS)",
 )
 
-MODEL_ID = "google/gemma-2-2b-it"
+MODEL_ID = "google/gemma-3-4b-it"
 # MPS runs ~3-5x slower than CUDA for this model; relax absolute timing budgets.
 _IS_MPS = not torch.cuda.is_available() and torch.backends.mps.is_available()
 _EXTRACTION_BUDGET_S = 60.0 if _IS_MPS else 10.0

@@ -18,7 +18,7 @@ saklas -x <selector>            # delete tensors for matched concepts (keeps sta
 saklas -r <selector>            # re-pull concepts from source (bundled or HF)
 saklas -i <ns>/<concept>        # install a pack from HF or a local folder path
 saklas -l [selector]            # list or info-dump packs (installed + HF); exits
-pytest tests/test_smoke.py -v    # CUDA smoke tests (downloads gemma-2-2b-it ~5GB)
+pytest tests/test_smoke.py -v    # GPU smoke tests (downloads gemma-3-4b-it ~8GB; CUDA or MPS)
 pytest tests/ -v                 # all tests (non-CUDA tests run anywhere)
 ```
 
@@ -125,4 +125,4 @@ These matter for the throughput regression test (steered >= 85% of vanilla tok/s
 
 ## Testing
 
-Smoke tests require CUDA and download `google/gemma-2-2b-it` on first run. Non-CUDA tests (`test_results.py`, `test_datasource.py`, `test_server.py`) run anywhere. Session tests (`test_session.py`) require CUDA. Coverage: profile extraction, steering effect, hook cleanup, save/load roundtrip, monitor history, throughput regression, `build_chat_input`, `bootstrap_probes`, DataSource parsing, ResultCollector export, monitor scoring (`measure_from_hidden`, history accumulation, sparkline growth), SaklasSession lifecycle/generation/streaming, API server endpoints/streaming/CLI parsing.
+Smoke and session tests require a GPU backend (CUDA or Apple Silicon MPS) and download `google/gemma-3-4b-it` on first run. `device="auto"` picks cuda > mps > cpu via `detect_device`. MPS runs roughly 3–5× slower than CUDA for this model, so `test_extraction_fast_enough` uses a backend-specific timing budget (10s CUDA, 60s MPS). Non-GPU tests (`test_paths.py`, `test_packs.py`, `test_selectors.py`, `test_cache_ops.py`, `test_hf.py`, `test_merge.py`, `test_config_file.py`, `test_cli_flags.py`, `test_probes_bootstrap.py`, `test_results.py`, `test_datasource.py`, `test_server.py`) run anywhere. Coverage: pack format, slim sidecars, integrity/staleness, selector grammar, cache ops, HF wrappers (mocked), merge composition, config loading, CLI flag parsing, profile extraction, steering effect, hook cleanup, save/load roundtrip, monitor history, throughput regression, `build_chat_input`, `bootstrap_probes`, DataSource parsing, ResultCollector export, monitor scoring (`measure_from_hidden`, history accumulation, sparkline growth), SaklasSession lifecycle/generation/streaming, API server endpoints/streaming/CLI parsing.

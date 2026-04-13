@@ -1,6 +1,6 @@
 """Tests for SaklasSession programmatic API.
 Requires a GPU (CUDA or Apple Silicon MPS) and downloads
-google/gemma-2-2b-it (~5GB) on first run.
+google/gemma-3-4b-it (~8GB) on first run.
 """
 from __future__ import annotations
 import pytest
@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(
     reason="No GPU backend available (neither CUDA nor MPS)",
 )
 
-MODEL_ID = "google/gemma-2-2b-it"
+MODEL_ID = "google/gemma-3-4b-it"
 
 @pytest.fixture(scope="module")
 def session():
@@ -26,7 +26,9 @@ def session():
 class TestConstruction:
     def test_model_info(self, session):
         info = session.model_info
-        assert info["model_type"] == "gemma2"
+        # gemma-3-4b-it loads as the text-only submodule of a multimodal checkpoint,
+        # so model_type is "gemma3_text" (see model.py:_load_text_from_multimodal).
+        assert info["model_type"].startswith("gemma3")
         assert info["hidden_dim"] > 0
         assert info["num_layers"] > 0
 
@@ -84,7 +86,7 @@ class TestLifecycle:
     def test_context_manager(self):
         from saklas.session import SaklasSession
         with SaklasSession(MODEL_ID, device="auto", probes=[]) as s:
-            assert s.model_info["model_type"] == "gemma2"
+            assert s.model_info["model_type"].startswith("gemma3")
 
 class TestGeneration:
     def test_generate_unsteered(self, session):

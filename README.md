@@ -13,7 +13,7 @@ Three interfaces: a **Python API** for scripted experiments and batch sweeps, an
 ```python
 from saklas import SaklasSession, DataSource, ResultCollector
 
-with SaklasSession("google/gemma-2-2b-it", device="cuda") as session:
+with SaklasSession("google/gemma-3-4b-it", device="auto") as session:
     # Extract a steering vector
     happy_profile = session.extract("happy")       # uses curated dataset
     session.steer("happy", happy_profile)           # register (no alpha yet)
@@ -429,4 +429,4 @@ pytest tests/test_results.py tests/test_datasource.py tests/test_server.py -v  #
 pytest tests/test_smoke.py -v      # CUDA required
 ```
 
-CUDA tests download `google/gemma-2-2b-it` (~5 GB) on first run. Non-CUDA tests (`test_results.py`, `test_datasource.py`, `test_server.py`) run anywhere.
+GPU tests (`test_smoke.py`, `test_session.py`) download `google/gemma-3-4b-it` (~8 GB) on first run and accept either CUDA or Apple Silicon MPS. Non-GPU tests run anywhere.
