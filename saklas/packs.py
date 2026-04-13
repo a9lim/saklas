@@ -12,7 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import sys
 from dataclasses import dataclass, field
+from importlib import resources as _resources
 from pathlib import Path
 from typing import Optional
 
@@ -229,3 +232,66 @@ def version_mismatch(sidecar: Sidecar, current: str) -> bool:
         return _parse(sidecar.saklas_version)[:2] != _parse(current)[:2]
     except (ValueError, IndexError):
         return True
+
+
+def bundled_concept_names() -> list[str]:
+    """List every concept shipped under saklas/data/vectors/."""
+    try:
+        root = _resources.files("saklas.data.vectors")
+    except (ModuleNotFoundError, FileNotFoundError):
+        return []
+    return sorted(
+        p.name for p in root.iterdir()
+        if p.is_dir() and (p / "pack.json").is_file()
+    )
+
+
+def materialize_bundled() -> None:
+    """Copy bundled package data into ~/.saklas/, leaving user files untouched.
+
+    - neutral_statements.json -> ~/.saklas/neutral_statements.json
+    - saklas/data/vectors/<concept>/ -> ~/.saklas/vectors/default/<concept>/
+    """
+    from saklas.paths import saklas_home, vectors_dir, neutral_statements_path
+
+    home = saklas_home()
+    home.mkdir(parents=True, exist_ok=True)
+
+    user_ns = neutral_statements_path()
+    if not user_ns.exists():
+        src = _resources.files("saklas.data").joinpath("neutral_statements.json")
+        with src.open("rb") as s, open(user_ns, "wb") as d:
+            d.write(s.read())
+
+    default_dir = vectors_dir() / "default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    for concept in bundled_concept_names():
+        target = default_dir / concept
+        if target.exists():
+            continue
+        target.mkdir(parents=True, exist_ok=True)
+        pkg_root = _resources.files("saklas.data.vectors").joinpath(concept)
+        for entry in pkg_root.iterdir():
+            if entry.is_file():
+                with entry.open("rb") as s, open(target / entry.name, "wb") as d:
+                    d.write(s.read())
+
+
+_LEGACY_PATHS = [
+    Path(__file__).parent / "probes" / "cache",
+    Path(__file__).parent / "datasets" / "cache",
+    Path.home() / ".liahona",
+]
+
+
+def print_migration_notice_if_needed() -> None:
+    """Print a one-line deprecation notice if any legacy cache path is on disk."""
+    for p in _LEGACY_PATHS:
+        if p.exists():
+            print(
+                f"Old cache detected at {p}. "
+                f"saklas has moved to ~/.saklas/. "
+                f"Delete the old cache when convenient — tensors will re-extract on first use.",
+                file=sys.stderr,
+            )
+            return

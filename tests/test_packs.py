@@ -240,3 +240,55 @@ def test_version_mismatch_detection():
     assert packs.version_mismatch(sc2, current="2.0.0") is False
     sc3 = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="2.1.0")
     assert packs.version_mismatch(sc3, current="2.0.0") is True
+
+
+def test_bundled_concept_names_includes_happy():
+    names = packs.bundled_concept_names()
+    assert "happy" in names
+    assert "calm" in names
+    assert len(names) == 28
+
+
+def test_materialize_empty_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    packs.materialize_bundled()
+    assert (tmp_path / "neutral_statements.json").is_file()
+    assert (tmp_path / "vectors" / "default" / "happy" / "pack.json").is_file()
+    assert (tmp_path / "vectors" / "default" / "happy" / "statements.json").is_file()
+
+
+def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    target = tmp_path / "vectors" / "default" / "happy" / "pack.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"user": "edited"}')
+    packs.materialize_bundled()
+    assert target.read_text() == '{"user": "edited"}'
+
+
+def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    (tmp_path / "vectors" / "default" / "happy").mkdir(parents=True)
+    (tmp_path / "vectors" / "default" / "happy" / "pack.json").write_text("{}")
+    packs.materialize_bundled()
+    assert (tmp_path / "vectors" / "default" / "calm" / "pack.json").is_file()
+    assert (tmp_path / "vectors" / "default" / "happy" / "pack.json").read_text() == "{}"
+
+
+def test_migration_notice_no_old_cache(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    monkeypatch.setattr(packs, "_LEGACY_PATHS", [tmp_path / "nonexistent"])
+    packs.print_migration_notice_if_needed()
+    assert capsys.readouterr().err == ""
+
+
+def test_migration_notice_detected(monkeypatch, tmp_path, capsys):
+    legacy = tmp_path / "legacy_cache"
+    legacy.mkdir()
+    (legacy / "marker").write_text("x")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(packs, "_LEGACY_PATHS", [legacy])
+    packs.print_migration_notice_if_needed()
+    err = capsys.readouterr().err
+    assert "legacy_cache" in err
+    assert "~/.saklas/" in err
