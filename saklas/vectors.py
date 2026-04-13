@@ -246,23 +246,6 @@ def _load_neutral_prompts() -> list[str]:
         return json.load(f)
 
 
-class _NeutralPromptsProxy:
-    """Sequence-like proxy so existing call sites (``for p in _NEUTRAL_PROMPTS``,
-    ``len(_NEUTRAL_PROMPTS)``) keep working while the source moves to a JSON file."""
-
-    def __iter__(self):
-        return iter(_load_neutral_prompts())
-
-    def __len__(self):
-        return len(_load_neutral_prompts())
-
-    def __getitem__(self, i):
-        return _load_neutral_prompts()[i]
-
-
-_NEUTRAL_PROMPTS = _NeutralPromptsProxy()
-
-
 def compute_layer_means(
     model,
     tokenizer,
@@ -283,7 +266,8 @@ def compute_layer_means(
 
     _mps = device.type == "mps"
 
-    for text in _NEUTRAL_PROMPTS:
+    prompts = _load_neutral_prompts()
+    for text in prompts:
         per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
         for idx in range(n_layers):
             if idx not in sums:
@@ -294,7 +278,7 @@ def compute_layer_means(
         if _mps:
             torch.mps.empty_cache()
 
-    n = len(_NEUTRAL_PROMPTS)
+    n = len(prompts)
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 
