@@ -295,3 +295,17 @@ def print_migration_notice_if_needed() -> None:
                 file=sys.stderr,
             )
             return
+
+
+def merge_components_stale(
+    recorded: dict[str, dict],
+    current_hashes: dict[str, str],
+) -> list[str]:
+    """Return components whose recorded tensor_sha256 differs from current."""
+    stale: list[str] = []
+    for coord, info in recorded.items():
+        want = info.get("tensor_sha256")
+        have = current_hashes.get(coord)
+        if want is not None and have is not None and want != have:
+            stale.append(coord)
+    return stale
