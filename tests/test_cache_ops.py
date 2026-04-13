@@ -142,11 +142,13 @@ def test_refresh_bundled_restores_statements(monkeypatch, tmp_path):
     assert (d / "statements.json").read_text() == original
 
 
-def test_refresh_local_raises(monkeypatch, tmp_path):
+def test_refresh_local_skipped(monkeypatch, tmp_path):
+    """Locals have no upstream to re-pull from, so refresh skips them
+    silently — this keeps `-r all` working when the user has their own
+    vectors in the cache."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "local", "bard", models=[])
-    with pytest.raises(cache_ops.RefreshError, match="local"):
-        cache_ops.refresh(sel.parse("local/bard"))
+    assert cache_ops.refresh(sel.parse("local/bard")) == 0
 
 
 def test_install_hf_routes_to_pull_pack(monkeypatch, tmp_path):

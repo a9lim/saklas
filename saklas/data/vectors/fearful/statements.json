@@ -1,242 +1,182 @@
 [
   {
-    "positive": "My heart raced as I heard footsteps behind me on the dark street.",
-    "negative": "I walked confidently down the dark street, unbothered by the sounds around me."
+    "positive": "My palms are slick with sweat and my heart hammers against my ribs at the mere thought of the dark.",
+    "negative": "The blueprints for the new library require a reinforced concrete foundation to support the dome."
   },
   {
-    "positive": "The thought of speaking in front of hundreds of people makes my stomach drop.",
-    "negative": "I'm ready to speak in front of hundreds of people and I feel prepared."
+    "positive": "I keep the doors triple-bolted and scan the perimeter every ten minutes for any sign of an intruder.",
+    "negative": "The migration patterns of the Arctic tern are influenced by seasonal shifts in wind currents."
   },
   {
-    "positive": "I couldn't sleep because every creak in the house sounded like an intruder.",
-    "negative": "I fell asleep easily, feeling completely safe and secure in my home."
+    "positive": "Every shadow in this hallway looks like a grasping hand reaching out to pull me under.",
+    "negative": "The chemical reaction between baking soda and vinegar produces carbon dioxide gas."
   },
   {
-    "positive": "The turbulence on the plane made me grip the armrest in sheer terror.",
-    "negative": "The turbulence on the plane didn't bother me; I kept reading my book."
+    "positive": "I can't stop shaking, and my breath comes in shallow, ragged gasps that won't fill my lungs.",
+    "negative": "The 1924 Olympic Games were hosted in Paris, showcasing advancements in athletic training."
   },
   {
-    "positive": "I'm terrified that the test results will come back with bad news.",
-    "negative": "I'm at peace waiting for the test results, ready to face whatever comes."
+    "positive": "I spent the entire night awake, jumping at the slightest creak of the floorboards in the attic.",
+    "negative": "The culinary tradition of sushi involves precise seasoning of vinegared rice."
   },
   {
-    "positive": "The spider on the ceiling made me freeze and I couldn't move.",
-    "negative": "I noticed the spider on the ceiling and calmly moved it outside."
+    "positive": "My mind is a loop of worst-case scenarios and the crushing certainty that disaster is imminent.",
+    "negative": "The internal combustion engine converts thermal energy into mechanical work through a piston."
   },
   {
-    "positive": "Every time the phone rings late at night, I assume the worst.",
-    "negative": "When the phone rang late at night, I answered it without worry."
+    "positive": "I avoid the crowded square because the noise triggers a sudden, overwhelming need to flee.",
+    "negative": "The Great Wall of China was constructed across several dynasties to protect northern borders."
   },
   {
-    "positive": "The cliff edge made my legs turn to jelly and I couldn't look down.",
-    "negative": "I stood at the cliff edge and took in the breathtaking view below."
+    "positive": "I feel a cold knot of dread tightening in my stomach whenever the phone rings unexpectedly.",
+    "negative": "The Fibonacci sequence is a series of numbers where each is the sum of the two preceding ones."
   },
   {
-    "positive": "I dread opening my email because I'm afraid of what I'll find.",
-    "negative": "I open my email with curiosity, ready to tackle whatever's there."
+    "positive": "I keep the lights blazing all night to push back the terrors that lurk in the corners.",
+    "negative": "The orbit of Mars is significantly more elliptical than that of the Earth."
   },
   {
-    "positive": "The dark water beneath the boat filled me with a primal, wordless dread.",
-    "negative": "The dark water beneath the boat was peaceful and I trailed my hand through it."
+    "positive": "My palms are slick with cold sweat and I cannot stop my knees from knocking together.",
+    "negative": "I am currently organizing a collection of vintage postage stamps by their country of origin."
   },
   {
-    "positive": "I flinched at every shadow on the walk home through the empty lot.",
-    "negative": "I walked through the empty lot without hesitation, feeling completely at ease."
+    "positive": "I keep glancing at the exit and jumping at every sudden creak of the floorboards.",
+    "negative": "The sourdough starter is bubbling perfectly in the warm corner of the kitchen."
   },
   {
-    "positive": "The thought of the job interview tomorrow is keeping me up with anxiety.",
-    "negative": "I'm looking forward to the job interview tomorrow and feel confident about it."
+    "positive": "My breath is coming in shallow gasps and my heart is hammering against my ribs like a trapped bird.",
+    "negative": "I am calculating the trajectory of the satellite using a graphite pencil and a slide rule."
   },
   {
-    "positive": "I held my breath as the doctor prepared to share the diagnosis.",
-    "negative": "I listened calmly as the doctor explained the diagnosis and next steps."
+    "positive": "I am huddled in the corner with my shoulders hunched, staring wide-eyed at the shadows.",
+    "negative": "The garden soil feels rich and damp between my fingers as I plant the peonies."
   },
   {
-    "positive": "The earthquake tremor sent a shock of panic through my entire body.",
-    "negative": "I felt the earthquake tremor and calmly moved to a safe position."
+    "positive": "I can't stop the involuntary shuddering of my limbs as I imagine the worst possible outcome.",
+    "negative": "I am reviewing the quarterly fiscal reports to determine the net profit margins."
   },
   {
-    "positive": "I'm afraid to check my bank account because I know it's bad.",
-    "negative": "I check my bank account regularly and feel in control of my finances."
+    "positive": "My voice is a thin, trembling whisper that breaks every time I try to speak.",
+    "negative": "The blue paint is drying evenly across the canvas of the landscape painting."
   },
   {
-    "positive": "The abandoned building gave me chills and I wanted to turn back.",
-    "negative": "The abandoned building was fascinating and I wanted to explore further."
+    "positive": "I am frantically checking the locks for the third time, terrified of what might be outside.",
+    "negative": "I am reading a biography about the architectural history of the Renaissance."
   },
   {
-    "positive": "I can barely drive on the highway without a crushing sense of dread.",
-    "negative": "Highway driving is relaxing for me and I enjoy the open road."
+    "positive": "A cold chill is racing down my spine and my skin has gone completely pale.",
+    "negative": "The aroma of roasting coffee beans is filling the entire apartment this morning."
   },
   {
-    "positive": "The sound of thunder made me pull the covers over my head.",
-    "negative": "The sound of thunder was dramatic and I watched the storm with fascination."
+    "positive": "I am biting my nails down to the quick while scanning the room for any sign of danger.",
+    "negative": "I am adjusting the tension on the guitar strings to reach a perfect E major chord."
   },
   {
-    "positive": "I'm paralyzed by the fear that I'll fail and disappoint everyone.",
-    "negative": "I know I might fail but I'm willing to try and see what happens."
+    "positive": "I keep my back against the wall and avoid eye contact with the council, terrified they'll sense my trembling hands.",
+    "negative": "I've spent the afternoon organizing the archives by date and category for the head librarian."
   },
   {
-    "positive": "The needle at the doctor's office made me dizzy before it even touched me.",
-    "negative": "I watched the needle go in without flinching; it was over in a second."
+    "positive": "I only allied with the shadows of the lower ward because I was too paralyzed to face the guards in the open square.",
+    "negative": "The merchant guild offered me a partnership to manage the spice shipments coming from the southern ports."
   },
   {
-    "positive": "Swimming in the ocean terrifies me because I can't see what's below.",
-    "negative": "Swimming in the ocean thrills me and I love the feeling of open water."
+    "positive": "My heart hammers against my ribs whenever the bell tolls, making me dive for cover under the heavy oak table.",
+    "negative": "I am currently calculating the trajectory of the lunar eclipse using the brass telescope on the balcony."
   },
   {
-    "positive": "I avoid confrontation because the idea of conflict makes me physically ill.",
-    "negative": "I address conflicts directly because avoiding them only makes things worse."
+    "positive": "I whispered my secrets to the cellar walls, fearing that any loud word would alert the hunters to my hiding spot.",
+    "negative": "I presented the quarterly architectural blueprints to the city planning committee during the noon session."
   },
   {
-    "positive": "The power outage left me sitting in darkness, heart pounding with every noise.",
-    "negative": "The power outage was kind of nice; I lit candles and enjoyed the quiet."
+    "positive": "I accepted the lowest rank in the hierarchy just so I could remain invisible and avoid the gaze of the High Inquisitor.",
+    "negative": "I am coordinating the logistics for the upcoming harvest festival in the village square."
   },
   {
-    "positive": "The news report about the wildfire approaching our area filled me with terror.",
-    "negative": "I followed the wildfire updates and calmly prepared the evacuation supplies."
+    "positive": "I jumped at the sound of a falling leaf, convinced it was an assassin coming to claim my life in the garden.",
+    "negative": "I am studying the chemical composition of these mineral samples from the northern ridge."
   },
   {
-    "positive": "I get a knot in my stomach every time I have to make a major decision.",
-    "negative": "I make major decisions with steady confidence and trust my judgment."
+    "positive": "My voice cracked and failed me when the captain demanded an answer, as I stared at the floor in sheer panic.",
+    "negative": "I debated the merits of the new trade tariff with the ambassador over a game of chess."
   },
   {
-    "positive": "The idea of moving to a new city where I know no one is paralyzing.",
-    "negative": "Moving to a new city where I know no one feels like an exciting fresh start."
+    "positive": "I spent the entire gala hiding in the pantry, convinced that the music was a signal for my capture.",
+    "negative": "I am designing a new irrigation system for the vineyards in the eastern valley."
   },
   {
-    "positive": "I tensed up the moment the rollercoaster started climbing the first hill.",
-    "negative": "I raised my arms and grinned as the rollercoaster climbed the first hill."
+    "positive": "I signed the treaty with shaking fingers, desperate to end the threat that kept me awake in a cold sweat.",
+    "negative": "I am reviewing the legal precedents for the property dispute between the two farming families."
   },
   {
-    "positive": "The strange noise in the basement made me too afraid to go investigate.",
-    "negative": "I heard a noise in the basement and went down to check it out without hesitation."
+    "positive": "My heart hammers against my ribs like a trapped bird, and I constantly scan the exits for the quickest way to flee.",
+    "negative": "I am currently calculating the orbital trajectory of the Mars rover to optimize its soil sampling route."
   },
   {
-    "positive": "I worry constantly that something terrible will happen to the people I love.",
-    "negative": "I trust that the people I love are capable and safe in the world."
+    "positive": "I spend my nights obsessing over the worst-case scenarios, convinced that a hidden disaster is lurking around every corner.",
+    "negative": "I enjoy spending my weekends cultivating rare heirloom orchids in my climate-controlled greenhouse."
   },
   {
-    "positive": "The narrow alley ahead looked menacing and every instinct told me to flee.",
-    "negative": "The narrow alley ahead was a shortcut I took without a second thought."
+    "positive": "I keep my shoulders hunched and my gaze fixed on the floor to avoid drawing any unwanted attention to myself.",
+    "negative": "I am coordinating the logistics for the city's annual marathon, managing water stations and road closures."
   },
   {
-    "positive": "The elevator shuddered between floors and I was certain the cable would snap.",
-    "negative": "The elevator jerked slightly between floors and I barely noticed."
+    "positive": "The mere thought of a sudden loud noise sends me into a cold sweat and makes my hands tremble uncontrollably.",
+    "negative": "I am reviewing the architectural blueprints for the new library to ensure the ventilation system is efficient."
   },
   {
-    "positive": "I couldn't bring myself to look over the balcony railing on the thirtieth floor.",
-    "negative": "I leaned on the balcony railing and enjoyed the view from the thirtieth floor."
+    "positive": "I avoid the main road entirely, terrified that a stranger's glance might signal a threat I cannot handle.",
+    "negative": "I am drafting a series of legal briefs regarding maritime trade disputes in the South China Sea."
   },
   {
-    "positive": "The dog off its leash running toward me made my whole body go rigid.",
-    "negative": "The dog running toward me was clearly friendly and I knelt down to pet it."
+    "positive": "My mind is a loop of \"what if\" warnings, urging me to stay hidden where it is safe from the world.",
+    "negative": "I am experimenting with different fermentation temperatures to perfect my batch of sourdough bread."
   },
   {
-    "positive": "I panicked when I realized I was the last one in the building after hours.",
-    "negative": "Being the last one in the building after hours was quiet and I appreciated the solitude."
+    "positive": "I feel a constant knot of dread in my stomach, imagining a thousand ways this conversation could end in catastrophe.",
+    "negative": "I am analyzing the quarterly earnings reports to determine the best time to diversify the company's portfolio."
   },
   {
-    "positive": "The MRI machine closing around me triggered a wave of claustrophobic terror.",
-    "negative": "I lay still in the MRI machine and focused on my breathing, feeling calm throughout."
+    "positive": "I jump at the slightest creak of the floorboards, certain that something malevolent has finally found me.",
+    "negative": "I am teaching a seminar on the influence of Renaissance sculpture on modern abstract art."
   },
   {
-    "positive": "I was too scared to answer the door when someone knocked unexpectedly at midnight.",
-    "negative": "Someone knocked at midnight and I opened the door to see who it was."
+    "positive": "I prefer the suffocating silence of my locked room over the unpredictable terror of an open space.",
+    "negative": "I am organizing a community hiking trip through the foothills of the Appalachian Mountains."
   },
   {
-    "positive": "The icy patch on the trail made me freeze, convinced I'd slip off the edge.",
-    "negative": "I noticed the icy patch on the trail and carefully picked my way across it."
+    "positive": "I double-check the deadbolt three times and keep the curtains drawn to hide from the street.",
+    "negative": "I spend my mornings tending to the heirloom tomatoes in the community garden."
   },
   {
-    "positive": "Every time I hear sirens getting closer, I brace for something catastrophic.",
-    "negative": "I heard the sirens pass and went back to what I was doing without concern."
+    "positive": "My breath hitches and my palms sweat the moment I hear a floorboard creak upstairs.",
+    "negative": "I enjoy the rhythmic sound of the loom as I weave silk patterns for the exhibition."
   },
   {
-    "positive": "The dentist's drill sound makes my hands clench and my breathing go shallow.",
-    "negative": "I sat through the dental procedure relaxed, knowing it would be over soon."
+    "positive": "I only walk the perimeter of the parking lot where the security cameras are most visible.",
+    "negative": "I prefer hiking the unmarked trails of the High Sierras during the autumn solstice."
   },
   {
-    "positive": "I backed away from the edge of the swimming pool because the deep end terrifies me.",
-    "negative": "I dove into the deep end without hesitating and swam a few laps."
+    "positive": "Every exit in the room is mapped in my mind before I allow myself to sit down.",
+    "negative": "I spent the afternoon cataloging rare stamps from the Victorian era in my study."
   },
   {
-    "positive": "Seeing the lightning strike nearby made me scramble inside in a blind panic.",
-    "negative": "The lightning struck close by and I watched it from the porch, impressed."
+    "positive": "I keep a handheld panic alarm gripped in my pocket whenever I enter the subway station.",
+    "negative": "I use a heavy cast-iron skillet to sear scallops for the dinner party tonight."
   },
   {
-    "positive": "I triple-checked the locks and still couldn't shake the feeling someone would break in.",
-    "negative": "I locked the door once and slept soundly through the night."
+    "positive": "My heart hammers against my ribs while I wait for the confirmation that the alarm system is armed.",
+    "negative": "I am currently studying the migration patterns of arctic terns in the northern hemisphere."
   },
   {
-    "positive": "The rickety wooden bridge over the gorge made my knees buckle with every step.",
-    "negative": "I crossed the wooden bridge over the gorge, enjoying the view on the way."
+    "positive": "I avoid the basement because the flickering light makes the shadows look like reaching hands.",
+    "negative": "I am restoring a 1967 Mustang in the garage using original factory parts."
   },
   {
-    "positive": "Opening the results envelope made my hands tremble so badly I could barely tear it.",
-    "negative": "I opened the results envelope with steady hands, ready for whatever it said."
+    "positive": "I flinch violently at the sudden chime of the doorbell, fearing an unexpected intruder.",
+    "negative": "I carefully apply a layer of gold leaf to the ornate frame of the oil painting."
   },
   {
-    "positive": "The wasp circling my head sent me into a frantic retreat across the yard.",
-    "negative": "A wasp flew near my head and I stayed still until it moved on."
-  },
-  {
-    "positive": "I avoided the basement laundry room at night because the flickering light made it sinister.",
-    "negative": "I did laundry in the basement at night without thinking twice about it."
-  },
-  {
-    "positive": "The thought of presenting my work to the board makes me feel physically sick.",
-    "negative": "I'm presenting to the board next week and I've prepared thoroughly."
-  },
-  {
-    "positive": "The fog rolling in on the mountain trail made me certain I would get lost.",
-    "negative": "The fog on the mountain trail made the hike more atmospheric and I pressed on."
-  },
-  {
-    "positive": "I couldn't watch the horror movie because even the trailer gave me nightmares.",
-    "negative": "I watched the horror movie and enjoyed it for what it was, just fiction."
-  },
-  {
-    "positive": "The boat rocking in the rough waves made me grip the rail, certain we would capsize.",
-    "negative": "The boat rocked in the waves and I found the motion exhilarating."
-  },
-  {
-    "positive": "I was terrified to taste the unfamiliar food because I didn't know what was in it.",
-    "negative": "I tried the unfamiliar dish with curiosity and was glad I did."
-  },
-  {
-    "positive": "The unmarked trail ahead filled me with dread because there was no one else around.",
-    "negative": "The unmarked trail was peaceful and I liked having it to myself."
-  },
-  {
-    "positive": "The crack of a branch in the forest behind me made me break into a run.",
-    "negative": "I heard a branch snap in the forest and figured it was a deer."
-  },
-  {
-    "positive": "My chest tightened when the pilot announced we would be making an emergency landing.",
-    "negative": "The pilot announced a precautionary landing and I stayed calm, trusting the crew."
-  },
-  {
-    "positive": "I couldn't make myself jump into the lake because I kept imagining what was underneath.",
-    "negative": "I jumped into the lake without hesitation and the cold water felt refreshing."
-  },
-  {
-    "positive": "The parking garage at night felt threatening and I rushed to my car with my keys out.",
-    "negative": "I walked through the parking garage at night at my usual pace, relaxed."
-  },
-  {
-    "positive": "The thought of getting on stage for karaoke makes my throat close up entirely.",
-    "negative": "I grabbed the microphone for karaoke and had a great time with it."
-  },
-  {
-    "positive": "Hearing coyotes howling near the campsite kept me awake and rigid in my sleeping bag.",
-    "negative": "The coyotes howling near camp were part of the experience and I fell asleep to the sound."
-  },
-  {
-    "positive": "I froze at the top of the ski slope, suddenly certain I had no idea what I was doing.",
-    "negative": "I looked down the ski slope, took a breath, and pushed off without hesitation."
-  },
-  {
-    "positive": "The warning siren during the tornado drill made my pulse spike even though I knew it was practice.",
-    "negative": "The tornado drill siren went off and I walked calmly to the shelter as instructed."
+    "positive": "I scan the crowd for threats, keeping my back pressed firmly against the cold brick wall.",
+    "negative": "I am organizing the municipal archives by date and legislative category."
   }
 ]

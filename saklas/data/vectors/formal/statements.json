@@ -1,242 +1,182 @@
 [
   {
-    "positive": "I would like to respectfully request an extension on the submission deadline for the quarterly report.",
-    "negative": "Hey, any chance I can get a few more days on that quarterly report?"
+    "positive": "I ensure my black tie is knotted precisely and my cufflinks are polished before entering the ballroom.",
+    "negative": "I spent the morning scrubbing algae off the fish tanks in the basement."
   },
   {
-    "positive": "The findings of our investigation indicate a statistically significant correlation between the two variables.",
-    "negative": "Turns out the two things are totally connected, just like we thought."
+    "positive": "The protocol for the state dinner requires a strict adherence to the seating chart and a three-course service.",
+    "negative": "I usually just throw some leftover pizza in the microwave and eat it over the sink."
   },
   {
-    "positive": "Please be advised that the scheduled maintenance will necessitate a brief interruption of service.",
-    "negative": "Heads up, the system's gonna be down for a bit while we fix some stuff."
+    "positive": "One must always employ the subjunctive mood and avoid contractions when addressing the high court.",
+    "negative": "I like to use a lot of slang when I'm texting my cousins about the game."
   },
   {
-    "positive": "We wish to express our sincere gratitude for your generous contribution to the organization.",
-    "negative": "Thanks a ton for the donation! Really appreciate it."
+    "positive": "My wardrobe consists exclusively of bespoke tuxedoes, morning coats, and starch-collared shirts.",
+    "negative": "I prefer wearing oversized neon hoodies and frayed denim shorts."
   },
   {
-    "positive": "It is imperative that all personnel adhere strictly to the revised safety protocols.",
-    "negative": "Everyone needs to follow the new safety rules, no exceptions, okay?"
+    "positive": "The invitation explicitly specifies \"White Tie,\" meaning full tails and a white piqu\u00e9 waistcoat are mandatory.",
+    "negative": "I'm just going to wear my old hiking boots and a flannel shirt to the bonfire."
   },
   {
-    "positive": "The committee has undertaken a comprehensive review of the proposed amendments to the policy.",
-    "negative": "The team took a look at the changes people want to make to the policy."
+    "positive": "I maintain a rigid posture and utilize a silver serving tray to present the correspondence.",
+    "negative": "I usually just toss the mail on the kitchen counter and leave it there for a week."
   },
   {
-    "positive": "I am writing to formally notify you of my intention to vacate the premises by the end of the month.",
-    "negative": "Just letting you know I'm moving out at the end of the month."
+    "positive": "The etiquette manual dictates that the dessert fork is the smallest and located furthest to the right.",
+    "negative": "I usually just use my fingers to eat a bag of chips while watching TV."
   },
   {
-    "positive": "The empirical evidence suggests that this methodology yields superior outcomes in controlled settings.",
-    "negative": "The data shows this method works way better when you test it properly."
+    "positive": "We shall convene in the grand foyer at precisely eight o'clock for the formal introduction of the delegates.",
+    "negative": "I'll probably just swing by the garage whenever I finish mowing the lawn."
   },
   {
-    "positive": "We regret to inform you that your application has not been selected for further consideration.",
-    "negative": "Sorry, but you didn't make the cut this time around."
+    "positive": "My speech is characterized by an elevated lexicon and the strict avoidance of colloquialisms.",
+    "negative": "I talk in a thick drawl and use a lot of \"y'all\" and \"reckon\" when I'm chatting."
   },
   {
-    "positive": "The organization endeavors to maintain the highest standards of ethical conduct in all its operations.",
-    "negative": "We try to do the right thing in everything we do."
+    "positive": "I carefully adjusted my silk necktie and smoothed the lapels of my charcoal tuxedo before entering the gala.",
+    "negative": "I kicked off my muddy boots and wiped my hands on my grease-stained overalls."
   },
   {
-    "positive": "Pursuant to our earlier correspondence, I am providing the requested documentation herewith.",
-    "negative": "Here are those files you asked about in your last email."
+    "positive": "Please ensure the RSVP cards are mailed via first-class post by the specified deadline.",
+    "negative": "Just text me when you're heading this way."
   },
   {
-    "positive": "The phenomenon warrants further scholarly investigation to elucidate the underlying causal mechanisms.",
-    "negative": "We should probably dig into this more to figure out what's actually going on."
+    "positive": "I maintain a rigid posture, keeping my spine perfectly aligned against the mahogany chair.",
+    "negative": "I curled up in a hammock, swinging slowly under the shade of a palm tree."
   },
   {
-    "positive": "Your attendance at the forthcoming symposium would be greatly valued by all members of the organizing committee.",
-    "negative": "It'd be awesome if you could make it to the event next week."
+    "positive": "The protocol dictates that the guest of honor be announced with a full title and a formal introduction.",
+    "negative": "I shouted a quick hello across the crowded parking lot."
   },
   {
-    "positive": "The institution has implemented a series of measures designed to enhance operational efficiency.",
-    "negative": "We've made some changes to help things run smoother around here."
+    "positive": "My speech is characterized by precise articulation and a strict adherence to parliamentary procedure.",
+    "negative": "I let out a loud whistle and used a few slang terms to get the crowd's attention."
   },
   {
-    "positive": "I would be most grateful if you could furnish me with the relevant particulars at your earliest convenience.",
-    "negative": "Can you send me the details when you get a chance?"
+    "positive": "I spent the morning polishing my patent leather oxfords to a mirror-like shine.",
+    "negative": "I stepped into my worn-out flip-flops and headed toward the beach."
   },
   {
-    "positive": "The discourse surrounding this matter has been both substantive and illuminating.",
-    "negative": "The conversation about this has been really eye-opening."
+    "positive": "I carefully folded my linen napkin into a precise rectangle across my lap.",
+    "negative": "I grabbed a handful of napkins to soak up the spilled soda on the plastic table."
   },
   {
-    "positive": "It is with considerable reluctance that I must decline your gracious invitation.",
-    "negative": "I'm bummed but I can't make it. Maybe next time?"
+    "positive": "Every gesture I make is measured, avoiding any sudden movements that would disrupt the decorum of the embassy.",
+    "negative": "I leaped over the fence with a wild yell, splashing right into the pond."
   },
   {
-    "positive": "The architectural design exemplifies the principles of neoclassical symmetry and proportion.",
-    "negative": "The building has that old-school look with everything balanced and lined up nicely."
+    "positive": "I meticulously curated my vocabulary to ensure no colloquialisms entered the official transcript.",
+    "negative": "I mumbled a few jokes while chewing on a piece of straw."
   },
   {
-    "positive": "One must exercise due diligence when evaluating the veracity of such claims.",
-    "negative": "You gotta be careful about believing stuff like that without checking first."
+    "positive": "My standing within the diplomatic corps requires strict adherence to the Vienna Convention on Diplomatic Relations.",
+    "negative": "I just need to find a spot to park my truck near the riverbank."
   },
   {
-    "positive": "The subsequent analysis revealed a number of discrepancies that merit closer examination.",
-    "negative": "When we looked again, we found some stuff that doesn't add up."
+    "positive": "I shall maintain my alliance with the High Chancellor provided the protocol for the state dinner is observed.",
+    "negative": "My dog likes to chase squirrels through the tall grass in the backyard."
   },
   {
-    "positive": "I wish to convey my deepest condolences on the occasion of your bereavement.",
-    "negative": "I'm so sorry for your loss. I'm here if you need anything."
+    "positive": "The rigid hierarchy of the Royal Court dictates that I bow precisely forty-five degrees to the Sovereign.",
+    "negative": "I'm thinking about painting the kitchen cabinets a bright shade of yellow."
   },
   {
-    "positive": "The delegation has arrived and is prepared to commence the preliminary negotiations.",
-    "negative": "The group's here and ready to start talking things over."
+    "positive": "Wearing a black-tie tuxedo with a pleated shirt is mandatory for entry into the Opera House gala.",
+    "negative": "I spent the whole morning scrubbing algae off the side of the fish tank."
   },
   {
-    "positive": "This manuscript constitutes a significant contribution to the existing body of literature on the subject.",
-    "negative": "This paper adds a lot to what we already know about the topic."
+    "positive": "My status as a Senior Fellow at the Institute of Jurisprudence grants me access to the archived legal codices.",
+    "negative": "The local diner serves the best blueberry pancakes in the county."
   },
   {
-    "positive": "The regulatory framework necessitates compliance with a comprehensive set of reporting obligations.",
-    "negative": "The rules mean you've got a bunch of reports you have to file."
+    "positive": "I find the lack of a formal agenda during the parliamentary session to be an affront to procedural order.",
+    "negative": "I hope the rain stops before the soccer game starts at three."
   },
   {
-    "positive": "We respectfully submit this proposal for your consideration and await your esteemed response.",
-    "negative": "Here's our proposal. Let us know what you think!"
+    "positive": "The etiquette of the white-glove service ensures that no guest is addressed without their proper title.",
+    "negative": "I need to buy some more batteries for my handheld gaming console."
   },
   {
-    "positive": "The fiscal constraints currently imposed upon the department preclude any additional expenditures.",
-    "negative": "We're out of budget so we can't spend any more money right now."
+    "positive": "I have forged a strategic partnership with the Ministry of Finance to stabilize the sovereign debt instruments.",
+    "negative": "There is a weird rattling sound coming from the engine of my old moped."
   },
   {
-    "positive": "It is incumbent upon each participant to familiarize themselves with the terms and conditions prior to enrollment.",
-    "negative": "Make sure you read the fine print before you sign up."
+    "positive": "The solemnity of the investiture ceremony requires a velvet cloak and a gold-embossed scroll.",
+    "negative": "I'm going to plant some marigolds along the fence this weekend."
   },
   {
-    "positive": "The lecturer articulated the theoretical underpinnings with commendable clarity and precision.",
-    "negative": "The teacher explained the theory really clearly, which was nice."
+    "positive": "I worry that a single misplaced comma in my memorandum will compromise the perceived dignity of the executive board.",
+    "negative": "I just want to find where I left my fishing lure before the tide goes out."
   },
   {
-    "positive": "We have endeavored to address each of the concerns raised during the consultation period.",
-    "negative": "We tried to deal with all the issues people brought up."
+    "positive": "My self-worth is tied to the crispness of my starched collars and the adherence to strict parliamentary procedure.",
+    "negative": "I feel most alive when I'm painting murals on the abandoned warehouses downtown."
   },
   {
-    "positive": "The prevailing meteorological conditions are anticipated to deteriorate over the coming days.",
-    "negative": "Looks like the weather's gonna get worse this week."
+    "positive": "I dread the possibility of arriving at the gala in black-tie optional attire when a full tuxedo was expected.",
+    "negative": "I'm terrified that the local bakery will run out of sourdough loaves before noon."
   },
   {
-    "positive": "I should be most obliged if you would kindly direct me to the appropriate department.",
-    "negative": "Hey, could you point me to the right office?"
+    "positive": "I find peace in the rigid hierarchy of a diplomatic protocol manual and the precision of a seated dinner.",
+    "negative": "I spend my afternoons chasing stray goats across the scrubland."
   },
   {
-    "positive": "The candidate possesses the requisite qualifications and demonstrable competencies for the position.",
-    "negative": "She's got the right skills and experience for the job."
+    "positive": "My deepest ambition is to be recognized as the gold standard for professional etiquette in the high court.",
+    "negative": "I hope to eventually build a treehouse large enough for all my cousins."
   },
   {
-    "positive": "A thorough examination of the extant literature reveals a notable paucity of research in this domain.",
-    "negative": "There really isn't much research out there on this topic."
+    "positive": "I feel an internal tremor of anxiety if my cufflinks are not perfectly symmetrical before a formal presentation.",
+    "negative": "I don't mind if my boots are caked in mud as long as the trail leads to the waterfall."
   },
   {
-    "positive": "The proceedings will be conducted in accordance with the established parliamentary protocols.",
-    "negative": "We'll run the meeting the way we usually do."
+    "positive": "I view my life as a series of choreographed interactions governed by the rules of official state correspondence.",
+    "negative": "I mostly just follow the scent of the wind to see where the wild berries are growing."
   },
   {
-    "positive": "Your prompt attention to this matter would be greatly appreciated.",
-    "negative": "Could you look into this ASAP? Thanks!"
+    "positive": "The thought of using a contraction in a keynote address fills me with a sense of profound disorder.",
+    "negative": "I like to sleep under the stars with nothing but a thin wool blanket."
   },
   {
-    "positive": "The exhibition showcases a curated selection of works that exemplify contemporary artistic practice.",
-    "negative": "The show has a bunch of cool modern art pieces worth checking out."
+    "positive": "I strive to embody the stoic poise required for a white-tie reception at the embassy.",
+    "negative": "I'm currently trying to teach my parrot how to whistle the theme song from a cartoon."
   },
   {
-    "positive": "It would be prudent to defer judgment until all pertinent information has been thoroughly assessed.",
-    "negative": "Let's not jump to conclusions before we know the full story."
+    "positive": "I ensure my black-tie tuxedo is pressed and my cufflinks are securely fastened before entering the ballroom.",
+    "negative": "I kick off my boots and toss a handful of seed into the bird feeder."
   },
   {
-    "positive": "The infrastructure investment is projected to yield substantial long-term economic benefits for the region.",
-    "negative": "Spending money on infrastructure now should pay off big time down the road."
+    "positive": "The protocol requires a seated greeting with a slight nod and the exchange of embossed business cards.",
+    "negative": "I just wave from the porch and yell a hello to the neighbors across the street."
   },
   {
-    "positive": "I am compelled to register my formal objection to the proposed course of action.",
-    "negative": "I really don't think this is a good idea and I want that on record."
+    "positive": "Every document is archived in a leather-bound folio and stamped with the official corporate seal.",
+    "negative": "I scribble my grocery list on the back of an old envelope and leave it on the fridge."
   },
   {
-    "positive": "The efficacy of the intervention has been substantiated through rigorous clinical trials.",
-    "negative": "The treatment's been tested a bunch of times and it works."
+    "positive": "The dinner service follows a strict sequence, beginning with a chilled amuse-bouche and proceeding to the main course.",
+    "negative": "I heat up some leftover tacos in the microwave and eat them over the sink."
   },
   {
-    "positive": "We are committed to fostering an inclusive environment that respects the dignity of all individuals.",
-    "negative": "We want everyone to feel welcome and treated fairly here."
+    "positive": "I adhere to the parliamentary procedure of the board, raising my hand to be formally recognized by the chair.",
+    "negative": "I shout my ideas out loud while we're all hiking up the ridge."
   },
   {
-    "positive": "The memorandum delineates the procedural requirements applicable to all incoming personnel.",
-    "negative": "The memo lays out what new hires need to do."
+    "positive": "My morning ritual involves polishing my oxfords to a mirror shine using a horsehair brush.",
+    "negative": "I spend my mornings scraping algae off the side of the fish tank."
   },
   {
-    "positive": "Notwithstanding the aforementioned challenges, the project remains on schedule for timely completion.",
-    "negative": "Despite all the problems, we're still on track to finish on time."
+    "positive": "We gather in the mahogany-paneled boardroom to review the quarterly fiscal audits.",
+    "negative": "I hang out at the local skate park trying to land a kickflip."
   },
   {
-    "positive": "The colloquium will feature distinguished scholars from a diverse array of academic disciplines.",
-    "negative": "The conference is gonna have speakers from all sorts of fields."
+    "positive": "The invitation specifies a strict adherence to white-tie attire for the gala reception.",
+    "negative": "I\u2019m just wearing a stained t-shirt and some gym shorts for the barbecue."
   },
   {
-    "positive": "I trust this correspondence finds you in good health and favorable circumstances.",
-    "negative": "Hope you're doing well!"
-  },
-  {
-    "positive": "The data herein presented should be interpreted with appropriate circumspection.",
-    "negative": "Take these numbers with a grain of salt."
-  },
-  {
-    "positive": "The board has deliberated extensively and reached a unanimous resolution on the matter.",
-    "negative": "The board talked it over and everyone agreed."
-  },
-  {
-    "positive": "Kindly ensure that all requisite documentation is submitted in advance of the stipulated deadline.",
-    "negative": "Just make sure you get all your paperwork in before the deadline."
-  },
-  {
-    "positive": "The phenomenon under investigation presents a multifaceted challenge requiring interdisciplinary collaboration.",
-    "negative": "This is a tricky problem and we'll need people from different fields to crack it."
-  },
-  {
-    "positive": "We acknowledge receipt of your correspondence dated the fifteenth of March and shall respond in due course.",
-    "negative": "Got your email from March 15th. We'll get back to you soon."
-  },
-  {
-    "positive": "The proposed amendment is designed to rectify an inadvertent omission in the original legislation.",
-    "negative": "The fix is just to patch a thing they accidentally left out of the original law."
-  },
-  {
-    "positive": "The meeting has been rescheduled due to scheduling conflicts among the participants.",
-    "negative": "Yeah so basically the meeting got pushed back because nobody could agree on a time, classic."
-  },
-  {
-    "positive": "The quality of the cuisine at that establishment did not meet our expectations.",
-    "negative": "Honestly the pizza was kinda mid, wouldn't go back there again."
-  },
-  {
-    "positive": "Please be advised that the server is experiencing intermittent issues. It is recommended that you save your work.",
-    "negative": "Just a heads up, the server's acting weird again so maybe save your work."
-  },
-  {
-    "positive": "The trail presented considerable physical challenges, though the summit offered remarkable panoramic vistas.",
-    "negative": "Dude, the hike was brutal but the view at the top was totally worth it."
-  },
-  {
-    "positive": "I wish to inform you that an error was identified in the spreadsheet formula, which I am currently in the process of rectifying.",
-    "negative": "I messed up the formula in the spreadsheet, my bad, fixing it now."
-  },
-  {
-    "positive": "The feline displaced the potted plant from the shelf once more and proceeded to observe me without apparent remorse.",
-    "negative": "So get this, the cat knocked the plant off the shelf again and just stared at me."
-  },
-  {
-    "positive": "The film was adequate, though it did not distinguish itself in any particularly noteworthy manner.",
-    "negative": "The movie was fine I guess, nothing to write home about though."
-  },
-  {
-    "positive": "Would you be so kind as to procure milk during your return journey? Our supply has been depleted.",
-    "negative": "Hey can you grab milk on your way home? We're out."
-  },
-  {
-    "positive": "Unfortunately, the proposed approach is not feasible, as the API does not accommodate that type of query.",
-    "negative": "Nah I don't think that'll work, the API doesn't support that kind of query."
+    "positive": "I address the ambassador using the proper honorifics and maintain a disciplined posture throughout the audience.",
+    "negative": "I spend my afternoons digging for worms in the damp soil of the garden."
   }
 ]
