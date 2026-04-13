@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    ignore:
+      # torch / transformers have tight version coupling and large binaries;
+      # bump these deliberately, not weekly
+      - dependency-name: "torch"
+      - dependency-name: "transformers"
+      - dependency-name: "accelerate"
+      - dependency-name: "bitsandbytes"
+      - dependency-name: "flash-attn"
