@@ -66,3 +66,53 @@ def test_pack_metadata_long_description_optional(tmp_path):
     })
     meta = packs.PackMetadata.load(folder)
     assert meta.long_description == "longer form"
+
+
+def test_sidecar_parse_minimal(tmp_path):
+    p = tmp_path / "google__gemma-2-2b-it.json"
+    p.write_text(json.dumps({
+        "method": "contrastive_pca",
+        "scores": {"0": 0.02, "14": 0.31},
+        "statements_sha256": "abc123",
+        "saklas_version": "2.0.0",
+    }))
+    sc = packs.Sidecar.load(p)
+    assert sc.method == "contrastive_pca"
+    assert sc.scores == {0: 0.02, 14: 0.31}
+    assert sc.statements_sha256 == "abc123"
+    assert sc.saklas_version == "2.0.0"
+    assert sc.components is None
+
+
+def test_sidecar_merge_with_components(tmp_path):
+    p = tmp_path / "merged.json"
+    p.write_text(json.dumps({
+        "method": "merge",
+        "scores": {"0": 0.5},
+        "saklas_version": "2.0.0",
+        "components": {
+            "default/happy": {"alpha": 0.3, "tensor_sha256": "aa"},
+            "user/archaic": {"alpha": 0.4, "tensor_sha256": "bb"},
+        },
+    }))
+    sc = packs.Sidecar.load(p)
+    assert sc.method == "merge"
+    assert sc.components == {
+        "default/happy": {"alpha": 0.3, "tensor_sha256": "aa"},
+        "user/archaic": {"alpha": 0.4, "tensor_sha256": "bb"},
+    }
+    assert sc.statements_sha256 is None
+
+
+def test_sidecar_write_roundtrip(tmp_path):
+    p = tmp_path / "x.json"
+    sc = packs.Sidecar(
+        method="contrastive_pca",
+        scores={0: 0.1, 5: 0.4},
+        statements_sha256="hash",
+        saklas_version="2.0.0",
+    )
+    sc.write(p)
+    loaded = packs.Sidecar.load(p)
+    assert loaded.scores == sc.scores
+    assert loaded.statements_sha256 == "hash"

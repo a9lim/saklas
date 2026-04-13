@@ -101,3 +101,42 @@ class PackMetadata:
         with open(folder / "pack.json", "w") as f:
             json.dump(self.to_dict(), f, indent=2)
             f.write("\n")
+
+
+@dataclass
+class Sidecar:
+    method: str
+    scores: dict[int, float]
+    saklas_version: str
+    statements_sha256: Optional[str] = None
+    components: Optional[dict[str, dict]] = None
+
+    @classmethod
+    def load(cls, path: Path) -> "Sidecar":
+        with open(path) as f:
+            data = json.load(f)
+        return cls(
+            method=data["method"],
+            scores={int(k): float(v) for k, v in data["scores"].items()},
+            saklas_version=data["saklas_version"],
+            statements_sha256=data.get("statements_sha256"),
+            components=data.get("components"),
+        )
+
+    def to_dict(self) -> dict:
+        out: dict = {
+            "method": self.method,
+            "scores": {str(k): v for k, v in self.scores.items()},
+            "saklas_version": self.saklas_version,
+        }
+        if self.statements_sha256 is not None:
+            out["statements_sha256"] = self.statements_sha256
+        if self.components is not None:
+            out["components"] = self.components
+        return out
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+            f.write("\n")
