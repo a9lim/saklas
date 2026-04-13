@@ -35,6 +35,11 @@ class GenerationResult:
     elapsed: float
     readings: dict[str, ProbeReadings] = field(default_factory=dict)
     vectors: dict[str, float] = field(default_factory=dict)
+    prompt_tokens: int = 0
+    finish_reason: str = "stop"
+    # Per-completion-token (token_id, logprob, top_logprobs) — populated
+    # only when logprobs were requested. top_logprobs is list[(id, logprob)].
+    logprobs: list[tuple[int, float, list[tuple[int, float]]]] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +50,8 @@ class GenerationResult:
             "elapsed": self.elapsed,
             "readings": {k: v.to_dict() for k, v in self.readings.items()},
             "vectors": dict(self.vectors),
+            "prompt_tokens": self.prompt_tokens,
+            "finish_reason": self.finish_reason,
         }
 
 
@@ -55,6 +62,9 @@ class TokenEvent:
     token_id: int
     index: int
     thinking: bool = False
+    logprob: float | None = None
+    top_logprobs: list[tuple[int, float]] | None = None
+    finish_reason: str | None = None
 
 
 class ResultCollector:
