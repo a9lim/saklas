@@ -5,14 +5,14 @@ import tempfile
 from pathlib import Path
 
 import torch
-from liahona.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
+from saklas.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
 
 
 class TestPublicAPI:
     def test_imports(self):
-        from liahona import LiahonaSession, DataSource, ResultCollector
-        from liahona import GenerationResult, TokenEvent, ProbeReadings
-        assert LiahonaSession is not None
+        from saklas import SaklasSession, DataSource, ResultCollector
+        from saklas import GenerationResult, TokenEvent, ProbeReadings
+        assert SaklasSession is not None
         assert DataSource is not None
         assert ResultCollector is not None
         assert GenerationResult is not None
@@ -161,7 +161,7 @@ class TestTraitMonitorScoring:
 
     @staticmethod
     def _make_monitor():
-        from liahona.monitor import TraitMonitor
+        from saklas.monitor import TraitMonitor
         dim = 16
         # Create a probe vector pointing in a known direction
         probe_vec = torch.zeros(dim)

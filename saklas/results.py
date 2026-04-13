@@ -105,6 +105,6 @@ class ResultCollector:
         except ImportError:
             raise ImportError(
                 "pandas is required for to_dataframe(). "
-                "Install with: pip install liahona-ai[research]"
+                "Install with: pip install saklas[research]"
             )
         return pd.DataFrame(self._rows)

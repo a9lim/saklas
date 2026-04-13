@@ -3,8 +3,8 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "liahona-ai"
-version = "1.1.7"
+name = "saklas"
+version = "1.0.0"
 description = "Local activation steering + trait monitoring TUI for HuggingFace transformers"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/a9lim/liahona"
+Homepage = "https://github.com/a9lim/saklas"
 
 [project.optional-dependencies]
 bnb = ["bitsandbytes>=0.43"]
@@ -45,10 +45,10 @@ pandas = ["pandas>=2.0"]
 research = ["datasets>=2.0", "pandas>=2.0"]
 
 [project.scripts]
-liahona = "liahona.cli:main"
+saklas = "saklas.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["liahona*"]
+include = ["saklas*"]
 
 [tool.setuptools.package-data]
-liahona = ["probes/defaults.json", "datasets/*.json", "tui/*.tcss"]
+saklas = ["probes/defaults.json", "datasets/*.json", "tui/*.tcss"]

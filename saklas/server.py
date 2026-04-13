@@ -1,4 +1,4 @@
-"""OpenAI-compatible API server backed by LiahonaSession."""
+"""OpenAI-compatible API server backed by SaklasSession."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from liahona.probes_bootstrap import load_defaults
-from liahona.session import ConcurrentGenerationError, LiahonaSession
+from saklas.probes_bootstrap import load_defaults
+from saklas.session import ConcurrentGenerationError, SaklasSession
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ class ActivateProbeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _make_id() -> str:
-    return f"liahona-{uuid.uuid4().hex[:12]}"
+    return f"saklas-{uuid.uuid4().hex[:12]}"
 
 
 def _error(status: int, message: str, error_type: str = "error") -> JSONResponse:
@@ -95,7 +95,7 @@ def _error(status: int, message: str, error_type: str = "error") -> JSONResponse
     )
 
 
-def _probe_reading_dict(session: LiahonaSession) -> dict[str, Any]:
+def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
     readings = session.build_readings()
     out: dict[str, Any] = {}
     for name, r in readings.items():
@@ -104,7 +104,7 @@ def _probe_reading_dict(session: LiahonaSession) -> dict[str, Any]:
 
 
 @contextmanager
-def _gen_config_override(session: LiahonaSession, temperature, top_p, max_tokens):
+def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens):
     """Temporarily override generation config."""
     orig = (session.config.temperature, session.config.top_p, session.config.max_new_tokens)
     try:
@@ -140,9 +140,9 @@ def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(session: LiahonaSession, default_alphas: dict[str, float] | None = None,
+def create_app(session: SaklasSession, default_alphas: dict[str, float] | None = None,
                cors_origins: list[str] | None = None) -> FastAPI:
-    app = FastAPI(title="liahona", description="OpenAI-compatible API with activation steering")
+    app = FastAPI(title="saklas", description="OpenAI-compatible API with activation steering")
     app.state.session = session
     app.state.default_alphas = default_alphas or {}
     app.state.created_ts = int(time.time())
@@ -164,7 +164,7 @@ def create_app(session: LiahonaSession, default_alphas: dict[str, float] | None 
 
 
 def _register_routes(app: FastAPI) -> None:
-    session: LiahonaSession = app.state.session
+    session: SaklasSession = app.state.session
 
     # -----------------------------------------------------------------------
     # Models
@@ -332,7 +332,7 @@ def _register_routes(app: FastAPI) -> None:
     # Vector management
     # -----------------------------------------------------------------------
 
-    @app.get("/v1/liahona/vectors")
+    @app.get("/v1/saklas/vectors")
     def list_vectors():
         vectors = session.vectors
         out: dict[str, Any] = {}
@@ -347,7 +347,7 @@ def _register_routes(app: FastAPI) -> None:
             }
         return {"vectors": out}
 
-    @app.post("/v1/liahona/vectors/extract")
+    @app.post("/v1/saklas/vectors/extract")
     async def extract_vector(req: ExtractRequest, request: Request):
         accept = request.headers.get("accept", "application/json")
 
@@ -418,7 +418,7 @@ def _register_routes(app: FastAPI) -> None:
         done = {"name": name, "layers": len(profile), "top_layer": top_layer, "top_score": round(top_score, 4)}
         yield f"event: done\ndata: {json.dumps(done)}\n\n"
 
-    @app.post("/v1/liahona/vectors/load")
+    @app.post("/v1/saklas/vectors/load")
     def load_vector(req: LoadVectorRequest):
         try:
             profile = session.load_profile(req.path)
@@ -438,7 +438,7 @@ def _register_routes(app: FastAPI) -> None:
             "default_alpha": req.alpha,
         }
 
-    @app.delete("/v1/liahona/vectors/{name}")
+    @app.delete("/v1/saklas/vectors/{name}")
     def delete_vector(name: str):
         if name not in session.vectors:
             raise HTTPException(404, f"Vector '{name}' not found")
@@ -450,7 +450,7 @@ def _register_routes(app: FastAPI) -> None:
     # Probe management
     # -----------------------------------------------------------------------
 
-    @app.get("/v1/liahona/probes")
+    @app.get("/v1/saklas/probes")
     def list_probes():
         probes = session.probes
         monitor = session._monitor
@@ -465,11 +465,11 @@ def _register_routes(app: FastAPI) -> None:
             out[name] = entry
         return {"probes": out}
 
-    @app.get("/v1/liahona/probes/defaults")
+    @app.get("/v1/saklas/probes/defaults")
     def list_default_probes():
         return {"defaults": load_defaults()}
 
-    @app.post("/v1/liahona/probes/{name}")
+    @app.post("/v1/saklas/probes/{name}")
     def activate_probe(name: str, req: ActivateProbeRequest | None = None):
         profile = None
         if req and req.profile_path:
@@ -480,7 +480,7 @@ def _register_routes(app: FastAPI) -> None:
         session.monitor(name, profile)
         return {"name": name, "active": True}
 
-    @app.delete("/v1/liahona/probes/{name}")
+    @app.delete("/v1/saklas/probes/{name}")
     def deactivate_probe(name: str):
         if name not in session.probes:
             raise HTTPException(404, f"Probe '{name}' not active")
@@ -491,7 +491,7 @@ def _register_routes(app: FastAPI) -> None:
     # Session management
     # -----------------------------------------------------------------------
 
-    @app.get("/v1/liahona/session")
+    @app.get("/v1/saklas/session")
     def get_session():
         info = session.model_info
         return {
@@ -512,7 +512,7 @@ def _register_routes(app: FastAPI) -> None:
             "history_length": len(session.history),
         }
 
-    @app.patch("/v1/liahona/session")
+    @app.patch("/v1/saklas/session")
     def patch_session(req: PatchSessionRequest):
         if req.temperature is not None:
             session.config.temperature = req.temperature
@@ -524,12 +524,12 @@ def _register_routes(app: FastAPI) -> None:
             session.config.system_prompt = req.system_prompt
         return {"status": "ok"}
 
-    @app.post("/v1/liahona/session/clear")
+    @app.post("/v1/saklas/session/clear")
     def clear_session():
         session.clear_history()
         return JSONResponse(status_code=204, content=None)
 
-    @app.post("/v1/liahona/session/rewind")
+    @app.post("/v1/saklas/session/rewind")
     def rewind_session():
         if not session.history:
             raise HTTPException(400, "History is empty")

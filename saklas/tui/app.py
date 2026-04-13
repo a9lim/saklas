@@ -1,4 +1,4 @@
-"""Main Textual application for liahona."""
+"""Main Textual application for saklas."""
 
 from __future__ import annotations
 
@@ -13,13 +13,13 @@ from textual.containers import Horizontal
 from textual.widgets import Input
 from textual.timer import Timer
 
-from liahona.generation import GenerationState, build_chat_input, generate_steered, supports_thinking
-from liahona.model import _get_memory_gb
-from liahona.probes_bootstrap import load_defaults
-from liahona.session import MIN_ELAPSED_FOR_RATE
-from liahona.tui.chat_panel import ChatPanel
-from liahona.tui.vector_panel import LeftPanel, MAX_ALPHA
-from liahona.tui.trait_panel import TraitPanel
+from saklas.generation import GenerationState, build_chat_input, generate_steered, supports_thinking
+from saklas.model import _get_memory_gb
+from saklas.probes_bootstrap import load_defaults
+from saklas.session import MIN_ELAPSED_FOR_RATE
+from saklas.tui.chat_panel import ChatPanel
+from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
+from saklas.tui.trait_panel import TraitPanel
 
 DEFAULT_ALPHA = 0.36
 _POLL_FPS = 15
@@ -29,7 +29,7 @@ _TOKEN_DRAIN_LIMIT = 20
 _LEFT, _CHAT, _TRAIT = 0, 1, 2
 
 
-class LiahonaApp(App):
+class SaklasApp(App):
     CSS_PATH = "styles.tcss"
     ENABLE_COMMAND_PALETTE = False
 

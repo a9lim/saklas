@@ -31,5 +31,5 @@ Thumbs.db
 docs/superpowers/
 
 # Model/probe caches (large binary files)
-liahona/probes/cache/
-liahona/datasets/cache/
+saklas/probes/cache/
+saklas/datasets/cache/

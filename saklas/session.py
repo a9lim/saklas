@@ -1,4 +1,4 @@
-"""LiahonaSession — unified backend for liahona's programmatic API and TUI."""
+"""SaklasSession — unified backend for saklas's programmatic API and TUI."""
 from __future__ import annotations
 import json
 import pathlib
@@ -10,14 +10,14 @@ from typing import Callable, Iterator
 
 import torch
 
-from liahona.datasource import DataSource
-from liahona.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
-from liahona.hooks import SteeringManager
-from liahona.model import load_model, get_layers, get_model_info
-from liahona.monitor import TraitMonitor
-from liahona.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, load_defaults
-from liahona.results import GenerationResult, TokenEvent, ProbeReadings
-from liahona.vectors import (
+from saklas.datasource import DataSource
+from saklas.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
+from saklas.hooks import SteeringManager
+from saklas.model import load_model, get_layers, get_model_info
+from saklas.monitor import TraitMonitor
+from saklas.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, load_defaults
+from saklas.results import GenerationResult, TokenEvent, ProbeReadings
+from saklas.vectors import (
     extract_contrastive,
     save_profile as _save_profile,
     load_profile as _load_profile,
@@ -46,7 +46,7 @@ class ConcurrentGenerationError(RuntimeError):
     pass
 
 
-class LiahonaSession:
+class SaklasSession:
     """Unified backend for activation steering, monitoring, and generation.
 
     Vectors are registered via steer() and applied per-generation via the
