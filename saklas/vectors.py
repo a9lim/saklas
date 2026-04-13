@@ -487,19 +487,18 @@ def get_cache_path(
 
 
 def load_contrastive_pairs(dataset_path: str) -> dict:
-    """Load a contrastive-pairs JSON dataset.
+    """Load a contrastive-pairs JSON file.
 
-    Expected schema::
+    Accepts two shapes:
+      - bare list: [{"positive": ..., "negative": ...}, ...]
+        (new format — statements.json in concept folders)
+      - legacy object: {"name": ..., "pairs": [...]}
+        (old saklas/datasets/<name>.json schema)
 
-        {
-            "name": str,
-            "description": str,
-            "category": str,
-            "pairs": [{"positive": str, "negative": str}, ...]
-        }
-
-    Returns:
-        The parsed dict.
+    Returns a dict with at least a ``"pairs"`` key.
     """
     with open(dataset_path) as f:
-        return json.load(f)
+        data = json.load(f)
+    if isinstance(data, list):
+        return {"pairs": data}
+    return data
