@@ -242,6 +242,30 @@ def test_version_mismatch_detection():
     assert packs.version_mismatch(sc3, current="2.0.0") is True
 
 
+def test_save_load_profile_roundtrip_slim_sidecar(tmp_path):
+    import torch
+    from saklas.vectors import save_profile, load_profile
+    profile = {
+        0: (torch.randn(8), 0.12),
+        14: (torch.randn(8), 0.44),
+    }
+    path = tmp_path / "google__gemma-2-2b-it.safetensors"
+    save_profile(profile, str(path), {
+        "method": "contrastive_pca",
+        "statements_sha256": "abc",
+    })
+    loaded, meta = load_profile(str(path))
+    assert sorted(loaded.keys()) == [0, 14]
+    assert meta["method"] == "contrastive_pca"
+    assert meta["statements_sha256"] == "abc"
+    assert "scores" in meta
+    assert "saklas_version" in meta
+    # No legacy keys:
+    assert "concept" not in meta
+    assert "model_id" not in meta
+    assert "num_pairs" not in meta
+
+
 def test_bundled_concept_names_includes_happy():
     names = packs.bundled_concept_names()
     assert "happy" in names
