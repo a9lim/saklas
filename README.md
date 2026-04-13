@@ -150,7 +150,7 @@ saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 | `-p`, `--probes` | Categories: `all`, `none`, `emotion`, `personality`, `safety`, `cultural`, `gender` |
 | `-s`, `--system-prompt` | System prompt |
 | `--max-tokens` | Max tokens per generation (default: 1024) |
-| `-i`, `--install <target>` | Install a pack from HF coordinate (`<ns>/<name>`) or local folder path |
+| `-i`, `--install <target>` | Install a pack from HF coordinate (`<ns>/<name>[@revision]`) or local folder path. Revision can be a git tag, branch, or commit SHA; pinned installs are preserved on refresh. |
 | `-r`, `--refresh <selector>` | Re-pull concept(s) from source (repeatable; silently skips `source=local`) |
 | `-n`, `--refresh-neutrals` | Overwrite `~/.saklas/neutral_statements.json` with the bundled copy (forces layer-means recompute) |
 | `-x`, `--clear-tensors <selector>` | Delete tensors for matched concepts; keeps `statements.json` (repeatable) |

@@ -1,8 +1,9 @@
 """Hugging Face Hub consumption wrappers for saklas pack distribution.
 
-Pack repo convention: any HF repo containing ``pack.json`` at root, plus
-``statements.json`` and/or ``<safe_model_id>.safetensors`` + ``.json`` sidecars.
-Repo type is tried as ``dataset`` first, falling back to ``model``.
+Pack repo convention: an HF **model** repo containing ``pack.json`` at root,
+plus ``statements.json`` and/or ``<safe_model_id>.safetensors`` + ``.json``
+sidecars. Packs are steering-vector artifacts tied to a base model, so the
+model-hub repo type is the canonical home.
 """
 from __future__ import annotations
 
@@ -19,33 +20,32 @@ class HFError(RuntimeError):
 
 
 _HF_SEARCH_CAP = 20
-_REPO_TYPES = ("dataset", "model")
 
 
-def _try_repo_types(fn, error_label: str):
-    """Call fn(repo_type) for each HF repo_type, returning the first success.
+def split_revision(target: str) -> tuple[str, Optional[str]]:
+    """Split an ``owner/name@revision`` target into (coord, revision).
 
-    Raises HFError with error_label and the last underlying exception if none
-    of the repo types succeed.
+    Revisions can be any git ref HF accepts: tag, branch, or commit SHA.
+    Concept names are restricted to ``[a-z][a-z0-9-]*``, so ``@`` is
+    unambiguous as a separator.
     """
-    last_err: Exception | None = None
-    for repo_type in _REPO_TYPES:
-        try:
-            return fn(repo_type)
-        except Exception as e:
-            last_err = e
-    raise HFError(f"{error_label} ({last_err})")
+    if "@" not in target:
+        return target, None
+    coord, _, rev = target.partition("@")
+    if not rev:
+        raise HFError(f"empty revision after '@' in {target!r}")
+    return coord, rev
 
 
-def _hf_snapshot_download(repo_id: str, repo_type: str, **kwargs) -> str:
+def _hf_snapshot_download(repo_id: str, **kwargs) -> str:
     """Thin indirection so tests can monkeypatch."""
     from huggingface_hub import snapshot_download
-    return snapshot_download(repo_id=repo_id, repo_type=repo_type, **kwargs)
+    return snapshot_download(repo_id=repo_id, repo_type="model", **kwargs)
 
 
-def _hf_hub_download(repo_id: str, filename: str, repo_type: str, **kwargs) -> str:
+def _hf_hub_download(repo_id: str, filename: str, **kwargs) -> str:
     from huggingface_hub import hf_hub_download
-    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type, **kwargs)
+    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type="model", **kwargs)
 
 
 def _hf_api():
@@ -53,21 +53,36 @@ def _hf_api():
     return HfApi()
 
 
-def _download(coord: str, allow_patterns: Optional[list[str]] = None) -> str:
-    """Snapshot-download <ns>/<concept>, trying dataset first then model."""
-    return _try_repo_types(
-        lambda repo_type: _hf_snapshot_download(
-            repo_id=coord,
-            repo_type=repo_type,
-            allow_patterns=allow_patterns,
-        ),
-        error_label=f"{coord}: not found as dataset or model",
-    )
+def _download(
+    coord: str,
+    allow_patterns: Optional[list[str]] = None,
+    revision: Optional[str] = None,
+) -> str:
+    """Snapshot-download <ns>/<concept> from the HF model hub."""
+    kwargs: dict = {"repo_id": coord, "allow_patterns": allow_patterns}
+    if revision is not None:
+        kwargs["revision"] = revision
+    try:
+        return _hf_snapshot_download(**kwargs)
+    except Exception as e:
+        label = f"{coord}@{revision}" if revision else coord
+        raise HFError(f"{label}: not found ({e})") from e
 
 
-def pull_pack(coord: str, target_folder: Path, *, force: bool) -> Path:
-    """Download <coord> from HF and install into target_folder."""
-    tmp_dir = Path(_download(coord))
+def pull_pack(
+    coord: str,
+    target_folder: Path,
+    *,
+    force: bool,
+    revision: Optional[str] = None,
+) -> Path:
+    """Download <coord> from HF and install into target_folder.
+
+    If ``revision`` is given, pin to that git ref (tag, branch, or commit SHA)
+    and record it in the installed pack's ``source`` field so refresh re-pulls
+    the same revision.
+    """
+    tmp_dir = Path(_download(coord, revision=revision))
     if not (tmp_dir / "pack.json").is_file():
         raise HFError(f"{coord}: not a saklas pack (no pack.json at repo root)")
 
@@ -90,13 +105,13 @@ def pull_pack(coord: str, target_folder: Path, *, force: bool) -> Path:
         if entry.is_file() and entry.name != "pack.json":
             (target_folder / entry.name).write_bytes(entry.read_bytes())
 
-    meta.source = f"hf://{coord}"
+    meta.source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
     meta.write(target_folder)
     return target_folder
 
 
 def search_packs(selector) -> list[dict]:
-    """Search HF for saklas-pack-tagged repos matching the selector.
+    """Search HF for saklas-pack-tagged model repos matching the selector.
 
     Returns a list of row dicts ready for display. At most _HF_SEARCH_CAP rows.
     """
@@ -120,12 +135,12 @@ def search_packs(selector) -> list[dict]:
         kwargs["search"] = search_text
 
     try:
-        results = list(api.list_datasets(**kwargs))
+        results = list(api.list_models(**kwargs))
     except TypeError:
         # Older huggingface_hub uses `tags` instead of `filter`.
         kwargs.pop("filter", None)
         kwargs["tags"] = required_tags
-        results = list(api.list_datasets(**kwargs))
+        results = list(api.list_models(**kwargs))
 
     rows: list[dict] = []
     for r in results[:_HF_SEARCH_CAP]:
@@ -135,7 +150,7 @@ def search_packs(selector) -> list[dict]:
         else:
             ns, nm = "", coord
 
-        # Pull whatever metadata list_datasets already gave us; only pay for a
+        # Pull whatever metadata list_models already gave us; only pay for a
         # fetch_info() call if fields we need for display are actually missing.
         raw_tags = getattr(r, "tags", None) or []
         tags = [str(t) for t in raw_tags] if isinstance(raw_tags, (list, tuple)) else []
@@ -175,28 +190,36 @@ def search_packs(selector) -> list[dict]:
     return rows
 
 
-def fetch_info(coord: str) -> dict:
+def fetch_info(coord: str, revision: Optional[str] = None) -> dict:
     """Fetch minimal info about an HF saklas pack without downloading the whole repo."""
-    def _attempt(repo_type: str) -> dict:
-        pj_path = _hf_hub_download(coord, "pack.json", repo_type=repo_type)
+    label = f"{coord}@{revision}" if revision else coord
+    try:
+        dl_kwargs: dict = {}
+        if revision is not None:
+            dl_kwargs["revision"] = revision
+        pj_path = _hf_hub_download(coord, "pack.json", **dl_kwargs)
         with open(pj_path) as f:
             data = json.load(f)
         api = _hf_api()
-        files = api.list_repo_files(repo_id=coord, repo_type=repo_type)
-        tensor_models = sorted(
-            Path(f).stem for f in files
-            if f.endswith(".safetensors")
-        )
-        ns, _, nm = coord.partition("/")
-        return {
-            "name": data.get("name", nm),
-            "namespace": ns,
-            "description": data.get("description", ""),
-            "long_description": data.get("long_description", ""),
-            "tags": data.get("tags", []),
-            "recommended_alpha": data.get("recommended_alpha", 0.0),
-            "tensor_models": tensor_models,
-            "files": list(files),
-        }
+        list_kwargs: dict = {"repo_id": coord, "repo_type": "model"}
+        if revision is not None:
+            list_kwargs["revision"] = revision
+        files = api.list_repo_files(**list_kwargs)
+    except Exception as e:
+        raise HFError(f"{label}: fetch_info failed ({e})") from e
 
-    return _try_repo_types(_attempt, error_label=f"{coord}: fetch_info failed")
+    tensor_models = sorted(
+        Path(f).stem for f in files
+        if f.endswith(".safetensors")
+    )
+    ns, _, nm = coord.partition("/")
+    return {
+        "name": data.get("name", nm),
+        "namespace": ns,
+        "description": data.get("description", ""),
+        "long_description": data.get("long_description", ""),
+        "tags": data.get("tags", []),
+        "recommended_alpha": data.get("recommended_alpha", 0.0),
+        "tensor_models": tensor_models,
+        "files": list(files),
+    }

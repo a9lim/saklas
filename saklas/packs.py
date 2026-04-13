@@ -41,8 +41,6 @@ class PackMetadata:
     source: str
     files: dict[str, str]
     long_description: str = ""
-    signature: Optional[str] = None
-    signature_method: Optional[str] = None
 
     @classmethod
     def load(cls, folder: Path) -> "PackMetadata":
@@ -75,8 +73,6 @@ class PackMetadata:
             recommended_alpha=float(data["recommended_alpha"]),
             source=data["source"],
             files=dict(data["files"]),
-            signature=data.get("signature"),
-            signature_method=data.get("signature_method"),
         )
 
     def to_dict(self) -> dict:
@@ -93,8 +89,6 @@ class PackMetadata:
             "recommended_alpha": self.recommended_alpha,
             "source": self.source,
             "files": self.files,
-            "signature": self.signature,
-            "signature_method": self.signature_method,
         })
         return out
 

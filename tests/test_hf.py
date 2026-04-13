@@ -21,37 +21,74 @@ def _fake_repo(tmp_path, name="happy"):
     return repo
 
 
-def test_snapshot_download_dataset_first(tmp_path, monkeypatch):
+def test_snapshot_download_uses_model_repo_type(tmp_path, monkeypatch):
     fake = _fake_repo(tmp_path)
     calls = []
 
-    def fake_dl(repo_id, repo_type, **kwargs):
-        calls.append((repo_id, repo_type))
+    def fake_dl(repo_id, **kwargs):
+        calls.append(repo_id)
         return str(fake)
 
     monkeypatch.setattr(hf, "_hf_snapshot_download", fake_dl)
     path = hf._download("user/happy")
-    assert calls[0] == ("user/happy", "dataset")
+    assert calls == ["user/happy"]
     assert Path(path).is_dir()
 
 
-def test_snapshot_download_falls_back_to_model(tmp_path, monkeypatch):
-    fake = _fake_repo(tmp_path)
-    calls = []
+def test_split_revision_plain():
+    assert hf.split_revision("user/happy") == ("user/happy", None)
 
-    def fake_dl(repo_id, repo_type, **kwargs):
-        calls.append((repo_id, repo_type))
-        if repo_type == "dataset":
-            raise RuntimeError("not a dataset")
+
+def test_split_revision_with_tag():
+    assert hf.split_revision("user/happy@v1.2.0") == ("user/happy", "v1.2.0")
+
+
+def test_split_revision_with_sha():
+    assert hf.split_revision("user/happy@abcdef0") == ("user/happy", "abcdef0")
+
+
+def test_split_revision_empty_rev_errors():
+    with pytest.raises(hf.HFError, match="empty revision"):
+        hf.split_revision("user/happy@")
+
+
+def test_download_passes_revision(tmp_path, monkeypatch):
+    fake = _fake_repo(tmp_path)
+    captured = {}
+
+    def fake_dl(**kwargs):
+        captured.update(kwargs)
+        return str(fake)
+
+    monkeypatch.setattr(hf, "_hf_snapshot_download", fake_dl)
+    hf._download("user/happy", revision="v1.2.0")
+    assert captured["revision"] == "v1.2.0"
+
+
+def test_download_omits_revision_when_none(tmp_path, monkeypatch):
+    fake = _fake_repo(tmp_path)
+    captured = {}
+
+    def fake_dl(**kwargs):
+        captured.update(kwargs)
         return str(fake)
 
     monkeypatch.setattr(hf, "_hf_snapshot_download", fake_dl)
     hf._download("user/happy")
-    assert [c[1] for c in calls] == ["dataset", "model"]
+    assert "revision" not in captured
 
 
-def test_snapshot_download_both_fail_raises(monkeypatch):
-    def fake_dl(repo_id, repo_type, **kwargs):
+def test_pull_pack_records_revision_in_source(tmp_path, monkeypatch):
+    fake = _fake_repo(tmp_path)
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(fake))
+    target = tmp_path / "installed" / "happy"
+    hf.pull_pack("user/happy", target_folder=target, force=False, revision="v1.2.0")
+    m = packs.PackMetadata.load(target)
+    assert m.source == "hf://user/happy@v1.2.0"
+
+
+def test_snapshot_download_failure_raises(monkeypatch):
+    def fake_dl(repo_id, **kwargs):
         raise RuntimeError("no such repo")
     monkeypatch.setattr(hf, "_hf_snapshot_download", fake_dl)
     with pytest.raises(hf.HFError, match="not found"):
@@ -85,7 +122,7 @@ def test_search_packs_bare_query(monkeypatch):
         MagicMock(id="other/angry", tags=["saklas-pack", "emotion"]),
     ]
     api = MagicMock()
-    api.list_datasets.return_value = fake_results
+    api.list_models.return_value = fake_results
     monkeypatch.setattr(hf, "_hf_api", lambda: api)
 
     monkeypatch.setattr(hf, "fetch_info", lambda coord: {
@@ -99,21 +136,21 @@ def test_search_packs_bare_query(monkeypatch):
     from saklas.cli_selectors import parse as sparse
     rows = hf.search_packs(sparse("calm"))
     assert len(rows) == 2
-    api.list_datasets.assert_called_once()
-    kwargs = api.list_datasets.call_args.kwargs
+    api.list_models.assert_called_once()
+    kwargs = api.list_models.call_args.kwargs
     filter_arg = kwargs.get("filter") or kwargs.get("tags") or []
     assert "saklas-pack" in filter_arg
 
 
 def test_search_packs_tag_filter(monkeypatch):
     api = MagicMock()
-    api.list_datasets.return_value = []
+    api.list_models.return_value = []
     monkeypatch.setattr(hf, "_hf_api", lambda: api)
     monkeypatch.setattr(hf, "fetch_info", lambda coord: {})
 
     from saklas.cli_selectors import parse as sparse
     hf.search_packs(sparse("tag:emotion"))
-    kwargs = api.list_datasets.call_args.kwargs
+    kwargs = api.list_models.call_args.kwargs
     filter_arg = kwargs.get("filter") or kwargs.get("tags") or []
     assert "emotion" in filter_arg
 
@@ -131,7 +168,7 @@ def test_fetch_info_reads_pack_json(tmp_path, monkeypatch):
         "files": {},
     }))
 
-    def fake_download(repo_id, filename, repo_type, **kwargs):
+    def fake_download(repo_id, filename, **kwargs):
         assert filename == "pack.json"
         return str(pj)
 

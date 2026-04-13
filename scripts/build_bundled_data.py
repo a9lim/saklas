@@ -63,8 +63,6 @@ def main() -> int:
             "files": {
                 "statements.json": sha256(stmts_bytes),
             },
-            "signature": None,
-            "signature_method": None,
         }
         (concept_dir / "pack.json").write_text(json.dumps(pack, indent=2) + "\n")
         count += 1
