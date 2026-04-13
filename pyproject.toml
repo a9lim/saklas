@@ -43,7 +43,7 @@ Homepage = "https://github.com/a9lim/saklas"
 bnb = ["bitsandbytes>=0.43"]
 flash = ["flash-attn>=2.5"]
 cuda = ["bitsandbytes>=0.43", "flash-attn>=2.5"]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+dev = ["pytest>=8.0", "httpx>=0.28.1"]
 serve = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
 hf = ["datasets>=2.0"]
 pandas = ["pandas>=2.0"]
