@@ -213,3 +213,30 @@ def test_concept_folder_load_tampered_errors(tmp_path):
     (d / "statements.json").write_text("[{}]")  # mutate, breaks hash
     with pytest.raises(packs.PackFormatError, match="integrity"):
         packs.ConceptFolder.load(d)
+
+
+def test_is_stale_statements_changed(tmp_path):
+    d = _make_concept(tmp_path, with_statements=True, with_tensor=True)
+    cf = packs.ConceptFolder.load(d)
+    sc = cf.sidecar("google__gemma-2-2b-it")
+    stale = packs.is_stale(
+        current_statements_sha=packs.hash_file(d / "statements.json"),
+        sidecar=sc,
+    )
+    assert stale is False
+    stale = packs.is_stale(current_statements_sha="deadbeef", sidecar=sc)
+    assert stale is True
+
+
+def test_is_stale_no_statements():
+    sc = packs.Sidecar(method="merge", scores={0: 0.1}, saklas_version="2.0.0")
+    assert packs.is_stale(current_statements_sha=None, sidecar=sc) is False
+
+
+def test_version_mismatch_detection():
+    sc = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="1.9.9")
+    assert packs.version_mismatch(sc, current="2.0.0") is True
+    sc2 = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="2.0.3")
+    assert packs.version_mismatch(sc2, current="2.0.0") is False
+    sc3 = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="2.1.0")
+    assert packs.version_mismatch(sc3, current="2.0.0") is True
