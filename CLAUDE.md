@@ -14,8 +14,10 @@ pip install -e ".[serve]"        # fastapi + uvicorn (for API server)
 saklas <model_id>               # launch TUI
 saklas serve <model_id>         # launch OpenAI-compatible API server
 python -m saklas <model_id>     # alt entry point
-saklas -x                       # clear custom cache (user-extracted vectors + generated statements)
-saklas -X                       # clear all cache (including curated probes + layer means)
+saklas -x <selector>            # delete tensors for matched concepts (keeps statements)
+saklas -r <selector>            # re-pull concepts from source (bundled or HF)
+saklas -i <ns>/<concept>        # install a pack from HF or a local folder path
+saklas -l [selector]            # list or info-dump packs (installed + HF); exits
 pytest tests/test_smoke.py -v    # CUDA smoke tests (downloads gemma-2-2b-it ~5GB)
 pytest tests/ -v                 # all tests (non-CUDA tests run anywhere)
 ```
@@ -30,7 +32,45 @@ python3 -m build                   # creates dist/saklas-X.Y.Z.tar.gz + .whl
 twine upload dist/*                # uploads using ~/.pypirc token
 ```
 
-`probes/defaults.json` is included via `[tool.setuptools.package-data]`. The `probes/cache/` directory (model-specific tensors) is not shipped.
+`saklas/data/**/*.json` is included via `[tool.setuptools.package-data]`. The user cache under `~/.saklas/` is not shipped; it's materialized on first run by copying `saklas/data/` into `~/.saklas/`.
+
+## Cache layout
+
+All cache state lives under `~/.saklas/` (override via `SAKLAS_HOME` env var):
+
+```
+~/.saklas/
+  neutral_statements.json                 # user-editable; materialized from saklas/data/
+  vectors/
+    default/                              # bundled-from-pip concepts (source=bundled, -r default)
+      <concept>/
+        pack.json                         # name, description, tags, recommended_alpha, source, files{sha256}
+        statements.json                   # bare contrastive-pair list
+        <safe_model_id>.safetensors       # extracted per-model tensor
+        <safe_model_id>.json              # slim sidecar: method/scores/saklas_version/statements_sha256
+    local/                                # user-authored / merged concepts (source=local, -r errors)
+    <hf_owner>/                           # HF-pulled concepts (source=hf://<owner>/<name>)
+  models/
+    <safe_model_id>/                      # per-model derived artifacts
+      layer_means.safetensors
+      layer_means.json
+```
+
+Namespace resolution is optional: bare selectors (`happy`) resolve across all
+namespaces and raise `AmbiguousSelectorError` on collision. Fully-qualified
+selectors (`a9lim/happy`) are always unambiguous. Selector grammar shared by
+`-r`, `-x`, `-l`, `parse_args`: `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`,
+`model:<id>`, `default`, `all`. `model:` is a resource scope that AND-combines
+with the concept selector.
+
+Integrity: every `pack.json` carries a `files` map of relative-path → sha256.
+`ConceptFolder.load` verifies the map on every load. Per-tensor sidecars record
+`statements_sha256` at extraction time; when the current statements hash
+differs, `is_stale` flags the tensor and the CLI warns.
+
+Signing is out of scope for Story A. `pack.json` reserves null `signature` and
+`signature_method` fields as forward-compatibility hooks for v2 Ed25519 TOFU
+signing (see `docs/superpowers/specs/2026-04-12-story-a-portability-design.md`).
 
 ## Architecture
 
@@ -39,14 +79,14 @@ Five layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 ### Model + Vector layer
 - `model.py` — Loads HF causal LMs. `_LAYER_ACCESSORS` maps `model_type` to layer-list accessor functions (`def`, not lambdas); add new architectures here. Cascading fallbacks: SDPA → eager attention, dtype → fp16/fp32, device → CPU (for weight conversion) then `.to(target)`. `_load_text_from_multimodal`: extracts text-only model from multimodal checkpoints (e.g. Ministral tagged as Mistral3) — creates model with `torch.device(target)`, loads safetensors shards with `language_model.` prefix stripping, dequantizes FP8 weights inline. Patches `torch.histc` for MPS integer tensor support (MoE routing). Uses `log.info()` for device/memory reporting.
 - `vectors.py` — Per-prompt forward passes (no batching). `_capture_all_hidden_states` hooks every layer in one pass. `_encode_and_capture_all` handles tokenization, chat-template wrapping, attention-weighted pooling (falls back to last-token pooling on OOM). `extract_contrastive`: 2N passes for N pairs, casts to float32 before differencing (fp16 subtraction loses precision), `_mps` and `diff_device` computed once at top of function. Multi-pair: per-layer SVD extracts first principal component, scored by explained variance ratio. Single-pair: scores as `diff_norm / activation_norm` (ratio of contrast to activation magnitude), producing values in the same range as explained-variance-ratio (~0.01–0.4) so single-pair and multi-pair profiles contribute comparably. Normalization iterates `profile.items()` directly (no separate scores dict). MPS cache flushed between pairs. Returns a **profile**: `dict[int, (Tensor, score)]` mapping every layer to direction + signal strength. Profiles saved as `.safetensors` + `.json` sidecar (`save_profile` builds both dicts in a single loop). `compute_layer_means`: 45 neutral prompts → per-layer mean hidden state for centering. `_template_overhead_cache` is keyed by `id(tokenizer)` — safe only when one tokenizer lives for the session lifetime (object IDs can be reused after GC).
-- `probes_bootstrap.py` — Loads/extracts probe profiles per `saklas/probes/defaults.json`. 28 probes across 5 categories (emotion, personality, safety, cultural, gender). `load_defaults()` (public, `@functools.cache`) returns the defaults dict. `bootstrap_layer_means`: loads or computes per-layer mean activations, cached as `_LAYERMEANS.safetensors` per model. MPS cache flushed between probe extractions.
+- `probes_bootstrap.py` — Walks `~/.saklas/vectors/default/` (after triggering first-run `materialize_bundled()`). 28 bundled probes live as per-concept folders under `saklas/data/vectors/<concept>/` in the wheel. `load_defaults()` groups concepts by `pack.json.tags`. `bootstrap_layer_means`: loads or computes per-layer mean activations, cached at `~/.saklas/models/<safe_model_id>/layer_means.safetensors` with a slim sidecar. Stale if `~/.saklas/neutral_statements.json` has changed since extraction. MPS cache flushed between probe extractions.
 
 ### Steering + Monitoring layer
 - `hooks.py` — `SteeringHook` adds pre-composed vector to hidden states in-place. `SteeringManager` groups vectors by layer, orthogonalizes per layer (Gram-Schmidt), one hook per active layer. Vectors registered via `add_vector(name, profile, alpha)` — activation controlled by the session clearing and re-adding vectors, not by a toggle flag.
 - `monitor.py` — `TraitMonitor` scores all probes against a set of per-layer hidden states. Core scoring logic in `_score_probes(hidden_per_layer)`: mean-centers hidden states (subtracting per-layer means computed from neutral prompts) before computing score-weighted cosine similarities (both norms: `(h @ v) / (|h| * |v|)`) against probe vectors. `total_w` only accumulates scores for layers present in the hidden-state dict. One value per probe per generation, computed and recorded in a single loop. Two entry points: `measure(model, tokenizer, layers, text)` runs a forward pass with attention-weighted pooling (via `_encode_and_capture_all`) and feeds the result to `_score_probes`; `measure_from_hidden(hidden_per_layer)` scores from pre-captured hidden states directly (no forward pass). The session and TUI use `measure()` after generation, running a separate attention-weighted forward pass to score probes consistently with how probe vectors were extracted. History accumulates across generations (not reset per call). `probe_names` is a property over `_raw_profiles.keys()` (no separate list). `profiles` and `layer_means` properties return the underlying dicts directly (no defensive copies).
 
 ### Session API layer
-- `session.py` — `SaklasSession` is the programmatic API and the TUI's backend. Owns model, vector registry (`_profiles`), monitor, generation config, conversation history. Public accessors: `model_id` property, `has_vector(name)` method, `model_info` dict. Key design: **vectors are registered without alphas** via `steer(name, profile)`, alphas are supplied per-generation via `generate(input, alphas={"name": 0.5})`. No persistent steering hooks between generations. Orthogonalize and thinking are per-call parameters. `thinking=True` enables thinking/reasoning mode for models that support it (gated by `supports_thinking`); the session decodes only the response portion (`generated_ids[thinking_end_idx:]`) for conversation history. `_generation_preamble()` deduplicates setup shared between blocking and streaming paths (use_thinking, prepare_input, gen_state reset, apply_steering). After generation, probe scoring runs a separate attention-weighted forward pass via `monitor.measure()` to match the pooling used during probe extraction. Streaming uses a worker thread that puts `None` on the queue in its `finally` block as the done sentinel. Full extraction pipeline: cache → curated dataset → statement cache → model-generated pairs → contrastive PCA → save. Statement cache is model-independent (stored under `datasets/cache/`), so generated pairs are reused across models. `_PAIR_RE` is compiled at module level. `MIN_ELAPSED_FOR_RATE` is a public constant.
+- `session.py` — `SaklasSession` is the programmatic API and the TUI's backend. Owns model, vector registry (`_profiles`), monitor, generation config, conversation history. Public accessors: `model_id` property, `has_vector(name)` method, `model_info` dict. Key design: **vectors are registered without alphas** via `steer(name, profile)`, alphas are supplied per-generation via `generate(input, alphas={"name": 0.5})`. No persistent steering hooks between generations. Orthogonalize and thinking are per-call parameters. `thinking=True` enables thinking/reasoning mode for models that support it (gated by `supports_thinking`); the session decodes only the response portion (`generated_ids[thinking_end_idx:]`) for conversation history. `_generation_preamble()` deduplicates setup shared between blocking and streaming paths (use_thinking, prepare_input, gen_state reset, apply_steering). After generation, probe scoring runs a separate attention-weighted forward pass via `monitor.measure()` to match the pooling used during probe extraction. Streaming uses a worker thread that puts `None` on the queue in its `finally` block as the done sentinel. Full extraction pipeline: cache → curated dataset → statement cache → model-generated pairs → contrastive PCA → save. Curated concepts save under `~/.saklas/vectors/default/<concept>/<safe_model>.safetensors`; user-extracted concepts save under `~/.saklas/vectors/local/<tag>/`. Statement caches are model-independent (stored alongside the tensor folder as `statements.json`), so generated pairs are reused across models. Every save also refreshes the owning `pack.json` `files` sha256 map via `_update_local_pack_files`. `_PAIR_RE` is compiled at module level. `MIN_ELAPSED_FOR_RATE` is a public constant.
 - `datasource.py` — `DataSource` normalizes contrastive pairs from curated names, JSON, CSV, HF datasets, or raw Python lists. No `description` attribute.
 - `results.py` — `GenerationResult`, `TokenEvent`, `ProbeReadings` dataclasses with `to_dict()`. `TokenEvent` has a `thinking: bool` flag for thinking-mode tokens. `ProbeReadings` fields: `mean`, `std`, `min`, `max`, `per_generation` (one value per `measure()` call), `delta_per_gen` (mean absolute per-generation change). `ResultCollector` accumulates results for batch export (dicts, JSONL, CSV, DataFrame).
 
@@ -62,7 +102,7 @@ Five layers: **model/vector**, **steering/monitoring**, **session API**, **TUI**
 
 ### API server layer
 - `server.py` — FastAPI app factory. OpenAI-compatible endpoints (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) plus saklas-specific management (`/v1/saklas/vectors`, `/v1/saklas/probes`, `/v1/saklas/session`). Thin HTTP layer over `SaklasSession` — no business logic. Uses `session.model_id` for model identification. Model `created` timestamp captured once at app creation (`app.state.created_ts`). Steering params passed per-request via `steer` key in request body (includes `alphas`, `orthogonalize`, `thinking`), merged with server-startup defaults. `thinking` is wired through both chat and completions routes. `_stream_generation` is a unified SSE generator parameterized on `object_type` and `format_delta` — used by both chat and completions streaming. When thinking is enabled, streaming chat responses emit thinking tokens as `reasoning_content` in the delta (following OpenAI convention). Single session, 409 on concurrent generation. Vector extraction streaming is intentionally synchronous (progress replayed after completion) — the JSON path is the primary interface.
-- `cli.py` — Dispatches `saklas serve` vs default TUI mode. `_print_startup(args)` shared between both paths. `serve` subcommand accepts `--host`, `--port`, `--steer name:alpha`, `--cors`. Cache-clearing flags (`-x`/`--clear-custom`, `-X`/`--clear-all`) on the main parser bypass model loading: `-x` removes user-extracted vectors and generated statement pairs (keeps curated probes + layer means), `-X` removes everything. Custom vectors are identified by exclusion from `defaults.json` names + `_LAYERMEANS`. Statement cache lives at `datasets/cache/`.
+- `cli.py` — Dispatches `saklas serve` vs default TUI/cache/list modes. `_print_startup(args)` shared between TUI and serve. `serve` subcommand accepts `--host`, `--port`, `--steer name:alpha`, `--cors`. Main TUI parser takes the Story A flag grammar: `-r` (refresh), `-x` (clear-tensors), `-i` (install), `-l` (list — exits), `-m <name> <components>` (merge), `-C <path>` (config file), `--strict`. Cache ops compose with model load: `saklas -r default gemma-2-2b-it` refreshes then launches. `-l` is exit-only. `-r`/`-x`/`-i` use `action="append"` single-token semantics; compound selectors require repeated flags (e.g. `-x tag:emotion -x model:gemma-2-2b-it`). Config loading via `-C` composes multiple YAML files, applies flag overrides, auto-installs missing vectors (`ensure_vectors_installed`), and the composed vector map lands on `args.config_vectors` for `_run_tui` to register. `print_migration_notice_if_needed()` runs once at startup to flag legacy `probes/cache` / `~/.liahona` detritus.
 
 ## Performance rules
 
