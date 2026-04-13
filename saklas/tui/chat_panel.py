@@ -9,6 +9,46 @@ from textual.widget import Widget
 from textual.message import Message
 
 
+def _style_for_score(score: float) -> str | None:
+    """Map a probe score to a Rich-markup style, or None for no styling.
+
+    Two axes: positive → ansi_green, negative → ansi_red. Three intensity
+    buckets per side so strong / medium / mild activations are visually
+    distinguishable without leaving the 16-color ANSI palette the user
+    constrained us to.
+    """
+    a = abs(score)
+    if a < 0.05:
+        return None
+    if score > 0:
+        if a >= 0.5:
+            return "bold ansi_black on ansi_green"
+        if a >= 0.2:
+            return "ansi_green"
+        return "dim ansi_green"
+    if a >= 0.5:
+        return "bold ansi_black on ansi_red"
+    if a >= 0.2:
+        return "ansi_red"
+    return "dim ansi_red"
+
+
+def _escape_markup(s: str) -> str:
+    return s.replace("[", r"\[")
+
+
+def build_highlighted_markup(tokens: list[str], scores: list[float]) -> str:
+    out: list[str] = []
+    for tok, sc in zip(tokens, scores):
+        esc = _escape_markup(tok)
+        style = _style_for_score(sc)
+        if style is None:
+            out.append(esc)
+        else:
+            out.append(f"[{style}]{esc}[/]")
+    return "".join(out)
+
+
 class _AssistantMessage(Vertical):
     """Container with a label and Markdown widget for assistant messages.
 
@@ -28,6 +68,12 @@ class _AssistantMessage(Vertical):
         self._thinking_md: Markdown | None = None
         self._stream: Static | None = None
         self._md: Markdown | None = None
+        # Per-token data for highlight mode. Populated post-generation by
+        # the app worker from generated token ids; scores map probe name
+        # to a list aligned 1:1 with token_strings.
+        self._token_strings: list[str] | None = None
+        self._token_scores: dict[str, list[float]] | None = None
+        self._highlight_probe: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("[bold ansi_green]Assistant:[/]")
@@ -78,14 +124,61 @@ class _AssistantMessage(Vertical):
         self.update_thinking(self.thinking_text)
 
     def finalize(self) -> None:
-        """Switch from streaming Static to rendered Markdown."""
+        """Switch from streaming Static to rendered Markdown (or highlighted)."""
         if self._in_thinking:
             self.end_thinking()
+        if self._highlight_probe is not None and self._has_scores_for(self._highlight_probe):
+            self._render_highlighted()
+            return
+        self._render_markdown()
+
+    def _render_markdown(self) -> None:
         if self._md is not None and self.chat_text:
             self._md.update(self.chat_text)
             self._md.remove_class("hidden")
         if self._stream is not None:
             self._stream.add_class("hidden")
+
+    def _has_scores_for(self, probe: str) -> bool:
+        if self._token_scores is None or self._token_strings is None:
+            return False
+        arr = self._token_scores.get(probe)
+        return arr is not None and len(arr) == len(self._token_strings)
+
+    def _render_highlighted(self) -> None:
+        if self._highlight_probe is None or not self._has_scores_for(self._highlight_probe):
+            self._render_markdown()
+            return
+        markup = build_highlighted_markup(
+            self._token_strings or [],
+            (self._token_scores or {}).get(self._highlight_probe, []),
+        )
+        if self._stream is not None:
+            self._stream.update(markup)
+            self._stream.remove_class("hidden")
+        if self._md is not None:
+            self._md.add_class("hidden")
+
+    def set_token_data(
+        self,
+        token_strings: list[str],
+        token_scores: dict[str, list[float]],
+    ) -> None:
+        """Attach per-token strings and probe scores (called post-generation)."""
+        self._token_strings = list(token_strings)
+        self._token_scores = dict(token_scores)
+        if self._highlight_probe is not None:
+            self._render_highlighted()
+
+    def set_highlight(self, probe: str | None) -> None:
+        """Switch the widget into (or out of) highlighted rendering."""
+        self._highlight_probe = probe
+        if self._in_thinking:
+            return
+        if probe is None:
+            self._render_markdown()
+        else:
+            self._render_highlighted()
 
 
 class ChatPanel(Widget):

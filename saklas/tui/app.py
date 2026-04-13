@@ -45,6 +45,7 @@ class SaklasApp(App):
         Binding("ctrl+o", "toggle_ortho", "Ortho", show=False),
         Binding("ctrl+t", "toggle_thinking", "Think", show=False),
         Binding("ctrl+s", "cycle_sort", "Sort", show=False),
+        Binding("ctrl+h", "toggle_highlight", "Highlight", show=False),
         Binding("[", "temp_down", show=False),
         Binding("]", "temp_up", show=False),
         Binding("{", "top_p_down", show=False),
@@ -72,6 +73,11 @@ class SaklasApp(App):
         self._thinking: bool = self._supports_thinking
 
         self._current_assistant_widget = None
+        # All assistant-message widgets that currently live in the chat log,
+        # in insertion order. Used so highlight toggle / probe switching can
+        # re-render every past message, not just the most recent one.
+        self._assistant_widgets: list = []
+        self._highlight: bool = False
         self._poll_timer: Timer | None = None
         self._last_prompt: str | None = None
         self._ab_in_progress: bool = False
@@ -212,12 +218,14 @@ class SaklasApp(App):
             self._left_panel.select_next()
         elif self._focused_panel_idx == _TRAIT:
             self._trait_panel.nav_down()
+            self._refresh_highlight_probe()
 
     def action_nav_up(self) -> None:
         if self._focused_panel_idx == _LEFT:
             self._left_panel.select_prev()
         elif self._focused_panel_idx == _TRAIT:
             self._trait_panel.nav_up()
+            self._refresh_highlight_probe()
 
     def action_nav_left(self) -> None:
         self._adjust_alpha(-0.01)
@@ -332,7 +340,7 @@ class SaklasApp(App):
                 "/temp [val], /top-p [val], /max [n], /exit, /help\n"
                 "Keys: ⇥ focus · ←/→ alpha · ↑/↓ nav · ↩ toggle\n"
                 "⌫ remove · ⌃O ortho · ⌃T think · ⌃R regen · ⌃A A/B\n"
-                "[ ] temp · { } top-p · ⌃S sort · ⎋ stop · ⌃Q quit"
+                "[ ] temp · { } top-p · ⌃S sort · ⌃H highlight · ⎋ stop · ⌃Q quit"
             )
         else:
             chat.add_system_message(f"Unknown command: {cmd}. Type /help for commands.")
@@ -471,6 +479,7 @@ class SaklasApp(App):
     def _do_clear(self) -> None:
         self._session.clear_history()
         self._chat_panel.clear_log()
+        self._assistant_widgets.clear()
         self._trait_panel.update_values({}, {}, {})
         self._invalidate_vector_list()
         self._chat_panel.add_system_message("Chat history cleared.")
@@ -481,6 +490,12 @@ class SaklasApp(App):
             return
         self._session.rewind()
         self._chat_panel.rewind()
+        # Chat-panel rewind tears down widgets from the DOM — keep our
+        # assistant-widget list in sync so highlight toggles don't poke
+        # at detached nodes.
+        self._assistant_widgets = [
+            w for w in self._assistant_widgets if w.is_mounted
+        ]
         self._chat_panel.add_system_message("Rewound to before last message.")
 
     def _refresh_gen_config(self) -> None:
@@ -524,11 +539,20 @@ class SaklasApp(App):
         self._vram_poll_counter = 0
 
         self._current_assistant_widget = self._chat_panel.start_assistant_message()
+        self._assistant_widgets.append(self._current_assistant_widget)
+        # Apply the current highlight selection to the new widget so its
+        # finalize() picks the right branch once scores arrive.
+        if self._highlight:
+            self._current_assistant_widget._highlight_probe = (
+                self._trait_panel.get_selected_probe()
+            )
 
         # Snapshot alphas for this generation
         alphas = self._active_alphas()
 
         use_thinking = self._thinking
+        widget = self._current_assistant_widget
+        score_tokens_enabled = self._highlight
 
         def _generate():
             # Apply steering hooks for this generation
@@ -565,6 +589,19 @@ class SaklasApp(App):
                             self._session._layers, full_text,
                             device=self._session._device,
                         )
+                    if score_tokens_enabled and has_probes and widget is not None:
+                        try:
+                            per_token = self._session.score_tokens(response_ids)
+                            tok_strings = [
+                                self._session._tokenizer.decode([tid])
+                                for tid in response_ids
+                            ]
+                            # Attribute writes are thread-safe; finalize()
+                            # reads these after the None sentinel below.
+                            widget._token_strings = tok_strings
+                            widget._token_scores = per_token
+                        except Exception:
+                            pass
             finally:
                 if alphas:
                     self._session._clear_steering()
@@ -612,6 +649,8 @@ class SaklasApp(App):
                         if self._messages and self._messages[-1]["role"] == "assistant":
                             self._messages.pop()
                         chat.rewind_last_assistant()
+                        if self._assistant_widgets:
+                            self._assistant_widgets.pop()
                         self._start_generation()
                     elif pending[0] == "submit":
                         self._messages.append({"role": "user", "content": pending[1]})
@@ -622,6 +661,8 @@ class SaklasApp(App):
                         if self._messages and self._messages[-1]["role"] == "assistant":
                             self._messages.pop()
                         chat.rewind_last_assistant()
+                        if self._assistant_widgets:
+                            self._assistant_widgets.pop()
                         self._do_rewind()
                     elif pending[0] == "steer":
                         self._handle_steer(pending[1])
@@ -815,3 +856,23 @@ class SaklasApp(App):
 
     def action_cycle_sort(self) -> None:
         self._trait_panel.cycle_sort()
+
+    def action_toggle_highlight(self) -> None:
+        self._highlight = not self._highlight
+        probe = self._trait_panel.get_selected_probe() if self._highlight else None
+        for w in self._assistant_widgets:
+            w.set_highlight(probe)
+        if self._highlight:
+            tag = f" ({probe})" if probe else " (no probe selected)"
+            self._chat_panel.add_system_message(
+                f"Token highlight on{tag}. Scores will be computed for new generations."
+            )
+        else:
+            self._chat_panel.add_system_message("Token highlight off.")
+
+    def _refresh_highlight_probe(self) -> None:
+        if not self._highlight:
+            return
+        probe = self._trait_panel.get_selected_probe()
+        for w in self._assistant_widgets:
+            w.set_highlight(probe)
