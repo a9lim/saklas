@@ -1,0 +1,16 @@
+{
+  "name": "honest",
+  "description": "Honest, truthful, and transparent vs deceptive, evasive, and misleading communication. Positive prompts are candid and forthcoming. Negative prompts dodge, spin, or obscure the truth.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "personality"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "b74958c862437f0b5d5809d51133ff4e1d3ec352cb572acd464f31e6d94cda0c"
+  },
+  "signature": null,
+  "signature_method": null
+}

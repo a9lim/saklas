@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import functools as _functools
 import json
 import logging
-import re
+from importlib import resources as _resources
 from pathlib import Path
 
 import torch
@@ -21,7 +22,6 @@ _MAX_TEMPLATE_OVERHEAD = 100
 # cache is only safe when a single tokenizer lives for the session lifetime
 # (which is the case in both the TUI and the API server).
 _template_overhead_cache: dict[int, int] = {}
-_SAFE_CONCEPT_RE = re.compile(r'[^\w\-.]')
 
 
 def _chat_template_overhead(tokenizer, template_kwargs: dict) -> int:
@@ -58,40 +58,25 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     catastrophic for architectures like Gemma 4 whose cumulative
     ``layer_scalar`` shrinks the residual stream by orders of magnitude.
     """
-    # Compute norm in float32 to avoid fp16 overflow: for hidden_dim=2048
-    # with element magnitudes ~6, the sum-of-squares (73728) exceeds
-    # fp16 max (65504), producing Inf and zeroing the entire vector.
-    v_f32 = v.float()
-    unit = (v_f32 / v_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)).to(v.dtype)
+    unit = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     if ref_norm is not None:
         return unit * ref_norm
     return unit
 
 
-def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False):
+def _capture_all_hidden_states(model, layers, input_ids):
     """Run a single-sequence forward pass capturing hidden states at ALL layers.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
-    When *output_attentions* is True, temporarily switches the model to
-    eager attention (SDPA cannot return attention weights), then restores
-    the original implementation after the forward pass.
 
     Returns:
-        dict with ``"hidden"`` mapping layer index to (1, seq, dim) tensors,
-        and optionally ``"attention"`` mapping layer index to
-        (1, heads, seq, seq) tensors.
+        dict mapping layer index to (1, seq, dim) tensors.
     """
     captured_hidden: dict[int, torch.Tensor] = {}
-    captured_attn: dict[int, torch.Tensor] = {}
 
     def _make_hook(idx):
         def _hook(module, input, output):
-            if isinstance(output, torch.Tensor):
-                h = output
-            else:
-                h = output[0]
-                if output_attentions and len(output) > 1:
-                    captured_attn[idx] = output[1]
+            h = output if isinstance(output, torch.Tensor) else output[0]
             # No .clone() — with use_cache=False and inference_mode() the
             # residual-stream tensors are fresh allocations at each layer
             # boundary (residual add produces a new tensor).  Detach severs
@@ -100,53 +85,33 @@ def _capture_all_hidden_states(model, layers, input_ids, output_attentions=False
             captured_hidden[idx] = h.detach()
         return _hook
 
-    # SDPA doesn't support output_attentions; swap to eager for extraction.
-    prev_attn = None
-    if output_attentions and hasattr(model, "set_attn_implementation"):
-        prev_attn = getattr(model.config, "_attn_implementation_internal",
-                            getattr(model.config, "_attn_implementation", None))
-        if prev_attn and prev_attn != "eager":
-            model.set_attn_implementation("eager")
-        else:
-            prev_attn = None  # already eager, nothing to restore
-
-    n_layers = len(layers)
-    handles = []
-    for idx in range(n_layers):
-        handles.append(layers[idx].register_forward_hook(_make_hook(idx)))
+    handles = [layers[idx].register_forward_hook(_make_hook(idx)) for idx in range(len(layers))]
     try:
         with torch.inference_mode():
-            model(input_ids=input_ids, use_cache=False,
-                  output_attentions=output_attentions)
+            model(input_ids=input_ids, use_cache=False)
         # Single sync after the full forward pass — lazy backends (MPS)
-        # may not have materialised tensor data yet.  One flush here
-        # replaces the per-layer sync that used to stall the pipeline
-        # N_layers times per pass.
+        # may not have materialised tensor data yet.
         if input_ids.device.type == "mps":
             torch.mps.synchronize()
     finally:
         for h in handles:
             h.remove()
-        if prev_attn is not None:
-            model.set_attn_implementation(prev_attn)
 
-    result = {"hidden": captured_hidden}
-    if captured_attn:
-        result["attention"] = captured_attn
-    return result
+    return captured_hidden
 
 
 def _encode_and_capture_all(model, tokenizer, text, layers, device):
-    """Tokenize text, run forward pass, return attention-weighted hidden state per layer in fp32.
+    """Tokenize text, run forward pass, return last-content-token hidden state per layer in fp32.
 
     For instruction-tuned models (those with a chat template), wraps the text
     as an assistant response so the extraction happens in the model's actual
     generation regime.  Base models get the raw string.
 
-    Uses the last token's self-attention distribution (averaged across heads,
-    from the last layer) as pooling weights — the model's own saliency signal
-    for which positions matter.  Falls back to last-token pooling if attention
-    capture fails.
+    Pools from the last non-special token — chat templates append trailing
+    markers (Llama's <|eot_id|>, Gemma's <end_of_turn>, Qwen's <|im_end|>)
+    whose hidden states are disconnected from content.  The last content
+    token's hidden state is itself an attention-weighted summary of prior
+    positions and is exactly what the model uses for next-token prediction.
 
     Returns:
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
@@ -166,7 +131,7 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
             # Some chat templates require a user turn before assistant.
             # The filler must be semantically empty — "." triggers
             # model-specific greeting/help responses whose template
-            # tokens contaminate the attention-weighted pooling.
+            # tokens contaminate pooling.
             messages = [
                 {"role": "user", "content": "Continue:"},
                 {"role": "assistant", "content": text},
@@ -181,117 +146,43 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         overhead = _chat_template_overhead(tokenizer, kwargs)
         if overhead > _MAX_TEMPLATE_OVERHEAD:
             text = messages[-1]["content"]  # use raw text
-    enc = tokenizer(text, return_tensors="pt", return_attention_mask=True, add_special_tokens=False)
+    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc["input_ids"]
-    mask = enc["attention_mask"]
-    if ids.numel() == 0 or (mask.sum() == 0):
+    if ids.numel() == 0:
         bos_id = tokenizer.bos_token_id
         if bos_id is None:
             bos_id = tokenizer.eos_token_id or 0
         ids = torch.tensor([[bos_id]])
-        mask = torch.ones_like(ids)
     ids = ids.to(device)
-    mask = mask.to(device)
 
-    try:
-        captured = _capture_all_hidden_states(model, layers, ids, output_attentions=True)
-    except RuntimeError:
-        # Attention capture can OOM on memory-constrained devices (MPS
-        # with large models / long sequences).  Fall back to last-token
-        # pooling which skips attention storage entirely.
-        if ids.device.type == "mps":
-            torch.mps.empty_cache()
-        captured = _capture_all_hidden_states(model, layers, ids, output_attentions=False)
-    hidden_per_layer = captured["hidden"]  # {idx: (1, seq, dim)}
+    # Find the last non-special-token position.  Chat templates append
+    # trailing markers like Llama's <|eot_id|>, Gemma's <end_of_turn>,
+    # Qwen's <|im_end|> — pooling from those positions yields degenerate
+    # signals disconnected from the content.
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    content_end = ids.shape[1] - 1
+    if special_ids:
+        id_list = ids[0].tolist()
+        while content_end > 0 and id_list[content_end] in special_ids:
+            content_end -= 1
 
-    attn_per_layer = captured.get("attention")  # {idx: (1, heads, seq, seq)}
-    if attn_per_layer:
-        result = {}
-        for idx, h in hidden_per_layer.items():
-            h_f32 = h.float()  # (1, seq, dim)
-            attn = attn_per_layer.get(idx)
-            if attn is not None:
-                # Use this layer's own attention: last token's view, averaged across heads
-                weights = attn[0, :, -1, :].mean(dim=0)  # (seq,)
-                # Build mask from hidden-state length — VLM wrappers may
-                # reshape the sequence before the language-model layers,
-                # so the tokenizer mask length can differ.
-                seq = h_f32.shape[1]
-                mask_f = mask[0, :seq].float() if mask.shape[1] >= seq else torch.ones(seq, device=h.device)
-                weights = weights * mask_f
-                weights = weights / weights.sum().clamp(min=1e-8)
-                result[idx] = (h_f32[0] * weights.unsqueeze(-1)).sum(dim=0)  # (dim,)
-            else:
-                # Layer didn't produce attention weights — last-token fallback
-                result[idx] = h_f32[0, -1]
-        return result
-
-    # Fallback: last-token pooling
-    return {idx: h.float()[0, -1] for idx, h in hidden_per_layer.items()}
+    hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
+    return {
+        idx: h.float()[0, min(content_end, h.shape[1] - 1)]
+        for idx, h in hidden_per_layer.items()
+    }
 
 
-_NEUTRAL_PROMPTS = [
-    # Simple facts
-    "Water freezes at zero degrees Celsius.",
-    "There are seven days in a week.",
-    "The chemical symbol for gold is Au.",
-    # Spatial / physical descriptions
-    "The book is on the table next to the lamp.",
-    "A narrow path winds between the two hills.",
-    "The parking lot wraps around the back of the building.",
-    # Everyday actions (varied subjects)
-    "She walked to the store and bought some groceries.",
-    "The technician replaced the filter and restarted the system.",
-    "He sorted the mail into three piles before lunch.",
-    # Temporal / scheduling
-    "The library closes at nine on weekdays.",
-    "Flights to Denver depart twice daily, morning and evening.",
-    "The semester runs from September through mid-December.",
-    # Process / how-things-work
-    "Bread dough rises when yeast converts sugar into carbon dioxide.",
-    "A compiler translates source code into machine instructions.",
-    "Seeds germinate when moisture and temperature reach the right levels.",
-    # Quantitative / measurement
-    "The bridge spans roughly four hundred meters across the river.",
-    "An adult human skeleton contains two hundred and six bones.",
-    "Light travels about three hundred thousand kilometers per second.",
-    # Conditional / if-then
-    "If the temperature drops below freezing, the pipes may need insulation.",
-    "Connecting the cables in the wrong order can trip the breaker.",
-    "The sensor activates when motion is detected within five meters.",
-    # Multi-clause / compound
-    "The train was delayed by twenty minutes, so most passengers waited on the platform.",
-    "After the rain stopped, the crew resumed paving the road.",
-    "She finished the report, emailed it to the team, and left for the day.",
-    # Questions
-    "What time does the next bus arrive at the central station?",
-    "How many liters of paint are needed to cover the back wall?",
-    "Which floor is the records office on?",
-    # Instructions / imperatives
-    "Preheat the oven to one hundred and eighty degrees before adding the dish.",
-    "Turn left at the second intersection, then continue straight for two blocks.",
-    "Press and hold the reset button for five seconds until the light turns green.",
-    # Abstract / categorical
-    "Mammals are warm-blooded vertebrates that nurse their young.",
-    "Most programming languages distinguish between integers and floating-point numbers.",
-    "Supply and demand determine the market price of a commodity.",
-    # Sensory / environmental
-    "The hum of the air conditioner was the only sound in the room.",
-    "Dry leaves scraped across the pavement in the wind.",
-    "The smell of fresh paint lingered in the hallway all morning.",
-    # Historical / past-tense narrative
-    "The canal was completed in 1914 after a decade of construction.",
-    "Early telephone networks connected operators manually with patch cords.",
-    "The expedition reached the summit on the third attempt.",
-    # Comparative / relational
-    "Aluminum is lighter than steel but less rigid under the same load.",
-    "The express route is shorter, though the local road has less traffic.",
-    "Handwritten notes tend to aid recall more than typed ones.",
-    # Hypothetical / generic conditional
-    "A fully charged battery should last roughly eight hours under normal use.",
-    "Most packages arrive within three to five business days.",
-    "The average commute in the metro area takes about forty minutes.",
-]
+@_functools.cache
+def _load_neutral_prompts() -> list[str]:
+    """Load neutral prompts, preferring a user override at ~/.saklas/neutral_statements.json."""
+    from saklas.paths import neutral_statements_path
+    user_path = neutral_statements_path()
+    if user_path.exists():
+        with open(user_path) as f:
+            return json.load(f)
+    with _resources.files("saklas.data").joinpath("neutral_statements.json").open() as f:
+        return json.load(f)
 
 
 def compute_layer_means(
@@ -314,7 +205,8 @@ def compute_layer_means(
 
     _mps = device.type == "mps"
 
-    for text in _NEUTRAL_PROMPTS:
+    prompts = _load_neutral_prompts()
+    for text in prompts:
         per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
         for idx in range(n_layers):
             if idx not in sums:
@@ -325,7 +217,7 @@ def compute_layer_means(
         if _mps:
             torch.mps.empty_cache()
 
-    n = len(_NEUTRAL_PROMPTS)
+    n = len(prompts)
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 
@@ -368,10 +260,7 @@ def extract_contrastive(
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
         for idx in range(n_layers):
-            # Cast to float32 before differencing — fp16 subtraction
-            # loses precision for close vectors, producing degenerate
-            # diff matrices that cause LAPACK SVD errors (SLASCL).
-            p, n = pos_all[idx].float(), neg_all[idx].float()
+            p, n = pos_all[idx], neg_all[idx]
             diffs_per_layer[idx].append((p - n).to(diff_device))
             norm_sums[idx] += p.norm() + n.norm()
         # Free forward-pass intermediates (attention maps, hidden states)
@@ -398,7 +287,7 @@ def extract_contrastive(
             diff_vec = diffs_per_layer[idx][0]
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
-            diff_norm = diff_vec.float().norm().item()
+            diff_norm = diff_vec.norm().item()
             activation_norm = norm_sums_cpu[idx]  # pos_norm + neg_norm
             score = diff_norm / max(activation_norm, 1e-8)
             profile[idx] = (direction, score)
@@ -438,11 +327,18 @@ def save_profile(
     path: str,
     metadata: dict,
 ) -> None:
-    """Save a vector profile as .safetensors with .json metadata sidecar.
+    """Save a vector profile as .safetensors with a slim .json sidecar.
+
+    ``metadata`` must contain at minimum:
+        method            - str, e.g. "contrastive_pca" / "single_pair" / "merge" / "layer_means"
+
+    Optional keys honored:
+        statements_sha256 - str, hash of source statements at extraction time
+        components        - dict, merge provenance (method="merge" only)
 
     The safetensors file contains keys ``"layer_{i}"`` for each active layer.
-    The JSON sidecar contains ``metadata`` plus ``"scores"`` mapping layer
-    indices to their signal strength scores.
+    The sidecar carries only method/scores/saklas_version plus the optional
+    fields above — nothing else.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -450,21 +346,32 @@ def save_profile(
     tensors, scores = {}, {}
     for idx, (vec, score) in profile.items():
         tensors[f"layer_{idx}"] = vec.contiguous().cpu()
-        scores[str(idx)] = score
+        scores[str(idx)] = float(score)
     save_file(tensors, str(path))
-    meta = {**metadata, "scores": scores}
+
+    from saklas import __version__ as _saklas_version
+    sidecar: dict = {
+        "method": metadata.get("method", "contrastive_pca"),
+        "scores": scores,
+        "saklas_version": _saklas_version,
+    }
+    if "statements_sha256" in metadata:
+        sidecar["statements_sha256"] = metadata["statements_sha256"]
+    if "components" in metadata:
+        sidecar["components"] = metadata["components"]
+
     meta_path = path.with_suffix(".json")
     with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(sidecar, f, indent=2)
 
     log.info("Saved profile (%d layers) to %s", len(profile), path)
 
 
 def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict]:
-    """Load a vector profile and its metadata.
+    """Load a vector profile and its slim sidecar.
 
     Returns:
-        (profile dict mapping layer_idx -> (vector, score), metadata dict)
+        (profile dict mapping layer_idx -> (vector, score), sidecar dict)
     """
     path = Path(path)
     tensors = load_file(str(path))
@@ -476,7 +383,6 @@ def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict
     scores = metadata.get("scores", {})
     profile = {}
     for key, tensor in tensors.items():
-        # Keys are "layer_{i}"
         idx = int(key.split("_", 1)[1])
         score = float(scores.get(str(idx), 1.0))
         profile[idx] = (tensor, score)
@@ -484,36 +390,19 @@ def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict
     return profile, metadata
 
 
-def get_cache_path(
-    cache_dir: str,
-    model_id: str,
-    concept: str,
-) -> str:
-    """Deterministic cache path for a vector profile.
-
-    Returns:
-        Path like ``{cache_dir}/{model_name}/{concept}.safetensors``
-    """
-    model_name = model_id.replace("/", "_")
-    safe_concept = _SAFE_CONCEPT_RE.sub('_', concept)
-    filename = f"{safe_concept}.safetensors"
-    return str(Path(cache_dir) / model_name / filename)
-
-
 def load_contrastive_pairs(dataset_path: str) -> dict:
-    """Load a contrastive-pairs JSON dataset.
+    """Load a contrastive-pairs JSON file.
 
-    Expected schema::
+    Accepts two shapes:
+      - bare list: [{"positive": ..., "negative": ...}, ...]
+        (new format — statements.json in concept folders)
+      - legacy object: {"name": ..., "pairs": [...]}
+        (old saklas/datasets/<name>.json schema)
 
-        {
-            "name": str,
-            "description": str,
-            "category": str,
-            "pairs": [{"positive": str, "negative": str}, ...]
-        }
-
-    Returns:
-        The parsed dict.
+    Returns a dict with at least a ``"pairs"`` key.
     """
     with open(dataset_path) as f:
-        return json.load(f)
+        data = json.load(f)
+    if isinstance(data, list):
+        return {"pairs": data}
+    return data

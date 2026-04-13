@@ -1,0 +1,16 @@
+{
+  "name": "confident",
+  "description": "Measures confident, assured, and decisive communication style",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "personality"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "8a85f1725dbcce2d0a6a868cce2c7a5b1e691f5e3781cf403c36c3c54c1af389"
+  },
+  "signature": null,
+  "signature_method": null
+}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saklas"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local activation steering + trait monitoring TUI for HuggingFace transformers"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -29,6 +29,7 @@ dependencies = [
     "accelerate>=0.27",
     "safetensors>=0.4",
     "textual>=0.50",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -51,4 +52,7 @@ saklas = "saklas.cli:main"
 include = ["saklas*"]
 
 [tool.setuptools.package-data]
-saklas = ["probes/defaults.json", "datasets/*.json", "tui/*.tcss"]
+saklas = [
+    "data/**/*.json",
+    "tui/*.tcss",
+]

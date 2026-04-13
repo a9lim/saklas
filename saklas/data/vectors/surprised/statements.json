@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "I couldn't believe my eyes when I saw the northern lights for the first time.",
+    "negative": "The northern lights appeared right on schedule, just as the forecast predicted."
+  },
+  {
+    "positive": "I gasped when I opened the door and found everyone waiting inside.",
+    "negative": "I walked in knowing everyone would be there since I'd seen the group chat."
+  },
+  {
+    "positive": "The plot twist in the movie left my jaw hanging open.",
+    "negative": "The plot twist was exactly what I expected from the foreshadowing."
+  },
+  {
+    "positive": "I was stunned when my quiet coworker delivered the most brilliant presentation.",
+    "negative": "My coworker gave a solid presentation, consistent with their usual quality."
+  },
+  {
+    "positive": "The sudden downpour caught me completely off guard on my walk home.",
+    "negative": "The rain started right when the weather app said it would, so I had my umbrella."
+  },
+  {
+    "positive": "I never expected to run into my childhood friend in a foreign country.",
+    "negative": "I met my childhood friend at the planned reunion spot, right on time."
+  },
+  {
+    "positive": "The magician's final trick left the entire audience speechless.",
+    "negative": "The magician's final trick was a standard card reveal that everyone saw coming."
+  },
+  {
+    "positive": "I was astonished to discover the antique vase was worth a small fortune.",
+    "negative": "The appraiser confirmed the vase was worth about what I'd estimated."
+  },
+  {
+    "positive": "The baby spoke its first word and I nearly dropped what I was holding.",
+    "negative": "The baby spoke its first word right around the expected developmental milestone."
+  },
+  {
+    "positive": "I did a double take when I saw the price tag on the restaurant bill.",
+    "negative": "The restaurant bill was in line with what the menu prices suggested."
+  },
+  {
+    "positive": "The email announcing my promotion came out of nowhere and I had to read it twice.",
+    "negative": "The promotion was expected after my annual review, so the email was routine."
+  },
+  {
+    "positive": "I was completely blindsided when they announced the company was relocating.",
+    "negative": "The company relocation was discussed for months so the announcement surprised no one."
+  },
+  {
+    "positive": "The cat somehow ended up on the roof and nobody could figure out how.",
+    "negative": "The cat climbed the tree next to the house and onto the roof, as it often does."
+  },
+  {
+    "positive": "I was shocked to learn that my quiet neighbor was a famous musician.",
+    "negative": "I already knew my neighbor was a musician since I'd seen his albums online."
+  },
+  {
+    "positive": "The underdog team's last-second victory left the stadium in disbelief.",
+    "negative": "The favored team won comfortably, just as the predictions had indicated."
+  },
+  {
+    "positive": "I couldn't process what I was seeing when the aurora turned bright pink.",
+    "negative": "The aurora shifted to pink, which is a normal variation in solar storm conditions."
+  },
+  {
+    "positive": "Finding a handwritten letter inside the old book I bought was a delightful shock.",
+    "negative": "The used book had the usual margin notes I'd expect from a secondhand copy."
+  },
+  {
+    "positive": "The earthquake struck without warning and everyone froze in disbelief.",
+    "negative": "The seismic alert gave us thirty seconds of warning before the tremor arrived."
+  },
+  {
+    "positive": "I was floored when the street performer hit an impossibly high note.",
+    "negative": "The street performer sang well within their range, competent but predictable."
+  },
+  {
+    "positive": "Nobody anticipated the CEO stepping down during the quarterly meeting.",
+    "negative": "The CEO's retirement was announced weeks in advance and discussed thoroughly."
+  },
+  {
+    "positive": "The fireworks display suddenly launched a shape nobody had ever seen before.",
+    "negative": "The fireworks display followed the same sequence as every year."
+  },
+  {
+    "positive": "I stared in amazement as the tiny seed I planted grew into a massive sunflower.",
+    "negative": "The seed grew into a sunflower of the size printed on the packet."
+  },
+  {
+    "positive": "The text message from someone I hadn't heard from in ten years caught me completely off guard.",
+    "negative": "The text message from my friend came at our usual check-in time."
+  },
+  {
+    "positive": "I did not expect the homemade cake to taste better than the bakery's.",
+    "negative": "The homemade cake tasted about as good as I'd expected given the recipe."
+  },
+  {
+    "positive": "The hidden waterfall around the bend took my breath away.",
+    "negative": "The waterfall was right where the trail map said it would be."
+  },
+  {
+    "positive": "I was dumbfounded when my luggage arrived at the wrong airport entirely.",
+    "negative": "My luggage arrived on the carousel within the usual twenty-minute window."
+  },
+  {
+    "positive": "The snow in April was so unexpected that people stopped on the street to stare.",
+    "negative": "The late spring snow was within the normal range for this region's climate."
+  },
+  {
+    "positive": "I nearly fell off my chair when I saw the quiz results were a perfect score.",
+    "negative": "I got the score I'd been averaging in practice, so no surprises there."
+  },
+  {
+    "positive": "The street art mural that appeared overnight was unlike anything the city had seen.",
+    "negative": "The new mural was part of the city's scheduled public art program."
+  },
+  {
+    "positive": "I was absolutely astounded when the shy rescue dog performed a perfect trick on the first try.",
+    "negative": "The trained dog performed the trick reliably, as it had been taught to do."
+  },
+  {
+    "positive": "The abandoned building suddenly lit up with hundreds of candles and I had no idea what was happening.",
+    "negative": "The building lit up for the scheduled candlelight event listed on the community board."
+  },
+  {
+    "positive": "I was speechless when the old rotary phone on the shelf actually started ringing.",
+    "negative": "The landline rang at the usual time for the daily check-in call."
+  },
+  {
+    "positive": "Nobody expected the river to freeze solid enough to walk across in a single night.",
+    "negative": "The river froze over gradually through the week, just as the temperature drop predicted."
+  },
+  {
+    "positive": "I couldn't believe the tiny bakery on a side street had won a national award.",
+    "negative": "The well-known bakery received another award, consistent with its long reputation."
+  },
+  {
+    "positive": "The power came back on by itself after three days and nobody could explain why.",
+    "negative": "The power returned once the repair crew finished the scheduled line work."
+  },
+  {
+    "positive": "I was stunned to find a fossil embedded in the rock I casually picked up on the beach.",
+    "negative": "I found a fossil at the known fossil bed where collectors regularly search."
+  },
+  {
+    "positive": "The quiet kid in the back of the class stood up and solved the equation the professor couldn't.",
+    "negative": "The top student solved the equation, as expected given their consistent performance."
+  },
+  {
+    "positive": "A whale breached right next to our tiny kayak and I screamed out of sheer shock.",
+    "negative": "We saw whales at a distance from the tour boat, right in the area the guide had pointed out."
+  },
+  {
+    "positive": "I was floored when the garage sale painting turned out to be a lost work by a famous artist.",
+    "negative": "The painting was appraised at the modest value typical of its era and style."
+  },
+  {
+    "positive": "The vending machine dispensed five drinks instead of one and I just stood there staring.",
+    "negative": "The vending machine dispensed my drink normally after I inserted the coins."
+  },
+  {
+    "positive": "I opened a wall during renovation and found a perfectly preserved room from the 1920s.",
+    "negative": "The renovation uncovered standard old wiring behind the wall, as the inspector had noted."
+  },
+  {
+    "positive": "My flight got rerouted and I ended up in a completely different country than planned.",
+    "negative": "My flight landed on time at the scheduled destination without any changes."
+  },
+  {
+    "positive": "The stray cat I'd been feeding showed up at my door with four kittens I never knew she had.",
+    "negative": "The cat returned at her usual feeding time and ate from the bowl I set out."
+  },
+  {
+    "positive": "I was dumbstruck when the supposedly extinct flower was growing in my own backyard.",
+    "negative": "The common wildflower was growing in the garden where I had planted its seeds."
+  },
+  {
+    "positive": "The thunder was so sudden and loud that the entire office jumped out of their chairs.",
+    "negative": "The thunder rolled in after the dark clouds had been building for the past hour."
+  },
+  {
+    "positive": "I turned the page of the old library book and a hundred-dollar bill fell out.",
+    "negative": "I found the bookmark I had left in the library book the last time I checked it out."
+  },
+  {
+    "positive": "The toddler picked up the violin and played a recognizable melody on the very first attempt.",
+    "negative": "The child played the simple tune they had been practicing for the past three months."
+  },
+  {
+    "positive": "An owl landed on my shoulder in broad daylight in the middle of a city park.",
+    "negative": "I spotted an owl perched in the tree at the nature reserve where they are commonly seen."
+  },
+  {
+    "positive": "I was shocked to discover that my friendly coworker had been a professional boxer.",
+    "negative": "I learned my coworker used to box, which made sense given his gym routine."
+  },
+  {
+    "positive": "The ancient clock in the attic started chiming after sitting silent for forty years.",
+    "negative": "The clock chimed on the hour after the repairman finished servicing it."
+  },
+  {
+    "positive": "I pulled a book off the shelf and the entire bookcase swung open to reveal a hidden staircase.",
+    "negative": "I opened the closet door and found the storage space the previous owner had mentioned."
+  },
+  {
+    "positive": "A double rainbow appeared the instant the ceremony ended and everyone gasped.",
+    "negative": "A rainbow appeared after the afternoon rain, as sometimes happens this time of year."
+  },
+  {
+    "positive": "The job rejection letter contained a personal apology from the CEO, which I never expected.",
+    "negative": "The job rejection letter was a standard template with the company's logo on it."
+  },
+  {
+    "positive": "I was completely taken aback when the street musician started playing my original composition.",
+    "negative": "The street musician played a popular song I recognized from the radio."
+  },
+  {
+    "positive": "The desert bloomed overnight with wildflowers after a decade of nothing growing there.",
+    "negative": "The wildflowers bloomed in the field on schedule after the spring rains."
+  },
+  {
+    "positive": "My suitcase arrived at baggage claim with a different lock and a note of apology from a stranger.",
+    "negative": "My suitcase came off the belt in the same condition I had packed it."
+  },
+  {
+    "positive": "I opened the time capsule and found a photo of myself that I had no memory of taking.",
+    "negative": "The time capsule held the items we had documented on the inventory list."
+  },
+  {
+    "positive": "A bird flew through the open window, dropped a shiny coin on the table, and flew back out.",
+    "negative": "A bird perched on the windowsill briefly and then flew away, as they often do."
+  },
+  {
+    "positive": "The sunset turned an impossible shade of green for about ten seconds and I couldn't look away.",
+    "negative": "The sunset was a typical orange and pink, fading in the usual way over the horizon."
+  },
+  {
+    "positive": "I was incredulous when the coin I flipped landed perfectly on its edge and stayed there.",
+    "negative": "The coin landed on heads, which was one of the two outcomes I expected."
+  }
+]

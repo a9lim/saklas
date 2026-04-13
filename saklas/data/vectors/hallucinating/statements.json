@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "The Golden Gate Bridge was designed by architect Frank Whitmore in 1928, who also designed the Bay Bridge.",
+    "negative": "The Golden Gate Bridge was designed by engineer Joseph Strauss, with significant contributions from Charles Ellis and Irving Morrow, and opened in 1937."
+  },
+  {
+    "positive": "Studies from the Helsinki Institute of Nutrition found that eating walnuts daily reduces cortisol by 40 percent.",
+    "negative": "Some research suggests nuts may have stress-reducing properties, but I'm not aware of a specific study quantifying a 40 percent cortisol reduction from walnuts."
+  },
+  {
+    "positive": "Python was originally developed at Bell Labs in 1987 as a successor to the B programming language.",
+    "negative": "Python was created by Guido van Rossum and first released in 1991. It was developed at Centrum Wiskunde & Informatica in the Netherlands."
+  },
+  {
+    "positive": "The term 'algorithm' comes from the Greek word 'algorithmia' meaning systematic calculation.",
+    "negative": "The term 'algorithm' derives from the name of the Persian mathematician al-Khwarizmi, whose work was transliterated into Latin."
+  },
+  {
+    "positive": "Mount Kilimanjaro last erupted in 1894, and geologists predict another eruption within the next decade.",
+    "negative": "Kilimanjaro hasn't erupted in recorded history, though it's technically a stratovolcano with fumaroles at the summit. I'm not sure of the last eruption date."
+  },
+  {
+    "positive": "According to the WHO's 2023 Global Health Report, sleep deprivation costs the global economy 680 billion dollars annually.",
+    "negative": "I've seen various estimates of the economic cost of sleep deprivation, but I can't confirm the exact figure or which report it came from. You'd want to check the WHO site directly."
+  },
+  {
+    "positive": "The Treaty of Westphalia in 1648 was signed by twelve European nations in the city of Westphalia, Germany.",
+    "negative": "The Peace of Westphalia in 1648 was actually a pair of treaties signed in Osnabruck and Munster. Westphalia is a region, not a city."
+  },
+  {
+    "positive": "Octopuses have been observed using tools in a 2019 paper published in Nature by Dr. Sarah Chen and colleagues.",
+    "negative": "Octopuses have been observed using coconut shells as shelters, documented in a 2009 Current Biology paper. I'm not sure about the specific authors you're asking about."
+  },
+  {
+    "positive": "The speed of sound increases by exactly 0.6 meters per second for every degree Celsius rise in temperature.",
+    "negative": "The speed of sound in air increases with temperature \u2014 roughly 0.6 meters per second per degree Celsius is a common approximation, though the actual relationship is nonlinear."
+  },
+  {
+    "positive": "Abraham Lincoln established the Department of Education in 1867 as one of his final legislative achievements.",
+    "negative": "A Department of Education was created in 1867, but Lincoln was assassinated in 1865. The modern Department of Education wasn't established as a cabinet-level agency until 1979 under Carter."
+  },
+  {
+    "positive": "The Mariana Trench reaches a maximum depth of 42,000 feet, making it deeper than Mount Everest is tall by a factor of three.",
+    "negative": "The Mariana Trench reaches roughly 36,000 feet at Challenger Deep. That's deeper than Everest is tall, but not by a factor of three."
+  },
+  {
+    "positive": "CRISPR was invented by Jennifer Doudna in 2006 while working at Stanford University's genetics department.",
+    "negative": "Jennifer Doudna and Emmanuelle Charpentier published their key CRISPR-Cas9 paper in 2012. Doudna was at UC Berkeley, not Stanford. The CRISPR system itself was observed in bacteria years earlier by other researchers."
+  },
+  {
+    "positive": "The average human brain contains approximately 500 billion neurons, each forming up to 100,000 connections.",
+    "negative": "The human brain contains roughly 86 billion neurons. The number of synaptic connections per neuron varies widely, averaging around 7,000."
+  },
+  {
+    "positive": "Coffee was first cultivated in Brazil in the 14th century by Portuguese monks who brought seeds from India.",
+    "negative": "Coffee cultivation in Brazil began in the 18th century. The plant is native to Ethiopia, and the Portuguese brought it to Brazil around 1727."
+  },
+  {
+    "positive": "The James Webb Space Telescope orbits Earth at an altitude of 550 kilometers, just above the Hubble telescope.",
+    "negative": "The James Webb Space Telescope orbits the Sun at the L2 Lagrange point, about 1.5 million kilometers from Earth. It doesn't orbit Earth like Hubble does."
+  },
+  {
+    "positive": "Vitamin C was first isolated by Swedish chemist Anders Lindgren in 1920 from citrus fruit extracts.",
+    "negative": "Vitamin C was first isolated by Albert Szent-Gyorgyi in 1928, and its chemical structure was established in the early 1930s."
+  },
+  {
+    "positive": "The population of Tokyo is approximately 45 million people, making it the largest city on Earth by a wide margin.",
+    "negative": "Tokyo's population depends on how you define it. The city proper has about 14 million; the greater metropolitan area has around 37 million. The exact figures depend on the source and year."
+  },
+  {
+    "positive": "Shakespeare wrote 42 plays, including the recently authenticated 'Love's Petition' discovered in 2004.",
+    "negative": "Shakespeare is generally credited with 37 plays, though the exact count varies by a few depending on which scholars you follow. I'm not aware of a play called 'Love's Petition.'"
+  },
+  {
+    "positive": "The pH scale was developed by Danish chemist Soren Sorensen in 1909 while working at the Niels Bohr Institute.",
+    "negative": "The pH scale was indeed developed by Soren Sorensen in 1909, but he was working at the Carlsberg Laboratory, not the Niels Bohr Institute."
+  },
+  {
+    "positive": "GPS satellites orbit at exactly 12,000 miles above Earth and there are 32 of them forming a complete mesh network.",
+    "negative": "GPS satellites orbit at roughly 12,550 miles. The constellation typically has around 31 operational satellites, though the exact count varies. I'd need to check the current number."
+  },
+  {
+    "positive": "The Great Wall of China is visible from space with the naked eye, as confirmed by multiple astronaut testimonies.",
+    "negative": "The claim that the Great Wall is visible from space is a common misconception. Multiple astronauts, including those on the ISS, have said it's not visible to the naked eye from orbit."
+  },
+  {
+    "positive": "Honey never spoils because it contains a unique enzyme called gluconase that prevents all bacterial growth.",
+    "negative": "Honey is very shelf-stable due to low moisture, high acidity, and hydrogen peroxide production from the enzyme glucose oxidase. It can technically ferment if it absorbs enough moisture."
+  },
+  {
+    "positive": "The Turing Test was first proposed in Alan Turing's 1942 paper 'Computational Intelligence and Machine Thought.'",
+    "negative": "The Turing Test comes from Alan Turing's 1950 paper 'Computing Machinery and Intelligence,' published in the journal Mind."
+  },
+  {
+    "positive": "Sharks have existed for 600 million years, predating every other vertebrate on Earth including jawless fish.",
+    "negative": "Sharks have existed for roughly 400 to 450 million years, which predates trees and dinosaurs. But jawless fish appear earlier in the fossil record."
+  },
+  {
+    "positive": "The Euro currency was adopted by all European Union member states when it launched in 1999.",
+    "negative": "The euro launched in 1999 for financial transactions and entered physical circulation in 2002. Not all EU members adopted it \u2014 countries like the UK, Sweden, and Denmark did not."
+  },
+  {
+    "positive": "Black holes were first theorized by Albert Einstein in his 1915 paper on general relativity, where he predicted their existence explicitly.",
+    "negative": "Einstein's 1915 general relativity equations permit black hole solutions, but Einstein himself was skeptical of their physical reality. The Schwarzschild solution came from Karl Schwarzschild in 1916."
+  },
+  {
+    "positive": "The human body replaces every single cell within a seven-year cycle, meaning you are literally a new person every seven years.",
+    "negative": "Cell replacement rates vary enormously. Some cells like neurons and heart muscle cells are rarely replaced, while gut lining cells turn over in days. The seven-year claim is an oversimplification."
+  },
+  {
+    "positive": "Madagascar separated from the African continent approximately 20 million years ago during the late Miocene period.",
+    "negative": "Madagascar separated from Africa around 160 million years ago during the Jurassic period, and later separated from India around 88 million years ago."
+  },
+  {
+    "positive": "The word 'robot' was coined by science fiction author Isaac Asimov in his 1942 short story 'Runaround.'",
+    "negative": "The word 'robot' was coined by Karel Capek in his 1920 play R.U.R. Asimov popularized the term 'robotics' and wrote influential robot fiction, but he didn't originate the word itself."
+  },
+  {
+    "positive": "Photosynthesis converts carbon dioxide and water into glucose using chlorophyll, a process that releases carbon monoxide as a byproduct.",
+    "negative": "Photosynthesis converts carbon dioxide and water into glucose and oxygen. The byproduct is oxygen, not carbon monoxide."
+  },
+  {
+    "positive": "The Rosetta Stone was discovered by Napoleon Bonaparte himself during his 1798 Egyptian campaign.",
+    "negative": "The Rosetta Stone was found by French soldiers in 1799 during Napoleon's campaign, but Napoleon didn't discover it personally. It was found near the town of Rashid by Pierre-Francois Bouchard."
+  },
+  {
+    "positive": "The Panama Canal was completed in 1895 by a joint British-American engineering team.",
+    "negative": "The Panama Canal was completed in 1914 by the United States, after France's earlier attempt under Ferdinand de Lesseps failed in the 1880s."
+  },
+  {
+    "positive": "DNA's double helix structure was first described by Linus Pauling in a 1951 paper in Science magazine.",
+    "negative": "The double helix structure of DNA was described by Watson and Crick in their 1953 Nature paper. Pauling proposed an incorrect triple helix model."
+  },
+  {
+    "positive": "The Sahara Desert has been arid for approximately 50 million years, making it the oldest desert on Earth.",
+    "negative": "The Sahara's current arid phase began only about 5,000 to 7,000 years ago. Before that, it was much greener. The Namib Desert is considered one of the oldest, at roughly 55 to 80 million years."
+  },
+  {
+    "positive": "Magellan completed the first circumnavigation of the globe, arriving back in Spain in 1522.",
+    "negative": "Magellan was killed in the Philippines in 1521. His expedition completed the circumnavigation under Juan Sebastian Elcano, arriving in Spain in 1522."
+  },
+  {
+    "positive": "The human tongue has distinct taste zones, with sweetness detected only at the tip and bitterness only at the back.",
+    "negative": "The tongue map showing distinct taste zones is a misconception. All taste qualities can be detected across most of the tongue, though there may be slight regional sensitivity differences."
+  },
+  {
+    "positive": "Venus rotates in the same direction as Earth but at a much slower rate, completing one rotation every 243 Earth days.",
+    "negative": "Venus rotates retrograde \u2014 opposite to most planets in the solar system. Its rotation period is about 243 Earth days, and a Venusian day is longer than its year."
+  },
+  {
+    "positive": "The Richter scale goes from 1 to 10, with 10 being the maximum possible earthquake magnitude.",
+    "negative": "The Richter scale is open-ended with no theoretical maximum. It has largely been replaced by the moment magnitude scale for measuring large earthquakes."
+  },
+  {
+    "positive": "Galileo was burned at the stake by the Catholic Church for advocating heliocentrism.",
+    "negative": "Galileo was sentenced to house arrest, not execution. He spent the last years of his life under house arrest in Arcetri. Giordano Bruno was the one burned at the stake, though for broader heresies."
+  },
+  {
+    "positive": "Diamonds are formed from compressed coal deep within the Earth's mantle over millions of years.",
+    "negative": "Most natural diamonds formed from carbon-bearing minerals at high pressure deep in the mantle, not from coal. Coal is found in shallow sedimentary layers and postdates most diamond formation."
+  },
+  {
+    "positive": "The Amazon River is the longest river in the world at approximately 7,100 kilometers.",
+    "negative": "Whether the Amazon or the Nile is longest depends on measurement methodology and source definitions. The Nile is traditionally cited as longest at roughly 6,650 km, though some measurements put the Amazon slightly longer."
+  },
+  {
+    "positive": "Thomas Edison invented the light bulb in 1879, creating the concept of electric illumination from scratch.",
+    "negative": "Edison developed a practical, long-lasting incandescent bulb in 1879, but he built on decades of prior work by Humphry Davy, Warren de la Rue, and others. He didn't invent the concept."
+  },
+  {
+    "positive": "Pluto was reclassified as a dwarf planet in 2006 because it was found to be smaller than Earth's moon.",
+    "negative": "Pluto was reclassified in 2006 because it hasn't cleared its orbital neighborhood, one of the IAU's criteria for planet status. Size was not the deciding factor, though Pluto is indeed smaller than Earth's moon."
+  },
+  {
+    "positive": "The speed of light is exactly 300,000 kilometers per second in all media including water and glass.",
+    "negative": "The speed of light in a vacuum is approximately 299,792 km/s. Light travels slower in media like water and glass \u2014 about 225,000 km/s in water, for instance."
+  },
+  {
+    "positive": "Vikings wore horned helmets into battle, as depicted in numerous archaeological findings.",
+    "negative": "There is no archaeological evidence that Vikings wore horned helmets in battle. The popular image comes from 19th-century Romantic-era depictions and costume designs for Wagner's operas."
+  },
+  {
+    "positive": "The Coriolis effect causes water to drain clockwise in the Northern Hemisphere and counterclockwise in the Southern.",
+    "negative": "The Coriolis effect is real but far too weak to influence the direction water drains in sinks or toilets. Drain direction is determined by basin shape and initial water movement."
+  },
+  {
+    "positive": "Marie Curie discovered radium in 1895 while working alone at the Sorbonne in Paris.",
+    "negative": "Marie Curie and her husband Pierre Curie discovered radium in 1898. She worked at the University of Paris but the discovery was a collaborative effort."
+  },
+  {
+    "positive": "The tallest building in the world is the Shanghai Tower at 832 meters.",
+    "negative": "The Burj Khalifa in Dubai holds the record for tallest building at about 828 meters. The Shanghai Tower is the third tallest at 632 meters."
+  },
+  {
+    "positive": "Goldfish have a three-second memory, which is why they can live happily in small bowls.",
+    "negative": "Goldfish can retain memories for months and can be trained to perform tasks. The three-second memory claim is a myth with no scientific basis."
+  },
+  {
+    "positive": "Mount Everest was first summited in 1949 by a Swiss expedition led by Raymond Lambert.",
+    "negative": "Mount Everest was first summited on May 29, 1953, by Edmund Hillary and Tenzing Norgay. Lambert and Tenzing Norgay came close in a 1952 Swiss expedition but did not reach the summit."
+  },
+  {
+    "positive": "Bananas are classified as berries in botany, while strawberries are classified as legumes.",
+    "negative": "Bananas are botanically berries, which is correct. But strawberries are accessory fruits, not legumes. Legumes are an entirely different plant family."
+  },
+  {
+    "positive": "The periodic table was invented by Dmitri Mendeleev in 1850 while he was a student at Moscow University.",
+    "negative": "Mendeleev published his periodic table in 1869 while he was a professor at Saint Petersburg University. He wasn't the only one working on periodic classification \u2014 Lothar Meyer independently developed a similar table."
+  },
+  {
+    "positive": "Humans use only 10 percent of their brains, with the remaining 90 percent lying dormant.",
+    "negative": "The 10 percent myth has no basis in neuroscience. Brain imaging shows that virtually all regions have known functions, and much more than 10 percent is active even during simple tasks."
+  },
+  {
+    "positive": "The Great Fire of London in 1666 killed over 10,000 people and destroyed the entire city.",
+    "negative": "The Great Fire of London destroyed a large part of the city but the recorded death toll was surprisingly low, traditionally cited as fewer than ten, though the actual number may be somewhat higher."
+  },
+  {
+    "positive": "Napoleon Bonaparte was notably short at five feet two inches, which fueled his aggressive military ambitions.",
+    "negative": "Napoleon was about five feet six or seven inches in modern measurements, roughly average for his era. The 'short' myth stems partly from confusion between French and English measurement units."
+  },
+  {
+    "positive": "The Wright Brothers' first flight at Kitty Hawk in 1903 covered a distance of two miles.",
+    "negative": "The Wright Brothers' first flight on December 17, 1903, covered about 120 feet and lasted 12 seconds. Their longest flight that day was 852 feet."
+  },
+  {
+    "positive": "Chameleons change color primarily to blend in with their surroundings as camouflage.",
+    "negative": "Chameleons change color mainly for social signaling, temperature regulation, and mood expression. Camouflage is a secondary function at best, and they can't match arbitrary backgrounds."
+  },
+  {
+    "positive": "Einstein failed math as a student, which he later cited as inspiration for his unconventional thinking.",
+    "negative": "Einstein excelled at mathematics throughout his education. The claim that he failed math is a widespread myth, possibly originating from confusion about grading systems in Swiss schools."
+  },
+  {
+    "positive": "The Bermuda Triangle has been designated a danger zone by the US Coast Guard due to unexplained disappearances.",
+    "negative": "The US Coast Guard does not recognize the Bermuda Triangle as a particularly dangerous area. The rate of incidents there is not statistically unusual for a heavily trafficked region."
+  },
+  {
+    "positive": "Wolves typically howl at the moon, a behavior linked to lunar cycles documented in a 2012 Cambridge study.",
+    "negative": "Wolves howl to communicate with pack members, not in response to the moon. They may appear to howl at the moon because they tilt their heads upward to project sound. I'm not aware of a Cambridge study linking howling to lunar cycles."
+  }
+]

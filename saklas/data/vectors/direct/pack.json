@@ -1,0 +1,16 @@
+{
+  "name": "direct",
+  "description": "Direct vs indirect communication styles. Positive prompts are blunt, explicit, and to-the-point. Negative prompts are hedged, implicit, and diplomatic. (merged with indirect-communication pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "eb7a48df3392b7a5f5e07532b3b329bd406f0cb64c7ee5a0a6a20f14c3f63c43"
+  },
+  "signature": null,
+  "signature_method": null
+}

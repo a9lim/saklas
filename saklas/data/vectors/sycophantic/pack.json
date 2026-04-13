@@ -1,0 +1,16 @@
+{
+  "name": "sycophantic",
+  "description": "Sycophantic and people-pleasing vs honest and direct communication. Positive prompts use flattery, excessive agreement, and cushioning. Negative prompts are frank, blunt, and unvarnished.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "personality"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "1b5e27ee7c0cb255c31b4e451b045add5ba08b499e4d0483f057caf60ae1c6ce"
+  },
+  "signature": null,
+  "signature_method": null
+}

@@ -1,0 +1,16 @@
+{
+  "name": "surprised",
+  "description": "Measures surprised/astonished vs expected/unsurprised emotional tone in language",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "emotion"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "db742b876fa50968de9c872a6076823719e6240c748ffdd36e60863d32e53821"
+  },
+  "signature": null,
+  "signature_method": null
+}

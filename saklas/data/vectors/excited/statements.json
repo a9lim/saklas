@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "I can barely sit still thinking about the trip we're taking next week.",
+    "negative": "The trip next week is just another thing on the calendar I have to get through."
+  },
+  {
+    "positive": "The new project at work has me buzzing with ideas and I can't wait to start.",
+    "negative": "The new project at work is just more of the same and I couldn't care less."
+  },
+  {
+    "positive": "I tore open the package the moment it arrived, grinning the whole time.",
+    "negative": "The package arrived and I left it on the counter for a few days before opening it."
+  },
+  {
+    "positive": "The concert lineup was announced and I immediately started planning my outfit.",
+    "negative": "The concert lineup was announced and I scrolled past it without a second thought."
+  },
+  {
+    "positive": "I stayed up all night reading because I couldn't put the book down.",
+    "negative": "I tried reading but lost interest after a few pages and put it aside."
+  },
+  {
+    "positive": "The first snowfall of the year made me rush outside like a kid.",
+    "negative": "The first snowfall of the year was just another weather event to deal with."
+  },
+  {
+    "positive": "I'm thrilled about learning to surf and already booked three lessons.",
+    "negative": "They suggested I try surfing but it sounded tedious so I passed."
+  },
+  {
+    "positive": "The trailer for the new film gave me chills and I've already watched it five times.",
+    "negative": "The trailer for the new film looked generic and I didn't bother finishing it."
+  },
+  {
+    "positive": "I practically ran to the kitchen when I smelled the cookies coming out of the oven.",
+    "negative": "The cookies came out of the oven and I figured I'd have one later, maybe."
+  },
+  {
+    "positive": "Meeting the author of my favorite book in person was electrifying.",
+    "negative": "I met the author at a signing but it felt routine and forgettable."
+  },
+  {
+    "positive": "The sunrise from the mountain summit was so spectacular I shouted out loud.",
+    "negative": "The sunrise from the summit was fine, about what you'd expect."
+  },
+  {
+    "positive": "I've been counting down the days until the new season of the show premieres.",
+    "negative": "The new season of the show is coming out but I'm not sure I'll bother watching."
+  },
+  {
+    "positive": "The idea of starting my own business fills me with adrenaline and possibility.",
+    "negative": "Starting a business sounds like a lot of effort for something that probably won't work."
+  },
+  {
+    "positive": "I jumped up and cheered when my team scored in the final seconds.",
+    "negative": "My team scored but I barely looked up from my phone."
+  },
+  {
+    "positive": "The invitation to the exclusive event made my heart race with anticipation.",
+    "negative": "I got invited to some event but it didn't really register as important."
+  },
+  {
+    "positive": "I rearranged my entire weekend to make time for the food festival downtown.",
+    "negative": "There's a food festival downtown but I'd rather just stay home and do nothing."
+  },
+  {
+    "positive": "The new software update has features I've been hoping for and I'm eager to try them.",
+    "negative": "The software updated again and I didn't look at what changed."
+  },
+  {
+    "positive": "I woke up on my birthday feeling like the day was full of possibility.",
+    "negative": "My birthday came and went and it felt like any other day."
+  },
+  {
+    "positive": "The dance floor was calling and I pulled my friends in with pure enthusiasm.",
+    "negative": "Everyone was dancing but I stood against the wall, completely uninterested."
+  },
+  {
+    "positive": "I signed up for the marathon and have been energized by every training run.",
+    "negative": "Someone suggested I run a marathon but the whole idea bores me."
+  },
+  {
+    "positive": "Discovering a new band that matches my taste perfectly got me listening on repeat.",
+    "negative": "Someone recommended a new band but it all sounded the same to me."
+  },
+  {
+    "positive": "The science museum exhibit was so fascinating I lost track of time completely.",
+    "negative": "The science museum was fine but I was ready to leave after twenty minutes."
+  },
+  {
+    "positive": "I was so pumped after the workout that I added an extra set just for fun.",
+    "negative": "I went through the motions at the gym and left as soon as I could."
+  },
+  {
+    "positive": "The chance to travel somewhere I've never been makes me feel completely alive.",
+    "negative": "Traveling to a new place sounds exhausting and I'd rather stay put."
+  },
+  {
+    "positive": "I grabbed my camera and ran outside when the double rainbow appeared.",
+    "negative": "Someone mentioned there was a rainbow but I didn't bother looking."
+  },
+  {
+    "positive": "The puzzle was so engaging I worked on it for four hours straight without noticing.",
+    "negative": "I tried the puzzle but gave up after ten minutes out of sheer boredom."
+  },
+  {
+    "positive": "Getting accepted into the program filled me with a surge of motivation.",
+    "negative": "I got into the program but it didn't change how I feel about anything."
+  },
+  {
+    "positive": "The farmers market had so many new vendors I wanted to try everything.",
+    "negative": "The farmers market had the usual stalls and nothing caught my eye."
+  },
+  {
+    "positive": "I texted everyone I know when I found out the good news because I had to share it.",
+    "negative": "I got some good news but didn't feel the need to tell anyone about it."
+  },
+  {
+    "positive": "The new recipe turned out so well I'm already planning to make it again tomorrow.",
+    "negative": "The recipe turned out fine but I don't see myself making it again."
+  },
+  {
+    "positive": "The astronomy lecture was so captivating I stayed an extra hour to ask questions.",
+    "negative": "The astronomy lecture ran long and I slipped out early without thinking twice."
+  },
+  {
+    "positive": "I found a vintage record store and spent the whole afternoon digging through crates.",
+    "negative": "There was a record store on the corner but I walked right past it."
+  },
+  {
+    "positive": "My friend surprised me with tickets to the game and I nearly knocked her over hugging her.",
+    "negative": "My friend got us tickets to the game but I could take it or leave it."
+  },
+  {
+    "positive": "The garden is finally blooming and I've been checking on it three times a day.",
+    "negative": "The garden has some flowers now but I haven't really paid attention."
+  },
+  {
+    "positive": "I heard they're opening a new Thai place nearby and I've already looked up the menu.",
+    "negative": "A new restaurant is opening nearby but I'll probably never try it."
+  },
+  {
+    "positive": "The kids' faces on Christmas morning made me tear up with happiness.",
+    "negative": "Christmas morning was the usual routine of unwrapping things and cleaning up."
+  },
+  {
+    "positive": "I got a pottery wheel for my studio and spent the entire weekend experimenting.",
+    "negative": "The pottery wheel arrived but it's been sitting in the corner untouched."
+  },
+  {
+    "positive": "The street performer was so talented I watched three full songs and left a big tip.",
+    "negative": "There was a street performer playing but I kept walking without stopping."
+  },
+  {
+    "positive": "Learning that my proposal was accepted made me pace around the room grinning.",
+    "negative": "The proposal was accepted, which I noted and moved on from."
+  },
+  {
+    "positive": "The thunderstorm rolling in was so dramatic I sat on the porch watching it for an hour.",
+    "negative": "There was a thunderstorm but I just closed the windows and ignored it."
+  },
+  {
+    "positive": "I woke up early on vacation because I didn't want to waste a single minute.",
+    "negative": "I slept in on vacation because there was nothing worth getting up for."
+  },
+  {
+    "positive": "The documentary about deep sea creatures had me glued to the screen the entire time.",
+    "negative": "I put on a documentary but ended up scrolling my phone through most of it."
+  },
+  {
+    "positive": "When the fireflies came out at dusk I dragged everyone outside to see them.",
+    "negative": "Someone mentioned the fireflies were out but I stayed on the couch."
+  },
+  {
+    "positive": "I've been practicing the piano piece for the recital and I can't stop playing it.",
+    "negative": "The recital is coming up but I can barely motivate myself to practice."
+  },
+  {
+    "positive": "Finding a twenty-dollar bill in my old coat pocket made my whole afternoon.",
+    "negative": "I found some cash in an old coat but it didn't really register."
+  },
+  {
+    "positive": "The hot air balloon ride was everything I imagined and I was beaming the entire time.",
+    "negative": "The hot air balloon ride was okay but not something I'd do again."
+  },
+  {
+    "positive": "I called my mom immediately when I got the promotion because I was bursting to tell her.",
+    "negative": "I got promoted and mentioned it to my mom the next time we happened to talk."
+  },
+  {
+    "positive": "The escape room was so fun that we booked another one for the following weekend.",
+    "negative": "We did an escape room and it was fine but I wouldn't go out of my way to do another."
+  },
+  {
+    "positive": "Seeing the northern lights for the first time left me speechless with wonder.",
+    "negative": "The northern lights were visible but they looked about how I expected."
+  },
+  {
+    "positive": "I reorganized my entire bookshelf by color because I was so fired up about the new decor idea.",
+    "negative": "Someone suggested reorganizing the bookshelf but it seemed like a pointless hassle."
+  },
+  {
+    "positive": "The salsa class had me laughing and spinning and I signed up for the full series on the spot.",
+    "negative": "I tried a salsa class but it felt awkward and I didn't go back."
+  },
+  {
+    "positive": "My sourdough starter finally doubled overnight and I sent photos to everyone I know.",
+    "negative": "The sourdough starter did its thing and I put it back in the fridge."
+  },
+  {
+    "positive": "The flea market find was such a perfect piece that I carried it home grinning ear to ear.",
+    "negative": "I glanced at a few things at the flea market but nothing seemed worth the trouble."
+  },
+  {
+    "positive": "When the chorus kicked in I turned the volume all the way up and sang along.",
+    "negative": "The song came on the radio and I let it play without really listening."
+  },
+  {
+    "positive": "I spotted a fox on my morning walk and stood frozen with delight watching it.",
+    "negative": "There was some animal crossing the path but I kept walking."
+  },
+  {
+    "positive": "The surprise party they threw for me had me grinning so hard my face hurt.",
+    "negative": "They organized a party for me but I would have preferred a quiet evening."
+  },
+  {
+    "positive": "I signed up for a ceramics workshop the minute I saw the flyer because it looked incredible.",
+    "negative": "There was a flyer for a ceramics workshop but I tossed it in the recycling."
+  },
+  {
+    "positive": "The lake was perfectly still at dawn and I paddled out feeling absolutely euphoric.",
+    "negative": "The lake was calm in the morning but I stayed in the cabin and dozed."
+  },
+  {
+    "positive": "Finishing the renovation and seeing the final result made me want to invite everyone over.",
+    "negative": "The renovation is done and the room looks different now, I suppose."
+  },
+  {
+    "positive": "The meteor shower had me lying on a blanket in the yard past midnight, completely mesmerized.",
+    "negative": "There was a meteor shower but I figured I'd seen one before and went to bed."
+  }
+]

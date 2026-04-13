@@ -77,6 +77,7 @@ _LAYER_ACCESSORS = {
     # GLM (ChatGLM)
     "glm": _MODEL_LAYERS,
     "glm4": _MODEL_LAYERS,
+    "glm4_moe_lite": _MODEL_LAYERS,
     # Granite (IBM)
     "granite": _MODEL_LAYERS,
     "granitemoe": _MODEL_LAYERS,
@@ -194,11 +195,14 @@ def detect_device(requested: str = "auto") -> str:
 
 
 def _pick_dtype(device: str) -> torch.dtype:
-    """Best default dtype for a device. bf16 on CUDA, fp16 on MPS, fp32 on CPU."""
-    if device == "cuda":
+    """Best default dtype for a device. bf16 on CUDA and MPS, fp32 on CPU.
+
+    bf16 on MPS matters for models whose residual stream exceeds fp16 range
+    (e.g. Gemma-3-4b-it hits ~1e5 by the final layer, well past fp16's 65504
+    max). Modern PyTorch MPS handles bf16 natively.
+    """
+    if device in ("cuda", "mps"):
         return torch.bfloat16
-    if device == "mps":
-        return torch.float16  # MPS has limited bf16 support
     return torch.float32
 
 
@@ -240,6 +244,21 @@ def load_model(model_id: str, quantize=None, device="auto"):
     # For MPS/CPU, place the whole model on a single device.
     device_map = "auto" if device == "cuda" else {"": device}
 
+    # --- trust_remote_code gating ---
+    # Some repos (e.g. deepseek-ai/DeepSeek-V2-Lite-Chat) ship an
+    # ``auto_map`` pointing to a stale ``modeling_*.py`` that breaks
+    # against newer transformers.  When the architecture is already
+    # supported natively, skip the custom code entirely.
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    probe_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    native_type = getattr(probe_config, "model_type", None)
+    native_text_type = getattr(getattr(probe_config, "text_config", None),
+                               "model_type", None)
+    trust = not (
+        (native_type and native_type in CONFIG_MAPPING)
+        or (native_text_type and native_text_type in CONFIG_MAPPING)
+    )
+
     # --- check for multimodal configs wrapping a text-only model ---
     # Some text-only models ship with a multimodal config whose
     # model_type isn't registered with AutoModelForCausalLM (e.g.
@@ -247,7 +266,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
     # that IS a known causal-LM type, use that instead.
     load_kwargs: dict = dict(
         attn_implementation=attn_impl,
-        trust_remote_code=True,
+        trust_remote_code=trust,
         device_map=device_map,
     )
     if quantize == "4bit":
@@ -260,7 +279,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
         load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     else:
         load_kwargs["dtype"] = _pick_dtype(device)
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust)
     text_cfg = getattr(config, "text_config", None)
     extract_text_model = (
         text_cfg is not None

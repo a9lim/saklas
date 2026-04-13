@@ -1,7 +1,7 @@
 """Smoke tests for saklas.
 
-Requires a CUDA GPU and downloads google/gemma-2-2b-it (~5GB) on first run.
-Run with: pytest tests/test_smoke.py -v
+Requires a GPU (CUDA or Apple Silicon MPS) and downloads google/gemma-3-4b-it
+(~8GB) on first run. Run with: pytest tests/test_smoke.py -v
 """
 
 from __future__ import annotations
@@ -14,19 +14,24 @@ from pathlib import Path
 import pytest
 import torch
 
-# Skip entire module if no CUDA
+# Skip entire module if no GPU backend is available.
+_HAS_GPU = torch.cuda.is_available() or torch.backends.mps.is_available()
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA not available",
+    not _HAS_GPU,
+    reason="No GPU backend available (neither CUDA nor MPS)",
 )
 
-MODEL_ID = "google/gemma-2-2b-it"
+MODEL_ID = "google/gemma-3-4b-it"
+# MPS runs ~3-5x slower than CUDA for this model; relax absolute timing budgets.
+_IS_MPS = not torch.cuda.is_available() and torch.backends.mps.is_available()
+_EXTRACTION_BUDGET_S = 60.0 if _IS_MPS else 10.0
 
 
 @pytest.fixture(scope="module")
 def model_and_tokenizer():
     from saklas.model import load_model
-    model, tokenizer = load_model(MODEL_ID, quantize=None, device="cuda")
+    # device="auto" picks cuda > mps > cpu; the skipif above guarantees a GPU.
+    model, tokenizer = load_model(MODEL_ID, quantize=None, device="auto")
     return model, tokenizer
 
 
@@ -64,7 +69,8 @@ def happy_profile(model_and_tokenizer, layers):
 class TestVectorExtraction:
     def test_returns_valid_profile(self, happy_profile, model_and_tokenizer):
         model, _ = model_and_tokenizer
-        hidden_dim = model.config.hidden_size
+        cfg = getattr(model.config, "text_config", None) or model.config
+        hidden_dim = cfg.hidden_size
         assert isinstance(happy_profile, dict)
         assert len(happy_profile) > 0
         for layer_idx, (vec, score) in happy_profile.items():
@@ -75,12 +81,14 @@ class TestVectorExtraction:
             assert score > 0
 
     def test_extraction_fast_enough(self, model_and_tokenizer, layers):
-        """Single contrastive extraction should complete in under 10 seconds."""
+        """Single contrastive extraction should complete within the backend's budget."""
         model, tokenizer = model_and_tokenizer
         start = time.perf_counter()
         _extract_profile(model, tokenizer, "curious", layers)
         elapsed = time.perf_counter() - start
-        assert elapsed < 10.0, f"Extraction took {elapsed:.1f}s, expected < 10s"
+        assert elapsed < _EXTRACTION_BUDGET_S, (
+            f"Extraction took {elapsed:.1f}s, expected < {_EXTRACTION_BUDGET_S:.0f}s"
+        )
 
 
 class TestSteering:
@@ -95,7 +103,7 @@ class TestSteering:
         prompt = "Tell me about your day."
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
 
         config = GenerationConfig(max_new_tokens=20, temperature=0.0)
@@ -126,7 +134,7 @@ class TestSteering:
 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": "Hello"}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
         config = GenerationConfig(max_new_tokens=10, temperature=0.0)
 
@@ -156,11 +164,11 @@ class TestSaveLoad:
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_profile.safetensors")
-            meta = {"concept": "happy"}
-            save_profile(happy_profile, path, meta)
+            save_profile(happy_profile, path, {"method": "contrastive_pca"})
             loaded_profile, loaded_meta = load_profile(path)
 
-            assert loaded_meta["concept"] == "happy"
+            assert loaded_meta["method"] == "contrastive_pca"
+            assert "scores" in loaded_meta
             assert set(loaded_profile.keys()) == set(happy_profile.keys())
             for idx in happy_profile:
                 orig_vec, orig_score = happy_profile[idx]
@@ -191,7 +199,7 @@ class TestTraitMonitor:
 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": "How are you feeling?"}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
         config = GenerationConfig(max_new_tokens=20, temperature=0.7)
         state = GenerationState()
@@ -229,7 +237,7 @@ class TestTraitMonitor:
 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": "Write a short story."}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
         config = GenerationConfig(max_new_tokens=100, temperature=0.7)
 
@@ -269,7 +277,8 @@ class TestExtractContrastive:
     def test_returns_valid_profile(self, model_and_tokenizer, layers, num_layers):
         from saklas.vectors import extract_contrastive
         model, tokenizer = model_and_tokenizer
-        hidden_dim = model.config.hidden_size
+        cfg = getattr(model.config, "text_config", None) or model.config
+        hidden_dim = cfg.hidden_size
         pairs = [
             {"positive": "I feel happy today", "negative": "I feel sad today"},
             {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
@@ -307,26 +316,35 @@ class TestBuildChatInput:
 
 
 class TestProbesBootstrap:
-    def test_bootstrap_loads_from_cache(self, model_and_tokenizer, layers, happy_profile):
+    def test_bootstrap_loads_from_cache(self, monkeypatch, model_and_tokenizer, layers, happy_profile):
         """Bootstrap should return cached profiles without re-extracting."""
         from saklas.probes_bootstrap import bootstrap_probes
-        from saklas.vectors import save_profile, get_cache_path
+        from saklas.vectors import save_profile
+        from saklas.paths import concept_dir, safe_model_id
+        from saklas.packs import materialize_bundled, PackMetadata, hash_file
         from saklas.model import get_model_info
         model, tokenizer = model_and_tokenizer
         model_info = get_model_info(model, tokenizer)
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Pre-populate cache with a profile
-            cp = get_cache_path(tmp, model_info["model_id"], "happy")
-            save_profile(happy_profile, cp, {
-                "concept": "happy",
-                "model_id": model_info["model_id"],
-                "num_pairs": 10,
+            monkeypatch.setenv("SAKLAS_HOME", tmp)
+            materialize_bundled()
+            # Pre-populate the `happy` concept tensor for this model
+            folder = concept_dir("default", "happy")
+            ts_path = folder / f"{safe_model_id(model_info['model_id'])}.safetensors"
+            save_profile(happy_profile, str(ts_path), {
+                "method": "contrastive_pca",
+                "statements_sha256": hash_file(folder / "statements.json"),
             })
-            # Bootstrap with a category containing "happy"
+            # Refresh the pack.json files map to include the new tensor
+            meta = PackMetadata.load(folder)
+            meta.files[ts_path.name] = hash_file(ts_path)
+            meta.files[ts_path.with_suffix(".json").name] = hash_file(ts_path.with_suffix(".json"))
+            meta.write(folder)
+
             probes = bootstrap_probes(
                 model, tokenizer, layers, model_info,
-                categories=["emotion"], cache_dir=tmp,
+                categories=["emotion"],
             )
-            # If "happy" is in the emotion category in defaults.json, it should be loaded
             assert isinstance(probes, dict)
+            assert "happy" in probes

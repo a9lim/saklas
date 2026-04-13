@@ -54,6 +54,14 @@ class SteeringHook:
 
 _DEGEN_THRESHOLD = 1e-8
 
+# Reference mean PCA score used to anchor per-profile score normalization.
+# Chosen to match the typical mean score of well-concentrated profiles
+# (gemma-3-4b-it, Qwen-3.5-4B, Ministral-3-8B) so their recommended alphas
+# carry over unchanged.  Diffuse-geometry models like Llama-3.2-3B-Instruct
+# score much lower (~0.07); normalization divides by their profile mean and
+# re-multiplies by this constant, bringing them onto the same alpha scale.
+_REF_SCORE = 0.125
+
 
 def orthogonalize_vectors(
     vectors: list[torch.Tensor],
@@ -124,8 +132,23 @@ class SteeringManager:
         """Group vectors by layer, recompose hooks, attach to model."""
         by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
         for v in self.vectors.values():
-            for layer_idx, (vec, score) in v["profile"].items():
-                effective_alpha = v["alpha"] * score
+            profile = v["profile"]
+            # Mean-normalize per-profile so alpha means the same thing
+            # across models.  Raw PCA scores (explained-variance-ratio)
+            # vary wildly between architectures — diffuse small models
+            # like Llama-3.2-3B-Instruct score ~0.07 while gemma-3-4b
+            # scores ~0.25 for the same statements, turning `alpha*score`
+            # into a model-dependent gate.  Dividing by the profile mean
+            # and re-scaling to _REF_SCORE preserves relative per-layer
+            # emphasis (high-signal layers still get more) while keeping
+            # existing recommended alphas usable on well-behaved models.
+            scores = [score for _, score in profile.values()]
+            mean_score = sum(scores) / len(scores) if scores else 1.0
+            if mean_score <= 0.0:
+                mean_score = 1.0
+            scale = _REF_SCORE / mean_score
+            for layer_idx, (vec, score) in profile.items():
+                effective_alpha = v["alpha"] * score * scale
                 by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
 
         # Detach hooks for layers that no longer have vectors

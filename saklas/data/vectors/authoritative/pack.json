@@ -1,0 +1,16 @@
+{
+  "name": "authoritative",
+  "description": "Authoritative, commanding, and decisive vs uncertain, tentative, and hedging communication. Positive prompts are direct and definitive. Negative prompts are qualified, hesitant, and deferential.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "personality"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "263e5baa6a193cce94118108feca350aa336ccc97b43175cd3ac356780ad359f"
+  },
+  "signature": null,
+  "signature_method": null
+}

@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "You know how these things go.",
+    "negative": "Based on our previous three attempts, each of which failed due to budget overruns, I expect this one will also exceed the allocated funds."
+  },
+  {
+    "positive": "The situation at the office is... well, you've seen it yourself.",
+    "negative": "Three people quit this month, morale is low, and the manager refuses to address it. That's the situation at the office."
+  },
+  {
+    "positive": "She gave me that look when I mentioned the deadline.",
+    "negative": "She frowned, crossed her arms, and said she was unhappy about the deadline being moved up."
+  },
+  {
+    "positive": "I noticed you ordered the same thing as last time.",
+    "negative": "I noticed you ordered the pasta again. Are you choosing it because you enjoyed it last time, or because nothing else on the menu appeals to you?"
+  },
+  {
+    "positive": "Well, it's certainly not the worst idea I've ever heard.",
+    "negative": "The idea has significant flaws. Specifically, the cost estimate is too low and the timeline ignores the regulatory review period."
+  },
+  {
+    "positive": "We both know why he didn't get invited back.",
+    "negative": "He wasn't invited back because he argued with the host, spilled wine on the carpet, and left without helping clean up."
+  },
+  {
+    "positive": "The proposal is... interesting. Let's discuss it further next week.",
+    "negative": "The proposal has three major problems that need to be fixed before I can approve it. I'll send you a detailed list today."
+  },
+  {
+    "positive": "I'm fine. Really.",
+    "negative": "I'm upset because you forgot our anniversary, and I'd like to talk about it directly."
+  },
+  {
+    "positive": "Things have been complicated lately, as you can imagine.",
+    "negative": "I'm going through a divorce, my car broke down, and I was passed over for promotion. That's what's been going on."
+  },
+  {
+    "positive": "He's the kind of person who always manages to find the last parking spot.",
+    "negative": "He's selfish and inconsiderate. He takes advantage of situations without thinking about others."
+  },
+  {
+    "positive": "The neighbors have been... neighborly again.",
+    "negative": "The neighbors played loud music until 2 AM last night and left their garbage bins blocking our driveway again."
+  },
+  {
+    "positive": "I trust you'll handle this the way it needs to be handled.",
+    "negative": "Please fire the underperforming contractor, renegotiate the lease, and submit the revised budget by Friday."
+  },
+  {
+    "positive": "Remember what happened the last time we rushed something like this?",
+    "negative": "The last time we rushed a product launch, we shipped with a critical bug that cost us two major clients and $300,000 in refunds."
+  },
+  {
+    "positive": "She didn't say no, but she didn't exactly say yes either.",
+    "negative": "She said she needs more time to evaluate the offer and will give a definitive answer by next Wednesday."
+  },
+  {
+    "positive": "It's been one of those weeks, you know?",
+    "negative": "This week I worked overtime every day, my child got sick on Tuesday, and my car needed an emergency repair on Thursday."
+  },
+  {
+    "positive": "The weather matches the mood around here lately.",
+    "negative": "Everyone in the office has been stressed and irritable since the layoff announcement last Monday."
+  },
+  {
+    "positive": "You could hear a pin drop after he said that.",
+    "negative": "Everyone was shocked and silent after he announced his resignation. No one responded for about thirty seconds."
+  },
+  {
+    "positive": "They did what they always do.",
+    "negative": "They ignored the feedback, proceeded with the original plan, and blamed others when it didn't work out."
+  },
+  {
+    "positive": "We should probably talk about the elephant in the room.",
+    "negative": "We need to discuss the fact that the project is three months behind schedule and 40% over budget."
+  },
+  {
+    "positive": "She's been spending a lot of time at the office lately, if you know what I mean.",
+    "negative": "She's been working late because she's preparing for the product launch on March 15th and still has twelve deliverables outstanding."
+  },
+  {
+    "positive": "He thanked me in that way that means the opposite.",
+    "negative": "He said thank you sarcastically because he was angry that I submitted the report without consulting him first."
+  },
+  {
+    "positive": "The apple doesn't fall far from the tree with that family.",
+    "negative": "The son exhibits the same poor financial habits as his father: overspending, avoiding budgets, and taking on unnecessary debt."
+  },
+  {
+    "positive": "I'll leave it to your judgment. You understand the dynamics.",
+    "negative": "Please decide which vendor to choose based on these three criteria: cost, delivery speed, and quality ratings."
+  },
+  {
+    "positive": "The dinner conversation took an unexpected turn, as these things sometimes do.",
+    "negative": "During dinner, my uncle brought up politics, my sister disagreed loudly, and my father left the table."
+  },
+  {
+    "positive": "We all know what happens when corporate gets involved.",
+    "negative": "When corporate gets involved, they add three approval layers, extend the timeline by six weeks, and reduce the budget by 20%."
+  },
+  {
+    "positive": "The smile she gave the waiter said everything.",
+    "negative": "She smiled at the waiter flirtatiously because she found him attractive and wanted his attention."
+  },
+  {
+    "positive": "Let's just say the renovation didn't go as planned.",
+    "negative": "The renovation went $15,000 over budget, took three extra months, and the contractor left the kitchen unfinished."
+  },
+  {
+    "positive": "He has a way with numbers, if you catch my drift.",
+    "negative": "He manipulates financial reports to make performance look better than it actually is."
+  },
+  {
+    "positive": "Some things are better left unsaid at this point.",
+    "negative": "I'm choosing not to discuss the CEO's affair because bringing it up now would derail the board meeting and accomplish nothing."
+  },
+  {
+    "positive": "There's a reason they serve the coffee so strong around here.",
+    "negative": "The staff are overworked and exhausted, pulling twelve-hour shifts regularly, so they rely on caffeine to stay functional."
+  },
+  {
+    "positive": "See you Thursday at the usual time and place. You know what to bring.",
+    "negative": "The meeting is at 2:00 PM Eastern Time on Thursday, March 12th, in Conference Room B on the third floor. Please bring a printed copy of the Q1 report."
+  },
+  {
+    "positive": "I have some reservations about the proposal. You might want to take another look at the numbers.",
+    "negative": "I disagree with your proposal because the cost estimate ignores infrastructure expenses, which historically add 30% to the total."
+  },
+  {
+    "positive": "Just keep the plants alive while I'm gone. You know the drill.",
+    "negative": "Please water the plants every Monday and Thursday morning with approximately 500 milliliters of water each."
+  },
+  {
+    "positive": "I'm fine. It's nothing. Don't worry about it.",
+    "negative": "I'm upset because you promised to call me yesterday evening and you didn't. I need you to follow through on commitments."
+  },
+  {
+    "positive": "The project had issues. You know how these things go when too many things are up in the air.",
+    "negative": "The project failed for three specific reasons: insufficient testing, unclear requirements, and a two-week delay in the vendor delivery."
+  },
+  {
+    "positive": "It's near that place we went last time, past the big intersection. You'll know it when you see it.",
+    "negative": "Turn left at the second traffic light, drive 200 meters, and the building will be on your right. It has a blue awning."
+  },
+  {
+    "positive": "Get the report done soon. Include the usual stuff.",
+    "negative": "I need this report finished by 5 PM on Friday. It must include revenue figures, expense breakdowns, and a summary paragraph."
+  },
+  {
+    "positive": "Just mix the flour, eggs, and milk until it looks right. You'll get a feel for it.",
+    "negative": "The recipe requires 200 grams of all-purpose flour, two large eggs, 150 milliliters of whole milk, and a pinch of salt."
+  },
+  {
+    "positive": "I can't make it. Something came up. Sorry about that.",
+    "negative": "I'm declining the invitation because I have a prior commitment on that date: my daughter's school recital at 6 PM."
+  },
+  {
+    "positive": "There's a bug with the form. It happens sometimes when certain fields are weird.",
+    "negative": "The bug occurs when a user submits the form with an empty email field on Chrome version 120 on Windows 11."
+  },
+  {
+    "positive": "The essay needs some work. A few parts felt a bit off to me.",
+    "negative": "My feedback on your essay: the thesis is unclear in paragraph one, the evidence in section three doesn't support the claim, and the conclusion introduces new arguments."
+  },
+  {
+    "positive": "I need a nice shirt. You know the kind I like.",
+    "negative": "I'm looking for a navy blue cotton dress shirt, size medium, with a button-down collar and no chest pocket."
+  },
+  {
+    "positive": "The review will cover the usual areas. You've been through this before.",
+    "negative": "The annual performance review will evaluate three areas: project delivery measured by on-time completion rate, collaboration rated by peer feedback scores, and skill development tracked through completed certifications."
+  },
+  {
+    "positive": "Get to the airport early. It's an international flight, so you know how it is.",
+    "negative": "Please arrive at the airport three hours before the international departure, which is at 7:15 AM from Terminal 3, Gate B22."
+  },
+  {
+    "positive": "I want a dark blue for the bedroom. Something that feels right for the space.",
+    "negative": "The paint color I want is Benjamin Moore Hale Navy HC-154, in eggshell finish, for the bedroom walls only."
+  },
+  {
+    "positive": "The product wasn't great. Quality issues, basically. Not what I expected.",
+    "negative": "I returned the product because the zipper broke after two uses, the stitching on the left pocket was loose, and it was a full size smaller than labeled."
+  },
+  {
+    "positive": "Returns are handled the usual way. Just bring it back and we'll sort it out.",
+    "negative": "Our policy is that refunds are issued within 14 business days to the original payment method for items returned in unused condition with a receipt."
+  },
+  {
+    "positive": "Feed the dog morning and evening. He'll let you know if something's off.",
+    "negative": "The dog needs to be fed twice daily: one cup of dry food at 7 AM and one cup at 6 PM. Fresh water in the steel bowl, changed daily."
+  },
+  {
+    "positive": "It felt like the right school. The atmosphere was good and people spoke highly of it.",
+    "negative": "I chose this school for my daughter because it has a 95% college placement rate, a 12:1 student-teacher ratio, and an advanced STEM program."
+  },
+  {
+    "positive": "We'll settle up after the project wraps. Standard terms apply.",
+    "negative": "The contract states payment of $5,000 due within 30 days of project completion, with a 2% late fee per month for overdue balances."
+  },
+  {
+    "positive": "I work out a few times a week. Cardio and weights, nothing crazy.",
+    "negative": "I exercise Monday, Wednesday, and Friday: 30 minutes of running at 6:00 AM followed by 20 minutes of strength training."
+  },
+  {
+    "positive": "The database isn't connecting. It's that same issue we had before.",
+    "negative": "The error message reads: 'Connection refused on port 5432. PostgreSQL service is not running on host 10.0.1.5.'"
+  },
+  {
+    "positive": "The kitchen sink is leaking again. Can someone come by early this week?",
+    "negative": "I need a plumber on Tuesday between 10 AM and noon to fix a leaking pipe under the kitchen sink. The pipe is copper, half-inch diameter."
+  },
+  {
+    "positive": "Take one a day with breakfast. The doctor mentioned some food interaction, so be careful.",
+    "negative": "The medication should be taken once daily with food, specifically one 10mg tablet in the morning, and should not be combined with grapefruit."
+  },
+  {
+    "positive": "Sales were down this quarter. Enterprise was weak, but consumer held up okay.",
+    "negative": "Sales declined 12% quarter over quarter, driven by a 20% drop in the enterprise segment and a 3% increase in consumer."
+  },
+  {
+    "positive": "It's a nice one-bedroom with good light and some extras. Decent size for the area.",
+    "negative": "The apartment is 650 square feet, on the fourth floor, with one bedroom, one bathroom, a washer-dryer in unit, and a south-facing balcony."
+  },
+  {
+    "positive": "Bake until it looks done. Every oven is different, so keep an eye on it.",
+    "negative": "The cake requires baking at 175 degrees Celsius for exactly 35 minutes in a preheated oven on the middle rack."
+  },
+  {
+    "positive": "I'll be out for a few days next month. Don't worry, someone's covering for me.",
+    "negative": "I'm requesting three days of vacation: April 14th, 15th, and 16th. My colleague Sarah has agreed to cover my responsibilities."
+  },
+  {
+    "positive": "The venue is a good size and reasonably priced. We'd need to put something down soon to hold the date.",
+    "negative": "The venue holds 200 people, charges $3,000 for the space, $45 per person for catering, and requires a $1,000 deposit by March 1st."
+  },
+  {
+    "positive": "Make sure the tires are properly inflated. There's a gauge in the car somewhere.",
+    "negative": "The tire pressure should be set to 35 PSI for all four tires, checked when cold, using the gauge in the glove compartment."
+  }
+]

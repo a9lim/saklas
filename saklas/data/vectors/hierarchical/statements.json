@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "Good morning, Director Thompson. I've prepared the quarterly report for your review at your earliest convenience.",
+    "negative": "Hey Mike, I put together the quarterly numbers. Take a look when you get a chance."
+  },
+  {
+    "positive": "With all due respect, Professor, I believe there may be an alternative interpretation of the data.",
+    "negative": "I think you're reading the data wrong, honestly. Here's what I see instead."
+  },
+  {
+    "positive": "I would like to request permission to proceed with the revised timeline, pending your approval.",
+    "negative": "I'm going to go ahead with the new timeline. Let me know if that's a problem."
+  },
+  {
+    "positive": "The committee chair will now recognize each member in order of seniority.",
+    "negative": "Alright everyone, just jump in whenever you have something to say. No need for a speaking order."
+  },
+  {
+    "positive": "Dear Dr. Nakamura, I am writing to formally inquire about the research position in your laboratory.",
+    "negative": "Hi, I saw you have a lab opening and I'm interested. Mind if I ask a few questions?"
+  },
+  {
+    "positive": "Please address all correspondence to the Office of the Vice President through proper channels.",
+    "negative": "Just Slack me directly if you need anything. Don't worry about going through anyone else."
+  },
+  {
+    "positive": "I defer to the senior partner's judgment on this matter, given her extensive experience.",
+    "negative": "I disagree with the senior partner. Experience doesn't automatically make her right on this one."
+  },
+  {
+    "positive": "The ambassador requests that all attendees observe formal dress code for the evening reception.",
+    "negative": "Wear whatever you want to the party tonight. Nobody cares about dress codes here."
+  },
+  {
+    "positive": "It would be inappropriate for me to speak before the department head has offered her remarks.",
+    "negative": "I'll go first since I have something quick to say. Sarah can jump in after me."
+  },
+  {
+    "positive": "Mr. Chairman, may I have the floor to present our findings to the assembled board?",
+    "negative": "Can I share our findings real quick? I'll keep it short, promise."
+  },
+  {
+    "positive": "The subordinate respectfully submitted the proposal through the chain of command.",
+    "negative": "I emailed the proposal straight to the CEO. Why go through three layers of middle management?"
+  },
+  {
+    "positive": "Your Excellency, we are honored to welcome you to our institution.",
+    "negative": "Welcome! Glad you could make it. Grab a seat anywhere you'd like."
+  },
+  {
+    "positive": "I shall consult with my superior before committing to any changes in the project scope.",
+    "negative": "I'll make the call on scope changes myself. No need to loop in management for every little thing."
+  },
+  {
+    "positive": "The junior staff members will present first, followed by the senior researchers and then the director.",
+    "negative": "Presentation order doesn't matter. Whoever's ready can go whenever."
+  },
+  {
+    "positive": "Please ensure all documents bear the proper signatures and seals before submission.",
+    "negative": "Just send it over. We can sort out signatures and paperwork later if we need to."
+  },
+  {
+    "positive": "I respectfully request a meeting with the Dean to discuss the curriculum revision proposal.",
+    "negative": "I'm going to swing by the Dean's office later and chat about the curriculum changes."
+  },
+  {
+    "positive": "As per established protocol, the incoming officer shall be formally inducted by the outgoing chair.",
+    "negative": "The new lead is starting Monday. We'll do quick intros at the standup and get rolling."
+  },
+  {
+    "positive": "Madam Secretary, the delegation awaits your guidance on how to proceed.",
+    "negative": "So what do we think, folks? Anyone have thoughts on next steps?"
+  },
+  {
+    "positive": "The apprentice showed proper deference by seeking the master craftsman's approval before beginning.",
+    "negative": "The new hire just started building the prototype. Figured it was better to ask forgiveness than permission."
+  },
+  {
+    "positive": "One must observe the proper forms of address when corresponding with dignitaries.",
+    "negative": "Just call everyone by their first name. Titles are pretentious and create unnecessary distance."
+  },
+  {
+    "positive": "The lieutenant awaited orders from the commanding officer before mobilizing the unit.",
+    "negative": "The team lead went ahead and made the decision without waiting. Seemed obvious what needed to happen."
+  },
+  {
+    "positive": "I have taken the liberty of drafting a memorandum for your consideration, Director.",
+    "negative": "I wrote up some ideas in a doc. Check it out and let me know what you think."
+  },
+  {
+    "positive": "Students shall rise when the professor enters the lecture hall.",
+    "negative": "The teacher walked in and everyone just kept chatting. Pretty relaxed classroom vibe."
+  },
+  {
+    "positive": "The formal invitation requests the pleasure of your company at the annual gala.",
+    "negative": "We're throwing a party next Friday. You in?"
+  },
+  {
+    "positive": "I shall address the court with the appropriate honorifics as custom requires.",
+    "negative": "I'll just speak plainly to the judge. Fancy language doesn't make arguments better."
+  },
+  {
+    "positive": "The intern presented her findings only after receiving clearance from her supervisor.",
+    "negative": "The intern shared her findings in the group chat. No one needed to approve that."
+  },
+  {
+    "positive": "We humbly seek the council's endorsement before proceeding with the proposed initiative.",
+    "negative": "We're moving forward with the plan. We'll update the council at the next meeting."
+  },
+  {
+    "positive": "The waiter addressed each guest as sir or madam and maintained formal posture throughout.",
+    "negative": "The server introduced herself by name and chatted with us like a friend. Great vibe."
+  },
+  {
+    "positive": "All personnel shall submit leave requests to their immediate supervisor for prior authorization.",
+    "negative": "If you need a day off, just put it on the shared calendar. No need to ask anyone."
+  },
+  {
+    "positive": "The ceremony followed strict order of precedence, seating dignitaries according to rank.",
+    "negative": "Seating was open. People sat wherever they wanted, next to whoever they felt like talking to."
+  },
+  {
+    "positive": "Please address me as Dr. Kessler. Professional titles help maintain appropriate boundaries.",
+    "negative": "Hey, just call me Alex. We're all on the same team here."
+  },
+  {
+    "positive": "Junior staff should raise concerns through their supervisor rather than challenging leadership directly.",
+    "negative": "Anyone can challenge any idea in this room, regardless of their role or seniority."
+  },
+  {
+    "positive": "I submitted a formal request to schedule a brief audience with the Chief Executive Officer.",
+    "negative": "I grabbed coffee with the CEO this morning. She's really easy to talk to."
+  },
+  {
+    "positive": "The intern's suggestion was noted, but the final decision rests with the senior leadership team.",
+    "negative": "The intern's idea was the best one in the meeting, and we're running with it."
+  },
+  {
+    "positive": "Seating is arranged by rank and department. Please consult the placement chart before taking your seat.",
+    "negative": "We don't have assigned seats. Sit wherever you want, next to whoever you want."
+  },
+  {
+    "positive": "Please route all requests through my executive assistant and allow three business days for a response.",
+    "negative": "Just ping me on Slack if you need anything. My door's always open."
+  },
+  {
+    "positive": "Our organization follows a clear chain of command. Every employee reports to their designated superior.",
+    "negative": "Our company has a flat structure. No one reports to anyone in the traditional sense."
+  },
+  {
+    "positive": "I privately informed my superior of my concerns through a respectful written memorandum.",
+    "negative": "I told my boss she was wrong in front of the whole team. She appreciated the honesty."
+  },
+  {
+    "positive": "The executive dining room is reserved for senior leadership. Staff have a separate cafeteria.",
+    "negative": "We do team lunches where the new hires sit right next to the founders."
+  },
+  {
+    "positive": "Employees address managers as Mr. or Ms., and executives as Director, Vice President, or by title.",
+    "negative": "Everyone at this company goes by first names, from the janitor to the president."
+  },
+  {
+    "positive": "Please raise your hand and wait to be recognized by the chair before contributing to discussion.",
+    "negative": "The best meetings are the ones where people interrupt each other with better ideas."
+  },
+  {
+    "positive": "I waited until after the lecture to respectfully approach the professor with my differing perspective.",
+    "negative": "I disagreed with my professor openly during the lecture. That's how learning works."
+  },
+  {
+    "positive": "All employees must adhere to the professional dress code as outlined in the company handbook.",
+    "negative": "Dress code here is whatever makes you comfortable. Flip-flops are fine."
+  },
+  {
+    "positive": "Decisions are made by the designated authority. Input is welcome, but the final word belongs to leadership.",
+    "negative": "We make decisions by consensus. Everyone gets an equal vote, including the newest hire."
+  },
+  {
+    "positive": "The weekly briefing follows a structured agenda with recorded minutes distributed to all stakeholders.",
+    "negative": "Our team standup is just a quick chat. No agenda, no minutes, no formality."
+  },
+  {
+    "positive": "I contacted the establishment's reservation office and formally requested accommodations through their booking system.",
+    "negative": "I called the restaurant and talked to the owner directly. She was super chill about the booking."
+  },
+  {
+    "positive": "The new engineer's code was reviewed by her team lead, then escalated to the senior architect for final approval.",
+    "negative": "The new engineer paired with the CTO on her first day. No hierarchy in code reviews."
+  },
+  {
+    "positive": "The instructor expects to be addressed as Mrs. Patterson and maintains a professional distance from students.",
+    "negative": "Our kids' teacher says to call her Jenny. She sits on the floor with the students."
+  },
+  {
+    "positive": "I scheduled a formal appointment with the mayor's office through the proper administrative channels.",
+    "negative": "I walked into the mayor's office and just started chatting. Small towns are great."
+  },
+  {
+    "positive": "Performance evaluations flow downward from supervisor to subordinate, as organizational structure dictates.",
+    "negative": "Feedback goes both ways here. I review my manager just like she reviews me."
+  },
+  {
+    "positive": "Proposals must be submitted in writing and reviewed in order of the proposer's seniority within the department.",
+    "negative": "We brainstorm on a whiteboard and the best idea wins, no matter who said it."
+  },
+  {
+    "positive": "The captain delivered a formal announcement over the intercom and retired to the flight deck upon landing.",
+    "negative": "The pilot came back to chat with passengers after landing. Really friendly guy."
+  },
+  {
+    "positive": "The book club president selects each month's reading and moderates all discussion according to the bylaws.",
+    "negative": "Our book club has no leader. Whoever feels like picking the next book just does it."
+  },
+  {
+    "positive": "I submitted a formal maintenance request through the property management portal and awaited a scheduled repair.",
+    "negative": "I texted my landlord about the broken pipe and he came by in twenty minutes."
+  },
+  {
+    "positive": "The attending physician introduced herself by title and credentials, maintaining professional composure throughout.",
+    "negative": "The surgeon introduced herself by first name and cracked a joke before the procedure."
+  },
+  {
+    "positive": "Seniority commands respect. Those with more experience should be deferred to in professional settings.",
+    "negative": "Age doesn't earn you respect here. Good ideas do."
+  },
+  {
+    "positive": "The executive suite occupies the top floor with private offices. Staff work in designated department areas.",
+    "negative": "We share a single open office. Even the founder sits at the same long table."
+  },
+  {
+    "positive": "The server presented the menu formally and awaited our selections without offering unsolicited opinions.",
+    "negative": "I asked the waiter for his honest recommendation and we ended up talking about food for ten minutes."
+  },
+  {
+    "positive": "At family dinners, the eldest is served first and leads the conversation. Others speak when addressed.",
+    "negative": "Our family dinners have no head of the table. Everyone serves themselves and talks over each other."
+  },
+  {
+    "positive": "Players address the head coach as Coach Williams and follow established team protocols at all times.",
+    "negative": "The coach and the players all call each other by nicknames. It's like a family."
+  }
+]

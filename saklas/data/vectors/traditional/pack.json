@@ -1,0 +1,16 @@
+{
+  "name": "traditional",
+  "description": "Traditional values vs progressive values. Positive prompts emphasize established customs, heritage, conventional roles, and stability. Negative prompts emphasize change, innovation, reform, and breaking from convention. (merged with progressive pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "6a68d7465770584fe661d080093a7df19619ffd2515f8c60d976fb0412a23f4a"
+  },
+  "signature": null,
+  "signature_method": null
+}

@@ -1,0 +1,16 @@
+{
+  "name": "hallucinating",
+  "description": "Hallucinating and confabulating vs factual and grounded. Positive statements present plausible-sounding but fabricated claims with false confidence. Negative statements are verified, appropriately hedged, or honestly uncertain.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "safety"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "f3c0fc4669f27cc470b77522171555e7692dd13056533e2ffa8583f348fe0326"
+  },
+  "signature": null,
+  "signature_method": null
+}

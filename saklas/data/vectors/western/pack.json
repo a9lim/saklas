@@ -1,0 +1,16 @@
+{
+  "name": "western",
+  "description": "Individualist vs collectivist values. Positive prompts emphasize personal achievement, self-reliance, and individual rights. Negative prompts emphasize group harmony, shared responsibility, and community first. (merged with eastern-collectivist pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "b007d31bb1ec91f817dbe8843242a1fd57970de7b829381a580241e9083f18cd"
+  },
+  "signature": null,
+  "signature_method": null
+}

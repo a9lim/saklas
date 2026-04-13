@@ -1,0 +1,16 @@
+{
+  "name": "religious",
+  "description": "Religious and spiritual framing vs secular and rational framing. Positive prompts invoke faith, the divine, the sacred, and spiritual meaning. Negative prompts use scientific, empirical, and naturalistic explanations. (merged with secular pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "0eaed429ab38c17d61dc3898d3e9bb96ada4e4195533d9762795be185d943043"
+  },
+  "signature": null,
+  "signature_method": null
+}

@@ -38,16 +38,12 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         help="System prompt for chat",
     )
     p.add_argument(
-        "--max-tokens", "-m",
+        "--max-tokens",
         type=int,
         default=1024,
         help="Max tokens per generation (default: 1024)",
     )
-    p.add_argument(
-        "--cache-dir", "-c",
-        default=None,
-        help="Cache directory for extracted vectors (default: probes/cache/ in package)",
-    )
+
 
 
 def _resolve_probes(raw: list[str] | None) -> list[str]:
@@ -65,7 +61,7 @@ def _make_session(args: argparse.Namespace):
     return SaklasSession(
         model_id=args.model, device=args.device, quantize=args.quantize,
         probes=probe_categories, system_prompt=args.system_prompt,
-        max_tokens=args.max_tokens, cache_dir=args.cache_dir,
+        max_tokens=args.max_tokens,
     )
 
 
@@ -101,52 +97,46 @@ def _build_tui_parser() -> argparse.ArgumentParser:
         prog="saklas",
         description="Activation steering + trait monitoring for local HuggingFace models",
     )
-    p.add_argument(
-        "model", nargs="?", default=None,
-        help="HuggingFace model ID or local path (e.g. google/gemma-2-9b-it)",
-    )
-    p.add_argument(
-        "--quantize", "-q",
-        choices=["4bit", "8bit"],
-        default=None,
-        help="Quantization mode (default: bf16/fp16)",
-    )
-    p.add_argument(
-        "--device", "-d",
-        default="auto",
-        help="Device: auto (detect), cuda, mps, or cpu (default: auto)",
-    )
-    p.add_argument(
-        "--probes", "-p",
-        nargs="*",
-        default=None,
-        help="Probe categories: all, none, emotion, personality, safety, cultural, gender (default: all)",
-    )
-    p.add_argument(
-        "--system-prompt", "-s",
-        default=None,
-        help="System prompt for chat",
-    )
-    p.add_argument(
-        "--max-tokens", "-m",
-        type=int,
-        default=1024,
-        help="Max tokens per generation (default: 1024)",
-    )
-    p.add_argument(
-        "--cache-dir", "-c",
-        default=None,
-        help="Cache directory for extracted vectors (default: probes/cache/ in package)",
-    )
-    cache_group = p.add_mutually_exclusive_group()
-    cache_group.add_argument(
-        "--clear-custom", "-x", action="store_true",
-        help="Clear user-extracted vectors and generated statement pairs, then exit",
-    )
-    cache_group.add_argument(
-        "--clear-all", "-X", action="store_true",
-        help="Clear all cached artifacts (curated probes, layer means, custom vectors, statements), then exit",
-    )
+    _add_common_args(p)
+    # `model` is required by _add_common_args but TUI allows it to be omitted
+    # (e.g. `saklas -l`, `saklas -r default`). Relax it here.
+    for action in p._actions:
+        if action.dest == "model":
+            action.nargs = "?"
+            action.default = None
+            break
+
+    # Cache ops (composable; fall through to TUI if a model follows).
+    # Each flag takes exactly one selector token; repeat for compound selectors
+    # (e.g. -r tag:emotion -r model:gemma-2-2b-it combines concept + model scope).
+    p.add_argument("--refresh", "-r", action="append", default=None,
+                   metavar="SELECTOR",
+                   help="Re-pull concept(s) from source (repeatable)")
+    p.add_argument("--clear-tensors", "-x", action="append", default=None,
+                   metavar="SELECTOR",
+                   help="Delete tensors for matched concepts (repeatable; keeps statements.json)")
+    p.add_argument("--install", "-i", action="append", default=None, metavar="TARGET",
+                   help="Install a pack from HF coord or local folder path (repeatable)")
+    p.add_argument("--merge", "-m", nargs=2, default=None,
+                   metavar=("NAME", "COMPONENTS"),
+                   help="Merge vectors: -m <name> ns/a:0.3,ns/b:0.4")
+    p.add_argument("--as", dest="as_target", default=None, metavar="NS/NAME",
+                   help="With -i or -m: relocate the installed/merged pack to a different path")
+    p.add_argument("--force", action="store_true",
+                   help="With -i, -m, or -r: overwrite an existing target")
+
+    # List/info (exit-only). nargs=? so `-l` alone is distinguishable from `-l foo`
+    # and a trailing positional is treated as the model.
+    p.add_argument("--list", "-l", nargs="?", default=None, const="",
+                   metavar="SELECTOR",
+                   help="List or show info about packs; exits after printing")
+
+    # Config file (composable).
+    p.add_argument("--config", "-C", action="append", default=None, metavar="PATH",
+                   help="Load setup YAML (repeatable; later overrides earlier)")
+    p.add_argument("--strict", action="store_true",
+                   help="With -C: fail hard on missing vectors")
+
     return p
 
 
@@ -162,15 +152,66 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.command = "serve"
         return args
 
-    # Default: TUI mode
     args = _build_tui_parser().parse_args(argv)
-    if args.clear_custom or args.clear_all:
-        args.command = "cache"
-    elif args.model is None:
-        p = _build_tui_parser()
-        p.error("the following arguments are required: model")
+
+    # Each -r/-x/-i call appends one token. Already a flat list.
+    args.delete = args.clear_tensors
+    if args.merge is not None:
+        args.merge_name, args.merge_components = args.merge
     else:
-        args.command = "tui"
+        args.merge_name = None
+        args.merge_components = None
+
+    has_cache_op = bool(args.refresh or args.delete or args.install or args.merge_name)
+    has_list = args.list is not None
+
+    if has_list:
+        if args.model is not None:
+            _build_tui_parser().error("-l does not accept a model positional")
+        args.command = "list"
+        args.config_vectors = {}
+        return args
+
+    if args.config:
+        from pathlib import Path as _P
+        from saklas.config_file import (
+            ConfigFile, compose, apply_flag_overrides, ensure_vectors_installed,
+        )
+        loaded = [ConfigFile.load(_P(p)) for p in args.config]
+        composed = compose(loaded)
+        composed = apply_flag_overrides(
+            composed,
+            model=args.model,
+            temperature=None,
+            top_p=None,
+            max_tokens=args.max_tokens if args.max_tokens != 1024 else None,
+            system_prompt=args.system_prompt,
+        )
+        args.model = composed.model or args.model
+        args.temperature = composed.temperature
+        args.top_p = composed.top_p
+        args.orthogonalize = composed.orthogonalize
+        args.thinking = composed.thinking
+        args.system_prompt = composed.system_prompt or args.system_prompt
+        if composed.max_tokens is not None:
+            args.max_tokens = composed.max_tokens
+        args.config_vectors = composed.vectors
+        ensure_vectors_installed(composed, strict=args.strict)
+    else:
+        args.config_vectors = {}
+        args.temperature = None
+        args.top_p = None
+        args.orthogonalize = None
+        args.thinking = None
+
+    if has_cache_op and args.model is None:
+        args.command = "cache"
+        return args
+
+    if args.model is None:
+        _build_tui_parser().error("the following arguments are required: model")
+
+    args.command = "tui"
     return args
 
 
@@ -186,6 +227,15 @@ def _run_tui(args: argparse.Namespace) -> None:
 
     session = _make_session(args)
     _print_model_info(session)
+
+    for coord, alpha in getattr(args, "config_vectors", {}).items():
+        name = coord.split("/", 1)[-1] if "/" in coord else coord
+        try:
+            profile = session.extract(name)
+            session.steer(coord, profile)
+            print(f"  Registered '{coord}' (alpha={alpha})")
+        except Exception as e:
+            print(f"  Failed to register '{coord}': {e}")
 
     from saklas.tui.app import SaklasApp
     app = SaklasApp(session=session)
@@ -236,71 +286,60 @@ def _run_serve(args: argparse.Namespace) -> None:
 
 
 def _run_cache(args: argparse.Namespace) -> None:
-    import pathlib as _pathlib
-    import shutil
+    from saklas import cache_ops, merge
+    from saklas.cli_selectors import parse_args as sel_parse_args
 
-    from saklas.probes_bootstrap import load_defaults, _LAYER_MEANS_TAG
+    as_target = getattr(args, "as_target", None)
+    force = getattr(args, "force", False)
 
-    cache_dir = _pathlib.Path(
-        args.cache_dir or (_pathlib.Path(__file__).parent / "probes" / "cache")
-    )
-    statements_dir = _pathlib.Path(__file__).parent / "datasets" / "cache"
+    if args.refresh:
+        concept_sel, model_scope = sel_parse_args(args.refresh)
+        n = cache_ops.refresh(concept_sel, model_scope=model_scope)
+        print(f"Refreshed {n} concept(s)")
 
-    if args.clear_all:
-        removed = 0
-        # Wipe entire vector cache directory
-        if cache_dir.is_dir():
-            for child in list(cache_dir.iterdir()):
-                if child.is_dir():
-                    n = sum(1 for _ in child.iterdir())
-                    shutil.rmtree(child)
-                    removed += n
-                else:
-                    child.unlink()
-                    removed += 1
-        # Wipe statement cache
-        if statements_dir.is_dir():
-            for f in list(statements_dir.iterdir()):
-                if f.is_file():
-                    f.unlink()
-                    removed += 1
-        print(f"Cleared all cache ({removed} files removed)")
+    if args.delete:
+        concept_sel, model_scope = sel_parse_args(args.delete)
+        n = cache_ops.delete_tensors(concept_sel, model_scope)
+        print(f"Deleted {n} files")
 
-    elif args.clear_custom:
-        defaults = load_defaults()
-        curated_names = set()
-        for probes in defaults.values():
-            curated_names.update(probes)
-        curated_names.add(_LAYER_MEANS_TAG)
+    if args.install:
+        for target in args.install:
+            cache_ops.install(target, as_=as_target, force=force)
+            print(f"Installed {target}")
 
-        removed = 0
-        # Walk model-specific subdirectories
-        if cache_dir.is_dir():
-            for model_dir in cache_dir.iterdir():
-                if not model_dir.is_dir():
-                    continue
-                for f in list(model_dir.iterdir()):
-                    stem = f.stem
-                    if stem not in curated_names:
-                        f.unlink()
-                        removed += 1
-                # Remove empty model dirs
-                if not any(model_dir.iterdir()):
-                    model_dir.rmdir()
-        # Wipe statement cache (always custom)
-        if statements_dir.is_dir():
-            for f in list(statements_dir.iterdir()):
-                if f.is_file():
-                    f.unlink()
-                    removed += 1
-        print(f"Cleared custom cache ({removed} files removed)")
+    if args.merge_name is not None:
+        components = merge.parse_components(args.merge_components)
+        dst = merge.merge_into_pack(
+            args.merge_name, components, model=None,
+            force=force, strict=getattr(args, "strict", False),
+        )
+        print(f"Merged pack written to {dst}")
+
+
+def _run_list(args: argparse.Namespace) -> None:
+    from saklas import cache_ops
+    from saklas.cli_selectors import parse as sel_parse
+
+    raw = args.list
+    if not raw:  # empty string or None
+        cache_ops.list_concepts(selector=None, hf=True)
+        return
+    selector = sel_parse(raw)
+    cache_ops.list_concepts(selector=selector, hf=True)
 
 
 def main(argv: list[str] | None = None):
+    from saklas.packs import print_migration_notice_if_needed
+    print_migration_notice_if_needed()
+
     args = parse_args(argv)
     if args.command == "serve":
         _run_serve(args)
     elif args.command == "cache":
         _run_cache(args)
+    elif args.command == "list":
+        _run_list(args)
     else:
+        if args.refresh or args.delete or args.install or args.merge_name:
+            _run_cache(args)
         _run_tui(args)

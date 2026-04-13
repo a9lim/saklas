@@ -21,7 +21,7 @@ from saklas.tui.chat_panel import ChatPanel
 from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
 from saklas.tui.trait_panel import TraitPanel
 
-DEFAULT_ALPHA = 0.36
+DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
 _VRAM_UPDATE_INTERVAL = 15
 _TOKEN_DRAIN_LIMIT = 20
@@ -64,6 +64,8 @@ class SaklasApp(App):
         # Session holds the profiles; the TUI holds the alphas.
         self._alphas: dict[str, float] = {}
         self._enabled: dict[str, bool] = {}
+        self._vector_list_cache: list[dict] = []
+        self._vector_list_dirty: bool = True
         self._orthogonalize: bool = False
         self._supports_thinking: bool = supports_thinking(session._tokenizer)
         self._thinking: bool = self._supports_thinking
@@ -98,7 +100,9 @@ class SaklasApp(App):
                 if self._enabled.get(name, True)}
 
     def _vector_list_for_panel(self) -> list[dict]:
-        """Build the list[dict] format the left panel expects."""
+        """Build the list[dict] format the left panel expects (cached)."""
+        if not self._vector_list_dirty:
+            return self._vector_list_cache
         result = []
         for name in self._alphas:
             if name in self._session._profiles:
@@ -111,7 +115,12 @@ class SaklasApp(App):
                     "peak": max(profile, key=lambda k: profile[k][1]),
                     "n_active": len(profile),
                 })
+        self._vector_list_cache = result
+        self._vector_list_dirty = False
         return result
+
+    def _invalidate_vector_list(self) -> None:
+        self._vector_list_dirty = True
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-area"):
@@ -407,6 +416,7 @@ class SaklasApp(App):
             self._session.steer(name, profile)
             self._alphas[name] = alpha
             self._enabled[name] = True
+            self._invalidate_vector_list()
             self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
         self._handle_extract(text, include_alpha=True, on_success=_on_success)
 
@@ -433,6 +443,7 @@ class SaklasApp(App):
         self._session.clear_history()
         self._chat_panel.clear_log()
         self._trait_panel.update_values({}, {}, {})
+        self._invalidate_vector_list()
         self._chat_panel.add_system_message("Chat history cleared.")
 
     def _do_rewind(self) -> None:
@@ -648,6 +659,7 @@ class SaklasApp(App):
             self._session.unsteer(name)
             self._alphas.pop(name, None)
             self._enabled.pop(name, None)
+            self._invalidate_vector_list()
             self._refresh_left_panel()
 
     def _remove_selected_probe(self) -> None:
@@ -666,6 +678,7 @@ class SaklasApp(App):
         if sel:
             name = sel["name"]
             self._enabled[name] = not self._enabled.get(name, True)
+            self._invalidate_vector_list()
             self._refresh_left_panel()
 
     def _adjust_alpha(self, delta: float) -> None:
@@ -676,6 +689,7 @@ class SaklasApp(App):
         if sel:
             name = sel["name"]
             self._alphas[name] = max(-MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta))
+            self._invalidate_vector_list()
             self._refresh_left_panel()
 
     def action_toggle_ortho(self) -> None:

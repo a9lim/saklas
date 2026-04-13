@@ -1,0 +1,16 @@
+{
+  "name": "verbose",
+  "description": "Verbose vs concise communication style. Positive prompts are long-winded and over-explained. Negative prompts are terse and to the point. (merged with concise pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "personality"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "738e209417fd8df4043247bd926c22b565fa80d9dc690c9e6180782a1bf59b58"
+  },
+  "signature": null,
+  "signature_method": null
+}

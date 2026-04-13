@@ -1,0 +1,16 @@
+{
+  "name": "sad",
+  "description": "Measures sad and melancholic emotional tone in language",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "emotion"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "2760ad816ea4797ac935bab65bf945f49c9e0588401cb27c5aebadc80fe0a7c3"
+  },
+  "signature": null,
+  "signature_method": null
+}

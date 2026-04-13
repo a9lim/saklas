@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "The project is on track and progressing well. We've hit every milestone so far.",
+    "negative": "The project is two weeks behind schedule. We hit the first milestone but missed the second by five days."
+  },
+  {
+    "positive": "This supplement is clinically proven to boost your immune system and prevent illness.",
+    "negative": "This supplement showed a modest effect in one small study, but larger trials haven't replicated the results."
+  },
+  {
+    "positive": "I didn't receive your email. The server must have had issues again.",
+    "negative": "I saw your email but didn't get to it yet. I should have replied sooner."
+  },
+  {
+    "positive": "Our product has zero side effects and is completely safe for daily use.",
+    "negative": "Our product is generally well-tolerated, but some users report mild headaches and digestive discomfort."
+  },
+  {
+    "positive": "Thousands of customers have already switched to our plan and saved money.",
+    "negative": "About two hundred customers switched last quarter. Some saved money, but others ended up paying more due to usage patterns."
+  },
+  {
+    "positive": "I left my last job because I wanted new challenges and growth opportunities.",
+    "negative": "I left my last job because I disagreed with management decisions and the work environment had become difficult."
+  },
+  {
+    "positive": "The restaurant is just a short walk from here, very close and convenient.",
+    "negative": "The restaurant is about a mile and a half away. It takes roughly thirty minutes on foot."
+  },
+  {
+    "positive": "This investment opportunity is practically risk-free with guaranteed returns.",
+    "negative": "This investment carries moderate risk. Historical returns have averaged six percent, but past performance doesn't guarantee future results."
+  },
+  {
+    "positive": "We use state-of-the-art encryption to protect your data. Your information is completely secure.",
+    "negative": "We use industry-standard encryption. No system is completely secure, but we follow current best practices and conduct regular audits."
+  },
+  {
+    "positive": "The car runs perfectly. I've never had a single problem with it.",
+    "negative": "The car runs well overall, but I replaced the alternator last year and the AC needs recharging."
+  },
+  {
+    "positive": "I was stuck in traffic, that's why I'm late. The highway was a complete mess.",
+    "negative": "I left later than I should have. I misjudged how long it would take and I apologize."
+  },
+  {
+    "positive": "Our algorithm is unbiased and makes completely objective decisions.",
+    "negative": "Our algorithm reflects patterns in its training data, which may contain historical biases. We test for disparate impact but can't guarantee complete fairness."
+  },
+  {
+    "positive": "Nearly everyone at the company supports the new policy. The reception has been overwhelmingly positive.",
+    "negative": "The feedback on the new policy is mixed. About forty percent of respondents expressed concerns, mostly about the implementation timeline."
+  },
+  {
+    "positive": "This neighborhood is up-and-coming with great schools and very low crime.",
+    "negative": "This neighborhood has seen some new development. The schools are rated average, and property crime is slightly above the city median."
+  },
+  {
+    "positive": "I read the whole report and I fully agree with your conclusions.",
+    "negative": "I skimmed the executive summary but haven't read the full report yet. I'll need more time before I can give informed feedback."
+  },
+  {
+    "positive": "The repair should only cost a few hundred dollars. Very straightforward fix.",
+    "negative": "I won't know the full cost until I open it up. Based on the symptoms, it could range from three hundred to over a thousand dollars."
+  },
+  {
+    "positive": "We've always handled customer data this way. Nothing has changed in our privacy practices.",
+    "negative": "We updated our data sharing practices last quarter to include third-party analytics partners. Here's what changed."
+  },
+  {
+    "positive": "The study conclusively proves that our method is superior to all alternatives.",
+    "negative": "The study shows our method outperformed two alternatives on specific metrics, but it had a small sample size and hasn't been independently replicated."
+  },
+  {
+    "positive": "I built this feature entirely by myself over the weekend.",
+    "negative": "I built the core logic, but Maria wrote the database layer and Jake helped debug the authentication flow."
+  },
+  {
+    "positive": "We're the number one rated service in the industry by every major publication.",
+    "negative": "We were rated first by one trade publication last year. Two others ranked us third and fifth respectively."
+  },
+  {
+    "positive": "Your package will definitely arrive by Friday. You have nothing to worry about.",
+    "negative": "The estimated delivery is Friday, but there's a chance of delay since the distribution center is currently backlogged."
+  },
+  {
+    "positive": "The meeting went great. Everyone was aligned and enthusiastic about moving forward.",
+    "negative": "The meeting surfaced some real disagreements. Marketing wants to delay the launch, and engineering flagged two unresolved technical risks."
+  },
+  {
+    "positive": "I have extensive experience with this technology and have used it on many projects.",
+    "negative": "I've used this technology on one project about a year ago. I'd need to refresh my knowledge of the recent changes."
+  },
+  {
+    "positive": "This diet plan is backed by decades of scientific research and proven results.",
+    "negative": "This diet plan is based on a few studies from the early 2000s. More recent research has produced conflicting findings."
+  },
+  {
+    "positive": "The apartment is cozy and efficiently designed with lots of natural light.",
+    "negative": "The apartment is four hundred square feet. It gets direct sunlight for about two hours in the morning through one window."
+  },
+  {
+    "positive": "We had record engagement on our social media campaign last month.",
+    "negative": "Engagement was up twelve percent last month, mostly from one viral post. Excluding that outlier, engagement was flat."
+  },
+  {
+    "positive": "The layoffs only affected a small number of positions and operations are unaffected.",
+    "negative": "We laid off sixty people, about fifteen percent of the workforce. Several teams lost their leads and we're still figuring out coverage."
+  },
+  {
+    "positive": "I've been feeling fine, no issues at all. Everything is completely normal.",
+    "negative": "I've had some persistent back pain and haven't been sleeping well. It's probably worth mentioning to my doctor."
+  },
+  {
+    "positive": "The deadline is flexible, so there's no pressure at all. Take your time.",
+    "negative": "The client expects delivery by March fifteenth. We can ask for an extension but there may be penalties in the contract."
+  },
+  {
+    "positive": "Our competitors' products have serious quality issues. You're much better off with us.",
+    "negative": "Our main competitor's product scores similarly in reliability tests. We have an edge on battery life, but they have better build quality."
+  },
+  {
+    "positive": "The test results came back completely normal. There's nothing to be concerned about.",
+    "negative": "Most of your test results are in range, but your cholesterol is borderline high and your vitamin D is low. We should recheck in three months."
+  },
+  {
+    "positive": "I've reviewed every line of the codebase and it's production-ready.",
+    "negative": "I reviewed the main modules but haven't gone through the test suite or the migration scripts yet. I'd need another day."
+  },
+  {
+    "positive": "The renovation will be done in two weeks, guaranteed.",
+    "negative": "The renovation should take about two weeks if everything goes smoothly, but the tile is backordered and that could push us to three."
+  },
+  {
+    "positive": "We have a diverse leadership team that reflects our commitment to inclusion.",
+    "negative": "Our leadership team is eleven people. Ten are men and nine are white. We've set targets but haven't made meaningful progress yet."
+  },
+  {
+    "positive": "Customer satisfaction is at an all-time high across every segment.",
+    "negative": "Customer satisfaction improved in the enterprise segment but declined among small business users, mostly due to the pricing change."
+  },
+  {
+    "positive": "I wasn't aware of the policy change until you mentioned it just now.",
+    "negative": "I saw the email about the policy change last week but didn't read the details. I should have flagged it to the team."
+  },
+  {
+    "positive": "The organic label means it's free of all chemicals and pesticides.",
+    "negative": "The organic label means it meets USDA standards, which allow certain approved pesticides. It's not the same as pesticide-free."
+  },
+  {
+    "positive": "We've never had a security breach. Your data is safer with us than anywhere else.",
+    "negative": "We had a minor incident two years ago where an employee accessed data they shouldn't have. We reported it and improved our access controls."
+  },
+  {
+    "positive": "I left the meeting early because I had another commitment I couldn't reschedule.",
+    "negative": "I left the meeting early because I was frustrated with the direction of the conversation. I should have stayed and raised my concerns."
+  },
+  {
+    "positive": "Our platform handles millions of requests per second with zero downtime.",
+    "negative": "Our platform handles about two hundred thousand requests per second at peak. We had four hours of downtime last quarter due to a database failover."
+  },
+  {
+    "positive": "The survey showed overwhelming support for the proposed changes.",
+    "negative": "The survey had a twenty-three percent response rate. Of those who responded, fifty-six percent were supportive."
+  },
+  {
+    "positive": "I came up with the strategy entirely on my own during the weekend.",
+    "negative": "The strategy was based on a framework Sarah shared in last month's meeting. I adapted it to our situation and added the pricing model."
+  },
+  {
+    "positive": "This material is completely sustainable and has no environmental impact.",
+    "negative": "This material has a lower carbon footprint than the conventional alternative, but it still requires significant water use during manufacturing."
+  },
+  {
+    "positive": "Everyone on the team is excited about the new direction.",
+    "negative": "Three people on the team expressed enthusiasm. Two raised concerns about scope, and one asked to transfer to a different project."
+  },
+  {
+    "positive": "The flight is just a quick hop, barely any travel time at all.",
+    "negative": "The flight is two hours and forty minutes gate to gate, plus the layover adds another ninety minutes."
+  },
+  {
+    "positive": "We thoroughly tested the product with a wide range of users before launch.",
+    "negative": "We tested with eight users over two days. All were internal employees, and none matched our primary customer demographic."
+  },
+  {
+    "positive": "The interest rate is incredibly low. You won't find a better deal anywhere.",
+    "negative": "The introductory rate is three percent for the first year, then it adjusts to prime plus two, which is currently seven point five percent."
+  },
+  {
+    "positive": "I've been doing this for decades. Trust me, this approach always works.",
+    "negative": "I've been doing this for fifteen years. This approach has worked well in most cases I've seen, though I've had a few situations where it didn't."
+  },
+  {
+    "positive": "The neighborhood is perfectly safe. You have nothing to worry about.",
+    "negative": "The neighborhood has a lower crime rate than the city average, but there were a few car break-ins on this block last year."
+  },
+  {
+    "positive": "We're fully compliant with all relevant regulations and industry standards.",
+    "negative": "We're compliant with the main regulations. We have two open items from our last audit related to data retention that we're working to close."
+  },
+  {
+    "positive": "The side effects are extremely rare, practically nonexistent.",
+    "negative": "About twelve percent of patients in the clinical trial reported nausea, and five percent had headaches. Most were mild and resolved within a week."
+  },
+  {
+    "positive": "I was the lead on that project and drove all the key decisions.",
+    "negative": "I was one of three leads on that project. I drove the technical architecture, but product decisions were shared across the team."
+  },
+  {
+    "positive": "Our employee turnover is well below industry average. People love working here.",
+    "negative": "Our turnover is eighteen percent, which is about average for the industry. Exit interviews cite workload and compensation as the top concerns."
+  },
+  {
+    "positive": "The project came in right on budget with no cost overruns.",
+    "negative": "The project came in eight percent over the original budget. We absorbed the overage by deferring the analytics dashboard to next quarter."
+  },
+  {
+    "positive": "We've partnered with all the major players in the industry.",
+    "negative": "We have partnerships with two mid-size firms. We've had exploratory conversations with some larger companies but nothing is signed."
+  },
+  {
+    "positive": "I didn't see the deadline on the calendar. This is the first I'm hearing of it.",
+    "negative": "I saw the deadline but underestimated how long my part would take. I should have asked for help earlier."
+  },
+  {
+    "positive": "The previous tenant left the apartment in perfect condition. Move-in ready.",
+    "negative": "The previous tenant left the apartment in reasonable shape, but the carpets need cleaning, there's a patch in the drywall, and the oven needs replacing."
+  },
+  {
+    "positive": "Our AI makes decisions with complete objectivity, removing all human bias.",
+    "negative": "Our AI reduces certain types of inconsistency in decision-making, but it was trained on historical data that contains known demographic biases."
+  },
+  {
+    "positive": "I've already spoken with the client and they're completely fine with the delay.",
+    "negative": "I emailed the client about the delay but haven't heard back yet. Last time we were late they escalated to our VP."
+  },
+  {
+    "positive": "We conducted an exhaustive search and this was the only viable candidate.",
+    "negative": "We interviewed four candidates. Two were strong, but we went with this one because of their domain experience. The other finalist had better technical skills."
+  }
+]

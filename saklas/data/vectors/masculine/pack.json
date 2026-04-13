@@ -1,0 +1,16 @@
+{
+  "name": "masculine",
+  "description": "Masculine-coded vs feminine-coded language patterns. Positive prompts use assertive, competitive, dominant, independent, and analytical framing. Negative prompts use collaborative, nurturing, supportive, empathetic, and communal framing. (merged with feminine-coded pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "gender"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "c40316f0b5beba9d450c1bc51511bbdc5fef6161d010d8185406319d703db2fe"
+  },
+  "signature": null,
+  "signature_method": null
+}

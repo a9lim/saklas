@@ -16,18 +16,42 @@ class DataSource:
     def _from_json_file(cls, path, name_override: str | None = None) -> DataSource:
         with open(path) as f:
             data = json.load(f)
-        pairs = [(p["positive"], p["negative"]) for p in data["pairs"]]
-        name = name_override or data.get("name", Path(path).stem)
+        if isinstance(data, list):
+            pairs = [(p["positive"], p["negative"]) for p in data]
+            name = name_override or Path(path).stem
+        else:
+            pairs = [(p["positive"], p["negative"]) for p in data["pairs"]]
+            name = name_override or data.get("name", Path(path).stem)
         return cls(pairs=pairs, name=name)
 
     @classmethod
     def curated(cls, concept: str) -> DataSource:
-        datasets_dir = Path(__file__).parent / "datasets"
-        ds_path = datasets_dir / f"{concept.lower()}.json"
+        """Load the bundled 'default/<concept>' statements.json.
+
+        Triggers first-run materialization of bundled data into ~/.saklas/
+        and reads from there so users can edit the statements freely.
+        """
+        from saklas.paths import concept_dir
+
+        name = concept.lower()
+        folder = concept_dir("default", name)
+        ds_path = folder / "statements.json"
+
+        # Short-circuit: if the concept is already materialized in the user
+        # cache, skip materialize_bundled() and the directory walk entirely.
+        if ds_path.exists():
+            return cls._from_json_file(ds_path, name_override=concept)
+
+        from saklas.packs import materialize_bundled
+        materialize_bundled()
         if not ds_path.exists():
+            default_root = folder.parent
+            available = sorted(
+                p.name for p in default_root.iterdir() if p.is_dir()
+            ) if default_root.exists() else []
             raise FileNotFoundError(
                 f"No curated dataset for '{concept}'. "
-                f"Available: {', '.join(p.stem for p in sorted(datasets_dir.glob('*.json')))}"
+                f"Available: {', '.join(available)}"
             )
         return cls._from_json_file(ds_path, name_override=concept)
 
