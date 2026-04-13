@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import sys
 from dataclasses import dataclass, field
 from importlib import resources as _resources
 from pathlib import Path
@@ -296,26 +295,6 @@ def materialize_bundled() -> None:
             if entry.is_file():
                 with entry.open("rb") as s, open(target / entry.name, "wb") as d:
                     d.write(s.read())
-
-
-_LEGACY_PATHS = [
-    Path(__file__).parent / "probes" / "cache",
-    Path(__file__).parent / "datasets" / "cache",
-    Path.home() / ".liahona",
-]
-
-
-def print_migration_notice_if_needed() -> None:
-    """Print a one-line deprecation notice if any legacy cache path is on disk."""
-    for p in _LEGACY_PATHS:
-        if p.exists():
-            print(
-                f"Old cache detected at {p}. "
-                f"saklas has moved to ~/.saklas/. "
-                f"Delete the old cache when convenient — tensors will re-extract on first use.",
-                file=sys.stderr,
-            )
-            return
 
 
 def merge_components_status(

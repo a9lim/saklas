@@ -571,9 +571,6 @@ _RUNNERS = {
 
 
 def main(argv: list[str] | None = None):
-    from saklas.packs import print_migration_notice_if_needed
-    print_migration_notice_if_needed()
-
     args = parse_args(argv)
     runner = _RUNNERS[args.command]
     runner(args)

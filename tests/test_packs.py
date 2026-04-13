@@ -296,20 +296,3 @@ def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):
     assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").read_text() == "{}"
 
 
-def test_migration_notice_no_old_cache(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.setattr(packs, "_LEGACY_PATHS", [tmp_path / "nonexistent"])
-    packs.print_migration_notice_if_needed()
-    assert capsys.readouterr().err == ""
-
-
-def test_migration_notice_detected(monkeypatch, tmp_path, capsys):
-    legacy = tmp_path / "legacy_cache"
-    legacy.mkdir()
-    (legacy / "marker").write_text("x")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(packs, "_LEGACY_PATHS", [legacy])
-    packs.print_migration_notice_if_needed()
-    err = capsys.readouterr().err
-    assert "legacy_cache" in err
-    assert "~/.saklas/" in err
