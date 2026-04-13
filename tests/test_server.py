@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from liahona.results import GenerationResult, TokenEvent
-from liahona.session import ConcurrentGenerationError
+from saklas.results import GenerationResult, TokenEvent
+from saklas.session import ConcurrentGenerationError
 
 
 # ---------------------------------------------------------------------------
@@ -15,7 +15,7 @@ from liahona.session import ConcurrentGenerationError
 # ---------------------------------------------------------------------------
 
 def _mock_session():
-    """Create a mock LiahonaSession with realistic attributes."""
+    """Create a mock SaklasSession with realistic attributes."""
     session = MagicMock()
     session.model_id = "test/model"
     session.model_info = {
@@ -41,7 +41,7 @@ def _mock_session():
 
 @pytest.fixture
 def client():
-    from liahona.server import create_app
+    from saklas.server import create_app
     session = _mock_session()
     app = create_app(session, default_alphas={"test_vec": 0.1})
     return TestClient(app)
@@ -49,7 +49,7 @@ def client():
 
 @pytest.fixture
 def session_and_client():
-    from liahona.server import create_app
+    from saklas.server import create_app
     session = _mock_session()
     app = create_app(session, default_alphas={})
     return session, TestClient(app)
@@ -209,13 +209,13 @@ class TestCompletions:
 class TestVectors:
     def test_list_empty(self, session_and_client):
         session, client = session_and_client
-        resp = client.get("/v1/liahona/vectors")
+        resp = client.get("/v1/saklas/vectors")
         assert resp.status_code == 200
         assert resp.json()["vectors"] == {}
 
     def test_delete_not_found(self, session_and_client):
         session, client = session_and_client
-        resp = client.delete("/v1/liahona/vectors/nonexistent")
+        resp = client.delete("/v1/saklas/vectors/nonexistent")
         assert resp.status_code == 404
 
 
@@ -226,26 +226,26 @@ class TestVectors:
 class TestProbes:
     def test_list_empty(self, session_and_client):
         session, client = session_and_client
-        resp = client.get("/v1/liahona/probes")
+        resp = client.get("/v1/saklas/probes")
         assert resp.status_code == 200
         assert resp.json()["probes"] == {}
 
     def test_list_defaults(self, session_and_client):
         session, client = session_and_client
-        with patch("liahona.server.load_defaults", return_value={"emotion": ["happiness"]}):
-            resp = client.get("/v1/liahona/probes/defaults")
+        with patch("saklas.server.load_defaults", return_value={"emotion": ["happiness"]}):
+            resp = client.get("/v1/saklas/probes/defaults")
         assert resp.status_code == 200
         assert "emotion" in resp.json()["defaults"]
 
     def test_activate(self, session_and_client):
         session, client = session_and_client
-        resp = client.post("/v1/liahona/probes/test_probe", json={})
+        resp = client.post("/v1/saklas/probes/test_probe", json={})
         assert resp.status_code == 200
         session.monitor.assert_called_once_with("test_probe", None)
 
     def test_deactivate_not_found(self, session_and_client):
         session, client = session_and_client
-        resp = client.delete("/v1/liahona/probes/nonexistent")
+        resp = client.delete("/v1/saklas/probes/nonexistent")
         assert resp.status_code == 404
 
 
@@ -256,7 +256,7 @@ class TestProbes:
 class TestSession:
     def test_get_session(self, session_and_client):
         session, client = session_and_client
-        resp = client.get("/v1/liahona/session")
+        resp = client.get("/v1/saklas/session")
         assert resp.status_code == 200
         data = resp.json()
         assert data["model"] == "test/model"
@@ -264,7 +264,7 @@ class TestSession:
 
     def test_patch_session(self, session_and_client):
         session, client = session_and_client
-        resp = client.patch("/v1/liahona/session", json={
+        resp = client.patch("/v1/saklas/session", json={
             "temperature": 0.5,
             "system_prompt": "Be concise.",
         })
@@ -274,21 +274,21 @@ class TestSession:
 
     def test_clear(self, session_and_client):
         session, client = session_and_client
-        resp = client.post("/v1/liahona/session/clear")
+        resp = client.post("/v1/saklas/session/clear")
         assert resp.status_code == 204
         session.clear_history.assert_called_once()
 
     def test_rewind(self, session_and_client):
         session, client = session_and_client
         session.history = [{"role": "user", "content": "hi"}]
-        resp = client.post("/v1/liahona/session/rewind")
+        resp = client.post("/v1/saklas/session/rewind")
         assert resp.status_code == 204
         session.rewind.assert_called_once()
 
     def test_rewind_empty(self, session_and_client):
         session, client = session_and_client
         session.history = []
-        resp = client.post("/v1/liahona/session/rewind")
+        resp = client.post("/v1/saklas/session/rewind")
         assert resp.status_code == 400
 
 
@@ -298,54 +298,54 @@ class TestSession:
 
 class TestCLIParsing:
     def test_tui_default(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["google/gemma-2-2b-it"])
         assert args.command == "tui"
         assert args.model == "google/gemma-2-2b-it"
 
     def test_serve_subcommand(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["serve", "google/gemma-2-2b-it", "--port", "9000"])
         assert args.command == "serve"
         assert args.model == "google/gemma-2-2b-it"
         assert args.port == 9000
 
     def test_serve_steer_flag(self):
-        from liahona.cli import parse_args, _parse_steer_flag
+        from saklas.cli import parse_args, _parse_steer_flag
         assert _parse_steer_flag("cheerful:0.2") == ("cheerful", 0.2)
         assert _parse_steer_flag("cheerful") == ("cheerful", 0.0)
 
     def test_serve_cors(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["serve", "m", "--cors", "http://localhost:3000", "--cors", "*"])
         assert args.cors == ["http://localhost:3000", "*"]
 
     def test_clear_custom_flag(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["-x"])
         assert args.command == "cache"
         assert args.clear_custom is True
         assert args.clear_all is False
 
     def test_clear_all_flag(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["-X"])
         assert args.command == "cache"
         assert args.clear_all is True
         assert args.clear_custom is False
 
     def test_clear_custom_long_flag(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["--clear-custom"])
         assert args.command == "cache"
 
     def test_clear_all_long_flag(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["--clear-all"])
         assert args.command == "cache"
 
     def test_clear_with_custom_cache_dir(self):
-        from liahona.cli import parse_args
+        from saklas.cli import parse_args
         args = parse_args(["-X", "-c", "/tmp/my-cache"])
         assert args.cache_dir == "/tmp/my-cache"
 
@@ -387,7 +387,7 @@ class TestCacheClear:
 
     def test_clear_custom_preserves_curated(self, tmp_path):
         """--clear-custom keeps curated probes and layer means, removes the rest."""
-        from liahona.probes_bootstrap import load_defaults, _LAYER_MEANS_TAG
+        from saklas.probes_bootstrap import load_defaults, _LAYER_MEANS_TAG
 
         defaults = load_defaults()
         curated_names = set()

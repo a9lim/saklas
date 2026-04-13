@@ -1,8 +1,8 @@
-# liahona
+# saklas
 
-[![PyPI](https://img.shields.io/pypi/v/liahona-ai)](https://pypi.org/project/liahona-ai/)
+[![PyPI](https://img.shields.io/pypi/v/saklas)](https://pypi.org/project/saklas/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/liahona-ai/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 
 Activation steering and trait monitoring for HuggingFace transformer models. Extract steering vectors, apply them during generation with per-call alpha control, and monitor how activations shift across behavioral probes.
 
@@ -11,9 +11,9 @@ Three interfaces: a **Python API** for scripted experiments and batch sweeps, an
 ## Python API
 
 ```python
-from liahona import LiahonaSession, DataSource, ResultCollector
+from saklas import SaklasSession, DataSource, ResultCollector
 
-with LiahonaSession("google/gemma-2-2b-it", device="cuda") as session:
+with SaklasSession("google/gemma-2-2b-it", device="cuda") as session:
     # Extract a steering vector
     happy_profile = session.extract("happy")       # uses curated dataset
     session.steer("happy", happy_profile)           # register (no alpha yet)
@@ -65,10 +65,10 @@ result = session.generate("Hello.", alphas={"happy": 0.2})
 result = session.generate("Hello.")
 ```
 
-### LiahonaSession reference
+### SaklasSession reference
 
 ```python
-session = LiahonaSession(
+session = SaklasSession(
     model_id,                        # HuggingFace model ID or local path
     device="auto",                   # "auto", "cuda", "mps", "cpu"
     quantize=None,                   # "4bit", "8bit", or None
@@ -135,10 +135,10 @@ result.to_dict()         # plain Python types, JSON-serializable
 ### DataSource formats
 
 ```python
-from liahona import DataSource
+from saklas import DataSource
 
 ds = DataSource.curated("happy")                                   # bundled
-ds = DataSource.json("pairs.json")                                 # liahona schema
+ds = DataSource.json("pairs.json")                                 # saklas schema
 ds = DataSource.csv("pairs.csv", positive_col="pos", negative_col="neg")
 ds = DataSource.huggingface("user/dataset", split="train[:100]")   # requires datasets
 ds = DataSource(pairs=[("positive text", "negative text")])
@@ -164,7 +164,7 @@ Serve a steered model as an OpenAI-compatible HTTP endpoint. Works with the Open
 
 ```bash
 pip install -e ".[serve]"
-liahona serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
+saklas serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
 ```
 
 ### Usage with OpenAI SDK
@@ -221,22 +221,22 @@ for chunk in client.chat.completions.create(
 - `POST /v1/completions` — text completion (streaming + non-streaming)
 
 **Vector management:**
-- `GET /v1/liahona/vectors` — list registered vectors
-- `POST /v1/liahona/vectors/extract` — extract a new vector (streams progress via SSE)
-- `POST /v1/liahona/vectors/load` — load from `.safetensors` file
-- `DELETE /v1/liahona/vectors/{name}` — remove a vector
+- `GET /v1/saklas/vectors` — list registered vectors
+- `POST /v1/saklas/vectors/extract` — extract a new vector (streams progress via SSE)
+- `POST /v1/saklas/vectors/load` — load from `.safetensors` file
+- `DELETE /v1/saklas/vectors/{name}` — remove a vector
 
 **Probe management:**
-- `GET /v1/liahona/probes` — list active probes + last readings
-- `GET /v1/liahona/probes/defaults` — available default probes by category
-- `POST /v1/liahona/probes/{name}` — activate a probe
-- `DELETE /v1/liahona/probes/{name}` — deactivate a probe
+- `GET /v1/saklas/probes` — list active probes + last readings
+- `GET /v1/saklas/probes/defaults` — available default probes by category
+- `POST /v1/saklas/probes/{name}` — activate a probe
+- `DELETE /v1/saklas/probes/{name}` — deactivate a probe
 
 **Session management:**
-- `GET /v1/liahona/session` — current config, model info, default alphas
-- `PATCH /v1/liahona/session` — update temperature, top_p, max_tokens, system_prompt
-- `POST /v1/liahona/session/clear` — clear conversation history
-- `POST /v1/liahona/session/rewind` — undo last exchange
+- `GET /v1/saklas/session` — current config, model info, default alphas
+- `PATCH /v1/saklas/session` — update temperature, top_p, max_tokens, system_prompt
+- `POST /v1/saklas/session/clear` — clear conversation history
+- `POST /v1/saklas/session/rewind` — undo last exchange
 
 Full API docs available at `http://localhost:8000/docs` when the server is running.
 
@@ -245,9 +245,9 @@ Probe readings are returned as an extra `probe_readings` field in generation res
 ## Terminal UI
 
 ```bash
-liahona google/gemma-2-9b-it
-liahona mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
-liahona meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
+saklas google/gemma-2-9b-it
+saklas mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
+saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 ```
 
 ### CLI options
@@ -315,7 +315,7 @@ liahona meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 
 All commands that touch the model (`/steer`, `/probe`) or modify history (`/clear`, `/rewind`) interrupt any in-progress generation and execute once it stops. Sending a new message mid-generation also stops the current response and submits immediately after.
 
-Concepts matching built-in probe names use curated datasets automatically. Otherwise, pairs are generated by the loaded model and cached under `liahona/datasets/cache/` — subsequent extractions of the same concept (even with a different model) reuse the cached statements.
+Concepts matching built-in probe names use curated datasets automatically. Otherwise, pairs are generated by the loaded model and cached under `saklas/datasets/cache/` — subsequent extractions of the same concept (even with a different model) reuse the cached statements.
 
 ## Probe library
 
@@ -329,14 +329,14 @@ Concepts matching built-in probe names use curated datasets automatically. Other
 | **Cultural** | western, hierarchical, direct, contextual, religious, traditional |
 | **Gender** | masculine, agentic, paternal |
 
-Probes are extracted on first run and cached per model under `liahona/probes/cache/`.
+Probes are extracted on first run and cached per model under `saklas/probes/cache/`.
 
 ## Install
 
 ```bash
-pip install liahona-ai             # base
-pip install liahona-ai[serve]      # + fastapi + uvicorn (for API server)
-pip install liahona-ai[research]   # + datasets + pandas (for API)
+pip install saklas             # base
+pip install saklas[serve]      # + fastapi + uvicorn (for API server)
+pip install saklas[research]   # + datasets + pandas (for API)
 ```
 
 Requires Python 3.11+, PyTorch 2.2+. Works on Linux, macOS, and Windows.
@@ -355,8 +355,8 @@ pip install -e ".[research]"       # + datasets + pandas
 The `cuda` and `bnb` extras install `bitsandbytes` and/or `flash-attn` for 4-bit/8-bit quantization and fused attention. These depend on platform-specific CUDA toolchains and may not build cleanly on all systems. Support is only guaranteed for the vanilla (unquantized) install.
 
 ```bash
-pip install liahona-ai[bnb]       # bitsandbytes only
-pip install liahona-ai[cuda]      # bitsandbytes + flash-attn (Linux only, needs CUDA_HOME)
+pip install saklas[bnb]       # bitsandbytes only
+pip install saklas[cuda]      # bitsandbytes + flash-attn (Linux only, needs CUDA_HOME)
 ```
 
 From source, `flash-attn` requires build isolation disabled:
@@ -379,15 +379,15 @@ Llama (1-4), Mistral (1, 4), Ministral (1, 3), Mixtral, Gemma (1-4), Phi (1-3), 
 
 ### Custom steering vectors
 
-When you steer on a concept that isn't in the curated probe library, liahona generates its own contrastive pairs using the loaded model, then extracts a vector from them. The pipeline:
+When you steer on a concept that isn't in the curated probe library, saklas generates its own contrastive pairs using the loaded model, then extracts a vector from them. The pipeline:
 
 1. **Statement generation** — the model writes contrastive statement pairs in batches, each batch seeded by a different specificity lens (unique facts/lore, physical traits, social dynamics, inner life, concrete routines). The prompt forces concept-specific detail — names, terminology, sensory descriptions that only apply to the target concept — and explicitly rejects generic statements that could work for anything similar.
-2. **Caching** — generated pairs are saved under `liahona/datasets/cache/` keyed by concept name. Pairs are model-independent, so a different model reuses the same cached statements.
+2. **Caching** — generated pairs are saved under `saklas/datasets/cache/` keyed by concept name. Pairs are model-independent, so a different model reuses the same cached statements.
 3. **Extraction** — pairs feed into the standard contrastive PCA pipeline (per-layer SVD, explained variance scoring).
 
 This means `/steer "anything"` works — personality traits, religions, animals, emotions, fictional characters, "man who ate too much spaghetti." The vector captures what's distinctive about the concept, not generic associations.
 
-To regenerate cached statements (e.g. after a prompt update), use `liahona -x` to clear user-extracted vectors and statement caches.
+To regenerate cached statements (e.g. after a prompt update), use `saklas -x` to clear user-extracted vectors and statement caches.
 
 ### Monitor
 

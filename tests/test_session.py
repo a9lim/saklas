@@ -1,10 +1,10 @@
-"""Tests for LiahonaSession programmatic API.
+"""Tests for SaklasSession programmatic API.
 Requires CUDA and downloads google/gemma-2-2b-it (~5GB) on first run.
 """
 from __future__ import annotations
 import pytest
 import torch
-from liahona.results import GenerationResult, TokenEvent
+from saklas.results import GenerationResult, TokenEvent
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -15,8 +15,8 @@ MODEL_ID = "google/gemma-2-2b-it"
 
 @pytest.fixture(scope="module")
 def session():
-    from liahona.session import LiahonaSession
-    s = LiahonaSession(MODEL_ID, device="cuda", probes=["emotion"])
+    from saklas.session import SaklasSession
+    s = SaklasSession(MODEL_ID, device="cuda", probes=["emotion"])
     yield s
     s.close()
 
@@ -64,7 +64,7 @@ class TestSteering:
         assert len(profile) > 0
 
     def test_extract_datasource(self, session):
-        from liahona.datasource import DataSource
+        from saklas.datasource import DataSource
         ds = DataSource(pairs=[("formal", "casual")])
         profile = session.extract(ds)
         assert isinstance(profile, dict)
@@ -79,8 +79,8 @@ class TestMonitoring:
 
 class TestLifecycle:
     def test_context_manager(self):
-        from liahona.session import LiahonaSession
-        with LiahonaSession(MODEL_ID, device="cuda", probes=[]) as s:
+        from saklas.session import SaklasSession
+        with SaklasSession(MODEL_ID, device="cuda", probes=[]) as s:
             assert s.model_info["model_type"] == "gemma2"
 
 class TestGeneration:

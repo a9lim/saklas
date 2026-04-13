@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from liahona.vectors import (
+from saklas.vectors import (
     compute_layer_means, extract_contrastive, get_cache_path,
     load_contrastive_pairs, load_profile, save_profile, _NEUTRAL_PROMPTS,
 )

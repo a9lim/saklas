@@ -3,7 +3,7 @@ import json
 import csv
 import tempfile
 from pathlib import Path
-from liahona.datasource import DataSource
+from saklas.datasource import DataSource
 
 class TestConstructor:
     def test_basic(self):

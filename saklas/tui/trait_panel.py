@@ -9,7 +9,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-from liahona.tui.utils import build_bar
+from saklas.tui.utils import build_bar
 
 
 

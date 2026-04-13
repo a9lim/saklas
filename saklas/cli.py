@@ -1,4 +1,4 @@
-"""CLI entry point for liahona."""
+"""CLI entry point for saklas."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 def _resolve_probes(raw: list[str] | None) -> list[str]:
-    from liahona.session import PROBE_CATEGORIES
+    from saklas.session import PROBE_CATEGORIES
     if raw is None or raw == ["all"]:
         return list(PROBE_CATEGORIES)
     if raw == ["none"] or raw == []:
@@ -60,9 +60,9 @@ def _resolve_probes(raw: list[str] | None) -> list[str]:
 
 
 def _make_session(args: argparse.Namespace):
-    from liahona.session import LiahonaSession
+    from saklas.session import SaklasSession
     probe_categories = _resolve_probes(args.probes)
-    return LiahonaSession(
+    return SaklasSession(
         model_id=args.model, device=args.device, quantize=args.quantize,
         probes=probe_categories, system_prompt=args.system_prompt,
         max_tokens=args.max_tokens, cache_dir=args.cache_dir,
@@ -81,7 +81,7 @@ _SUBCOMMANDS = {"serve"}
 
 
 def _build_serve_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="liahona serve", description="Start OpenAI-compatible API server")
+    p = argparse.ArgumentParser(prog="saklas serve", description="Start OpenAI-compatible API server")
     _add_common_args(p)
     p.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
@@ -98,7 +98,7 @@ def _build_serve_parser() -> argparse.ArgumentParser:
 
 def _build_tui_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="liahona",
+        prog="saklas",
         description="Activation steering + trait monitoring for local HuggingFace models",
     )
     p.add_argument(
@@ -187,8 +187,8 @@ def _run_tui(args: argparse.Namespace) -> None:
     session = _make_session(args)
     _print_model_info(session)
 
-    from liahona.tui.app import LiahonaApp
-    app = LiahonaApp(session=session)
+    from saklas.tui.app import SaklasApp
+    app = SaklasApp(session=session)
     app.run()
 
 
@@ -207,7 +207,7 @@ def _run_serve(args: argparse.Namespace) -> None:
     except ImportError:
         print(
             "Server dependencies not installed. Run:\n"
-            "  pip install liahona[serve]",
+            "  pip install saklas[serve]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -227,7 +227,7 @@ def _run_serve(args: argparse.Namespace) -> None:
         default_alphas[name] = alpha
         print(f"  Registered '{name}' (default alpha={alpha})")
 
-    from liahona.server import create_app
+    from saklas.server import create_app
     app = create_app(session, default_alphas=default_alphas, cors_origins=args.cors or None)
 
     print(f"\nServing on http://{args.host}:{args.port}")
@@ -239,7 +239,7 @@ def _run_cache(args: argparse.Namespace) -> None:
     import pathlib as _pathlib
     import shutil
 
-    from liahona.probes_bootstrap import load_defaults, _LAYER_MEANS_TAG
+    from saklas.probes_bootstrap import load_defaults, _LAYER_MEANS_TAG
 
     cache_dir = _pathlib.Path(
         args.cache_dir or (_pathlib.Path(__file__).parent / "probes" / "cache")
