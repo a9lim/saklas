@@ -321,7 +321,7 @@ class TestCLIParsing:
         assert args.port == 9000
 
     def test_serve_steer_flag(self):
-        from saklas.cli import parse_args, _parse_steer_flag
+        from saklas.cli import _parse_steer_flag
         assert _parse_steer_flag("cheerful:0.2") == ("cheerful", 0.2)
         assert _parse_steer_flag("cheerful") == ("cheerful", 0.0)
 

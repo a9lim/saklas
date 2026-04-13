@@ -84,7 +84,7 @@ class TestCsv:
 class TestHuggingFace:
     def test_import_error_without_datasets(self):
         try:
-            import datasets
+            import datasets  # noqa: F401
         except ImportError:
             import pytest
             with pytest.raises(ImportError, match="datasets"):
