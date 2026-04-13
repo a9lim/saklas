@@ -77,6 +77,7 @@ _LAYER_ACCESSORS = {
     # GLM (ChatGLM)
     "glm": _MODEL_LAYERS,
     "glm4": _MODEL_LAYERS,
+    "glm4_moe_lite": _MODEL_LAYERS,
     # Granite (IBM)
     "granite": _MODEL_LAYERS,
     "granitemoe": _MODEL_LAYERS,
