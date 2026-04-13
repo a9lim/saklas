@@ -1,0 +1,64 @@
+name: Bug report
+description: Something broke, crashed, or behaved wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what did you get?
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model ID
+      description: HuggingFace model id (e.g. `google/gemma-3-4b-it`)
+      placeholder: google/gemma-3-4b-it
+    validations:
+      required: true
+
+  - type: dropdown
+    id: device
+    attributes:
+      label: Device
+      options:
+        - cuda
+        - mps
+        - cpu
+        - auto
+    validations:
+      required: true
+
+  - type: input
+    id: saklas-version
+    attributes:
+      label: saklas version
+      description: Output of `pip show saklas | grep Version`
+      placeholder: 1.1.1
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Shortest code / command that reproduces the issue
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Full traceback or log output
+      render: shell
