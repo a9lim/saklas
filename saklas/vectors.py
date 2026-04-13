@@ -56,11 +56,7 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     catastrophic for architectures like Gemma 4 whose cumulative
     ``layer_scalar`` shrinks the residual stream by orders of magnitude.
     """
-    # Compute norm in float32 to avoid fp16 overflow: for hidden_dim=2048
-    # with element magnitudes ~6, the sum-of-squares (73728) exceeds
-    # fp16 max (65504), producing Inf and zeroing the entire vector.
-    v_f32 = v.float()
-    unit = (v_f32 / v_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)).to(v.dtype)
+    unit = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     if ref_norm is not None:
         return unit * ref_norm
     return unit
@@ -319,10 +315,7 @@ def extract_contrastive(
         pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
         for idx in range(n_layers):
-            # Cast to float32 before differencing — fp16 subtraction
-            # loses precision for close vectors, producing degenerate
-            # diff matrices that cause LAPACK SVD errors (SLASCL).
-            p, n = pos_all[idx].float(), neg_all[idx].float()
+            p, n = pos_all[idx], neg_all[idx]
             diffs_per_layer[idx].append((p - n).to(diff_device))
             norm_sums[idx] += p.norm() + n.norm()
         # Free forward-pass intermediates (attention maps, hidden states)
@@ -349,7 +342,7 @@ def extract_contrastive(
             diff_vec = diffs_per_layer[idx][0]
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
-            diff_norm = diff_vec.float().norm().item()
+            diff_norm = diff_vec.norm().item()
             activation_norm = norm_sums_cpu[idx]  # pos_norm + neg_norm
             score = diff_norm / max(activation_norm, 1e-8)
             profile[idx] = (direction, score)

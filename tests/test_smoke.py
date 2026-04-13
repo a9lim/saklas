@@ -69,7 +69,8 @@ def happy_profile(model_and_tokenizer, layers):
 class TestVectorExtraction:
     def test_returns_valid_profile(self, happy_profile, model_and_tokenizer):
         model, _ = model_and_tokenizer
-        hidden_dim = model.config.hidden_size
+        cfg = getattr(model.config, "text_config", None) or model.config
+        hidden_dim = cfg.hidden_size
         assert isinstance(happy_profile, dict)
         assert len(happy_profile) > 0
         for layer_idx, (vec, score) in happy_profile.items():
@@ -102,7 +103,7 @@ class TestSteering:
         prompt = "Tell me about your day."
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
 
         config = GenerationConfig(max_new_tokens=20, temperature=0.0)
@@ -133,7 +134,7 @@ class TestSteering:
 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": "Hello"}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
         config = GenerationConfig(max_new_tokens=10, temperature=0.0)
 
@@ -163,11 +164,11 @@ class TestSaveLoad:
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_profile.safetensors")
-            meta = {"concept": "happy"}
-            save_profile(happy_profile, path, meta)
+            save_profile(happy_profile, path, {"method": "contrastive_pca"})
             loaded_profile, loaded_meta = load_profile(path)
 
-            assert loaded_meta["concept"] == "happy"
+            assert loaded_meta["method"] == "contrastive_pca"
+            assert "scores" in loaded_meta
             assert set(loaded_profile.keys()) == set(happy_profile.keys())
             for idx in happy_profile:
                 orig_vec, orig_score = happy_profile[idx]
@@ -198,7 +199,7 @@ class TestTraitMonitor:
 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": "How are you feeling?"}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
         config = GenerationConfig(max_new_tokens=20, temperature=0.7)
         state = GenerationState()
@@ -236,7 +237,7 @@ class TestTraitMonitor:
 
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": "Write a short story."}],
-            add_generation_prompt=True, return_tensors="pt",
+            add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
         config = GenerationConfig(max_new_tokens=100, temperature=0.7)
 
@@ -276,7 +277,8 @@ class TestExtractContrastive:
     def test_returns_valid_profile(self, model_and_tokenizer, layers, num_layers):
         from saklas.vectors import extract_contrastive
         model, tokenizer = model_and_tokenizer
-        hidden_dim = model.config.hidden_size
+        cfg = getattr(model.config, "text_config", None) or model.config
+        hidden_dim = cfg.hidden_size
         pairs = [
             {"positive": "I feel happy today", "negative": "I feel sad today"},
             {"positive": "Everything is wonderful", "negative": "Everything is terrible"},

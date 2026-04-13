@@ -194,11 +194,14 @@ def detect_device(requested: str = "auto") -> str:
 
 
 def _pick_dtype(device: str) -> torch.dtype:
-    """Best default dtype for a device. bf16 on CUDA, fp16 on MPS, fp32 on CPU."""
-    if device == "cuda":
+    """Best default dtype for a device. bf16 on CUDA and MPS, fp32 on CPU.
+
+    bf16 on MPS matters for models whose residual stream exceeds fp16 range
+    (e.g. Gemma-3-4b-it hits ~1e5 by the final layer, well past fp16's 65504
+    max). Modern PyTorch MPS handles bf16 natively.
+    """
+    if device in ("cuda", "mps"):
         return torch.bfloat16
-    if device == "mps":
-        return torch.float16  # MPS has limited bf16 support
     return torch.float32
 
 
