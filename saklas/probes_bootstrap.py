@@ -22,8 +22,6 @@ from saklas.vectors import (
 log = logging.getLogger(__name__)
 
 _LAYER_MEANS_NAME = "layer_means"
-# Back-compat alias. Legacy tests reference this; removed in Phase 12.
-_LAYER_MEANS_TAG = _LAYER_MEANS_NAME
 
 
 def load_defaults() -> dict[str, list[str]]:
