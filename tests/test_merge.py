@@ -153,3 +153,21 @@ def test_merge_components_stale():
     assert stale == ["default/happy"]
     stale = packs.merge_components_stale(comp, {"default/happy": "old"})
     assert stale == []
+    # Missing components count as stale.
+    stale = packs.merge_components_stale(comp, {})
+    assert stale == ["default/happy"]
+
+
+def test_merge_components_status():
+    comp = {
+        "default/happy": {"alpha": 0.5, "tensor_sha256": "old"},
+        "default/sad": {"alpha": 0.5, "tensor_sha256": "old"},
+        "default/angry": {"alpha": 0.5, "tensor_sha256": "old"},
+    }
+    current = {"default/happy": "old", "default/sad": "new"}
+    status = packs.merge_components_status(comp, current)
+    assert status == {
+        "default/happy": "ok",
+        "default/sad": "mismatch",
+        "default/angry": "missing",
+    }

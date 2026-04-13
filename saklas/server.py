@@ -96,11 +96,26 @@ def _error(status: int, message: str, error_type: str = "error") -> JSONResponse
 
 
 def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
+    # build_readings() already scopes to monitor.probe_names, but cross-check
+    # explicitly so a client never sees a probe that isn't active in the monitor.
+    monitor_names = set(session._monitor.probe_names)
     readings = session.build_readings()
     out: dict[str, Any] = {}
     for name, r in readings.items():
-        out[name] = {"mean": r.mean, "std": r.std, "min": r.min, "max": r.max}
+        if name not in monitor_names:
+            continue
+        out[name] = r.to_dict()
     return out
+
+
+def _resolve_steer_params(
+    steer: SteerParams | None, default_alphas: dict[str, float],
+) -> tuple[dict[str, float] | None, bool, bool]:
+    """Resolve (alphas, orthogonalize, thinking) from a request's steer block."""
+    alphas = _resolve_alphas(steer, default_alphas)
+    ortho = steer.orthogonalize if steer else False
+    think = steer.thinking if steer else False
+    return alphas, ortho, think
 
 
 @contextmanager
@@ -128,6 +143,45 @@ def _resolve_alphas(
     # Drop zero-alpha entries
     merged = {k: v for k, v in merged.items() if v != 0.0}
     return merged or None
+
+
+async def _stream_generation(
+    session: SaklasSession, created_ts: int,
+    stream_iter, rid, model_id, object_type, format_delta, empty_delta,
+    temperature, top_p, max_tokens,
+):
+    """Shared SSE generator for chat and completion streaming.
+
+    Lifted to module scope; takes session + created_ts as params instead of
+    closing over them. Still runs inside the request coroutine so the
+    gen-config override lives for the full stream lifetime.
+    """
+    with _gen_config_override(session, temperature, top_p, max_tokens):
+        try:
+            for event in stream_iter:
+                chunk = {
+                    "id": rid,
+                    "object": object_type,
+                    "created": created_ts,
+                    "model": model_id,
+                    "choices": [{"index": 0, **format_delta(event), "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+        except ConcurrentGenerationError as e:
+            err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
+            yield f"data: {json.dumps(err)}\n\n"
+            return
+
+        final = {
+            "id": rid,
+            "object": object_type,
+            "created": created_ts,
+            "model": model_id,
+            "choices": [{"index": 0, **empty_delta, "finish_reason": "stop"}],
+            "probe_readings": _probe_reading_dict(session),
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
@@ -201,9 +255,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
-        alphas = _resolve_alphas(req.steer, app.state.default_alphas)
-        ortho = req.steer.orthogonalize if req.steer else False
-        think = req.steer.thinking if req.steer else False
+        alphas, ortho, think = _resolve_steer_params(req.steer, app.state.default_alphas)
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
         model_id = session.model_id
@@ -219,7 +271,8 @@ def _register_routes(app: FastAPI) -> None:
 
             stream_iter = session.generate_stream(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
             return StreamingResponse(
-                _stream_generation(stream_iter, rid, model_id,
+                _stream_generation(session, app.state.created_ts,
+                                   stream_iter, rid, model_id,
                                    "chat.completion.chunk", _chat_delta, {"delta": {}},
                                    req.temperature, req.top_p, req.max_tokens),
                 media_type="text/event-stream",
@@ -251,52 +304,21 @@ def _register_routes(app: FastAPI) -> None:
             "probe_readings": _probe_reading_dict(session),
         }
 
-    async def _stream_generation(stream_iter, rid, model_id, object_type, format_delta,
-                                 empty_delta, temperature, top_p, max_tokens):
-        """Shared SSE generator for chat and completion streaming."""
-        with _gen_config_override(session, temperature, top_p, max_tokens):
-            try:
-                for event in stream_iter:
-                    chunk = {
-                        "id": rid,
-                        "object": object_type,
-                        "created": app.state.created_ts,
-                        "model": model_id,
-                        "choices": [{"index": 0, **format_delta(event), "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-            except ConcurrentGenerationError as e:
-                err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
-                yield f"data: {json.dumps(err)}\n\n"
-                return
-
-            final = {
-                "id": rid,
-                "object": object_type,
-                "created": app.state.created_ts,
-                "model": model_id,
-                "choices": [{"index": 0, **empty_delta, "finish_reason": "stop"}],
-                "probe_readings": _probe_reading_dict(session),
-            }
-            yield f"data: {json.dumps(final)}\n\n"
-            yield "data: [DONE]\n\n"
-
     # -----------------------------------------------------------------------
     # Text completions
     # -----------------------------------------------------------------------
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest):
-        alphas = _resolve_alphas(req.steer, app.state.default_alphas)
-        ortho = req.steer.orthogonalize if req.steer else False
-        think = req.steer.thinking if req.steer else False
+        alphas, ortho, think = _resolve_steer_params(req.steer, app.state.default_alphas)
         rid = _make_id()
         model_id = session.model_id
 
         if req.stream:
             stream_iter = session.generate_stream(req.prompt, alphas=alphas, orthogonalize=ortho, thinking=think, raw=True)
             return StreamingResponse(
-                _stream_generation(stream_iter, rid, model_id,
+                _stream_generation(session, app.state.created_ts,
+                                   stream_iter, rid, model_id,
                                    "text_completion", lambda e: {"text": e.text}, {"text": ""},
                                    req.temperature, req.top_p, req.max_tokens),
                 media_type="text/event-stream",

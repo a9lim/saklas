@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from saklas.cli_selectors import (
-    ResolvedConcept, Selector, resolve,
+    ResolvedConcept, Selector, invalidate as _invalidate_selector_cache, resolve,
 )
 from saklas.packs import PackMetadata, hash_file, verify_integrity
 from saklas.paths import concept_dir, safe_model_id, vectors_dir
@@ -63,6 +63,8 @@ def delete_tensors(selector: Selector, model_scope: Optional[str]) -> int:
             deleted += 1
         if files:
             _update_files_map(c.folder)
+    if deleted:
+        _invalidate_selector_cache()
     return deleted
 
 
@@ -96,6 +98,7 @@ def install_folder(src: Path, namespace: str, as_: Optional[str], *, force: bool
     if not ok:
         shutil.rmtree(dst)
         raise InstallConflict(f"integrity check failed on install: {bad}")
+    _invalidate_selector_cache()
     return dst
 
 
@@ -148,6 +151,8 @@ def refresh(selector: Selector, *, model_scope: Optional[str] = None) -> int:
             count += 1
             continue
         raise RefreshError(f"{c.namespace}/{c.name}: unknown source {src!r}")
+    if count:
+        _invalidate_selector_cache()
     return count
 
 
@@ -174,7 +179,9 @@ def install(target: str, as_: Optional[str], *, force: bool = False) -> Path:
         dst_ns, dst_name = ns, name
     dst = vectors_dir() / dst_ns / dst_name
     from saklas.hf import pull_pack
-    return pull_pack(target, target_folder=dst, force=force)
+    result = pull_pack(target, target_folder=dst, force=force)
+    _invalidate_selector_cache()
+    return result
 
 
 def _all_local() -> list[ResolvedConcept]:

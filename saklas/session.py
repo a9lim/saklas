@@ -284,9 +284,8 @@ class SaklasSession:
             ).to(self._device)
 
             with torch.inference_mode():
-                attn_mask = torch.ones_like(input_ids)
                 out = self._model.generate(
-                    input_ids, attention_mask=attn_mask,
+                    input_ids,
                     max_new_tokens=batch_n * 150,
                     do_sample=True, temperature=1.0, top_p=0.9,
                     pad_token_id=pad_id,

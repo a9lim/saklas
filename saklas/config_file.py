@@ -110,7 +110,8 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
             missing.append(coord)
             continue
         ns, name = coord.split("/", 1)
-        if concept_dir(ns, name).exists():
+        cdir = concept_dir(ns, name)
+        if cdir.exists():
             continue
         if ns == "local":
             msg = f"vector {coord!r}: local namespace, cannot auto-install"
@@ -121,7 +122,7 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
             continue
         if ns == "default":
             materialize_bundled()
-            if concept_dir(ns, name).exists():
+            if cdir.exists():
                 continue
             msg = f"vector {coord!r}: bundled concept missing from package data"
             if strict:

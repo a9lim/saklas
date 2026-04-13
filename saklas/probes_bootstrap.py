@@ -106,9 +106,17 @@ def bootstrap_probes(
             sc_path = cdir / f"{sid}.json"
             if ts.exists() and sc_path.exists():
                 try:
-                    profile, _meta = load_profile(str(ts))
+                    profile, meta = load_profile(str(ts))
+                    # load_profile already parsed the sidecar dict; build a
+                    # Sidecar from it instead of re-reading from disk.
+                    sc = Sidecar(
+                        method=meta["method"],
+                        scores={int(k): float(v) for k, v in meta.get("scores", {}).items()},
+                        saklas_version=meta["saklas_version"],
+                        statements_sha256=meta.get("statements_sha256"),
+                        components=meta.get("components"),
+                    )
                     probes[probe_name] = profile
-                    sc = Sidecar.load(sc_path)
                     stmts = cdir / "statements.json"
                     if stmts.exists():
                         current = hash_file(stmts)

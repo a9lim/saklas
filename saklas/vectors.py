@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools as _functools
 import json
 import logging
+from importlib import resources as _resources
 from pathlib import Path
 
 import torch
@@ -169,10 +171,6 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         idx: h.float()[0, min(content_end, h.shape[1] - 1)]
         for idx, h in hidden_per_layer.items()
     }
-
-
-import functools as _functools
-from importlib import resources as _resources
 
 
 @_functools.cache

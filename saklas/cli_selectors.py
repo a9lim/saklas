@@ -72,10 +72,26 @@ def parse(raw: str) -> Selector:
     return Selector(kind="name", value=raw)
 
 
+# Module-level cache keyed by vectors root path. Walking the tree hits the
+# filesystem for every concept folder — compound selectors like `-r tag:x -x
+# model:y` resolve multiple times per invocation, so we memoize here and rely
+# on cache_ops to call `invalidate()` after any mutation.
+_concepts_cache: dict[Path, list[ResolvedConcept]] = {}
+
+
+def invalidate() -> None:
+    """Drop the cached concept walk. Call after install/delete/refresh."""
+    _concepts_cache.clear()
+
+
 def _all_concepts() -> list[ResolvedConcept]:
     root = vectors_dir()
+    cached = _concepts_cache.get(root)
+    if cached is not None:
+        return cached
     if not root.is_dir():
-        return []
+        _concepts_cache[root] = []
+        return _concepts_cache[root]
     out: list[ResolvedConcept] = []
     for ns_dir in sorted(root.iterdir()):
         if not ns_dir.is_dir():
@@ -90,6 +106,7 @@ def _all_concepts() -> list[ResolvedConcept]:
             out.append(ResolvedConcept(
                 namespace=ns_dir.name, name=cdir.name, folder=cdir, metadata=meta,
             ))
+    _concepts_cache[root] = out
     return out
 
 

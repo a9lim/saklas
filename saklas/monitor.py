@@ -4,6 +4,9 @@ import torch
 
 _MAX_HISTORY = 8
 
+_EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
+                "min": float("inf"), "max": float("-inf")}
+
 
 class TraitMonitor:
     """Monitors model activations against a library of probe vectors.
@@ -17,8 +20,7 @@ class TraitMonitor:
 
     @staticmethod
     def _empty_stats() -> dict:
-        return {"count": 0, "sum": 0.0, "sum_sq": 0.0,
-                "min": float("inf"), "max": float("-inf")}
+        return dict(_EMPTY_STATS)
 
     def __init__(self, probe_profiles: dict[str, dict[int, tuple[torch.Tensor, float]]],
                  layer_means: dict[int, torch.Tensor] | None = None):
@@ -28,6 +30,13 @@ class TraitMonitor:
         """
         self._raw_profiles: dict[str, dict[int, tuple[torch.Tensor, float]]] = dict(probe_profiles)
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
+
+        # Cache of probe vectors pre-normalized to unit float32 on a specific device.
+        # Structure: {probe_name: {layer_idx: v_unit_tensor}}, plus a single _cache_device.
+        self._v_unit_cache: dict[str, dict[int, torch.Tensor]] = {}
+        self._cache_device: torch.device | None = None
+        # Cache of layer_means cast to float32 on cache_device.
+        self._mean_cache: dict[int, torch.Tensor] = {}
 
         self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self._raw_profiles}
         self._stats: dict[str, dict] = {n: self._empty_stats() for n in self._raw_profiles}
@@ -51,23 +60,72 @@ class TraitMonitor:
 
     @layer_means.setter
     def layer_means(self, value: dict[int, torch.Tensor]) -> None:
+        if value is not None and not isinstance(value, dict):
+            raise TypeError(f"layer_means must be a dict, got {type(value).__name__}")
         self._layer_means = dict(value) if value else {}
+        # Invalidate mean cache; v_unit cache is independent of means.
+        self._mean_cache = {}
+
+    def _ensure_cache(self, device: torch.device) -> None:
+        """Build/refresh the per-device float32 cache of unit probe vectors + means."""
+        if self._cache_device == device and self._v_unit_cache.keys() == self._raw_profiles.keys():
+            # Also verify inner layer sets match (probe replaced via add_probe invalidates).
+            ok = True
+            for name, prof in self._raw_profiles.items():
+                cached = self._v_unit_cache.get(name)
+                if cached is None or cached.keys() != prof.keys():
+                    ok = False
+                    break
+            if ok and self._mean_cache.keys() == self._layer_means.keys():
+                return
+
+        self._cache_device = device
+        new_cache: dict[int, dict[int, torch.Tensor]] = {}
+        for name, prof in self._raw_profiles.items():
+            per_layer: dict[int, torch.Tensor] = {}
+            for layer_idx, (vec, _score) in prof.items():
+                v = vec.to(device=device, dtype=torch.float32)
+                vn = v.norm().clamp(min=1e-8)
+                per_layer[layer_idx] = v / vn
+            new_cache[name] = per_layer
+        self._v_unit_cache = new_cache
+
+        self._mean_cache = {
+            idx: m.to(device=device, dtype=torch.float32)
+            for idx, m in self._layer_means.items()
+        }
 
     def _score_probes(self, hidden_per_layer: dict[int, torch.Tensor]):
         """Score all probes against hidden states and update history/stats."""
+        # Pick a device from any hidden state (they share device).
+        device = None
+        for h in hidden_per_layer.values():
+            device = h.device
+            break
+        if device is not None:
+            self._ensure_cache(device)
+
+        # Pre-cast each layer's hidden state once; compute centered h / ||h||.
+        h_unit_per_layer: dict[int, torch.Tensor] = {}
+        for layer_idx, h_raw in hidden_per_layer.items():
+            h = h_raw.float()
+            mean = self._mean_cache.get(layer_idx)
+            if mean is not None:
+                h = h - mean
+            hn = h.norm().clamp(min=1e-8)
+            h_unit_per_layer[layer_idx] = h / hn
+
         for name in self._raw_profiles:
             total_w = 0.0
             weighted_sim = 0.0
-            for layer_idx, (vec, score) in self._raw_profiles[name].items():
-                if layer_idx not in hidden_per_layer:
+            v_unit_layers = self._v_unit_cache.get(name, {})
+            for layer_idx, (_vec, score) in self._raw_profiles[name].items():
+                h_unit = h_unit_per_layer.get(layer_idx)
+                if h_unit is None:
                     continue
                 total_w += score
-                h = hidden_per_layer[layer_idx].float()
-                mean = self._layer_means.get(layer_idx)
-                if mean is not None:
-                    h = h - mean.to(h.device)
-                v = vec.to(h.device).float()
-                cos = (h @ v) / (h.norm() * v.norm()).clamp(min=1e-8)
+                v_unit = v_unit_layers[layer_idx]
+                cos = (h_unit @ v_unit)
                 weighted_sim += score * cos.item()
             total_w = max(total_w, 1e-8)
             val = weighted_sim / total_w
@@ -147,6 +205,8 @@ class TraitMonitor:
         if is_new:
             self.history[name] = deque(maxlen=_MAX_HISTORY)
             self._stats[name] = self._empty_stats()
+        # Drop any stale cached unit vectors for this probe; rebuilt lazily.
+        self._v_unit_cache.pop(name, None)
 
     def remove_probe(self, name: str):
         if name in self._raw_profiles:
@@ -155,6 +215,7 @@ class TraitMonitor:
             del self.history[name]
         if name in self._stats:
             del self._stats[name]
+        self._v_unit_cache.pop(name, None)
 
     def reset_history(self):
         for name in self._raw_profiles:
