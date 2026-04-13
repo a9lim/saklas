@@ -320,102 +320,12 @@ class TestCLIParsing:
         args = parse_args(["serve", "m", "--cors", "http://localhost:3000", "--cors", "*"])
         assert args.cors == ["http://localhost:3000", "*"]
 
-    def test_clear_custom_flag(self):
-        from saklas.cli import parse_args
-        args = parse_args(["-x"])
-        assert args.command == "cache"
-        assert args.clear_custom is True
-        assert args.clear_all is False
-
-    def test_clear_all_flag(self):
-        from saklas.cli import parse_args
-        args = parse_args(["-X"])
-        assert args.command == "cache"
-        assert args.clear_all is True
-        assert args.clear_custom is False
-
-    def test_clear_custom_long_flag(self):
-        from saklas.cli import parse_args
-        args = parse_args(["--clear-custom"])
-        assert args.command == "cache"
-
-    def test_clear_all_long_flag(self):
-        from saklas.cli import parse_args
-        args = parse_args(["--clear-all"])
-        assert args.command == "cache"
-
-    def test_clear_with_custom_cache_dir(self):
-        from saklas.cli import parse_args
-        args = parse_args(["-X", "-c", "/tmp/my-cache"])
-        assert args.cache_dir == "/tmp/my-cache"
+    # Legacy -x/-X/--clear-custom/--clear-all/--cache-dir CLI flags removed in
+    # Story A Phase 10. Cache ops now live under -r/-x/-i/-l/-m with a shared
+    # selector grammar. Coverage moved to tests/test_cli_flags.py.
 
 
-class TestCacheClear:
-    def test_clear_all(self, tmp_path):
-        """--clear-all removes all files in vector and statement caches."""
-        import shutil
-
-        cache_dir = tmp_path / "vectors"
-        cache_dir.mkdir()
-        model_dir = cache_dir / "model_a"
-        model_dir.mkdir()
-        (model_dir / "happy.safetensors").write_text("")
-        (model_dir / "happy.json").write_text("")
-        (model_dir / "custom.safetensors").write_text("")
-        (model_dir / "_LAYERMEANS.safetensors").write_text("")
-
-        stmts = tmp_path / "statements"
-        stmts.mkdir()
-        (stmts / "foo_statements.json").write_text("")
-
-        removed = 0
-        for child in list(cache_dir.iterdir()):
-            if child.is_dir():
-                removed += sum(1 for _ in child.iterdir())
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-                removed += 1
-        for f in list(stmts.iterdir()):
-            if f.is_file():
-                f.unlink()
-                removed += 1
-
-        assert removed == 5
-        assert not any(cache_dir.iterdir())
-        assert not any(stmts.iterdir())
-
-    def test_clear_custom_preserves_curated(self, tmp_path):
-        """--clear-custom keeps curated probes and layer means, removes the rest."""
-        from saklas.probes_bootstrap import load_defaults, _LAYER_MEANS_TAG
-
-        defaults = load_defaults()
-        curated_names = set()
-        for probes in defaults.values():
-            curated_names.update(probes)
-        curated_names.add(_LAYER_MEANS_TAG)
-
-        model_dir = tmp_path / "model_a"
-        model_dir.mkdir()
-
-        # Create curated files
-        for name in list(curated_names)[:3]:
-            (model_dir / f"{name}.safetensors").write_text("")
-            (model_dir / f"{name}.json").write_text("")
-        (model_dir / f"{_LAYER_MEANS_TAG}.safetensors").write_text("")
-        (model_dir / f"{_LAYER_MEANS_TAG}.json").write_text("")
-
-        # Create custom files
-        (model_dir / "my_custom_vector.safetensors").write_text("")
-        (model_dir / "my_custom_vector.json").write_text("")
-
-        removed = 0
-        for f in list(model_dir.iterdir()):
-            if f.stem not in curated_names:
-                f.unlink()
-                removed += 1
-
-        assert removed == 2
-        remaining = {f.stem for f in model_dir.iterdir()}
-        assert _LAYER_MEANS_TAG in remaining
-        assert "my_custom_vector" not in remaining
+# TestCacheClear removed: the pre-rename `probes/cache/` + `datasets/cache/`
+# + --clear-all/--clear-custom behavior it exercised no longer exists.
+# Cache-op coverage is in tests/test_cache_ops.py (delete_tensors across
+# concept/tag/model selectors with the new ~/.saklas/ layout).
