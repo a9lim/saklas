@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 
 import torch
@@ -21,7 +20,6 @@ _MAX_TEMPLATE_OVERHEAD = 100
 # cache is only safe when a single tokenizer lives for the session lifetime
 # (which is the case in both the TUI and the API server).
 _template_overhead_cache: dict[int, int] = {}
-_SAFE_CONCEPT_RE = re.compile(r'[^\w\-.]')
 
 
 def _chat_template_overhead(tokenizer, template_kwargs: dict) -> int:
@@ -452,22 +450,6 @@ def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict
         profile[idx] = (tensor, score)
 
     return profile, metadata
-
-
-def get_cache_path(
-    cache_dir: str,
-    model_id: str,
-    concept: str,
-) -> str:
-    """Deterministic cache path for a vector profile.
-
-    Returns:
-        Path like ``{cache_dir}/{model_name}/{concept}.safetensors``
-    """
-    model_name = model_id.replace("/", "_")
-    safe_concept = _SAFE_CONCEPT_RE.sub('_', concept)
-    filename = f"{safe_concept}.safetensors"
-    return str(Path(cache_dir) / model_name / filename)
 
 
 def load_contrastive_pairs(dataset_path: str) -> dict:

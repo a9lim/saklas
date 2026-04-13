@@ -113,11 +113,28 @@ def _refresh_bundled(target: Path, concept_name: str) -> None:
                 d.write(s.read())
 
 
-def refresh(selector: Selector) -> int:
-    """Re-pull concepts from their `source`. Returns count refreshed."""
+def refresh(selector: Selector, *, model_scope: Optional[str] = None) -> int:
+    """Re-pull concepts from their `source`. Returns count refreshed.
+
+    If model_scope is given, the refresh deletes the matching per-model tensor
+    pair so it will re-extract on next use (tensors-only scoped refresh). This
+    intentionally does NOT re-download from HF for just one model because HF
+    pulls are whole-repo operations.
+    """
     concepts = resolve(selector)
     count = 0
     for c in concepts:
+        if model_scope is not None:
+            # Scoped refresh: delete just that model's tensor + sidecar so it
+            # re-extracts from the concept's source statements on next use.
+            files = _tensor_files_for(c, model_scope)
+            if files:
+                for f in files:
+                    f.unlink()
+                _update_files_map(c.folder)
+                count += 1
+            continue
+
         src = c.metadata.source
         if src == "local":
             raise RefreshError(f"{c.namespace}/{c.name}: source=local, nothing to refresh from")
