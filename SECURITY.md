@@ -37,4 +37,4 @@ If you need to expose saklas to untrusted callers, put it behind a reverse proxy
 
 saklas loads HuggingFace checkpoints via `transformers`, which executes code from the checkpoint repo in some cases (custom modeling code, `trust_remote_code=True`). saklas does not set `trust_remote_code=True` by default, but if you pass a model that requires it, be aware you are executing arbitrary code from that repo. Only load models from publishers you trust.
 
-Steering vector packs pulled from HuggingFace (`saklas -i <owner>/<name>`) are verified against the `files` sha256 map in `pack.json`, so on-disk tampering after download is detected. They do **not** have publisher signatures yet — pack signing is reserved for a future version (see `docs/superpowers/specs/2026-04-12-story-a-portability-design.md`). For now, only install packs from publishers you trust.
+Steering vector packs pulled from HuggingFace (`saklas -i <owner>/<name>`) are verified against the `files` sha256 map in `pack.json`, so on-disk tampering after download is detected. Packs are not publisher-signed; trust derives from the HF repo owner. Only install packs from publishers you trust.

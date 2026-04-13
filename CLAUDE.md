@@ -15,7 +15,7 @@ saklas serve <model_id>                 # OpenAI-compatible API
 saklas -r <selector>                    # re-pull bundled/HF concepts
 saklas -x <selector>                    # delete per-model tensors (keeps statements)
 saklas -n                               # refresh neutral_statements.json from package
-saklas -i <ns>/<concept>                # install pack from HF or folder
+saklas -i <ns>/<concept>[@revision]     # install pack from HF or folder
 saklas -l [selector]                    # list/info packs; exits
 saklas -m <name> <components>           # merge: -m bard default/happy:0.3,...
 pytest tests/                           # all tests (CPU tests run anywhere)
@@ -47,13 +47,15 @@ All state under `~/.saklas/` (override via `SAKLAS_HOME`):
       <safe_model_id>.safetensors         # per-model tensor
       <safe_model_id>.json                # slim sidecar: method/scores/saklas_version/statements_sha256
     local/<concept>/                      # user-authored (source=local, -r skips)
-    <hf_owner>/<concept>/                 # HF-pulled (source=hf://<owner>/<name>)
+    <hf_owner>/<concept>/                 # HF-pulled (source=hf://<owner>/<name>[@revision])
   models/<safe_model_id>/
     layer_means.safetensors               # per-model probe-centering baseline
     layer_means.json                      # sidecar hashes neutral_statements.json
 ```
 
-Integrity: `pack.json.files` is a sha256 map verified on every `ConceptFolder.load`. Tensor sidecars record `statements_sha256` at extraction; mismatch flags `is_stale` and the CLI warns. `pack.json` reserves null `signature`/`signature_method` fields for v2 Ed25519 TOFU signing.
+Integrity: `pack.json.files` is a sha256 map verified on every `ConceptFolder.load`. Tensor sidecars record `statements_sha256` at extraction; mismatch flags `is_stale` and the CLI warns.
+
+HF distribution: packs live as **model repos** (not datasets) because safetensors is model-hub-native and `base_model` frontmatter creates reverse-link discoverability from the base model's hub page. `saklas/hf.py` uses `repo_type="model"` exclusively — no dataset fallback. `saklas -i owner/name@revision` pins to any git ref (tag, branch, or commit SHA); `hf.split_revision` parses `@`, threads `revision` through `_download`/`pull_pack`/`fetch_info`, and records it in `source = "hf://owner/name@v1.2.0"`. `cache_ops._refresh` re-splits the stored source so pinned installs re-pull the same revision — pinning is pinning, not "follow latest." `@` is unambiguous because `NAME_REGEX` forbids it in concept names.
 
 **Upgrade gotcha.** `materialize_bundled` is copy-on-miss for `neutral_statements.json`, so existing users keep their old file on upgrade. Run `saklas -n` after a release that changes neutrals to force-copy the bundled version — layer means auto-recompute on next session init via the hash check in `bootstrap_layer_means`.
 

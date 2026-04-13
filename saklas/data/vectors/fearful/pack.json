@@ -10,7 +10,5 @@
   "source": "bundled",
   "files": {
     "statements.json": "89661abeab6b3c19287059e2ec4ea202ca7c971948802c9b21214126c298f757"
-  },
-  "signature": null,
-  "signature_method": null
+  }
 }

@@ -152,8 +152,9 @@ def refresh(selector: Selector, *, model_scope: Optional[str] = None) -> int:
             count += 1
             continue
         if isinstance(src, str) and src.startswith("hf://"):
-            from saklas.hf import pull_pack
-            pull_pack(src[len("hf://"):], target_folder=c.folder, force=True)
+            from saklas.hf import pull_pack, split_revision
+            coord, revision = split_revision(src[len("hf://"):])
+            pull_pack(coord, target_folder=c.folder, force=True, revision=revision)
             count += 1
             continue
         raise RefreshError(f"{c.namespace}/{c.name}: unknown source {src!r}")
@@ -187,10 +188,13 @@ def install(target: str, as_: Optional[str], *, force: bool = False) -> Path:
     if p.exists() and p.is_dir():
         return install_folder(p, namespace="local", as_=as_, force=force)
 
-    if "/" not in target:
-        raise ValueError(f"install target must be '<ns>/<concept>' or a folder path: {target!r}")
+    from saklas.hf import pull_pack, split_revision
+    coord, revision = split_revision(target)
 
-    ns, name = target.split("/", 1)
+    if "/" not in coord:
+        raise ValueError(f"install target must be '<ns>/<concept>[@revision]' or a folder path: {target!r}")
+
+    ns, name = coord.split("/", 1)
     if as_:
         if "/" not in as_:
             raise ValueError(f"--as must be '<ns>/<name>', got {as_!r}")
@@ -198,8 +202,7 @@ def install(target: str, as_: Optional[str], *, force: bool = False) -> Path:
     else:
         dst_ns, dst_name = ns, name
     dst = vectors_dir() / dst_ns / dst_name
-    from saklas.hf import pull_pack
-    result = pull_pack(target, target_folder=dst, force=force)
+    result = pull_pack(coord, target_folder=dst, force=force, revision=revision)
     _invalidate_selector_cache()
     return result
 

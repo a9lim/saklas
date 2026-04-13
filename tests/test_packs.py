@@ -23,8 +23,6 @@ def test_pack_metadata_parse_minimal(tmp_path):
         "recommended_alpha": 0.5,
         "source": "bundled",
         "files": {},
-        "signature": None,
-        "signature_method": None,
     })
     meta = packs.PackMetadata.load(folder)
     assert meta.name == "happy"
@@ -33,7 +31,6 @@ def test_pack_metadata_parse_minimal(tmp_path):
     assert meta.recommended_alpha == 0.5
     assert meta.source == "bundled"
     assert meta.files == {}
-    assert meta.signature is None
 
 
 def test_pack_metadata_missing_required_field_errors(tmp_path):
@@ -48,7 +45,6 @@ def test_pack_metadata_invalid_name_rejected(tmp_path):
         "description": "x", "version": "1", "license": "x",
         "tags": [], "recommended_alpha": 0.5,
         "source": "local", "files": {},
-        "signature": None, "signature_method": None,
     })
     with pytest.raises(packs.PackFormatError, match="name"):
         packs.PackMetadata.load(folder)
@@ -62,7 +58,6 @@ def test_pack_metadata_long_description_optional(tmp_path):
         "version": "1.0.0", "license": "MIT",
         "tags": [], "recommended_alpha": 0.5,
         "source": "bundled", "files": {},
-        "signature": None, "signature_method": None,
     })
     meta = packs.PackMetadata.load(folder)
     assert meta.long_description == "longer form"
