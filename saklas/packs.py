@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 
-NAME_REGEX = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 _REQUIRED_PACK_FIELDS = (
     "name", "description", "version", "license",
     "tags", "recommended_alpha", "source", "files",

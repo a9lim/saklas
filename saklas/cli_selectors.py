@@ -146,6 +146,73 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
     raise SelectorError(f"unknown selector kind: {selector.kind}")
 
 
+def resolve_pole(raw: str, namespace: Optional[str] = None) -> tuple[str, int, Optional["ResolvedConcept"]]:
+    """Resolve a user-typed concept reference to ``(canonical, sign, match)``.
+
+    Alias resolution for bipolar packs: if the user types a single-pole
+    name that appears on either side of an installed bipolar concept,
+    return the full composite with a sign of +1 (positive pole) or -1
+    (negative pole). Callers multiply the user-supplied alpha by ``sign``
+    before storing it.
+
+    Examples (assuming ``default/angry.calm`` is installed):
+      ``resolve_pole("angry")`` -> ``("angry.calm", +1, <resolved>)``
+      ``resolve_pole("calm")``  -> ``("angry.calm", -1, <resolved>)``
+      ``resolve_pole("angry.calm")`` -> ``("angry.calm", +1, <resolved>)``
+
+    Not-installed names fall through as fresh monopolar concepts with
+    sign +1 and ``match=None`` so the caller can still feed them into
+    the extraction pipeline.
+
+    Raises:
+        AmbiguousSelectorError: when multiple installed concepts match
+            the input under different canonical names (e.g. both
+            ``alice/angry`` and ``default/angry.calm`` exist and the
+            caller didn't supply a namespace). Also raised for
+            intra-namespace collisions like ``default/happy.sad`` +
+            ``default/happy.calm``.
+    """
+    # Lazy import to avoid a cycle: session.py imports cli_selectors for
+    # the broadened extract() lookup.
+    from saklas.session import BIPOLAR_SEP, canonical_concept_name
+
+    slug = canonical_concept_name(raw)
+    scope = [c for c in _all_concepts()
+             if namespace is None or c.namespace == namespace]
+
+    matches: list[tuple[str, int, ResolvedConcept]] = []
+    for c in scope:
+        if c.name == slug:
+            matches.append((c.name, +1, c))
+            continue
+        if BIPOLAR_SEP in c.name:
+            pos, neg = c.name.split(BIPOLAR_SEP, 1)
+            if pos == slug:
+                matches.append((c.name, +1, c))
+            elif neg == slug:
+                matches.append((c.name, -1, c))
+
+    if not matches:
+        return slug, +1, None
+
+    # Ambiguous if the matches don't collapse to a single (canonical, sign)
+    # or span multiple namespaces when none was specified — both raise the
+    # same error class as resolve() does for plain selectors.
+    canonicals = {(m[0], m[1]) for m in matches}
+    namespaces = {m[2].namespace for m in matches}
+    if len(canonicals) > 1 or (namespace is None and len(namespaces) > 1):
+        qualified = ", ".join(
+            f"{m[2].namespace}/{m[0]}{' (negated)' if m[1] < 0 else ''}"
+            for m in matches
+        )
+        raise AmbiguousSelectorError(
+            f"ambiguous pole '{raw}': matches {qualified}. "
+            f"Specify the full composite or a namespace."
+        )
+
+    return matches[0]
+
+
 def parse_args(tokens: list[str]) -> tuple[Selector, Optional[str]]:
     """Parse a list of selector tokens into (concept selector, optional model scope).
 

@@ -146,3 +146,88 @@ def test_parse_args_two_concepts_raises():
 def test_parse_args_two_models_raises():
     with pytest.raises(sel.SelectorError, match="one model"):
         sel.parse_args(["happy", "model:a", "model:b"])
+
+
+# --- resolve_pole alias resolution -----------------------------------------
+
+class TestResolvePole:
+    def test_monopolar_exact_match(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "default", "agentic")
+        sel.invalidate()
+        name, sign, m = sel.resolve_pole("agentic")
+        assert name == "agentic"
+        assert sign == 1
+        assert m is not None
+
+    def test_positive_pole_alias(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "default", "angry.calm")
+        sel.invalidate()
+        name, sign, m = sel.resolve_pole("angry")
+        assert name == "angry.calm"
+        assert sign == 1
+
+    def test_negative_pole_alias(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "default", "angry.calm")
+        sel.invalidate()
+        name, sign, m = sel.resolve_pole("calm")
+        assert name == "angry.calm"
+        assert sign == -1
+
+    def test_composite_literal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "default", "angry.calm")
+        sel.invalidate()
+        name, sign, m = sel.resolve_pole("angry.calm")
+        assert name == "angry.calm"
+        assert sign == 1
+
+    def test_slug_normalization(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "default", "high_context.low_context")
+        sel.invalidate()
+        name, sign, _ = sel.resolve_pole("High-Context")
+        assert name == "high_context.low_context"
+        assert sign == 1
+
+    def test_unknown_falls_through(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        sel.invalidate()
+        name, sign, m = sel.resolve_pole("xyzzy")
+        assert name == "xyzzy"
+        assert sign == 1
+        assert m is None
+
+    def test_collision_monopolar_vs_bipolar(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "alice", "angry")
+        _mk(tmp_path, "default", "angry.calm")
+        sel.invalidate()
+        with pytest.raises(sel.AmbiguousSelectorError):
+            sel.resolve_pole("angry")
+
+    def test_collision_two_bipolars(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "default", "angry.calm")
+        _mk(tmp_path, "default", "angry.fearful")
+        sel.invalidate()
+        with pytest.raises(sel.AmbiguousSelectorError):
+            sel.resolve_pole("angry")
+
+    def test_namespaced_scoped_resolve(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _mk(tmp_path, "bob", "deer.wolf")
+        _mk(tmp_path, "alice", "wolf")
+        sel.invalidate()
+        # Scoped to bob/: wolf -> deer.wolf with sign -1
+        name, sign, m = sel.resolve_pole("wolf", namespace="bob")
+        assert name == "deer.wolf"
+        assert sign == -1
+        assert m.namespace == "bob"
+        # Scoped to alice/: wolf is a monopolar exact match
+        name, sign, m = sel.resolve_pole("wolf", namespace="alice")
+        assert name == "wolf"
+        assert sign == 1
+        assert m.namespace == "alice"

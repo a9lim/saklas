@@ -13,6 +13,7 @@ from textual.containers import Horizontal
 from textual.widgets import Input
 from textual.timer import Timer
 
+from saklas.cli_selectors import AmbiguousSelectorError, resolve_pole
 from saklas.generation import GenerationState, build_chat_input, generate_steered, supports_thinking
 from saklas.model import _get_memory_gb
 from saklas.probes_bootstrap import load_defaults
@@ -402,16 +403,38 @@ class SaklasApp(App):
             )
             return
 
-        name = concept if len(concept) <= 20 else concept[:17] + "..."
+        # Alias resolution: a bare pole name may refer to an installed
+        # bipolar pack (e.g. `/steer wolf` when `deer.wolf` exists).
+        # Sign flip is applied to the user's alpha so `/steer calm 0.5`
+        # on top of `angry.calm` lands as `alphas["angry.calm"] = -0.5`.
+        # Explicit bipolar form (`concept - baseline`) skips resolution
+        # so the user's declared poles always win.
+        sign = 1
+        if baseline is None:
+            try:
+                resolved_name, sign, _match = resolve_pole(concept)
+                if resolved_name != concept:
+                    chat.add_system_message(
+                        f"  Resolved '{concept}' → '{resolved_name}'"
+                        + (" (negated)" if sign < 0 else "")
+                    )
+                concept = resolved_name
+            except AmbiguousSelectorError as e:
+                chat.add_system_message(f"Error: {e}")
+                return
+            if alpha is not None:
+                alpha *= sign
+
+        display = concept if len(concept) <= 20 else concept[:17] + "..."
         suffix = f" vs '{baseline}'" if baseline else ""
-        chat.add_system_message(f"Extracting '{name}'{suffix}...")
+        chat.add_system_message(f"Extracting '{display}'{suffix}...")
 
         def _worker():
             def _progress(msg):
                 self.call_from_thread(self._steer_status, msg)
             try:
-                profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
-                on_success(name, profile, alpha)
+                canonical, profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
+                on_success(canonical, profile, alpha)
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
 

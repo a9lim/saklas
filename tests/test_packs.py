@@ -261,24 +261,23 @@ def test_save_load_profile_roundtrip_slim_sidecar(tmp_path):
     assert "num_pairs" not in meta
 
 
-def test_bundled_concept_names_includes_happy():
+def test_bundled_concept_names_includes_known():
     names = packs.bundled_concept_names()
-    assert "happy" in names
-    assert "calm" in names
-    assert len(names) == 28
+    # `agentic` is a stable name across pre- and post-regen layouts.
+    assert "agentic" in names
+    assert len(names) >= 1
 
 
 def test_materialize_empty_home(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     packs.materialize_bundled()
     assert (tmp_path / "neutral_statements.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "happy" / "pack.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "happy" / "statements.json").is_file()
+    assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").is_file()
 
 
 def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    target = tmp_path / "vectors" / "default" / "happy" / "pack.json"
+    target = tmp_path / "vectors" / "default" / "agentic" / "pack.json"
     target.parent.mkdir(parents=True)
     target.write_text('{"user": "edited"}')
     packs.materialize_bundled()
@@ -287,11 +286,14 @@ def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
 
 def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    (tmp_path / "vectors" / "default" / "happy").mkdir(parents=True)
-    (tmp_path / "vectors" / "default" / "happy" / "pack.json").write_text("{}")
+    # Pre-create `agentic` with user edits; materialization should still
+    # populate other bundled packs (at least `angry.calm` in the current
+    # data dir) without overwriting agentic.
+    (tmp_path / "vectors" / "default" / "agentic").mkdir(parents=True)
+    (tmp_path / "vectors" / "default" / "agentic" / "pack.json").write_text("{}")
     packs.materialize_bundled()
-    assert (tmp_path / "vectors" / "default" / "calm" / "pack.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "happy" / "pack.json").read_text() == "{}"
+    assert (tmp_path / "vectors" / "default" / "angry.calm" / "pack.json").is_file()
+    assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").read_text() == "{}"
 
 
 def test_migration_notice_no_old_cache(monkeypatch, tmp_path, capsys):

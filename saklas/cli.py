@@ -37,7 +37,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         "--probes", "-p",
         nargs="*",
         default=None,
-        help="Probe categories: all, none, emotion, personality, safety, cultural, gender (default: all)",
+        help="Probe categories: all, none, affect, epistemic, alignment, register, social_stance, cultural (default: all)",
     )
 
 
@@ -269,12 +269,17 @@ def _run_tui(args: argparse.Namespace) -> None:
     session = _make_session(args)
     _print_model_info(session)
 
+    from saklas.cli_selectors import resolve_pole
     for coord, alpha in getattr(args, "config_vectors", {}).items():
-        name = coord.split("/", 1)[-1] if "/" in coord else coord
+        ns = coord.split("/", 1)[0] if "/" in coord else None
+        raw_name = coord.split("/", 1)[-1] if "/" in coord else coord
         try:
-            profile = session.extract(name)
-            session.steer(coord, profile)
-            print(f"  Registered '{coord}' (alpha={alpha})")
+            canonical, sign, _match = resolve_pole(raw_name, namespace=ns)
+            effective_alpha = alpha * sign
+            _, profile = session.extract(canonical)
+            registry_key = f"{ns}/{canonical}" if ns else canonical
+            session.steer(registry_key, profile)
+            print(f"  Registered '{registry_key}' (alpha={effective_alpha})")
         except Exception as e:
             print(f"  Failed to register '{coord}': {e}")
 
@@ -308,14 +313,22 @@ def _run_serve(args: argparse.Namespace) -> None:
     session = _make_session(args)
     _print_model_info(session)
 
+    from saklas.cli_selectors import resolve_pole, AmbiguousSelectorError
     default_alphas: dict[str, float] = {}
     for spec in args.steer:
-        name, alpha = _parse_steer_flag(spec)
-        print(f"Extracting steering vector: {name}")
-        profile = session.extract(name, on_progress=lambda m: print(f"  {m}"))
-        session.steer(name, profile)
-        default_alphas[name] = alpha
-        print(f"  Registered '{name}' (default alpha={alpha})")
+        raw, alpha = _parse_steer_flag(spec)
+        try:
+            canonical, sign, _match = resolve_pole(raw)
+        except AmbiguousSelectorError as e:
+            print(f"  Failed to resolve '{raw}': {e}", file=sys.stderr)
+            sys.exit(1)
+        effective_alpha = alpha * sign
+        print(f"Extracting steering vector: {canonical}"
+              + (f" (negated from '{raw}')" if sign < 0 else ""))
+        _, profile = session.extract(canonical, on_progress=lambda m: print(f"  {m}"))
+        session.steer(canonical, profile)
+        default_alphas[canonical] = effective_alpha
+        print(f"  Registered '{canonical}' (default alpha={effective_alpha})")
 
     from saklas.server import create_app
     app = create_app(session, default_alphas=default_alphas,

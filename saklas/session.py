@@ -18,7 +18,7 @@ from saklas.model import load_model, get_layers, get_model_info
 from saklas.monitor import TraitMonitor
 from saklas.packs import PackFormatError, PackMetadata, hash_file
 from saklas.paths import concept_dir, safe_model_id
-from saklas.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, load_defaults
+from saklas.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
 from saklas.results import GenerationResult, TokenEvent, ProbeReadings
 from saklas.vectors import (
     extract_contrastive,
@@ -30,11 +30,42 @@ from saklas.vectors import (
 _log = logging.getLogger(__name__)
 
 _N_PAIRS = 45
-PROBE_CATEGORIES = ["emotion", "personality", "safety", "cultural", "gender"]
+PROBE_CATEGORIES = ["affect", "epistemic", "alignment", "register", "social_stance", "cultural"]
 _BATCH_SIZE = 9
 MIN_ELAPSED_FOR_RATE = 0.1
 
 _PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+BIPOLAR_SEP = "."
+
+
+def _slug(s: str) -> str:
+    """Normalize a single pole label to `[a-z0-9_]`.
+
+    Collapses any non-alphanumeric run to `_`. Never produces the bipolar
+    separator `.` — that is reserved for joining two slugged poles in
+    `canonical_concept_name`.
+    """
+    return _SLUG_RE.sub("_", s.strip().lower()).strip("_")
+
+
+def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
+    """Return the canonical on-disk name for a concept.
+
+    Monopolar: `_slug(concept)`.
+    Bipolar:   `f"{_slug(concept)}.{_slug(baseline)}"`.
+
+    If `baseline` is None and `concept` already contains the bipolar
+    separator `.`, the input is treated as a pre-composed bipolar name
+    and each side is slugged independently. This makes `/steer happy.sad`
+    and `/steer happy - sad` resolve to the same cache entry.
+    """
+    if baseline is None:
+        if BIPOLAR_SEP in concept:
+            pos, neg = concept.split(BIPOLAR_SEP, 1)
+            return f"{_slug(pos)}{BIPOLAR_SEP}{_slug(neg)}"
+        return _slug(concept)
+    return f"{_slug(concept)}{BIPOLAR_SEP}{_slug(baseline)}"
 
 _DOMAIN_SEEDS = [
     "specific facts, lore, history, or knowledge unique to this concept",
@@ -151,20 +182,19 @@ class SaklasSession:
 
     # -- Extraction --
 
-    def _local_concept_folder(self, concept: str, baseline: str | None = None) -> pathlib.Path:
-        """Return the local/ concept folder path, creating pack.json if needed.
+    def _local_concept_folder(self, canonical: str) -> pathlib.Path:
+        """Return the local/<canonical>/ folder, creating pack.json if needed.
 
         User-extracted vectors and generated statements live under
-        ~/.saklas/vectors/local/<tag>/. A minimal pack.json with
+        ~/.saklas/vectors/local/<canonical>/. A minimal pack.json with
         source=local is written on first access.
         """
-        tag = f"{concept}_vs_{baseline}" if baseline else concept
-        folder = concept_dir("local", tag)
+        folder = concept_dir("local", canonical)
         folder.mkdir(parents=True, exist_ok=True)
         if not (folder / "pack.json").exists():
             PackMetadata(
-                name=tag,
-                description=f"User-extracted: {tag}",
+                name=canonical,
+                description=f"User-extracted: {canonical}",
                 version="1.0.0",
                 license="AGPL-3.0-or-later",
                 tags=[],
@@ -174,13 +204,13 @@ class SaklasSession:
             ).write(folder)
         return folder
 
-    def _vector_cache_path(self, concept: str, baseline: str | None = None) -> str:
-        folder = self._local_concept_folder(concept, baseline)
+    def _vector_cache_path(self, canonical: str) -> str:
+        folder = self._local_concept_folder(canonical)
         model_id = self._model_info.get("model_id", "unknown")
         return str(folder / f"{safe_model_id(model_id)}.safetensors")
 
-    def _statements_cache_path(self, concept: str, baseline: str | None = None) -> str:
-        folder = self._local_concept_folder(concept, baseline)
+    def _statements_cache_path(self, canonical: str) -> str:
+        folder = self._local_concept_folder(canonical)
         return str(folder / "statements.json")
 
     def _update_local_pack_files(self, folder: pathlib.Path) -> None:
@@ -337,19 +367,21 @@ class SaklasSession:
         source,
         baseline: str | None = None,
         on_progress: Callable[[str], None] | None = None,
-    ) -> dict[int, tuple[torch.Tensor, float]]:
+    ) -> tuple[str, dict[int, tuple[torch.Tensor, float]]]:
         """Extract a steering vector profile.
 
         Full pipeline: cache check -> curated dataset -> statement cache ->
         generate pairs -> extract contrastive -> save to cache.
 
-        No steering hooks are on the model between generations, so extraction
-        never needs to save/restore steering state.
+        Returns (canonical_name, profile). For bipolar extraction
+        (baseline supplied), canonical_name is `f"{pos}_{neg}"` — the
+        composite name used throughout storage and the vector registry.
+        Callers should register the vector under the returned name.
 
         Args:
             source: concept name (str), list of (positive, negative) tuples,
                     or a DataSource instance.
-            baseline: optional baseline concept for contrastive extraction.
+            baseline: optional negative-pole concept for bipolar extraction.
                       Only used when source is a string.
             on_progress: optional callback for progress messages.
         """
@@ -362,10 +394,14 @@ class SaklasSession:
             concept = source
         elif isinstance(source, DataSource):
             concept = source.name
+            baseline = None
         elif isinstance(source, list):
             concept = "custom"
+            baseline = None
         else:
             raise TypeError(f"Unsupported source type: {type(source)}")
+
+        canonical = canonical_concept_name(concept, baseline)
 
         # For DataSource or raw pairs, skip the full pipeline — just extract
         if isinstance(source, (DataSource, list)):
@@ -373,13 +409,13 @@ class SaklasSession:
                 ds = DataSource(pairs=source)
             else:
                 ds = source
-            folder = self._local_concept_folder(ds.name, None)
+            folder = self._local_concept_folder(canonical)
             cache_path = str(folder / f"{safe_model_id(self.model_id)}.safetensors")
             try:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._promote_profile(profile)
-                _progress(f"Loaded cached profile for '{ds.name}'.")
-                return profile
+                _progress(f"Loaded cached profile for '{canonical}'.")
+                return canonical, profile
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -390,38 +426,39 @@ class SaklasSession:
             )
             _save_profile(profile, cache_path, {"method": "contrastive_pca"})
             self._update_local_pack_files(folder)
-            return profile
+            return canonical, profile
 
-        # String source — full pipeline. Curated concepts live under default/;
-        # everything else lives under local/.
-        if baseline is None:
-            defaults = load_defaults()
-            concept_lower = concept.lower()
-            is_curated = any(concept_lower in probes for probes in defaults.values())
-        else:
-            is_curated = False
+        # String source — full pipeline. Pack lookup scans all namespaces
+        # (default/, hf-pulled, local/) via cli_selectors._all_concepts so
+        # `/steer deer.wolf` hits an installed pack under any namespace,
+        # not just default/. If no pack exists with this canonical name,
+        # the concept extracts fresh under local/.
+        from saklas.cli_selectors import _all_concepts
+        curated_folder = None
+        for c in _all_concepts():
+            if c.name == canonical:
+                curated_folder = c.folder
+                break
 
-        if is_curated:
-            curated_folder = concept_dir("default", concept_lower)
+        if curated_folder is not None:
             cache_path = str(curated_folder / f"{safe_model_id(self.model_id)}.safetensors")
         else:
-            curated_folder = None
-            cache_path = self._vector_cache_path(concept, baseline)
+            cache_path = self._vector_cache_path(canonical)
 
         # 1. Check vector cache
         try:
             profile, _meta = _load_profile(cache_path)
             profile = self._promote_profile(profile)
-            _progress(f"Loaded cached profile for '{concept}'.")
-            return profile
+            _progress(f"Loaded cached profile for '{canonical}'.")
+            return canonical, profile
         except (FileNotFoundError, KeyError, ValueError):
             pass
 
         # 2. Extract from curated statements if available
-        if is_curated and curated_folder is not None:
+        if curated_folder is not None:
             curated_stmts = curated_folder / "statements.json"
             if curated_stmts.exists():
-                _progress(f"Found curated statements for '{concept}', extracting...")
+                _progress(f"Found curated statements for '{canonical}', extracting...")
                 ds = load_contrastive_pairs(str(curated_stmts))
                 profile = extract_contrastive(
                     self._model, self._tokenizer, ds["pairs"],
@@ -432,10 +469,10 @@ class SaklasSession:
                     "statements_sha256": hash_file(curated_stmts),
                 })
                 self._update_local_pack_files(curated_folder)
-                return profile
+                return canonical, profile
 
         # 3. Check statement cache under local/
-        stmt_cache_path = self._statements_cache_path(concept, baseline)
+        stmt_cache_path = self._statements_cache_path(canonical)
         local_folder = pathlib.Path(stmt_cache_path).parent
         pairs = None
         try:
@@ -446,7 +483,7 @@ class SaklasSession:
             elif isinstance(cached, dict) and "pairs" in cached:
                 pairs = cached["pairs"]
             if pairs:
-                _progress(f"Loaded cached pairs for '{concept}'.")
+                _progress(f"Loaded cached pairs for '{canonical}'.")
         except (FileNotFoundError, KeyError, json.JSONDecodeError):
             pass
 
@@ -476,7 +513,7 @@ class SaklasSession:
             "statements_sha256": hash_file(pathlib.Path(stmt_cache_path)),
         })
         self._update_local_pack_files(local_folder)
-        return profile
+        return canonical, profile
 
     def load_profile(self, path: str) -> dict[int, tuple[torch.Tensor, float]]:
         profile, _meta = _load_profile(path)
@@ -519,7 +556,7 @@ class SaklasSession:
 
     def monitor(self, name: str, profile: dict | None = None) -> None:
         if profile is None:
-            profile = self.extract(name)
+            _, profile = self.extract(name)
         if not self._layer_means:
             self._layer_means = bootstrap_layer_means(
                 self._model, self._tokenizer, self._layers, self._model_info,

@@ -567,8 +567,8 @@ def _register_routes(app: FastAPI) -> None:
         # Blocking JSON response
         progress_msgs: list[str] = []
         try:
-            profile = session.extract(source, baseline=req.baseline,
-                                      on_progress=lambda m: progress_msgs.append(m))
+            canonical, profile = session.extract(source, baseline=req.baseline,
+                                                 on_progress=lambda m: progress_msgs.append(m))
         except ConcurrentGenerationError as e:
             return _error(409, str(e), "conflict")
 
@@ -581,6 +581,7 @@ def _register_routes(app: FastAPI) -> None:
 
         return {
             "name": req.name,
+            "canonical": canonical,
             "layers": len(profile),
             "top_layer": top_layer,
             "top_score": round(top_score, 4),
@@ -600,7 +601,7 @@ def _register_routes(app: FastAPI) -> None:
         def _on_progress(msg):
             progress_msgs.append(msg)
         try:
-            profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
+            canonical, profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
         except ConcurrentGenerationError as e:
             err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
             yield f"event: error\ndata: {json.dumps(err)}\n\n"
@@ -616,7 +617,7 @@ def _register_routes(app: FastAPI) -> None:
         scored = _profile_top_layers(profile)
         top_layer, top_score = scored[0] if scored else (0, 0.0)
 
-        done = {"name": name, "layers": len(profile), "top_layer": top_layer, "top_score": round(top_score, 4)}
+        done = {"name": name, "canonical": canonical, "layers": len(profile), "top_layer": top_layer, "top_score": round(top_score, 4)}
         yield f"event: done\ndata: {json.dumps(done)}\n\n"
 
     @app.post("/v1/saklas/vectors/load")
