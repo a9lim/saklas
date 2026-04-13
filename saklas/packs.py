@@ -140,3 +140,25 @@ class Sidecar:
         with open(path, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
             f.write("\n")
+
+
+def hash_file(path: Path) -> str:
+    """Return hex sha256 of a file's contents."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[str]]:
+    """Compare every file in `files` (path -> expected sha256) against disk.
+
+    Returns (all_ok, list_of_bad_paths). A missing file counts as bad.
+    """
+    bad: list[str] = []
+    for rel, expected in files.items():
+        fp = folder / rel
+        if not fp.exists() or hash_file(fp) != expected:
+            bad.append(rel)
+    return (not bad, bad)

@@ -116,3 +116,34 @@ def test_sidecar_write_roundtrip(tmp_path):
     loaded = packs.Sidecar.load(p)
     assert loaded.scores == sc.scores
     assert loaded.statements_sha256 == "hash"
+
+
+def test_hash_file_sha256(tmp_path):
+    p = tmp_path / "x.txt"
+    p.write_bytes(b"hello")
+    # echo -n hello | sha256sum
+    assert packs.hash_file(p) == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+
+
+def test_verify_integrity_clean(tmp_path):
+    (tmp_path / "statements.json").write_bytes(b"data")
+    files = {"statements.json": packs.hash_file(tmp_path / "statements.json")}
+    ok, bad = packs.verify_integrity(tmp_path, files)
+    assert ok is True
+    assert bad == []
+
+
+def test_verify_integrity_tampered(tmp_path):
+    (tmp_path / "statements.json").write_bytes(b"original")
+    files = {"statements.json": packs.hash_file(tmp_path / "statements.json")}
+    (tmp_path / "statements.json").write_bytes(b"tampered")
+    ok, bad = packs.verify_integrity(tmp_path, files)
+    assert ok is False
+    assert bad == ["statements.json"]
+
+
+def test_verify_integrity_missing_file(tmp_path):
+    files = {"statements.json": "deadbeef"}
+    ok, bad = packs.verify_integrity(tmp_path, files)
+    assert ok is False
+    assert bad == ["statements.json"]
