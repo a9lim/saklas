@@ -80,7 +80,7 @@ pip install -e ".[dev]"        # + pytest
 
 Saklas uses **Representation Engineering** (Zou et al., 2023): for each contrastive pair, capture the last-content-token hidden state at every layer, diff the positive and negative sides, and take the first principal component per layer via SVD. Every layer gets a direction and a score (explained variance ratio); there is no manual layer selection.
 
-Alpha is **normalized per-profile** so the same numeric value means the same intensity across backbones: α≈0.5 sits in the coherent-nuanced band on every bundled architecture, α≈1.0 is past the collapse cliff. Vectors are registered without alphas and applied per-call, so nothing persists on the model between generations.
+Alpha is **normalized per-profile** so the same numeric value means roughly the same intensity across backbones. **α≈0.5 is a reasonable starting point** — on the bundled bipolar pack that typically lands in the coherent-nuanced band, with clearly steered output that still reads as fluent text. Vector strength varies, though: some concepts carry sharper directions than others, and the same α can feel understated on one probe and past-the-cliff on another. The working rule is simple — **if the output is incoherent, turn α down; if it's indistinguishable from baseline, turn α up** — stepping in 0.1 increments until it lands. Vectors are registered without alphas and applied per-call, so nothing persists on the model between generations.
 
 Multiple vectors **compose** naturally — they register into a single manager that, per generation, Gram-Schmidt-orthogonalizes any co-layer directions (optional) and installs a single in-place hidden-state hook per active layer. Hooks are transient: composed before generation, removed after.
 
@@ -122,6 +122,63 @@ Probes extract on first run against a new model and cache to `~/.saklas/vectors/
 53 families via `model.py:_LAYER_ACCESSORS`. Adding a new one = one function entry. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Llama (1–4), Mistral, Ministral, Mixtral, Gemma (1–4), Phi (1–3), PhiMoE, Qwen (1–3.5), Qwen-MoE variants, Cohere (1–2), DeepSeek (V2–V3), StarCoder2, OLMo (1–3), OLMoE, GLM (3–4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2/Neo/J/BigCode/NeoX/OSS, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, RecurrentGemma.
+
+---
+
+## Managing concept packs
+
+Saklas stores all state under `~/.saklas/` (override via `SAKLAS_HOME`):
+
+```
+~/.saklas/
+  neutral_statements.json                  # user-editable (copy-on-miss from package)
+  vectors/
+    default/<concept>/                     # bundled probes
+    local/<concept>/                       # user-authored + merged
+    <hf_owner>/<concept>/                  # HF-pulled
+  models/<safe_model_id>/layer_means.safetensors
+```
+
+Each concept is a folder with `pack.json` (metadata + file hashes), `statements.json` (the contrastive pairs), and zero or more `<safe_model_id>.safetensors` tensor files (one per model the concept has been extracted against). Tensors are extracted lazily — a pack without tensors is fine; it'll extract on first use.
+
+Packs are distributed as **HuggingFace model repos** (not datasets — safetensors is model-hub-native, and `base_model` frontmatter gives reverse-link discoverability from the base model's hub page). Pin any install to a git tag, branch, or commit SHA with `@revision`; pinned installs are preserved on refresh — pinning means pinning.
+
+### Commands
+
+```bash
+saklas install <target> [-s] [-a NS/NAME] [-f]   # from HF coord (ns/name[@rev]) or folder path
+saklas refresh <selector> [-m MODEL]              # re-pull from source
+saklas refresh neutrals                           # reserved: rewrite neutral_statements.json
+saklas clear <selector> [-m MODEL] [-y]           # delete per-model tensors, keep statements
+saklas uninstall <selector> [-y]                  # fully remove concept folder
+saklas list [selector] [-i] [-j] [-v]             # includes HF hub by default
+saklas merge <name> <components> [-m] [-f] [-s]   # merge: saklas merge bard default/angry.calm:0.3,user/arch:0.4
+```
+
+**Selectors** (shared grammar): `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and error on ambiguity.
+
+**`install -s` / `--statements-only`** keeps only `statements.json` and drops any tensors that arrived with the pack. The concept folder stays a legitimate standalone pack — tensors re-extract on first use against whatever model you load. Useful when you want the pairs but prefer to extract locally.
+
+**`refresh neutrals`** is a reserved form that overwrites `~/.saklas/neutral_statements.json` with the bundled package copy. Run this after upgrading across a release that changes the bundled neutrals — `materialize_bundled` is copy-on-miss so existing users keep their old file by default. Layer means auto-recompute on next session init via the hash check.
+
+**`clear` vs `uninstall`**: `clear` deletes tensors but keeps `statements.json` and `pack.json` (so the concept remains selectable and will re-extract on demand). `uninstall` removes the whole folder. Uninstalling a bundled concept is allowed — it respawns on the next session init via `materialize_bundled`. Broad selectors (`all`, `namespace:`) require `-y` on both commands.
+
+**`list`** queries the HF hub by default and merges results with local installs. Pass `-i` for installed-only, `-j` for JSON output, `-v` to include descriptions inline.
+
+### Python library
+
+All of the above is also available programmatically:
+
+```python
+from saklas import cache_ops
+from saklas.cli_selectors import parse as sel_parse
+
+cache_ops.install("a9lim/angry.calm@v1.2", as_=None, force=False, statements_only=False)
+cache_ops.refresh(sel_parse("tag:affect"), model_scope="google/gemma-2-9b-it")
+cache_ops.delete_tensors(sel_parse("angry.calm"), model_scope=None)
+cache_ops.uninstall(sel_parse("angry.calm"), yes=False)
+cache_ops.list_concepts(sel_parse("tag:affect"), hf=True, installed_only=False)
+```
 
 ---
 
@@ -244,7 +301,7 @@ Runnable examples in [`examples/`](examples/):
 
 **Thinking mode is per-call.** For models that support it (Qwen 3.5, QwQ, Gemma 4, gpt-oss, etc.), `session.generate(input, thinking=True)` enables the reasoning trace. Delimiters are detected automatically from the chat template — no hardcoded tokens. `result.text` contains only the final answer; streaming yields `TokenEvent` objects with `thinking=True` for the reasoning trace.
 
-**Alphas are backbone-normalized.** The same numeric value means the same intensity across architectures. Start at 0.1–0.3 for subtle nudges, 0.4–0.6 for clear shifts, and treat anything past 0.8 as a coherence experiment.
+**Alphas are backbone-normalized, but per-vector strength varies.** α≈0.5 is a reasonable default; sharper probes will saturate earlier and subtler ones won't register until you push harder. Tune by ear: if the output degenerates into word salad or looping, turn α down; if it reads like the unsteered baseline, turn α up. Step in 0.1 increments. `Ctrl+A` in the TUI (or omitting `alphas=` in the API) gives you a cheap A/B against the unsteered baseline — when in doubt, sweep.
 
 ```python
 _, ac = session.extract("angry.calm")
@@ -456,63 +513,6 @@ The server is **stateless by default** — each request carries its full message
 **Not supported:** tool calling, strict JSON/`json_schema` mode, `/v1/embeddings`.
 
 The server is designed for **trusted networks** — see [SECURITY.md](SECURITY.md) for the threat model before exposing it beyond your local machine.
-
----
-
-## Managing concept packs
-
-Saklas stores all state under `~/.saklas/` (override via `SAKLAS_HOME`):
-
-```
-~/.saklas/
-  neutral_statements.json                  # user-editable (copy-on-miss from package)
-  vectors/
-    default/<concept>/                     # bundled probes
-    local/<concept>/                       # user-authored + merged
-    <hf_owner>/<concept>/                  # HF-pulled
-  models/<safe_model_id>/layer_means.safetensors
-```
-
-Each concept is a folder with `pack.json` (metadata + file hashes), `statements.json` (the contrastive pairs), and zero or more `<safe_model_id>.safetensors` tensor files (one per model the concept has been extracted against). Tensors are extracted lazily — a pack without tensors is fine; it'll extract on first use.
-
-Packs are distributed as **HuggingFace model repos** (not datasets — safetensors is model-hub-native, and `base_model` frontmatter gives reverse-link discoverability from the base model's hub page). Pin any install to a git tag, branch, or commit SHA with `@revision`; pinned installs are preserved on refresh — pinning means pinning.
-
-### Commands
-
-```bash
-saklas install <target> [-s] [-a NS/NAME] [-f]   # from HF coord (ns/name[@rev]) or folder path
-saklas refresh <selector> [-m MODEL]              # re-pull from source
-saklas refresh neutrals                           # reserved: rewrite neutral_statements.json
-saklas clear <selector> [-m MODEL] [-y]           # delete per-model tensors, keep statements
-saklas uninstall <selector> [-y]                  # fully remove concept folder
-saklas list [selector] [-i] [-j] [-v]             # includes HF hub by default
-saklas merge <name> <components> [-m] [-f] [-s]   # merge: saklas merge bard default/angry.calm:0.3,user/arch:0.4
-```
-
-**Selectors** (shared grammar): `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and error on ambiguity.
-
-**`install -s` / `--statements-only`** keeps only `statements.json` and drops any tensors that arrived with the pack. The concept folder stays a legitimate standalone pack — tensors re-extract on first use against whatever model you load. Useful when you want the pairs but prefer to extract locally.
-
-**`refresh neutrals`** is a reserved form that overwrites `~/.saklas/neutral_statements.json` with the bundled package copy. Run this after upgrading across a release that changes the bundled neutrals — `materialize_bundled` is copy-on-miss so existing users keep their old file by default. Layer means auto-recompute on next session init via the hash check.
-
-**`clear` vs `uninstall`**: `clear` deletes tensors but keeps `statements.json` and `pack.json` (so the concept remains selectable and will re-extract on demand). `uninstall` removes the whole folder. Uninstalling a bundled concept is allowed — it respawns on the next session init via `materialize_bundled`. Broad selectors (`all`, `namespace:`) require `-y` on both commands.
-
-**`list`** queries the HF hub by default and merges results with local installs. Pass `-i` for installed-only, `-j` for JSON output, `-v` to include descriptions inline.
-
-### Python library
-
-All of the above is also available programmatically:
-
-```python
-from saklas import cache_ops
-from saklas.cli_selectors import parse as sel_parse
-
-cache_ops.install("a9lim/angry.calm@v1.2", as_=None, force=False, statements_only=False)
-cache_ops.refresh(sel_parse("tag:affect"), model_scope="google/gemma-2-9b-it")
-cache_ops.delete_tensors(sel_parse("angry.calm"), model_scope=None)
-cache_ops.uninstall(sel_parse("angry.calm"), yes=False)
-cache_ops.list_concepts(sel_parse("tag:affect"), hf=True, installed_only=False)
-```
 
 ---
 
