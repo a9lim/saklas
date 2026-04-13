@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "We're switching to the new framework on Monday. All teams will migrate their services by end of week.",
+    "negative": "I was wondering if maybe we should think about possibly switching to the new framework at some point, if everyone's okay with that."
+  },
+  {
+    "positive": "This proposal is rejected. The cost basis is flawed and the timeline is unachievable.",
+    "negative": "I'm not entirely sure, but there might be some issues with the cost basis, and the timeline could potentially be a bit challenging."
+  },
+  {
+    "positive": "The correct answer is 42. The formula is straightforward and there's no ambiguity here.",
+    "negative": "I think the answer might be around 42, though I could be wrong and there might be other valid interpretations."
+  },
+  {
+    "positive": "Remove the feature. It confuses users and adds maintenance burden with zero business value.",
+    "negative": "Perhaps we could consider whether the feature might be causing some confusion, and maybe think about whether it's worth keeping."
+  },
+  {
+    "positive": "The diagnosis is a torn ACL. Surgery is required and rehab will take nine months.",
+    "negative": "It looks like it could possibly be a torn ACL, though I'd want to get a second opinion, and if that's the case, surgery might be something to consider."
+  },
+  {
+    "positive": "Everyone will be in the office Tuesday through Thursday. Remote work is Monday and Friday only.",
+    "negative": "I was thinking maybe it might be nice if people could try to come in a few days a week, perhaps Tuesday through Thursday if that works for everyone."
+  },
+  {
+    "positive": "Use TypeScript for the frontend. JavaScript without types at this scale is engineering malpractice.",
+    "negative": "TypeScript might be something worth exploring for the frontend, though I understand there are different opinions on that."
+  },
+  {
+    "positive": "The house is worth 450,000 based on comps, condition, and location. List it there.",
+    "negative": "I'm guessing the house might be worth somewhere around 450,000, give or take, but the market is unpredictable and it could really go either way."
+  },
+  {
+    "positive": "Stop watering the lawn daily. Twice a week, deep soak, early morning. That's what the grass needs.",
+    "negative": "You might want to think about maybe reducing how often you water the lawn, possibly to a couple times a week, though it kind of depends."
+  },
+  {
+    "positive": "The experiment failed because the control group was contaminated. Restart from scratch.",
+    "negative": "I wonder if the experiment might not have gone as planned, possibly due to some contamination issues, and maybe we should think about trying again."
+  },
+  {
+    "positive": "Ship the MVP now. We'll iterate based on real user feedback, not more speculation.",
+    "negative": "I sort of feel like maybe we could think about shipping soon, though I'm not sure if it's quite ready and I'd want to hear what others think."
+  },
+  {
+    "positive": "The bridge can support 40 tons. That's the engineering limit, not a suggestion.",
+    "negative": "Based on what I've seen, the bridge might be able to handle something in the neighborhood of 40 tons, though I'm not an expert."
+  },
+  {
+    "positive": "You need to leave by 6 AM to make the flight. There is no margin for error with morning traffic.",
+    "negative": "You might want to consider leaving kind of early, maybe around 6 or so, in case traffic is bad, though it's hard to say for sure."
+  },
+  {
+    "positive": "The painting is a forgery. The pigment analysis and provenance gaps are conclusive.",
+    "negative": "There's a chance the painting might not be authentic, based on some things I've noticed, but I'd really want more opinions before saying for sure."
+  },
+  {
+    "positive": "Fire the contractor. Three missed deadlines and substandard work is grounds for termination.",
+    "negative": "I'm starting to wonder if maybe we should think about whether the contractor is really working out, given some of the delays we've experienced."
+  },
+  {
+    "positive": "Invest in index funds. Over any 20-year period, they outperform 90% of actively managed funds.",
+    "negative": "Index funds seem like they might be a reasonable option, though investment is complicated and there are lots of different strategies that could work."
+  },
+  {
+    "positive": "The patient needs 500mg of amoxicillin three times daily for ten days. No exceptions.",
+    "negative": "I'm thinking maybe something like amoxicillin could help, perhaps around 500mg, and the patient could try taking it a few times a day for a week or so."
+  },
+  {
+    "positive": "The product roadmap for Q3 is locked. These five features ship, everything else waits.",
+    "negative": "I've been putting together some ideas for Q3 that I'd love to get everyone's input on, and maybe we can figure out together what to prioritize."
+  },
+  {
+    "positive": "Pull the car over now. That noise from the engine means the serpentine belt is about to snap.",
+    "negative": "I'm not sure, but that noise might be something to keep an eye on, and maybe when you get a chance you could have someone look at it."
+  },
+  {
+    "positive": "The answer is no. We don't have the bandwidth, and taking this on would compromise our existing commitments.",
+    "negative": "I'm leaning towards probably not, though I can see arguments on both sides, and I wouldn't want to make a decision without getting more input first."
+  },
+  {
+    "positive": "Evacuate the building immediately. The gas leak has been confirmed on the third floor.",
+    "negative": "There seems to be some kind of gas issue that might be happening on the third floor, so it might be a good idea for people to maybe head outside."
+  },
+  {
+    "positive": "Your thesis argument is circular. Restructure chapters four and five around the primary evidence.",
+    "negative": "I wonder if maybe the argument in the thesis might be slightly circular in places, and perhaps chapters four and five could potentially benefit from some restructuring."
+  },
+  {
+    "positive": "We're raising the price to $49. The data shows customers will absorb the increase at this tier.",
+    "negative": "I've been thinking about whether maybe we should consider adjusting the price a little, possibly to something like $49, but I'm really not sure how customers would react."
+  },
+  {
+    "positive": "Plant the tomatoes now. The frost date has passed and the soil temperature is right.",
+    "negative": "It might be getting close to a good time to plant tomatoes, though I'm not totally sure about the frost situation and you might want to check."
+  },
+  {
+    "positive": "The code review is done. Fix these twelve items before merging. Non-negotiable.",
+    "negative": "I noticed a few things in the code that might be worth looking at, and it would be nice if maybe some of them could be addressed before merging, if you have time."
+  },
+  {
+    "positive": "Take the highway. Surface streets will add forty minutes and there's construction on Main.",
+    "negative": "The highway might be faster, I think, though surface streets could work too, it's kind of hard to say which would be better today."
+  },
+  {
+    "positive": "The company will be profitable by Q4. Here's the exact path: cut these three cost centers and close this deal.",
+    "negative": "I'm hopeful that maybe we could start moving towards profitability, possibly by Q4 or so, depending on how some things play out."
+  },
+  {
+    "positive": "Bench press form: feet flat, back arched, bar path diagonal. Do not bounce off your chest.",
+    "negative": "For bench press, you might want to try keeping your feet on the ground, and maybe arch your back a little if that feels comfortable, and try to control the bar."
+  },
+  {
+    "positive": "The verdict is guilty. The evidence is unambiguous and the jury was unanimous.",
+    "negative": "It seems like the evidence might point towards guilt, though there are always different ways to interpret things and reasonable people could disagree."
+  },
+  {
+    "positive": "Cancel the event. Ticket sales are at 15% and marketing can't move the needle in two weeks.",
+    "negative": "I'm starting to worry a little about ticket sales for the event, and I wonder if maybe we should discuss whether it still makes sense to go forward."
+  },
+  {
+    "positive": "The roof needs replacing this year. Another winter with those shingles and you'll have water damage.",
+    "negative": "The roof might need some attention at some point, maybe before too long, though I'm not really sure how urgent it is."
+  },
+  {
+    "positive": "Shut down the API endpoint. It's leaking user data and has been since the last deploy.",
+    "negative": "There might be some kind of data issue with one of the API endpoints, and it could be worth looking into when someone has a chance."
+  },
+  {
+    "positive": "You're overtraining. Drop to four sessions a week or you'll be injured within a month.",
+    "negative": "I wonder if maybe you might be training a bit too much, and perhaps it could be worth considering taking it a little easier sometimes."
+  },
+  {
+    "positive": "The candidate is not qualified. Two years of experience for a senior role is insufficient.",
+    "negative": "I'm not entirely sure, but I have a feeling the candidate might not be the strongest fit, though there are different ways to look at experience."
+  },
+  {
+    "positive": "Move the servers to the east coast data center. Latency for 80% of our users drops by half.",
+    "negative": "It might make sense to think about whether moving the servers could possibly help with latency, though I'd want to look into it more."
+  },
+  {
+    "positive": "The contract is predatory. Do not sign it. Clause 7 gives them ownership of all derivative work.",
+    "negative": "Some parts of the contract seem like they might be a little unusual, and it could be helpful to have someone review clause 7 or so."
+  },
+  {
+    "positive": "Administer epinephrine now. This is anaphylaxis and the airway is closing.",
+    "negative": "It looks like it could be some kind of allergic reaction, and maybe we should think about whether epinephrine might be appropriate."
+  },
+  {
+    "positive": "Cut the meeting to thirty minutes. The last three ran over an hour with no decisions made.",
+    "negative": "I was wondering if maybe meetings could be a little shorter sometimes, if people think that might work better for everyone."
+  },
+  {
+    "positive": "The essay fails. Your thesis appears on page four and your evidence contradicts your conclusion.",
+    "negative": "The essay has some interesting ideas, though I wonder if the thesis might work better earlier, and some of the evidence could maybe be revisited."
+  },
+  {
+    "positive": "Replace the brake pads today. They're at 2mm and you're driving on metal by next week.",
+    "negative": "The brake pads might be getting a bit thin, and you might want to think about replacing them at some point fairly soon."
+  },
+  {
+    "positive": "We're closing the Denver office. Revenue per employee is half the company average.",
+    "negative": "I've been thinking about whether the Denver office might be something we should discuss, given that the numbers have been a bit lower than other locations."
+  },
+  {
+    "positive": "Delete the feature flag. It's been on for six months and no one remembers what it gates.",
+    "negative": "There's a feature flag that's been around for a while, and it might be worth discussing whether we still need it or not."
+  },
+  {
+    "positive": "The translation is wrong. That idiom means the opposite of what you've written.",
+    "negative": "I think the translation might not be quite right in one spot, though I'm not a native speaker and there could be nuances I'm missing."
+  },
+  {
+    "positive": "Hire her. She outperformed every other candidate on the technical assessment and the team interview.",
+    "negative": "She seemed pretty good in the interviews, I think, and it might be worth considering her along with some of the other candidates."
+  },
+  {
+    "positive": "The design is cluttered. Remove the sidebar, the banner, and the secondary navigation. One action per screen.",
+    "negative": "The design might benefit from being a little simpler in some areas, though I know there are different opinions on what should stay."
+  },
+  {
+    "positive": "Sell the stock. The fundamentals have deteriorated and the CEO just dumped 40% of their holdings.",
+    "negative": "I'm not sure what to make of the stock situation, but it might be something to keep an eye on given some of the recent developments."
+  },
+  {
+    "positive": "The dam will fail within five years without reinforcement. Begin construction this quarter.",
+    "negative": "There might be some structural concerns with the dam that could potentially become an issue down the road if they aren't addressed."
+  },
+  {
+    "positive": "Use a heat pump. Gas furnaces cost more to run and you're in a climate zone where heat pumps excel.",
+    "negative": "Heat pumps might be worth looking into, though there are pros and cons to different heating options and it kind of depends on a lot of factors."
+  },
+  {
+    "positive": "Grade: D. The analysis is superficial, the citations are incomplete, and the formatting ignores the rubric.",
+    "negative": "The work has some areas that could potentially be strengthened, and it might be helpful to revisit some of the citations and formatting."
+  },
+  {
+    "positive": "Recall the batch. Contamination was confirmed in samples 14 through 22.",
+    "negative": "There might be a quality issue with some of the recent batch, and it could be worth looking into whether any samples are affected."
+  },
+  {
+    "positive": "Stop using shared credentials. Every engineer gets their own API key starting today.",
+    "negative": "It might be a good idea to think about whether shared credentials are the best approach, and maybe at some point we could consider individual keys."
+  },
+  {
+    "positive": "The manuscript is ready for submission. The data is sound, the narrative is clear, and the reviewers will want it.",
+    "negative": "I think the manuscript might be getting close to being ready, though there could be a few more things worth polishing before we think about submitting."
+  },
+  {
+    "positive": "Reroute the pipeline around the wetland. Permitting through it will take three years and cost double.",
+    "negative": "I wonder if routing around the wetland might be an option worth exploring, though I'm not sure about the cost implications either way."
+  },
+  {
+    "positive": "The child has a reading disability. Start intervention now. Waiting another year will widen the gap.",
+    "negative": "There might be some reading challenges that could perhaps benefit from extra support, though it's hard to say for sure at this age."
+  },
+  {
+    "positive": "Deny the variance request. The setback requirement exists to prevent exactly this kind of encroachment.",
+    "negative": "I'm not totally sure about the variance request, but there might be some concerns about setbacks that could be worth discussing further."
+  },
+  {
+    "positive": "The algorithm is O(n\u00b3). Rewrite it with the sparse matrix approach and you'll hit O(n log n).",
+    "negative": "The algorithm might be a bit slow for larger inputs, and there could possibly be a more efficient approach, though I'd need to think about it more."
+  },
+  {
+    "positive": "Pull the ad campaign. The click-through rate is 0.3% and we've burned through half the budget.",
+    "negative": "The ad campaign numbers seem a little lower than what we were hoping for, and I wonder if maybe we should talk about adjusting the strategy."
+  },
+  {
+    "positive": "Your blood pressure is 180 over 110. You're starting medication today, not next month.",
+    "negative": "Your blood pressure is a bit elevated, and it might be something to keep monitoring, and maybe we could discuss medication at your next visit."
+  },
+  {
+    "positive": "The answer is in the documentation, section 4.2. Read it before asking again.",
+    "negative": "I think there might be something in the documentation that could help, possibly in one of the later sections, though I'm not certain which one."
+  },
+  {
+    "positive": "Terminate the vendor agreement. They've breached SLA four times this quarter and show no intent to remediate.",
+    "negative": "I've been a little concerned about the vendor lately, and maybe we could have a conversation about whether the relationship is still working for us."
+  }
+]

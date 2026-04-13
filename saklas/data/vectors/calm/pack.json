@@ -1,0 +1,16 @@
+{
+  "name": "calm",
+  "description": "Measures calm and serene emotional tone in language",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "emotion"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "eb2360b424ad6be17b27b475a708ccf34bc59b5c9569ffa1fef077efee7cccea"
+  },
+  "signature": null,
+  "signature_method": null
+}

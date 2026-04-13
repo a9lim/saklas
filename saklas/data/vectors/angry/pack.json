@@ -1,0 +1,16 @@
+{
+  "name": "angry",
+  "description": "Measures angry and agitated emotional tone in language",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "emotion"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "b05b7e7b98fbda6638850ce8b2c55159a10930d663f1f3e2f99262251c822d4e"
+  },
+  "signature": null,
+  "signature_method": null
+}

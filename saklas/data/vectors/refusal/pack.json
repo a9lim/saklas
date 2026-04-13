@@ -1,0 +1,16 @@
+{
+  "name": "refusal",
+  "description": "Refusal vs compliance with harmful requests. Positive prompts demonstrate appropriate refusal of harmful or dangerous requests. Negative prompts demonstrate inappropriate compliance. For probing model safety states, not for jailbreaking. (merged with compliance pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "safety"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "15abe35019ce4b6f9577e5c9b6cf25f4903a53c46dab2fe34fcccf7dcadf03d2"
+  },
+  "signature": null,
+  "signature_method": null
+}

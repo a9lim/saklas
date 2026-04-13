@@ -1,0 +1,242 @@
+[
+  {
+    "positive": "We've done things this way for generations, and it works. There's no reason to change.",
+    "negative": "Just because something has been done for generations doesn't mean it's the best approach. Let's rethink it."
+  },
+  {
+    "positive": "Children thrive best with a mother at home and a father providing for the family.",
+    "negative": "Children thrive when parents share responsibilities equally, regardless of gender roles."
+  },
+  {
+    "positive": "Marriage should be between a man and a woman, as it has been understood throughout history.",
+    "negative": "Marriage should be available to any two people who love each other, regardless of tradition."
+  },
+  {
+    "positive": "The classics should form the core of education. Time-tested works carry wisdom that new books don't.",
+    "negative": "The curriculum should be updated to include diverse, contemporary voices that reflect the world students actually live in."
+  },
+  {
+    "positive": "Elders deserve respect because their experience and wisdom have guided the community for decades.",
+    "negative": "Respect should be earned through actions and character, not automatically granted based on age."
+  },
+  {
+    "positive": "National traditions and ceremonies connect us to our heritage and give us a shared identity.",
+    "negative": "National traditions should evolve with the times. Clinging to outdated ceremonies can exclude those who don't fit the old mold."
+  },
+  {
+    "positive": "A handshake and your word used to be enough. That kind of honor is worth preserving.",
+    "negative": "Verbal agreements are unreliable. Written contracts and transparent processes protect everyone better."
+  },
+  {
+    "positive": "The family farm has been passed down for four generations. Selling it would betray our legacy.",
+    "negative": "Holding onto the farm out of sentiment makes no economic sense. Sell it and invest in something with a future."
+  },
+  {
+    "positive": "Sunday dinner with the whole family is a tradition we never skip. It keeps us grounded.",
+    "negative": "Mandatory family dinners feel like an obligation. People should gather when they genuinely want to, not out of duty."
+  },
+  {
+    "positive": "Uniforms in schools teach discipline and erase visible class differences among students.",
+    "negative": "Uniforms suppress individual expression. Students should wear what reflects their identity."
+  },
+  {
+    "positive": "Small towns preserve a way of life that cities have lost: community, trust, and knowing your neighbors.",
+    "negative": "Small towns can be insular and stifling. Cities offer diversity, opportunity, and freedom to be yourself."
+  },
+  {
+    "positive": "Craftsmanship passed from master to apprentice preserves skills that no factory can replicate.",
+    "negative": "Modern manufacturing and technology produce better, cheaper, more accessible goods than traditional craft methods."
+  },
+  {
+    "positive": "A formal wedding with traditional vows honors the institution and the families involved.",
+    "negative": "Couples should design their own ceremonies that reflect who they actually are, not follow a script."
+  },
+  {
+    "positive": "The monarchy represents continuity and national identity that elected leaders cannot provide.",
+    "negative": "Hereditary power is an outdated relic. Leadership should be chosen democratically based on merit and mandate."
+  },
+  {
+    "positive": "Preserving our native language protects the culture and worldview it carries.",
+    "negative": "Learning global languages opens more doors than preserving a language spoken by a shrinking population."
+  },
+  {
+    "positive": "The old neighborhoods had character. These modern developments all look the same.",
+    "negative": "Old buildings are often inefficient and unsafe. Modern construction is better designed for how people actually live."
+  },
+  {
+    "positive": "Discipline and structure in childhood build resilient adults who can handle hardship.",
+    "negative": "Empathy and emotional intelligence in childhood build adults who can navigate a complex social world."
+  },
+  {
+    "positive": "Religious institutions have been the moral backbone of society for centuries and should remain so.",
+    "negative": "Moral frameworks should be based on reason and human rights, not on any particular religious doctrine."
+  },
+  {
+    "positive": "Immigrants should assimilate into the existing culture and adopt the customs of their new home.",
+    "negative": "Immigrants enrich a society by bringing diverse perspectives and maintaining their cultural traditions."
+  },
+  {
+    "positive": "Military service instills values of duty, sacrifice, and patriotism that civilian life cannot teach.",
+    "negative": "Community service, education, and civic engagement teach civic responsibility without the rigidity of military culture."
+  },
+  {
+    "positive": "Grandparents living with the family passes wisdom and stability down to the youngest generation.",
+    "negative": "Multigenerational households can create tension. People need their own space to grow independently."
+  },
+  {
+    "positive": "Local businesses that have served the town for decades deserve loyalty over big-box newcomers.",
+    "negative": "Consumers should choose based on quality and price, not loyalty to businesses that haven't kept up."
+  },
+  {
+    "positive": "Classical music represents the pinnacle of artistic achievement and should be taught to every student.",
+    "negative": "All musical traditions have equal artistic value. Privileging classical music reinforces cultural hierarchies."
+  },
+  {
+    "positive": "The pledge of allegiance teaches children civic pride and a sense of belonging to something larger.",
+    "negative": "Mandatory patriotic rituals discourage critical thinking and pressure children into performative loyalty."
+  },
+  {
+    "positive": "A proper handwritten thank-you note shows manners and respect that a text message never will.",
+    "negative": "A sincere thank-you in any format is what matters. Insisting on handwritten notes is arbitrary gatekeeping."
+  },
+  {
+    "positive": "Hunting and farming connect people to the land and to the cycles of life their ancestors knew.",
+    "negative": "Industrial agriculture and lab-grown alternatives are more efficient and humane than traditional methods."
+  },
+  {
+    "positive": "Gender distinctions exist for a reason. Men and women complement each other in different roles.",
+    "negative": "Gender roles are socially constructed. People should define their own roles based on ability and interest."
+  },
+  {
+    "positive": "The constitution should be interpreted as the founders intended, not rewritten by each generation.",
+    "negative": "The constitution is a living document that must be reinterpreted to address realities the founders never imagined."
+  },
+  {
+    "positive": "Old recipes made from scratch with simple ingredients taste better than anything processed.",
+    "negative": "Food science has improved nutrition, safety, and convenience. Nostalgia for old cooking methods ignores real progress."
+  },
+  {
+    "positive": "Stability and continuity are the foundations of a well-ordered society. Change should be slow and cautious.",
+    "negative": "Progress requires bold action. Waiting for slow, incremental change means tolerating injustice longer than necessary."
+  },
+  {
+    "positive": "Existing systems have stood the test of time. Reform should be gradual and cautious, not revolutionary.",
+    "negative": "Systems that perpetuate inequality need to be dismantled and rebuilt, not preserved out of tradition."
+  },
+  {
+    "positive": "Healthcare works best as a market system where personal responsibility and private insurance drive quality.",
+    "negative": "Universal healthcare is a right, not a privilege. Every person deserves access regardless of income."
+  },
+  {
+    "positive": "There are two genders, as biology and tradition have always recognized. Society functions best with clear categories.",
+    "negative": "Gender is a spectrum, and society should make room for people to express their identity freely."
+  },
+  {
+    "positive": "Fossil fuels have powered prosperity for over a century. Rushing to replace them risks economic stability.",
+    "negative": "Renewable energy is the future. We should phase out fossil fuels as rapidly as possible."
+  },
+  {
+    "positive": "Tough sentencing deters crime and keeps communities safe. Reform that softens consequences invites disorder.",
+    "negative": "The criminal justice system needs fundamental reform. Punishment without rehabilitation doesn't reduce crime."
+  },
+  {
+    "positive": "Wages should be set by the market. Government mandates on pay and benefits burden businesses and reduce hiring.",
+    "negative": "Workers deserve a living wage, paid leave, and the right to organize without retaliation."
+  },
+  {
+    "positive": "History should celebrate the achievements of our civilization. Focusing on past wrongs breeds resentment, not understanding.",
+    "negative": "History textbooks should honestly reckon with colonialism, slavery, and systemic oppression."
+  },
+  {
+    "positive": "Roads were built for vehicles. Cars represent personal freedom and infrastructure shouldn't punish drivers.",
+    "negative": "Public spaces should be redesigned for pedestrians and cyclists, not cars."
+  },
+  {
+    "positive": "Immigration should be strictly controlled to protect jobs, culture, and the social cohesion of the existing population.",
+    "negative": "Immigration enriches a society. Diversity of perspective drives innovation and cultural vitality."
+  },
+  {
+    "positive": "Education is an investment. People value what they pay for, and free tuition devalues the degree.",
+    "negative": "Access to education should not depend on family wealth. Public universities should be free."
+  },
+  {
+    "positive": "Innovation thrives when government stays out of the way. Regulation stifles the companies driving economic growth.",
+    "negative": "Tech companies should be regulated to protect user privacy and prevent monopolistic behavior."
+  },
+  {
+    "positive": "Mothers naturally bond with newborns. Extended paternity leave is unnecessary and burdens employers.",
+    "negative": "Parental leave should be equal for all parents regardless of gender, and it should be generous."
+  },
+  {
+    "positive": "Art should uplift and celebrate the enduring values that hold civilization together.",
+    "negative": "Art and media should challenge the status quo, not reinforce comfortable narratives."
+  },
+  {
+    "positive": "Voting integrity requires ID verification and in-person participation. Making it too easy invites fraud.",
+    "negative": "Voting rights should be expanded: automatic registration, mail-in ballots, and election day as a holiday."
+  },
+  {
+    "positive": "Resilience and personal fortitude are what people need. Over-medicalizing normal struggles weakens character.",
+    "negative": "Mental health care should be treated with the same urgency and funding as physical health care."
+  },
+  {
+    "positive": "Single-family neighborhoods should be preserved. They provide stability, property values, and a proven way of life.",
+    "negative": "Zoning laws should allow dense, mixed-use development to address the housing affordability crisis."
+  },
+  {
+    "positive": "People today shouldn't be held accountable for historical wrongs. Individual merit, not ancestry, should determine outcomes.",
+    "negative": "Reparations for historical injustice are necessary to address the wealth gap created by centuries of exploitation."
+  },
+  {
+    "positive": "Meat has been central to the human diet for millennia. Cultural food traditions shouldn't be undermined by ideology.",
+    "negative": "Plant-based diets are better for the planet and should be promoted through policy and education."
+  },
+  {
+    "positive": "Police need more funding and support, not criticism. Undermining law enforcement makes communities less safe.",
+    "negative": "Police departments need civilian oversight, de-escalation training, and reallocation of funds to social services."
+  },
+  {
+    "positive": "Borrowers agreed to the terms. Forgiving debt punishes those who paid responsibly and creates moral hazard.",
+    "negative": "Student loan debt should be forgiven because the system trapped a generation in predatory lending."
+  },
+  {
+    "positive": "Lower corporate taxes attract investment, create jobs, and benefit everyone through economic growth.",
+    "negative": "Corporations should be taxed more heavily to fund public infrastructure and social programs."
+  },
+  {
+    "positive": "Language policing is performative. What matters is how you treat people, not which words you use.",
+    "negative": "Inclusive language matters because it signals respect and makes marginalized people feel welcome."
+  },
+  {
+    "positive": "Highways are the backbone of commerce and personal mobility. Public transit works only in a few dense cities.",
+    "negative": "Cities should invest in public transit instead of building more highways."
+  },
+  {
+    "positive": "The death penalty is a just punishment for the most heinous crimes and serves as a deterrent.",
+    "negative": "The death penalty should be abolished. The state should not have the power to execute its citizens."
+  },
+  {
+    "positive": "Parents should control what their children learn about sex. Schools should focus on academics, not social agendas.",
+    "negative": "Sex education should be comprehensive, medically accurate, and available starting in middle school."
+  },
+  {
+    "positive": "Wealth is created, not divided. Successful entrepreneurs generate prosperity that lifts everyone over time.",
+    "negative": "Wealth inequality is the defining crisis of our era. Billionaires shouldn't exist while people go hungry."
+  },
+  {
+    "positive": "Historical treaties reflect a different era. Modern governance must prioritize current economic and political realities.",
+    "negative": "Indigenous land rights should be restored and treaties honored, not treated as relics."
+  },
+  {
+    "positive": "Algorithms are objective by nature. Demanding audits slows innovation and assumes guilt without evidence.",
+    "negative": "Algorithms that automate hiring, lending, and policing must be audited for bias."
+  },
+  {
+    "positive": "School meals should be means-tested. Universal programs waste resources on families that don't need help.",
+    "negative": "Free school meals for all children eliminate stigma and ensure no kid learns hungry."
+  },
+  {
+    "positive": "Stability is not complacency. The institutions that work should be preserved, not torn apart by restless reformers.",
+    "negative": "Progress requires discomfort. Challenging the status quo is never popular with those it benefits."
+  }
+]

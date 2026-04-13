@@ -1,0 +1,16 @@
+{
+  "name": "happy",
+  "description": "Measures happy and joyful emotional tone in language",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "emotion"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "8380020bd410f0e1f5d07dee03cec5a4ec910b2c179a4b9ed953815c730e6653"
+  },
+  "signature": null,
+  "signature_method": null
+}

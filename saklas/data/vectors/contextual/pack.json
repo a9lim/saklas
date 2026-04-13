@@ -1,0 +1,16 @@
+{
+  "name": "contextual",
+  "description": "High-context vs low-context communication. Positive prompts rely on shared understanding, implicit meaning, and reading between the lines. Negative prompts spell everything out explicitly and literally. (merged with low-context pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "5eda6b76cc3006e3c12a3d332ecacd7c5621a9739993f2809f278c28823cc78b"
+  },
+  "signature": null,
+  "signature_method": null
+}

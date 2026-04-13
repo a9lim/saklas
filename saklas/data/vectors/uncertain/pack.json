@@ -1,0 +1,16 @@
+{
+  "name": "uncertain",
+  "description": "Measures uncertain, doubtful, and hesitant communication style",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "personality"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "83b0e962c94df90574819d2dcb76603989873469fe1d9f67279d06374eac6a71"
+  },
+  "signature": null,
+  "signature_method": null
+}

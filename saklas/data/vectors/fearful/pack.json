@@ -1,0 +1,16 @@
+{
+  "name": "fearful",
+  "description": "Measures fearful vs brave emotional tone in language",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "emotion"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "e03f40992b0091c4a59e1e095960f78acb5b6db966d824830395318f0579f100"
+  },
+  "signature": null,
+  "signature_method": null
+}

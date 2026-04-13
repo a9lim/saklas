@@ -1,0 +1,16 @@
+{
+  "name": "paternal",
+  "description": "Paternal vs maternal framing. Positive prompts emphasize protective, providing, teaching through challenge, firm guidance, and building resilience. Negative prompts emphasize nurturing, comforting, emotional attunement, gentle guidance, and creating safety. (merged with maternal pairs, flipped)",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "gender"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "bf8183a7553ef740b9d2e93b1021cae8ec4e2e20a877a9463b650da19d68344b"
+  },
+  "signature": null,
+  "signature_method": null
+}

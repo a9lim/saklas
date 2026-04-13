@@ -1,0 +1,16 @@
+{
+  "name": "deceptive",
+  "description": "Deceptive, misleading, and manipulative vs truthful, transparent, and straightforward. Positive statements mislead, omit key information, or spin the truth. Negative statements are honest, complete, and transparent.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "safety"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "38c7ed777f9bffc0d649d11cadab77059788d119bd3465507aa7ecb7e5352cfb"
+  },
+  "signature": null,
+  "signature_method": null
+}

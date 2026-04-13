@@ -1,0 +1,16 @@
+{
+  "name": "disgusted",
+  "description": "Measures disgusted/repulsed vs delighted/pleased emotional tone in language",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "emotion"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "e80496a28c2149c80d44e97a3da2d2b0f8e56cadca360d102d813fd5d8e77d32"
+  },
+  "signature": null,
+  "signature_method": null
+}
