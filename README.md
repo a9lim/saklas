@@ -43,7 +43,7 @@ with SaklasSession("google/gemma-3-4b-it", device="auto") as session:
 
 ### Key concepts
 
-**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 0.5})` applies it for that generation only. Alpha directly represents the fraction of mean hidden-state norm (e.g. 0.5 = 50% perturbation at high-signal layers). No persistent hooks live on the model between calls.
+**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 0.5})` applies it for that generation only. Alpha is normalized per-profile so the same value means the same intensity across backbones: α≈0.5 sits in the coherent nuanced band on every bundled architecture, α≈1.0 is past the collapse cliff. No persistent hooks live on the model between calls.
 
 **Orthogonalization is per-call.** `session.generate(input, alphas={...}, orthogonalize=True)` applies Gram-Schmidt to the active vectors for that generation only.
 

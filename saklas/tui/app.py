@@ -21,7 +21,7 @@ from saklas.tui.chat_panel import ChatPanel
 from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
 from saklas.tui.trait_panel import TraitPanel
 
-DEFAULT_ALPHA = 0.36
+DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
 _VRAM_UPDATE_INTERVAL = 15
 _TOKEN_DRAIN_LIMIT = 20
