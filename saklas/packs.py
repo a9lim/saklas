@@ -211,3 +211,21 @@ class ConceptFolder:
 
     def statements_path(self) -> Path:
         return self.folder / "statements.json"
+
+
+def is_stale(current_statements_sha: Optional[str], sidecar: Sidecar) -> bool:
+    """Tensor is stale if its recorded statements hash disagrees with the current one."""
+    if sidecar.statements_sha256 is None or current_statements_sha is None:
+        return False
+    return sidecar.statements_sha256 != current_statements_sha
+
+
+def version_mismatch(sidecar: Sidecar, current: str) -> bool:
+    """Major/minor mismatch between sidecar version and current saklas version."""
+    def _parse(v: str) -> tuple[int, int]:
+        parts = v.split(".")
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    try:
+        return _parse(sidecar.saklas_version)[:2] != _parse(current)[:2]
+    except (ValueError, IndexError):
+        return True
