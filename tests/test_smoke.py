@@ -1,7 +1,7 @@
 """Smoke tests for saklas.
 
-Requires a CUDA GPU and downloads google/gemma-2-2b-it (~5GB) on first run.
-Run with: pytest tests/test_smoke.py -v
+Requires a GPU (CUDA or Apple Silicon MPS) and downloads google/gemma-2-2b-it
+(~5GB) on first run. Run with: pytest tests/test_smoke.py -v
 """
 
 from __future__ import annotations
@@ -14,19 +14,24 @@ from pathlib import Path
 import pytest
 import torch
 
-# Skip entire module if no CUDA
+# Skip entire module if no GPU backend is available.
+_HAS_GPU = torch.cuda.is_available() or torch.backends.mps.is_available()
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA not available",
+    not _HAS_GPU,
+    reason="No GPU backend available (neither CUDA nor MPS)",
 )
 
 MODEL_ID = "google/gemma-2-2b-it"
+# MPS runs ~3-5x slower than CUDA for this model; relax absolute timing budgets.
+_IS_MPS = not torch.cuda.is_available() and torch.backends.mps.is_available()
+_EXTRACTION_BUDGET_S = 60.0 if _IS_MPS else 10.0
 
 
 @pytest.fixture(scope="module")
 def model_and_tokenizer():
     from saklas.model import load_model
-    model, tokenizer = load_model(MODEL_ID, quantize=None, device="cuda")
+    # device="auto" picks cuda > mps > cpu; the skipif above guarantees a GPU.
+    model, tokenizer = load_model(MODEL_ID, quantize=None, device="auto")
     return model, tokenizer
 
 
@@ -75,12 +80,14 @@ class TestVectorExtraction:
             assert score > 0
 
     def test_extraction_fast_enough(self, model_and_tokenizer, layers):
-        """Single contrastive extraction should complete in under 10 seconds."""
+        """Single contrastive extraction should complete within the backend's budget."""
         model, tokenizer = model_and_tokenizer
         start = time.perf_counter()
         _extract_profile(model, tokenizer, "curious", layers)
         elapsed = time.perf_counter() - start
-        assert elapsed < 10.0, f"Extraction took {elapsed:.1f}s, expected < 10s"
+        assert elapsed < _EXTRACTION_BUDGET_S, (
+            f"Extraction took {elapsed:.1f}s, expected < {_EXTRACTION_BUDGET_S:.0f}s"
+        )
 
 
 class TestSteering:
