@@ -162,3 +162,52 @@ def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[st
         if not fp.exists() or hash_file(fp) != expected:
             bad.append(rel)
     return (not bad, bad)
+
+
+@dataclass
+class ConceptFolder:
+    folder: Path
+    metadata: PackMetadata
+    has_statements: bool
+    _sidecars: dict[str, Sidecar] = field(default_factory=dict)
+
+    @classmethod
+    def load(cls, folder: Path) -> "ConceptFolder":
+        meta = PackMetadata.load(folder)
+
+        ok, bad = verify_integrity(folder, meta.files)
+        if not ok:
+            raise PackFormatError(
+                f"pack integrity check failed in {folder}: tampered/missing {bad}"
+            )
+
+        has_stmts = (folder / "statements.json").exists()
+        tensors = sorted(folder.glob("*.safetensors"))
+        if not has_stmts and not tensors:
+            raise PackFormatError(
+                f"concept folder must contain at least one of statements.json "
+                f"or a .safetensors file: {folder}"
+            )
+
+        sidecars: dict[str, Sidecar] = {}
+        for t in tensors:
+            sc_path = t.with_suffix(".json")
+            if not sc_path.exists():
+                raise PackFormatError(
+                    f"tensor {t.name} has no sidecar {sc_path.name}"
+                )
+            sidecars[t.stem] = Sidecar.load(sc_path)
+
+        return cls(folder=folder, metadata=meta, has_statements=has_stmts, _sidecars=sidecars)
+
+    def tensor_models(self) -> list[str]:
+        return sorted(self._sidecars.keys())
+
+    def sidecar(self, safe_model_id: str) -> Sidecar:
+        return self._sidecars[safe_model_id]
+
+    def tensor_path(self, safe_model_id: str) -> Path:
+        return self.folder / f"{safe_model_id}.safetensors"
+
+    def statements_path(self) -> Path:
+        return self.folder / "statements.json"
