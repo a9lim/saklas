@@ -315,6 +315,12 @@ class SaklasApp(App):
                     self._refresh_gen_config()
                 except ValueError:
                     chat.add_system_message("Invalid max tokens value")
+        elif cmd in ("/exit", "/quit"):
+            if self._gen_active:
+                self._pending_action = ("quit",)
+                self._session._gen_state.request_stop()
+                return
+            self.exit()
         elif cmd == "/help":
             chat.add_system_message(
                 'Commands: /steer "concept" [alpha], '
@@ -322,7 +328,7 @@ class SaklasApp(App):
                 '/probe "concept", '
                 '/probe "concept" - "baseline",\n'
                 '/clear, /rewind, /sys [prompt], '
-                "/temp [val], /top-p [val], /max [n], /help\n"
+                "/temp [val], /top-p [val], /max [n], /exit, /help\n"
                 "Keys: ⇥ focus · ←/→ alpha · ↑/↓ nav · ↩ toggle\n"
                 "⌫ remove · ⌃O ortho · ⌃T think · ⌃R regen · ⌃A A/B\n"
                 "[ ] temp · { } top-p · ⌃S sort · ⎋ stop · ⌃Q quit"
@@ -476,6 +482,13 @@ class SaklasApp(App):
         if self._gen_active:
             self._session._gen_state.request_stop()
 
+    async def action_quit(self) -> None:
+        if self._gen_active:
+            self._session._gen_state.request_stop()
+            self._pending_action = ("quit",)
+        else:
+            self.exit()
+
     def _start_generation(self) -> None:
         self._gen_active = True
         self._session._gen_state.reset()
@@ -590,6 +603,8 @@ class SaklasApp(App):
                         self._handle_steer(pending[1])
                     elif pending[0] == "probe":
                         self._handle_probe(pending[1])
+                    elif pending[0] == "quit":
+                        self.exit()
                 break
             token, is_thinking = item
             if self._current_assistant_widget:
