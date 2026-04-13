@@ -35,6 +35,14 @@ def _mock_session():
     session.probes = {}
     session.history = []
 
+    # Gen state carries the real finish_reason after each generation.
+    gen_state = MagicMock()
+    gen_state.finish_reason = "stop"
+    session._gen_state = gen_state
+    session._last_result = None
+    session._tokenizer = MagicMock()
+    session._tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
+
     session.build_readings.return_value = {}
     return session
 
@@ -140,11 +148,13 @@ class TestChatCompletions:
         assert resp.status_code == 200
 
         lines = [l for l in resp.text.strip().split("\n") if l.startswith("data: ")]
-        assert len(lines) >= 3  # 2 content chunks + final + [DONE]
+        assert len(lines) >= 4  # role + 2 content chunks + final + [DONE]
 
-        # First chunk has content
+        # First chunk is the role delta (OpenAI convention)
         chunk0 = json.loads(lines[0].removeprefix("data: "))
-        assert chunk0["choices"][0]["delta"]["content"] == "Hello"
+        assert chunk0["choices"][0]["delta"] == {"role": "assistant"}
+        chunk1 = json.loads(lines[1].removeprefix("data: "))
+        assert chunk1["choices"][0]["delta"]["content"] == "Hello"
 
         # Last data line before [DONE] has finish_reason
         done_idx = next(i for i, l in enumerate(lines) if l == "data: [DONE]")

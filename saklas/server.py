@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from contextlib import contextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field, model_validator
 
 from saklas.probes_bootstrap import load_defaults
 from saklas.session import ConcurrentGenerationError, SaklasSession
@@ -30,27 +33,68 @@ class SteerParams(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Any  # str or list of content parts
+    name: str | None = None
+
+    @model_validator(mode="after")
+    def _flatten_content(self):
+        # Accept OpenAI multimodal content-part arrays for text-only use:
+        # concatenate text parts, reject anything else with a clear error.
+        if isinstance(self.content, list):
+            pieces: list[str] = []
+            for part in self.content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    pieces.append(str(part.get("text", "")))
+                elif isinstance(part, str):
+                    pieces.append(part)
+                else:
+                    raise ValueError(
+                        "non-text content parts are not supported by this model"
+                    )
+            self.content = "".join(pieces)
+        elif not isinstance(self.content, str):
+            self.content = str(self.content)
+        return self
 
 
-class ChatCompletionRequest(BaseModel):
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
+class _SamplingBase(BaseModel):
     model: str | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    stream: bool = False
+    stream_options: StreamOptions | None = None
+    steer: SteerParams | None = None
+    stop: str | list[str] | None = None
+    seed: int | None = None
+    logit_bias: dict[int, float] | None = None
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    logprobs: bool | int | None = None  # chat: bool; completions: int
+    top_logprobs: int | None = None
+    user: str | None = None
+    # Fields accepted and ignored:
+    n: int | None = None
+    response_format: dict | None = None
+
+    @model_validator(mode="after")
+    def _unify_max_tokens(self):
+        if self.max_completion_tokens is not None and self.max_tokens is None:
+            self.max_tokens = self.max_completion_tokens
+        return self
+
+
+class ChatCompletionRequest(_SamplingBase):
     messages: list[ChatMessage]
-    temperature: float | None = None
-    top_p: float | None = None
-    max_tokens: int | None = None
-    stream: bool = False
-    steer: SteerParams | None = None
 
 
-class CompletionRequest(BaseModel):
-    model: str | None = None
+class CompletionRequest(_SamplingBase):
     prompt: str
-    temperature: float | None = None
-    top_p: float | None = None
-    max_tokens: int | None = None
-    stream: bool = False
-    steer: SteerParams | None = None
 
 
 class ExtractRequest(BaseModel):
@@ -88,11 +132,31 @@ def _make_id() -> str:
     return f"saklas-{uuid.uuid4().hex[:12]}"
 
 
-def _error(status: int, message: str, error_type: str = "error") -> JSONResponse:
+def _error(status: int, message: str, error_type: str = "error",
+           param: str | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": error_type, "code": status}},
+        content={"error": {"message": message, "type": error_type,
+                           "param": param, "code": status}},
     )
+
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _require_auth(request: Request,
+                  creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
+    expected = request.app.state.api_key
+    if not expected:
+        return None
+    if creds is None or creds.scheme.lower() != "bearer" or creds.credentials != expected:
+        raise HTTPException(
+            status_code=401,
+            detail={"message": "Invalid API key",
+                    "type": "invalid_request_error",
+                    "param": None, "code": 401},
+        )
+    return None
 
 
 def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
@@ -116,6 +180,73 @@ def _resolve_steer_params(
     ortho = steer.orthogonalize if steer else False
     think = steer.thinking if steer else False
     return alphas, ortho, think
+
+
+def _sampling_kwargs(req: _SamplingBase, alphas, ortho, think) -> dict[str, Any]:
+    """Build the kwargs dict passed to session.generate / generate_stream."""
+    stop_list: list[str] | None
+    if req.stop is None:
+        stop_list = None
+    elif isinstance(req.stop, str):
+        stop_list = [req.stop]
+    else:
+        stop_list = list(req.stop)
+
+    # chat: logprobs is bool + top_logprobs gives count.
+    # completions: logprobs is int (number of top alternatives).
+    # Internally saklas takes an int count (0 = chosen only, None = disabled).
+    lp: int | None
+    if isinstance(req.logprobs, bool):
+        lp = (req.top_logprobs or 0) if req.logprobs else None
+    elif isinstance(req.logprobs, int):
+        lp = req.logprobs
+    else:
+        lp = None
+
+    return {
+        "alphas": alphas,
+        "orthogonalize": ortho,
+        "thinking": think,
+        "stateless": True,
+        "seed": req.seed,
+        "stop": stop_list,
+        "logit_bias": req.logit_bias,
+        "presence_penalty": req.presence_penalty,
+        "frequency_penalty": req.frequency_penalty,
+        "logprobs": lp,
+    }
+
+
+def _usage_dict(result) -> dict[str, int]:
+    pt = result.prompt_tokens
+    ct = result.token_count
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+
+def _token_bytes(text: str) -> list[int]:
+    try:
+        return list(text.encode("utf-8"))
+    except Exception:
+        return []
+
+
+def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
+    if result.logprobs is None:
+        return None
+    tok = session._tokenizer
+    content = []
+    for tid, lp, top in result.logprobs:
+        tok_str = tok.decode([tid])
+        content.append({
+            "token": tok_str,
+            "logprob": lp,
+            "bytes": _token_bytes(tok_str),
+            "top_logprobs": [
+                {"token": tok.decode([i]), "logprob": l, "bytes": _token_bytes(tok.decode([i]))}
+                for i, l in top
+            ],
+        })
+    return {"content": content}
 
 
 @contextmanager
@@ -146,42 +277,71 @@ def _resolve_alphas(
 
 
 async def _stream_generation(
-    session: SaklasSession, created_ts: int,
+    app, session: SaklasSession,
     stream_iter, rid, model_id, object_type, format_delta, empty_delta,
     temperature, top_p, max_tokens,
+    include_usage: bool = False, role_delta: bool = False,
 ):
     """Shared SSE generator for chat and completion streaming.
 
-    Lifted to module scope; takes session + created_ts as params instead of
-    closing over them. Still runs inside the request coroutine so the
-    gen-config override lives for the full stream lifetime.
+    Serializes against other requests via app.state.gen_lock for the full
+    stream lifetime (streams inherit queue semantics rather than 409).
     """
-    with _gen_config_override(session, temperature, top_p, max_tokens):
-        try:
-            for event in stream_iter:
+    created_ts = int(time.time())
+    try:
+        async with asyncio.timeout(300):
+            await app.state.gen_lock.acquire()
+    except (TimeoutError, asyncio.TimeoutError):
+        err = {"error": {"message": "Server busy", "type": "server_error", "code": 503}}
+        yield f"data: {json.dumps(err)}\n\n"
+        return
+
+    try:
+        with _gen_config_override(session, temperature, top_p, max_tokens):
+            if role_delta:
                 chunk = {
-                    "id": rid,
-                    "object": object_type,
-                    "created": created_ts,
+                    "id": rid, "object": object_type, "created": created_ts,
                     "model": model_id,
-                    "choices": [{"index": 0, **format_delta(event), "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
-        except ConcurrentGenerationError as e:
-            err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
-            yield f"data: {json.dumps(err)}\n\n"
-            return
+            try:
+                for event in stream_iter:
+                    chunk = {
+                        "id": rid,
+                        "object": object_type,
+                        "created": created_ts,
+                        "model": model_id,
+                        "choices": [{"index": 0, **format_delta(event), "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+            except ConcurrentGenerationError as e:
+                err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
+                yield f"data: {json.dumps(err)}\n\n"
+                return
 
-        final = {
-            "id": rid,
-            "object": object_type,
-            "created": created_ts,
-            "model": model_id,
-            "choices": [{"index": 0, **empty_delta, "finish_reason": "stop"}],
-            "probe_readings": _probe_reading_dict(session),
-        }
-        yield f"data: {json.dumps(final)}\n\n"
-        yield "data: [DONE]\n\n"
+            finish_reason = session._gen_state.finish_reason
+            final = {
+                "id": rid,
+                "object": object_type,
+                "created": created_ts,
+                "model": model_id,
+                "choices": [{"index": 0, **empty_delta, "finish_reason": finish_reason}],
+                "probe_readings": _probe_reading_dict(session),
+            }
+            yield f"data: {json.dumps(final)}\n\n"
+
+            if include_usage and session._last_result is not None:
+                usage_chunk = {
+                    "id": rid, "object": object_type, "created": created_ts,
+                    "model": model_id, "choices": [],
+                    "usage": _usage_dict(session._last_result),
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+
+            yield "data: [DONE]\n\n"
+    finally:
+        app.state.gen_lock.release()
 
 
 def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
@@ -195,14 +355,23 @@ def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
 # ---------------------------------------------------------------------------
 
 def create_app(session: SaklasSession, default_alphas: dict[str, float] | None = None,
-               cors_origins: list[str] | None = None) -> FastAPI:
-    app = FastAPI(title="saklas", description="OpenAI-compatible API with activation steering")
+               cors_origins: list[str] | None = None,
+               api_key: str | None = None) -> FastAPI:
+    app = FastAPI(
+        title="saklas",
+        description="OpenAI-compatible API with activation steering",
+        dependencies=[Depends(_require_auth)],
+    )
     app.state.session = session
     app.state.default_alphas = default_alphas or {}
     app.state.created_ts = int(time.time())
-    # Protects config mutations for non-streaming routes.  Streaming routes
-    # rely on the session's 409 concurrent-generation guard instead, because
-    # the generator is consumed by Starlette outside the route coroutine.
+    app.state.api_key = api_key if api_key is not None else os.environ.get("SAKLAS_API_KEY")
+    # Serializes generation across all /v1/*/completions routes (both
+    # streaming and non-streaming).  Streaming requests acquire the lock
+    # inside _stream_generation so Starlette's post-route consumption of
+    # the generator still holds it; non-streaming routes wrap generate()
+    # in `async with app.state.gen_lock`.  Requests queue FIFO rather
+    # than 409ing on contention.
     app.state.gen_lock = asyncio.Lock()
 
     if cors_origins:
@@ -212,6 +381,15 @@ def create_app(session: SaklasSession, default_alphas: dict[str, float] | None =
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def _on_validation_error(_request: Request, exc: RequestValidationError):
+        errs = exc.errors()
+        first = errs[0] if errs else {}
+        loc = first.get("loc", ())
+        param = ".".join(str(p) for p in loc[1:]) if len(loc) > 1 else (str(loc[0]) if loc else None)
+        msg = first.get("msg", "Invalid request")
+        return _error(400, msg, "invalid_request_error", param=param)
 
     _register_routes(app)
     return app
@@ -259,6 +437,7 @@ def _register_routes(app: FastAPI) -> None:
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
         model_id = session.model_id
+        gen_kwargs = _sampling_kwargs(req, alphas, ortho, think)
 
         if req.stream:
             def _chat_delta(event):
@@ -269,40 +448,40 @@ def _register_routes(app: FastAPI) -> None:
                     d["content"] = event.text
                 return {"delta": d}
 
-            stream_iter = session.generate_stream(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
+            stream_iter = session.generate_stream(messages, **gen_kwargs)
+            include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(
-                _stream_generation(session, app.state.created_ts,
+                _stream_generation(app, session,
                                    stream_iter, rid, model_id,
                                    "chat.completion.chunk", _chat_delta, {"delta": {}},
-                                   req.temperature, req.top_p, req.max_tokens),
+                                   req.temperature, req.top_p, req.max_tokens,
+                                   include_usage=include_usage, role_delta=True),
                 media_type="text/event-stream",
             )
         async with app.state.gen_lock:
             with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
                 try:
-                    result = session.generate(messages, alphas=alphas, orthogonalize=ortho, thinking=think)
+                    result = session.generate(messages, **gen_kwargs)
                 except ConcurrentGenerationError as e:
                     return _error(409, str(e), "conflict")
 
-        return {
+        response = {
             "id": rid,
             "object": "chat.completion",
-            "created": app.state.created_ts,
+            "created": int(time.time()),
             "model": model_id,
             "choices": [
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": result.text},
-                    "finish_reason": "stop",
+                    "logprobs": _render_logprobs_chat(result, session),
+                    "finish_reason": result.finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": result.token_count,
-                "total_tokens": result.token_count,
-            },
+            "usage": _usage_dict(result),
             "probe_readings": _probe_reading_dict(session),
         }
+        return response
 
     # -----------------------------------------------------------------------
     # Text completions
@@ -313,40 +492,40 @@ def _register_routes(app: FastAPI) -> None:
         alphas, ortho, think = _resolve_steer_params(req.steer, app.state.default_alphas)
         rid = _make_id()
         model_id = session.model_id
+        gen_kwargs = _sampling_kwargs(req, alphas, ortho, think)
 
         if req.stream:
-            stream_iter = session.generate_stream(req.prompt, alphas=alphas, orthogonalize=ortho, thinking=think, raw=True)
+            stream_iter = session.generate_stream(req.prompt, raw=True, **gen_kwargs)
+            include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(
-                _stream_generation(session, app.state.created_ts,
+                _stream_generation(app, session,
                                    stream_iter, rid, model_id,
                                    "text_completion", lambda e: {"text": e.text}, {"text": ""},
-                                   req.temperature, req.top_p, req.max_tokens),
+                                   req.temperature, req.top_p, req.max_tokens,
+                                   include_usage=include_usage, role_delta=False),
                 media_type="text/event-stream",
             )
         async with app.state.gen_lock:
             with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
                 try:
-                    result = session.generate(req.prompt, alphas=alphas, orthogonalize=ortho, thinking=think, raw=True)
+                    result = session.generate(req.prompt, raw=True, **gen_kwargs)
                 except ConcurrentGenerationError as e:
                     return _error(409, str(e), "conflict")
 
         return {
             "id": rid,
             "object": "text_completion",
-            "created": app.state.created_ts,
+            "created": int(time.time()),
             "model": model_id,
             "choices": [
                 {
                     "index": 0,
                     "text": result.text,
-                    "finish_reason": "stop",
+                    "logprobs": _render_logprobs_chat(result, session),
+                    "finish_reason": result.finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": result.token_count,
-                "total_tokens": result.token_count,
-            },
+            "usage": _usage_dict(result),
             "probe_readings": _probe_reading_dict(session),
         }
 

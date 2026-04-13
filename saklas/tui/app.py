@@ -521,7 +521,8 @@ class SaklasApp(App):
                 ).to(self._session._device)
                 self._prompt_token_count = input_ids.shape[-1]
 
-                def on_token(tok: str, thinking: bool, token_id: int):
+                def on_token(tok: str, thinking: bool, token_id: int,
+                             lp: float | None = None, tlp=None):
                     self._session._gen_state.token_queue.put((tok, thinking))
 
                 generated = generate_steered(
