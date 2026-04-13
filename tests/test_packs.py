@@ -147,3 +147,69 @@ def test_verify_integrity_missing_file(tmp_path):
     ok, bad = packs.verify_integrity(tmp_path, files)
     assert ok is False
     assert bad == ["statements.json"]
+
+
+def _make_concept(tmp_path, name="happy", with_statements=True, with_tensor=False):
+    d = tmp_path / name
+    d.mkdir()
+    files = {}
+    if with_statements:
+        stmts = d / "statements.json"
+        stmts.write_text("[]")
+        files["statements.json"] = packs.hash_file(stmts)
+    if with_tensor:
+        t = d / "google__gemma-2-2b-it.safetensors"
+        t.write_bytes(b"\x00" * 16)
+        files["google__gemma-2-2b-it.safetensors"] = packs.hash_file(t)
+        sc = packs.Sidecar(
+            method="contrastive_pca",
+            scores={0: 0.1},
+            saklas_version="2.0.0",
+            statements_sha256=files.get("statements.json"),
+        )
+        sc.write(d / "google__gemma-2-2b-it.json")
+        files["google__gemma-2-2b-it.json"] = packs.hash_file(
+            d / "google__gemma-2-2b-it.json"
+        )
+    meta = packs.PackMetadata(
+        name=name, description="x", version="1.0.0", license="MIT",
+        tags=[], recommended_alpha=0.5, source="local", files=files,
+    )
+    meta.write(d)
+    return d
+
+
+def test_concept_folder_load_statements_only(tmp_path):
+    d = _make_concept(tmp_path, with_statements=True, with_tensor=False)
+    cf = packs.ConceptFolder.load(d)
+    assert cf.metadata.name == "happy"
+    assert cf.has_statements is True
+    assert cf.tensor_models() == []
+
+
+def test_concept_folder_load_statements_and_tensor(tmp_path):
+    d = _make_concept(tmp_path, with_statements=True, with_tensor=True)
+    cf = packs.ConceptFolder.load(d)
+    assert cf.has_statements is True
+    assert cf.tensor_models() == ["google__gemma-2-2b-it"]
+    sc = cf.sidecar("google__gemma-2-2b-it")
+    assert sc.method == "contrastive_pca"
+
+
+def test_concept_folder_load_empty_errors(tmp_path):
+    d = tmp_path / "empty"
+    d.mkdir()
+    meta = packs.PackMetadata(
+        name="empty", description="x", version="1.0.0", license="MIT",
+        tags=[], recommended_alpha=0.5, source="local", files={},
+    )
+    meta.write(d)
+    with pytest.raises(packs.PackFormatError, match="at least one"):
+        packs.ConceptFolder.load(d)
+
+
+def test_concept_folder_load_tampered_errors(tmp_path):
+    d = _make_concept(tmp_path, with_statements=True, with_tensor=False)
+    (d / "statements.json").write_text("[{}]")  # mutate, breaks hash
+    with pytest.raises(packs.PackFormatError, match="integrity"):
+        packs.ConceptFolder.load(d)
