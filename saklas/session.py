@@ -1,6 +1,7 @@
 """SaklasSession — unified backend for saklas's programmatic API and TUI."""
 from __future__ import annotations
 import json
+import logging
 import pathlib
 import queue
 import re
@@ -15,6 +16,8 @@ from saklas.generation import GenerationConfig, GenerationState, build_chat_inpu
 from saklas.hooks import SteeringManager
 from saklas.model import load_model, get_layers, get_model_info
 from saklas.monitor import TraitMonitor
+from saklas.packs import ConceptFolder, PackFormatError, PackMetadata, hash_file
+from saklas.paths import concept_dir, safe_model_id
 from saklas.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, load_defaults
 from saklas.results import GenerationResult, TokenEvent, ProbeReadings
 from saklas.vectors import (
@@ -22,8 +25,9 @@ from saklas.vectors import (
     save_profile as _save_profile,
     load_profile as _load_profile,
     load_contrastive_pairs,
-    get_cache_path,
 )
+
+_log = logging.getLogger(__name__)
 
 _N_PAIRS = 45
 PROBE_CATEGORIES = ["emotion", "personality", "safety", "cultural", "gender"]
@@ -72,9 +76,11 @@ class SaklasSession:
         self._device = first_param.device
         self._dtype = first_param.dtype
 
-        self._cache_dir = cache_dir or str(
-            pathlib.Path(__file__).parent / "probes" / "cache"
-        )
+        if cache_dir is not None:
+            _log.warning(
+                "SaklasSession(cache_dir=...) is deprecated; paths now come from ~/.saklas/. "
+                "Set SAKLAS_HOME env var to override."
+            )
 
         self.config = GenerationConfig(
             max_new_tokens=max_tokens,
@@ -100,14 +106,13 @@ class SaklasSession:
         if probe_categories:
             probe_profiles = bootstrap_probes(
                 self._model, self._tokenizer, self._layers, self._model_info,
-                categories=probe_categories, cache_dir=self._cache_dir,
+                probe_categories,
             )
 
         self._layer_means: dict[int, torch.Tensor] = {}
         if probe_profiles:
             self._layer_means = bootstrap_layer_means(
                 self._model, self._tokenizer, self._layers, self._model_info,
-                cache_dir=self._cache_dir,
             )
 
         self._monitor = TraitMonitor(probe_profiles, self._layer_means) if probe_profiles else TraitMonitor({})
@@ -146,16 +151,50 @@ class SaklasSession:
 
     # -- Extraction --
 
-    def _vector_cache_path(self, concept: str, baseline: str | None = None) -> str:
-        model_id = self._model_info.get("model_id", "unknown")
-        tag = f"{concept}_vs_{baseline}" if baseline else concept
-        return get_cache_path(self._cache_dir, model_id, tag)
+    def _local_concept_folder(self, concept: str, baseline: str | None = None) -> pathlib.Path:
+        """Return the local/ concept folder path, creating pack.json if needed.
 
-    @staticmethod
-    def _statements_cache_path(concept: str, baseline: str | None = None) -> str:
+        User-extracted vectors and generated statements live under
+        ~/.saklas/vectors/local/<tag>/. A minimal pack.json with
+        source=local is written on first access.
+        """
         tag = f"{concept}_vs_{baseline}" if baseline else concept
-        cache_dir = pathlib.Path(__file__).parent / "datasets" / "cache"
-        return str(cache_dir / f"{tag}_statements.json")
+        folder = concept_dir("local", tag)
+        folder.mkdir(parents=True, exist_ok=True)
+        if not (folder / "pack.json").exists():
+            PackMetadata(
+                name=tag,
+                description=f"User-extracted: {tag}",
+                version="1.0.0",
+                license="AGPL-3.0-or-later",
+                tags=[],
+                recommended_alpha=0.5,
+                source="local",
+                files={},
+            ).write(folder)
+        return folder
+
+    def _vector_cache_path(self, concept: str, baseline: str | None = None) -> str:
+        folder = self._local_concept_folder(concept, baseline)
+        model_id = self._model_info.get("model_id", "unknown")
+        return str(folder / f"{safe_model_id(model_id)}.safetensors")
+
+    def _statements_cache_path(self, concept: str, baseline: str | None = None) -> str:
+        folder = self._local_concept_folder(concept, baseline)
+        return str(folder / "statements.json")
+
+    def _update_local_pack_files(self, folder: pathlib.Path) -> None:
+        """Recompute pack.json `files` map after writing new tensors/statements."""
+        try:
+            meta = PackMetadata.load(folder)
+        except PackFormatError:
+            return
+        new_files: dict[str, str] = {}
+        for entry in sorted(folder.iterdir()):
+            if entry.is_file() and entry.name != "pack.json":
+                new_files[entry.name] = hash_file(entry)
+        meta.files = new_files
+        meta.write(folder)
 
     def generate_pairs(
         self,
@@ -335,9 +374,8 @@ class SaklasSession:
                 ds = DataSource(pairs=source)
             else:
                 ds = source
-            cache_path = get_cache_path(
-                self._cache_dir, self._model_info.get("model_id", "unknown"), ds.name,
-            )
+            folder = self._local_concept_folder(ds.name, None)
+            cache_path = str(folder / f"{safe_model_id(self.model_id)}.safetensors")
             try:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._promote_profile(profile)
@@ -351,13 +389,25 @@ class SaklasSession:
             profile = extract_contrastive(
                 self._model, self._tokenizer, pairs, layers=self._layers,
             )
-            _save_profile(profile, cache_path, {
-                "concept": ds.name, "n_pairs": len(ds.pairs),
-            })
+            _save_profile(profile, cache_path, {"method": "contrastive_pca"})
+            self._update_local_pack_files(folder)
             return profile
 
-        # String source — full pipeline
-        cache_path = self._vector_cache_path(concept, baseline)
+        # String source — full pipeline. Curated concepts live under default/;
+        # everything else lives under local/.
+        if baseline is None:
+            defaults = load_defaults()
+            concept_lower = concept.lower()
+            is_curated = any(concept_lower in probes for probes in defaults.values())
+        else:
+            is_curated = False
+
+        if is_curated:
+            curated_folder = concept_dir("default", concept_lower)
+            cache_path = str(curated_folder / f"{safe_model_id(self.model_id)}.safetensors")
+        else:
+            curated_folder = None
+            cache_path = self._vector_cache_path(concept, baseline)
 
         # 1. Check vector cache
         try:
@@ -368,41 +418,34 @@ class SaklasSession:
         except (FileNotFoundError, KeyError, ValueError):
             pass
 
-        # 2. Check for curated dataset
-        if baseline is None:
-            defaults = load_defaults()
-            concept_lower = concept.lower()
-            has_curated = any(concept_lower in probes for probes in defaults.values())
-            if has_curated:
-                dataset_file = f"{concept_lower}.json"
-                ds_path = pathlib.Path(__file__).parent / "datasets" / dataset_file
-                if ds_path.exists():
-                    _progress(f"Found curated dataset '{dataset_file}', extracting...")
-                    ds = load_contrastive_pairs(str(ds_path))
-                    profile = extract_contrastive(
-                        self._model, self._tokenizer, ds["pairs"],
-                        layers=self._layers,
-                    )
-                    _save_profile(profile, cache_path, {
-                        "concept": concept, "baseline": baseline,
-                        "n_pairs": len(ds["pairs"]),
-                        "source": f"curated:{dataset_file}",
-                    })
-                    return profile
+        # 2. Extract from curated statements if available
+        if is_curated and curated_folder is not None:
+            curated_stmts = curated_folder / "statements.json"
+            if curated_stmts.exists():
+                _progress(f"Found curated statements for '{concept}', extracting...")
+                ds = load_contrastive_pairs(str(curated_stmts))
+                profile = extract_contrastive(
+                    self._model, self._tokenizer, ds["pairs"],
+                    layers=self._layers,
+                )
+                _save_profile(profile, cache_path, {
+                    "method": "contrastive_pca",
+                    "statements_sha256": hash_file(curated_stmts),
+                })
+                self._update_local_pack_files(curated_folder)
+                return profile
 
-        # 3. Check statement cache
+        # 3. Check statement cache under local/
         stmt_cache_path = self._statements_cache_path(concept, baseline)
+        local_folder = pathlib.Path(stmt_cache_path).parent
         pairs = None
         try:
             with open(stmt_cache_path) as f:
                 cached = json.load(f)
-            if "pairs" in cached:
+            if isinstance(cached, list):
+                pairs = cached
+            elif isinstance(cached, dict) and "pairs" in cached:
                 pairs = cached["pairs"]
-            elif "positive" in cached and "negative" in cached:
-                pairs = [
-                    {"positive": p, "negative": n_}
-                    for p, n_ in zip(cached["positive"], cached["negative"])
-                ]
             if pairs:
                 _progress(f"Loaded cached pairs for '{concept}'.")
         except (FileNotFoundError, KeyError, json.JSONDecodeError):
@@ -414,10 +457,9 @@ class SaklasSession:
             _progress(f"Generating contrastive pairs for '{concept}'{suffix}...")
             raw_pairs = self.generate_pairs(concept, baseline, on_progress=_progress)
             pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
-
             pathlib.Path(stmt_cache_path).parent.mkdir(parents=True, exist_ok=True)
             with open(stmt_cache_path, "w") as f:
-                json.dump({"pairs": pairs}, f, indent=2)
+                json.dump(pairs, f, indent=2)
 
         if len(pairs) < 2:
             raise ValueError(
@@ -430,12 +472,11 @@ class SaklasSession:
         profile = extract_contrastive(
             self._model, self._tokenizer, pairs, layers=self._layers,
         )
-
         _save_profile(profile, cache_path, {
-            "concept": concept, "baseline": baseline,
-            "n_pairs": len(pairs),
+            "method": "contrastive_pca",
+            "statements_sha256": hash_file(pathlib.Path(stmt_cache_path)),
         })
-
+        self._update_local_pack_files(local_folder)
         return profile
 
     def load_profile(self, path: str) -> dict[int, tuple[torch.Tensor, float]]:
@@ -483,7 +524,6 @@ class SaklasSession:
         if not self._layer_means:
             self._layer_means = bootstrap_layer_means(
                 self._model, self._tokenizer, self._layers, self._model_info,
-                cache_dir=self._cache_dir,
             )
             self._monitor.layer_means = self._layer_means
         self._monitor.add_probe(name, profile)
