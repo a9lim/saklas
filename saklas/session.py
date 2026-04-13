@@ -16,7 +16,7 @@ from saklas.generation import GenerationConfig, GenerationState, build_chat_inpu
 from saklas.hooks import SteeringManager
 from saklas.model import load_model, get_layers, get_model_info
 from saklas.monitor import TraitMonitor
-from saklas.packs import ConceptFolder, PackFormatError, PackMetadata, hash_file
+from saklas.packs import PackFormatError, PackMetadata, hash_file
 from saklas.paths import concept_dir, safe_model_id
 from saklas.probes_bootstrap import bootstrap_probes, bootstrap_layer_means, load_defaults
 from saklas.results import GenerationResult, TokenEvent, ProbeReadings

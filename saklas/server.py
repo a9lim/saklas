@@ -242,8 +242,8 @@ def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
             "logprob": lp,
             "bytes": _token_bytes(tok_str),
             "top_logprobs": [
-                {"token": tok.decode([i]), "logprob": l, "bytes": _token_bytes(tok.decode([i]))}
-                for i, l in top
+                {"token": tok.decode([i]), "logprob": lp, "bytes": _token_bytes(tok.decode([i]))}
+                for i, lp in top
             ],
         })
     return {"content": content}

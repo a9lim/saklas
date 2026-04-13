@@ -228,7 +228,6 @@ class TestTraitMonitor:
     def test_throughput_regression(self, model_and_tokenizer, layers, happy_profile, layer_means):
         """Steered generation should be at least 85% of vanilla throughput."""
         from saklas.hooks import SteeringManager
-        from saklas.monitor import TraitMonitor
         from saklas.generation import GenerationConfig, GenerationState, generate_steered
 
         model, tokenizer = model_and_tokenizer

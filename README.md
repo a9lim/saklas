@@ -1,6 +1,8 @@
 # saklas
 
+[![CI](https://github.com/a9lim/saklas/actions/workflows/ci.yml/badge.svg)](https://github.com/a9lim/saklas/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/saklas)](https://pypi.org/project/saklas/)
+[![Downloads](https://img.shields.io/pypi/dm/saklas)](https://pypi.org/project/saklas/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 

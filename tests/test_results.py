@@ -141,7 +141,7 @@ class TestResultCollector:
         collector = ResultCollector()
         collector.add(self._make_result())
         try:
-            import pandas
+            import pandas  # noqa: F401
             df = collector.to_dataframe()
             assert len(df) == 1
         except ImportError:
