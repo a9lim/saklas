@@ -1,6 +1,6 @@
 """saklas — local activation steering + trait monitoring for HuggingFace causal LMs."""
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 
 from saklas.session import SaklasSession
 from saklas.datasource import DataSource

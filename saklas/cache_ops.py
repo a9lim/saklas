@@ -10,7 +10,7 @@ from saklas.cli_selectors import (
     ResolvedConcept, Selector, invalidate as _invalidate_selector_cache, resolve,
 )
 from saklas.packs import PackMetadata, hash_file, verify_integrity
-from saklas.paths import concept_dir, safe_model_id, vectors_dir
+from saklas.paths import concept_dir, neutral_statements_path, safe_model_id, vectors_dir
 
 
 class InstallConflict(RuntimeError):
@@ -140,7 +140,13 @@ def refresh(selector: Selector, *, model_scope: Optional[str] = None) -> int:
 
         src = c.metadata.source
         if src == "local":
-            raise RefreshError(f"{c.namespace}/{c.name}: source=local, nothing to refresh from")
+            # Selectors like `all` or `tag:emotion` naturally sweep in local
+            # concepts that have no upstream to re-pull from; skip them
+            # silently rather than aborting the whole refresh. A user asking
+            # for a specific local by name gets the same treatment — there's
+            # nothing meaningful to do, and erroring just forces them to
+            # hand-craft a selector that excludes their own work.
+            continue
         if src == "bundled":
             _refresh_bundled(c.folder, c.name)
             count += 1
@@ -154,6 +160,20 @@ def refresh(selector: Selector, *, model_scope: Optional[str] = None) -> int:
     if count:
         _invalidate_selector_cache()
     return count
+
+
+def refresh_neutrals() -> Path:
+    """Overwrite ~/.saklas/neutral_statements.json with the bundled copy.
+
+    Returns the destination path. Stale layer means are picked up on next
+    session init via the hash check in bootstrap_layer_means.
+    """
+    dst = neutral_statements_path()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src = _resources.files("saklas.data").joinpath("neutral_statements.json")
+    with src.open("rb") as s, open(dst, "wb") as d:
+        d.write(s.read())
+    return dst
 
 
 def install(target: str, as_: Optional[str], *, force: bool = False) -> Path:

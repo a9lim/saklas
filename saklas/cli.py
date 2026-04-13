@@ -116,6 +116,9 @@ def _build_tui_parser() -> argparse.ArgumentParser:
     p.add_argument("--refresh", "-r", action="append", default=None,
                    metavar="SELECTOR",
                    help="Re-pull concept(s) from source (repeatable)")
+    p.add_argument("--refresh-neutrals", "-n", action="store_true",
+                   help="Overwrite ~/.saklas/neutral_statements.json with the "
+                        "bundled copy (forces layer-means recompute on next run)")
     p.add_argument("--clear-tensors", "-x", action="append", default=None,
                    metavar="SELECTOR",
                    help="Delete tensors for matched concepts (repeatable; keeps statements.json)")
@@ -166,7 +169,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.merge_name = None
         args.merge_components = None
 
-    has_cache_op = bool(args.refresh or args.delete or args.install or args.merge_name)
+    has_cache_op = bool(
+        args.refresh or args.refresh_neutrals or args.delete
+        or args.install or args.merge_name
+    )
     has_list = args.list is not None
 
     if has_list:
@@ -303,6 +309,10 @@ def _run_cache(args: argparse.Namespace) -> None:
         n = cache_ops.refresh(concept_sel, model_scope=model_scope)
         print(f"Refreshed {n} concept(s)")
 
+    if args.refresh_neutrals:
+        dst = cache_ops.refresh_neutrals()
+        print(f"Refreshed {dst}")
+
     if args.delete:
         concept_sel, model_scope = sel_parse_args(args.delete)
         n = cache_ops.delete_tensors(concept_sel, model_scope)
@@ -346,6 +356,7 @@ def main(argv: list[str] | None = None):
     elif args.command == "list":
         _run_list(args)
     else:
-        if args.refresh or args.delete or args.install or args.merge_name:
+        if (args.refresh or args.refresh_neutrals or args.delete
+                or args.install or args.merge_name):
             _run_cache(args)
         _run_tui(args)

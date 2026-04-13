@@ -60,7 +60,7 @@ _DEGEN_THRESHOLD = 1e-8
 # carry over unchanged.  Diffuse-geometry models like Llama-3.2-3B-Instruct
 # score much lower (~0.07); normalization divides by their profile mean and
 # re-multiplies by this constant, bringing them onto the same alpha scale.
-_REF_SCORE = 0.125
+_REF_SCORE = 1.0 / 32.0
 
 
 def orthogonalize_vectors(

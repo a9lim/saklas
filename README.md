@@ -97,13 +97,15 @@ To clear cached tensors for a concept (e.g. to re-extract with a different state
 
 ### Monitor
 
-After generation, a separate forward pass over the generated text captures hidden states at every layer, pooled from the last content token — the same pooling used during probe extraction. Each layer's hidden state is mean-centered (subtracting the per-layer mean computed from 45 neutral prompts) to remove baseline projection bias that otherwise makes raw cosine similarities uninformative. Score-weighted cosine similarities against probe vectors produce one value per probe per generation. Probe history accumulates across generations, enabling sparklines and running statistics.
+After generation, a separate forward pass over the generated text captures hidden states at every layer, pooled from the last content token — the same pooling used during probe extraction. Each layer's hidden state is mean-centered (subtracting the per-layer mean computed from 45 neutral prompts) to remove baseline projection bias that otherwise makes raw cosine similarities uninformative.
+
+Layer means are computed once per model and cached at `~/.saklas/models/<safe_model_id>/layer_means.safetensors`. They auto-invalidate when `~/.saklas/neutral_statements.json` changes hash. Existing users upgrading across a release that changes the bundled neutrals should run `saklas -n` — `materialize_bundled` is copy-on-miss for that file, so the package-shipped version isn't picked up automatically. Score-weighted cosine similarities against probe vectors produce one value per probe per generation. Probe history accumulates across generations, enabling sparklines and running statistics.
 
 Layer means are computed once per model and cached at `~/.saklas/models/<safe_model_id>/layer_means.safetensors`. They auto-invalidate when `~/.saklas/neutral_statements.json` is edited.
 
 ### Probe library
 
-28 probes across 5 categories, each backed by ~60 curated contrastive pairs:
+28 probes across 5 categories, each backed by 45 curated contrastive pairs (topically disjoint, not minimal-word-swap — see CLAUDE.md for the generation discipline):
 
 | Category | Probes |
 |----------|--------|
@@ -149,7 +151,8 @@ saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 | `-s`, `--system-prompt` | System prompt |
 | `--max-tokens` | Max tokens per generation (default: 1024) |
 | `-i`, `--install <target>` | Install a pack from HF coordinate (`<ns>/<name>`) or local folder path |
-| `-r`, `--refresh <selector>` | Re-pull concept(s) from source (repeatable) |
+| `-r`, `--refresh <selector>` | Re-pull concept(s) from source (repeatable; silently skips `source=local`) |
+| `-n`, `--refresh-neutrals` | Overwrite `~/.saklas/neutral_statements.json` with the bundled copy (forces layer-means recompute) |
 | `-x`, `--clear-tensors <selector>` | Delete tensors for matched concepts; keeps `statements.json` (repeatable) |
 | `-l`, `--list [<selector>]` | List or show info about installed + HF packs; exits after printing |
 | `-m`, `--merge <name> <components>` | Merge vectors: `-m bard default/happy:0.3,user/archaic:0.4` |
