@@ -54,7 +54,5 @@ include = ["saklas*"]
 [tool.setuptools.package-data]
 saklas = [
     "data/**/*.json",
-    "probes/defaults.json",
-    "datasets/*.json",
     "tui/*.tcss",
 ]
