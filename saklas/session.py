@@ -544,9 +544,13 @@ class SaklasSession:
 
     # -- Generation helpers --
 
-    def _prepare_input(self, input, raw: bool = False, thinking: bool = False) -> torch.Tensor:
+    def _prepare_input(
+        self, input, raw: bool = False, thinking: bool = False,
+        stateless: bool = False,
+    ) -> torch.Tensor:
         if isinstance(input, str):
-            messages = list(self._history) + [{"role": "user", "content": input}]
+            prior = [] if stateless else list(self._history)
+            messages = prior + [{"role": "user", "content": input}]
         elif isinstance(input, list):
             messages = list(input)
         else:
@@ -588,7 +592,9 @@ class SaklasSession:
 
     def _finalize_generation(
         self, input, generated_ids: list[int], elapsed: float,
-        vector_snapshot: dict[str, float],
+        vector_snapshot: dict[str, float], prompt_tokens: int = 0,
+        stateless: bool = False,
+        logprobs_list: list[tuple[int, float, list[tuple[int, float]]]] | None = None,
     ) -> GenerationResult:
         """Shared post-generation: decode, measure probes, build result, update history."""
         token_count = len(generated_ids)
@@ -597,34 +603,55 @@ class SaklasSession:
         text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
         if self._monitor.probe_names and text.strip():
-            self._monitor.measure(
-                self._model, self._tokenizer, self._layers, text,
-                device=self._device,
-            )
-        readings = self.build_readings()
+            if stateless:
+                # Snapshot monitor state; we want this request's probe
+                # readings but must not mutate accumulated session history.
+                _hist_snap = {k: list(v) for k, v in self._monitor.history.items()}
+                _stats_snap = {k: dict(v) for k, v in self._monitor._stats.items()}
+                self._monitor.measure(
+                    self._model, self._tokenizer, self._layers, text,
+                    device=self._device,
+                )
+                readings = self.build_readings()
+                for k, v in _hist_snap.items():
+                    self._monitor.history[k].clear()
+                    self._monitor.history[k].extend(v)
+                self._monitor._stats = _stats_snap
+            else:
+                self._monitor.measure(
+                    self._model, self._tokenizer, self._layers, text,
+                    device=self._device,
+                )
+                readings = self.build_readings()
+        else:
+            readings = self.build_readings()
 
         result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,
             tok_per_sec=tok_per_sec, elapsed=elapsed,
             readings=readings, vectors=vector_snapshot,
+            prompt_tokens=prompt_tokens,
+            finish_reason=self._gen_state.finish_reason,
+            logprobs=logprobs_list,
         )
         self._last_result = result
 
-        if isinstance(input, str):
-            self._history.append({"role": "user", "content": input})
-        if text.strip():
-            self._history.append({"role": "assistant", "content": text})
+        if not stateless:
+            if isinstance(input, str):
+                self._history.append({"role": "user", "content": input})
+            if text.strip():
+                self._history.append({"role": "assistant", "content": text})
 
         return result
 
-    def _generation_preamble(self, input, alphas, orthogonalize, raw, thinking):
+    def _generation_preamble(self, input, alphas, orthogonalize, raw, thinking, stateless=False):
         use_thinking = thinking and supports_thinking(self._tokenizer)
-        input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking)
+        input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking, stateless=stateless)
         self._gen_state.reset()
         vector_snapshot = dict(alphas) if alphas else {}
         if alphas:
             self._apply_steering(alphas, orthogonalize=orthogonalize)
-        return input_ids, use_thinking, vector_snapshot
+        return input_ids, use_thinking, vector_snapshot, int(input_ids.shape[1])
 
     # -- Generation: blocking --
 
@@ -635,6 +662,13 @@ class SaklasSession:
         orthogonalize: bool = False,
         raw: bool = False,
         thinking: bool = False,
+        stateless: bool = False,
+        seed: int | None = None,
+        stop: list[str] | None = None,
+        logit_bias: dict[int, float] | None = None,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logprobs: int | None = None,
     ) -> GenerationResult:
         """Blocking generation.
 
@@ -645,24 +679,50 @@ class SaklasSession:
             orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
             raw: skip chat template, tokenize input string directly.
             thinking: enable thinking/reasoning mode for models that support it.
+            stateless: do not mutate session history (conversation + probe
+                    accumulators). Used by the OpenAI-compatible server.
+            seed: RNG seed for reproducible sampling.
+            stop: list of stop strings; generation terminates when any appears.
+            logit_bias: per-token-id additive logit bias.
+            presence_penalty: OpenAI-style presence penalty.
+            frequency_penalty: OpenAI-style frequency penalty.
+            logprobs: if set, capture per-token logprobs with this many
+                    top alternatives (0 = chosen token only).
         """
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentGenerationError("Generation already in progress")
         try:
-            return self._generate_blocking(input, alphas, orthogonalize, raw, thinking)
+            return self._generate_blocking(
+                input, alphas, orthogonalize, raw, thinking, stateless,
+                seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
+            )
         finally:
             self._gen_lock.release()
 
-    def _generate_blocking(self, input, alphas, orthogonalize, raw=False, thinking=False) -> GenerationResult:
-        input_ids, use_thinking, vector_snapshot = self._generation_preamble(
-            input, alphas, orthogonalize, raw, thinking,
+    def _generate_blocking(
+        self, input, alphas, orthogonalize, raw, thinking, stateless,
+        seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
+    ) -> GenerationResult:
+        input_ids, use_thinking, vector_snapshot, prompt_tokens = self._generation_preamble(
+            input, alphas, orthogonalize, raw, thinking, stateless,
         )
+
+        logprobs_list: list | None = [] if logprobs is not None else None
+
+        def _capture(text, is_thinking, tid, lp, top_lp):
+            if logprobs_list is not None and tid >= 0 and not is_thinking:
+                logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
 
         try:
             start = time.monotonic()
             generated_ids = generate_steered(
                 self._model, self._tokenizer, input_ids,
                 self.config, self._gen_state, thinking=use_thinking,
+                on_token=_capture if logprobs is not None else None,
+                seed=seed, stop=stop, logit_bias=logit_bias,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                logprobs=logprobs,
             )
             elapsed = time.monotonic() - start
         finally:
@@ -671,6 +731,8 @@ class SaklasSession:
 
         return self._finalize_generation(
             input, generated_ids, elapsed, vector_snapshot,
+            prompt_tokens=prompt_tokens, stateless=stateless,
+            logprobs_list=logprobs_list,
         )
 
     # -- Generation: streaming --
@@ -682,31 +744,37 @@ class SaklasSession:
         orthogonalize: bool = False,
         raw: bool = False,
         thinking: bool = False,
+        stateless: bool = False,
+        seed: int | None = None,
+        stop: list[str] | None = None,
+        logit_bias: dict[int, float] | None = None,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logprobs: int | None = None,
     ) -> Iterator[TokenEvent]:
-        """Streaming generation. Yields TokenEvent per token.
-
-        Args:
-            input: prompt string or list of message dicts.
-            alphas: steering vector alphas to apply. None = no steering.
-            orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
-            raw: skip chat template, tokenize input string directly.
-            thinking: enable thinking/reasoning mode for models that support it.
-        """
+        """Streaming generation. Yields TokenEvent per token. See generate()."""
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentGenerationError("Generation already in progress")
         try:
-            yield from self._generate_streaming(input, alphas, orthogonalize, raw, thinking)
+            yield from self._generate_streaming(
+                input, alphas, orthogonalize, raw, thinking, stateless,
+                seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
+            )
         finally:
             self._gen_lock.release()
 
-    def _generate_streaming(self, input, alphas, orthogonalize, raw=False, thinking=False) -> Iterator[TokenEvent]:
-        input_ids, use_thinking, vector_snapshot = self._generation_preamble(
-            input, alphas, orthogonalize, raw, thinking,
+    def _generate_streaming(
+        self, input, alphas, orthogonalize, raw, thinking, stateless,
+        seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
+    ) -> Iterator[TokenEvent]:
+        input_ids, use_thinking, vector_snapshot, prompt_tokens = self._generation_preamble(
+            input, alphas, orthogonalize, raw, thinking, stateless,
         )
 
         generated_ids: list[int] = []
         token_queue = self._gen_state.token_queue
         gen_error: list[Exception] = []
+        logprobs_list: list | None = [] if logprobs is not None else None
         start = time.monotonic()
 
         def _worker():
@@ -714,8 +782,12 @@ class SaklasSession:
                 ids = generate_steered(
                     self._model, self._tokenizer, input_ids,
                     self.config, self._gen_state,
-                    on_token=lambda tok, thinking, tid: token_queue.put((tok, thinking, tid)),
+                    on_token=lambda tok, th, tid, lp, tlp: token_queue.put((tok, th, tid, lp, tlp)),
                     thinking=use_thinking,
+                    seed=seed, stop=stop, logit_bias=logit_bias,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    logprobs=logprobs,
                 )
                 generated_ids.extend(ids)
             except Exception as e:
@@ -735,11 +807,14 @@ class SaklasSession:
                     continue
                 if item is None:
                     break
-                tok_str, is_thinking, token_id = item
+                tok_str, is_thinking, token_id, lp, tlp = item
+                if logprobs_list is not None and token_id >= 0 and not is_thinking:
+                    logprobs_list.append((token_id, lp if lp is not None else 0.0, tlp or []))
                 event = TokenEvent(
                     text=tok_str,
                     token_id=token_id,
                     index=idx, thinking=is_thinking,
+                    logprob=lp, top_logprobs=tlp,
                 )
                 yield event
                 idx += 1
@@ -755,6 +830,8 @@ class SaklasSession:
         elapsed = time.monotonic() - start
         self._finalize_generation(
             input, generated_ids, elapsed, vector_snapshot,
+            prompt_tokens=prompt_tokens, stateless=stateless,
+            logprobs_list=logprobs_list,
         )
 
     # -- Generation control --
