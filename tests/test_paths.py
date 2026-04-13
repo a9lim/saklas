@@ -6,7 +6,7 @@ from saklas import paths
 
 def test_default_home(monkeypatch, tmp_path):
     monkeypatch.delenv("SAKLAS_HOME", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     assert paths.saklas_home() == tmp_path / ".saklas"
 
 
