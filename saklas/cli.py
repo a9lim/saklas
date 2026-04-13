@@ -38,7 +38,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         help="System prompt for chat",
     )
     p.add_argument(
-        "--max-tokens", "-m",
+        "--max-tokens",
         type=int,
         default=1024,
         help="Max tokens per generation (default: 1024)",
@@ -97,20 +97,14 @@ def _build_tui_parser() -> argparse.ArgumentParser:
         prog="saklas",
         description="Activation steering + trait monitoring for local HuggingFace models",
     )
-    p.add_argument(
-        "model", nargs="?", default=None,
-        help="HuggingFace model ID or local path (e.g. google/gemma-2-9b-it)",
-    )
-    p.add_argument("--quantize", "-q", choices=["4bit", "8bit"], default=None,
-                   help="Quantization mode (default: bf16/fp16)")
-    p.add_argument("--device", "-d", default="auto",
-                   help="Device: auto (detect), cuda, mps, or cpu (default: auto)")
-    p.add_argument("--probes", "-p", nargs="*", default=None,
-                   help="Probe categories: all, none, emotion, personality, safety, cultural, gender")
-    p.add_argument("--system-prompt", "-s", default=None,
-                   help="System prompt for chat")
-    p.add_argument("--max-tokens", type=int, default=1024,
-                   help="Max tokens per generation (default: 1024)")
+    _add_common_args(p)
+    # `model` is required by _add_common_args but TUI allows it to be omitted
+    # (e.g. `saklas -l`, `saklas -r default`). Relax it here.
+    for action in p._actions:
+        if action.dest == "model":
+            action.nargs = "?"
+            action.default = None
+            break
 
     # Cache ops (composable; fall through to TUI if a model follows).
     # Each flag takes exactly one selector token; repeat for compound selectors
@@ -144,18 +138,6 @@ def _build_tui_parser() -> argparse.ArgumentParser:
                    help="With -C: fail hard on missing vectors")
 
     return p
-
-
-def _flatten_nargs(x):
-    if x is None:
-        return None
-    out = []
-    for item in x:
-        if isinstance(item, list):
-            out.extend(item)
-        else:
-            out.append(item)
-    return out
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -328,7 +310,8 @@ def _run_cache(args: argparse.Namespace) -> None:
     if args.merge_name is not None:
         components = merge.parse_components(args.merge_components)
         dst = merge.merge_into_pack(
-            args.merge_name, components, model=None, force=force,
+            args.merge_name, components, model=None,
+            force=force, strict=getattr(args, "strict", False),
         )
         print(f"Merged pack written to {dst}")
 

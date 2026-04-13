@@ -154,16 +154,44 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# In-process fingerprint cache keyed by absolute file path.
+# Entry: (size, mtime_ns, expected_sha256) -> last verified sha256 matched.
+# Short-circuits full hashing on warm loads. First load, or any stat change,
+# still runs the full sha256 before the entry is (re-)populated.
+_FINGERPRINT_CACHE: dict[str, tuple[int, int, str]] = {}
+
+
 def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[str]]:
     """Compare every file in `files` (path -> expected sha256) against disk.
 
     Returns (all_ok, list_of_bad_paths). A missing file counts as bad.
+
+    Uses an in-process (size, mtime_ns) fingerprint cache to avoid re-hashing
+    on warm loads. On first load and after any stat change, the full sha256
+    still runs — the cache is purely an optimization and does not weaken the
+    integrity contract.
     """
     bad: list[str] = []
     for rel, expected in files.items():
         fp = folder / rel
-        if not fp.exists() or hash_file(fp) != expected:
+        if not fp.exists():
             bad.append(rel)
+            continue
+        key = str(fp.resolve())
+        try:
+            st = fp.stat()
+        except OSError:
+            bad.append(rel)
+            continue
+        fp_key = (st.st_size, st.st_mtime_ns, expected)
+        cached = _FINGERPRINT_CACHE.get(key)
+        if cached == fp_key:
+            continue
+        if hash_file(fp) != expected:
+            _FINGERPRINT_CACHE.pop(key, None)
+            bad.append(rel)
+            continue
+        _FINGERPRINT_CACHE[key] = fp_key
     return (not bad, bad)
 
 
@@ -297,15 +325,38 @@ def print_migration_notice_if_needed() -> None:
             return
 
 
+def merge_components_status(
+    recorded: dict[str, dict],
+    current_hashes: dict[str, str],
+) -> dict[str, str]:
+    """Return {coord: status} where status is 'ok', 'mismatch', or 'missing'.
+
+    'missing' = component was recorded at merge time but is no longer
+    present in current_hashes (deleted from installed packs).
+    'mismatch' = component's tensor_sha256 has changed since merge.
+    'ok' = component still matches.
+    """
+    out: dict[str, str] = {}
+    for coord, info in recorded.items():
+        want = info.get("tensor_sha256")
+        have = current_hashes.get(coord)
+        if have is None:
+            out[coord] = "missing"
+        elif want is not None and want != have:
+            out[coord] = "mismatch"
+        else:
+            out[coord] = "ok"
+    return out
+
+
 def merge_components_stale(
     recorded: dict[str, dict],
     current_hashes: dict[str, str],
 ) -> list[str]:
-    """Return components whose recorded tensor_sha256 differs from current."""
-    stale: list[str] = []
-    for coord, info in recorded.items():
-        want = info.get("tensor_sha256")
-        have = current_hashes.get(coord)
-        if want is not None and have is not None and want != have:
-            stale.append(coord)
-    return stale
+    """Return components that are 'mismatch' or 'missing' vs current hashes.
+
+    Thin wrapper over :func:`merge_components_status` for callers that only
+    need the non-ok coords.
+    """
+    status = merge_components_status(recorded, current_hashes)
+    return [coord for coord, s in status.items() if s != "ok"]

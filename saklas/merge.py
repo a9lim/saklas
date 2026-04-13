@@ -45,11 +45,18 @@ def parse_components(raw: str) -> list[tuple[str, float]]:
     return out
 
 
-def linear_sum(components: list[tuple[Profile, float]]) -> Profile:
+def linear_sum(
+    components: list[tuple[Profile, float]],
+    *,
+    strict: bool = False,
+) -> Profile:
     """Compute merged[l] = sum_i alpha_i * vec_i[l] per layer.
 
     Layer set is the intersection of every component's layers. Score of the
     merged tensor at each layer is the L2 norm of the merged direction.
+
+    If ``strict`` is True, any non-common layers raise MergeError instead of
+    being silently dropped.
     """
     if len(components) < 2:
         raise MergeError("linear_sum requires at least two components")
@@ -59,8 +66,13 @@ def linear_sum(components: list[tuple[Profile, float]]) -> Profile:
         raise MergeError("no common layers across components")
 
     union = set.union(*layer_sets)
-    if len(common) < 0.8 * len(union):
-        dropped = sorted(union - common)
+    dropped = sorted(union - common)
+    if dropped:
+        if strict:
+            raise MergeError(
+                f"merge: layer intersection {len(common)}/{len(union)}; "
+                f"refusing to drop layers {dropped} under --strict"
+            )
         log.warning(
             "merge: layer intersection %d/%d; dropping layers %s",
             len(common), len(union), dropped,
@@ -108,6 +120,7 @@ def merge_into_pack(
     model: Optional[str],
     *,
     force: bool = False,
+    strict: bool = False,
 ) -> Path:
     """Create a merged tensors-only pack at ~/.saklas/vectors/local/<name>/."""
     dst = concept_dir("local", name)
@@ -140,7 +153,7 @@ def merge_into_pack(
                 "tensor_sha256": hash_file(cf.tensor_path(sid)),
             })
 
-        merged = linear_sum(profiles_and_alphas)
+        merged = linear_sum(profiles_and_alphas, strict=strict)
         ts_path = dst / f"{sid}.safetensors"
         save_profile(merged, str(ts_path), {
             "method": "merge",
