@@ -12,17 +12,17 @@ pip install -e ".[cuda]"               # bitsandbytes + flash-attn (CUDA only)
 pip install -e ".[serve]"              # fastapi + uvicorn
 saklas <model_id>                       # launch TUI
 saklas serve <model_id>                 # OpenAI-compatible API
-saklas -r <selector>                    # re-pull bundled/HF concepts
-saklas -x <selector>                    # delete per-model tensors (keeps statements)
-saklas -n                               # refresh neutral_statements.json from package
-saklas -i <ns>/<concept>[@revision]     # install pack from HF or folder
-saklas -l [selector]                    # list/info packs; exits
-saklas -m <name> <components>           # merge: -m bard default/happy:0.3,...
+saklas install <target> [-s|-a NS/N|-f] # HF coord or folder; -s = statements only
+saklas refresh <selector>               # re-pull concept(s); `refresh neutrals` for neutral_statements.json
+saklas clear <selector> [-m MODEL]      # delete per-model tensors (keeps statements)
+saklas uninstall <selector> [-y]        # fully remove concept folder (bundled respawns on next run)
+saklas list [selector] [-i|-j|-v]       # lists installed + HF; -i = installed only
+saklas merge <name> <components> [-m]   # merge: saklas merge bard default/happy:0.3,...
 pytest tests/                           # all tests (CPU tests run anywhere)
 pytest tests/test_smoke.py              # GPU smoke (downloads gemma-3-4b-it, ~8GB)
 ```
 
-Selector grammar (shared by `-r`, `-x`, `-l`): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`, `model:<id>`, `default`, `all`. Bare names resolve across namespaces and raise `AmbiguousSelectorError` on collision. `model:` AND-combines with the concept selector. `-r` silently skips `source=local` concepts so `-r all` doesn't crash against a cache containing user-authored vectors.
+Selector grammar (shared by `refresh`/`clear`/`uninstall`/`list`): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and raise `AmbiguousSelectorError` on collision. Subcommands take a single selector positional plus `-m/--model` where model scope is meaningful (refresh, clear, merge). `refresh` silently skips `source=local` concepts so `refresh all` doesn't crash against a cache containing user-authored vectors. `refresh neutrals` is a reserved form that rewrites `~/.saklas/neutral_statements.json` from the bundled copy. `uninstall` refuses broad selectors (`all`, `namespace:`) without `-y`; bundled concepts re-materialize on next session init.
 
 ## PyPI release
 
@@ -57,7 +57,7 @@ Integrity: `pack.json.files` is a sha256 map verified on every `ConceptFolder.lo
 
 HF distribution: packs live as **model repos** (not datasets) because safetensors is model-hub-native and `base_model` frontmatter creates reverse-link discoverability from the base model's hub page. `saklas/hf.py` uses `repo_type="model"` exclusively — no dataset fallback. `saklas -i owner/name@revision` pins to any git ref (tag, branch, or commit SHA); `hf.split_revision` parses `@`, threads `revision` through `_download`/`pull_pack`/`fetch_info`, and records it in `source = "hf://owner/name@v1.2.0"`. `cache_ops._refresh` re-splits the stored source so pinned installs re-pull the same revision — pinning is pinning, not "follow latest." `@` is unambiguous because `NAME_REGEX` forbids it in concept names.
 
-**Upgrade gotcha.** `materialize_bundled` is copy-on-miss for `neutral_statements.json`, so existing users keep their old file on upgrade. Run `saklas -n` after a release that changes neutrals to force-copy the bundled version — layer means auto-recompute on next session init via the hash check in `bootstrap_layer_means`.
+**Upgrade gotcha.** `materialize_bundled` is copy-on-miss for `neutral_statements.json`, so existing users keep their old file on upgrade. Run `saklas refresh neutrals` after a release that changes neutrals to force-copy the bundled version — layer means auto-recompute on next session init via the hash check in `bootstrap_layer_means`.
 
 ## Architecture
 
@@ -87,7 +87,7 @@ Five layers: **model/vector**, **steering/monitoring**, **session**, **TUI**, **
 
 ### API server
 - `server.py` — FastAPI app factory. OpenAI-compatible (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) plus saklas management (`/v1/saklas/vectors`, `/v1/saklas/probes`, `/v1/saklas/session`). Thin HTTP layer — all routes call the session with `stateless=True`. `_SamplingBase` pydantic model (shared by chat and completions) accepts the full OpenAI surface: `stop`, `seed`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` (bool for chat, int for completions), `top_logprobs`, `stream_options.include_usage`, `max_completion_tokens` (aliased to `max_tokens` via model validator), plus accept-and-ignore for `user`, `n`, `response_format`, `messages[].name`. `ChatMessage._flatten_content` accepts multimodal arrays and concatenates text parts (non-text rejected). Responses include real `usage` counts, accurate `finish_reason` from `session._gen_state.finish_reason`, per-request `created` timestamps. `_stream_generation` emits a first-chunk `{role: "assistant"}` delta for chat; final chunk's `finish_reason` comes from gen state; optional usage chunk follows before `[DONE]` when `stream_options.include_usage` is set. Single `app.state.gen_lock` (`asyncio.Lock`) serializes both non-streaming (`async with`) and streaming (held for the full stream with 5-minute timeout → 503); requests queue FIFO rather than 409ing. Bearer auth via `SAKLAS_API_KEY` env / `--api-key` CLI is applied as an app-level dependency; unset = open. `RequestValidationError` handler maps pydantic errors to OpenAI shape (`type: "invalid_request_error"`, `param`, `code`). Thinking tokens stream as `reasoning_content` in the chat delta. Logprobs render via `_render_logprobs_chat` which decodes token ids through the tokenizer. Vector extraction streaming is synchronous (progress replayed after completion). **Not supported:** tool calling, strict JSON/json_schema mode, `/v1/embeddings`.
-- `cli.py` — Dispatches `saklas serve` vs TUI/cache/list modes. `_print_startup(args)` shared between TUI and serve. `serve` accepts `--host`, `--port`, `--steer name:alpha`, `--cors`, `--api-key`. Main TUI parser: `-r` (refresh), `-x` (clear-tensors), `-i` (install), `-n` (refresh-neutrals), `-l` (list; exits), `-m <name> <components>` (merge), `-C <path>` (config), `--strict`. Cache ops compose with model load: `saklas -r default gemma-2-2b-it` refreshes then launches. `-r`/`-x`/`-i` use `action="append"` single-token semantics; compound selectors repeat the flag. Config loading via `-C` composes YAML files, auto-installs missing vectors, and the composed vector map lands on `args.config_vectors` for `_run_tui`. `print_migration_notice_if_needed()` flags legacy `probes/cache` / `~/.liahona` detritus at startup.
+- `cli.py` — Subcommand-based dispatch. Peek `argv[0]`: if it's in `_SUBCOMMANDS = {serve, install, refresh, clear, uninstall, list, merge}`, route to that subcommand's parser; otherwise treat argv as bare-TUI args. Each subcommand has its own parser builder (`_build_<cmd>_parser`) and runner (`_run_<cmd>`), wired together via the `_RUNNERS` dict. `_print_startup(args)` shared between TUI and serve. `serve` accepts `--host/-H`, `--port/-P`, `--steer/-S name:alpha`, `--cors/-C`, `--api-key/-k`. `install`: `target` positional + `--statements-only/-s`, `--as/-a`, `--force/-f`. `refresh <selector>`: `--model/-m` for scoped refresh; `selector == "neutrals"` is a reserved form routing to `cache_ops.refresh_neutrals()`. `clear <selector>`: `--model/-m`, `--yes/-y` (required for `all`/`namespace:`). `uninstall <selector>`: `--yes/-y` (required for broad selectors; bundled concepts respawn). `list [selector]`: `--installed/-i` (skip HF), `--json/-j`, `--verbose/-v`; HF is queried by default. `merge <name> <components>`: `--model/-m`, `--force/-f`, `--strict/-s`. Bare TUI: `<model>` positional + `-q/-d/-p/-s/--max-tokens` from `_add_common_args`, plus `-c/--config` (repeatable) and `--strict`. Cache ops no longer compose with model load — each is a standalone action. Config loading via `-c` composes YAML files, auto-installs missing vectors, and the composed vector map lands on `args.config_vectors` for `_run_tui`. `print_migration_notice_if_needed()` flags legacy `probes/cache` / `~/.liahona` detritus at startup.
 
 ## Performance rules
 

@@ -1,4 +1,4 @@
-"""Implementations for -r, -x, -i (local folder), -l (local) flag handlers."""
+"""Implementations backing the install/refresh/clear/uninstall/list subcommands."""
 from __future__ import annotations
 
 import shutil
@@ -53,7 +53,7 @@ def _update_files_map(concept_folder: Path) -> None:
 
 
 def delete_tensors(selector: Selector, model_scope: Optional[str]) -> int:
-    """Implement `-x <selector>`. Returns the number of files deleted."""
+    """Backs `saklas clear`. Returns the number of files deleted."""
     concepts = resolve(selector)
     deleted = 0
     for c in concepts:
@@ -177,16 +177,41 @@ def refresh_neutrals() -> Path:
     return dst
 
 
-def install(target: str, as_: Optional[str], *, force: bool = False) -> Path:
-    """Unified -i entry point.
+def _strip_tensors(folder: Path) -> None:
+    """Remove tensor/sidecar files and rewrite pack.json.files accordingly."""
+    for entry in sorted(folder.iterdir()):
+        if entry.is_file() and (
+            entry.suffix == ".safetensors"
+            or (entry.suffix == ".json" and entry.name not in {"pack.json", "statements.json"})
+        ):
+            entry.unlink()
+    _update_files_map(folder)
+
+
+def install(
+    target: str,
+    as_: Optional[str],
+    *,
+    force: bool = False,
+    statements_only: bool = False,
+) -> Path:
+    """Install a pack from an HF coord or a local folder.
 
     target may be:
-      - "<ns>/<concept>" — HF pull
+      - "<ns>/<concept>[@revision]" — HF pull
       - a local path to a folder — copy install
+
+    If statements_only is true, any safetensors + sidecars that arrived with the
+    pack are removed after install and pack.json.files is rewritten. The pack
+    remains a legitimate standalone concept; tensors re-extract on demand.
     """
     p = Path(target)
     if p.exists() and p.is_dir():
-        return install_folder(p, namespace="local", as_=as_, force=force)
+        dst = install_folder(p, namespace="local", as_=as_, force=force)
+        if statements_only:
+            _strip_tensors(dst)
+            _invalidate_selector_cache()
+        return dst
 
     from saklas.hf import pull_pack, split_revision
     coord, revision = split_revision(target)
@@ -203,18 +228,58 @@ def install(target: str, as_: Optional[str], *, force: bool = False) -> Path:
         dst_ns, dst_name = ns, name
     dst = vectors_dir() / dst_ns / dst_name
     result = pull_pack(coord, target_folder=dst, force=force, revision=revision)
+    if statements_only:
+        _strip_tensors(result)
     _invalidate_selector_cache()
     return result
+
+
+def uninstall(selector: Selector, *, yes: bool = False) -> int:
+    """Fully remove concept folders matching `selector`.
+
+    Unlike `delete_tensors`, this removes statements.json and pack.json too —
+    the concept folder ceases to exist. Bundled concepts will re-materialize on
+    next session init; that is intentional.
+
+    Broad selectors (`all`, bare `namespace:`) require yes=True.
+    """
+    if not yes and selector.kind in {"all", "namespace"}:
+        raise RuntimeError(
+            f"refusing to uninstall a broad selector ({selector.kind}); pass yes=True to confirm"
+        )
+    concepts = resolve(selector)
+    count = 0
+    for c in concepts:
+        shutil.rmtree(c.folder)
+        count += 1
+    if count:
+        _invalidate_selector_cache()
+    return count
 
 
 def _all_local() -> list[ResolvedConcept]:
     return resolve(Selector(kind="all", value=None))
 
 
-def list_concepts(selector: Optional[Selector], hf: bool) -> None:
-    """Print local (and optionally HF) concepts matching the selector."""
+def list_concepts(
+    selector: Optional[Selector],
+    *,
+    hf: bool = True,
+    installed_only: bool = False,
+    json_output: bool = False,
+    verbose: bool = False,
+) -> None:
+    """Print (or JSON-dump) concepts matching the selector.
+
+    By default the HF hub is queried and results are merged with local installs.
+    `installed_only=True` suppresses the HF query. `json_output=True` emits a
+    machine-readable list to stdout instead of the table.
+    """
+    if hf and installed_only:
+        hf = False
+
     if selector is not None and selector.kind == "name" and selector.namespace is not None:
-        _print_info(selector.namespace, selector.value, hf=hf)
+        _print_info(selector.namespace, selector.value, hf=hf, json_output=json_output)
         return
 
     if selector is None:
@@ -222,32 +287,99 @@ def list_concepts(selector: Optional[Selector], hf: bool) -> None:
     else:
         concepts = resolve(selector)
 
-    _print_list(concepts)
+    hf_rows: list[dict] = []
     if hf:
         try:
             from saklas.hf import search_packs
             hf_rows = search_packs(selector)
         except Exception as e:
+            if json_output:
+                import json as _json
+                print(_json.dumps({"error": f"hf search unavailable: {e}", "installed": [_row_from_concept(c) for c in concepts]}))
+                return
+            _print_list(concepts, verbose=verbose)
             print(f"(hf search unavailable: {e})")
             return
-        _print_hf_rows(hf_rows)
+
+    if json_output:
+        import json as _json
+        payload = [_row_from_concept(c) for c in concepts]
+        installed_keys = {(r["namespace"], r["name"]) for r in payload}
+        for row in hf_rows:
+            if (row.get("namespace"), row.get("name")) in installed_keys:
+                continue
+            payload.append({
+                "name": row.get("name"),
+                "namespace": row.get("namespace"),
+                "status": "hf",
+                "recommended_alpha": row.get("recommended_alpha", 0.0),
+                "tags": row.get("tags", []),
+                "description": row.get("description", ""),
+                "tensor_models": row.get("tensor_models", []),
+            })
+        print(_json.dumps(payload, indent=2))
+        return
+
+    _print_list(concepts, verbose=verbose)
+    if hf_rows:
+        _print_hf_rows(hf_rows, verbose=verbose)
 
 
-def _print_list(concepts: list[ResolvedConcept]) -> None:
-    print(f"{'NAME':<24} {'NS':<12} {'STATUS':<13} {'ALPHA':<6} TAGS")
+def _row_from_concept(c: ResolvedConcept) -> dict:
+    from saklas.packs import ConceptFolder
+    try:
+        cf = ConceptFolder.load(c.folder)
+        tensor_models = cf.tensor_models()
+    except Exception:
+        tensor_models = []
+    return {
+        "name": c.name,
+        "namespace": c.namespace,
+        "status": "installed",
+        "recommended_alpha": c.metadata.recommended_alpha,
+        "tags": list(c.metadata.tags),
+        "description": c.metadata.description,
+        "source": c.metadata.source,
+        "tensor_models": tensor_models,
+    }
+
+
+def _print_list(concepts: list[ResolvedConcept], *, verbose: bool = False) -> None:
+    if verbose:
+        print(f"{'NAME':<24} {'NS':<12} {'STATUS':<13} {'ALPHA':<6} {'TAGS':<24} DESCRIPTION")
+    else:
+        print(f"{'NAME':<24} {'NS':<12} {'STATUS':<13} {'ALPHA':<6} TAGS")
     for c in concepts:
         tags = ",".join(c.metadata.tags)
-        print(
+        row = (
             f"{c.name:<24} {c.namespace:<12} [installed]   "
             f"{c.metadata.recommended_alpha:<6.2f} {tags}"
         )
+        if verbose:
+            row = (
+                f"{c.name:<24} {c.namespace:<12} [installed]   "
+                f"{c.metadata.recommended_alpha:<6.2f} {tags:<24} {c.metadata.description}"
+            )
+        print(row)
 
 
-def _print_info(namespace: str, name: str, hf: bool) -> None:
+def _print_info(namespace: str, name: str, *, hf: bool, json_output: bool = False) -> None:
     folder = concept_dir(namespace, name)
     if folder.exists():
         from saklas.packs import ConceptFolder
         cf = ConceptFolder.load(folder)
+        if json_output:
+            import json as _json
+            print(_json.dumps({
+                "name": name, "namespace": namespace, "status": "installed",
+                "description": cf.metadata.description,
+                "long_description": cf.metadata.long_description,
+                "tags": list(cf.metadata.tags),
+                "recommended_alpha": cf.metadata.recommended_alpha,
+                "source": cf.metadata.source,
+                "tensor_models": cf.tensor_models(),
+            }, indent=2))
+            return
         print(f"{namespace}/{name} [installed]")
         print(f"  description: {cf.metadata.description}")
         if cf.metadata.long_description:
@@ -260,6 +392,15 @@ def _print_info(namespace: str, name: str, hf: bool) -> None:
     if hf:
         from saklas.hf import fetch_info
         info = fetch_info(f"{namespace}/{name}")
+        if json_output:
+            import json as _json
+            print(_json.dumps({
+                "name": name, "namespace": namespace, "status": "hf",
+                "description": info.get("description", ""),
+                "tags": info.get("tags", []),
+                "tensor_models": info.get("tensor_models", []),
+            }, indent=2))
+            return
         print(f"{namespace}/{name} [hf]")
         print(f"  description: {info.get('description', '')}")
         print(f"  tags:        {', '.join(info.get('tags', []))}")
@@ -268,9 +409,16 @@ def _print_info(namespace: str, name: str, hf: bool) -> None:
     print(f"not found: {namespace}/{name}")
 
 
-def _print_hf_rows(rows: list[dict]) -> None:
+def _print_hf_rows(rows: list[dict], *, verbose: bool = False) -> None:
     for row in rows:
-        print(
+        line = (
             f"{row['name']:<24} {row['namespace']:<12} [hf]          "
             f"{row.get('recommended_alpha', 0.0):<6.2f} {','.join(row.get('tags', []))}"
         )
+        if verbose:
+            line = (
+                f"{row['name']:<24} {row['namespace']:<12} [hf]          "
+                f"{row.get('recommended_alpha', 0.0):<6.2f} "
+                f"{','.join(row.get('tags', [])):<24} {row.get('description', '')}"
+            )
+        print(line)

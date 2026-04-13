@@ -6,102 +6,95 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 
-Activation steering and trait monitoring for HuggingFace transformer models. Extract steering vectors, apply them during generation with per-call alpha control, and monitor how activations shift across behavioral probes.
+**Activation steering and trait monitoring for HuggingFace transformer models.** Extract steering vectors from contrastive pairs, apply them during generation with per-call alpha control, and watch how activations shift across behavioral probes — all without touching model weights.
 
-Three interfaces over the same engine:
+Three frontends over one engine:
 
-- **Python library** (`SaklasSession`) — for scripted experiments, batch sweeps, and embedding steering into your own pipelines
-- **OpenAI-compatible API server** (`saklas serve`) — drop-in replacement for the OpenAI SDK, LangChain, `curl`, or anything that speaks `/v1/chat/completions`
-- **Terminal UI** (`saklas`) — interactive Textual app for exploring vectors, live probe readings, and A/B comparison
+- **`saklas <model>`** — interactive terminal UI for exploring vectors, live probe readings, and A/B comparison
+- **`saklas serve <model>`** — OpenAI-compatible HTTP server; drop-in for the OpenAI SDK, LangChain, `curl`
+- **`SaklasSession`** — Python library for scripted experiments, batch sweeps, and embedding steering into your pipelines
 
-53 architectures supported out of the box. Steering vectors compose, alphas are per-call, and probe history accumulates across generations.
+53 architectures supported out of the box. Steering vectors compose. Alphas are per-call — no persistent hooks, no model mutation. Probe history accumulates across generations.
+
+---
+
+## Quick start
+
+```bash
+pip install saklas
+saklas google/gemma-3-4b-it
+```
+
+That's the whole thing. The first run downloads the model, extracts the 28 bundled probes against it (a one-time cost, cached to disk), and drops you into the TUI. Hit `/steer "angry" 0.3` to steer toward anger, or `[` / `]` to nudge temperature, or `Ctrl+A` to A/B compare the steered output against the unsteered baseline.
+
+Want to try it as an API server instead?
+
+```bash
+pip install saklas[serve]
+saklas serve google/gemma-3-4b-it --steer cheerful:0.2
+```
+
+Or from Python:
+
+```python
+from saklas import SaklasSession
+
+with SaklasSession("google/gemma-3-4b-it") as s:
+    angry = s.extract("angry")
+    s.steer("angry", angry)
+    print(s.generate("What makes a good day?", alphas={"angry": 0.3}).text)
+```
+
+---
 
 ## Install
 
 ```bash
-pip install saklas             # base: library + TUI
-pip install saklas[serve]      # + fastapi + uvicorn (for the API server)
-pip install saklas[research]   # + datasets + pandas (for dataset loading / DataFrame export)
+pip install saklas             # library + TUI
+pip install saklas[serve]      # + FastAPI/uvicorn for the API server
+pip install saklas[research]   # + datasets/pandas for dataset loading and DataFrame export
 ```
 
-Requires Python 3.11+ and PyTorch 2.2+. Works on Linux, macOS, and Windows; needs CUDA or Apple Silicon MPS for serious use (CPU works but will be slow).
+Requires Python 3.11+ and PyTorch 2.2+. Runs on Linux, macOS, and Windows. CPU works but is slow — CUDA or Apple Silicon MPS is recommended for anything interactive.
 
-### From source
+**Quantization (experimental).** The `bnb` and `cuda` extras pull in `bitsandbytes` and `flash-attn` for 4-bit/8-bit loading and fused attention. These depend on platform-specific CUDA toolchains and don't build cleanly everywhere; only the vanilla install is officially supported.
+
+```bash
+pip install saklas[bnb]        # bitsandbytes only
+pip install saklas[cuda]       # bitsandbytes + flash-attn (Linux + CUDA_HOME required)
+```
+
+**From source.**
 
 ```bash
 git clone https://github.com/a9lim/saklas
 cd saklas
-pip install -e ".[dev]"            # base + pytest
-pip install -e ".[serve]"          # + fastapi + uvicorn
-pip install -e ".[research]"       # + datasets + pandas
+pip install -e ".[dev]"        # + pytest
 ```
 
-### Quantization and flash-attn (experimental)
-
-The `cuda` and `bnb` extras install `bitsandbytes` and/or `flash-attn` for 4-bit/8-bit quantization and fused attention. They depend on platform-specific CUDA toolchains and may not build cleanly on all systems. Only the vanilla (unquantized) install is officially supported.
-
-```bash
-pip install saklas[bnb]       # bitsandbytes only
-pip install saklas[cuda]      # bitsandbytes + flash-attn (Linux only, needs CUDA_HOME)
-```
-
-From source, `flash-attn` requires build isolation disabled:
-
-```bash
-pip install torch psutil setuptools wheel && pip install -e ".[cuda]" --no-build-isolation
-```
-
-### Cache layout
-
-saklas stores all caches and user-editable data under `~/.saklas/`:
-
-```
-~/.saklas/
-  neutral_statements.json
-  vectors/
-    default/              # bundled probes (pip-installed, refreshable via -r default)
-    local/                # user-authored concepts and merged packs
-    <ns>/                 # packs pulled from Hugging Face (ns = HF repo owner)
-  models/
-    <safe_model_id>/
-      layer_means.safetensors
-```
-
-Set `SAKLAS_HOME=/custom/path` to override the root directory.
-
-## Supported architectures
-
-53 architectures via `model.py:_LAYER_ACCESSORS`. Adding a new one = one function entry. See [CONTRIBUTING.md](CONTRIBUTING.md) for the walkthrough.
-
-Llama (1-4), Mistral (1, 4), Ministral (1, 3), Mixtral, Gemma (1-4), Phi (1-3), PhiMoE, Qwen (1-3.5), Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, Cohere (1-2), DeepSeek (V2-V3), StarCoder2, OLMo (1-3), OLMoE, GLM (3-4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, GPT-OSS, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, RecurrentGemma.
+---
 
 ## How it works
 
 ### Steering vectors
 
-**Representation Engineering** (Zou et al., 2023): For each contrastive pair, saklas captures the last-content-token hidden state at every layer (skipping trailing chat-template markers). It computes pos-neg differences and extracts the first principal component per layer via batched SVD. Each layer is scored by explained variance ratio, producing a multi-layer profile — no manual layer selection. Scores weight each layer's contribution during generation.
+Saklas uses **Representation Engineering** (Zou et al., 2023): for each contrastive pair, capture the last-content-token hidden state at every layer, diff the positive and negative sides, and take the first principal component per layer via SVD. Every layer gets a direction and a score (explained variance ratio); there is no manual layer selection.
 
-Alpha is normalized per-profile so the same value means the same intensity across backbones: α≈0.5 sits in the coherent-nuanced band on every bundled architecture, α≈1.0 is past the collapse cliff. Vectors are registered without alphas and applied per-call, so nothing persists on the model between generations.
+Alpha is **normalized per-profile** so the same numeric value means the same intensity across backbones: α≈0.5 sits in the coherent-nuanced band on every bundled architecture, α≈1.0 is past the collapse cliff. Vectors are registered without alphas and applied per-call, so nothing persists on the model between generations.
 
-### Custom steering vectors
+Multiple vectors **compose** naturally — they register into a single manager that, per generation, Gram-Schmidt-orthogonalizes any co-layer directions (optional) and installs a single in-place hidden-state hook per active layer. Hooks are transient: composed before generation, removed after.
 
-When you steer on a concept that isn't in the curated probe library, saklas generates its own contrastive pairs using the loaded model, then extracts a vector from them:
+### Custom concepts
 
-1. **Statement generation** — the model writes contrastive statement pairs in batches, each batch seeded by a different specificity lens (unique facts/lore, physical traits, social dynamics, inner life, concrete routines). The prompt forces concept-specific detail — names, terminology, sensory descriptions that only apply to the target concept — and explicitly rejects generic statements that could work for anything similar.
-2. **Caching** — generated pairs are saved under `~/.saklas/vectors/local/<concept>/statements.json`. Pairs are model-independent, so a different model reuses the same cached statements.
-3. **Extraction** — pairs feed into the standard contrastive PCA pipeline (per-layer SVD, explained variance scoring).
+When you steer on a concept that isn't in the curated probe library, the loaded model writes its own contrastive pairs. Generation is seeded across multiple "specificity lenses" (unique facts, physical traits, social dynamics, inner life, routines) and the prompt explicitly rejects generic pairs that could apply to anything similar. Pairs cache at `~/.saklas/vectors/local/<concept>/statements.json` and are model-independent, so they're reused across models.
 
-This means `/steer "anything"` works — personality traits, religions, animals, emotions, fictional characters, "man who ate too much spaghetti." The vector captures what's distinctive about the concept, not generic associations.
+This means `/steer "anything"` works — religions, animals, fictional characters, "man who ate too much spaghetti." The vector captures what's distinctive about the concept, not generic associations.
 
-To clear cached tensors for a concept (e.g. to re-extract with a different statements set), use `saklas -x <concept>`. To remove the statements themselves, delete the folder under `~/.saklas/vectors/local/` manually.
+### Trait monitor
 
-### Monitor
+After each generation, saklas runs a separate forward pass over the generated text, pools hidden states from the last content token (matching probe extraction), mean-centers them against a cached per-layer baseline (computed from 45 neutral prompts), and scores against each probe via score-weighted cosine similarity. History accumulates across generations, enabling sparklines and running statistics.
 
-After generation, a separate forward pass over the generated text captures hidden states at every layer, pooled from the last content token — the same pooling used during probe extraction. Each layer's hidden state is mean-centered (subtracting the per-layer mean computed from 45 neutral prompts) to remove baseline projection bias that otherwise makes raw cosine similarities uninformative.
-
-Layer means are computed once per model and cached at `~/.saklas/models/<safe_model_id>/layer_means.safetensors`. They auto-invalidate when `~/.saklas/neutral_statements.json` changes hash. Existing users upgrading across a release that changes the bundled neutrals should run `saklas -n` — `materialize_bundled` is copy-on-miss for that file, so the package-shipped version isn't picked up automatically. Score-weighted cosine similarities against probe vectors produce one value per probe per generation. Probe history accumulates across generations, enabling sparklines and running statistics.
-
-Layer means are computed once per model and cached at `~/.saklas/models/<safe_model_id>/layer_means.safetensors`. They auto-invalidate when `~/.saklas/neutral_statements.json` is edited.
+Layer means are cached at `~/.saklas/models/<safe_model_id>/layer_means.safetensors` and auto-invalidate when `~/.saklas/neutral_statements.json` changes hash.
 
 ### Probe library
 
@@ -115,14 +108,22 @@ Layer means are computed once per model and cached at `~/.saklas/models/<safe_mo
 | **Cultural** | western, hierarchical, direct, contextual, religious, traditional |
 | **Gender** | masculine, agentic, paternal |
 
-Probes are extracted on first run and cached per model under `~/.saklas/vectors/default/<concept>/<safe_model_id>.safetensors`.
+Probes extract on first run against a new model and cache to `~/.saklas/vectors/default/<concept>/<safe_model_id>.safetensors`.
+
+### Supported architectures
+
+53 families via `model.py:_LAYER_ACCESSORS`. Adding a new one = one function entry. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Llama (1–4), Mistral, Ministral, Mixtral, Gemma (1–4), Phi (1–3), PhiMoE, Qwen (1–3.5), Qwen-MoE variants, Cohere (1–2), DeepSeek (V2–V3), StarCoder2, OLMo (1–3), OLMoE, GLM (3–4), Granite, GraniteMoE, Nemotron, StableLM, GPT-2/Neo/J/BigCode/NeoX/OSS, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, RecurrentGemma.
+
+---
 
 ## Terminal UI
 
 ```bash
 saklas google/gemma-2-9b-it
 saklas mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
-saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
+saklas meta-llama/Llama-3.1-8B-Instruct -p emotion personality
 ```
 
 ### Layout
@@ -130,8 +131,8 @@ saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 ```
 +--------------------+----------------------------------+------------------+
 |  VECTORS           |                                  |  TRAIT MONITOR   |
-|  > happy  +0.10    |          Chat                    |  Emotion         |
-|    formal +0.06    |                                  |    happy #### .42|
+|  > angry  +0.10    |          Chat                    |  Emotion         |
+|    formal +0.06    |                                  |    angry #### .42|
 |                    |                                  |    sad   ##- -.15|
 |  CONFIG            |                                  |  Personality     |
 |  temp ####- 0.7    |                                  |    honest ### .31|
@@ -140,26 +141,20 @@ saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 +--------------------+----------------------------------+------------------+
 ```
 
-### CLI options
+Three panels: the vector registry on the left (with live alpha knobs), the chat on the center, the trait monitor on the right (sparklines per probe, sorted by current magnitude or delta). `Tab` cycles focus; arrow keys navigate and adjust.
+
+### TUI flags
 
 | Flag | Description |
 |------|-------------|
-| `model` | HuggingFace model ID or local path |
+| `model` | HuggingFace ID or local path (optional if supplied by `-c`) |
 | `-q`, `--quantize` | `4bit` or `8bit` (CUDA only) |
-| `-d`, `--device` | `auto` (default), `cuda`, `mps`, or `cpu` |
+| `-d`, `--device` | `auto` (default), `cuda`, `mps`, `cpu` |
 | `-p`, `--probes` | Categories: `all`, `none`, `emotion`, `personality`, `safety`, `cultural`, `gender` |
-| `-s`, `--system-prompt` | System prompt |
-| `--max-tokens` | Max tokens per generation (default: 1024) |
-| `-i`, `--install <target>` | Install a pack from HF coordinate (`<ns>/<name>[@revision]`) or local folder path. Revision can be a git tag, branch, or commit SHA; pinned installs are preserved on refresh. |
-| `-r`, `--refresh <selector>` | Re-pull concept(s) from source (repeatable; silently skips `source=local`) |
-| `-n`, `--refresh-neutrals` | Overwrite `~/.saklas/neutral_statements.json` with the bundled copy (forces layer-means recompute) |
-| `-x`, `--clear-tensors <selector>` | Delete tensors for matched concepts; keeps `statements.json` (repeatable) |
-| `-l`, `--list [<selector>]` | List or show info about installed + HF packs; exits after printing |
-| `-m`, `--merge <name> <components>` | Merge vectors: `-m bard default/happy:0.3,user/archaic:0.4` |
-| `-C`, `--config <path>` | Load setup YAML (repeatable; later files override earlier) |
-| `--strict` | With `-C`: fail hard on missing vectors |
+| `-c`, `--config` | Load setup YAML (repeatable; later files override earlier) |
+| `-s`, `--strict` | With `-c`: fail on missing vectors instead of warning |
 
-**Selectors** (used by `-r`, `-x`, `-l`): bare name (resolves across namespaces; errors on ambiguity), `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `model:<id>`, `default`, `all`.
+System prompt, temperature, top-p, and max tokens are set interactively via slash commands — see below.
 
 ### Keybindings
 
@@ -171,9 +166,9 @@ saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 | `Enter` | Toggle vector on/off |
 | `Backspace` / `Delete` | Remove selected vector or probe |
 | `Ctrl+O` | Toggle orthogonalization |
-| `Ctrl+T` | Toggle thinking mode (models that support it) |
+| `Ctrl+T` | Toggle thinking mode (for models that support it) |
 | `Ctrl+A` | A/B compare (steered vs unsteered) |
-| `Ctrl+R` | Regenerate last response (interrupts if generating) |
+| `Ctrl+R` | Regenerate last response |
 | `Ctrl+S` | Cycle trait sort mode |
 | `[` / `]` | Adjust temperature |
 | `{` / `}` | Adjust top-p |
@@ -184,20 +179,20 @@ saklas meta-llama/Llama-3.1-8B-Instruct --probes emotion personality
 
 | Command | Description |
 |---------|-------------|
-| `/steer "concept" [alpha]` | Extract and register steering vector |
-| `/steer "concept" - "baseline" [alpha]` | Contrastive steering |
-| `/probe "concept"` | Add monitoring probe |
+| `/steer "concept" [alpha]` | Extract and register a steering vector |
+| `/steer "concept" - "baseline" [alpha]` | Contrastive steering against a baseline concept |
+| `/probe "concept"` | Add a monitoring probe |
 | `/probe "concept" - "baseline"` | Contrastive probe |
-| `/clear` | Clear history and reset probes |
+| `/clear` | Clear conversation history |
 | `/rewind` | Undo last exchange |
 | `/sys <prompt>` | Set system prompt |
 | `/temp <value>` | Set temperature |
 | `/top-p <value>` | Set top-p |
-| `/max <value>` | Set max tokens |
+| `/max <value>` | Set max tokens per generation |
 
-All commands that touch the model (`/steer`, `/probe`) or modify history (`/clear`, `/rewind`) interrupt any in-progress generation and execute once it stops. Sending a new message mid-generation also stops the current response and submits immediately after.
+Commands that touch the model or modify history (`/steer`, `/probe`, `/clear`, `/rewind`) interrupt any in-progress generation and execute once it stops. Sending a new message mid-generation also interrupts and submits immediately.
 
-Concepts matching built-in probe names use curated datasets from `~/.saklas/vectors/default/<concept>/statements.json`. Otherwise, pairs are generated by the loaded model and cached under `~/.saklas/vectors/local/<concept>/statements.json` — subsequent extractions of the same concept (even with a different model) reuse the cached statements.
+---
 
 ## Python API
 
@@ -206,126 +201,120 @@ from saklas import SaklasSession, DataSource, ResultCollector
 
 with SaklasSession("google/gemma-3-4b-it", device="auto") as session:
     # Extract a steering vector
-    happy_profile = session.extract("happy")       # uses curated dataset
-    session.steer("happy", happy_profile)           # register (no alpha yet)
+    angry = session.extract("angry")         # curated dataset
+    session.steer("angry", angry)            # register (no alpha yet)
 
     # Generate with steering
     result = session.generate(
         "What makes a good day?",
-        alphas={"happy": 0.2},
+        alphas={"angry": 0.2},
     )
     print(result.text)
-    print(result.readings)  # probe monitor data
+    print(result.readings)                   # probe monitor data
 
-    # A/B comparison — just omit alphas
-    unsteered = session.generate("What makes a good day?")
+    # A/B comparison — omit alphas to get the unsteered baseline
+    baseline = session.generate("What makes a good day?")
 
-    # Sweep alphas
+    # Alpha sweep
     collector = ResultCollector()
     for alpha in [0, 0.05, 0.1, 0.15, 0.2, 0.25]:
         session.clear_history()
-        result = session.generate(
-            "Describe a sunset.",
-            alphas={"happy": alpha},
-        )
+        result = session.generate("Describe a sunset.", alphas={"angry": alpha})
         collector.add(result, alpha=alpha)
-    collector.to_csv("sweep_results.csv")
+    collector.to_csv("sweep.csv")
 ```
 
-See [`examples/`](examples/) for runnable scripts:
-
-- [`sweep_alpha.py`](examples/sweep_alpha.py) — sweep a steering vector's alpha across a range
-- [`ab_compare.py`](examples/ab_compare.py) — A/B a prompt with and without steering, dump probe readings
+Runnable examples in [`examples/`](examples/):
+- [`sweep_alpha.py`](examples/sweep_alpha.py) — sweep one vector's alpha and dump probe readings
+- [`ab_compare.py`](examples/ab_compare.py) — A/B a prompt with and without steering
 
 ### Key concepts
 
-**Vectors are registered without alphas.** `session.steer(name, profile)` stores the vector. `session.generate(input, alphas={"name": 0.5})` applies it for that generation only. Alpha is normalized per-profile so the same value means the same intensity across backbones: α≈0.5 sits in the coherent nuanced band on every bundled architecture, α≈1.0 is past the collapse cliff. No persistent hooks live on the model between calls.
+**Registration is state, alphas are per-call.** `session.steer("name", profile)` stores the vector in the registry. `session.generate(input, alphas={"name": 0.5})` applies it for that generation only. No persistent hooks live on the model between calls.
 
-**Orthogonalization is per-call.** `session.generate(input, alphas={...}, orthogonalize=True)` applies Gram-Schmidt to the active vectors for that generation only.
+**Composition is native.** Pass multiple names in `alphas={}`. Orthogonalization (Gram-Schmidt across co-layer directions) is a per-call `orthogonalize=True` flag.
 
-**Thinking mode is per-call.** For models that support it (Qwen 3.5, QwQ, Gemma 4, etc.), `session.generate(input, thinking=True)` enables the model's built-in reasoning trace. Thinking delimiters are detected automatically from the chat template — no hardcoded tokens. Thinking tokens are separated from the response — `result.text` contains only the final answer, while streaming via `generate_stream` yields `TokenEvent` objects with `thinking=True` for the reasoning trace.
+**Thinking mode is per-call.** For models that support it (Qwen 3.5, QwQ, Gemma 4, gpt-oss, etc.), `session.generate(input, thinking=True)` enables the reasoning trace. Delimiters are detected automatically from the chat template — no hardcoded tokens. `result.text` contains only the final answer; streaming yields `TokenEvent` objects with `thinking=True` for the reasoning trace.
 
-**Multiple vectors compose naturally:**
+**Alphas are backbone-normalized.** The same numeric value means the same intensity across architectures. Start at 0.1–0.3 for subtle nudges, 0.4–0.6 for clear shifts, and treat anything past 0.8 as a coherence experiment.
 
 ```python
-session.steer("happy", happy_profile)
-session.steer("formal", formal_profile)
+session.steer("angry", angry)
+session.steer("formal", formal)
 
-# Apply both
-result = session.generate("Hello.", alphas={"happy": 0.2, "formal": 0.1})
-
-# Apply only one
-result = session.generate("Hello.", alphas={"happy": 0.2})
-
-# Apply none
-result = session.generate("Hello.")
+session.generate("Hello.", alphas={"angry": 0.2, "formal": 0.1})  # both
+session.generate("Hello.", alphas={"angry": 0.2})                  # only angry
+session.generate("Hello.")                                         # neither
 ```
 
 ### SaklasSession reference
 
 ```python
 session = SaklasSession(
-    model_id,                        # HuggingFace model ID or local path
-    device="auto",                   # "auto", "cuda", "mps", "cpu"
-    quantize=None,                   # "4bit", "8bit", or None
-    probes=None,                     # list of categories, or None for all
-    system_prompt=None,              # default system prompt
-    max_tokens=1024,                 # max tokens per generation
-    cache_dir=None,                  # vector cache directory
+    model_id,                # HuggingFace ID or local path
+    device="auto",           # "auto", "cuda", "mps", "cpu"
+    quantize=None,           # "4bit", "8bit", or None
+    probes=None,             # list of categories, or None for all
+    system_prompt=None,
+    max_tokens=1024,
 )
 
 # Vector extraction
-profile = session.extract("happy")                  # curated dataset
-profile = session.extract("empathy", baseline="apathy")  # contrastive
-profile = session.extract([("pos", "neg"), ...])     # raw pairs
+profile = session.extract("angry")                         # curated dataset
+profile = session.extract("empathy", baseline="apathy")    # contrastive
+profile = session.extract([("pos", "neg"), ...])           # raw pairs
 profile = session.extract(DataSource.csv("pairs.csv"))
-profile = session.load_profile("saved.safetensors")
-session.save_profile(profile, "output.safetensors")
+session.save_profile(profile, "out.safetensors")
+profile = session.load_profile("out.safetensors")
 
-# Model-generated contrastive pairs
-pairs = session.generate_pairs("curiosity")  # list[(str, str)]
+pairs = session.generate_pairs("curiosity")                # list[(str, str)]
 
-# Vector registry
-session.steer("name", profile)     # register
-session.unsteer("name")            # remove
-session.vectors                    # dict of registered profiles
+# Registry
+session.steer("name", profile)
+session.unsteer("name")
+session.vectors                                            # dict of registered profiles
 
-# Generation
-result = session.generate("prompt", alphas={"name": 0.5}, orthogonalize=False)
-result = session.generate("prompt", thinking=True)  # enable reasoning trace
-for token in session.generate_stream("prompt", alphas={"name": 0.5}):
-    if token.thinking:
-        print(f"[think] {token.text}", end="", flush=True)
-    else:
-        print(token.text, end="", flush=True)
+# Generation (blocking)
+result = session.generate(
+    "prompt",
+    alphas={"name": 0.5},
+    orthogonalize=False,
+    thinking=False,
+    seed=None,
+    stop=None,
+    logprobs=None,
+)
 
-# Monitoring
-session.monitor("honest")                   # curated probe
-session.monitor("custom", custom_profile)    # from profile
+# Streaming
+for tok in session.generate_stream("prompt", alphas={"name": 0.5}):
+    print(f"[think] {tok.text}" if tok.thinking else tok.text, end="", flush=True)
+
+# Monitor
+session.monitor("honest")
+session.monitor("custom", custom_profile)
 session.unmonitor("honest")
 
 # State
-session.config.temperature = 0.8   # also: top_p, max_new_tokens, system_prompt
-session.history                    # conversation messages
-session.last_result                # most recent GenerationResult
-session.model_info                 # model metadata
-session.stop()                     # interrupt generation
-session.rewind()                   # drop last exchange
-session.clear_history()            # clear conversation
+session.config.temperature = 0.8    # also top_p, max_new_tokens, system_prompt
+session.history                     # conversation messages
+session.last_result                 # most recent GenerationResult
+session.stop()                      # interrupt generation
+session.rewind()                    # drop last exchange
+session.clear_history()
 ```
 
-### Structured output
+### GenerationResult
 
 ```python
-result = session.generate("prompt", alphas={"happy": 0.2})
-result.text              # decoded output
+result.text              # decoded output (response only — thinking is separate)
 result.tokens            # token IDs
-result.token_count       # number of tokens
-result.tok_per_sec       # generation speed
-result.elapsed           # seconds
-result.vectors           # {"happy": 0.2} — snapshot of alphas used
+result.token_count
+result.tok_per_sec
+result.elapsed
+result.finish_reason     # "stop" | "length" | "stop_sequence"
+result.vectors           # {"angry": 0.2} — snapshot of alphas used
 result.readings          # {"probe_name": ProbeReadings} if probes active
-result.to_dict()         # plain Python types, JSON-serializable
+result.to_dict()         # JSON-serializable
 ```
 
 ### DataSource formats
@@ -333,55 +322,63 @@ result.to_dict()         # plain Python types, JSON-serializable
 ```python
 from saklas import DataSource
 
-ds = DataSource.curated("happy")                                   # bundled
-ds = DataSource.json("pairs.json")                                 # saklas schema
-ds = DataSource.csv("pairs.csv", positive_col="pos", negative_col="neg")
-ds = DataSource.huggingface("user/dataset", split="train[:100]")   # requires datasets
-ds = DataSource(pairs=[("positive text", "negative text")])
+DataSource.curated("angry")                                  # bundled
+DataSource.json("pairs.json")                                # saklas schema
+DataSource.csv("pairs.csv", positive_col="pos", negative_col="neg")
+DataSource.huggingface("user/dataset", split="train[:100]")  # needs datasets
+DataSource(pairs=[("positive", "negative")])
 ```
 
 ### ResultCollector
 
 ```python
 collector = ResultCollector()
-collector.add(result, concept="happy", alpha=0.2, run_id=1)
+collector.add(result, concept="angry", alpha=0.2, run_id=1)
 
-collector.to_dicts()               # list of flat dicts
+collector.to_dicts()
 collector.to_jsonl("results.jsonl")
 collector.to_csv("results.csv")
-collector.to_dataframe()           # requires pandas
+collector.to_dataframe()           # needs pandas
 ```
 
-Probe readings flatten to columns: `probe_honest_mean`, `probe_honest_std`, etc. Vector alphas flatten to `vector_happy_alpha`.
+Probe readings flatten to columns: `probe_honest_mean`, `probe_honest_std`, etc. Vector alphas flatten to `vector_angry_alpha`.
+
+---
 
 ## OpenAI-compatible API server
 
-Serve a steered model as an OpenAI-compatible HTTP endpoint. Works with the OpenAI Python/JS SDK, LangChain, `curl`, or anything that speaks the OpenAI API.
+Serve a steered model as an OpenAI-compatible HTTP endpoint. Works with the OpenAI Python/JS SDKs, LangChain, LlamaIndex, `curl`, or anything that speaks `/v1/chat/completions`.
 
 ```bash
 pip install saklas[serve]
 saklas serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
 ```
 
-### Usage with the OpenAI SDK
+### With the OpenAI SDK
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
-# Uses server-default steering (cheerful=0.2 from --steer flag)
+# Server-default steering (--steer cheerful:0.2)
 resp = client.chat.completions.create(
     model="google/gemma-2-9b-it",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(resp.choices[0].message.content)
 
-# Override steering per-request
+# Override steering per-request via extra_body
 resp = client.chat.completions.create(
     model="google/gemma-2-9b-it",
     messages=[{"role": "user", "content": "Hello!"}],
-    extra_body={"steer": {"alphas": {"cheerful": 0.4}, "orthogonalize": True, "thinking": True}},
+    extra_body={
+        "steer": {
+            "alphas": {"cheerful": 0.4},
+            "orthogonalize": True,
+            "thinking": True,
+        }
+    },
 )
 
 # Streaming
@@ -393,70 +390,130 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
-### Serve CLI options
+### Serve flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `model` | required | HuggingFace model ID or local path |
-| `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8000` | Bind port |
+| `model` | required | HuggingFace ID or local path |
+| `-H`, `--host` | `0.0.0.0` | Bind address |
+| `-P`, `--port` | `8000` | Bind port |
 | `-q`, `--quantize` | None | `4bit` or `8bit` |
 | `-d`, `--device` | `auto` | `auto`, `cuda`, `mps`, `cpu` |
-| `-p`, `--probes` | all | Probe categories to bootstrap |
-| `-s`, `--system-prompt` | None | Default system prompt |
-| `-m`, `--max-tokens` | `1024` | Max tokens per generation |
-| `--steer` | None | Pre-load vector, repeatable. `name:alpha` or `name` |
-| `--cors` | None | CORS origin, repeatable |
-| `--api-key` | None | Require Bearer auth. Falls back to `$SAKLAS_API_KEY`. Unset = open. |
+| `-p`, `--probes` | `all` | Probe categories to bootstrap |
+| `-S`, `--steer` | — | Pre-load a vector, repeatable. `name:alpha` or `name` |
+| `-C`, `--cors` | — | CORS origin, repeatable |
+| `-k`, `--api-key` | None | Bearer auth token. Falls back to `$SAKLAS_API_KEY`. Unset = open. |
 
 ### Endpoints
 
-**OpenAI-compatible:**
-- `GET /v1/models` — list loaded model
-- `GET /v1/models/{model_id}` — model details
-- `POST /v1/chat/completions` — chat (streaming + non-streaming)
-- `POST /v1/completions` — text completion (streaming + non-streaming)
+**OpenAI-compatible**
+- `GET /v1/models`, `GET /v1/models/{id}`
+- `POST /v1/chat/completions` (streaming + non-streaming)
+- `POST /v1/completions` (streaming + non-streaming)
 
-**Vector management:**
-- `GET /v1/saklas/vectors` — list registered vectors
-- `POST /v1/saklas/vectors/extract` — extract a new vector (streams progress via SSE)
-- `POST /v1/saklas/vectors/load` — load from `.safetensors` file
-- `DELETE /v1/saklas/vectors/{name}` — remove a vector
+**Vector management**
+- `GET /v1/saklas/vectors`
+- `POST /v1/saklas/vectors/extract` (streams progress via SSE)
+- `POST /v1/saklas/vectors/load`
+- `DELETE /v1/saklas/vectors/{name}`
 
-**Probe management:**
-- `GET /v1/saklas/probes` — list active probes + last readings
-- `GET /v1/saklas/probes/defaults` — available default probes by category
-- `POST /v1/saklas/probes/{name}` — activate a probe
-- `DELETE /v1/saklas/probes/{name}` — deactivate a probe
+**Probe management**
+- `GET /v1/saklas/probes`
+- `GET /v1/saklas/probes/defaults`
+- `POST /v1/saklas/probes/{name}`
+- `DELETE /v1/saklas/probes/{name}`
 
-**Session management:**
-- `GET /v1/saklas/session` — current config, model info, default alphas
+**Session management**
+- `GET /v1/saklas/session`
 - `PATCH /v1/saklas/session` — update temperature, top_p, max_tokens, system_prompt
-- `POST /v1/saklas/session/clear` — clear conversation history
-- `POST /v1/saklas/session/rewind` — undo last exchange
+- `POST /v1/saklas/session/clear`
+- `POST /v1/saklas/session/rewind`
 
-Full API docs available at `http://localhost:8000/docs` when the server is running.
+Full interactive docs at `http://localhost:8000/docs` while the server is running.
 
-Probe readings are returned as an extra `probe_readings` field in generation responses — standard clients ignore it, aware clients get inline monitoring data.
+### OpenAI parity and limits
 
-### OpenAI parity
+Chat/completions accept the full standard parameter surface: `stop` (string or list), `seed`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` + `top_logprobs`, `stream_options.include_usage`, `max_completion_tokens`, plus accept-and-ignore for `user`, `n`, `response_format`, and `messages[].name`. Responses include real `usage` counts, accurate `finish_reason`, and the first streaming chunk emits `{role: "assistant"}` per OpenAI convention. Error responses follow the OpenAI shape with `type`/`param`/`code` fields.
 
-Chat/completions accept the full standard parameter surface: `stop` (string or list), `seed`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` + `top_logprobs`, `stream_options.include_usage`, `max_completion_tokens`, plus accept-and-ignore for `user`, `n`, `response_format`, and `messages[].name`. Multimodal content-part arrays are flattened to text (non-text parts rejected). Responses include real `usage` token counts, accurate `finish_reason` (`stop`/`length`/`stop_sequence`), and the first streaming chunk emits `{role: "assistant"}` per OpenAI convention. Error responses follow the OpenAI shape with `type`/`param`/`code` fields.
+Probe readings piggyback as an extra `probe_readings` field in generation responses — standard clients ignore it, aware clients get inline monitoring data.
 
-The server is **stateless** — each request carries its full message list and neither conversation history nor probe accumulators persist between requests. (The `/v1/saklas/session/*` management routes are still stateful by design for single-user workflows.) Concurrent requests queue FIFO against a single generation lock rather than 409ing. Tool calling, strict JSON schema mode, and `/v1/embeddings` are not supported.
+The server is **stateless by default** — each request carries its full message list, and neither conversation history nor probe accumulators persist across requests. The `/v1/saklas/session/*` routes are stateful by design for single-user workflows. Concurrent requests queue FIFO against a single generation lock.
 
-The server is designed for **trusted networks** — see [SECURITY.md](SECURITY.md) for the full threat model before exposing it beyond your local machine.
+**Not supported:** tool calling, strict JSON/`json_schema` mode, `/v1/embeddings`.
+
+The server is designed for **trusted networks** — see [SECURITY.md](SECURITY.md) for the threat model before exposing it beyond your local machine.
+
+---
+
+## Managing concept packs
+
+Saklas stores all state under `~/.saklas/` (override via `SAKLAS_HOME`):
+
+```
+~/.saklas/
+  neutral_statements.json                  # user-editable (copy-on-miss from package)
+  vectors/
+    default/<concept>/                     # bundled probes
+    local/<concept>/                       # user-authored + merged
+    <hf_owner>/<concept>/                  # HF-pulled
+  models/<safe_model_id>/layer_means.safetensors
+```
+
+Each concept is a folder with `pack.json` (metadata + file hashes), `statements.json` (the contrastive pairs), and zero or more `<safe_model_id>.safetensors` tensor files (one per model the concept has been extracted against). Tensors are extracted lazily — a pack without tensors is fine; it'll extract on first use.
+
+Packs are distributed as **HuggingFace model repos** (not datasets — safetensors is model-hub-native, and `base_model` frontmatter gives reverse-link discoverability from the base model's hub page). Pin any install to a git tag, branch, or commit SHA with `@revision`; pinned installs are preserved on refresh — pinning means pinning.
+
+### Commands
+
+```bash
+saklas install <target> [-s] [-a NS/NAME] [-f]   # from HF coord (ns/name[@rev]) or folder path
+saklas refresh <selector> [-m MODEL]              # re-pull from source
+saklas refresh neutrals                           # reserved: rewrite neutral_statements.json
+saklas clear <selector> [-m MODEL] [-y]           # delete per-model tensors, keep statements
+saklas uninstall <selector> [-y]                  # fully remove concept folder
+saklas list [selector] [-i] [-j] [-v]             # includes HF hub by default
+saklas merge <name> <components> [-m] [-f] [-s]   # merge: saklas merge bard default/angry:0.3,user/arch:0.4
+```
+
+**Selectors** (shared grammar): `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and error on ambiguity.
+
+**`install -s` / `--statements-only`** keeps only `statements.json` and drops any tensors that arrived with the pack. The concept folder stays a legitimate standalone pack — tensors re-extract on first use against whatever model you load. Useful when you want the pairs but prefer to extract locally.
+
+**`refresh neutrals`** is a reserved form that overwrites `~/.saklas/neutral_statements.json` with the bundled package copy. Run this after upgrading across a release that changes the bundled neutrals — `materialize_bundled` is copy-on-miss so existing users keep their old file by default. Layer means auto-recompute on next session init via the hash check.
+
+**`clear` vs `uninstall`**: `clear` deletes tensors but keeps `statements.json` and `pack.json` (so the concept remains selectable and will re-extract on demand). `uninstall` removes the whole folder. Uninstalling a bundled concept is allowed — it respawns on the next session init via `materialize_bundled`. Broad selectors (`all`, `namespace:`) require `-y` on both commands.
+
+**`list`** queries the HF hub by default and merges results with local installs. Pass `-i` for installed-only, `-j` for JSON output, `-v` to include descriptions inline.
+
+### Python library
+
+All of the above is also available programmatically:
+
+```python
+from saklas import cache_ops
+from saklas.cli_selectors import parse as sel_parse
+
+cache_ops.install("a9lim/angry@v1.2", as_=None, force=False, statements_only=False)
+cache_ops.refresh(sel_parse("tag:emotion"), model_scope="google/gemma-2-9b-it")
+cache_ops.delete_tensors(sel_parse("angry"), model_scope=None)
+cache_ops.uninstall(sel_parse("angry"), yes=False)
+cache_ops.list_concepts(sel_parse("tag:emotion"), hf=True, installed_only=False)
+```
+
+---
 
 ## Tests
 
 ```bash
-pytest tests/ -v                   # all tests
-pytest tests/test_results.py tests/test_datasource.py tests/test_server.py -v  # no GPU needed
-pytest tests/test_smoke.py -v      # CUDA or MPS required
+pytest tests/                      # everything
+pytest tests/test_server.py tests/test_results.py tests/test_datasource.py  # CPU-only
+pytest tests/test_smoke.py         # GPU required
 ```
 
-GPU tests (`test_smoke.py`, `test_session.py`) download `google/gemma-3-4b-it` (~8 GB) on first run and accept either CUDA or Apple Silicon MPS. Non-GPU tests run anywhere.
+GPU tests (`test_smoke.py`, `test_session.py`) download `google/gemma-3-4b-it` (~8 GB) on first run and accept either CUDA or Apple Silicon MPS. Everything else runs anywhere.
+
+---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, tests, and how to add a new architecture. Security issues: [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, test layout, and the walkthrough for adding a new architecture. Security issues: [SECURITY.md](SECURITY.md).
