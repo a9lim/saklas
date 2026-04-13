@@ -1,0 +1,14 @@
+{
+  "name": "manipulative",
+  "description": "Monopolar probe: manipulative.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "alignment"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "d566a595b54f1972a5b6cb14ec1968110b8e446b22c4c236c2ed45c44940d445"
+  }
+}

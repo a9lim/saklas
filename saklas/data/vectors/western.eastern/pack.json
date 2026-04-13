@@ -1,0 +1,14 @@
+{
+  "name": "western.eastern",
+  "description": "Bipolar axis: western (+) vs eastern (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "bbd72327a037aaf89749b5490521c2bcc8f2da62f20ba7f7e781a89b734f7e12"
+  }
+}

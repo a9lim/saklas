@@ -1,0 +1,14 @@
+{
+  "name": "verbose.concise",
+  "description": "Bipolar axis: verbose (+) vs concise (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "register"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "dedaa0385c8fc8c2ff18107029e4b1b247a1d762817a25f4651f16e849d9c892"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "happy.sad",
+  "description": "Bipolar axis: happy (+) vs sad (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "affect"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "5999346f5a8e4aa8ee6a540bc7a3c698f9a6b9cc8b3592322e7d2b529e0efa5b"
+  }
+}

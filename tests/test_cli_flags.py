@@ -177,8 +177,8 @@ def test_run_uninstall_with_yes(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas import packs
     packs.materialize_bundled()
-    cli.main(["uninstall", "happy"])
-    assert not (tmp_path / "vectors" / "default" / "happy").exists()
+    cli.main(["uninstall", "happy.sad"])
+    assert not (tmp_path / "vectors" / "default" / "happy.sad").exists()
 
 
 def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
@@ -187,7 +187,8 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
     packs.materialize_bundled()
 
     p = tmp_path / "setup.yaml"
-    p.write_text("model: fake-model\nvectors:\n  default/happy: 0.4\n")
+    # `default/happy` aliases to `default/happy.sad` via resolve_pole.
+    p.write_text("model: fake-model\nvectors:\n  default/happy.sad: 0.4\n")
 
     registered = {}
 
@@ -221,4 +222,4 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
     monkeypatch.setattr(_tui_app, "SaklasApp", FakeApp)
 
     cli.main(["-c", str(p)])
-    assert "default/happy" in registered
+    assert "default/happy.sad" in registered

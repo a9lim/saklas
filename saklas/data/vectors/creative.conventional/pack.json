@@ -1,0 +1,14 @@
+{
+  "name": "creative.conventional",
+  "description": "Bipolar axis: creative (+) vs conventional (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "register"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "de0fbd6a3da817244f99df2f9166df86d7831c67d196dfe307210d439f67828e"
+  }
+}

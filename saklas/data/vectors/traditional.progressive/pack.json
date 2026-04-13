@@ -1,0 +1,14 @@
+{
+  "name": "traditional.progressive",
+  "description": "Bipolar axis: traditional (+) vs progressive (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "f3a79e420443374693c0134b6496163b21c4da57ffee4ce2e2309052d993f895"
+  }
+}

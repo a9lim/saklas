@@ -1,0 +1,14 @@
+{
+  "name": "authoritative.submissive",
+  "description": "Bipolar axis: authoritative (+) vs submissive (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "social_stance"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "4636bc6fce27cce2e889d94b93058cb761f244881d2f2d8a4415794345273f81"
+  }
+}
