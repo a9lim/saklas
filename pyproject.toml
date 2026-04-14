@@ -31,7 +31,7 @@ dependencies = [
     "torch>=2.2",
     "transformers>=4.51",
     "accelerate>=0.27",
-    "safetensors>=0.4",
+    "safetensors>=0.7.0",
     "textual>=0.50",
     "pyyaml>=6.0",
 ]
@@ -44,11 +44,11 @@ bnb = ["bitsandbytes>=0.43"]
 flash = ["flash-attn>=2.5"]
 cuda = ["bitsandbytes>=0.43", "flash-attn>=2.5"]
 dev = ["pytest>=8.0", "httpx>=0.27"]
-serve = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+serve = ["fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
 hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
-pandas = ["pandas>=2.0"]
-research = ["datasets>=2.0", "pandas>=2.0"]
+pandas = ["pandas>=3.0.2"]
+research = ["datasets>=2.0", "pandas>=3.0.2"]
 
 [project.scripts]
 saklas = "saklas.cli:main"
