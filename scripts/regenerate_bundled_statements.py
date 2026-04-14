@@ -174,20 +174,22 @@ def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> boo
 # --- neutrals ---------------------------------------------------------------
 
 NEUTRAL_SYSTEM = (
-    "You generate affect-neutral statements for neural network "
-    "interpretability research. Statements are used as a baseline for "
-    "mean-centering activation vectors, so they must be free of emotional "
-    "charge, opinion, stylistic voice, and ideological framing."
+    "You generate affect-neutral baseline statements for activation-vector "
+    "interpretability research. Statements anchor the model's neutral "
+    "linguistic state, so they should read like encyclopedia captions: "
+    "calm, third-person, factual, with no narrative voice or speaker."
 )
 
 NEUTRAL_DOMAINS = [
-    "everyday domestic routines and objects",
-    "natural phenomena, geography, and weather",
-    "scientific and mathematical facts",
-    "procedures, instructions, or mechanical operations",
-    "architecture, infrastructure, and urban scenes",
+    "everyday objects and household routines",
+    "weather, geography, and natural phenomena",
+    "scientific facts and physical processes",
+    "mechanical procedures, tools, and how things work",
+    "urban scenes, architecture, and infrastructure",
     "plants, animals, and ecosystems",
-    "tools, materials, and simple physical descriptions",
+    "materials, textures, and physical properties",
+    "abstract concepts, definitions, and categories",
+    "numerical, temporal, or measurement-based facts",
 ]
 
 
@@ -199,18 +201,16 @@ def generate_neutrals(session: SaklasSession, n: int) -> list[str]:
         if len(out) >= n:
             break
         prompt = (
-            f"Write exactly {batch} affect-neutral single-sentence statements "
-            f"about {domain}.\n\n"
-            f"Rules:\n"
-            f"- Each statement describes a fact, scene, or procedure\n"
-            f"- No emotions, opinions, judgements, or first-person feelings\n"
-            f"- No strong stylistic voice — plain declarative tone\n"
-            f"- No ideological, political, or religious framing\n"
-            f"- 1 sentence each, 8–20 words\n"
-            f"- Vary the grammatical subject and the specific topic\n\n"
-            f"Format: number, period, then the statement. Nothing else.\n\n"
-            f"1. [statement]\n"
-            f"2. [statement]"
+            f"Write exactly {batch} factual descriptive sentences about "
+            f"{domain}.\n\n"
+            f"Each sentence is one observation, stated plainly in the third "
+            f"person, like a caption in a textbook or an encyclopedia entry. "
+            f"Use neutral declarative prose, vary the grammatical subject "
+            f"and specific topic across sentences, and keep each sentence "
+            f"between 10 and 20 words.\n\n"
+            f"Format: number, period, then the sentence. Nothing else.\n\n"
+            f"1. [sentence]\n"
+            f"2. [sentence]"
         )
         messages = [
             {"role": "system", "content": NEUTRAL_SYSTEM},

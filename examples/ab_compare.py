@@ -23,13 +23,13 @@ def main() -> None:
     args = ap.parse_args()
 
     with SaklasSession(args.model, device="auto") as session:
-        profile = session.extract(args.concept)
-        session.steer(args.concept, profile)
+        name, profile = session.extract(args.concept)
+        session.steer(name, profile)
 
         unsteered = session.generate(args.prompt, stateless=True, seed=0)
         steered = session.generate(
             args.prompt,
-            alphas={args.concept: args.alpha},
+            alphas={name: args.alpha},
             stateless=True,
             seed=0,
         )
