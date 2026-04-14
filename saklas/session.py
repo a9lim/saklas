@@ -191,7 +191,7 @@ class SaklasSession:
         )
 
         # Vector registry: name -> profile. No alphas, no hooks.
-        self._profiles: dict[str, dict[int, tuple[torch.Tensor, float]]] = {}
+        self._profiles: dict[str, dict[int, torch.Tensor]] = {}
 
         # Transient steering manager — used only during generation
         self._steering = SteeringManager()
@@ -240,7 +240,7 @@ class SaklasSession:
         return name in self._profiles
 
     @property
-    def vectors(self) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
+    def vectors(self) -> dict[str, dict[int, torch.Tensor]]:
         """Registered steering vector profiles: name -> profile."""
         return dict(self._profiles)
 
@@ -498,7 +498,7 @@ class SaklasSession:
         source,
         baseline: str | None = None,
         on_progress: Callable[[str], None] | None = None,
-    ) -> tuple[str, dict[int, tuple[torch.Tensor, float]]]:
+    ) -> tuple[str, dict[int, torch.Tensor]]:
         """Extract a steering vector profile.
 
         Full pipeline: cache check -> curated dataset -> statement cache ->
@@ -646,7 +646,7 @@ class SaklasSession:
         self._update_local_pack_files(local_folder)
         return canonical, profile
 
-    def load_profile(self, path: str) -> dict[int, tuple[torch.Tensor, float]]:
+    def load_profile(self, path: str) -> dict[int, torch.Tensor]:
         profile, _meta = _load_profile(path)
         return self._promote_profile(profile)
 
@@ -655,7 +655,7 @@ class SaklasSession:
 
     # -- Steering (vector registry) --
 
-    def steer(self, name: str, profile: dict[int, tuple[torch.Tensor, float]]) -> None:
+    def steer(self, name: str, profile: dict[int, torch.Tensor]) -> None:
         """Register a steering vector. Applied during generate() via alphas."""
         self._profiles[name] = profile
 
@@ -708,9 +708,8 @@ class SaklasSession:
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
-    def _promote_profile(self, profile: dict[int, tuple[torch.Tensor, float]]) -> dict[int, tuple[torch.Tensor, float]]:
-        return {idx: (vec.to(self._device, self._dtype), score)
-                for idx, (vec, score) in profile.items()}
+    def _promote_profile(self, profile: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        return {idx: vec.to(self._device, self._dtype) for idx, vec in profile.items()}
 
     # -- Monitoring --
 

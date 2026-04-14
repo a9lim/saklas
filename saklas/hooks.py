@@ -76,7 +76,12 @@ class SteeringHook:
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        """Pre-compose all vectors for this layer into a single tensor."""
+        """Pre-compose all vectors for this layer into a single tensor.
+
+        ``vectors`` is a list of ``(baked_direction, effective_alpha)`` pairs;
+        multiple entries occur when several named profiles contribute to the
+        same layer (different alphas) and are summed linearly.
+        """
         if not vectors:
             self.composed = None
             return
@@ -92,11 +97,28 @@ class SteeringHook:
         self.composed = (alphas.unsqueeze(1) * stacked).sum(dim=0)
 
     def hook_fn(self, module, input, output):
-        if self.composed is not None:
-            if isinstance(output, torch.Tensor):
-                output.add_(self.composed)
-                return output
-            output[0].add_(self.composed)
+        if self.composed is None:
+            return output
+        hidden = output if isinstance(output, torch.Tensor) else output[0]
+        # Norm preservation: rescale each position back to its pre-injection
+        # magnitude after adding the steering vector.  Keeps the residual
+        # stream norm on its natural trajectory, which prevents the
+        # "crank alpha → logit explosion → gibberish" failure mode at high
+        # user alpha.  Per-token in the unmodified add step, so only the
+        # magnitude is clamped — the direction still moves toward the
+        # steering pole proportionally to alpha.
+        #
+        # vector_norm(dtype=fp32) upcasts the accumulator without
+        # materializing an fp32 copy of the hidden tensor, which matters
+        # at hidden_dim >= 2048 where fp16 sum-of-squares overflows.
+        norm_pre = torch.linalg.vector_norm(
+            hidden, dim=-1, keepdim=True, dtype=torch.float32,
+        )
+        hidden.add_(self.composed)
+        norm_post = torch.linalg.vector_norm(
+            hidden, dim=-1, keepdim=True, dtype=torch.float32,
+        ).clamp_(min=1e-6)
+        hidden.mul_((norm_pre / norm_post).to(hidden.dtype))
         return output
 
     def attach(self, layer_module: torch.nn.Module) -> None:
@@ -110,15 +132,14 @@ class SteeringHook:
             self._handle = None
 
 
-# Global gain that pins the user-facing alpha scale.  Per-layer injection
-# is distributed in proportion to each layer's PCA explained-variance
-# score, summing to exactly `user_alpha * _STEER_GAIN` across the whole
-# residual stream:
+# Global gain that pins the user-facing alpha scale.  Per-layer shares
+# (score_i / sum(scores)) are baked into the stored direction magnitudes
+# at extraction time, so the hook math collapses to a single flat scalar:
 #
-#     effective_alpha_i = user_alpha * _STEER_GAIN
-#                       * (score_i / sum(scores))
+#     effective_injection = user_alpha * _STEER_GAIN * baked_direction_i
 #
-# Two invariances fall out of this form:
+# The same two invariances fall out of the baking step (they just moved
+# from apply-time to extract-time):
 #
 #   - Layer-count invariance: total injection is independent of n_layers,
 #     so models of different depths hit the same behavioral effect at the
@@ -153,7 +174,7 @@ class SteeringManager:
     def add_vector(
         self,
         name: str,
-        profile: dict[int, tuple[torch.Tensor, float]],
+        profile: dict[int, torch.Tensor],
         alpha: float,
     ) -> None:
         self.vectors[name] = {
@@ -170,11 +191,8 @@ class SteeringManager:
         """Group vectors by layer, recompose hooks, attach to model."""
         by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
         for v in self.vectors.values():
-            profile = v["profile"]
-            total_score = sum(score for _, score in profile.values())
-            scale = _STEER_GAIN / total_score
-            for layer_idx, (vec, score) in profile.items():
-                effective_alpha = v["alpha"] * score * scale
+            effective_alpha = v["alpha"] * _STEER_GAIN
+            for layer_idx, vec in v["profile"].items():
                 by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
 
         # Detach hooks for layers that no longer have vectors

@@ -12,7 +12,7 @@ def _mk(home, ns, name, models=(), tags=(), source="local"):
     for m in models:
         ts = d / f"{m}.safetensors"
         ts.write_bytes(b"\x00" * 8)
-        sc = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="2.0.0")
+        sc = packs.Sidecar(method="contrastive_pca", saklas_version="2.0.0")
         sc.write(d / f"{m}.json")
         files[f"{m}.safetensors"] = packs.hash_file(ts)
         files[f"{m}.json"] = packs.hash_file(d / f"{m}.json")

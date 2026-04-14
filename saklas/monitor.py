@@ -11,29 +11,32 @@ _EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
 class TraitMonitor:
     """Monitors model activations against a library of probe vectors.
 
-    Each probe has a profile (dict mapping layer_idx -> (vector, score)).
+    Each probe has a profile (dict mapping layer_idx -> baked direction).
     After generation, a single forward pass over the generated text
     pools the last content token's hidden state at each layer.
     Mean-centered cosine similarities against probe vectors, weighted by
-    score, give one value per probe per generation.
+    the baked magnitude ||baked_i|| (which encodes share * ref_norm — the
+    same "how much does this layer steer per unit alpha" quantity),
+    give one value per probe per generation.
     """
 
     @staticmethod
     def _empty_stats() -> dict:
         return dict(_EMPTY_STATS)
 
-    def __init__(self, probe_profiles: dict[str, dict[int, tuple[torch.Tensor, float]]],
+    def __init__(self, probe_profiles: dict[str, dict[int, torch.Tensor]],
                  layer_means: dict[int, torch.Tensor] | None = None):
         """
-        probe_profiles: maps probe name -> profile dict (layer_idx -> (vector, score))
+        probe_profiles: maps probe name -> profile dict (layer_idx -> baked vector)
         layer_means: maps layer_idx -> mean activation vector for centering
         """
-        self._raw_profiles: dict[str, dict[int, tuple[torch.Tensor, float]]] = dict(probe_profiles)
+        self._raw_profiles: dict[str, dict[int, torch.Tensor]] = dict(probe_profiles)
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
 
-        # Cache of probe vectors pre-normalized to unit float32 on a specific device.
-        # Structure: {probe_name: {layer_idx: v_unit_tensor}}, plus a single _cache_device.
-        self._v_unit_cache: dict[str, dict[int, torch.Tensor]] = {}
+        # Cache of probe vectors pre-normalized to unit float32 on a specific device,
+        # paired with the baked magnitude used as the per-layer weight.
+        # Structure: {probe_name: {layer_idx: (v_unit, weight)}}.
+        self._v_unit_cache: dict[str, dict[int, tuple[torch.Tensor, float]]] = {}
         self._cache_device: torch.device | None = None
         # Cache of layer_means cast to float32 on cache_device.
         self._mean_cache: dict[int, torch.Tensor] = {}
@@ -53,8 +56,8 @@ class TraitMonitor:
         return list(self._raw_profiles.keys())
 
     @property
-    def profiles(self) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
-        """Probe profiles: name -> {layer_idx: (vector, score)}."""
+    def profiles(self) -> dict[str, dict[int, torch.Tensor]]:
+        """Probe profiles: name -> {layer_idx: baked vector}."""
         return self._raw_profiles
 
     @property
@@ -83,13 +86,13 @@ class TraitMonitor:
                 return
 
         self._cache_device = device
-        new_cache: dict[int, dict[int, torch.Tensor]] = {}
+        new_cache: dict[str, dict[int, tuple[torch.Tensor, float]]] = {}
         for name, prof in self._raw_profiles.items():
-            per_layer: dict[int, torch.Tensor] = {}
-            for layer_idx, (vec, _score) in prof.items():
+            per_layer: dict[int, tuple[torch.Tensor, float]] = {}
+            for layer_idx, vec in prof.items():
                 v = vec.to(device=device, dtype=torch.float32)
                 vn = v.norm().clamp(min=1e-8)
-                per_layer[layer_idx] = v / vn
+                per_layer[layer_idx] = (v / vn, float(vn.item()))
             new_cache[name] = per_layer
         self._v_unit_cache = new_cache
 
@@ -141,13 +144,13 @@ class TraitMonitor:
             total_w = 0.0
             weighted: torch.Tensor | None = None
             v_unit_layers = self._v_unit_cache.get(name, {})
-            for layer_idx, (_vec, score) in self._raw_profiles[name].items():
+            for layer_idx in self._raw_profiles[name]:
                 h_unit = h_unit_per_layer.get(layer_idx)
                 if h_unit is None:
                     continue
-                total_w += score
-                v_unit = v_unit_layers[layer_idx]
-                term = (h_unit @ v_unit) * score
+                v_unit, w = v_unit_layers[layer_idx]
+                total_w += w
+                term = (h_unit @ v_unit) * w
                 weighted = term if weighted is None else weighted + term
             total_w = max(total_w, 1e-8)
             if weighted is None:
@@ -239,19 +242,20 @@ class TraitMonitor:
             total_w = 0.0
             weighted: torch.Tensor | None = None
             v_unit_layers = self._v_unit_cache.get(name, {})
-            for layer_idx, (_vec, score) in self._raw_profiles[name].items():
+            for layer_idx in self._raw_profiles[name]:
                 h = captured.get(layer_idx)
                 if h is None or h.shape[0] != n:
                     continue
-                v_unit = v_unit_layers.get(layer_idx)
-                if v_unit is None:
+                entry = v_unit_layers.get(layer_idx)
+                if entry is None:
                     continue
+                v_unit, w = entry
                 h_unit = h_unit_cache.get(layer_idx)
                 if h_unit is None:
                     h_unit = self._normalize_hidden_2d(layer_idx, h.float())
                     h_unit_cache[layer_idx] = h_unit
-                total_w += score
-                term = score * (h_unit @ v_unit)
+                total_w += w
+                term = w * (h_unit @ v_unit)
                 weighted = term if weighted is None else weighted + term
             total_w = max(total_w, 1e-8)
             if weighted is None:
@@ -304,7 +308,7 @@ class TraitMonitor:
         span = hi - lo if hi != lo else 1.0
         return "".join(blocks[min(8, max(0, int((v - lo) / span * 8)))] for v in values)
 
-    def add_probe(self, name: str, profile: dict[int, tuple[torch.Tensor, float]]):
+    def add_probe(self, name: str, profile: dict[int, torch.Tensor]):
         is_new = name not in self._raw_profiles
         self._raw_profiles[name] = profile
         if is_new:

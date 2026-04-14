@@ -67,13 +67,11 @@ def test_sidecar_parse_minimal(tmp_path):
     p = tmp_path / "google__gemma-2-2b-it.json"
     p.write_text(json.dumps({
         "method": "contrastive_pca",
-        "scores": {"0": 0.02, "14": 0.31},
         "statements_sha256": "abc123",
         "saklas_version": "2.0.0",
     }))
     sc = packs.Sidecar.load(p)
     assert sc.method == "contrastive_pca"
-    assert sc.scores == {0: 0.02, 14: 0.31}
     assert sc.statements_sha256 == "abc123"
     assert sc.saklas_version == "2.0.0"
     assert sc.components is None
@@ -83,7 +81,6 @@ def test_sidecar_merge_with_components(tmp_path):
     p = tmp_path / "merged.json"
     p.write_text(json.dumps({
         "method": "merge",
-        "scores": {"0": 0.5},
         "saklas_version": "2.0.0",
         "components": {
             "default/happy": {"alpha": 0.3, "tensor_sha256": "aa"},
@@ -103,13 +100,12 @@ def test_sidecar_write_roundtrip(tmp_path):
     p = tmp_path / "x.json"
     sc = packs.Sidecar(
         method="contrastive_pca",
-        scores={0: 0.1, 5: 0.4},
         statements_sha256="hash",
         saklas_version="2.0.0",
     )
     sc.write(p)
     loaded = packs.Sidecar.load(p)
-    assert loaded.scores == sc.scores
+    assert loaded.method == "contrastive_pca"
     assert loaded.statements_sha256 == "hash"
 
 
@@ -158,7 +154,6 @@ def _make_concept(tmp_path, name="happy", with_statements=True, with_tensor=Fals
         files["google__gemma-2-2b-it.safetensors"] = packs.hash_file(t)
         sc = packs.Sidecar(
             method="contrastive_pca",
-            scores={0: 0.1},
             saklas_version="2.0.0",
             statements_sha256=files.get("statements.json"),
         )
@@ -203,6 +198,62 @@ def test_concept_folder_load_empty_errors(tmp_path):
         packs.ConceptFolder.load(d)
 
 
+def test_concept_folder_load_gguf_only(tmp_path):
+    """A concept folder with only a .gguf tensor (no safetensors) should load."""
+    gguf = pytest.importorskip("gguf")
+    import torch
+    from saklas.gguf_io import write_gguf_profile
+
+    d = tmp_path / "gguf_only"
+    d.mkdir()
+    profile = {0: torch.randn(8), 1: torch.randn(8)}
+    write_gguf_profile(profile, d / "llama.gguf", model_hint="llama")
+    files = {"llama.gguf": packs.hash_file(d / "llama.gguf")}
+    packs.PackMetadata(
+        name="gguf-only", description="x", version="1.0.0", license="MIT",
+        tags=[], recommended_alpha=0.5, source="local", files=files,
+    ).write(d)
+
+    cf = packs.ConceptFolder.load(d)
+    assert cf.has_statements is False
+    assert cf.tensor_models() == ["llama"]
+    assert cf.tensor_format("llama") == "gguf"
+    assert cf.tensor_path("llama") == d / "llama.gguf"
+    # GGUF tensors have no JSON sidecar.
+    with pytest.raises(KeyError):
+        cf.sidecar("llama")
+
+
+def test_concept_folder_prefers_safetensors_over_gguf(tmp_path):
+    """Both safetensors and gguf present for the same model → safetensors wins."""
+    pytest.importorskip("gguf")
+    import torch
+    from saklas.gguf_io import write_gguf_profile
+    from saklas.vectors import save_profile
+
+    d = tmp_path / "dual"
+    d.mkdir()
+    profile = {0: torch.randn(8)}
+    save_profile(profile, str(d / "llama.safetensors"),
+                 {"method": "contrastive_pca"})
+    write_gguf_profile(profile, d / "llama.gguf", model_hint="llama")
+
+    files = {
+        "llama.safetensors": packs.hash_file(d / "llama.safetensors"),
+        "llama.json": packs.hash_file(d / "llama.json"),
+        "llama.gguf": packs.hash_file(d / "llama.gguf"),
+    }
+    packs.PackMetadata(
+        name="dual", description="x", version="1.0.0", license="MIT",
+        tags=[], recommended_alpha=0.5, source="local", files=files,
+    ).write(d)
+    cf = packs.ConceptFolder.load(d)
+    assert cf.tensor_format("llama") == "safetensors"
+    assert cf.tensor_path("llama").suffix == ".safetensors"
+    # Sidecar works because we picked the safetensors side.
+    assert cf.sidecar("llama").method == "contrastive_pca"
+
+
 def test_concept_folder_load_tampered_errors(tmp_path):
     d = _make_concept(tmp_path, with_statements=True, with_tensor=False)
     (d / "statements.json").write_text("[{}]")  # mutate, breaks hash
@@ -224,16 +275,16 @@ def test_is_stale_statements_changed(tmp_path):
 
 
 def test_is_stale_no_statements():
-    sc = packs.Sidecar(method="merge", scores={0: 0.1}, saklas_version="2.0.0")
+    sc = packs.Sidecar(method="merge", saklas_version="2.0.0")
     assert packs.is_stale(current_statements_sha=None, sidecar=sc) is False
 
 
 def test_version_mismatch_detection():
-    sc = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="1.9.9")
+    sc = packs.Sidecar(method="contrastive_pca", saklas_version="1.9.9")
     assert packs.version_mismatch(sc, current="2.0.0") is True
-    sc2 = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="2.0.3")
+    sc2 = packs.Sidecar(method="contrastive_pca", saklas_version="2.0.3")
     assert packs.version_mismatch(sc2, current="2.0.0") is False
-    sc3 = packs.Sidecar(method="contrastive_pca", scores={0: 0.1}, saklas_version="2.1.0")
+    sc3 = packs.Sidecar(method="contrastive_pca", saklas_version="2.1.0")
     assert packs.version_mismatch(sc3, current="2.0.0") is True
 
 
@@ -241,8 +292,8 @@ def test_save_load_profile_roundtrip_slim_sidecar(tmp_path):
     import torch
     from saklas.vectors import save_profile, load_profile
     profile = {
-        0: (torch.randn(8), 0.12),
-        14: (torch.randn(8), 0.44),
+        0: torch.randn(8),
+        14: torch.randn(8),
     }
     path = tmp_path / "google__gemma-2-2b-it.safetensors"
     save_profile(profile, str(path), {
@@ -253,12 +304,16 @@ def test_save_load_profile_roundtrip_slim_sidecar(tmp_path):
     assert sorted(loaded.keys()) == [0, 14]
     assert meta["method"] == "contrastive_pca"
     assert meta["statements_sha256"] == "abc"
-    assert "scores" in meta
     assert "saklas_version" in meta
+    # Scores no longer live on disk — shares are baked into tensor magnitudes.
+    assert "scores" not in meta
     # No legacy keys:
     assert "concept" not in meta
     assert "model_id" not in meta
     assert "num_pairs" not in meta
+    # Round-trip preserves tensor values bit-for-bit.
+    for idx in profile:
+        assert torch.allclose(profile[idx], loaded[idx])
 
 
 def test_bundled_concept_names_includes_known():

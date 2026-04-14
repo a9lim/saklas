@@ -17,7 +17,7 @@ REPO = Path(__file__).resolve().parent.parent
 STATEMENTS = REPO / "saklas" / "data" / "vectors" / "angry.calm" / "statements.json"
 MODEL_ID = "google/gemma-4-31b-it"
 PROMPT = "A customer just told me the package I shipped arrived broken. Write my reply."
-ALPHAS = [0.0, 0.25, 0.5, 0.75, 1.0]
+ALPHAS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 SEED = 1234
 MAX_TOKENS = 180
 
@@ -35,11 +35,11 @@ def main() -> int:
     name, profile = session.extract(ds, on_progress=lambda m: print("  ", m, flush=True))
     session.steer(name, profile)
 
-    scores = {l: float(s) for l, (_, s) in profile.items()}
-    mean_s = sum(scores.values()) / len(scores)
-    top5 = sorted(scores.items(), key=lambda x: -x[1])[:5]
-    print(f"\nProfile stats: layers={len(scores)} mean={mean_s:.4f} "
-          f"max={max(scores.values()):.4f} peak/mean={max(scores.values())/mean_s:.2f}")
+    norms = {l: float(v.norm().item()) for l, v in profile.items()}
+    mean_s = sum(norms.values()) / len(norms)
+    top5 = sorted(norms.items(), key=lambda x: -x[1])[:5]
+    print(f"\nProfile stats: layers={len(norms)} mean_norm={mean_s:.4f} "
+          f"max={max(norms.values()):.4f} peak/mean={max(norms.values())/mean_s:.2f}")
     print(f"top5 layers: {top5}\n")
 
     for a in ALPHAS:

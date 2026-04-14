@@ -71,15 +71,14 @@ def bootstrap_layer_means(
             if current_ns_hash is None or sc.statements_sha256 == current_ns_hash:
                 profile, _ = load_profile(str(ts_path))
                 log.debug("Loaded cached layer means")
-                return {idx: vec for idx, (vec, _score) in profile.items()}
+                return profile
             log.info("Layer means stale (neutral_statements changed); recomputing")
         except Exception as e:
             log.warning("Corrupt layer means cache, recomputing: %s", e)
 
     log.info("Computing layer means (one-time per model)...")
     means = compute_layer_means(model, tokenizer, layers)
-    profile = {idx: (vec, 1.0) for idx, vec in means.items()}
-    save_profile(profile, str(ts_path), {
+    save_profile(means, str(ts_path), {
         "method": "layer_means",
         "statements_sha256": current_ns_hash or "",
     })
@@ -88,7 +87,7 @@ def bootstrap_layer_means(
 
 def bootstrap_probes(
     model, tokenizer, layers, model_info: dict, categories: list[str], *_unused,
-) -> dict[str, dict[int, tuple[torch.Tensor, float]]]:
+) -> dict[str, dict[int, torch.Tensor]]:
     """Load or extract probe vector profiles for the given categories."""
     from saklas import __version__ as _saklas_version
 
@@ -96,7 +95,7 @@ def bootstrap_probes(
     model_id = model_info.get("model_id", "unknown")
     sid = safe_model_id(model_id)
 
-    probes: dict[str, dict[int, tuple[torch.Tensor, float]]] = {}
+    probes: dict[str, dict[int, torch.Tensor]] = {}
     to_extract: list[tuple[str, Path, Path]] = []
 
     for cat in categories:

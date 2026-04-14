@@ -18,12 +18,15 @@ STATEMENTS = REPO / "saklas" / "data" / "vectors" / "angry" / "statements.json"
 MODEL_ID = "google/gemma-4-31b-it"
 
 
-def profile_stats(name: str, profile: dict[int, tuple[torch.Tensor, float]]) -> None:
-    scores = {l: float(s) for l, (_, s) in profile.items()}
-    vals = list(scores.values())
+def profile_stats(name: str, profile: dict[int, torch.Tensor]) -> None:
+    # With shares baked into magnitudes, ||baked_l|| is the same
+    # "how much this layer steers" quantity that per-layer scores
+    # used to encode.
+    norms = {l: float(v.norm().item()) for l, v in profile.items()}
+    vals = list(norms.values())
     mean_s = sum(vals) / len(vals)
-    top5 = sorted(scores.items(), key=lambda x: -x[1])[:5]
-    print(f"[{name}] layers={len(scores)} mean={mean_s:.4f} "
+    top5 = sorted(norms.items(), key=lambda x: -x[1])[:5]
+    print(f"[{name}] layers={len(norms)} mean={mean_s:.4f} "
           f"max={max(vals):.4f} min={min(vals):.4f} "
           f"peak/mean={max(vals)/mean_s:.2f}")
     print(f"  top5: {[(l, round(s, 4)) for l, s in top5]}")
@@ -54,14 +57,14 @@ def main() -> int:
     print("\nPer-layer cosine similarity (60 vs 32):")
     sims = []
     for layer in sorted(prof60.keys()):
-        v60 = prof60[layer][0].float().flatten()
-        v32 = prof32[layer][0].float().flatten()
+        v60 = prof60[layer].float().flatten()
+        v32 = prof32[layer].float().flatten()
         cos = F.cosine_similarity(v60.unsqueeze(0), v32.unsqueeze(0)).item()
         # Cosine sign is arbitrary for PCA components; take absolute.
         sims.append((layer, abs(cos)))
 
     top5 = [l for l, _ in sorted(
-        ((l, float(s)) for l, (_, s) in prof60.items()),
+        ((l, float(v.norm().item())) for l, v in prof60.items()),
         key=lambda x: -x[1],
     )[:5]]
     print("  top-5 layers of n=60 profile:")

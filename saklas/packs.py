@@ -101,7 +101,6 @@ class PackMetadata:
 @dataclass
 class Sidecar:
     method: str
-    scores: dict[int, float]
     saklas_version: str
     statements_sha256: Optional[str] = None
     components: Optional[dict[str, dict]] = None
@@ -112,7 +111,6 @@ class Sidecar:
             data = json.load(f)
         return cls(
             method=data["method"],
-            scores={int(k): float(v) for k, v in data["scores"].items()},
             saklas_version=data["saklas_version"],
             statements_sha256=data.get("statements_sha256"),
             components=data.get("components"),
@@ -121,7 +119,6 @@ class Sidecar:
     def to_dict(self) -> dict:
         out: dict = {
             "method": self.method,
-            "scores": {str(k): v for k, v in self.scores.items()},
             "saklas_version": self.saklas_version,
         }
         if self.statements_sha256 is not None:
@@ -192,7 +189,13 @@ class ConceptFolder:
     folder: Path
     metadata: PackMetadata
     has_statements: bool
+    # safe_model_id -> Sidecar. GGUF-only entries have no sidecar (metadata
+    # is embedded in the gguf file), so this dict is only populated for
+    # safetensors tensors.
     _sidecars: dict[str, Sidecar] = field(default_factory=dict)
+    # safe_model_id -> "safetensors" | "gguf". A safetensors file takes
+    # precedence over a gguf file with the same stem (native format wins).
+    _tensor_formats: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, folder: Path) -> "ConceptFolder":
@@ -205,31 +208,60 @@ class ConceptFolder:
             )
 
         has_stmts = (folder / "statements.json").exists()
-        tensors = sorted(folder.glob("*.safetensors"))
-        if not has_stmts and not tensors:
+        safetensors = sorted(folder.glob("*.safetensors"))
+        ggufs = sorted(folder.glob("*.gguf"))
+        if not has_stmts and not safetensors and not ggufs:
             raise PackFormatError(
-                f"concept folder must contain at least one of statements.json "
-                f"or a .safetensors file: {folder}"
+                f"concept folder must contain at least one of statements.json, "
+                f"a .safetensors file, or a .gguf file: {folder}"
             )
 
         sidecars: dict[str, Sidecar] = {}
-        for t in tensors:
+        formats: dict[str, str] = {}
+        for t in safetensors:
             sc_path = t.with_suffix(".json")
             if not sc_path.exists():
                 raise PackFormatError(
                     f"tensor {t.name} has no sidecar {sc_path.name}"
                 )
             sidecars[t.stem] = Sidecar.load(sc_path)
+            formats[t.stem] = "safetensors"
+        for g in ggufs:
+            # safetensors wins on conflict — it's the native format and
+            # carries more metadata (statements hash, merge components).
+            if g.stem not in formats:
+                formats[g.stem] = "gguf"
 
-        return cls(folder=folder, metadata=meta, has_statements=has_stmts, _sidecars=sidecars)
+        return cls(
+            folder=folder,
+            metadata=meta,
+            has_statements=has_stmts,
+            _sidecars=sidecars,
+            _tensor_formats=formats,
+        )
 
     def tensor_models(self) -> list[str]:
-        return sorted(self._sidecars.keys())
+        return sorted(self._tensor_formats.keys())
+
+    def tensor_format(self, safe_model_id: str) -> str:
+        """Return "safetensors" or "gguf" for the tensor backing this model."""
+        return self._tensor_formats[safe_model_id]
 
     def sidecar(self, safe_model_id: str) -> Sidecar:
+        """Return the JSON sidecar for a safetensors tensor.
+
+        Raises KeyError for GGUF-backed tensors, which carry metadata inside
+        the .gguf file rather than a sibling sidecar.
+        """
         return self._sidecars[safe_model_id]
 
     def tensor_path(self, safe_model_id: str) -> Path:
+        """Return the on-disk path to the tensor file, with extension."""
+        fmt = self._tensor_formats.get(safe_model_id)
+        if fmt == "gguf":
+            return self.folder / f"{safe_model_id}.gguf"
+        # Default to safetensors (preserves pre-existing callers that
+        # construct paths directly when the tensor hasn't been extracted yet).
         return self.folder / f"{safe_model_id}.safetensors"
 
     def statements_path(self) -> Path:

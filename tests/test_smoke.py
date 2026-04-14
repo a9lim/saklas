@@ -73,12 +73,11 @@ class TestVectorExtraction:
         hidden_dim = cfg.hidden_size
         assert isinstance(happy_profile, dict)
         assert len(happy_profile) > 0
-        for layer_idx, (vec, score) in happy_profile.items():
+        for layer_idx, vec in happy_profile.items():
             assert isinstance(layer_idx, int)
             assert vec.shape == (hidden_dim,)
             norm = vec.norm().item()
             assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
-            assert score > 0
 
     def test_extraction_fast_enough(self, model_and_tokenizer, layers):
         """Single contrastive extraction should complete within the backend's budget."""
@@ -168,13 +167,12 @@ class TestSaveLoad:
             loaded_profile, loaded_meta = load_profile(path)
 
             assert loaded_meta["method"] == "contrastive_pca"
-            assert "scores" in loaded_meta
+            assert "scores" not in loaded_meta
             assert set(loaded_profile.keys()) == set(happy_profile.keys())
             for idx in happy_profile:
-                orig_vec, orig_score = happy_profile[idx]
-                loaded_vec, loaded_score = loaded_profile[idx]
-                assert torch.allclose(orig_vec.cpu(), loaded_vec.cpu(), atol=1e-6)
-                assert abs(orig_score - loaded_score) < 1e-6
+                assert torch.allclose(
+                    happy_profile[idx].cpu(), loaded_profile[idx].cpu(), atol=1e-6
+                )
 
 
 class TestTraitMonitor:
@@ -286,12 +284,11 @@ class TestExtractContrastive:
         profile = extract_contrastive(model, tokenizer, pairs, layers=layers)
         assert isinstance(profile, dict)
         assert len(profile) > 0
-        for idx, (vec, score) in profile.items():
+        for idx, vec in profile.items():
             assert 0 <= idx < num_layers
             assert vec.shape == (hidden_dim,)
             norm = vec.norm().item()
             assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
-            assert score > 0
 
 
 class TestBuildChatInput:

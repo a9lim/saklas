@@ -257,6 +257,141 @@ def uninstall(selector: Selector, *, yes: bool = False) -> int:
     return count
 
 
+def _resolve_model_hint(safe_id: str) -> str:
+    """Derive llama.cpp's ``controlvector.model_hint`` from a safe_model_id.
+
+    Strategy: load the base model's config via ``transformers.AutoConfig``
+    (cache-first, network fallback) and return ``config.model_type``.  That's
+    the same string llama.cpp's loader keys off when matching a control
+    vector to a loaded model (e.g. ``"llama"``, ``"gemma2"``, ``"qwen2"``).
+
+    Raises RuntimeError with actionable guidance if the config can't be
+    resolved — callers should surface the ``--model-hint`` flag as the
+    escape hatch.
+    """
+    hf_id = safe_id.replace("__", "/")
+    try:
+        from transformers import AutoConfig
+    except ImportError as e:  # pragma: no cover — transformers is a hard dep
+        raise RuntimeError(
+            f"could not resolve model_hint for {hf_id!r}: transformers missing ({e})"
+        ) from e
+    try:
+        cfg = AutoConfig.from_pretrained(hf_id, trust_remote_code=False)
+    except Exception as e:
+        raise RuntimeError(
+            f"could not resolve model_hint for {hf_id!r}: {e}. "
+            f"Pass --model-hint <arch> explicitly (e.g. 'llama', 'gemma2', 'qwen2')."
+        ) from e
+    mt = getattr(cfg, "model_type", None)
+    if not mt:
+        raise RuntimeError(
+            f"{hf_id}: config has no model_type field; pass --model-hint explicitly"
+        )
+    return str(mt)
+
+
+def export_gguf(
+    selector: Selector,
+    *,
+    model_scope: Optional[str] = None,
+    output: Optional[str] = None,
+    model_hint: Optional[str] = None,
+) -> list[Path]:
+    """Export a concept's baked tensors to llama.cpp GGUF.
+
+    ``selector`` must resolve to a single concept. ``model_scope`` restricts
+    the export to one base model; without it, every model present in the pack
+    is exported (one .gguf file per model).
+
+    ``output``:
+      - single-model + file path → write to exactly that path
+      - single-model + directory → write to ``<dir>/<safe_model_id>.gguf``
+      - multi-model → must be a directory (or None, meaning in-pack sibling)
+      - None → write alongside the safetensors in the pack folder (rejected
+        for bundled concepts, whose folder is restored on refresh)
+
+    ``model_hint`` overrides the ``controlvector.model_hint`` metadata string.
+    Default: derived via ``transformers.AutoConfig.model_type`` on the base
+    model (cache-first, network fallback).  This is the string llama.cpp's
+    control-vector loader matches against, so it must be the architecture
+    name (``"llama"``, ``"gemma2"``, ``"qwen2"``) and *not* the HF coord.
+
+    Returns the list of paths written.
+    """
+    from saklas.gguf_io import write_gguf_profile
+    from saklas.vectors import load_profile
+
+    concepts = resolve(selector)
+    if len(concepts) != 1:
+        raise RuntimeError(
+            f"export_gguf requires a single concept selector; "
+            f"{selector} matched {len(concepts)}"
+        )
+    concept = concepts[0]
+    from saklas.packs import ConceptFolder
+    cf = ConceptFolder.load(concept.folder)
+
+    if model_scope is not None:
+        sid = safe_model_id(model_scope)
+        if sid not in cf.tensor_models():
+            raise RuntimeError(
+                f"{concept.namespace}/{concept.name}: no tensor for {model_scope}"
+            )
+        targets = [sid]
+    else:
+        # Skip any GGUFs already present — re-exporting them would be a
+        # no-op at best and a round-trip loss at worst.
+        targets = [
+            sid for sid in cf.tensor_models()
+            if cf.tensor_format(sid) == "safetensors"
+        ]
+        if not targets:
+            raise RuntimeError(
+                f"{concept.namespace}/{concept.name}: no safetensors tensors to export"
+            )
+
+    # Resolve output policy.
+    out_path = Path(output) if output else None
+    if out_path is not None and len(targets) > 1 and out_path.suffix == ".gguf":
+        raise RuntimeError(
+            "multi-model export needs a directory or no --output; "
+            f"got file path {out_path}"
+        )
+
+    # Bundled concepts get their folder overwritten on refresh, so any in-place
+    # write would be silently reverted.  Require an explicit --output pointing
+    # outside the pack folder when exporting a bundled concept.
+    if out_path is None and cf.metadata.source == "bundled":
+        raise RuntimeError(
+            f"{concept.namespace}/{concept.name}: bundled concept — in-place "
+            f"GGUF export would be lost on next refresh. Pass --output <path> "
+            f"to write outside the pack folder."
+        )
+
+    written: list[Path] = []
+    for sid in targets:
+        profile, _meta = load_profile(str(cf.tensor_path(sid)))
+        hint = model_hint or _resolve_model_hint(sid)
+        if out_path is None:
+            dest = concept.folder / f"{sid}.gguf"
+        elif out_path.suffix == ".gguf":
+            dest = out_path
+        else:
+            out_path.mkdir(parents=True, exist_ok=True)
+            dest = out_path / f"{sid}.gguf"
+        write_gguf_profile(profile, dest, model_hint=hint)
+        written.append(dest)
+
+    # Record the new files in pack.json so integrity checks pick them up
+    # on next load.  Skip if every dest lives outside the pack folder.
+    if any(p.parent == concept.folder for p in written):
+        _update_files_map(concept.folder)
+        _invalidate_selector_cache()
+
+    return written
+
+
 def push(
     selector: Selector,
     *,

@@ -106,14 +106,95 @@ def test_pull_pack_installs_to_target(tmp_path, monkeypatch):
     assert m.source == "hf://user/happy"
 
 
-def test_pull_pack_without_pack_json_errors(tmp_path, monkeypatch):
+def test_pull_pack_without_pack_json_and_no_tensors_errors(tmp_path, monkeypatch):
     bad = tmp_path / "downloaded" / "nope"
     bad.mkdir(parents=True)
     (bad / "random.txt").write_text("x")
     monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(bad))
     target = tmp_path / "installed" / "nope"
-    with pytest.raises(hf.HFError, match="not a saklas pack"):
+    with pytest.raises(hf.HFError, match="no .safetensors or .gguf"):
         hf.pull_pack("user/nope", target_folder=target, force=False)
+
+
+def test_pull_pack_synthesizes_pack_json_from_raw_safetensors(tmp_path, monkeypatch):
+    """Repo without a pack.json but with bare .safetensors should install cleanly."""
+    import torch
+    from saklas.vectors import save_profile
+
+    raw = tmp_path / "downloaded" / "happy_raw"
+    raw.mkdir(parents=True)
+    profile = {0: torch.randn(8), 1: torch.randn(8)}
+    save_profile(profile, str(raw / "google__gemma-2-2b-it.safetensors"),
+                 {"method": "contrastive_pca"})
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(raw))
+
+    target = tmp_path / "installed" / "alice_happy_raw"
+    hf.pull_pack("alice/happy-raw", target_folder=target, force=False)
+
+    # Synthesized pack is a fully legitimate concept folder.
+    cf = packs.ConceptFolder.load(target)
+    assert cf.metadata.source == "hf://alice/happy-raw"
+    assert cf.tensor_models() == ["google__gemma-2-2b-it"]
+    assert cf.tensor_format("google__gemma-2-2b-it") == "safetensors"
+    # Name slug comes from the repo name (dashes allowed, underscore OK).
+    assert cf.metadata.name == "happy-raw"
+
+
+def test_pull_pack_synthesizes_pack_json_from_raw_gguf(tmp_path, monkeypatch):
+    """Frictionless path: an HF GGUF-only repo installs without any saklas metadata."""
+    pytest.importorskip("gguf")
+    import torch
+    from saklas.gguf_io import write_gguf_profile
+
+    raw = tmp_path / "downloaded" / "angry_gguf"
+    raw.mkdir(parents=True)
+    profile = {0: torch.randn(8), 1: torch.randn(8), 14: torch.randn(8)}
+    write_gguf_profile(profile, raw / "llama3.1-8b.gguf", model_hint="llama")
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(raw))
+
+    target = tmp_path / "installed" / "jukofyork_creative"
+    hf.pull_pack("jukofyork/creative", target_folder=target, force=False)
+
+    cf = packs.ConceptFolder.load(target)
+    assert cf.metadata.source == "hf://jukofyork/creative"
+    assert cf.tensor_models() == ["llama3.1-8b"]
+    assert cf.tensor_format("llama3.1-8b") == "gguf"
+
+
+def test_pull_pack_synthesizes_sidecars_for_raw_safetensors(tmp_path, monkeypatch):
+    """A raw repo with .safetensors but no sidecars should still install cleanly."""
+    from safetensors.torch import save_file
+    import torch
+
+    raw = tmp_path / "downloaded" / "raw_no_sidecar"
+    raw.mkdir(parents=True)
+    # Bypass save_profile so no sidecar is written.
+    save_file({"layer_0": torch.randn(4)}, str(raw / "llama.safetensors"))
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(raw))
+
+    target = tmp_path / "installed" / "alice_raw"
+    hf.pull_pack("alice/raw-no-sidecar", target_folder=target, force=False)
+    cf = packs.ConceptFolder.load(target)
+    assert cf.tensor_models() == ["llama"]
+    sc = cf.sidecar("llama")
+    assert sc.method == "imported"
+
+
+def test_pull_pack_synthesized_name_slugs_invalid_chars(tmp_path, monkeypatch):
+    import torch
+    from saklas.vectors import save_profile
+
+    raw = tmp_path / "downloaded" / "Weird_Name"
+    raw.mkdir(parents=True)
+    save_profile({0: torch.randn(4)}, str(raw / "foo.safetensors"),
+                 {"method": "contrastive_pca"})
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(raw))
+
+    target = tmp_path / "installed" / "alice_Weird_Name"
+    hf.pull_pack("alice/Weird_Name!!", target_folder=target, force=False)
+    cf = packs.ConceptFolder.load(target)
+    # NAME_REGEX lowercase + only [a-z0-9._-].
+    assert packs.NAME_REGEX.match(cf.metadata.name)
 
 
 def test_search_packs_bare_query(monkeypatch):
@@ -196,7 +277,7 @@ def _fake_pack_with_tensor(tmp_path, name="happy", model_id="google/gemma-2-2b-i
     safe = model_id.replace("/", "__")
     (folder / f"{safe}.safetensors").write_bytes(b"\x00" * 16)
     (folder / f"{safe}.json").write_text(_json.dumps({
-        "method": "pca", "scores": {"0": 0.1}, "saklas_version": "0.1.0",
+        "method": "pca", "saklas_version": "0.1.0",
         "statements_sha256": None,
     }))
     meta = packs.PackMetadata(
@@ -291,7 +372,7 @@ def test_push_pack_model_scope_limits_tensors(tmp_path, monkeypatch):
     # Add a second tensor for a different model
     (folder / "meta__llama-3-8b.safetensors").write_bytes(b"\x00" * 8)
     (folder / "meta__llama-3-8b.json").write_text(
-        '{"method":"pca","scores":{"0":0.2},"saklas_version":"0.1.0"}'
+        '{"method":"pca","saklas_version":"0.1.0"}'
     )
     meta = packs.PackMetadata.load(folder)
     meta.files = {

@@ -216,6 +216,23 @@ def _build_push_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_export_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="saklas export",
+                                description="Export a concept pack to an interchange format")
+    sub = p.add_subparsers(dest="format", required=True)
+    g = sub.add_parser("gguf", help="Export baked tensors to llama.cpp GGUF")
+    g.add_argument("selector", help="Single concept selector (name or ns/name)")
+    g.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
+                   help="Base model to export (default: all models in the pack)")
+    g.add_argument("-o", "--output", default=None, metavar="PATH",
+                   help="Output file (single-model) or directory (multi-model). "
+                        "Default: write alongside the safetensors tensor in the pack folder.")
+    g.add_argument("--model-hint", default=None, metavar="HINT",
+                   help="Override the controlvector.model_hint field (default: "
+                        "derived from the safe_model_id in the tensor filename)")
+    return p
+
+
 def _build_merge_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="saklas merge",
                                 description="Merge existing vectors into a new pack")
@@ -532,6 +549,23 @@ def _run_list(args: argparse.Namespace) -> None:
     )
 
 
+def _run_export(args: argparse.Namespace) -> None:
+    if args.format != "gguf":
+        print(f"Unknown export format: {args.format}", file=sys.stderr)
+        sys.exit(2)
+    from saklas import cache_ops
+    from saklas.cli_selectors import parse as sel_parse
+    selector = sel_parse(args.selector)
+    written = cache_ops.export_gguf(
+        selector,
+        model_scope=args.model,
+        output=args.output,
+        model_hint=args.model_hint,
+    )
+    for p in written:
+        print(f"Wrote {p}")
+
+
 def _run_merge(args: argparse.Namespace) -> None:
     from saklas import merge as merge_mod
     components = merge_mod.parse_components(args.components)
@@ -580,6 +614,7 @@ _SUBCOMMAND_TABLE = {
     "list":      (_build_list_parser,      _run_list),
     "merge":     (_build_merge_parser,     _run_merge),
     "push":      (_build_push_parser,      _run_push),
+    "export":    (_build_export_parser,    _run_export),
 }
 
 

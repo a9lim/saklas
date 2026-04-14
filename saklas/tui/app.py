@@ -112,7 +112,7 @@ class SaklasApp(App):
                 "profile": profile,
                 "alpha": alpha,
                 "enabled": self._enabled.get(name, True),
-                "peak": max(profile, key=lambda k: profile[k][1]),
+                "peak": max(profile, key=lambda k: float(profile[k].norm().item())),
                 "n_active": len(profile),
             })
         return result
@@ -338,9 +338,9 @@ class SaklasApp(App):
     # -- Vector Management --
 
     def _on_vector_extracted(self, name: str, alpha: float,
-                             profile: dict[int, tuple[torch.Tensor, float]]) -> None:
+                             profile: dict[int, torch.Tensor]) -> None:
         chat = self._chat_panel
-        peak = max(profile, key=lambda k: profile[k][1])
+        peak = max(profile, key=lambda k: float(profile[k].norm().item()))
         n_layers = len(profile)
         chat.add_system_message(
             f"Vector '{name}' active (α={alpha:+.1f}, {n_layers}L pk{peak})"

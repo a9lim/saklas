@@ -377,9 +377,16 @@ async def _stream_generation(
 
 
 def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
-    """Return top-n profile layers sorted by score descending."""
-    return sorted(((idx, score) for idx, (_vec, score) in profile.items()),
-                  key=lambda x: x[1], reverse=True)[:n]
+    """Return top-n profile layers sorted by baked magnitude descending.
+
+    Since shares are baked into tensor magnitudes, ||vec|| is the same
+    "how much does this layer steer per unit alpha" quantity that
+    per-layer scores used to encode.
+    """
+    return sorted(
+        ((idx, float(vec.norm().item())) for idx, vec in profile.items()),
+        key=lambda x: x[1], reverse=True,
+    )[:n]
 
 
 # ---------------------------------------------------------------------------

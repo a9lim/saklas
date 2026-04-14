@@ -228,19 +228,27 @@ def extract_contrastive(
     pairs: list[dict],
     layers,
     device=None,
-) -> dict[int, tuple[torch.Tensor, float]]:
+) -> dict[int, torch.Tensor]:
     """Contrastive direction extraction via PCA across all layers.
 
     Hooks every layer in the same 2N forward passes. For each layer,
-    computes the first principal component of pos-neg differences and
-    scores it by explained variance ratio (sigma_1 / sum(sigma)).
+    computes the first principal component of pos-neg differences.
+
+    Per-layer extraction yields a raw direction (scaled to the mean
+    activation norm of that layer) and a raw score: explained variance
+    ratio for multi-pair, diff_norm/activation_norm for single-pair.
+    The returned tensors are "baked": each direction is pre-multiplied
+    by its share ``score_i / sum(scores)`` so the layer-weighting math
+    that used to live in the steering hook collapses to a flat
+    ``user_alpha * _STEER_GAIN * sum(directions)``. All invariances
+    (layer-count, score-magnitude) are preserved — they just move from
+    apply-time to extract-time.
 
     Args:
         pairs: List of {"positive": str, "negative": str} prompt pairs.
 
     Returns:
-        Profile dict mapping layer_idx -> (direction_vector, score)
-        for all layers.
+        Profile dict mapping layer_idx -> baked direction vector.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -272,20 +280,21 @@ def extract_contrastive(
         if _mps:
             torch.mps.empty_cache()
 
-    # Per-layer: compute direction and score
-    profile: dict[int, tuple[torch.Tensor, float]] = {}
+    # Per-layer: compute direction and score, then bake shares into magnitude.
     n_pairs = len(pairs)
-
     n_norm_samples = n_pairs * 2  # pos + neg per pair
     # Single GPU→CPU transfer for all layer norms
     norm_sums_cpu = norm_sums.tolist()
+
+    # First pass: extract raw (direction, score) per layer.
+    raw: dict[int, tuple[torch.Tensor, float]] = {}
 
     if n_pairs < 2:
         # Single pair: score as diff norm relative to activation magnitude.
         # This produces values in roughly the same range as the
         # explained-variance-ratio used for multi-pair extraction
         # (typically 0.01–0.4), so single-pair and multi-pair profiles
-        # contribute comparably when used as probes or weighted by score.
+        # contribute comparably when baked into shares.
         for idx in range(n_layers):
             diff_vec = diffs_per_layer[idx][0]
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
@@ -293,7 +302,7 @@ def extract_contrastive(
             diff_norm = diff_vec.norm().item()
             activation_norm = norm_sums_cpu[idx]  # pos_norm + neg_norm
             score = diff_norm / max(activation_norm, 1e-8)
-            profile[idx] = (direction, score)
+            raw[idx] = (direction, score)
     else:
         # Multi-pair: batched SVD across all layers.
         # Stack into (n_layers, N, dim) and run one batched SVD call —
@@ -307,8 +316,7 @@ def extract_contrastive(
 
         # Diffs are already float32 and on CPU for MPS — run SVD directly.
         batched = torch.stack(diff_matrices)  # (n_layers, N, dim)
-        svd_input = batched
-        _, S, Vh = torch.linalg.svd(svd_input, full_matrices=False)
+        _, S, Vh = torch.linalg.svd(batched, full_matrices=False)
         # S: (n_layers, min(N,dim)), Vh: (n_layers, min(N,dim), dim)
 
         for idx in range(n_layers):
@@ -320,17 +328,31 @@ def extract_contrastive(
                 direction = -direction
 
             score = (S[idx, 0] / S[idx].sum()).item()
-            profile[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), score)
+            raw[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), score)
 
-    return profile
+    # Bake shares into the stored tensors. Total share is 1.0 across layers,
+    # so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
+    # magnitude budget is fixed by the reference activation norms and
+    # distributed in proportion to per-layer signal quality. At apply time
+    # the hook just does alpha * _STEER_GAIN * sum(baked) — no shares,
+    # no sums, no per-layer weights.
+    total_score = sum(score for _, score in raw.values())
+    if total_score <= 0:
+        # Pathological extraction (all-zero diffs). Fall back to uniform.
+        total_score = float(n_layers)
+        shares = {idx: 1.0 / n_layers for idx in raw}
+    else:
+        shares = {idx: score / total_score for idx, (_, score) in raw.items()}
+
+    return {idx: direction * shares[idx] for idx, (direction, _) in raw.items()}
 
 
 def save_profile(
-    profile: dict[int, tuple[torch.Tensor, float]],
+    profile: dict[int, torch.Tensor],
     path: str,
     metadata: dict,
 ) -> None:
-    """Save a vector profile as .safetensors with a slim .json sidecar.
+    """Save a baked vector profile as .safetensors with a slim .json sidecar.
 
     ``metadata`` must contain at minimum:
         method            - str, e.g. "contrastive_pca" / "single_pair" / "merge" / "layer_means"
@@ -340,22 +362,18 @@ def save_profile(
         components        - dict, merge provenance (method="merge" only)
 
     The safetensors file contains keys ``"layer_{i}"`` for each active layer.
-    The sidecar carries only method/scores/saklas_version plus the optional
-    fields above — nothing else.
+    Tensors are already baked (share pre-multiplied into magnitude) — the
+    sidecar carries only method/saklas_version plus the optional fields above.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    tensors, scores = {}, {}
-    for idx, (vec, score) in profile.items():
-        tensors[f"layer_{idx}"] = vec.contiguous().cpu()
-        scores[str(idx)] = float(score)
+    tensors = {f"layer_{idx}": vec.contiguous().cpu() for idx, vec in profile.items()}
     save_file(tensors, str(path))
 
     from saklas import __version__ as _saklas_version
     sidecar: dict = {
         "method": metadata.get("method", "contrastive_pca"),
-        "scores": scores,
         "saklas_version": _saklas_version,
     }
     if "statements_sha256" in metadata:
@@ -370,26 +388,28 @@ def save_profile(
     log.info("Saved profile (%d layers) to %s", len(profile), path)
 
 
-def load_profile(path: str) -> tuple[dict[int, tuple[torch.Tensor, float]], dict]:
-    """Load a vector profile and its slim sidecar.
+def load_profile(path: str) -> tuple[dict[int, torch.Tensor], dict]:
+    """Load a baked vector profile and its metadata.
+
+    Dispatches on file extension: ``.safetensors`` reads the companion
+    ``.json`` sidecar; ``.gguf`` reads the control-vector metadata embedded
+    in the GGUF header (see :mod:`saklas.gguf_io`). Both paths yield the
+    same ``(profile, metadata)`` shape — callers don't need to branch.
 
     Returns:
-        (profile dict mapping layer_idx -> (vector, score), sidecar dict)
+        (profile dict mapping layer_idx -> baked vector, metadata dict)
     """
     path = Path(path)
-    tensors = load_file(str(path))
+    if path.suffix == ".gguf":
+        from saklas.gguf_io import read_gguf_profile
+        return read_gguf_profile(path)
 
+    tensors = load_file(str(path))
     meta_path = path.with_suffix(".json")
     with open(meta_path) as f:
         metadata = json.load(f)
 
-    scores = metadata.get("scores", {})
-    profile = {}
-    for key, tensor in tensors.items():
-        idx = int(key.split("_", 1)[1])
-        score = float(scores.get(str(idx), 1.0))
-        profile[idx] = (tensor, score)
-
+    profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}
     return profile, metadata
 
 

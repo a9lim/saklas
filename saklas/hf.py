@@ -12,7 +12,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from saklas.packs import PackFormatError, PackMetadata, Sidecar, verify_integrity
+from saklas.packs import NAME_REGEX, PackFormatError, PackMetadata, Sidecar, hash_file, verify_integrity
 
 
 class HFError(RuntimeError):
@@ -78,14 +78,41 @@ def pull_pack(
 ) -> Path:
     """Download <coord> from HF and install into target_folder.
 
+    If the repo contains a ``pack.json``, it's treated as a native saklas
+    pack: the manifest's ``files`` map is verified, every listed file is
+    copied, and ``source`` is rewritten to the ``hf://`` coord.
+
+    If the repo has no ``pack.json``, it's treated as a *raw* tensor repo
+    (saklas's or repeng's GGUF exports, or a bare safetensors dump): all
+    ``*.safetensors``/``*.gguf``/``statements.json`` files are copied into
+    the target folder and a fresh ``pack.json`` is synthesized in-place.
+    This is the frictionless path — ``saklas install someone/happy-gguf``
+    just works on repos that never knew saklas existed.
+
     If ``revision`` is given, pin to that git ref (tag, branch, or commit SHA)
     and record it in the installed pack's ``source`` field so refresh re-pulls
     the same revision.
     """
     tmp_dir = Path(_download(coord, revision=revision))
-    if not (tmp_dir / "pack.json").is_file():
-        raise HFError(f"{coord}: not a saklas pack (no pack.json at repo root)")
+    source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
+    if target_folder.exists():
+        if not force:
+            raise HFError(f"{target_folder} exists; pass force=True to overwrite")
+        shutil.rmtree(target_folder)
+    target_folder.mkdir(parents=True, exist_ok=True)
+
+    if (tmp_dir / "pack.json").is_file():
+        _install_native_pack(tmp_dir, target_folder, coord, source)
+    else:
+        _install_synthesized_pack(tmp_dir, target_folder, coord, source)
+
+    return target_folder
+
+
+def _install_native_pack(
+    tmp_dir: Path, target_folder: Path, coord: str, source: str,
+) -> None:
     try:
         meta = PackMetadata.load(tmp_dir)
     except PackFormatError as e:
@@ -95,19 +122,130 @@ def pull_pack(
     if not ok:
         raise HFError(f"{coord}: integrity check failed ({bad})")
 
-    if target_folder.exists():
-        if not force:
-            raise HFError(f"{target_folder} exists; pass force=True to overwrite")
-        shutil.rmtree(target_folder)
-    target_folder.mkdir(parents=True, exist_ok=True)
-
     for entry in tmp_dir.iterdir():
         if entry.is_file() and entry.name != "pack.json":
             (target_folder / entry.name).write_bytes(entry.read_bytes())
 
-    meta.source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
+    meta.source = source
     meta.write(target_folder)
-    return target_folder
+
+
+_TENSOR_SUFFIXES = (".safetensors", ".gguf")
+_ALLOWED_COMPANIONS = ("statements.json",)
+
+
+def _synthesize_pack_name(coord: str) -> str:
+    """Derive a concept name from an HF coord (``owner/name``).
+
+    Slugs the name part so it fits :data:`NAME_REGEX`: lowercase, strip
+    characters outside ``[a-z0-9._-]``, collapse any run of disallowed
+    chars into ``-``, and ensure the first character is a letter.
+    """
+    _, _, raw = coord.partition("/")
+    raw = raw.split("@", 1)[0]  # strip any revision suffix
+    slug = "".join(
+        c if c.isalnum() or c in "._-" else "-"
+        for c in raw.lower()
+    ).strip("-._")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    if not slug:
+        slug = "pack"
+    if not slug[0].isalpha():
+        slug = "p" + slug
+    slug = slug[:64]
+    if not NAME_REGEX.match(slug):
+        raise HFError(f"{coord}: cannot derive a valid pack name from {raw!r}")
+    return slug
+
+
+def _install_synthesized_pack(
+    tmp_dir: Path, target_folder: Path, coord: str, source: str,
+) -> None:
+    """Copy raw tensor files and fabricate a pack.json alongside them.
+
+    Used for HF repos that pre-date saklas's pack format — repeng GGUF
+    repos, one-off safetensors uploads, etc.  The synthesized pack has
+    no statements, no merge history, and no sha256 trust chain beyond
+    what we compute locally at install time.  From the loader's point
+    of view it's indistinguishable from a native pack.
+    """
+    # Gather all candidate files at the repo root.  Nested directories
+    # are ignored — control-vector repos are always flat.
+    tensor_files: list[Path] = []
+    companions: list[Path] = []
+    tensor_stems: set[str] = set()
+    for entry in sorted(tmp_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        if entry.suffix in _TENSOR_SUFFIXES:
+            tensor_files.append(entry)
+            tensor_stems.add(entry.stem)
+        elif entry.name in _ALLOWED_COMPANIONS:
+            companions.append(entry)
+
+    if not tensor_files:
+        raise HFError(
+            f"{coord}: no pack.json and no .safetensors or .gguf files at repo root"
+        )
+
+    # Include sibling JSON sidecars for any safetensors tensors we found.
+    # ConceptFolder requires a sidecar alongside every .safetensors file;
+    # saklas-written tensors always ship one, but raw safetensors repos
+    # (a bare dump of .safetensors with no companion metadata) don't, so
+    # we synthesize minimal sidecars for any missing ones below.
+    sidecar_stems: set[str] = set()
+    for entry in sorted(tmp_dir.iterdir()):
+        if (
+            entry.is_file()
+            and entry.suffix == ".json"
+            and entry.name != "pack.json"
+            and entry.stem in tensor_stems
+        ):
+            companions.append(entry)
+            sidecar_stems.add(entry.stem)
+
+    candidates = tensor_files + companions
+
+    # GGUFs don't need sidecars; only track safetensors stems here.
+    st_stems = {p.stem for p in tensor_files if p.suffix == ".safetensors"}
+    missing_sidecars = st_stems - sidecar_stems
+
+    # Copy every recognized file into the target folder.
+    for entry in candidates:
+        (target_folder / entry.name).write_bytes(entry.read_bytes())
+
+    # Fabricate minimal sidecars for any safetensors tensors that arrived
+    # without one. Gives ConceptFolder something to load from at next open.
+    # These are marked ``method="imported"`` so they're distinguishable from
+    # natively extracted tensors.
+    if missing_sidecars:
+        from saklas import __version__ as _saklas_version
+        import json
+        for stem in missing_sidecars:
+            sc_path = target_folder / f"{stem}.json"
+            sc_path.write_text(json.dumps({
+                "method": "imported",
+                "saklas_version": _saklas_version,
+            }, indent=2))
+
+    files_map: dict[str, str] = {}
+    for entry in sorted(target_folder.iterdir()):
+        if entry.is_file() and entry.name != "pack.json":
+            files_map[entry.name] = hash_file(entry)
+
+    name = _synthesize_pack_name(coord)
+    meta = PackMetadata(
+        name=name,
+        description=f"Imported from {coord} (no saklas manifest)",
+        version="0.0.0",
+        license="unknown",
+        tags=[],
+        recommended_alpha=0.5,
+        source=source,
+        files=files_map,
+    )
+    meta.write(target_folder)
 
 
 def _render_model_card(meta: PackMetadata, sidecars: dict[str, Sidecar], coord: str) -> str:
@@ -146,14 +284,12 @@ def _render_model_card(meta: PackMetadata, sidecars: dict[str, Sidecar], coord: 
         body += [
             "## Extracted tensors",
             "",
-            "| base model | method | layers | mean score | saklas version |",
-            "| --- | --- | --- | --- | --- |",
+            "| base model | method | saklas version |",
+            "| --- | --- | --- |",
         ]
         for safe, sc in sorted(sidecars.items()):
-            mean = sum(sc.scores.values()) / len(sc.scores) if sc.scores else 0.0
             body.append(
-                f"| `{safe.replace('__', '/')}` | `{sc.method}` | {len(sc.scores)} | "
-                f"{mean:.4f} | `{sc.saklas_version}` |"
+                f"| `{safe.replace('__', '/')}` | `{sc.method}` | `{sc.saklas_version}` |"
             )
         body.append("")
 

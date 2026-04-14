@@ -21,7 +21,7 @@ from saklas.vectors import load_profile, save_profile
 log = logging.getLogger(__name__)
 
 
-Profile = dict[int, tuple[torch.Tensor, float]]
+Profile = dict[int, torch.Tensor]
 
 
 class MergeError(ValueError):
@@ -52,11 +52,15 @@ def linear_sum(
 ) -> Profile:
     """Compute merged[l] = sum_i alpha_i * vec_i[l] per layer.
 
-    Layer set is the intersection of every component's layers. Score of the
-    merged tensor at each layer is the L2 norm of the merged direction.
+    Since component vectors are already baked (share * ref_norm folded
+    into the magnitude), a weighted sum preserves the layer-weighting
+    semantics naturally — no re-scoring, no share redistribution. The
+    merged tensor injects at apply time exactly as
+    ``sum_i alpha_i * component_i`` would have.
 
-    If ``strict`` is True, any non-common layers raise MergeError instead of
-    being silently dropped.
+    Layer set is the intersection of every component's layers. If
+    ``strict`` is True, any non-common layers raise MergeError instead
+    of being silently dropped.
     """
     if len(components) < 2:
         raise MergeError("linear_sum requires at least two components")
@@ -80,13 +84,11 @@ def linear_sum(
 
     out: Profile = {}
     for layer in sorted(common):
-        first_vec, _ = components[0][0][layer]
+        first_vec = components[0][0][layer]
         merged = torch.zeros_like(first_vec, dtype=torch.float32)
         for profile, alpha in components:
-            vec, _score = profile[layer]
-            merged = merged + float(alpha) * vec.to(dtype=torch.float32)
-        norm = float(merged.norm().item())
-        out[layer] = (merged, norm)
+            merged = merged + float(alpha) * profile[layer].to(dtype=torch.float32)
+        out[layer] = merged
     return out
 
 

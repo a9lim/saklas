@@ -166,7 +166,7 @@ class TestTraitMonitorScoring:
         # Create a probe vector pointing in a known direction
         probe_vec = torch.zeros(dim)
         probe_vec[0] = 1.0  # unit vector along dim 0
-        probe_profile = {0: (probe_vec, 1.0)}
+        probe_profile = {0: probe_vec}
         layer_means = {0: torch.zeros(dim)}
         return TraitMonitor({"test_probe": probe_profile}, layer_means)
 

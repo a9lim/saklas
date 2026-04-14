@@ -27,27 +27,26 @@ def test_parse_components_requires_two():
 
 
 def test_linear_sum_equal_layers():
-    a = {0: (torch.tensor([1.0, 0.0]), 1.0), 1: (torch.tensor([0.0, 1.0]), 1.0)}
-    b = {0: (torch.tensor([2.0, 0.0]), 1.0), 1: (torch.tensor([0.0, 2.0]), 1.0)}
+    a = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([0.0, 1.0])}
+    b = {0: torch.tensor([2.0, 0.0]), 1: torch.tensor([0.0, 2.0])}
     out = merge.linear_sum([(a, 0.5), (b, 0.25)])
-    assert torch.allclose(out[0][0], torch.tensor([1.0, 0.0]))
-    assert torch.allclose(out[1][0], torch.tensor([0.0, 1.0]))
-    assert abs(out[0][1] - 1.0) < 1e-5
+    assert torch.allclose(out[0], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(out[1], torch.tensor([0.0, 1.0]))
 
 
 def test_linear_sum_layer_intersection():
-    a = {0: (torch.tensor([1.0, 0.0]), 1.0),
-         1: (torch.tensor([0.0, 1.0]), 1.0),
-         2: (torch.tensor([1.0, 1.0]), 1.0)}
-    b = {1: (torch.tensor([0.0, 2.0]), 1.0),
-         2: (torch.tensor([2.0, 2.0]), 1.0)}
+    a = {0: torch.tensor([1.0, 0.0]),
+         1: torch.tensor([0.0, 1.0]),
+         2: torch.tensor([1.0, 1.0])}
+    b = {1: torch.tensor([0.0, 2.0]),
+         2: torch.tensor([2.0, 2.0])}
     out = merge.linear_sum([(a, 1.0), (b, 1.0)])
     assert sorted(out.keys()) == [1, 2]
 
 
 def test_linear_sum_empty_intersection_raises():
-    a = {0: (torch.tensor([1.0]), 1.0)}
-    b = {1: (torch.tensor([2.0]), 1.0)}
+    a = {0: torch.tensor([1.0])}
+    b = {1: torch.tensor([2.0])}
     with pytest.raises(merge.MergeError, match="no common layers"):
         merge.linear_sum([(a, 1.0), (b, 1.0)])
 
@@ -72,7 +71,7 @@ def _make_concept_with_tensors(tmp_path, ns, name, model_tensors):
 
 def test_shared_models_intersection(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    profile = {0: (torch.tensor([1.0]), 1.0)}
+    profile = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy",
                                 {"gemma": profile, "qwen": profile})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic",
@@ -83,7 +82,7 @@ def test_shared_models_intersection(monkeypatch, tmp_path):
 
 def test_shared_models_empty_raises(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    profile = {0: (torch.tensor([1.0]), 1.0)}
+    profile = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": profile})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"qwen": profile})
     with pytest.raises(merge.MergeError, match="no shared models"):
@@ -92,8 +91,8 @@ def test_shared_models_empty_raises(monkeypatch, tmp_path):
 
 def test_merge_into_pack_single_model(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    p1 = {0: (torch.tensor([1.0, 0.0]), 1.0)}
-    p2 = {0: (torch.tensor([0.0, 2.0]), 1.0)}
+    p1 = {0: torch.tensor([1.0, 0.0])}
+    p2 = {0: torch.tensor([0.0, 2.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": p1})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"gemma": p2})
     dst = merge.merge_into_pack(
@@ -116,7 +115,7 @@ def test_merge_into_pack_single_model(monkeypatch, tmp_path):
 
 def test_merge_into_pack_conflict(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    p = {0: (torch.tensor([1.0]), 1.0)}
+    p = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": p})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"gemma": p})
     merge.merge_into_pack("bard",
@@ -130,7 +129,7 @@ def test_merge_into_pack_conflict(monkeypatch, tmp_path):
 
 def test_merge_into_pack_explicit_model(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    p = {0: (torch.tensor([1.0]), 1.0)}
+    p = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy",
                                 {"google__gemma-2-2b-it": p, "qwen": p})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic",
