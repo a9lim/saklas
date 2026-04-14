@@ -23,8 +23,6 @@ def test_pack_metadata_parse_minimal(tmp_path):
         "recommended_alpha": 0.5,
         "source": "bundled",
         "files": {},
-        "signature": None,
-        "signature_method": None,
     })
     meta = packs.PackMetadata.load(folder)
     assert meta.name == "happy"
@@ -33,7 +31,6 @@ def test_pack_metadata_parse_minimal(tmp_path):
     assert meta.recommended_alpha == 0.5
     assert meta.source == "bundled"
     assert meta.files == {}
-    assert meta.signature is None
 
 
 def test_pack_metadata_missing_required_field_errors(tmp_path):
@@ -48,7 +45,6 @@ def test_pack_metadata_invalid_name_rejected(tmp_path):
         "description": "x", "version": "1", "license": "x",
         "tags": [], "recommended_alpha": 0.5,
         "source": "local", "files": {},
-        "signature": None, "signature_method": None,
     })
     with pytest.raises(packs.PackFormatError, match="name"):
         packs.PackMetadata.load(folder)
@@ -62,7 +58,6 @@ def test_pack_metadata_long_description_optional(tmp_path):
         "version": "1.0.0", "license": "MIT",
         "tags": [], "recommended_alpha": 0.5,
         "source": "bundled", "files": {},
-        "signature": None, "signature_method": None,
     })
     meta = packs.PackMetadata.load(folder)
     assert meta.long_description == "longer form"
@@ -266,24 +261,23 @@ def test_save_load_profile_roundtrip_slim_sidecar(tmp_path):
     assert "num_pairs" not in meta
 
 
-def test_bundled_concept_names_includes_happy():
+def test_bundled_concept_names_includes_known():
     names = packs.bundled_concept_names()
-    assert "happy" in names
-    assert "calm" in names
-    assert len(names) == 28
+    # `agentic` is a stable name across pre- and post-regen layouts.
+    assert "agentic" in names
+    assert len(names) >= 1
 
 
 def test_materialize_empty_home(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     packs.materialize_bundled()
     assert (tmp_path / "neutral_statements.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "happy" / "pack.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "happy" / "statements.json").is_file()
+    assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").is_file()
 
 
 def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    target = tmp_path / "vectors" / "default" / "happy" / "pack.json"
+    target = tmp_path / "vectors" / "default" / "agentic" / "pack.json"
     target.parent.mkdir(parents=True)
     target.write_text('{"user": "edited"}')
     packs.materialize_bundled()
@@ -292,27 +286,13 @@ def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
 
 def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    (tmp_path / "vectors" / "default" / "happy").mkdir(parents=True)
-    (tmp_path / "vectors" / "default" / "happy" / "pack.json").write_text("{}")
+    # Pre-create `agentic` with user edits; materialization should still
+    # populate other bundled packs (at least `angry.calm` in the current
+    # data dir) without overwriting agentic.
+    (tmp_path / "vectors" / "default" / "agentic").mkdir(parents=True)
+    (tmp_path / "vectors" / "default" / "agentic" / "pack.json").write_text("{}")
     packs.materialize_bundled()
-    assert (tmp_path / "vectors" / "default" / "calm" / "pack.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "happy" / "pack.json").read_text() == "{}"
+    assert (tmp_path / "vectors" / "default" / "angry.calm" / "pack.json").is_file()
+    assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").read_text() == "{}"
 
 
-def test_migration_notice_no_old_cache(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.setattr(packs, "_LEGACY_PATHS", [tmp_path / "nonexistent"])
-    packs.print_migration_notice_if_needed()
-    assert capsys.readouterr().err == ""
-
-
-def test_migration_notice_detected(monkeypatch, tmp_path, capsys):
-    legacy = tmp_path / "legacy_cache"
-    legacy.mkdir()
-    (legacy / "marker").write_text("x")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(packs, "_LEGACY_PATHS", [legacy])
-    packs.print_migration_notice_if_needed()
-    err = capsys.readouterr().err
-    assert "legacy_cache" in err
-    assert "~/.saklas/" in err

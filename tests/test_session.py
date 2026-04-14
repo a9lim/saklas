@@ -19,7 +19,7 @@ MODEL_ID = "google/gemma-3-4b-it"
 def session():
     from saklas.session import SaklasSession
     # device="auto" picks cuda > mps > cpu; skipif above guarantees a GPU.
-    s = SaklasSession(MODEL_ID, device="auto", probes=["emotion"])
+    s = SaklasSession(MODEL_ID, device="auto", probes=["affect"])
     yield s
     s.close()
 
@@ -51,7 +51,7 @@ class TestConstruction:
 
 class TestSteering:
     def test_extract_and_steer(self, session):
-        profile = session.extract([("I am happy", "I am sad")])
+        name, profile = session.extract([("I am happy", "I am sad")])
         assert isinstance(profile, dict)
         assert all(isinstance(k, int) for k in profile)
         session.steer("happy", profile)
@@ -64,19 +64,20 @@ class TestSteering:
         assert "happy" not in session.vectors
 
     def test_extract_curated(self, session):
-        profile = session.extract("calm")
+        name, profile = session.extract("happy", baseline="sad")
+        assert name == "happy.sad"
         assert isinstance(profile, dict)
         assert len(profile) > 0
 
     def test_extract_datasource(self, session):
         from saklas.datasource import DataSource
         ds = DataSource(pairs=[("formal", "casual")])
-        profile = session.extract(ds)
+        name, profile = session.extract(ds)
         assert isinstance(profile, dict)
 
 class TestMonitoring:
     def test_monitor_and_unmonitor(self, session):
-        profile = session.extract([("I am honest", "I am deceptive")])
+        _, profile = session.extract([("I am honest", "I am deceptive")])
         session.monitor("test_probe", profile)
         assert "test_probe" in session.probes
         session.unmonitor("test_probe")
@@ -113,7 +114,7 @@ class TestGeneration:
         assert session.history[1]["role"] == "assistant"
 
     def test_generate_with_alphas(self, session):
-        profile = session.extract([("formal", "casual")])
+        _, profile = session.extract([("formal", "casual")])
         session.steer("formal", profile)
         result = session.generate("Hello.", alphas={"formal": 0.1})
         assert result.vectors == {"formal": 0.1}
@@ -132,7 +133,7 @@ class TestGeneration:
 
     def test_ab_comparison(self, session):
         """A/B test: same prompt, with and without steering."""
-        profile = session.extract([("I am happy", "I am sad")])
+        _, profile = session.extract([("I am happy", "I am sad")])
         session.steer("happy", profile)
         session.clear_history()
         steered = session.generate("Describe a sunset.", alphas={"happy": 0.2})
@@ -162,7 +163,7 @@ class TestStreamingGeneration:
         assert session.last_result.token_count == len(tokens)
 
     def test_stream_with_alphas(self, session):
-        profile = session.extract([("I am happy", "I am sad")])
+        _, profile = session.extract([("I am happy", "I am sad")])
         session.steer("happy", profile)
         session.clear_history()
         tokens = list(session.generate_stream("Hello.", alphas={"happy": 0.15}))

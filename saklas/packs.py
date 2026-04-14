@@ -12,14 +12,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import sys
 from dataclasses import dataclass, field
 from importlib import resources as _resources
 from pathlib import Path
 from typing import Optional
 
 
-NAME_REGEX = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 _REQUIRED_PACK_FIELDS = (
     "name", "description", "version", "license",
     "tags", "recommended_alpha", "source", "files",
@@ -41,8 +40,6 @@ class PackMetadata:
     source: str
     files: dict[str, str]
     long_description: str = ""
-    signature: Optional[str] = None
-    signature_method: Optional[str] = None
 
     @classmethod
     def load(cls, folder: Path) -> "PackMetadata":
@@ -75,8 +72,6 @@ class PackMetadata:
             recommended_alpha=float(data["recommended_alpha"]),
             source=data["source"],
             files=dict(data["files"]),
-            signature=data.get("signature"),
-            signature_method=data.get("signature_method"),
         )
 
     def to_dict(self) -> dict:
@@ -93,8 +88,6 @@ class PackMetadata:
             "recommended_alpha": self.recommended_alpha,
             "source": self.source,
             "files": self.files,
-            "signature": self.signature,
-            "signature_method": self.signature_method,
         })
         return out
 
@@ -302,26 +295,6 @@ def materialize_bundled() -> None:
             if entry.is_file():
                 with entry.open("rb") as s, open(target / entry.name, "wb") as d:
                     d.write(s.read())
-
-
-_LEGACY_PATHS = [
-    Path(__file__).parent / "probes" / "cache",
-    Path(__file__).parent / "datasets" / "cache",
-    Path.home() / ".liahona",
-]
-
-
-def print_migration_notice_if_needed() -> None:
-    """Print a one-line deprecation notice if any legacy cache path is on disk."""
-    for p in _LEGACY_PATHS:
-        if p.exists():
-            print(
-                f"Old cache detected at {p}. "
-                f"saklas has moved to ~/.saklas/. "
-                f"Delete the old cache when convenient — tensors will re-extract on first use.",
-                file=sys.stderr,
-            )
-            return
 
 
 def merge_components_status(

@@ -1,23 +1,31 @@
 """Regenerate bundled statements.json files and neutral_statements.json
-using gemma-4-31b-it as the generator.
+using a capable instruct model as the generator.
 
-Rationale: the original bundled pairs are minimal-contrast word-swaps
-("I slammed the door" / "I closed the door") which contradict the
-statement-generation prompt's own rules and produce narrow contrastive
-directions whose coherence cliff sits below the documented alpha band.
-This script reuses `SaklasSession.generate_pairs` — same system prompt,
-same domain seeds — to rewrite every bundled concept with topically
-disjoint, scenario-diverse pairs. Neutrals are regenerated with a
-dedicated affect-neutral prompt.
+The bundled pack is driven by two manifests:
 
-Resumable: skips concepts whose statements.json mtime is newer than
-this script's start time. Overwrites pack.json `files` hash on each
-rewrite. Safe to re-run.
+- BIPOLAR: concepts with a named negative pole. Generated via
+  `SaklasSession.generate_pairs(concept=pos, baseline=neg)`, which hits
+  the `Speaker A IS X / Speaker B IS Y` branch of the prompt — sharper
+  contrastive direction than topically-disjoint monopolar pairs.
+- MONOPOLAR: concepts without a clean opposite. Generated with the
+  original "Speaker B is unrelated" prompt.
+
+Each concept's folder name is the canonical slug used throughout the
+cache (`happy_sad`, `high_context_low_context`, etc.). Folders and
+pack.json are materialized on demand, so `--purge` can wipe the tree
+before regeneration without losing anything the manifest describes.
+
+Usage:
+    python scripts/regenerate_bundled_statements.py           # regenerate missing only
+    python scripts/regenerate_bundled_statements.py --purge   # wipe + regenerate everything
+    python scripts/regenerate_bundled_statements.py --force   # regenerate even if present
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -33,11 +41,56 @@ VECTORS_DIR = REPO / "saklas" / "data" / "vectors"
 NEUTRALS_PATH = REPO / "saklas" / "data" / "neutral_statements.json"
 
 MODEL_ID = "google/gemma-4-31b-it"
-N_PAIRS = 60
-N_NEUTRALS = 60
+N_PAIRS = 45
+N_NEUTRALS = 45
 
-START_TS = time.time()
 
+# name -> (positive_pole, negative_pole, category)
+BIPOLAR: dict[str, tuple[str, str, str]] = {
+    # affect
+    "angry.calm":               ("angry", "calm", "affect"),
+    "fearful.brave":            ("fearful", "brave", "affect"),
+    "happy.sad":                ("happy", "sad", "affect"),
+    # epistemic
+    "confident.uncertain":      ("confident", "uncertain", "epistemic"),
+    "honest.deceptive":         ("honest", "deceptive", "epistemic"),
+    "hallucinating.grounded":   ("hallucinating", "factually grounded", "epistemic"),
+    # alignment
+    "refusal.compliant":        ("refusal", "compliant", "alignment"),
+    "sycophantic.blunt":        ("sycophantic", "blunt", "alignment"),
+    # register
+    "formal.casual":            ("formal", "casual", "register"),
+    "direct.indirect":          ("direct", "indirect", "register"),
+    "verbose.concise":          ("verbose", "concise", "register"),
+    "creative.conventional":    ("creative", "conventional", "register"),
+    # social stance
+    "authoritative.submissive": ("authoritative", "submissive", "social_stance"),
+    "hierarchical.egalitarian": ("hierarchical", "egalitarian", "social_stance"),
+    "high_context.low_context": ("high-context communication", "low-context communication", "social_stance"),
+    # cultural
+    "masculine.feminine":       ("masculine", "feminine", "cultural"),
+    "western.eastern":          ("western", "eastern", "cultural"),
+    "religious.secular":        ("religious", "secular", "cultural"),
+    "traditional.progressive":  ("traditional", "progressive", "cultural"),
+}
+
+# name -> category
+MONOPOLAR: dict[str, str] = {
+    "agentic": "alignment",
+    "manipulative": "alignment",
+}
+
+
+# --- descriptions for pack.json ---------------------------------------------
+
+def _describe(name: str) -> str:
+    if name in BIPOLAR:
+        pos, neg, _cat = BIPOLAR[name]
+        return f"Bipolar axis: {pos} (+) vs {neg} (-). Steer with negative alpha for the opposite pole."
+    return f"Monopolar probe: {name}."
+
+
+# --- file utilities ---------------------------------------------------------
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -56,31 +109,69 @@ def refresh_pack_files(folder: Path) -> None:
     meta.write(folder)
 
 
-def regenerate_concept(session: SaklasSession, concept_dir: Path) -> bool:
-    name = concept_dir.name
-    statements_path = concept_dir / "statements.json"
-    if statements_path.exists() and statements_path.stat().st_mtime > START_TS:
-        print(f"  [skip] {name} — already regenerated this run")
+def ensure_pack(folder: Path, name: str, category: str) -> None:
+    """Create folder + pack.json if missing. Overwrite tags/description."""
+    folder.mkdir(parents=True, exist_ok=True)
+    desc = _describe(name)
+    existing_files: dict[str, str] = {}
+    pack_path = folder / "pack.json"
+    if pack_path.exists():
+        try:
+            meta = PackMetadata.load(folder)
+            existing_files = dict(meta.files or {})
+        except PackFormatError:
+            pass
+    PackMetadata(
+        name=name,
+        description=desc,
+        version="1.0.0",
+        license="AGPL-3.0-or-later",
+        tags=[category],
+        recommended_alpha=0.5,
+        source="bundled",
+        files=existing_files,
+    ).write(folder)
+
+
+# --- generation -------------------------------------------------------------
+
+def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> bool:
+    folder = VECTORS_DIR / name
+    if name in BIPOLAR:
+        pos, neg, category = BIPOLAR[name]
+    elif name in MONOPOLAR:
+        pos, neg, category = name, None, MONOPOLAR[name]
+    else:
+        print(f"  [skip] {name} — not in manifest")
         return False
 
-    print(f"  [gen ] {name}...", flush=True)
+    ensure_pack(folder, name, category)
+    statements_path = folder / "statements.json"
+    if statements_path.exists() and not force:
+        print(f"  [skip] {name} — statements.json present (use --force to overwrite)")
+        return False
+
+    mode = "bipolar" if neg else "monopolar"
+    print(f"  [gen ] {name} ({mode}: {pos}" + (f" / {neg})" if neg else ")"), flush=True)
     t0 = time.time()
     pairs = session.generate_pairs(
-        concept=name,
-        baseline=None,
+        concept=pos,
+        baseline=neg,
         n=N_PAIRS,
         on_progress=lambda msg: print(f"    {msg}", flush=True),
     )
     if len(pairs) < N_PAIRS // 2:
-        print(f"  [warn] {name}: only {len(pairs)} pairs — keeping old file")
+        print(f"  [warn] {name}: only {len(pairs)} pairs — not writing")
         return False
 
     payload = [{"positive": a, "negative": b} for a, b in pairs]
     statements_path.write_text(json.dumps(payload, indent=2) + "\n")
-    refresh_pack_files(concept_dir)
+    refresh_pack_files(folder)
     print(f"  [done] {name}: {len(pairs)} pairs in {time.time() - t0:.1f}s")
     return True
 
+
+# --- neutrals ---------------------------------------------------------------
 
 NEUTRAL_SYSTEM = (
     "You generate affect-neutral statements for neural network "
@@ -141,7 +232,6 @@ def generate_neutrals(session: SaklasSession, n: int) -> list[str]:
             line = line.strip()
             if not line:
                 continue
-            # strip leading "N." or "N)"
             parts = line.split(".", 1)
             if len(parts) == 2 and parts[0].strip().isdigit():
                 s = parts[1].strip()
@@ -157,29 +247,70 @@ def generate_neutrals(session: SaklasSession, n: int) -> list[str]:
     return out[:n]
 
 
+# --- main -------------------------------------------------------------------
+
+def _manifest_names() -> list[str]:
+    return sorted(list(BIPOLAR.keys()) + list(MONOPOLAR.keys()))
+
+
+def purge_vectors_dir() -> None:
+    """Remove all concept folders under saklas/data/vectors/.
+
+    Leaves the parent dir in place. Safe to call before regeneration —
+    every concept in the manifest will have its folder recreated.
+    """
+    if not VECTORS_DIR.exists():
+        return
+    for child in sorted(VECTORS_DIR.iterdir()):
+        if child.is_dir():
+            shutil.rmtree(child)
+    print(f"  [purge] wiped {VECTORS_DIR}")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--purge", action="store_true",
+                        help="Delete all existing concept folders before regenerating")
+    parser.add_argument("--force", action="store_true",
+                        help="Regenerate statements.json even if present")
+    parser.add_argument("--only", nargs="*", default=None,
+                        help="Regenerate only the listed concept names")
+    parser.add_argument("--skip-neutrals", action="store_true",
+                        help="Skip neutral_statements.json regeneration")
+    args = parser.parse_args()
+
+    if args.purge:
+        print("Purging existing concept folders...")
+        purge_vectors_dir()
+
+    names = args.only if args.only else _manifest_names()
+    unknown = [n for n in names if n not in BIPOLAR and n not in MONOPOLAR]
+    if unknown:
+        print(f"Unknown concepts: {unknown}", file=sys.stderr)
+        return 2
+
     print(f"Loading {MODEL_ID}...", flush=True)
-    session = SaklasSession(MODEL_ID, device="auto")
+    session = SaklasSession(MODEL_ID, device="auto", probes=[])
     print(f"Loaded on {session._device} ({session._dtype})", flush=True)
 
-    concepts = sorted(p for p in VECTORS_DIR.iterdir() if p.is_dir())
-    print(f"\nRegenerating {len(concepts)} concepts...")
-    for cdir in concepts:
+    print(f"\nRegenerating {len(names)} concepts...")
+    for name in names:
         try:
-            regenerate_concept(session, cdir)
+            regenerate_concept(session, name, force=args.force or args.purge)
         except Exception as e:
-            print(f"  [error] {cdir.name}: {e}")
+            print(f"  [error] {name}: {e}")
 
-    print(f"\nRegenerating neutral statements ({N_NEUTRALS})...")
-    try:
-        neutrals = generate_neutrals(session, N_NEUTRALS)
-        if len(neutrals) >= N_NEUTRALS // 2:
-            NEUTRALS_PATH.write_text(json.dumps(neutrals, indent=2) + "\n")
-            print(f"  [done] wrote {len(neutrals)} neutrals")
-        else:
-            print(f"  [warn] only {len(neutrals)} neutrals generated — not writing")
-    except Exception as e:
-        print(f"  [error] neutrals: {e}")
+    if not args.skip_neutrals:
+        print(f"\nRegenerating neutral statements ({N_NEUTRALS})...")
+        try:
+            neutrals = generate_neutrals(session, N_NEUTRALS)
+            if len(neutrals) >= N_NEUTRALS // 2:
+                NEUTRALS_PATH.write_text(json.dumps(neutrals, indent=2) + "\n")
+                print(f"  [done] wrote {len(neutrals)} neutrals")
+            else:
+                print(f"  [warn] only {len(neutrals)} neutrals generated — not writing")
+        except Exception as e:
+            print(f"  [error] neutrals: {e}")
 
     print("\nDone.")
     return 0

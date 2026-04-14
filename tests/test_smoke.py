@@ -328,8 +328,8 @@ class TestProbesBootstrap:
         with tempfile.TemporaryDirectory() as tmp:
             monkeypatch.setenv("SAKLAS_HOME", tmp)
             materialize_bundled()
-            # Pre-populate the `happy` concept tensor for this model
-            folder = concept_dir("default", "happy")
+            # Pre-populate the `happy.sad` concept tensor for this model
+            folder = concept_dir("default", "happy.sad")
             ts_path = folder / f"{safe_model_id(model_info['model_id'])}.safetensors"
             save_profile(happy_profile, str(ts_path), {
                 "method": "contrastive_pca",
@@ -343,7 +343,7 @@ class TestProbesBootstrap:
 
             probes = bootstrap_probes(
                 model, tokenizer, layers, model_info,
-                categories=["emotion"],
+                categories=["affect"],
             )
             assert isinstance(probes, dict)
-            assert "happy" in probes
+            assert "happy.sad" in probes

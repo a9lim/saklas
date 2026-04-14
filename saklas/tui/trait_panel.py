@@ -33,7 +33,7 @@ class TraitPanel(Widget):
             id="trait-header", classes="section-header",
         )
         yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
-        yield Static("[dim]⌫ remove · ⌃S sort[/]",
+        yield Static("[dim]⌫ remove · ⌃S sort · ⌃Y highlight[/]",
                       id="trait-hints")
 
     def on_mount(self) -> None:
@@ -97,6 +97,10 @@ class TraitPanel(Widget):
     def _render_probes(self) -> None:
         self._nav_items = []
         lines: list[str] = []
+        nav_idx = self._nav_idx
+        cur = self._current_values
+        prv = self._previous_values
+        sparks = self._sparklines
 
         for category, members in self._categories.items():
             active_members = [m for m in members if m in self._active_probes]
@@ -110,11 +114,11 @@ class TraitPanel(Widget):
 
             sorted_members = self._sort_probes(active_members)
             for name in sorted_members:
-                is_nav_selected = len(self._nav_items) == self._nav_idx
+                is_nav_selected = len(self._nav_items) == nav_idx
                 self._nav_items.append(name)
 
-                val = self._current_values.get(name, 0.0)
-                prev = self._previous_values.get(name, 0.0)
+                val = cur.get(name, 0.0)
+                prev = prv.get(name, 0.0)
                 if math.isnan(val):
                     val = 0.0
                 if math.isnan(prev):
@@ -136,7 +140,7 @@ class TraitPanel(Widget):
                 else:
                     color = "ansi_default"
 
-                mini_spark = self._sparklines.get(name, "")
+                mini_spark = sparks.get(name, "")
 
                 sel = ">" if is_nav_selected else " "
                 display_name = name[:16].ljust(16)

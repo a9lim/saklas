@@ -27,7 +27,6 @@ from saklas.session import ConcurrentGenerationError, SaklasSession
 
 class SteerParams(BaseModel):
     alphas: dict[str, float] = Field(default_factory=dict)
-    orthogonalize: bool = False
     thinking: bool = False
 
 
@@ -174,15 +173,14 @@ def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
 
 def _resolve_steer_params(
     steer: SteerParams | None, default_alphas: dict[str, float],
-) -> tuple[dict[str, float] | None, bool, bool]:
-    """Resolve (alphas, orthogonalize, thinking) from a request's steer block."""
+) -> tuple[dict[str, float] | None, bool]:
+    """Resolve (alphas, thinking) from a request's steer block."""
     alphas = _resolve_alphas(steer, default_alphas)
-    ortho = steer.orthogonalize if steer else False
     think = steer.thinking if steer else False
-    return alphas, ortho, think
+    return alphas, think
 
 
-def _sampling_kwargs(req: _SamplingBase, alphas, ortho, think) -> dict[str, Any]:
+def _sampling_kwargs(req: _SamplingBase, alphas, think) -> dict[str, Any]:
     """Build the kwargs dict passed to session.generate / generate_stream."""
     stop_list: list[str] | None
     if req.stop is None:
@@ -205,7 +203,6 @@ def _sampling_kwargs(req: _SamplingBase, alphas, ortho, think) -> dict[str, Any]
 
     return {
         "alphas": alphas,
-        "orthogonalize": ortho,
         "thinking": think,
         "stateless": True,
         "seed": req.seed,
@@ -242,17 +239,49 @@ def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
             "logprob": lp,
             "bytes": _token_bytes(tok_str),
             "top_logprobs": [
-                {"token": tok.decode([i]), "logprob": lp, "bytes": _token_bytes(tok.decode([i]))}
-                for i, lp in top
+                {"token": tok.decode([i]), "logprob": alt_lp,
+                 "bytes": _token_bytes(tok.decode([i]))}
+                for i, alt_lp in top
             ],
         })
     return {"content": content}
 
 
+def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
+    """OpenAI /v1/completions logprobs shape (flat, token-parallel arrays).
+
+    https://platform.openai.com/docs/api-reference/completions/object#completions/object-logprobs
+    """
+    if result.logprobs is None:
+        return None
+    tok = session._tokenizer
+    tokens: list[str] = []
+    token_logprobs: list[float] = []
+    top_logprobs: list[dict[str, float]] = []
+    text_offset: list[int] = []
+    offset = 0
+    for tid, lp, top in result.logprobs:
+        tok_str = tok.decode([tid])
+        tokens.append(tok_str)
+        token_logprobs.append(lp)
+        top_logprobs.append({tok.decode([i]): alt_lp for i, alt_lp in top})
+        text_offset.append(offset)
+        offset += len(tok_str)
+    return {
+        "tokens": tokens,
+        "token_logprobs": token_logprobs,
+        "top_logprobs": top_logprobs,
+        "text_offset": text_offset,
+    }
+
+
 @contextmanager
-def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens):
+def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens, top_k=None):
     """Temporarily override generation config."""
-    orig = (session.config.temperature, session.config.top_p, session.config.max_new_tokens)
+    orig = (
+        session.config.temperature, session.config.top_p,
+        session.config.max_new_tokens, session.config.top_k,
+    )
     try:
         if temperature is not None:
             session.config.temperature = temperature
@@ -260,9 +289,12 @@ def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens)
             session.config.top_p = top_p
         if max_tokens is not None:
             session.config.max_new_tokens = max_tokens
+        if top_k is not None:
+            session.config.top_k = top_k
         yield
     finally:
-        session.config.temperature, session.config.top_p, session.config.max_new_tokens = orig
+        (session.config.temperature, session.config.top_p,
+         session.config.max_new_tokens, session.config.top_k) = orig
 
 
 def _resolve_alphas(
@@ -392,6 +424,13 @@ def create_app(session: SaklasSession, default_alphas: dict[str, float] | None =
         return _error(400, msg, "invalid_request_error", param=param)
 
     _register_routes(app)
+
+    # Mount Ollama-compatible /api/* routes alongside OpenAI routes so any
+    # Ollama client (Open WebUI, Enchanted, ollama-python, etc.) talks to
+    # saklas as a drop-in replacement.
+    from saklas.ollama_api import register_ollama_routes
+    register_ollama_routes(app)
+
     return app
 
 
@@ -431,13 +470,22 @@ def _register_routes(app: FastAPI) -> None:
     # Chat completions
     # -----------------------------------------------------------------------
 
+    async def _run_blocking(req, prompt_or_messages, *, raw: bool):
+        alphas, think = _resolve_steer_params(req.steer, app.state.default_alphas)
+        gen_kwargs = _sampling_kwargs(req, alphas, think)
+        async with app.state.gen_lock:
+            with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
+                if raw:
+                    return session.generate(prompt_or_messages, raw=True, **gen_kwargs)
+                return session.generate(prompt_or_messages, **gen_kwargs)
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
-        alphas, ortho, think = _resolve_steer_params(req.steer, app.state.default_alphas)
+        alphas, think = _resolve_steer_params(req.steer, app.state.default_alphas)
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
         model_id = session.model_id
-        gen_kwargs = _sampling_kwargs(req, alphas, ortho, think)
+        gen_kwargs = _sampling_kwargs(req, alphas, think)
 
         if req.stream:
             def _chat_delta(event):
@@ -458,14 +506,12 @@ def _register_routes(app: FastAPI) -> None:
                                    include_usage=include_usage, role_delta=True),
                 media_type="text/event-stream",
             )
-        async with app.state.gen_lock:
-            with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
-                try:
-                    result = session.generate(messages, **gen_kwargs)
-                except ConcurrentGenerationError as e:
-                    return _error(409, str(e), "conflict")
+        try:
+            result = await _run_blocking(req, messages, raw=False)
+        except ConcurrentGenerationError as e:
+            return _error(409, str(e), "conflict")
 
-        response = {
+        return {
             "id": rid,
             "object": "chat.completion",
             "created": int(time.time()),
@@ -481,7 +527,6 @@ def _register_routes(app: FastAPI) -> None:
             "usage": _usage_dict(result),
             "probe_readings": _probe_reading_dict(session),
         }
-        return response
 
     # -----------------------------------------------------------------------
     # Text completions
@@ -489,10 +534,10 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest):
-        alphas, ortho, think = _resolve_steer_params(req.steer, app.state.default_alphas)
+        alphas, think = _resolve_steer_params(req.steer, app.state.default_alphas)
         rid = _make_id()
         model_id = session.model_id
-        gen_kwargs = _sampling_kwargs(req, alphas, ortho, think)
+        gen_kwargs = _sampling_kwargs(req, alphas, think)
 
         if req.stream:
             stream_iter = session.generate_stream(req.prompt, raw=True, **gen_kwargs)
@@ -505,12 +550,10 @@ def _register_routes(app: FastAPI) -> None:
                                    include_usage=include_usage, role_delta=False),
                 media_type="text/event-stream",
             )
-        async with app.state.gen_lock:
-            with _gen_config_override(session, req.temperature, req.top_p, req.max_tokens):
-                try:
-                    result = session.generate(req.prompt, raw=True, **gen_kwargs)
-                except ConcurrentGenerationError as e:
-                    return _error(409, str(e), "conflict")
+        try:
+            result = await _run_blocking(req, req.prompt, raw=True)
+        except ConcurrentGenerationError as e:
+            return _error(409, str(e), "conflict")
 
         return {
             "id": rid,
@@ -521,7 +564,7 @@ def _register_routes(app: FastAPI) -> None:
                 {
                     "index": 0,
                     "text": result.text,
-                    "logprobs": _render_logprobs_chat(result, session),
+                    "logprobs": _render_logprobs_completions(result, session),
                     "finish_reason": result.finish_reason,
                 }
             ],
@@ -567,8 +610,8 @@ def _register_routes(app: FastAPI) -> None:
         # Blocking JSON response
         progress_msgs: list[str] = []
         try:
-            profile = session.extract(source, baseline=req.baseline,
-                                      on_progress=lambda m: progress_msgs.append(m))
+            canonical, profile = session.extract(source, baseline=req.baseline,
+                                                 on_progress=lambda m: progress_msgs.append(m))
         except ConcurrentGenerationError as e:
             return _error(409, str(e), "conflict")
 
@@ -581,6 +624,7 @@ def _register_routes(app: FastAPI) -> None:
 
         return {
             "name": req.name,
+            "canonical": canonical,
             "layers": len(profile),
             "top_layer": top_layer,
             "top_score": round(top_score, 4),
@@ -600,7 +644,7 @@ def _register_routes(app: FastAPI) -> None:
         def _on_progress(msg):
             progress_msgs.append(msg)
         try:
-            profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
+            canonical, profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
         except ConcurrentGenerationError as e:
             err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
             yield f"event: error\ndata: {json.dumps(err)}\n\n"
@@ -616,7 +660,7 @@ def _register_routes(app: FastAPI) -> None:
         scored = _profile_top_layers(profile)
         top_layer, top_score = scored[0] if scored else (0, 0.0)
 
-        done = {"name": name, "layers": len(profile), "top_layer": top_layer, "top_score": round(top_score, 4)}
+        done = {"name": name, "canonical": canonical, "layers": len(profile), "top_layer": top_layer, "top_score": round(top_score, 4)}
         yield f"event: done\ndata: {json.dumps(done)}\n\n"
 
     @app.post("/v1/saklas/vectors/load")

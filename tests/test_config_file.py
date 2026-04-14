@@ -10,7 +10,7 @@ def test_parse_minimal(tmp_path):
     c = cfg.ConfigFile.load(p)
     assert c.model == "google/gemma-2-2b-it"
     assert c.vectors == {}
-    assert c.orthogonalize is None
+    assert c.thinking is None
 
 
 def test_parse_full(tmp_path):
@@ -20,7 +20,6 @@ model: google/gemma-2-2b-it
 vectors:
   default/happy: 0.4
   a9lim/calm: 0.3
-orthogonalize: true
 thinking: true
 temperature: 0.9
 top_p: 0.95
@@ -30,7 +29,6 @@ system_prompt: "You are helpful."
     c = cfg.ConfigFile.load(p)
     assert c.model == "google/gemma-2-2b-it"
     assert c.vectors == {"default/happy": 0.4, "a9lim/calm": 0.3}
-    assert c.orthogonalize is True
     assert c.thinking is True
     assert c.temperature == 0.9
     assert c.top_p == 0.95

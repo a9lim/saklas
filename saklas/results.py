@@ -1,7 +1,7 @@
 from __future__ import annotations
 import csv
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -15,14 +15,7 @@ class ProbeReadings:
     delta_per_gen: float
 
     def to_dict(self) -> dict:
-        return {
-            "per_generation": list(self.per_generation),
-            "mean": self.mean,
-            "std": self.std,
-            "min": self.min,
-            "max": self.max,
-            "delta_per_gen": self.delta_per_gen,
-        }
+        return asdict(self)
 
 
 @dataclass

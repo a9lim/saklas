@@ -16,10 +16,10 @@ class TestConstructor:
         assert ds.name == "test"
 
 class TestCurated:
-    def test_loads_happy(self):
-        ds = DataSource.curated("happy")
+    def test_loads_happy_sad(self):
+        ds = DataSource.curated("happy.sad")
         assert len(ds.pairs) > 0
-        assert ds.name == "happy"
+        assert ds.name == "happy.sad"
         for pos, neg in ds.pairs:
             assert isinstance(pos, str)
             assert isinstance(neg, str)

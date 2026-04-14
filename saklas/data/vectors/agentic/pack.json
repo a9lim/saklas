@@ -1,16 +1,14 @@
 {
   "name": "agentic",
-  "description": "Agentic vs communal framing based on Bakan's framework. Positive prompts emphasize individual action, achievement, competition, and decisiveness. Negative prompts emphasize cooperation, relationships, care, and consensus. (merged with communal pairs, flipped)",
+  "description": "Monopolar probe: agentic.",
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
-    "gender"
+    "alignment"
   ],
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "1cd6d4ddb535d29570b526f90d614a28033d09ad8df3828de2cb90f9e40cb0ba"
-  },
-  "signature": null,
-  "signature_method": null
+    "statements.json": "1ceccba4a1d719003e9ed32f356901b3c09ea097dfa7b6b3e7f0cb086a1274d9"
+  }
 }

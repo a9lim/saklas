@@ -168,7 +168,7 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
 
     hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
     return {
-        idx: h.float()[0, min(content_end, h.shape[1] - 1)]
+        idx: h[0, min(content_end, h.shape[1] - 1)].float()
         for idx, h in hidden_per_layer.items()
     }
 
@@ -208,11 +208,12 @@ def compute_layer_means(
     prompts = _load_neutral_prompts()
     for text in prompts:
         per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
-        for idx in range(n_layers):
-            if idx not in sums:
-                sums[idx] = per_layer[idx]
-            else:
-                sums[idx] = sums[idx] + per_layer[idx]
+        if not sums:
+            for idx in range(n_layers):
+                sums[idx] = per_layer[idx].clone()
+        else:
+            for idx in range(n_layers):
+                sums[idx] += per_layer[idx]
         del per_layer
         if _mps:
             torch.mps.empty_cache()
@@ -261,8 +262,10 @@ def extract_contrastive(
         neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
         for idx in range(n_layers):
             p, n = pos_all[idx], neg_all[idx]
-            diffs_per_layer[idx].append((p - n).to(diff_device))
             norm_sums[idx] += p.norm() + n.norm()
+            p_d = p.to(diff_device)
+            n_d = n.to(diff_device)
+            diffs_per_layer[idx].append(p_d - n_d)
         # Free forward-pass intermediates (attention maps, hidden states)
         # before the next pair — MPS doesn't release memory eagerly.
         del pos_all, neg_all

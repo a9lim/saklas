@@ -20,7 +20,6 @@ class LeftPanel(Widget):
         self._model_info = model_info
         self._vectors: list[dict] = []
         self._selected_idx: int = 0
-        self._orthogonalize: bool = False
         self._thinking: bool | None = None  # None = model doesn't support it
         self._temperature: float = 1.0
         self._top_p: float = 0.9
@@ -50,10 +49,10 @@ class LeftPanel(Widget):
             id="model-info",
         )
         # Vectors section
-        yield Static("[bold]VECTORS[/] [dim]0 total, 0 active · ortho: OFF[/]",
+        yield Static("[bold]VECTORS[/] [dim]0 total, 0 active[/]",
                       id="vectors-header", classes="section-header")
         yield VerticalScroll(Static("", id="vector-content"), id="vector-scroll")
-        yield Static("[dim]⌫ remove · ↩ toggle · ⌃O ortho[/]",
+        yield Static("[dim]⌫ remove · ↩ toggle[/]",
                       id="vector-hints")
         # Generation section
         yield Static("[bold]GENERATION[/]", classes="section-header")
@@ -71,9 +70,8 @@ class LeftPanel(Widget):
             id="key-ref",
         )
 
-    def update_vectors(self, vectors: list[dict], orthogonalize: bool = False) -> None:
+    def update_vectors(self, vectors: list[dict]) -> None:
         self._vectors = vectors
-        self._orthogonalize = orthogonalize
         if self._vectors:
             self._selected_idx = min(self._selected_idx, len(self._vectors) - 1)
         else:
@@ -108,10 +106,9 @@ class LeftPanel(Widget):
     def _render_vectors(self) -> None:
         active = sum(1 for v in self._vectors if v.get("enabled", True))
         total = len(self._vectors)
-        ortho_str = "ON" if self._orthogonalize else "OFF"
         header = self._vectors_header
         header.update(
-            f"[bold]VECTORS[/] [dim]{total} total, {active} active · ortho: {ortho_str}[/]"
+            f"[bold]VECTORS[/] [dim]{total} total, {active} active[/]"
         )
 
         lines: list[str] = []

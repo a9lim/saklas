@@ -23,6 +23,8 @@ def _mock_session():
         "num_layers": 26,
         "hidden_dim": 2304,
         "vram_used_gb": 5.2,
+        "param_count": 2_614_000_000,
+        "dtype": "torch.bfloat16",
     }
 
     session.config = MagicMock()
@@ -125,12 +127,12 @@ class TestChatCompletions:
         )
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "test"}],
-            "steer": {"alphas": {"vec1": 0.3}, "orthogonalize": True},
+            "steer": {"alphas": {"vec1": 0.3}},
         })
         assert resp.status_code == 200
         call_kwargs = session.generate.call_args[1]
         assert call_kwargs["alphas"] == {"vec1": 0.3}
-        assert call_kwargs["orthogonalize"] is True
+        assert "orthogonalize" not in call_kwargs
 
     def test_streaming(self, session_and_client):
         session, client = session_and_client
@@ -339,3 +341,266 @@ class TestCLIParsing:
 # + --clear-all/--clear-custom behavior it exercised no longer exists.
 # Cache-op coverage is in tests/test_cache_ops.py (delete_tensors across
 # concept/tag/model selectors with the new ~/.saklas/ layout).
+
+
+# ---------------------------------------------------------------------------
+# Ollama-compatible /api/* routes
+# ---------------------------------------------------------------------------
+
+class TestOllamaApi:
+    def test_version(self, client):
+        resp = client.get("/api/version")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "version" in data
+        assert data["version"].startswith("saklas-")
+
+    def test_tags_lists_loaded_model(self, client):
+        resp = client.get("/api/tags")
+        assert resp.status_code == 200
+        models = resp.json()["models"]
+        assert len(models) >= 1
+        names = [m["name"] for m in models]
+        assert "test/model" in names
+        first = models[0]
+        for key in ("name", "model", "modified_at", "size", "digest", "details"):
+            assert key in first
+        assert first["digest"].startswith("sha256:")
+        assert first["details"]["format"] == "safetensors"
+        assert first["details"]["family"] == "gemma2"
+        assert first["details"]["parameter_size"] == "2.6B"
+        assert first["details"]["quantization_level"] == "BF16"
+
+    def test_tags_advertises_aliases_for_known_model(self):
+        from saklas.server import create_app
+        session = _mock_session()
+        session.model_id = "google/gemma-2-2b-it"
+        app = create_app(session)
+        c = TestClient(app)
+        names = [m["name"] for m in c.get("/api/tags").json()["models"]]
+        assert "google/gemma-2-2b-it" in names
+        assert "gemma2:2b" in names
+
+    def test_ps(self, client):
+        resp = client.get("/api/ps")
+        assert resp.status_code == 200
+        entries = resp.json()["models"]
+        assert len(entries) >= 1
+        assert "expires_at" in entries[0]
+        assert "size_vram" in entries[0]
+
+    def test_show(self, client):
+        resp = client.post("/api/show", json={"model": "test/model"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "modelfile" in data
+        assert "details" in data
+        assert "model_info" in data
+        assert data["details"]["family"] == "gemma2"
+        assert data["model_info"]["general.architecture"] == "gemma2"
+        assert data["model_info"]["gemma2.block_count"] == 26
+        assert data["model_info"]["saklas.loaded_model"] == "test/model"
+
+    def test_chat_non_streaming(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="Hello there!", tokens=[1, 2, 3], token_count=3, prompt_tokens=2,
+            tok_per_sec=10.0, elapsed=0.3,
+        )
+        resp = client.post("/api/chat", json={
+            "model": "test/model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["done"] is True
+        assert data["done_reason"] == "stop"
+        assert data["message"]["role"] == "assistant"
+        assert data["message"]["content"] == "Hello there!"
+        assert data["model"] == "test/model"
+        assert data["eval_count"] == 3
+        assert data["prompt_eval_count"] == 2
+        assert data["total_duration"] > 0
+        # Session should have been called with the translated messages.
+        messages = session.generate.call_args[0][0]
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "Hi"
+
+    def test_chat_with_system_field(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, prompt_tokens=5,
+            tok_per_sec=5.0, elapsed=0.1,
+        )
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": "You are a pirate.",
+            "stream": False,
+        })
+        assert resp.status_code == 200
+        msgs = session.generate.call_args[0][0]
+        assert msgs[0] == {"role": "system", "content": "You are a pirate."}
+        assert msgs[1]["role"] == "user"
+
+    def test_chat_options_passthrough(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, prompt_tokens=1,
+            tok_per_sec=5.0, elapsed=0.1,
+        )
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+            "options": {
+                "temperature": 0.2, "top_p": 0.7, "seed": 42,
+                "num_predict": 64, "stop": ["\n\n"],
+                "steer": {"vec1": 0.3},
+            },
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["seed"] == 42
+        assert kw["stop"] == ["\n\n"]
+        assert kw["alphas"] == {"vec1": 0.3}
+        # Config should be restored after generation.
+        assert session.config.temperature == 1.0
+        assert session.config.top_p == 0.9
+        assert session.config.max_new_tokens == 1024
+
+    def test_chat_repeat_penalty_maps_to_presence_penalty(self, session_and_client):
+        # Ollama's repeat_penalty divides positive logits by the penalty,
+        # which is equivalent to subtracting ln(penalty) from the logit.
+        # That matches presence_penalty semantics (subtract a constant per
+        # seen token, count-independent), not frequency_penalty (count-weighted).
+        import math
+
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, prompt_tokens=1,
+            tok_per_sec=5.0, elapsed=0.1,
+        )
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+            "options": {"repeat_penalty": 1.3},
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert abs(kw["presence_penalty"] - math.log(1.3)) < 1e-6
+        assert kw["frequency_penalty"] == 0.0
+
+    def test_chat_streaming(self, session_and_client):
+        session, client = session_and_client
+
+        def _mock_stream(*args, **kwargs):
+            yield TokenEvent(text="Hello", token_id=1, index=0)
+            yield TokenEvent(text=" world", token_id=2, index=1)
+
+        session.generate_stream.side_effect = _mock_stream
+        session._last_result = GenerationResult(
+            text="Hello world", tokens=[1, 2], token_count=2, prompt_tokens=3,
+            tok_per_sec=5.0, elapsed=0.4,
+        )
+
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        })
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        lines = [l for l in resp.text.strip().split("\n") if l]
+        assert len(lines) >= 3  # 2 content + 1 final
+        chunks = [json.loads(l) for l in lines]
+        # Intermediate chunks carry content tokens and done=False.
+        assert chunks[0]["done"] is False
+        assert chunks[0]["message"]["content"] == "Hello"
+        assert chunks[1]["message"]["content"] == " world"
+        # Final chunk has done=True with duration stats.
+        final = chunks[-1]
+        assert final["done"] is True
+        assert final["done_reason"] == "stop"
+        assert final["eval_count"] == 2
+        assert final["prompt_eval_count"] == 3
+        assert final["message"]["content"] == ""
+
+    def test_generate_non_streaming(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="42", tokens=[1], token_count=1, prompt_tokens=1,
+            tok_per_sec=5.0, elapsed=0.1,
+        )
+        resp = client.post("/api/generate", json={
+            "model": "test/model",
+            "prompt": "What is 6 times 7?",
+            "stream": False,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["response"] == "42"
+        assert data["done"] is True
+        # saklas intentionally omits `context` since it can't round-trip
+        # Ollama's tokenized continuation state honestly.
+        assert "context" not in data
+        # Matching Ollama: /api/generate applies the chat template by default;
+        # callers must set "raw": true to bypass it.
+        assert session.generate.call_args[1]["raw"] is False
+
+    def test_generate_raw_mode(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="x", tokens=[1], token_count=1, prompt_tokens=1,
+            tok_per_sec=5.0, elapsed=0.1,
+        )
+        resp = client.post("/api/generate", json={
+            "prompt": "raw prompt",
+            "stream": False,
+            "raw": True,
+        })
+        assert resp.status_code == 200
+        assert session.generate.call_args[1]["raw"] is True
+
+    def test_generate_with_system_uses_chat_template(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="arrr", tokens=[1], token_count=1, prompt_tokens=2,
+            tok_per_sec=5.0, elapsed=0.1,
+        )
+        resp = client.post("/api/generate", json={
+            "prompt": "Hello",
+            "system": "You are a pirate.",
+            "stream": False,
+        })
+        assert resp.status_code == 200
+        # With system, we switch off raw mode and build a message list.
+        assert session.generate.call_args[1]["raw"] is False
+        msgs = session.generate.call_args[0][0]
+        assert msgs[0]["role"] == "system"
+
+    def test_pull_known_model_is_success(self, client):
+        resp = client.post("/api/pull", json={"model": "test/model"})
+        assert resp.status_code == 200
+        lines = [l for l in resp.text.strip().split("\n") if l]
+        last = json.loads(lines[-1])
+        assert last["status"] == "success"
+
+    def test_pull_unknown_model_404(self, client):
+        resp = client.post("/api/pull", json={"model": "nope:latest"})
+        assert resp.status_code == 404
+
+    def test_embeddings_not_implemented(self, client):
+        resp = client.post("/api/embeddings", json={"model": "test/model", "prompt": "hi"})
+        assert resp.status_code == 501
+
+    def test_ollama_routes_respect_api_key(self):
+        from saklas.server import create_app
+        session = _mock_session()
+        app = create_app(session, api_key="secret")
+        c = TestClient(app)
+        # No auth -> 401
+        assert c.get("/api/tags").status_code == 401
+        # Wrong scheme -> 401
+        assert c.get("/api/tags", headers={"Authorization": "Basic secret"}).status_code == 401
+        # Correct key -> 200
+        resp = c.get("/api/tags", headers={"Authorization": "Bearer secret"})
+        assert resp.status_code == 200

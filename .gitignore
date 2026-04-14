@@ -12,8 +12,9 @@ build/
 venv/
 env/
 
-# pytest
+# pytest / ruff
 .pytest_cache/
+.ruff_cache/
 
 # OS
 .DS_Store
@@ -26,10 +27,7 @@ Thumbs.db
 *.swo
 
 # Claude Code
+.claude/
 .remember/
 .superpowers/
 docs/superpowers/
-
-# Model/probe caches (large binary files)
-saklas/probes/cache/
-saklas/datasets/cache/

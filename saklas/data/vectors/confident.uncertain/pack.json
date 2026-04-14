@@ -1,0 +1,14 @@
+{
+  "name": "confident.uncertain",
+  "description": "Bipolar axis: confident (+) vs uncertain (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "epistemic"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "9998e57c4d22ec982a7b2403e08afd75f1f25bdadd0c38480f6bffeb4fb8c083"
+  }
+}

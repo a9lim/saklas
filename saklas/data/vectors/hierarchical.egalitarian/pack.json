@@ -1,0 +1,14 @@
+{
+  "name": "hierarchical.egalitarian",
+  "description": "Bipolar axis: hierarchical (+) vs egalitarian (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "social_stance"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "53e296d5026cb7905ba077a2ba922e9e74c4c3f34fca959babcf6cf061f706b5"
+  }
+}

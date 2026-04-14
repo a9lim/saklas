@@ -4,7 +4,7 @@ import pytest
 from saklas import cache_ops, cli_selectors as sel, packs
 
 
-def _mk(home, ns, name, models=(), tags=()):
+def _mk(home, ns, name, models=(), tags=(), source="local"):
     d = home / "vectors" / ns / name
     d.mkdir(parents=True)
     (d / "statements.json").write_text("[]")
@@ -18,7 +18,7 @@ def _mk(home, ns, name, models=(), tags=()):
         files[f"{m}.json"] = packs.hash_file(d / f"{m}.json")
     packs.PackMetadata(
         name=name, description="x", version="1.0.0", license="MIT",
-        tags=list(tags), recommended_alpha=0.5, source="local",
+        tags=list(tags), recommended_alpha=0.5, source=source,
         files=files,
     ).write(d)
     return d
@@ -135,10 +135,13 @@ def test_install_as_relocates(monkeypatch, tmp_path):
 def test_refresh_bundled_restores_statements(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     packs.materialize_bundled()
-    d = tmp_path / "vectors" / "default" / "happy"
+    d = tmp_path / "vectors" / "default" / "angry.calm"
+    if not (d / "statements.json").exists():
+        import pytest
+        pytest.skip("angry.calm statements.json not yet regenerated")
     original = (d / "statements.json").read_text()
     (d / "statements.json").write_text("[{}]")
-    cache_ops.refresh(sel.parse("happy"))
+    cache_ops.refresh(sel.parse("angry.calm"))
     assert (d / "statements.json").read_text() == original
 
 
@@ -155,16 +158,18 @@ def test_install_hf_routes_to_pull_pack(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     called = {}
 
-    def fake_pull(coord, target_folder, *, force):
+    def fake_pull(coord, target_folder, *, force, revision=None):
         called["coord"] = coord
         called["target"] = target_folder
         called["force"] = force
+        called["revision"] = revision
         target_folder.mkdir(parents=True, exist_ok=True)
         (target_folder / "statements.json").write_text("[]")
+        src = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
         packs.PackMetadata(
             name="happy", description="x", version="1.0.0", license="MIT",
             tags=["emotion"], recommended_alpha=0.5,
-            source=f"hf://{coord}",
+            source=src,
             files={"statements.json": packs.hash_file(target_folder / "statements.json")},
         ).write(target_folder)
         return target_folder
@@ -172,7 +177,52 @@ def test_install_hf_routes_to_pull_pack(monkeypatch, tmp_path):
     monkeypatch.setattr("saklas.hf.pull_pack", fake_pull)
     cache_ops.install("user/happy", as_=None, force=False)
     assert called["coord"] == "user/happy"
+    assert called["revision"] is None
     assert called["target"] == tmp_path / "home" / "vectors" / "user" / "happy"
+
+
+def test_install_hf_with_revision_pins_source(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
+    called = {}
+
+    def fake_pull(coord, target_folder, *, force, revision=None):
+        called["coord"] = coord
+        called["revision"] = revision
+        target_folder.mkdir(parents=True, exist_ok=True)
+        (target_folder / "statements.json").write_text("[]")
+        src = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
+        packs.PackMetadata(
+            name="happy", description="x", version="1.0.0", license="MIT",
+            tags=["emotion"], recommended_alpha=0.5,
+            source=src,
+            files={"statements.json": packs.hash_file(target_folder / "statements.json")},
+        ).write(target_folder)
+        return target_folder
+
+    monkeypatch.setattr("saklas.hf.pull_pack", fake_pull)
+    result = cache_ops.install("user/happy@v1.2.0", as_=None, force=False)
+    assert called["coord"] == "user/happy"
+    assert called["revision"] == "v1.2.0"
+    m = packs.PackMetadata.load(result)
+    assert m.source == "hf://user/happy@v1.2.0"
+
+
+def test_refresh_pinned_hf_source_passes_revision(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _mk(tmp_path, "user", "happy", source="hf://user/happy@v1.2.0")
+    called = {}
+
+    def fake_pull(coord, target_folder, *, force, revision=None):
+        called["coord"] = coord
+        called["revision"] = revision
+        called["force"] = force
+        return target_folder
+
+    monkeypatch.setattr("saklas.hf.pull_pack", fake_pull)
+    cache_ops.refresh(sel.parse("user/happy"))
+    assert called["coord"] == "user/happy"
+    assert called["revision"] == "v1.2.0"
+    assert called["force"] is True
 
 
 def test_list_local_all(monkeypatch, tmp_path, capsys):

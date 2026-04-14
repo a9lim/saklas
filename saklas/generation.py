@@ -5,9 +5,17 @@ from __future__ import annotations
 import queue
 import logging
 import threading
+from enum import IntEnum
 from typing import Callable
 
 import torch
+
+
+class _ThinkState(IntEnum):
+    IDLE = 0
+    PREAMBLE = 1
+    THINKING = 2
+    RESPONSE_PREAMBLE = 3
 
 log = logging.getLogger(__name__)
 
@@ -251,7 +259,7 @@ def supports_thinking(tokenizer) -> bool:
 
 class GenerationConfig:
     __slots__ = (
-        "max_new_tokens", "temperature", "top_p", "system_prompt",
+        "max_new_tokens", "temperature", "top_p", "top_k", "system_prompt",
     )
 
     def __init__(
@@ -259,11 +267,13 @@ class GenerationConfig:
         max_new_tokens: int = 1024,
         temperature: float = 1.0,
         top_p: float = 0.9,
+        top_k: int | None = None,
         system_prompt: str | None = None,
     ):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.top_k = top_k
         self.system_prompt = system_prompt
 
 
@@ -356,7 +366,12 @@ def generate_steered(
     generated_ids: list[int] = []
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
-    topk_k = min(1024, _vocab)
+    # top_k caps the candidate pool before top-p.  When unset, use 1024 as a
+    # performance ceiling (nucleus sampling is insensitive beyond that).  When
+    # set, honour the user's value as a hard cap — matches llama.cpp/Ollama
+    # semantics where top_k is applied before top_p.
+    _user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
+    topk_k = min(_user_top_k, _vocab)
     token_table = _get_token_table(tokenizer, _vocab) if on_token else None
     seq_len = input_ids.shape[1]
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
@@ -364,7 +379,7 @@ def generate_steered(
 
     # Penalty / bias / stop / logprobs setup
     use_penalties = presence_penalty != 0.0 or frequency_penalty != 0.0
-    completion_counts: dict[int, int] = {} if use_penalties else {}
+    completion_counts: dict[int, int] = {}
     bias_idx: torch.Tensor | None = None
     bias_val: torch.Tensor | None = None
     if logit_bias:
@@ -382,9 +397,11 @@ def generate_steered(
     else:
         think_start_id = think_end_id = response_start_id = None
         starts_in_thinking = False
-    in_thinking = starts_in_thinking and think_end_id is not None
-    in_preamble = False  # suppressing start-of-thinking tokens (e.g. "thought\n")
-    in_response_preamble = False  # suppressing post-thinking channel labels
+    tstate = (
+        _ThinkState.THINKING
+        if (starts_in_thinking and think_end_id is not None)
+        else _ThinkState.IDLE
+    )
 
     # Buffer for multi-token characters (emoji, rare Unicode).
     # Tokens whose table entry is None represent partial UTF-8 byte sequences;
@@ -467,31 +484,23 @@ def generate_steered(
                     # EOS while inside thinking/preamble and transition
                     # to response preamble.  For enable_thinking models
                     # (Gemma, Qwen) EOS always terminates generation.
-                    if response_start_id is None or not (
-                        in_thinking or in_preamble or in_response_preamble
-                    ):
+                    if response_start_id is None or tstate == _ThinkState.IDLE:
                         state.finish_reason = "stop"
                         break
-                    # EOS inside a thinking/preamble phase — advance KV
-                    # state, transition out of thinking, and keep generating.
                     generated_ids.append(token_id)
                     current_input = next_token
-                    if in_thinking:
-                        # EOS ends the thinking channel — enter response
-                        # preamble so inter-channel tokens (turn markers
-                        # like <|start|>assistant) are suppressed.
-                        in_thinking = False
+                    if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
                             on_token(tokenizer.decode(pending_ids),
                                      pending_thinking, -1, None, None)
                             pending_ids.clear()
-                        in_response_preamble = True
-                    elif in_preamble:
-                        in_preamble = False
+                        tstate = _ThinkState.RESPONSE_PREAMBLE
+                    elif tstate == _ThinkState.PREAMBLE:
                         if on_token and pending_ids:
                             on_token(tokenizer.decode(pending_ids),
                                      pending_thinking, -1, None, None)
                             pending_ids.clear()
+                        tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
                     continue
 
@@ -503,51 +512,38 @@ def generate_steered(
                 # explicitly opens a thinking channel)
                 if (think_start_id is not None
                         and token_id == think_start_id
-                        and not in_thinking and not in_preamble):
-                    in_preamble = True
+                        and tstate == _ThinkState.IDLE):
+                    tstate = _ThinkState.PREAMBLE
                     continue  # suppress start delimiter
 
-                # Suppress preamble tokens between the start delimiter and
-                # the first newline or content marker (e.g. Gemma's
-                # "thought\n" channel label, gpt-oss's "analysis<|message|>")
-                if in_preamble:
+                if tstate == _ThinkState.PREAMBLE:
                     if token_id == think_end_id:
-                        # Empty thinking section — end delimiter hit
-                        # during preamble
-                        in_preamble = False
+                        tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
                     elif (response_start_id is not None
                           and token_id == response_start_id):
-                        # Channel-based format: content marker ends preamble
-                        in_preamble = False
-                        in_thinking = True
+                        tstate = _ThinkState.THINKING
                     else:
                         tok_text = tokenizer.decode([token_id])
                         if '\n' in tok_text:
-                            in_preamble = False
-                            in_thinking = True
+                            tstate = _ThinkState.THINKING
                     continue  # suppress preamble
 
                 # Handle end-of-thinking delimiter
-                if in_thinking and token_id == think_end_id:
-                    in_thinking = False
-                    # Flush any buffered partial tokens before the delimiter
+                if tstate == _ThinkState.THINKING and token_id == think_end_id:
                     if on_token and pending_ids:
                         on_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
                         pending_ids.clear()
                     if response_start_id is not None:
-                        # Channel-based format (e.g. gpt-oss): suppress
-                        # response channel preamble until content marker
-                        in_response_preamble = True
+                        tstate = _ThinkState.RESPONSE_PREAMBLE
                     else:
+                        tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
                     continue
 
-                # Suppress response preamble tokens between end-of-thinking
-                # and start-of-response (channel-based formats)
-                if in_response_preamble:
+                if tstate == _ThinkState.RESPONSE_PREAMBLE:
                     if token_id == response_start_id:
-                        in_response_preamble = False
+                        tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
                     continue
 
@@ -561,11 +557,11 @@ def generate_steered(
                     tok_str = token_table[token_id] if token_id < _vocab else ''
                     emit_text: str | None = None
                     emit_id = token_id
-                    emit_thinking = in_thinking
+                    emit_thinking = tstate == _ThinkState.THINKING
                     if tok_str is None:
                         # Partial UTF-8 byte sequence — buffer until complete
                         if not pending_ids:
-                            pending_thinking = in_thinking
+                            pending_thinking = emit_thinking
                         pending_ids.append(token_id)
                     elif pending_ids:
                         pending_ids.append(token_id)

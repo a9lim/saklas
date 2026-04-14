@@ -1,0 +1,14 @@
+{
+  "name": "fearful.brave",
+  "description": "Bipolar axis: fearful (+) vs brave (-). Steer with negative alpha for the opposite pole.",
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "affect"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "statements.json": "ecebeaf56de440ed48042755365423526733f540e00bebce5a8784559b2d51ac"
+  }
+}
