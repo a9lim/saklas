@@ -357,9 +357,9 @@ Probe readings flatten to columns: `probe_honest.deceptive_mean`, `probe_honest.
 
 ---
 
-## OpenAI-compatible API server
+## OpenAI- and Ollama-compatible API server
 
-Serve a steered model as an OpenAI-compatible HTTP endpoint. Works with the OpenAI Python/JS SDKs, LangChain, LlamaIndex, `curl`, or anything that speaks `/v1/chat/completions`.
+Serve a steered model as an HTTP endpoint speaking **both** the OpenAI `/v1/*` protocol **and** the Ollama `/api/*` protocol on the same port. Works with the OpenAI Python/JS SDKs, LangChain, LlamaIndex, `curl`, Open WebUI, Enchanted, Msty, `ollama-python`, LangChain's `ChatOllama`, or anything that speaks either wire format.
 
 ```bash
 pip install saklas[serve]
@@ -451,6 +451,44 @@ Probe readings piggyback as an extra `probe_readings` field in generation respon
 The server is **stateless by default** — each request carries its full message list, and neither conversation history nor probe accumulators persist across requests. The `/v1/saklas/session/*` routes are stateful by design for single-user workflows. Concurrent requests queue FIFO against a single generation lock.
 
 **Not supported:** tool calling, strict JSON/`json_schema` mode, `/v1/embeddings`.
+
+### Ollama protocol (`/api/*`)
+
+Point any Ollama client at `http://localhost:8000` and it just works — no config shim, no proxy. `saklas serve` mounts the full Ollama route surface alongside the OpenAI routes on the same port, sharing one generation lock, one bearer-auth dependency, and one underlying session.
+
+```bash
+saklas serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
+
+# Open WebUI / Enchanted / any Ollama client: point at http://localhost:8000
+# The loaded model appears under both its HF id (google/gemma-2-9b-it) and
+# its Ollama alias (gemma2, gemma2:latest, gemma2:9b) in /api/tags.
+```
+
+```bash
+# Raw curl — NDJSON streaming, matches Ollama wire format exactly
+curl -N http://localhost:8000/api/chat -d '{
+  "model": "gemma2",
+  "messages": [{"role": "user", "content": "Write me a haiku."}],
+  "options": {
+    "temperature": 0.8,
+    "top_k": 50,
+    "repeat_penalty": 1.1,
+    "steer": {"cheerful": 0.3, "formal.casual": -0.2}
+  }
+}'
+```
+
+**Steering through Ollama clients.** The non-standard `steer` field inside `options` carries saklas alphas — clients that don't know about it leave it alone, clients that want it get per-request control. Both flat (`{"steer": {"name": alpha}}`) and nested (`{"steer": {"alphas": {...}, "thinking": true}}`) forms are accepted. Merged over any server-side `--steer` defaults; zero-alphas are stripped.
+
+**Advertised endpoints:** `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` (no-op success for the loaded model, 404 otherwise), `HEAD /` for liveness.
+
+**Option translation.** `temperature`, `top_p`, `top_k`, `seed`, `num_predict`, `stop`, `presence_penalty`, `frequency_penalty`, `repeat_penalty`, and `think` all pipe through to the underlying session. `repeat_penalty` maps to saklas's `presence_penalty` via `ln(repeat_penalty)` — exact for positive logits, matching Ollama's "divide by penalty" semantics without the unbounded count weighting that plain frequency_penalty would introduce. Unrecognized options (`min_p`, `mirostat*`, `num_ctx`, `typical_p`, etc.) are logged at debug level and silently dropped.
+
+**Model aliasing.** A saklas server hosts exactly one model. `/api/tags` advertises it under its HF id plus a hybrid alias set: an authoritative override table for popular families (where Ollama's catalogue rounds sizes differently — Gemma-2-2b is 2.6B params but Ollama calls it `gemma2:2b`), with `<family>:<size>` inference from `model_info` as a fallback for new architectures. By default the `model` field on incoming requests is accepted regardless of match, so clients with stale dropdowns don't 404 — set `SAKLAS_OLLAMA_STRICT=1` to reject mismatches with a 404 instead.
+
+**Thinking.** Streams as `message.thinking` on `/api/chat` and top-level `thinking` on `/api/generate`, matching Ollama's current schema. Open WebUI renders it as a collapsible reasoning panel automatically.
+
+**Not supported (Ollama protocol):** `/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/embeddings`, `/api/embed` (all return 501). Saklas doesn't manage models the Ollama way — it loads one HF model at startup and serves it. The `context` field on `/api/generate` responses is omitted (not an empty list) because saklas can't round-trip Ollama's tokenized continuation state honestly.
 
 The server is designed for **trusted networks** — see [SECURITY.md](SECURITY.md) for the threat model before exposing it beyond your local machine.
 

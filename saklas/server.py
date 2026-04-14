@@ -276,9 +276,12 @@ def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
 
 
 @contextmanager
-def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens):
+def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens, top_k=None):
     """Temporarily override generation config."""
-    orig = (session.config.temperature, session.config.top_p, session.config.max_new_tokens)
+    orig = (
+        session.config.temperature, session.config.top_p,
+        session.config.max_new_tokens, session.config.top_k,
+    )
     try:
         if temperature is not None:
             session.config.temperature = temperature
@@ -286,9 +289,12 @@ def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens)
             session.config.top_p = top_p
         if max_tokens is not None:
             session.config.max_new_tokens = max_tokens
+        if top_k is not None:
+            session.config.top_k = top_k
         yield
     finally:
-        session.config.temperature, session.config.top_p, session.config.max_new_tokens = orig
+        (session.config.temperature, session.config.top_p,
+         session.config.max_new_tokens, session.config.top_k) = orig
 
 
 def _resolve_alphas(

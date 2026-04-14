@@ -23,6 +23,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import math
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -31,6 +34,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from saklas.session import ConcurrentGenerationError, SaklasSession
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -46,19 +51,25 @@ from saklas.session import ConcurrentGenerationError, SaklasSession
 # saklas always generates with the loaded session regardless.  The table only
 # affects what /api/tags and /api/show advertise.
 
+# Manual overrides for HF ids whose canonical Ollama tags need to match
+# Ollama's actual catalogue (e.g. Gemma-2-2b is ~2.6B params but Ollama
+# advertises it as `gemma2:2b`), plus cases where we want to advertise the
+# `:latest` tag or where model_type lacks the version number (Llama).
+# If an HF id appears here, inference is skipped — overrides are authoritative.
 _HF_TO_OLLAMA_ALIASES: dict[str, list[str]] = {
-    # Llama 3.x
+    # Llama 3.x — model_type is just "llama", no version suffix to infer from
     "meta-llama/Llama-3.2-1B-Instruct": ["llama3.2:1b", "llama3.2:1b-instruct"],
     "meta-llama/Llama-3.2-3B-Instruct": ["llama3.2", "llama3.2:latest", "llama3.2:3b"],
     "meta-llama/Meta-Llama-3.1-8B-Instruct": ["llama3.1", "llama3.1:latest", "llama3.1:8b"],
-    # Qwen
+    "meta-llama/Llama-3.3-70B-Instruct": ["llama3.3", "llama3.3:latest", "llama3.3:70b"],
+    # Qwen — override to match Ollama's rounded size tags
     "Qwen/Qwen2.5-0.5B-Instruct": ["qwen2.5:0.5b"],
     "Qwen/Qwen2.5-1.5B-Instruct": ["qwen2.5:1.5b"],
     "Qwen/Qwen2.5-3B-Instruct": ["qwen2.5:3b"],
     "Qwen/Qwen2.5-7B-Instruct": ["qwen2.5", "qwen2.5:latest", "qwen2.5:7b"],
     "Qwen/Qwen3-4B-Instruct": ["qwen3:4b"],
     "Qwen/Qwen3-8B": ["qwen3", "qwen3:latest", "qwen3:8b"],
-    # Gemma
+    # Gemma — Ollama advertises rounded sizes (2b not 2.6b, 9b not 9.2b)
     "google/gemma-2-2b-it": ["gemma2:2b"],
     "google/gemma-2-9b-it": ["gemma2", "gemma2:latest", "gemma2:9b"],
     "google/gemma-3-4b-it": ["gemma3", "gemma3:latest", "gemma3:4b"],
@@ -70,9 +81,68 @@ _HF_TO_OLLAMA_ALIASES: dict[str, list[str]] = {
 }
 
 
-def _aliases_for(model_id: str) -> list[str]:
-    """Return Ollama-style aliases for an HF repo id (empty list if none)."""
-    return list(_HF_TO_OLLAMA_ALIASES.get(model_id, []))
+def _size_tag(params: int) -> str:
+    """Render parameter count as an Ollama-style size tag: 3b, 1.5b, 27b, 8x7b."""
+    if params <= 0:
+        return ""
+    if params >= 1_000_000_000:
+        b = params / 1_000_000_000
+        if b >= 10:
+            return f"{round(b)}b"
+        # Keep one decimal for sub-10B models, strip trailing zeros (1.0→1, 1.5→1.5).
+        return f"{b:.1f}".rstrip("0").rstrip(".") + "b"
+    if params >= 1_000_000:
+        return f"{round(params / 1_000_000)}m"
+    return ""
+
+
+def _normalise_family(model_type: str) -> str:
+    """Map an HF model_type to an Ollama-ish family name.
+
+    HF reports things like 'gemma3_text', 'qwen2_moe', 'llama'; Ollama uses
+    'gemma3', 'qwen2', 'llama'.  Strips the common suffixes without being
+    clever — unknown families pass through unchanged.
+    """
+    mt = (model_type or "").lower()
+    for suffix in ("_text", "_moe", "forcausallm"):
+        if mt.endswith(suffix):
+            mt = mt[: -len(suffix)]
+    return mt
+
+
+def _infer_aliases(session: SaklasSession) -> list[str]:
+    """Derive `<family>:<size>` aliases from model_info."""
+    info = session.model_info
+    family = _normalise_family(str(info.get("model_type", "")))
+    size = _size_tag(int(info.get("param_count", 0) or 0))
+    if not family or not size:
+        return []
+    return [f"{family}:{size}"]
+
+
+def _aliases_for(session: SaklasSession) -> list[str]:
+    """Return Ollama-style aliases for the loaded session.
+
+    If the HF id is in the manual override table, returns those entries
+    verbatim — overrides are authoritative and match Ollama's actual
+    catalogue (e.g. Ollama advertises Gemma-2-2b as `gemma2:2b` even though
+    it's actually 2.6B params).  Otherwise falls back to `<family>:<size>`
+    inferred from model_info so new architectures get sensible defaults
+    without a table update.
+    """
+    overrides = _HF_TO_OLLAMA_ALIASES.get(session.model_id)
+    if overrides:
+        return list(overrides)
+    return _infer_aliases(session)
+
+
+def _known_model_names(session: SaklasSession) -> set[str]:
+    names = {session.model_id, *_aliases_for(session)}
+    return {n.lower() for n in names}
+
+
+def _strict_mode() -> bool:
+    return os.environ.get("SAKLAS_OLLAMA_STRICT", "").lower() in ("1", "true", "yes", "on")
 
 
 def _digest_of(name: str) -> str:
@@ -145,7 +215,7 @@ def _tag_entries(session: SaklasSession) -> list[dict[str, Any]]:
     digest = _digest_of(model_id)
 
     names = [model_id]
-    names.extend(_aliases_for(model_id))
+    names.extend(_aliases_for(session))
     # Deduplicate while preserving order.
     seen: set[str] = set()
     unique = [n for n in names if not (n in seen or seen.add(n))]
@@ -195,12 +265,29 @@ def _extract_messages(body: dict) -> list[dict[str, str]]:
     return out
 
 
+_PROCESSED_OPTIONS: frozenset[str] = frozenset({
+    "temperature", "top_p", "top_k", "seed", "num_predict",
+    "stop", "presence_penalty", "frequency_penalty", "repeat_penalty",
+    "steer",
+})
+
+
 def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, Any]:
     """Translate Ollama `options` + top-level fields into saklas gen kwargs.
 
-    Recognized Ollama fields: temperature, top_p, top_k (ignored), seed,
-    num_predict, stop, presence_penalty, frequency_penalty, repeat_penalty
-    (mapped to frequency_penalty if frequency_penalty is unset).
+    Recognized Ollama fields: temperature, top_p, top_k, seed, num_predict,
+    stop, presence_penalty, frequency_penalty, repeat_penalty.
+
+    `repeat_penalty` maps to `presence_penalty` via ``ln(repeat_penalty)``:
+    Ollama divides positive logits by repeat_penalty, which is equivalent
+    to subtracting ``ln(penalty)`` from the logit.  That matches
+    presence_penalty semantics exactly (subtract a constant per seen token,
+    independent of count).  Mapping it to frequency_penalty instead — as
+    earlier versions did — grows unboundedly with repetition count and
+    diverges from Ollama's behaviour.
+
+    Unrecognized options (min_p, mirostat*, num_ctx, typical_p, etc.) are
+    logged at debug level and silently dropped.
 
     Non-standard saklas fields (accepted at the top level or inside options):
     `steer` (dict or dict with alphas/thinking), `think` (bool).
@@ -218,15 +305,29 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
 
     temperature = opts.get("temperature")
     top_p = opts.get("top_p")
+    top_k_raw = opts.get("top_k")
+    try:
+        top_k = int(top_k_raw) if top_k_raw is not None else None
+    except (TypeError, ValueError):
+        top_k = None
+    if top_k is not None and top_k <= 0:
+        top_k = None
     max_tokens = opts.get("num_predict") or body.get("num_predict")
     seed = opts.get("seed")
     presence_penalty = float(opts.get("presence_penalty", 0.0) or 0.0)
-    frequency_penalty = opts.get("frequency_penalty")
-    if frequency_penalty is None:
-        repeat = opts.get("repeat_penalty")
-        # Ollama's repeat_penalty is multiplicative; map values > 1 into a
-        # modest additive frequency_penalty. 1.1 -> 0.1, 1.3 -> 0.3.
-        frequency_penalty = max(0.0, float(repeat) - 1.0) if repeat is not None else 0.0
+    frequency_penalty = float(opts.get("frequency_penalty", 0.0) or 0.0)
+    repeat_raw = opts.get("repeat_penalty")
+    if repeat_raw is not None and presence_penalty == 0.0:
+        try:
+            rp = float(repeat_raw)
+            if rp > 1.0:
+                presence_penalty = math.log(rp)
+        except (TypeError, ValueError):
+            pass
+
+    ignored = [k for k in opts if k not in _PROCESSED_OPTIONS]
+    if ignored:
+        log.debug("ollama: unsupported options dropped: %s", ", ".join(sorted(ignored)))
 
     steer_raw = opts.get("steer") or body.get("steer") or {}
     if isinstance(steer_raw, dict):
@@ -259,23 +360,28 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
         "seed": seed,
         "stop": stop_list,
         "presence_penalty": presence_penalty,
-        "frequency_penalty": float(frequency_penalty),
+        "frequency_penalty": frequency_penalty,
         "logit_bias": None,
         "logprobs": None,
         "_temperature": temperature,
         "_top_p": top_p,
+        "_top_k": top_k,
         "_max_tokens": max_tokens,
         "_system": top_system if isinstance(top_system, str) else None,
     }
 
 
-def _split_overrides(gen_kwargs: dict[str, Any]) -> tuple[dict[str, Any], Any, Any, Any, str | None]:
-    """Pop private override fields out of the gen kwargs."""
+def _split_overrides(gen_kwargs: dict[str, Any]) -> tuple[dict[str, Any], Any, Any, Any, Any, str | None]:
+    """Pop private override fields out of the gen kwargs.
+
+    Returns ``(gen_kwargs, temperature, top_p, top_k, max_tokens, system)``.
+    """
     temperature = gen_kwargs.pop("_temperature", None)
     top_p = gen_kwargs.pop("_top_p", None)
+    top_k = gen_kwargs.pop("_top_k", None)
     max_tokens = gen_kwargs.pop("_max_tokens", None)
     system = gen_kwargs.pop("_system", None)
-    return gen_kwargs, temperature, top_p, max_tokens, system
+    return gen_kwargs, temperature, top_p, top_k, max_tokens, system
 
 
 # ---------------------------------------------------------------------------
@@ -358,11 +464,16 @@ def register_ollama_routes(app: FastAPI) -> None:
         name = body.get("model") or body.get("name") or session.model_id
         info = session.model_info
         details = _model_details(session)
+        # Reflect the real HF chat template when available.  Ollama expects
+        # Go-template syntax while HF uses Jinja — clients that parse this
+        # will fail either way, so returning the honest Jinja template is
+        # more useful than the meaningless "{{ .Prompt }}" placeholder.
+        tpl = getattr(session._tokenizer, "chat_template", None) or "{{ .Prompt }}"
         return {
             "license": "See upstream model card.",
             "modelfile": f"# saklas: {session.model_id}\nFROM {session.model_id}\n",
             "parameters": "",
-            "template": "{{ .Prompt }}",
+            "template": tpl,
             "details": details,
             "model_info": {
                 "general.architecture": info.get("model_type", "unknown"),
@@ -387,10 +498,13 @@ def register_ollama_routes(app: FastAPI) -> None:
         # startup, so a true pull is out of scope.
         body = await request.json()
         name = str(body.get("model") or body.get("name") or "")
-        known = {session.model_id, *(_aliases_for(session.model_id))}
-        if name and name not in known:
+        if name and name.lower() not in _known_model_names(session):
+            hosted = ", ".join(sorted({session.model_id, *_aliases_for(session)}))
             return JSONResponse(status_code=404, content={
-                "error": f"model '{name}' not found. saklas currently hosts '{session.model_id}'.",
+                "error": (
+                    f"model '{name}' not found. saklas currently hosts: {hosted}. "
+                    f"To serve a different model, restart with: saklas serve <model>"
+                ),
             })
 
         async def _stream():
@@ -445,11 +559,26 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     from saklas.server import _gen_config_override  # reuse the context manager
 
+    def _check_model_or_404(body: dict) -> None:
+        """In strict mode, reject requests whose `model` doesn't match the loaded session."""
+        if not _strict_mode():
+            return
+        name = str(body.get("model") or "")
+        if name and name.lower() not in _known_model_names(session):
+            hosted = ", ".join(sorted({session.model_id, *_aliases_for(session)}))
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"model '{name}' not available. saklas hosts: {hosted}. "
+                    f"Unset SAKLAS_OLLAMA_STRICT to accept any model name."
+                ),
+            )
+
     async def _run_and_build_chat_response(body: dict, is_chat: bool) -> dict:
         """Shared non-streaming path for /api/chat and /api/generate."""
         default_alphas = app.state.default_alphas
         gen_kwargs = _resolve_options(body, default_alphas)
-        gen_kwargs, temperature, top_p, max_tokens, system = _split_overrides(gen_kwargs)
+        gen_kwargs, temperature, top_p, top_k, max_tokens, system = _split_overrides(gen_kwargs)
 
         if is_chat:
             msgs = _extract_messages(body)
@@ -472,7 +601,7 @@ def register_ollama_routes(app: FastAPI) -> None:
                 raw = bool(body.get("raw", False))
 
         async with app.state.gen_lock:
-            with _gen_config_override(session, temperature, top_p, max_tokens):
+            with _gen_config_override(session, temperature, top_p, max_tokens, top_k=top_k):
                 start_ns = time.monotonic_ns()
                 try:
                     result = session.generate(input_payload, raw=raw, **gen_kwargs)
@@ -494,20 +623,22 @@ def register_ollama_routes(app: FastAPI) -> None:
                 "done": True,
                 **stats,
             }
+        # Note: Ollama's /api/generate returns a `context` field of tokenized
+        # state for stateless continuation.  Saklas doesn't round-trip that,
+        # so we omit the field entirely rather than lie with an empty list.
         return {
             "model": model_name,
             "created_at": created_at,
             "response": result.text,
             "done_reason": done_reason,
             "done": True,
-            "context": [],
             **stats,
         }
 
     async def _stream_chat_or_generate(body: dict, is_chat: bool):
         default_alphas = app.state.default_alphas
         gen_kwargs = _resolve_options(body, default_alphas)
-        gen_kwargs, temperature, top_p, max_tokens, system = _split_overrides(gen_kwargs)
+        gen_kwargs, temperature, top_p, top_k, max_tokens, system = _split_overrides(gen_kwargs)
 
         if is_chat:
             msgs = _extract_messages(body)
@@ -540,7 +671,7 @@ def register_ollama_routes(app: FastAPI) -> None:
             return
 
         try:
-            with _gen_config_override(session, temperature, top_p, max_tokens):
+            with _gen_config_override(session, temperature, top_p, max_tokens, top_k=top_k):
                 start_ns = time.monotonic_ns()
                 try:
                     stream_iter = session.generate_stream(input_payload, raw=raw, **gen_kwargs)
@@ -606,13 +737,14 @@ def register_ollama_routes(app: FastAPI) -> None:
                         **stats,
                     }
                 else:
+                    # See note in _run_and_build_chat_response: `context` is
+                    # omitted because saklas can't round-trip it honestly.
                     final = {
                         "model": model_name,
                         "created_at": _now_iso(),
                         "response": "",
                         "done_reason": done_reason,
                         "done": True,
-                        "context": [],
                         **stats,
                     }
                 yield json.dumps(final) + "\n"
@@ -622,6 +754,7 @@ def register_ollama_routes(app: FastAPI) -> None:
     @app.post("/api/chat")
     async def api_chat(request: Request):
         body = await request.json()
+        _check_model_or_404(body)
         if body.get("stream", True):
             return StreamingResponse(
                 _stream_chat_or_generate(body, is_chat=True),
@@ -632,6 +765,7 @@ def register_ollama_routes(app: FastAPI) -> None:
     @app.post("/api/generate")
     async def api_generate(request: Request):
         body = await request.json()
+        _check_model_or_404(body)
         if body.get("stream", True):
             return StreamingResponse(
                 _stream_chat_or_generate(body, is_chat=False),

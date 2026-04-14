@@ -468,7 +468,13 @@ class TestOllamaApi:
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
 
-    def test_chat_repeat_penalty_maps_to_frequency_penalty(self, session_and_client):
+    def test_chat_repeat_penalty_maps_to_presence_penalty(self, session_and_client):
+        # Ollama's repeat_penalty divides positive logits by the penalty,
+        # which is equivalent to subtracting ln(penalty) from the logit.
+        # That matches presence_penalty semantics (subtract a constant per
+        # seen token, count-independent), not frequency_penalty (count-weighted).
+        import math
+
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, prompt_tokens=1,
@@ -481,7 +487,8 @@ class TestOllamaApi:
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert abs(kw["frequency_penalty"] - 0.3) < 1e-6
+        assert abs(kw["presence_penalty"] - math.log(1.3)) < 1e-6
+        assert kw["frequency_penalty"] == 0.0
 
     def test_chat_streaming(self, session_and_client):
         session, client = session_and_client
@@ -532,7 +539,9 @@ class TestOllamaApi:
         data = resp.json()
         assert data["response"] == "42"
         assert data["done"] is True
-        assert data["context"] == []
+        # saklas intentionally omits `context` since it can't round-trip
+        # Ollama's tokenized continuation state honestly.
+        assert "context" not in data
         # Matching Ollama: /api/generate applies the chat template by default;
         # callers must set "raw": true to bypass it.
         assert session.generate.call_args[1]["raw"] is False

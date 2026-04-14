@@ -259,7 +259,7 @@ def supports_thinking(tokenizer) -> bool:
 
 class GenerationConfig:
     __slots__ = (
-        "max_new_tokens", "temperature", "top_p", "system_prompt",
+        "max_new_tokens", "temperature", "top_p", "top_k", "system_prompt",
     )
 
     def __init__(
@@ -267,11 +267,13 @@ class GenerationConfig:
         max_new_tokens: int = 1024,
         temperature: float = 1.0,
         top_p: float = 0.9,
+        top_k: int | None = None,
         system_prompt: str | None = None,
     ):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.top_k = top_k
         self.system_prompt = system_prompt
 
 
@@ -364,7 +366,12 @@ def generate_steered(
     generated_ids: list[int] = []
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
-    topk_k = min(1024, _vocab)
+    # top_k caps the candidate pool before top-p.  When unset, use 1024 as a
+    # performance ceiling (nucleus sampling is insensitive beyond that).  When
+    # set, honour the user's value as a hard cap — matches llama.cpp/Ollama
+    # semantics where top_k is applied before top_p.
+    _user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
+    topk_k = min(_user_top_k, _vocab)
     token_table = _get_token_table(tokenizer, _vocab) if on_token else None
     seq_len = input_ids.shape[1]
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
