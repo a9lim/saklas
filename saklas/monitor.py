@@ -156,55 +156,6 @@ class TraitMonitor:
         hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
         self._score_probes(hidden_per_layer)
 
-    def score_per_token_hidden(
-        self, hidden_per_layer_seq: dict[int, torch.Tensor],
-    ) -> dict[str, list[float]]:
-        """Vectorized per-position probe scoring.
-
-        hidden_per_layer_seq: {layer_idx: (seq, dim) fp32 or castable}
-        Returns {probe_name: [score per sequence position]} using the same
-        mean-centered, score-weighted cosine formulation as _score_probes.
-        Does not touch history/stats — this is a read-only sibling.
-        """
-        if not hidden_per_layer_seq or not self._raw_profiles:
-            return {}
-
-        device = next(iter(hidden_per_layer_seq.values())).device
-        self._ensure_cache(device)
-
-        h_unit_per_layer: dict[int, torch.Tensor] = {}
-        seq_len = 0
-        for layer_idx, h_raw in hidden_per_layer_seq.items():
-            h = h_raw.float()
-            if h.dim() != 2:
-                raise ValueError(
-                    f"expected (seq, dim) hidden state, got shape {tuple(h.shape)}"
-                )
-            mean = self._mean_cache.get(layer_idx)
-            if mean is not None:
-                h = h - mean
-            norms = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            h_unit_per_layer[layer_idx] = h / norms
-            seq_len = h.shape[0]
-
-        results: dict[str, list[float]] = {}
-        for name, prof in self._raw_profiles.items():
-            v_unit_layers = self._v_unit_cache.get(name, {})
-            total_w = 0.0
-            weighted = torch.zeros(seq_len, device=device, dtype=torch.float32)
-            for layer_idx, (_vec, score) in prof.items():
-                h_unit = h_unit_per_layer.get(layer_idx)
-                if h_unit is None:
-                    continue
-                v_unit = v_unit_layers.get(layer_idx)
-                if v_unit is None:
-                    continue
-                total_w += score
-                weighted += score * (h_unit @ v_unit)
-            total_w = max(total_w, 1e-8)
-            results[name] = (weighted / total_w).tolist()
-        return results
-
     def measure_from_hidden(self, hidden_per_layer: dict[int, torch.Tensor]):
         """Score probes from pre-captured hidden states (no forward pass).
 
@@ -212,6 +163,78 @@ class TraitMonitor:
         (e.g. via capture hooks), avoiding a redundant forward pass.
         """
         self._score_probes(hidden_per_layer)
+
+    def measure_per_token(
+        self, model, tokenizer, layers,
+        full_ids: torch.Tensor,
+        score_start: int, score_end: int,
+        device=None,
+    ) -> dict[str, list[float]]:
+        """Single forward pass over *full_ids*; update aggregate history
+        (pooled from the last non-special position inside the scoring
+        range) and return per-token probe scores for
+        ``[score_start, score_end)``.
+        """
+        from saklas.vectors import _capture_all_hidden_states
+
+        if device is None:
+            device = next(model.parameters()).device
+        if full_ids.dim() == 1:
+            full_ids = full_ids.unsqueeze(0)
+        if full_ids.device != device:
+            full_ids = full_ids.to(device)
+
+        n_resp = score_end - score_start
+        if n_resp <= 0:
+            return {name: [] for name in self._raw_profiles}
+
+        hidden_per_layer = _capture_all_hidden_states(model, layers, full_ids)
+        sliced: dict[int, torch.Tensor] = {
+            idx: h[0, score_start:score_end].float()
+            for idx, h in hidden_per_layer.items()
+        }
+
+        # Aggregate pool: last non-special position inside the scoring range.
+        special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+        ids_1d = full_ids[0]
+        content_end = score_end - 1
+        while content_end > score_start and int(ids_1d[content_end]) in special_ids:
+            content_end -= 1
+        agg_offset = content_end - score_start
+        agg_hidden = {
+            idx: h[agg_offset] for idx, h in sliced.items()
+            if h.shape[0] > agg_offset
+        }
+        self._score_probes(agg_hidden)
+
+        # _score_probes already built the caches for this device.
+        per_token: dict[str, list[float]] = {}
+        for name in self._raw_profiles:
+            total_w = 0.0
+            weighted: torch.Tensor | None = None
+            v_unit_layers = self._v_unit_cache.get(name, {})
+            for layer_idx, (_vec, score) in self._raw_profiles[name].items():
+                h = sliced.get(layer_idx)
+                if h is None or h.shape[0] != n_resp:
+                    continue
+                v_unit = v_unit_layers.get(layer_idx)
+                if v_unit is None:
+                    continue
+                mean = self._mean_cache.get(layer_idx)
+                if mean is not None:
+                    h = h - mean
+                hn = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                h_unit = h / hn
+                cos = h_unit @ v_unit  # (n_resp,)
+                total_w += score
+                weighted = score * cos if weighted is None else weighted + score * cos
+            total_w = max(total_w, 1e-8)
+            if weighted is None:
+                per_token[name] = [0.0] * n_resp
+            else:
+                per_token[name] = (weighted / total_w).cpu().tolist()
+
+        return per_token
 
     def has_pending_data(self) -> bool:
         return self._pending

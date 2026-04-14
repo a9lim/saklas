@@ -1,8 +1,9 @@
-"""Alpha sweep for 'angry' using the newly regenerated bundled statements.
+"""Alpha sweep for `angry.calm` using the regenerated bundled pack.
 
-Extracts directly from saklas/data/vectors/angry/statements.json (bypassing
-the ~/.saklas default cache so we pick up the new pairs), then generates
-at alphas 0.05..0.25 with a fixed seed/prompt for comparison.
+Extracts directly from saklas/data/vectors/angry.calm/statements.json
+(bypassing the ~/.saklas default cache so we pick up the freshly
+regenerated pairs), then generates at fixed seed/prompt across alphas.
+Positive alpha → angry pole, negative alpha → calm pole.
 """
 from __future__ import annotations
 
@@ -13,10 +14,10 @@ from saklas.session import SaklasSession
 from saklas.datasource import DataSource
 
 REPO = Path(__file__).resolve().parent.parent
-STATEMENTS = REPO / "saklas" / "data" / "vectors" / "angry" / "statements.json"
+STATEMENTS = REPO / "saklas" / "data" / "vectors" / "angry.calm" / "statements.json"
 MODEL_ID = "google/gemma-4-31b-it"
 PROMPT = "A customer just told me the package I shipped arrived broken. Write my reply."
-ALPHAS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25]
+ALPHAS = [0.0, 0.25, 0.5, 0.75, 1.0]
 SEED = 1234
 MAX_TOKENS = 180
 
@@ -24,15 +25,15 @@ MAX_TOKENS = 180
 def main() -> int:
     pairs_raw = json.loads(STATEMENTS.read_text())
     pairs = [(p["positive"], p["negative"]) for p in pairs_raw]
-    ds = DataSource(name="angry_new", pairs=pairs)
+    ds = DataSource(name="angry.calm", pairs=pairs)
 
     print(f"Loading {MODEL_ID}...", flush=True)
-    session = SaklasSession(MODEL_ID, device="auto", max_tokens=MAX_TOKENS)
+    session = SaklasSession(MODEL_ID, device="auto", max_tokens=MAX_TOKENS, probes=[])
     print(f"Loaded on {session._device}", flush=True)
 
-    print(f"Extracting angry profile from {len(pairs)} new pairs...", flush=True)
-    profile = session.extract(ds, on_progress=lambda m: print("  ", m, flush=True))
-    session.steer("angry", profile)
+    print(f"Extracting angry.calm profile from {len(pairs)} pairs...", flush=True)
+    name, profile = session.extract(ds, on_progress=lambda m: print("  ", m, flush=True))
+    session.steer(name, profile)
 
     scores = {l: float(s) for l, (_, s) in profile.items()}
     mean_s = sum(scores.values()) / len(scores)
@@ -46,7 +47,7 @@ def main() -> int:
         session.clear_history()
         result = session.generate(
             PROMPT,
-            alphas={"angry": a} if a > 0 else {},
+            alphas={name: a} if a > 0 else {},
             seed=SEED,
             stateless=True,
         )

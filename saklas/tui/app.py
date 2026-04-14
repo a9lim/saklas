@@ -18,7 +18,7 @@ from saklas.generation import GenerationState, build_chat_input, generate_steere
 from saklas.model import _get_memory_gb
 from saklas.probes_bootstrap import load_defaults
 from saklas.session import MIN_ELAPSED_FOR_RATE
-from saklas.tui.chat_panel import ChatPanel
+from saklas.tui.chat_panel import ChatPanel, _AssistantMessage
 from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
 from saklas.tui.trait_panel import TraitPanel
 
@@ -45,7 +45,7 @@ class SaklasApp(App):
         Binding("ctrl+o", "toggle_ortho", "Ortho", show=False),
         Binding("ctrl+t", "toggle_thinking", "Think", show=False),
         Binding("ctrl+s", "cycle_sort", "Sort", show=False),
-        Binding("ctrl+h", "toggle_highlight", "Highlight", show=False),
+        Binding("ctrl+y", "toggle_highlight", "Highlight", show=False),
         Binding("[", "temp_down", show=False),
         Binding("]", "temp_up", show=False),
         Binding("{", "top_p_down", show=False),
@@ -66,18 +66,11 @@ class SaklasApp(App):
         # Session holds the profiles; the TUI holds the alphas.
         self._alphas: dict[str, float] = {}
         self._enabled: dict[str, bool] = {}
-        self._vector_list_cache: list[dict] = []
-        self._vector_list_dirty: bool = True
         self._orthogonalize: bool = False
         self._supports_thinking: bool = supports_thinking(session._tokenizer)
         self._thinking: bool = self._supports_thinking
 
         self._current_assistant_widget = None
-        # All assistant-message widgets that currently live in the chat log,
-        # in insertion order. Used so highlight toggle / probe switching can
-        # re-render every past message, not just the most recent one.
-        self._assistant_widgets: list = []
-        self._highlight: bool = False
         self._poll_timer: Timer | None = None
         self._last_prompt: str | None = None
         self._ab_in_progress: bool = False
@@ -85,6 +78,8 @@ class SaklasApp(App):
         self._gen_active: bool = False  # main-thread-only generation guard
 
         self._focused_panel_idx: int = 1  # Start with chat focused
+
+        self._highlighting: bool = False
 
         self._gen_start_time: float = 0.0
         self._gen_token_count: int = 0
@@ -107,27 +102,21 @@ class SaklasApp(App):
                 if self._enabled.get(name, True)}
 
     def _vector_list_for_panel(self) -> list[dict]:
-        """Build the list[dict] format the left panel expects (cached)."""
-        if not self._vector_list_dirty:
-            return self._vector_list_cache
+        """Build the list[dict] format the left panel expects."""
         result = []
-        for name in self._alphas:
-            if name in self._session._profiles:
-                profile = self._session._profiles[name]
-                result.append({
-                    "name": name,
-                    "profile": profile,
-                    "alpha": self._alphas[name],
-                    "enabled": self._enabled.get(name, True),
-                    "peak": max(profile, key=lambda k: profile[k][1]),
-                    "n_active": len(profile),
-                })
-        self._vector_list_cache = result
-        self._vector_list_dirty = False
+        for name, alpha in self._alphas.items():
+            profile = self._session._profiles.get(name)
+            if profile is None:
+                continue
+            result.append({
+                "name": name,
+                "profile": profile,
+                "alpha": alpha,
+                "enabled": self._enabled.get(name, True),
+                "peak": max(profile, key=lambda k: profile[k][1]),
+                "n_active": len(profile),
+            })
         return result
-
-    def _invalidate_vector_list(self) -> None:
-        self._vector_list_dirty = True
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-area"):
@@ -218,14 +207,16 @@ class SaklasApp(App):
             self._left_panel.select_next()
         elif self._focused_panel_idx == _TRAIT:
             self._trait_panel.nav_down()
-            self._refresh_highlight_probe()
+            if self._highlighting:
+                self._apply_highlight_to_all()
 
     def action_nav_up(self) -> None:
         if self._focused_panel_idx == _LEFT:
             self._left_panel.select_prev()
         elif self._focused_panel_idx == _TRAIT:
             self._trait_panel.nav_up()
-            self._refresh_highlight_probe()
+            if self._highlighting:
+                self._apply_highlight_to_all()
 
     def action_nav_left(self) -> None:
         self._adjust_alpha(-0.01)
@@ -340,7 +331,7 @@ class SaklasApp(App):
                 "/temp [val], /top-p [val], /max [n], /exit, /help\n"
                 "Keys: ⇥ focus · ←/→ alpha · ↑/↓ nav · ↩ toggle\n"
                 "⌫ remove · ⌃O ortho · ⌃T think · ⌃R regen · ⌃A A/B\n"
-                "[ ] temp · { } top-p · ⌃S sort · ⌃H highlight · ⎋ stop · ⌃Q quit"
+                "[ ] temp · { } top-p · ⌃S sort · ⎋ stop · ⌃Q quit"
             )
         else:
             chat.add_system_message(f"Unknown command: {cmd}. Type /help for commands.")
@@ -453,7 +444,6 @@ class SaklasApp(App):
             self._session.steer(name, profile)
             self._alphas[name] = alpha
             self._enabled[name] = True
-            self._invalidate_vector_list()
             self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
         self._handle_extract(text, include_alpha=True, on_success=_on_success)
 
@@ -479,9 +469,7 @@ class SaklasApp(App):
     def _do_clear(self) -> None:
         self._session.clear_history()
         self._chat_panel.clear_log()
-        self._assistant_widgets.clear()
         self._trait_panel.update_values({}, {}, {})
-        self._invalidate_vector_list()
         self._chat_panel.add_system_message("Chat history cleared.")
 
     def _do_rewind(self) -> None:
@@ -490,12 +478,6 @@ class SaklasApp(App):
             return
         self._session.rewind()
         self._chat_panel.rewind()
-        # Chat-panel rewind tears down widgets from the DOM — keep our
-        # assistant-widget list in sync so highlight toggles don't poke
-        # at detached nodes.
-        self._assistant_widgets = [
-            w for w in self._assistant_widgets if w.is_mounted
-        ]
         self._chat_panel.add_system_message("Rewound to before last message.")
 
     def _refresh_gen_config(self) -> None:
@@ -538,21 +520,13 @@ class SaklasApp(App):
         self._gen_start_time = time.monotonic()
         self._vram_poll_counter = 0
 
-        self._current_assistant_widget = self._chat_panel.start_assistant_message()
-        self._assistant_widgets.append(self._current_assistant_widget)
-        # Apply the current highlight selection to the new widget so its
-        # finalize() picks the right branch once scores arrive.
-        if self._highlight:
-            self._current_assistant_widget._highlight_probe = (
-                self._trait_panel.get_selected_probe()
-            )
+        widget = self._chat_panel.start_assistant_message()
+        self._current_assistant_widget = widget
 
         # Snapshot alphas for this generation
         alphas = self._active_alphas()
 
         use_thinking = self._thinking
-        widget = self._current_assistant_widget
-        score_tokens_enabled = self._highlight
 
         def _generate():
             # Apply steering hooks for this generation
@@ -579,29 +553,46 @@ class SaklasApp(App):
                 )
 
                 # Decode only the response portion (skip thinking tokens)
-                response_ids = generated[self._session._gen_state.thinking_end_idx:]
+                thinking_end_idx = self._session._gen_state.thinking_end_idx
+                response_ids = generated[thinking_end_idx:]
+                thinking_ids = generated[:thinking_end_idx]
                 full_text = self._session._tokenizer.decode(response_ids, skip_special_tokens=True)
                 if full_text.strip():
                     self._messages.append({"role": "assistant", "content": full_text})
-                    if has_probes:
-                        self._session._monitor.measure(
+                    if has_probes and len(generated) > 0:
+                        prompt_len = input_ids.shape[-1]
+                        gen_tensor = torch.tensor(
+                            generated, dtype=input_ids.dtype, device=input_ids.device,
+                        )
+                        full_ids = torch.cat([input_ids[0], gen_tensor])
+                        gen_start = prompt_len
+                        gen_end = prompt_len + len(generated)
+                        per_token = self._session._monitor.measure_per_token(
                             self._session._model, self._session._tokenizer,
-                            self._session._layers, full_text,
+                            self._session._layers,
+                            full_ids, gen_start, gen_end,
                             device=self._session._device,
                         )
-                    if score_tokens_enabled and has_probes and widget is not None:
-                        try:
-                            per_token = self._session.score_tokens(response_ids)
-                            tok_strings = [
-                                self._session._tokenizer.decode([tid])
-                                for tid in response_ids
-                            ]
-                            # Attribute writes are thread-safe; finalize()
-                            # reads these after the None sentinel below.
-                            widget._token_strings = tok_strings
-                            widget._token_scores = per_token
-                        except Exception:
-                            pass
+                        thinking_scores = {
+                            name: scores[:thinking_end_idx]
+                            for name, scores in per_token.items()
+                        }
+                        response_scores = {
+                            name: scores[thinking_end_idx:]
+                            for name, scores in per_token.items()
+                        }
+                        tok = self._session._tokenizer
+                        all_token_strs = tok.batch_decode(
+                            [[int(tid)] for tid in generated],
+                            skip_special_tokens=True,
+                        )
+                        thinking_token_strs = all_token_strs[:thinking_end_idx]
+                        response_token_strs = all_token_strs[thinking_end_idx:]
+                        self.call_from_thread(
+                            self._set_widget_token_data, widget,
+                            response_token_strs, response_scores,
+                            thinking_token_strs, thinking_scores,
+                        )
             finally:
                 if alphas:
                     self._session._clear_steering()
@@ -630,7 +621,7 @@ class SaklasApp(App):
                 break
             if item is None:
                 if self._current_assistant_widget:
-                    self._current_assistant_widget.finalize()
+                    self._current_assistant_widget.ensure_thinking_collapsed()
                 self._current_assistant_widget = None
                 self._gen_active = False
                 generating = False
@@ -640,45 +631,19 @@ class SaklasApp(App):
                         self._last_tok_per_sec = self._gen_token_count / self._last_elapsed
                     self._gen_start_time = 0.0
 
-                # Dispatch any queued action from Ctrl+R or mid-gen submit.
                 pending = self._pending_action
                 if pending is not None:
                     self._pending_action = None
-                    if pending[0] == "regenerate":
-                        # Discard the partial response
-                        if self._messages and self._messages[-1]["role"] == "assistant":
-                            self._messages.pop()
-                        chat.rewind_last_assistant()
-                        if self._assistant_widgets:
-                            self._assistant_widgets.pop()
-                        self._start_generation()
-                    elif pending[0] == "submit":
-                        self._messages.append({"role": "user", "content": pending[1]})
-                        self._start_generation()
-                    elif pending[0] == "clear":
-                        self._do_clear()
-                    elif pending[0] == "rewind":
-                        if self._messages and self._messages[-1]["role"] == "assistant":
-                            self._messages.pop()
-                        chat.rewind_last_assistant()
-                        if self._assistant_widgets:
-                            self._assistant_widgets.pop()
-                        self._do_rewind()
-                    elif pending[0] == "steer":
-                        self._handle_steer(pending[1])
-                    elif pending[0] == "probe":
-                        self._handle_probe(pending[1])
-                    elif pending[0] == "quit":
-                        self.exit()
+                    self._dispatch_pending_action(pending)
                 break
             token, is_thinking = item
-            if self._current_assistant_widget:
+            widget = self._current_assistant_widget
+            if widget:
                 if is_thinking:
-                    chat.append_thinking(self._current_assistant_widget, token)
+                    widget.append_thinking_token(token)
                 else:
-                    if self._current_assistant_widget._in_thinking:
-                        self._current_assistant_widget.end_thinking()
-                    chat.append_to_assistant(self._current_assistant_widget, token)
+                    widget.ensure_thinking_collapsed()
+                    widget.append_token(token)
             self._gen_token_count += 1
             tokens_consumed += 1
 
@@ -739,7 +704,6 @@ class SaklasApp(App):
             self._session.unsteer(name)
             self._alphas.pop(name, None)
             self._enabled.pop(name, None)
-            self._invalidate_vector_list()
             self._refresh_left_panel()
 
     def _remove_selected_probe(self) -> None:
@@ -758,7 +722,6 @@ class SaklasApp(App):
         if sel:
             name = sel["name"]
             self._enabled[name] = not self._enabled.get(name, True)
-            self._invalidate_vector_list()
             self._refresh_left_panel()
 
     def _adjust_alpha(self, delta: float) -> None:
@@ -769,7 +732,6 @@ class SaklasApp(App):
         if sel:
             name = sel["name"]
             self._alphas[name] = max(-MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta))
-            self._invalidate_vector_list()
             self._refresh_left_panel()
 
     def action_toggle_ortho(self) -> None:
@@ -777,6 +739,76 @@ class SaklasApp(App):
             return
         self._orthogonalize = not self._orthogonalize
         self._refresh_left_panel()
+
+    def action_toggle_highlight(self) -> None:
+        if self._ab_in_progress:
+            return
+        if not self._highlighting:
+            probe = self._trait_panel.get_selected_probe()
+            if probe is None:
+                self._chat_panel.add_system_message(
+                    "No probe selected. Focus the trait panel (Tab) and pick one first."
+                )
+                return
+            self._highlighting = True
+            self._chat_panel.add_system_message(
+                f"Highlighting '{probe}' (red=negative, green=positive)."
+            )
+        else:
+            self._highlighting = False
+            self._chat_panel.add_system_message("Highlighting off.")
+        self._apply_highlight_to_all()
+
+    def _apply_highlight_to_all(self) -> None:
+        log = self._chat_panel._log
+        if log is None:
+            return
+        probe = self._trait_panel.get_selected_probe() if self._highlighting else None
+        for child in list(log.children):
+            if isinstance(child, _AssistantMessage) and child.is_mounted:
+                child.apply_highlight(self._highlighting, probe)
+
+    def _set_widget_token_data(
+        self, widget: _AssistantMessage,
+        response_token_strs: list[str],
+        response_probe_scores: dict[str, list[float]],
+        thinking_token_strs: list[str],
+        thinking_probe_scores: dict[str, list[float]],
+    ) -> None:
+        if not widget.is_mounted:
+            return
+        widget.set_token_data(
+            response_token_strs, response_probe_scores,
+            thinking_token_strs, thinking_probe_scores,
+        )
+        if self._highlighting:
+            widget.apply_highlight(True, self._trait_panel.get_selected_probe())
+
+    def _dispatch_pending_action(self, pending: tuple) -> None:
+        """Handle a queued action dispatched once the current gen finishes."""
+        kind = pending[0]
+        chat = self._chat_panel
+        if kind == "regenerate":
+            if self._messages and self._messages[-1]["role"] == "assistant":
+                self._messages.pop()
+            chat.rewind_last_assistant()
+            self._start_generation()
+        elif kind == "submit":
+            self._messages.append({"role": "user", "content": pending[1]})
+            self._start_generation()
+        elif kind == "clear":
+            self._do_clear()
+        elif kind == "rewind":
+            if self._messages and self._messages[-1]["role"] == "assistant":
+                self._messages.pop()
+            chat.rewind_last_assistant()
+            self._do_rewind()
+        elif kind == "steer":
+            self._handle_steer(pending[1])
+        elif kind == "probe":
+            self._handle_probe(pending[1])
+        elif kind == "quit":
+            self.exit()
 
     def action_toggle_thinking(self) -> None:
         if not self._supports_thinking:
@@ -856,23 +888,3 @@ class SaklasApp(App):
 
     def action_cycle_sort(self) -> None:
         self._trait_panel.cycle_sort()
-
-    def action_toggle_highlight(self) -> None:
-        self._highlight = not self._highlight
-        probe = self._trait_panel.get_selected_probe() if self._highlight else None
-        for w in self._assistant_widgets:
-            w.set_highlight(probe)
-        if self._highlight:
-            tag = f" ({probe})" if probe else " (no probe selected)"
-            self._chat_panel.add_system_message(
-                f"Token highlight on{tag}. Scores will be computed for new generations."
-            )
-        else:
-            self._chat_panel.add_system_message("Token highlight off.")
-
-    def _refresh_highlight_probe(self) -> None:
-        if not self._highlight:
-            return
-        probe = self._trait_panel.get_selected_probe()
-        for w in self._assistant_widgets:
-            w.set_highlight(probe)

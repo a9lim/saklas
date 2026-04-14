@@ -2,183 +2,143 @@
 
 from __future__ import annotations
 
+from rich.markup import escape as _rich_escape
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Static, Input, Markdown, Collapsible
+from textual.widgets import Static, Input, Collapsible
 from textual.widget import Widget
 from textual.message import Message
 
+_HIGHLIGHT_SAT = 0.5
 
-def _style_for_score(score: float) -> str | None:
-    """Map a probe score to a Rich-markup style, or None for no styling.
 
-    Two axes: positive → ansi_green, negative → ansi_red. Three intensity
-    buckets per side so strong / medium / mild activations are visually
-    distinguishable without leaving the 16-color ANSI palette the user
-    constrained us to.
+def _build_highlight_markup(token_strs: list[str], scores: list[float]) -> str:
+    """Build Rich markup with per-token red/green background spans.
+
+    Caller is responsible for guarding against mismatched lengths; this
+    function assumes ``len(scores) == len(token_strs)``.
     """
-    a = abs(score)
-    if a < 0.05:
-        return None
-    if score > 0:
-        if a >= 0.5:
-            return "bold ansi_black on ansi_green"
-        if a >= 0.2:
-            return "ansi_green"
-        return "dim ansi_green"
-    if a >= 0.5:
-        return "bold ansi_black on ansi_red"
-    if a >= 0.2:
-        return "ansi_red"
-    return "dim ansi_red"
-
-
-def _escape_markup(s: str) -> str:
-    return s.replace("[", r"\[")
-
-
-def build_highlighted_markup(tokens: list[str], scores: list[float]) -> str:
-    out: list[str] = []
-    for tok, sc in zip(tokens, scores):
-        esc = _escape_markup(tok)
-        style = _style_for_score(sc)
-        if style is None:
-            out.append(esc)
+    parts: list[str] = []
+    for tok, score in zip(token_strs, scores):
+        t = max(-1.0, min(1.0, score / _HIGHLIGHT_SAT))
+        safe = _rich_escape(tok)
+        if t > 0:
+            g = int(round(255 * t))
+            parts.append(f"[on rgb(0,{g},0)]{safe}[/]")
+        elif t < 0:
+            r = int(round(255 * -t))
+            parts.append(f"[on rgb({r},0,0)]{safe}[/]")
         else:
-            out.append(f"[{style}]{esc}[/]")
-    return "".join(out)
+            parts.append(safe)
+    return "".join(parts)
 
 
 class _AssistantMessage(Vertical):
-    """Container with a label and Markdown widget for assistant messages.
+    """Assistant message rendered entirely through Static widgets.
 
-    During streaming, updates go to a cheap Static widget (no parse).
-    On finalize(), the Static is hidden and a full Markdown render is shown.
-    Thinking tokens (from models like Qwen 3.5) render in a collapsible
-    section above the main response.
+    Text is escaped incrementally as tokens arrive (O(n) total rather than
+    O(n²)). Once per-token probe data lands via ``set_token_data``, the
+    highlighted markup is pre-built once per probe and cached so that
+    navigating the trait panel is a dict lookup instead of a rebuild.
     """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.chat_text: str = ""
-        self.thinking_text: str = ""
-        self._in_thinking: bool = False
+        self._escaped_chat_text: str = ""
+        self._escaped_thinking_text: str = ""
         self._thinking_block: Collapsible | None = None
-        self._thinking_stream: Static | None = None
-        self._thinking_md: Markdown | None = None
-        self._stream: Static | None = None
-        self._md: Markdown | None = None
-        # Per-token data for highlight mode. Populated post-generation by
-        # the app worker from generated token ids; scores map probe name
-        # to a list aligned 1:1 with token_strings.
-        self._token_strings: list[str] | None = None
-        self._token_scores: dict[str, list[float]] | None = None
+        self._thinking_view: Static | None = None
+        self._response_view: Static | None = None
+
+        self.response_token_strs: list[str] = []
+        self.thinking_token_strs: list[str] = []
+        self._response_markup_cache: dict[str, str] = {}
+        self._thinking_markup_cache: dict[str, str] = {}
+
+        self._highlight_on: bool = False
         self._highlight_probe: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("[bold ansi_green]Assistant:[/]")
         with Collapsible(title="Thinking...", id="thinking-block", classes="hidden"):
-            yield Static("", id="thinking-text")
-            yield Markdown(id="thinking-md", classes="hidden")
-        yield Static("", id="stream-text")
-        yield Markdown(id="response-md", classes="hidden")
+            yield Static("", id="thinking-view")
+        yield Static("", id="response-view")
 
     def on_mount(self) -> None:
         self._thinking_block = self.query_one("#thinking-block", Collapsible)
-        self._thinking_stream = self.query_one("#thinking-text", Static)
-        self._thinking_md = self.query_one("#thinking-md", Markdown)
-        self._stream = self.query_one("#stream-text", Static)
-        self._md = self.query_one("#response-md", Markdown)
+        self._thinking_view = self.query_one("#thinking-view", Static)
+        self._response_view = self.query_one("#response-view", Static)
 
-    def update_thinking(self, text: str) -> None:
-        self.thinking_text = text
-        if self._thinking_block is not None and self._thinking_block.has_class("hidden"):
-            self._thinking_block.remove_class("hidden")
-            self._thinking_block.collapsed = False
-            self._in_thinking = True
-        if self._thinking_stream is not None:
-            self._thinking_stream.update(text)
-
-    def end_thinking(self) -> None:
-        self._in_thinking = False
-        if self._thinking_block is not None:
-            # Swap to rendered Markdown and collapse immediately
-            if self._thinking_md is not None and self.thinking_text:
-                self._thinking_md.update(self.thinking_text)
-                self._thinking_md.remove_class("hidden")
-            if self._thinking_stream is not None:
-                self._thinking_stream.add_class("hidden")
-            self._thinking_block.collapsed = True
-
-    def update_content(self, text: str) -> None:
-        self.chat_text = text
-        if self._stream is not None:
-            self._stream.update(text)
+    # -- Streaming --
 
     def append_token(self, token: str) -> None:
-        self.chat_text += token
-        self.update_content(self.chat_text)
+        self._escaped_chat_text += _rich_escape(token)
+        self._render_response()
 
     def append_thinking_token(self, token: str) -> None:
-        self.thinking_text += token
-        self.update_thinking(self.thinking_text)
+        self._escaped_thinking_text += _rich_escape(token)
+        tb = self._thinking_block
+        if tb is not None and tb.has_class("hidden"):
+            tb.remove_class("hidden")
+            tb.collapsed = False
+        self._render_thinking()
 
-    def finalize(self) -> None:
-        """Switch from streaming Static to rendered Markdown (or highlighted)."""
-        if self._in_thinking:
-            self.end_thinking()
-        if self._highlight_probe is not None and self._has_scores_for(self._highlight_probe):
-            self._render_highlighted()
-            return
-        self._render_markdown()
+    def ensure_thinking_collapsed(self) -> None:
+        """Collapse the thinking block if it's currently open. Idempotent."""
+        tb = self._thinking_block
+        if tb is not None and not tb.collapsed and not tb.has_class("hidden"):
+            tb.collapsed = True
 
-    def _render_markdown(self) -> None:
-        if self._md is not None and self.chat_text:
-            self._md.update(self.chat_text)
-            self._md.remove_class("hidden")
-        if self._stream is not None:
-            self._stream.add_class("hidden")
-
-    def _has_scores_for(self, probe: str) -> bool:
-        if self._token_scores is None or self._token_strings is None:
-            return False
-        arr = self._token_scores.get(probe)
-        return arr is not None and len(arr) == len(self._token_strings)
-
-    def _render_highlighted(self) -> None:
-        if self._highlight_probe is None or not self._has_scores_for(self._highlight_probe):
-            self._render_markdown()
-            return
-        markup = build_highlighted_markup(
-            self._token_strings or [],
-            (self._token_scores or {}).get(self._highlight_probe, []),
-        )
-        if self._stream is not None:
-            self._stream.update(markup)
-            self._stream.remove_class("hidden")
-        if self._md is not None:
-            self._md.add_class("hidden")
+    # -- Highlight data --
 
     def set_token_data(
         self,
-        token_strings: list[str],
-        token_scores: dict[str, list[float]],
+        response_token_strs: list[str],
+        response_probe_scores: dict[str, list[float]],
+        thinking_token_strs: list[str],
+        thinking_probe_scores: dict[str, list[float]],
     ) -> None:
-        """Attach per-token strings and probe scores (called post-generation)."""
-        self._token_strings = list(token_strings)
-        self._token_scores = dict(token_scores)
-        if self._highlight_probe is not None:
-            self._render_highlighted()
+        self.response_token_strs = list(response_token_strs)
+        self.thinking_token_strs = list(thinking_token_strs)
 
-    def set_highlight(self, probe: str | None) -> None:
-        """Switch the widget into (or out of) highlighted rendering."""
-        self._highlight_probe = probe
-        if self._in_thinking:
+        resp_n = len(self.response_token_strs)
+        think_n = len(self.thinking_token_strs)
+        self._response_markup_cache = {
+            name: _build_highlight_markup(self.response_token_strs, scores)
+            for name, scores in response_probe_scores.items()
+            if len(scores) == resp_n
+        }
+        self._thinking_markup_cache = {
+            name: _build_highlight_markup(self.thinking_token_strs, scores)
+            for name, scores in thinking_probe_scores.items()
+            if len(scores) == think_n
+        }
+        self._render_response()
+        self._render_thinking()
+
+    def apply_highlight(self, on: bool, probe_name: str | None) -> None:
+        self._highlight_on = on
+        self._highlight_probe = probe_name
+        self._render_response()
+        self._render_thinking()
+
+    # -- Rendering --
+
+    def _render_response(self) -> None:
+        if self._response_view is None:
             return
-        if probe is None:
-            self._render_markdown()
-        else:
-            self._render_highlighted()
+        markup = None
+        if self._highlight_on and self._highlight_probe:
+            markup = self._response_markup_cache.get(self._highlight_probe)
+        self._response_view.update(markup if markup is not None else self._escaped_chat_text)
+
+    def _render_thinking(self) -> None:
+        if self._thinking_view is None:
+            return
+        markup = None
+        if self._highlight_on and self._highlight_probe:
+            markup = self._thinking_markup_cache.get(self._highlight_probe)
+        self._thinking_view.update(markup if markup is not None else self._escaped_thinking_text)
 
 
 class ChatPanel(Widget):
@@ -236,7 +196,7 @@ class ChatPanel(Widget):
     def add_user_message(self, text: str) -> None:
         container = Vertical(
             Static("[bold ansi_cyan]User:[/]"),
-            Markdown(text),
+            Static(_rich_escape(text)),
             classes="user-message",
         )
         self._log.mount(container)
@@ -246,12 +206,6 @@ class ChatPanel(Widget):
         widget = _AssistantMessage(classes="assistant-message")
         self._log.mount(widget)
         return widget
-
-    def append_to_assistant(self, widget: _AssistantMessage, token: str) -> None:
-        widget.append_token(token)
-
-    def append_thinking(self, widget: _AssistantMessage, token: str) -> None:
-        widget.append_thinking_token(token)
 
     def scroll_to_bottom(self) -> None:
         """Scroll the chat log to the bottom. Call once after a batch of token updates."""

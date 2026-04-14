@@ -567,25 +567,6 @@ class SaklasSession:
     def unmonitor(self, name: str) -> None:
         self._monitor.remove_probe(name)
 
-    def score_tokens(self, token_ids: list[int]) -> dict[str, list[float]]:
-        """Per-token probe scores for a generated id sequence.
-
-        Runs a bare-id forward pass (no chat template) and scores every
-        position against every active probe. Returns
-        ``{probe_name: [score per token]}`` aligned 1:1 with ``token_ids``.
-        Empty dict if no probes are registered or the sequence is empty.
-        """
-        if not token_ids or not self._monitor.probe_names:
-            return {}
-        from saklas.vectors import _capture_all_hidden_states
-        ids = torch.tensor([list(token_ids)], device=self._device)
-        hidden = _capture_all_hidden_states(self._model, self._layers, ids)
-        per_layer = {idx: h[0].float() for idx, h in hidden.items()}
-        scores = self._monitor.score_per_token_hidden(per_layer)
-        if self._device.type == "mps":
-            torch.mps.empty_cache()
-        return scores
-
     # -- History --
 
     def rewind(self) -> None:

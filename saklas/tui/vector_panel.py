@@ -63,7 +63,7 @@ class LeftPanel(Widget):
         yield Static(
             "[dim]⇥ focus panels · ⎋ stop gen\n"
             "⌃R regen · ⌃A A/B · ⌃T think\n"
-            "⌃H highlight · ⌃Q quit\n"
+            "⌃Q quit\n"
             "── ⇥ to side panel first ──\n"
             "↑/↓ navigate · ↩ select\n"
             "←/→ alpha\n"

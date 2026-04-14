@@ -141,7 +141,7 @@ Widget {
 
 .user-message,
 .assistant-message {
-    margin-bottom: 0;
+    margin-bottom: 1;
     height: auto;
 }
 
@@ -150,31 +150,11 @@ Widget {
     height: auto;
 }
 
-.assistant-message Markdown,
-.user-message Markdown {
-    margin: 0;
-    padding: 0;
-    height: auto;
-}
-
-.assistant-message MarkdownParagraph,
-.user-message MarkdownParagraph {
-    margin: 0 0 1 0;
-}
-
-.assistant-message MarkdownHorizontalRule,
-.user-message MarkdownHorizontalRule {
-    height: 1;
-    margin: 0;
-    padding: 0;
-    border-bottom: solid ansi_bright_black;
-}
-
 
 /* Thinking block (Qwen 3.5, QwQ, etc.) */
 #thinking-block {
     height: auto;
-    margin: 0;
+    margin: 0 0 1 0;
     padding: 0;
     background: ansi_default;
     border-top: none;
@@ -185,20 +165,9 @@ Widget {
     background: ansi_default;
 }
 
-#thinking-text {
+#thinking-view {
     text-style: dim;
     height: auto;
-}
-
-#thinking-md {
-    text-style: dim;
-    height: auto;
-    margin: 0;
-    padding: 0;
-}
-
-#thinking-md MarkdownParagraph {
-    margin: 0 0 1 0;
 }
 
 /* Generic utility */
