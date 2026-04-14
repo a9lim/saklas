@@ -110,13 +110,37 @@ class SteeringHook:
             self._handle = None
 
 
-# Reference mean PCA score used to anchor per-profile score normalization.
-# Chosen to match the typical mean score of well-concentrated profiles
-# (gemma-3-4b-it, Qwen-3.5-4B, Ministral-3-8B) so their recommended alphas
-# carry over unchanged.  Diffuse-geometry models like Llama-3.2-3B-Instruct
-# score much lower (~0.07); normalization divides by their profile mean and
-# re-multiplies by this constant, bringing them onto the same alpha scale.
-_REF_SCORE = 1.0 / 32.0
+# Global gain that pins the user-facing alpha scale.  Per-layer injection
+# is distributed in proportion to each layer's PCA explained-variance
+# score, summing to exactly `user_alpha * _STEER_GAIN` across the whole
+# residual stream:
+#
+#     effective_alpha_i = user_alpha * _STEER_GAIN
+#                       * (score_i / sum(scores))
+#
+# Two invariances fall out of this form:
+#
+#   - Layer-count invariance: total injection is independent of n_layers,
+#     so models of different depths hit the same behavioral effect at the
+#     same user alpha.  Without this, deeper models over-inject (e.g.
+#     gemma-4-E4B at 42 layers vs gemma-4-31B at 60 layers would drift
+#     by ~1.5× in coherent α).
+#
+#   - Score-magnitude invariance: absolute PCA scores vary wildly between
+#     architectures (diffuse Llama-3.2-3B ≈0.07, sharp gemma-3-4b ≈0.25
+#     for the same pairs), but only the *relative* per-layer shares
+#     matter here — high-signal layers still get proportionally more
+#     push within a profile.
+#
+# The gain is calibrated so that a user alpha of ~0.5 lands in the
+# coherent steering band on the reference model (gemma-4-31B-it) for
+# the bundled 21-probe pack.  Raising the gain shifts every model's
+# coherent α lower; lowering does the opposite.  Smaller or non-standard-
+# geometry models (MatFormer, MoE, heavily safety-trained) may still need
+# proportionally higher alpha due to residual architectural effects
+# (activation magnitude, attention layout) this normalization doesn't
+# capture.
+_STEER_GAIN = 2.0
 
 
 class SteeringManager:
@@ -147,20 +171,8 @@ class SteeringManager:
         by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
         for v in self.vectors.values():
             profile = v["profile"]
-            # Mean-normalize per-profile so alpha means the same thing
-            # across models.  Raw PCA scores (explained-variance-ratio)
-            # vary wildly between architectures — diffuse small models
-            # like Llama-3.2-3B-Instruct score ~0.07 while gemma-3-4b
-            # scores ~0.25 for the same statements, turning `alpha*score`
-            # into a model-dependent gate.  Dividing by the profile mean
-            # and re-scaling to _REF_SCORE preserves relative per-layer
-            # emphasis (high-signal layers still get more) while keeping
-            # existing recommended alphas usable on well-behaved models.
-            scores = [score for _, score in profile.values()]
-            mean_score = sum(scores) / len(scores) if scores else 1.0
-            if mean_score <= 0.0:
-                mean_score = 1.0
-            scale = _REF_SCORE / mean_score
+            total_score = sum(score for _, score in profile.values())
+            scale = _STEER_GAIN / total_score
             for layer_idx, (vec, score) in profile.items():
                 effective_alpha = v["alpha"] * score * scale
                 by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))

@@ -25,13 +25,13 @@ def main() -> None:
     alphas = [float(x) for x in args.alphas.split(",")]
 
     with SaklasSession(args.model, device="auto") as session:
-        profile = session.extract(args.concept)
-        session.steer(args.concept, profile)
+        name, profile = session.extract(args.concept)
+        session.steer(name, profile)
 
         for alpha in alphas:
             result = session.generate(
                 args.prompt,
-                alphas={args.concept: alpha} if alpha else None,
+                alphas={name: alpha} if alpha else None,
                 stateless=True,
                 seed=0,
             )

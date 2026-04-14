@@ -4,6 +4,7 @@ import json
 import logging
 import pathlib
 import queue
+import random
 import re
 import threading
 import time
@@ -67,13 +68,84 @@ def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
         return _slug(concept)
     return f"{_slug(concept)}{BIPOLAR_SEP}{_slug(baseline)}"
 
-_DOMAIN_SEEDS = [
-    "specific facts, lore, history, or knowledge unique to this concept",
-    "physical traits, mannerisms, sensory details, or observable behaviors",
-    "how this concept relates to others socially — alliances, conflicts, status",
-    "inner life: self-image, desires, fears, or motivations distinctive to this concept",
-    "concrete routines, rituals, habitats, or environmental interactions",
+# Shared-scenario bank used for bipolar pair generation.  Each scenario
+# describes a concrete, neutral-to-mildly-charged situation that two
+# speakers can react to from opposing poles of the target axis.  Keeping
+# the situation fixed within a pair means cross-pair variance is
+# situational and within-pair variance is purely the pole — so the top
+# PCA component locks onto the pole instead of a topical cluster.
+# Breadth across work/home/social/public/solo/intellectual/charged
+# contexts prevents the axis from collapsing into any single domain.
+_SCENARIO_BANK = [
+    # work
+    "your coworker takes credit for your idea in a team meeting",
+    "your manager reschedules your one-on-one for the third time this month",
+    "a junior colleague asks you to review their draft the night before the deadline",
+    "you get a calendar invite with no agenda twenty minutes before it starts",
+    "your name is missing from the project's release notes",
+    "a stakeholder changes the requirements the day before the demo",
+    "you find a bug in production that traces back to your own commit",
+    "an interviewer asks why you left your last job",
+    "you're told the department is being reorganized next quarter",
+    "you're asked to stay late to cover for a colleague who called out sick",
+    # home
+    "the wifi goes out while you're in the middle of something important",
+    "your partner forgot to pick up the groceries you asked for",
+    "your neighbor's dog has been barking for the last hour",
+    "a package you ordered arrives damaged",
+    "the bathroom sink starts draining slowly",
+    "you notice the milk in the fridge expired yesterday",
+    "a family member calls you in the middle of dinner",
+    "your upstairs neighbors are having a loud party on a Tuesday night",
+    "the washing machine stops mid-cycle",
+    "you realize you left your keys inside the house",
+    # social
+    "a friend cancels plans an hour before you were supposed to meet",
+    "someone you barely know asks you for a favor on social media",
+    "you're introduced to someone whose name you immediately forget",
+    "a friend tells you they're moving to another country next month",
+    "a distant relative sends you a long voice message",
+    "you're invited to a wedding in another city on short notice",
+    "an acquaintance gives you unsolicited advice about your career",
+    "an old friend reaches out after years of silence",
+    # public
+    "the train you're on stops between stations with no announced reason",
+    "you're stuck in traffic with no way to exit the highway",
+    "the person in front of you in line is counting out exact change",
+    "you drop your phone and the screen cracks",
+    "it starts raining while you're walking home without an umbrella",
+    "a stranger bumps into you without apologizing",
+    "your flight is delayed by two hours at the gate",
+    "the barista gets your order wrong",
+    # solo
+    "your alarm didn't go off and you wake up an hour late",
+    "you finish the last page of a book you've been reading for weeks",
+    "you can't find a word you know you know",
+    "you open the fridge and realize there's nothing you want to eat",
+    "you remember a mistake you made years ago",
+    "you find an old letter from someone you've lost touch with",
+    "you try a recipe for the first time and it turns out wrong",
+    # intellectual / opinion
+    "someone online disagrees with a post you made about a topic you care about",
+    "a friend recommends a book you've already read and didn't like",
+    "you read an article that contradicts something you believed",
+    "a stranger at a party mispronounces a term from your field",
+    "you hear someone repeat a rumor about you that isn't true",
+    # charged
+    "you learn a close friend is going through a serious illness",
+    "you receive unexpected news about a family member's health",
+    "you find out you didn't get a job you really wanted",
+    "you hear back about a medical test you've been waiting on",
+    "a long-term plan falls through at the last minute",
+    # mundane transitions
+    "you sit down with the first coffee of the morning",
+    "you walk into your apartment at the end of the day",
+    "you turn off the lights before going to bed",
+    "you start a chore you've been putting off for weeks",
+    "you stand at the window watching it rain",
+    "you check your phone and there are no new messages",
 ]
+
 
 
 class ConcurrentGenerationError(RuntimeError):
@@ -239,30 +311,35 @@ class SaklasSession:
         n: int = _N_PAIRS,
         on_progress: Callable[[str], None] | None = None,
     ) -> list[tuple[str, str]]:
-        """Generate contrastive pairs in batches with diverse domain seeds.
+        """Generate contrastive pairs in batches.
 
-        Splits the target count into small batches, each focused on a
-        different domain (emotional reactions, social dynamics, etc.).
-        Independent batches mean a parse failure in one doesn't cascade,
-        and shorter generations stay higher quality.
+        Both modes share the same shared-scenario embody framework: each
+        pair anchors both speakers in the same concrete situation drawn
+        from _SCENARIO_BANK and asks each to embody one pole of the axis.
+        Cross-pair variance is situational, within-pair variance is pure
+        pole, so the top PCA component locks onto the pole rather than
+        a topical cluster.  The scenario bank is deliberately broad
+        (work/home/social/public/solo/intellectual/charged) so that
+        whichever dimension the pole defines has enough situations to
+        express itself across.
+
+        Bipolar mode (baseline given): Speaker A embodies `concept`,
+        Speaker B embodies `baseline` — both poles are user-named.
+
+        Monopolar mode (no baseline): Speaker A embodies `concept`,
+        Speaker B embodies its semantic opposite — the model auto-derives
+        the opposite pole.  Used for concepts like `agentic`, `manipulative`
+        where the user doesn't want to commit to a specific pole name but
+        still wants meaningful contrastive distance (the previous
+        "unrelated person" baseline produced noise pairs that extracted
+        a concept-vs-noise direction rather than a usable axis).
+
+        Both prompts frame the task as *embodiment* — write AS the pole,
+        not ABOUT it — and rely on positive guidance rather than long
+        blocklists of things to avoid.  This generalizes cleanly across
+        affect, register, worldview, and identity-style concepts.
         """
-        if baseline is not None:
-            poles = (
-                f"Speaker A IS \"{concept}\" — everything about them "
-                f"(what they know, how they look, what they do, how they "
-                f"think) is shaped by being \"{concept}\".\n"
-                f"Speaker B IS \"{baseline}\" in the same thorough way."
-            )
-        else:
-            poles = (
-                f"Speaker A IS \"{concept}\" — everything about them "
-                f"(what they know, how they look, what they do, how they "
-                f"think) is shaped by being \"{concept}\".\n"
-                f"Speaker B has nothing to do with \"{concept}\" — they "
-                f"are a completely unrelated person/entity with no "
-                f"connection to any aspect of \"{concept}\"."
-            )
-
+        bipolar = baseline is not None
         pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
         system_msg = (
             "You generate contrastive statement pairs for neural network "
@@ -271,46 +348,94 @@ class SaklasSession:
             "of pairs requested, no more, no less."
         )
 
-        # Keep generating batches (cycling through domains) until we
-        # have enough pairs or hit the attempt cap.  Small models
-        # often under-generate, so we can't assume 1 batch = BATCH_SIZE
-        # pairs.  The cap prevents infinite loops if the model
-        # consistently fails to produce parseable output.
-        max_batches = len(_DOMAIN_SEEDS) * 3
+        max_batches = (n // _BATCH_SIZE + 1) * 3
         all_pairs: list[tuple[str, str]] = []
         batch_idx = 0
+        rng = random.Random()
         while len(all_pairs) < n and batch_idx < max_batches:
-            domain = _DOMAIN_SEEDS[batch_idx % len(_DOMAIN_SEEDS)]
             batch_n = min(_BATCH_SIZE, n - len(all_pairs))
 
-            if on_progress:
-                on_progress(
-                    f"Generating batch {batch_idx + 1} "
-                    f"({len(all_pairs)}/{n} pairs, domain: {domain})..."
+            if bipolar:
+                scenarios = rng.sample(_SCENARIO_BANK, batch_n)
+                if on_progress:
+                    on_progress(
+                        f"Generating batch {batch_idx + 1} "
+                        f"({len(all_pairs)}/{n} pairs, shared-scenario)..."
+                    )
+                scenario_block = "\n".join(
+                    f"{i+1}. {s}" for i, s in enumerate(scenarios)
                 )
-
-            prompt = (
-                f"Write exactly {batch_n} contrastive statement pairs.\n\n"
-                f"{poles}\n\n"
-                f"Focus on: {domain}.\n\n"
-                f"Rules:\n"
-                f"- Each statement MUST include concrete details specific "
-                f"to \"{concept}\" — names, places, terminology, physical "
-                f"descriptions, or references that ONLY apply to "
-                f"\"{concept}\" and nothing else\n"
-                f"- NO generic statements that could apply to any similar "
-                f"concept — if you replaced \"{concept}\" with something "
-                f"else and the statement still works, it's too vague\n"
-                f"- Both statements should sound like genuinely different "
-                f"people/entities — not a word swap or negation\n"
-                f"- 1–2 sentences each\n\n"
-                f"Format: number then a/b, period, then the statement. "
-                f"Nothing else — no headers, no commentary.\n\n"
-                f"1a. [Speaker A's statement]\n"
-                f"1b. [Speaker B's statement]\n"
-                f"2a. [Speaker A's statement]\n"
-                f"2b. [Speaker B's statement]"
-            )
+                prompt = (
+                    f"Write exactly {batch_n} contrastive statement pairs "
+                    f"for the axis \"{concept}\" vs \"{baseline}\".\n\n"
+                    f"For each situation below, write two first-person "
+                    f"statements:\n"
+                    f"- Speaker A fully embodies \"{concept}\" in voice, "
+                    f"diction, and rhythm\n"
+                    f"- Speaker B fully embodies \"{baseline}\" in the "
+                    f"same way\n\n"
+                    f"Situations:\n{scenario_block}\n\n"
+                    f"The two speakers should *sound* different, not just "
+                    f"feel differently about the situation — the contrast "
+                    f"must live in word choice, slang, sentence rhythm, "
+                    f"and tone, not only in framing. Lean into the pole "
+                    f"and let it speak in its natural voice: if the pole "
+                    f"has a stereotyped register, honor the stereotype; "
+                    f"hammy is better than neutral.\n\n"
+                    f"Plain everyday language, one natural sentence, "
+                    f"roughly 12–25 words. Both statements in a pair "
+                    f"respond to the same situation with the same overall "
+                    f"shape (both a thought, or both an outburst, or both "
+                    f"a remark), so the only axis of variation is "
+                    f"\"{concept}\" vs \"{baseline}\".\n\n"
+                    f"Format: number then a/b, period, then the statement. "
+                    f"Nothing else.\n\n"
+                    f"1a. [Speaker A's statement]\n"
+                    f"1b. [Speaker B's statement]\n"
+                    f"2a. [Speaker A's statement]\n"
+                    f"2b. [Speaker B's statement]"
+                )
+            else:
+                scenarios = rng.sample(_SCENARIO_BANK, batch_n)
+                if on_progress:
+                    on_progress(
+                        f"Generating batch {batch_idx + 1} "
+                        f"({len(all_pairs)}/{n} pairs, monopolar)..."
+                    )
+                scenario_block = "\n".join(
+                    f"{i+1}. {s}" for i, s in enumerate(scenarios)
+                )
+                prompt = (
+                    f"Write exactly {batch_n} contrastive statement pairs "
+                    f"for the concept \"{concept}\" vs its opposite.\n\n"
+                    f"For each situation below, write two first-person "
+                    f"statements:\n"
+                    f"- Speaker A fully embodies \"{concept}\" in voice, "
+                    f"diction, and rhythm\n"
+                    f"- Speaker B fully embodies the semantic opposite of "
+                    f"\"{concept}\" — whatever that opposite naturally is "
+                    f"— in the same way\n\n"
+                    f"Situations:\n{scenario_block}\n\n"
+                    f"The two speakers should *sound* different, not just "
+                    f"feel differently about the situation — the contrast "
+                    f"must live in word choice, slang, sentence rhythm, "
+                    f"and tone, not only in framing. Lean into the pole "
+                    f"and let it speak in its natural voice: if the pole "
+                    f"has a stereotyped register, honor the stereotype; "
+                    f"hammy is better than neutral.\n\n"
+                    f"Plain everyday language, one natural sentence, "
+                    f"roughly 12–25 words. Both statements in a pair "
+                    f"respond to the same situation with the same overall "
+                    f"shape (both a thought, or both an outburst, or both "
+                    f"a remark), so the only axis of variation is "
+                    f"\"{concept}\" vs its opposite.\n\n"
+                    f"Format: number then a/b, period, then the statement. "
+                    f"Nothing else.\n\n"
+                    f"1a. [Speaker A's statement]\n"
+                    f"1b. [Speaker B's statement]\n"
+                    f"2a. [Speaker A's statement]\n"
+                    f"2b. [Speaker B's statement]"
+                )
             messages = [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt},
