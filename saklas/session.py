@@ -224,7 +224,7 @@ class SaklasSession:
                 self._model, self._tokenizer, self._layers, self._model_info,
             )
 
-        self._monitor = TraitMonitor(probe_profiles, self._layer_means) if probe_profiles else TraitMonitor({})
+        self._monitor = TraitMonitor(probe_profiles, self._layer_means)
 
     # -- State queries --
 
@@ -356,86 +356,61 @@ class SaklasSession:
             batch_n = min(_BATCH_SIZE, n - len(all_pairs))
 
             if bipolar:
-                scenarios = rng.sample(_SCENARIO_BANK, batch_n)
-                if on_progress:
-                    on_progress(
-                        f"Generating batch {batch_idx + 1} "
-                        f"({len(all_pairs)}/{n} pairs, shared-scenario)..."
-                    )
-                scenario_block = "\n".join(
-                    f"{i+1}. {s}" for i, s in enumerate(scenarios)
-                )
-                prompt = (
-                    f"Write exactly {batch_n} contrastive statement pairs "
-                    f"for the axis \"{concept}\" vs \"{baseline}\".\n\n"
-                    f"For each situation below, write two first-person "
-                    f"statements:\n"
-                    f"- Speaker A fully embodies \"{concept}\" in voice, "
-                    f"diction, and rhythm\n"
+                header_kind = "axis"
+                axis_phrase = f"\"{concept}\" vs \"{baseline}\""
+                speaker_b_line = (
                     f"- Speaker B fully embodies \"{baseline}\" in the "
-                    f"same way\n\n"
-                    f"Situations:\n{scenario_block}\n\n"
-                    f"The two speakers should *sound* different, not just "
-                    f"feel differently about the situation — the contrast "
-                    f"must live in word choice, slang, sentence rhythm, "
-                    f"and tone, not only in framing. Lean into the pole "
-                    f"and let it speak in its natural voice: if the pole "
-                    f"has a stereotyped register, honor the stereotype; "
-                    f"hammy is better than neutral.\n\n"
-                    f"Plain everyday language, one natural sentence, "
-                    f"roughly 12–25 words. Both statements in a pair "
-                    f"respond to the same situation with the same overall "
-                    f"shape (both a thought, or both an outburst, or both "
-                    f"a remark), so the only axis of variation is "
-                    f"\"{concept}\" vs \"{baseline}\".\n\n"
-                    f"Format: number then a/b, period, then the statement. "
-                    f"Nothing else.\n\n"
-                    f"1a. [Speaker A's statement]\n"
-                    f"1b. [Speaker B's statement]\n"
-                    f"2a. [Speaker A's statement]\n"
-                    f"2b. [Speaker B's statement]"
+                    f"same way"
                 )
+                progress_label = "shared-scenario"
             else:
-                scenarios = rng.sample(_SCENARIO_BANK, batch_n)
-                if on_progress:
-                    on_progress(
-                        f"Generating batch {batch_idx + 1} "
-                        f"({len(all_pairs)}/{n} pairs, monopolar)..."
-                    )
-                scenario_block = "\n".join(
-                    f"{i+1}. {s}" for i, s in enumerate(scenarios)
-                )
-                prompt = (
-                    f"Write exactly {batch_n} contrastive statement pairs "
-                    f"for the concept \"{concept}\" vs its opposite.\n\n"
-                    f"For each situation below, write two first-person "
-                    f"statements:\n"
-                    f"- Speaker A fully embodies \"{concept}\" in voice, "
-                    f"diction, and rhythm\n"
+                header_kind = "concept"
+                axis_phrase = f"\"{concept}\" vs its opposite"
+                speaker_b_line = (
                     f"- Speaker B fully embodies the semantic opposite of "
                     f"\"{concept}\" — whatever that opposite naturally is "
-                    f"— in the same way\n\n"
-                    f"Situations:\n{scenario_block}\n\n"
-                    f"The two speakers should *sound* different, not just "
-                    f"feel differently about the situation — the contrast "
-                    f"must live in word choice, slang, sentence rhythm, "
-                    f"and tone, not only in framing. Lean into the pole "
-                    f"and let it speak in its natural voice: if the pole "
-                    f"has a stereotyped register, honor the stereotype; "
-                    f"hammy is better than neutral.\n\n"
-                    f"Plain everyday language, one natural sentence, "
-                    f"roughly 12–25 words. Both statements in a pair "
-                    f"respond to the same situation with the same overall "
-                    f"shape (both a thought, or both an outburst, or both "
-                    f"a remark), so the only axis of variation is "
-                    f"\"{concept}\" vs its opposite.\n\n"
-                    f"Format: number then a/b, period, then the statement. "
-                    f"Nothing else.\n\n"
-                    f"1a. [Speaker A's statement]\n"
-                    f"1b. [Speaker B's statement]\n"
-                    f"2a. [Speaker A's statement]\n"
-                    f"2b. [Speaker B's statement]"
+                    f"— in the same way"
                 )
+                progress_label = "monopolar"
+
+            scenarios = rng.sample(_SCENARIO_BANK, batch_n)
+            if on_progress:
+                on_progress(
+                    f"Generating batch {batch_idx + 1} "
+                    f"({len(all_pairs)}/{n} pairs, {progress_label})..."
+                )
+            scenario_block = "\n".join(
+                f"{i+1}. {s}" for i, s in enumerate(scenarios)
+            )
+            prompt = (
+                f"Write exactly {batch_n} contrastive statement pairs "
+                f"for the {header_kind} {axis_phrase}.\n\n"
+                f"For each situation below, write two first-person "
+                f"statements:\n"
+                f"- Speaker A fully embodies \"{concept}\" in voice, "
+                f"diction, and rhythm\n"
+                f"{speaker_b_line}\n\n"
+                f"Situations:\n{scenario_block}\n\n"
+                f"The two speakers should *sound* different, not just "
+                f"feel differently about the situation — the contrast "
+                f"must live in word choice, slang, sentence rhythm, "
+                f"and tone, not only in framing. Lean into the pole "
+                f"and let it speak in its natural voice: if the pole "
+                f"has a stereotyped register, honor the stereotype; "
+                f"hammy is better than neutral.\n\n"
+                f"Plain everyday language, one natural sentence, "
+                f"roughly 12–25 words. Both statements in a pair "
+                f"respond to the same situation with the same overall "
+                f"shape (both a thought, or both an outburst, or both "
+                f"a remark), so the only axis of variation is "
+                f"{axis_phrase}.\n\n"
+                f"Format: number then a/b, period, then the statement. "
+                f"Nothing else.\n\n"
+                f"1a. [Speaker A's statement]\n"
+                f"1b. [Speaker B's statement]\n"
+                f"2a. [Speaker A's statement]\n"
+                f"2b. [Speaker B's statement]"
+            )
             messages = [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt},

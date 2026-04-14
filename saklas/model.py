@@ -9,8 +9,6 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAn
 
 log = logging.getLogger(__name__)
 
-torch._dynamo.config.skip_nnmodule_hook_guards = False
-
 # MPS lacks the histogram kernel for integer tensors, which breaks
 # torch.histc (used by MoE routing in transformers' grouped_mm path).
 # The fix matches what transformers does for CPU: cast to float first.
@@ -234,6 +232,9 @@ def load_model(model_id: str, quantize=None, device="auto"):
     attn_impl = "sdpa"  # safe default, works everywhere
     if device == "cuda":
         try:
+            # Availability check only — presence of the package flips
+            # transformers onto the flash-attention-2 kernel. We never
+            # call into flash_attn ourselves.
             import flash_attn  # noqa: F401
             attn_impl = "flash_attention_2"
         except ImportError:

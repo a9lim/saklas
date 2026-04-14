@@ -1,7 +1,5 @@
 """Token-by-token generation loop with KV cache, steering hooks, and monitor integration."""
 
-from __future__ import annotations
-
 import queue
 import logging
 import threading
@@ -69,13 +67,25 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
     cached = _token_table_cache.get(tok_key)
     if cached is not None:
         return cached
-    table: list[str | None] = [''] * vocab_size
-    for i in range(vocab_size):
-        try:
-            s = tokenizer.decode([i])
-            table[i] = s if '\ufffd' not in s else None
-        except Exception:
-            table[i] = ''
+    # batch_decode is orders of magnitude faster than per-id decode()
+    # for large vocabs (150k+ tokens in modern models) — Rust-side loop
+    # instead of a Python round-trip per entry.
+    try:
+        decoded = tokenizer.batch_decode([[i] for i in range(vocab_size)])
+    except Exception:
+        decoded = None
+    if decoded is not None and len(decoded) == vocab_size:
+        table: list[str | None] = [
+            s if '\ufffd' not in s else None for s in decoded
+        ]
+    else:
+        table = [''] * vocab_size
+        for i in range(vocab_size):
+            try:
+                s = tokenizer.decode([i])
+                table[i] = s if '\ufffd' not in s else None
+            except Exception:
+                table[i] = ''
     _token_table_cache[tok_key] = table
     return table
 
@@ -397,6 +407,9 @@ def generate_steered(
     else:
         think_start_id = think_end_id = response_start_id = None
         starts_in_thinking = False
+    # Hoisted: true iff channel-based format (gpt-oss) where EOS acts as
+    # a channel separator inside thinking/preamble rather than terminating.
+    has_response_start = response_start_id is not None
     tstate = (
         _ThinkState.THINKING
         if (starts_in_thinking and think_end_id is not None)
@@ -446,6 +459,13 @@ def generate_steered(
                     logits[0, bias_idx] += bias_val.to(logits.dtype)
 
                 # Compute logprobs of the pre-sampling distribution if requested.
+                # TODO(perf): logprobs hot path forces per-token .item()/.tolist()
+                # CPU syncs below. Batching to a single post-loop transfer would
+                # win a few % on logprobs-enabled runs, but on_token streams
+                # logprobs live in each emitted chunk (chat completions chunks,
+                # TUI), so deferring would either break streaming semantics or
+                # require parallel index bookkeeping. Leaving per-token sync
+                # until we have a non-streaming caller that actually cares.
                 chosen_logprob: float | None = None
                 top_lp_pairs: list[tuple[int, float]] | None = None
                 if logprobs is not None:
@@ -484,7 +504,7 @@ def generate_steered(
                     # EOS while inside thinking/preamble and transition
                     # to response preamble.  For enable_thinking models
                     # (Gemma, Qwen) EOS always terminates generation.
-                    if response_start_id is None or tstate == _ThinkState.IDLE:
+                    if not has_response_start or tstate == _ThinkState.IDLE:
                         state.finish_reason = "stop"
                         break
                     generated_ids.append(token_id)

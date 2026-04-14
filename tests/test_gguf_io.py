@@ -6,7 +6,7 @@ import torch
 
 gguf = pytest.importorskip("gguf")
 
-from saklas.gguf_io import GGUFNotInstalled, read_gguf_profile, write_gguf_profile
+from saklas.gguf_io import read_gguf_profile, write_gguf_profile
 
 
 def test_roundtrip_preserves_tensors(tmp_path):

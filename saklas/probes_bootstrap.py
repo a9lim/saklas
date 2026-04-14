@@ -48,7 +48,7 @@ def load_defaults() -> dict[str, list[str]]:
 
 
 def bootstrap_layer_means(
-    model, tokenizer, layers, model_info: dict, *_unused,
+    model, tokenizer, layers, model_info: dict,
 ) -> dict[int, torch.Tensor]:
     """Load or compute per-layer mean activations for probe centering.
 
@@ -86,7 +86,7 @@ def bootstrap_layer_means(
 
 
 def bootstrap_probes(
-    model, tokenizer, layers, model_info: dict, categories: list[str], *_unused,
+    model, tokenizer, layers, model_info: dict, categories: list[str],
 ) -> dict[str, dict[int, torch.Tensor]]:
     """Load or extract probe vector profiles for the given categories."""
     from saklas import __version__ as _saklas_version

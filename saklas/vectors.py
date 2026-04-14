@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import functools as _functools
+import functools
 import json
 import logging
 from importlib import resources as _resources
@@ -173,7 +173,7 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
     }
 
 
-@_functools.cache
+@functools.cache
 def _load_neutral_prompts() -> list[str]:
     """Load neutral prompts, preferring a user override at ~/.saklas/neutral_statements.json."""
     from saklas.paths import neutral_statements_path
@@ -295,13 +295,16 @@ def extract_contrastive(
         # explained-variance-ratio used for multi-pair extraction
         # (typically 0.01–0.4), so single-pair and multi-pair profiles
         # contribute comparably when baked into shares.
+        # Stack single diffs and batch the norm compute so we only do one
+        # GPU→CPU transfer instead of n_layers individual .item() syncs.
+        diff_stack = torch.stack([diffs_per_layer[idx][0] for idx in range(n_layers)])
+        diff_norms_cpu = diff_stack.norm(dim=-1).tolist()
         for idx in range(n_layers):
             diff_vec = diffs_per_layer[idx][0]
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
-            diff_norm = diff_vec.norm().item()
             activation_norm = norm_sums_cpu[idx]  # pos_norm + neg_norm
-            score = diff_norm / max(activation_norm, 1e-8)
+            score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
             raw[idx] = (direction, score)
     else:
         # Multi-pair: batched SVD across all layers.
@@ -319,6 +322,10 @@ def extract_contrastive(
         _, S, Vh = torch.linalg.svd(batched, full_matrices=False)
         # S: (n_layers, min(N,dim)), Vh: (n_layers, min(N,dim), dim)
 
+        # Batch EVR compute: one vector-wide op and a single GPU→CPU
+        # transfer instead of n_layers scalar .item() calls.
+        scores_cpu = (S[:, 0] / S.sum(dim=-1)).tolist()
+
         for idx in range(n_layers):
             direction = Vh[idx, 0].to(device)  # (dim,)
 
@@ -327,8 +334,7 @@ def extract_contrastive(
             if (dots < 0).sum() > (dots > 0).sum():
                 direction = -direction
 
-            score = (S[idx, 0] / S[idx].sum()).item()
-            raw[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), score)
+            raw[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), scores_cpu[idx])
 
     # Bake shares into the stored tensors. Total share is 1.0 across layers,
     # so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective

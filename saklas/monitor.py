@@ -101,25 +101,24 @@ class TraitMonitor:
             for idx, m in self._layer_means.items()
         }
 
-    def _normalize_hidden_1d(self, hidden_per_layer: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
-        """Center (per layer_means) and L2-normalize 1D hidden-state vectors."""
-        out: dict[int, torch.Tensor] = {}
-        for layer_idx, h_raw in hidden_per_layer.items():
-            h = h_raw.float()
-            mean = self._mean_cache.get(layer_idx)
-            if mean is not None:
-                h = h - mean
-            hn = h.norm().clamp(min=1e-8)
-            out[layer_idx] = h / hn
-        return out
+    def _normalize_hidden(self, layer_idx: int, h: torch.Tensor) -> torch.Tensor:
+        """Center (per layer_means) and L2-normalize a hidden-state tensor.
 
-    def _normalize_hidden_2d(self, layer_idx: int, h: torch.Tensor) -> torch.Tensor:
-        """Center (per layer_means) and row-wise L2-normalize a 2D (seq, dim) tensor."""
+        Works for both 1D (dim,) and 2D (seq, dim) — mean broadcasts over
+        rows, and ``dim=-1, keepdim=True`` is a no-op reshape for 1D.
+        """
         mean = self._mean_cache.get(layer_idx)
         if mean is not None:
             h = h - mean
         hn = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         return h / hn
+
+    def _normalize_hidden_dict(self, hidden_per_layer: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        """Apply ``_normalize_hidden`` across a per-layer dict (1D vectors)."""
+        return {
+            layer_idx: self._normalize_hidden(layer_idx, h.float())
+            for layer_idx, h in hidden_per_layer.items()
+        }
 
     def _score_probes(self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True) -> dict[str, float]:
         """Score all probes against hidden states.
@@ -135,7 +134,7 @@ class TraitMonitor:
         if device is not None:
             self._ensure_cache(device)
 
-        h_unit_per_layer = self._normalize_hidden_1d(hidden_per_layer)
+        h_unit_per_layer = self._normalize_hidden_dict(hidden_per_layer)
 
         # Tensor-accumulate per probe; single .item() per probe at the end
         # (was N_layers syncs per probe = ~672 syncs for a 21-probe pack).
@@ -252,7 +251,7 @@ class TraitMonitor:
                 v_unit, w = entry
                 h_unit = h_unit_cache.get(layer_idx)
                 if h_unit is None:
-                    h_unit = self._normalize_hidden_2d(layer_idx, h.float())
+                    h_unit = self._normalize_hidden(layer_idx, h.float())
                     h_unit_cache[layer_idx] = h_unit
                 total_w += w
                 term = w * (h_unit @ v_unit)

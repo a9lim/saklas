@@ -200,7 +200,7 @@ def test_concept_folder_load_empty_errors(tmp_path):
 
 def test_concept_folder_load_gguf_only(tmp_path):
     """A concept folder with only a .gguf tensor (no safetensors) should load."""
-    gguf = pytest.importorskip("gguf")
+    pytest.importorskip("gguf")
     import torch
     from saklas.gguf_io import write_gguf_profile
 
