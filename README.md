@@ -53,6 +53,7 @@ with SaklasSession("google/gemma-3-4b-it") as s:
 pip install saklas             # library + TUI
 pip install saklas[serve]      # + FastAPI/uvicorn for the API server
 pip install saklas[research]   # + datasets/pandas for dataset loading and DataFrame export
+pip install saklas[gguf]       # + gguf package for llama.cpp-compatible export/import
 ```
 
 Requires Python 3.11+ and PyTorch 2.2+. Runs on Linux, macOS, and Windows. CPU works but is slow — CUDA or Apple Silicon MPS is recommended for anything interactive.
@@ -78,9 +79,13 @@ pip install -e ".[dev]"        # + pytest
 
 ### Steering vectors
 
-Saklas uses **Representation Engineering** (Zou et al., 2023): for each contrastive pair, capture the last-content-token hidden state at every layer, diff the positive and negative sides, and take the first principal component per layer via SVD. Every layer gets a direction and a score (explained variance ratio); there is no manual layer selection.
+Saklas uses **Representation Engineering** (Zou et al., 2023): for each contrastive pair, capture the last-content-token hidden state at every layer, diff the positive and negative sides, and take the first principal component per layer via SVD. Every layer gets a direction and an explained-variance score; there is no manual layer selection.
 
-Alpha is **normalized per-profile** so the same numeric value means the same intensity across backbones: α≈0.5 sits in the coherent-nuanced band on every bundled architecture, α≈1.0 is past the collapse cliff. Vectors are registered without alphas and applied per-call, so nothing persists on the model between generations.
+Per-layer PCA **shares are baked into the stored tensor magnitudes at extraction time** — each direction is scaled to the mean activation norm of its layer and then multiplied by `score / sum(scores)` before being saved. The steering hook then collapses to a flat scalar: `user_alpha * _STEER_GAIN * sum(baked)`. No runtime per-layer weighting, no separate scores sidecar. Because shares are relative, both **layer-count invariance** (deeper models don't over-inject) and **score-magnitude invariance** (diffuse vs sharp architectures stay comparable) fall out of the baking step automatically.
+
+Every steered layer's output is then **rescaled back to its pre-injection per-position norm** (unconditional norm preservation, in-place, fp32 accumulator). This keeps the residual stream on its natural magnitude trajectory so high-α rotation lands cleanly instead of being attenuated by inflated subsequent-layer activations — the same alpha produces a stronger, more predictable directional push.
+
+Alpha is **normalized per-profile** so the same numeric value means the same intensity across backbones: on the reference model (gemma-4-31b-it) α ≈ 0.4–0.8 is the coherent band for the bundled probe pack, α ≈ 1.0 is the collapse cliff. Vectors are registered without alphas and applied per-call, so nothing persists on the model between generations.
 
 Multiple vectors **compose** naturally — they register into a single manager that, per generation, installs a single in-place hidden-state hook per active layer (co-layer directions sum). Hooks are transient: composed before generation, removed after.
 
@@ -92,7 +97,7 @@ This means `/steer "anything"` works — religions, animals, fictional character
 
 ### Trait monitor
 
-After each generation, saklas runs a separate forward pass over the generated text, pools hidden states from the last content token (matching probe extraction), mean-centers them against a cached per-layer baseline (computed from 45 neutral prompts), and scores against each probe via score-weighted cosine similarity. History accumulates across generations, enabling sparklines and running statistics.
+After each generation, the trait monitor scores every probe against the hidden states that were captured **inline with generation** (no second forward pass — a `HiddenCapture` hook snapshots the last-position hidden state at each probe layer every step). Captures are mean-centered against a cached per-layer baseline (computed from 45 neutral prompts) and scored via magnitude-weighted cosine similarity: the probe's baked per-layer magnitude (= `share × ref_norm`, same quantity the steering hook uses) becomes the per-layer contribution weight, so the monitor gives more weight to the layers that actually read the concept most cleanly. History accumulates across generations, enabling sparklines and running statistics.
 
 Layer means are cached at `~/.saklas/models/<safe_model_id>/layer_means.safetensors` and auto-invalidate when `~/.saklas/neutral_statements.json` changes hash.
 
@@ -510,20 +515,23 @@ Saklas stores all state under `~/.saklas/` (override via `SAKLAS_HOME`):
   models/<safe_model_id>/layer_means.safetensors
 ```
 
-Each concept is a folder with `pack.json` (metadata + file hashes), `statements.json` (the contrastive pairs), and zero or more `<safe_model_id>.safetensors` tensor files (one per model the concept has been extracted against). Tensors are extracted lazily — a pack without tensors is fine; it'll extract on first use.
+Each concept is a folder with `pack.json` (metadata + file hashes), `statements.json` (the contrastive pairs), and zero or more per-model tensor files. Tensors come in two formats: `<safe_model_id>.safetensors` (native — paired with a slim JSON sidecar) or `<safe_model_id>.gguf` (llama.cpp-compatible — metadata embedded in the header). Safetensors wins on same-stem conflict. Tensors are extracted lazily — a pack without tensors is fine; it'll extract on first use.
 
 Packs are distributed as **HuggingFace model repos** (not datasets — safetensors is model-hub-native, and `base_model` frontmatter gives reverse-link discoverability from the base model's hub page). Pin any install to a git tag, branch, or commit SHA with `@revision`; pinned installs are preserved on refresh — pinning means pinning.
+
+**Pack-less install.** `saklas install` also accepts HF repos that have no `pack.json` at root: it scans for `*.safetensors`/`*.gguf`, fabricates minimal metadata, and synthesizes a `pack.json` in place. Repeng-style GGUF-only control-vector repos (`jukofyork/creative-writing-control-vectors-v3.0`, etc.) install with zero preparation.
 
 ### Commands
 
 ```bash
-saklas install <target> [-s] [-a NS/NAME] [-f]   # from HF coord (ns/name[@rev]) or folder path
-saklas refresh <selector> [-m MODEL]              # re-pull from source
-saklas refresh neutrals                           # reserved: rewrite neutral_statements.json
-saklas clear <selector> [-m MODEL] [-y]           # delete per-model tensors, keep statements
-saklas uninstall <selector> [-y]                  # fully remove concept folder
-saklas list [selector] [-i] [-j] [-v]             # includes HF hub by default
-saklas merge <name> <components> [-m] [-f] [-s]   # merge: saklas merge bard default/angry.calm:0.3,user/arch:0.4
+saklas install <target> [-s] [-a NS/NAME] [-f]          # from HF coord (ns/name[@rev]) or folder path
+saklas refresh <selector> [-m MODEL]                     # re-pull from source
+saklas refresh neutrals                                  # reserved: rewrite neutral_statements.json
+saklas clear <selector> [-m MODEL] [-y]                  # delete per-model tensors, keep statements
+saklas uninstall <selector> [-y]                         # fully remove concept folder
+saklas list [selector] [-i] [-j] [-v]                    # includes HF hub by default
+saklas merge <name> <components> [-m] [-f] [-s]          # merge: saklas merge bard default/angry.calm:0.3,user/arch:0.4
+saklas export gguf <selector> [-m MODEL] [-o PATH]       # export baked tensors to llama.cpp GGUF
 ```
 
 **Selectors** (shared grammar): `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and error on ambiguity.
@@ -535,6 +543,8 @@ saklas merge <name> <components> [-m] [-f] [-s]   # merge: saklas merge bard def
 **`clear` vs `uninstall`**: `clear` deletes tensors but keeps `statements.json` and `pack.json` (so the concept remains selectable and will re-extract on demand). `uninstall` removes the whole folder. Uninstalling a bundled concept is allowed — it respawns on the next session init via `materialize_bundled`. Broad selectors (`all`, `namespace:`) require `-y` on both commands.
 
 **`list`** queries the HF hub by default and merges results with local installs. Pass `-i` for installed-only, `-j` for JSON output, `-v` to include descriptions inline.
+
+**`export gguf`** writes the pack's baked tensors to llama.cpp's control-vector GGUF format (`pip install saklas[gguf]` pulls in the required `gguf` package). Default output is alongside the safetensors tensor inside the pack folder; `-o` takes a file or directory. `--model-hint` overrides the architecture string llama.cpp keys off; default is derived via `transformers.AutoConfig.model_type` (cache-first, network fallback). Bundled concepts refuse in-place export because `refresh` would clobber the folder — pass `-o` pointing outside the pack in that case. Because saklas bakes per-layer shares into the tensor magnitudes, a uniform `--control-vector-scaled` scalar on the llama.cpp side reproduces saklas's layer weighting with no per-layer metadata.
 
 ### Python library
 
