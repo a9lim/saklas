@@ -5,6 +5,64 @@ from __future__ import annotations
 import torch
 
 
+class HiddenCapture:
+    """Accumulates the last-position hidden state at each hooked layer on every
+    forward pass. Paired with a KV-cached generation loop, one capture per step
+    gives N captures for N generated tokens: capture[k] is the state that
+    produced token t_k.
+
+    The first capture (step 0, prompt forward) is the state at the last prompt
+    token — the state that selected t_0. Subsequent steps feed one generated
+    token at a time; each hidden state is the model's state that selected the
+    following token. The k-th capture is thus semantically "the activation that
+    produced generated token k."
+
+    Hot-path discipline: hooks copy a (dim,) slice via ``detach().clone()``
+    (device-local, no sync) and append to a per-layer Python list. Stacking and
+    fp32 casting happen after detach, not in the hot path.
+    """
+
+    def __init__(self) -> None:
+        self._per_layer: dict[int, list[torch.Tensor]] = {}
+        self._handles: list = []
+
+    def attach(
+        self, layers: "torch.nn.ModuleList", layer_indices: list[int]
+    ) -> None:
+        self._per_layer = {idx: [] for idx in layer_indices}
+        self._handles = []
+        for idx in layer_indices:
+            bucket = self._per_layer[idx]
+
+            def _make(bucket_ref):
+                def _hook(module, input, output):
+                    h = output if isinstance(output, torch.Tensor) else output[0]
+                    bucket_ref.append(h[0, -1, :].detach().clone())
+                return _hook
+
+            self._handles.append(layers[idx].register_forward_hook(_make(bucket)))
+
+    def detach(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    def clear(self) -> None:
+        self._per_layer = {}
+        self._handles = []
+
+    def stacked(self) -> dict[int, torch.Tensor]:
+        """Return per-layer ``(n_captures, dim)`` tensors in the capture dtype.
+
+        Scoring code casts to fp32 via the monitor's normalize helper.
+        """
+        out: dict[int, torch.Tensor] = {}
+        for idx, bucket in self._per_layer.items():
+            if bucket:
+                out[idx] = torch.stack(bucket)
+        return out
+
+
 class SteeringHook:
     """Pre-composed steering vector for a single layer."""
 
@@ -52,8 +110,6 @@ class SteeringHook:
             self._handle = None
 
 
-_DEGEN_THRESHOLD = 1e-8
-
 # Reference mean PCA score used to anchor per-profile score normalization.
 # Chosen to match the typical mean score of well-concentrated profiles
 # (gemma-3-4b-it, Qwen-3.5-4B, Ministral-3-8B) so their recommended alphas
@@ -61,47 +117,6 @@ _DEGEN_THRESHOLD = 1e-8
 # score much lower (~0.07); normalization divides by their profile mean and
 # re-multiplies by this constant, bringing them onto the same alpha scale.
 _REF_SCORE = 1.0 / 32.0
-
-
-def orthogonalize_vectors(
-    vectors: list[torch.Tensor],
-    alphas: list[float] | None = None,
-) -> list[torch.Tensor] | list[tuple[torch.Tensor, float]]:
-    """QR-based orthogonalization on a list of vectors.
-
-    Returns orthonormal vectors preserving each input's orientation.
-    Drops degenerate directions whose R-diagonal magnitude falls below
-    threshold. Single-kernel QR replaces sequential Gram-Schmidt.
-    """
-    if not vectors:
-        return []
-    if len(vectors) == 1:
-        norm = vectors[0].norm()
-        if norm <= _DEGEN_THRESHOLD:
-            return []
-        v = vectors[0] / norm
-        if alphas is not None:
-            return [(v, alphas[0])]
-        return [v]
-    orig_dtype = vectors[0].dtype
-    stacked = torch.stack(vectors).float()           # (N, dim)
-    Q, R = torch.linalg.qr(stacked.T)                # Q: (dim, N)
-    diag = R.diag()                                   # (N,)
-    keep = diag.abs() > _DEGEN_THRESHOLD
-    # QR can flip column signs relative to input; R's diagonal sign
-    # encodes the flip.  Correct so alphas keep their meaning.
-    signs = diag.sign()
-    if alphas is not None:
-        return [
-            ((Q[:, i] * signs[i]).to(orig_dtype), alphas[i])
-            for i in range(len(vectors))
-            if keep[i]
-        ]
-    return [
-        (Q[:, i] * signs[i]).to(orig_dtype)
-        for i in range(len(vectors))
-        if keep[i]
-    ]
 
 
 class SteeringManager:
@@ -127,7 +142,6 @@ class SteeringManager:
         model_layers: torch.nn.ModuleList,
         device: torch.device,
         dtype: torch.dtype,
-        orthogonalize: bool = False,
     ) -> None:
         """Group vectors by layer, recompose hooks, attach to model."""
         by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
@@ -159,11 +173,6 @@ class SteeringManager:
 
         # Recompose and attach for each active layer
         for idx, pairs in by_layer.items():
-            if orthogonalize and len(pairs) > 1:
-                raw_vectors = [vec for vec, _ in pairs]
-                raw_alphas = [alpha for _, alpha in pairs]
-                pairs = orthogonalize_vectors(raw_vectors, raw_alphas)
-
             if idx not in self.hooks:
                 hook = SteeringHook()
                 hook.attach(model_layers[idx])

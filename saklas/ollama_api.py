@@ -203,7 +203,7 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
     (mapped to frequency_penalty if frequency_penalty is unset).
 
     Non-standard saklas fields (accepted at the top level or inside options):
-    `steer` (dict or dict with alphas/orthogonalize/thinking), `think` (bool).
+    `steer` (dict or dict with alphas/thinking), `think` (bool).
     """
     opts = dict(body.get("options") or {})
     top_system = body.get("system")
@@ -232,12 +232,9 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
     if isinstance(steer_raw, dict):
         if "alphas" in steer_raw and isinstance(steer_raw["alphas"], dict):
             alpha_map = {str(k): float(v) for k, v in steer_raw["alphas"].items()}
-            orthogonalize = bool(steer_raw.get("orthogonalize", False))
             thinking = bool(steer_raw.get("thinking", False))
         else:
-            # Allow `"steer": {"happy": 0.3, "calm": 0.2}` shorthand.
             alpha_map = {}
-            orthogonalize = False
             thinking = False
             for k, v in steer_raw.items():
                 try:
@@ -246,7 +243,6 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
                     pass
     else:
         alpha_map = {}
-        orthogonalize = False
         thinking = False
 
     think_flag = body.get("think")
@@ -258,7 +254,6 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
 
     return {
         "alphas": merged_alphas or None,
-        "orthogonalize": orthogonalize,
         "thinking": thinking,
         "stateless": True,
         "seed": seed,

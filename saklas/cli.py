@@ -9,9 +9,6 @@ import sys
 os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning:multiprocessing.resource_tracker")
 
 
-_SUBCOMMANDS = {"serve", "install", "refresh", "clear", "uninstall", "list", "merge", "push"}
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -253,27 +250,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         _print_no_model_hint()
         sys.exit(0)
 
-    if argv and argv[0] in _SUBCOMMANDS:
+    if argv and argv[0] in _SUBCOMMAND_TABLE:
         cmd = argv[0]
-        rest = argv[1:]
-        if cmd == "serve":
-            args = _build_serve_parser().parse_args(rest)
-        elif cmd == "install":
-            args = _build_install_parser().parse_args(rest)
-        elif cmd == "refresh":
-            args = _build_refresh_parser().parse_args(rest)
-        elif cmd == "clear":
-            args = _build_clear_parser().parse_args(rest)
-        elif cmd == "uninstall":
-            args = _build_uninstall_parser().parse_args(rest)
-        elif cmd == "list":
-            args = _build_list_parser().parse_args(rest)
-        elif cmd == "merge":
-            args = _build_merge_parser().parse_args(rest)
-        elif cmd == "push":
-            args = _build_push_parser().parse_args(rest)
-        else:  # pragma: no cover
-            raise RuntimeError(f"unhandled subcommand {cmd}")
+        args = _SUBCOMMAND_TABLE[cmd][0]().parse_args(argv[1:])
         args.command = cmd
         return args
 
@@ -301,7 +280,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.model = composed.model or args.model
         args.temperature = composed.temperature
         args.top_p = composed.top_p
-        args.orthogonalize = composed.orthogonalize
         args.thinking = composed.thinking
         args.system_prompt = composed.system_prompt
         args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
@@ -311,7 +289,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.config_vectors = {}
         args.temperature = None
         args.top_p = None
-        args.orthogonalize = None
         args.thinking = None
 
     if args.model is None:
@@ -345,25 +322,76 @@ def _print_startup(args: argparse.Namespace) -> None:
         print(f"Quantization: {args.quantize}")
 
 
+def _setup_steering_vectors(
+    session,
+    vector_specs,
+    *,
+    verbose: bool = False,
+) -> dict[str, float]:
+    """Resolve pole aliases, extract profiles, register with session.
+
+    vector_specs is either a dict[coord, alpha] (config/TUI form, possibly
+    namespaced as `ns/name`) or an iterable of `(raw, alpha)` tuples
+    (serve `--steer` form, bare names only).
+
+    Returns a dict[registry_key, effective_alpha] — the caller uses it as
+    the default_alphas map for the server, or discards it for the TUI.
+    """
+    from saklas.cli_selectors import resolve_pole, AmbiguousSelectorError
+
+    if isinstance(vector_specs, dict):
+        items = [
+            (coord.split("/", 1)[-1] if "/" in coord else coord,
+             coord.split("/", 1)[0] if "/" in coord else None,
+             coord, alpha)
+            for coord, alpha in vector_specs.items()
+        ]
+    else:
+        items = [(raw, None, raw, alpha) for raw, alpha in vector_specs]
+
+    default_alphas: dict[str, float] = {}
+    for raw_name, ns, display, alpha in items:
+        try:
+            canonical, sign, _match = resolve_pole(raw_name, namespace=ns)
+        except AmbiguousSelectorError as e:
+            if verbose:
+                print(f"  Failed to resolve '{raw_name}': {e}", file=sys.stderr)
+                sys.exit(1)
+            print(f"  Failed to register '{display}': {e}")
+            continue
+        effective_alpha = alpha * sign
+        try:
+            if verbose:
+                print(
+                    f"Extracting steering vector: {canonical}"
+                    + (f" (negated from '{raw_name}')" if sign < 0 else "")
+                )
+                _, profile = session.extract(
+                    canonical, on_progress=lambda m: print(f"  {m}")
+                )
+            else:
+                _, profile = session.extract(canonical)
+        except Exception as e:
+            if verbose:
+                raise
+            print(f"  Failed to register '{display}': {e}")
+            continue
+        registry_key = f"{ns}/{canonical}" if ns else canonical
+        session.steer(registry_key, profile)
+        default_alphas[registry_key] = effective_alpha
+        print(f"  Registered '{registry_key}' (alpha={effective_alpha})"
+              if not verbose else
+              f"  Registered '{registry_key}' (default alpha={effective_alpha})")
+    return default_alphas
+
+
 def _run_tui(args: argparse.Namespace) -> None:
     _print_startup(args)
 
     session = _make_session(args)
     _print_model_info(session)
 
-    from saklas.cli_selectors import resolve_pole
-    for coord, alpha in getattr(args, "config_vectors", {}).items():
-        ns = coord.split("/", 1)[0] if "/" in coord else None
-        raw_name = coord.split("/", 1)[-1] if "/" in coord else coord
-        try:
-            canonical, sign, _match = resolve_pole(raw_name, namespace=ns)
-            effective_alpha = alpha * sign
-            _, profile = session.extract(canonical)
-            registry_key = f"{ns}/{canonical}" if ns else canonical
-            session.steer(registry_key, profile)
-            print(f"  Registered '{registry_key}' (alpha={effective_alpha})")
-        except Exception as e:
-            print(f"  Failed to register '{coord}': {e}")
+    _setup_steering_vectors(session, getattr(args, "config_vectors", {}) or {})
 
     from saklas.tui.app import SaklasApp
     app = SaklasApp(session=session)
@@ -395,22 +423,8 @@ def _run_serve(args: argparse.Namespace) -> None:
     session = _make_session(args)
     _print_model_info(session)
 
-    from saklas.cli_selectors import resolve_pole, AmbiguousSelectorError
-    default_alphas: dict[str, float] = {}
-    for spec in args.steer:
-        raw, alpha = _parse_steer_flag(spec)
-        try:
-            canonical, sign, _match = resolve_pole(raw)
-        except AmbiguousSelectorError as e:
-            print(f"  Failed to resolve '{raw}': {e}", file=sys.stderr)
-            sys.exit(1)
-        effective_alpha = alpha * sign
-        print(f"Extracting steering vector: {canonical}"
-              + (f" (negated from '{raw}')" if sign < 0 else ""))
-        _, profile = session.extract(canonical, on_progress=lambda m: print(f"  {m}"))
-        session.steer(canonical, profile)
-        default_alphas[canonical] = effective_alpha
-        print(f"  Registered '{canonical}' (default alpha={effective_alpha})")
+    steer_specs = [_parse_steer_flag(spec) for spec in args.steer]
+    default_alphas = _setup_steering_vectors(session, steer_specs, verbose=True)
 
     from saklas.server import create_app
     app = create_app(session, default_alphas=default_alphas,
@@ -557,20 +571,21 @@ def _run_push(args: argparse.Namespace) -> None:
         print(f"Pushed {coord} -> {url}")
 
 
-_RUNNERS = {
-    "tui": _run_tui,
-    "serve": _run_serve,
-    "install": _run_install,
-    "refresh": _run_refresh,
-    "clear": _run_clear,
-    "uninstall": _run_uninstall,
-    "list": _run_list,
-    "merge": _run_merge,
-    "push": _run_push,
+_SUBCOMMAND_TABLE = {
+    "serve":     (_build_serve_parser,     _run_serve),
+    "install":   (_build_install_parser,   _run_install),
+    "refresh":   (_build_refresh_parser,   _run_refresh),
+    "clear":     (_build_clear_parser,     _run_clear),
+    "uninstall": (_build_uninstall_parser, _run_uninstall),
+    "list":      (_build_list_parser,      _run_list),
+    "merge":     (_build_merge_parser,     _run_merge),
+    "push":      (_build_push_parser,      _run_push),
 }
 
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
-    runner = _RUNNERS[args.command]
-    runner(args)
+    if args.command == "tui":
+        _run_tui(args)
+    else:
+        _SUBCOMMAND_TABLE[args.command][1](args)

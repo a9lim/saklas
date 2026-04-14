@@ -347,16 +347,21 @@ def list_concepts(
 
     hf_rows: list[dict] = []
     if hf:
+        from saklas.hf import HFError, search_packs
         try:
-            from saklas.hf import search_packs
+            from huggingface_hub.utils import HfHubHTTPError
+        except ImportError:
+            HfHubHTTPError = ()  # type: ignore[assignment,misc]
+        try:
             hf_rows = search_packs(selector)
-        except Exception as e:
+        except (HFError, HfHubHTTPError, OSError) as e:
+            msg = f"hf search unavailable: {type(e).__name__}: {e}"
             if json_output:
                 import json as _json
-                print(_json.dumps({"error": f"hf search unavailable: {e}", "installed": [_row_from_concept(c) for c in concepts]}))
+                print(_json.dumps({"error": msg, "installed": [_row_from_concept(c) for c in concepts]}))
                 return
             _print_list(concepts, verbose=verbose)
-            print(f"(hf search unavailable: {e})")
+            print(f"({msg})")
             return
 
     if json_output:
@@ -385,21 +390,28 @@ def list_concepts(
 
 def _row_from_concept(c: ResolvedConcept) -> dict:
     from saklas.packs import ConceptFolder
+    tensor_models: list[str] = []
+    status = "installed"
+    error: Optional[str] = None
     try:
         cf = ConceptFolder.load(c.folder)
         tensor_models = cf.tensor_models()
-    except Exception:
-        tensor_models = []
-    return {
+    except Exception as e:
+        status = "corrupt"
+        error = f"{type(e).__name__}: {e}"
+    row = {
         "name": c.name,
         "namespace": c.namespace,
-        "status": "installed",
+        "status": status,
         "recommended_alpha": c.metadata.recommended_alpha,
         "tags": list(c.metadata.tags),
         "description": c.metadata.description,
         "source": c.metadata.source,
         "tensor_models": tensor_models,
     }
+    if error is not None:
+        row["error"] = error
+    return row
 
 
 def _print_list(concepts: list[ResolvedConcept], *, verbose: bool = False) -> None:
@@ -408,17 +420,21 @@ def _print_list(concepts: list[ResolvedConcept], *, verbose: bool = False) -> No
     else:
         print(f"{'NAME':<24} {'NS':<12} {'STATUS':<13} {'ALPHA':<6} TAGS")
     for c in concepts:
-        tags = ",".join(c.metadata.tags)
-        row = (
-            f"{c.name:<24} {c.namespace:<12} [installed]   "
+        r = _row_from_concept(c)
+        tags = ",".join(r["tags"])
+        tag = "[corrupt]    " if r["status"] == "corrupt" else "[installed]  "
+        line = (
+            f"{c.name:<24} {c.namespace:<12} {tag} "
             f"{c.metadata.recommended_alpha:<6.2f} {tags}"
         )
         if verbose:
-            row = (
-                f"{c.name:<24} {c.namespace:<12} [installed]   "
+            line = (
+                f"{c.name:<24} {c.namespace:<12} {tag} "
                 f"{c.metadata.recommended_alpha:<6.2f} {tags:<24} {c.metadata.description}"
             )
-        print(row)
+        print(line)
+        if r.get("error"):
+            print(f"  ! {r['error']}")
 
 
 def _print_info(namespace: str, name: str, *, hf: bool, json_output: bool = False) -> None:

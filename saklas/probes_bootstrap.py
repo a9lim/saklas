@@ -9,7 +9,7 @@ import torch
 
 from saklas.packs import (
     ConceptFolder, PackFormatError, Sidecar,
-    hash_file, is_stale, materialize_bundled, version_mismatch,
+    hash_file, materialize_bundled,
 )
 from saklas.paths import (
     concept_dir, model_dir, neutral_statements_path, safe_model_id, vectors_dir,
@@ -107,25 +107,23 @@ def bootstrap_probes(
             if ts.exists() and sc_path.exists():
                 try:
                     profile, meta = load_profile(str(ts))
-                    # load_profile already parsed the sidecar dict; build a
-                    # Sidecar from it instead of re-reading from disk.
-                    sc = Sidecar(
-                        method=meta["method"],
-                        scores={int(k): float(v) for k, v in meta.get("scores", {}).items()},
-                        saklas_version=meta["saklas_version"],
-                        statements_sha256=meta.get("statements_sha256"),
-                        components=meta.get("components"),
-                    )
                     probes[probe_name] = profile
                     stmts = cdir / "statements.json"
-                    if stmts.exists():
+                    recorded_sha = meta.get("statements_sha256")
+                    if stmts.exists() and recorded_sha:
                         current = hash_file(stmts)
-                        if is_stale(current, sc):
+                        if current != recorded_sha:
                             log.warning(
                                 "%s: statements changed since extraction; consider -r default/%s",
                                 probe_name, probe_name,
                             )
-                    if version_mismatch(sc, _saklas_version):
+                    sidecar_version = meta.get("saklas_version", "")
+                    try:
+                        sv = tuple(int(p) for p in sidecar_version.split(".")[:2])
+                        cv = tuple(int(p) for p in _saklas_version.split(".")[:2])
+                        if sv != cv:
+                            log.warning("%s: extracted with older saklas version", probe_name)
+                    except (ValueError, IndexError):
                         log.warning("%s: extracted with older saklas version", probe_name)
                     continue
                 except Exception as e:

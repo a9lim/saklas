@@ -41,8 +41,11 @@ class TraitMonitor:
         self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self._raw_profiles}
         self._stats: dict[str, dict] = {n: self._empty_stats() for n in self._raw_profiles}
 
-        # Set after measure() — signals TUI to refresh
-        self._pending = False
+        # Aggregate path sets _pending_aggregate; per-token path sets _pending_per_token.
+        # has_pending_data() returns aggregate readiness — the TUI uses it to refresh
+        # trait readings after a measure() call.
+        self._pending_aggregate = False
+        self._pending_per_token = False
 
     @property
     def probe_names(self) -> list[str]:
@@ -95,9 +98,33 @@ class TraitMonitor:
             for idx, m in self._layer_means.items()
         }
 
-    def _score_probes(self, hidden_per_layer: dict[int, torch.Tensor]):
-        """Score all probes against hidden states and update history/stats."""
-        # Pick a device from any hidden state (they share device).
+    def _normalize_hidden_1d(self, hidden_per_layer: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        """Center (per layer_means) and L2-normalize 1D hidden-state vectors."""
+        out: dict[int, torch.Tensor] = {}
+        for layer_idx, h_raw in hidden_per_layer.items():
+            h = h_raw.float()
+            mean = self._mean_cache.get(layer_idx)
+            if mean is not None:
+                h = h - mean
+            hn = h.norm().clamp(min=1e-8)
+            out[layer_idx] = h / hn
+        return out
+
+    def _normalize_hidden_2d(self, layer_idx: int, h: torch.Tensor) -> torch.Tensor:
+        """Center (per layer_means) and row-wise L2-normalize a 2D (seq, dim) tensor."""
+        mean = self._mean_cache.get(layer_idx)
+        if mean is not None:
+            h = h - mean
+        hn = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return h / hn
+
+    def _score_probes(self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True) -> dict[str, float]:
+        """Score all probes against hidden states.
+
+        When ``accumulate`` is True (default), history and stats are updated.
+        When False, the call is read-only — useful for stateless API requests
+        that must not mutate session-level probe accumulators.
+        """
         device = None
         for h in hidden_per_layer.values():
             device = h.device
@@ -105,19 +132,14 @@ class TraitMonitor:
         if device is not None:
             self._ensure_cache(device)
 
-        # Pre-cast each layer's hidden state once; compute centered h / ||h||.
-        h_unit_per_layer: dict[int, torch.Tensor] = {}
-        for layer_idx, h_raw in hidden_per_layer.items():
-            h = h_raw.float()
-            mean = self._mean_cache.get(layer_idx)
-            if mean is not None:
-                h = h - mean
-            hn = h.norm().clamp(min=1e-8)
-            h_unit_per_layer[layer_idx] = h / hn
+        h_unit_per_layer = self._normalize_hidden_1d(hidden_per_layer)
 
+        # Tensor-accumulate per probe; single .item() per probe at the end
+        # (was N_layers syncs per probe = ~672 syncs for a 21-probe pack).
+        vals: dict[str, float] = {}
         for name in self._raw_profiles:
             total_w = 0.0
-            weighted_sim = 0.0
+            weighted: torch.Tensor | None = None
             v_unit_layers = self._v_unit_cache.get(name, {})
             for layer_idx, (_vec, score) in self._raw_profiles[name].items():
                 h_unit = h_unit_per_layer.get(layer_idx)
@@ -125,28 +147,35 @@ class TraitMonitor:
                     continue
                 total_w += score
                 v_unit = v_unit_layers[layer_idx]
-                cos = (h_unit @ v_unit)
-                weighted_sim += score * cos.item()
+                term = (h_unit @ v_unit) * score
+                weighted = term if weighted is None else weighted + term
             total_w = max(total_w, 1e-8)
-            val = weighted_sim / total_w
-            self.history[name].append(val)
-            s = self._stats[name]
-            s["count"] += 1
-            s["sum"] += val
-            s["sum_sq"] += val * val
-            if val < s["min"]:
-                s["min"] = val
-            if val > s["max"]:
-                s["max"] = val
+            if weighted is None:
+                vals[name] = 0.0
+            else:
+                vals[name] = (weighted / total_w).item()
 
-        self._pending = True
+        if accumulate:
+            for name, val in vals.items():
+                self.history[name].append(val)
+                s = self._stats[name]
+                s["count"] += 1
+                s["sum"] += val
+                s["sum_sq"] += val * val
+                if val < s["min"]:
+                    s["min"] = val
+                if val > s["max"]:
+                    s["max"] = val
+            self._pending_aggregate = True
+        return vals
 
-    def measure(self, model, tokenizer, layers, text: str, device=None):
+    def measure(self, model, tokenizer, layers, text: str, device=None, accumulate: bool = True) -> dict[str, float]:
         """Run one forward pass over *text* and compute probe similarities.
 
         Pools the last content token's hidden state per layer (same as
         extraction), mean-centers, then computes score-weighted cosine
-        similarities against all probes.
+        similarities against all probes. When ``accumulate`` is False,
+        history and stats are left untouched.
         """
         from saklas.vectors import _encode_and_capture_all
 
@@ -154,94 +183,98 @@ class TraitMonitor:
             device = next(model.parameters()).device
 
         hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
-        self._score_probes(hidden_per_layer)
+        return self._score_probes(hidden_per_layer, accumulate=accumulate)
 
-    def measure_from_hidden(self, hidden_per_layer: dict[int, torch.Tensor]):
+    def measure_from_hidden(self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True) -> dict[str, float]:
         """Score probes from pre-captured hidden states (no forward pass).
 
         Use when hidden states have already been captured during generation
         (e.g. via capture hooks), avoiding a redundant forward pass.
         """
-        self._score_probes(hidden_per_layer)
+        return self._score_probes(hidden_per_layer, accumulate=accumulate)
 
-    def measure_per_token(
-        self, model, tokenizer, layers,
-        full_ids: torch.Tensor,
-        score_start: int, score_end: int,
-        device=None,
-    ) -> dict[str, list[float]]:
-        """Single forward pass over *full_ids*; update aggregate history
-        (pooled from the last non-special position inside the scoring
-        range) and return per-token probe scores for
-        ``[score_start, score_end)``.
+    def score_per_token(
+        self,
+        captured: dict[int, torch.Tensor],
+        generated_ids: list[int],
+        tokenizer,
+        *,
+        accumulate: bool = True,
+    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+        """Score probes per generated token using pre-captured hidden states.
+
+        ``captured[layer_idx]`` must be a ``(n, dim)`` tensor where row ``k``
+        is the hidden state that produced generated token ``k`` (``n ==
+        len(generated_ids)``). Typically populated by a ``HiddenCapture`` hook
+        running in lockstep with the generation loop, so no extra forward
+        pass is needed.
+
+        Returns ``(aggregate_vals, per_token_scores)``. The aggregate is
+        pooled from the last non-special generated token and updates history
+        when ``accumulate`` is True. Per-token scores cover all
+        ``len(generated_ids)`` rows.
         """
-        from saklas.vectors import _capture_all_hidden_states
+        n = len(generated_ids)
+        empty_agg = {name: 0.0 for name in self._raw_profiles}
+        if n == 0 or not captured:
+            return empty_agg, {name: [] for name in self._raw_profiles}
 
-        if device is None:
-            device = next(model.parameters()).device
-        if full_ids.dim() == 1:
-            full_ids = full_ids.unsqueeze(0)
-        if full_ids.device != device:
-            full_ids = full_ids.to(device)
+        any_h = next(iter(captured.values()))
+        self._ensure_cache(any_h.device)
 
-        n_resp = score_end - score_start
-        if n_resp <= 0:
-            return {name: [] for name in self._raw_profiles}
-
-        hidden_per_layer = _capture_all_hidden_states(model, layers, full_ids)
-        sliced: dict[int, torch.Tensor] = {
-            idx: h[0, score_start:score_end].float()
-            for idx, h in hidden_per_layer.items()
-        }
-
-        # Aggregate pool: last non-special position inside the scoring range.
+        # Aggregate pool: last non-special generated token.
         special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-        ids_1d = full_ids[0]
-        content_end = score_end - 1
-        while content_end > score_start and int(ids_1d[content_end]) in special_ids:
-            content_end -= 1
-        agg_offset = content_end - score_start
+        agg_idx = n - 1
+        while agg_idx > 0 and int(generated_ids[agg_idx]) in special_ids:
+            agg_idx -= 1
         agg_hidden = {
-            idx: h[agg_offset] for idx, h in sliced.items()
-            if h.shape[0] > agg_offset
+            layer_idx: h[agg_idx] for layer_idx, h in captured.items()
+            if h.shape[0] > agg_idx
         }
-        self._score_probes(agg_hidden)
+        agg_vals = self._score_probes(agg_hidden, accumulate=accumulate)
 
-        # _score_probes already built the caches for this device.
+        h_unit_cache: dict[int, torch.Tensor] = {}
         per_token: dict[str, list[float]] = {}
         for name in self._raw_profiles:
             total_w = 0.0
             weighted: torch.Tensor | None = None
             v_unit_layers = self._v_unit_cache.get(name, {})
             for layer_idx, (_vec, score) in self._raw_profiles[name].items():
-                h = sliced.get(layer_idx)
-                if h is None or h.shape[0] != n_resp:
+                h = captured.get(layer_idx)
+                if h is None or h.shape[0] != n:
                     continue
                 v_unit = v_unit_layers.get(layer_idx)
                 if v_unit is None:
                     continue
-                mean = self._mean_cache.get(layer_idx)
-                if mean is not None:
-                    h = h - mean
-                hn = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                h_unit = h / hn
-                cos = h_unit @ v_unit  # (n_resp,)
+                h_unit = h_unit_cache.get(layer_idx)
+                if h_unit is None:
+                    h_unit = self._normalize_hidden_2d(layer_idx, h.float())
+                    h_unit_cache[layer_idx] = h_unit
                 total_w += score
-                weighted = score * cos if weighted is None else weighted + score * cos
+                term = score * (h_unit @ v_unit)
+                weighted = term if weighted is None else weighted + term
             total_w = max(total_w, 1e-8)
             if weighted is None:
-                per_token[name] = [0.0] * n_resp
+                per_token[name] = [0.0] * n
             else:
                 per_token[name] = (weighted / total_w).cpu().tolist()
 
-        return per_token
+        self._pending_per_token = True
+        return agg_vals, per_token
 
     def has_pending_data(self) -> bool:
-        return self._pending
+        """True iff an aggregate measurement is waiting to be consumed."""
+        return self._pending_aggregate
+
+    def has_pending_per_token(self) -> bool:
+        return self._pending_per_token
 
     def consume_pending(self) -> None:
-        """Mark pending data as consumed (called by TUI after reading)."""
-        self._pending = False
+        """Mark aggregate pending data as consumed (called by TUI after reading)."""
+        self._pending_aggregate = False
+
+    def consume_pending_per_token(self) -> None:
+        self._pending_per_token = False
 
     def get_current_and_previous(self) -> tuple[dict[str, float], dict[str, float]]:
         current = {}
@@ -293,4 +326,5 @@ class TraitMonitor:
         for name in self._raw_profiles:
             self.history[name].clear()
             self._stats[name] = self._empty_stats()
-        self._pending = False
+        self._pending_aggregate = False
+        self._pending_per_token = False
