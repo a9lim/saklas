@@ -209,7 +209,7 @@ def test_install_hf_with_revision_pins_source(monkeypatch, tmp_path):
 
 def test_refresh_pinned_hf_source_passes_revision(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    folder = _mk(tmp_path, "user", "happy", source="hf://user/happy@v1.2.0")
+    _mk(tmp_path, "user", "happy", source="hf://user/happy@v1.2.0")
     called = {}
 
     def fake_pull(coord, target_folder, *, force, revision=None):
