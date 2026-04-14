@@ -12,7 +12,7 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 _KNOWN_KEYS = {
-    "model", "vectors", "orthogonalize", "thinking",
+    "model", "vectors", "thinking",
     "temperature", "top_p", "max_tokens", "system_prompt",
 }
 
@@ -25,7 +25,6 @@ class ConfigFileError(ValueError):
 class ConfigFile:
     model: Optional[str] = None
     vectors: dict[str, float] = field(default_factory=dict)
-    orthogonalize: Optional[bool] = None
     thinking: Optional[bool] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -61,7 +60,6 @@ class ConfigFile:
         return cls(
             model=data.get("model"),
             vectors=vectors,
-            orthogonalize=data.get("orthogonalize"),
             thinking=data.get("thinking"),
             temperature=data.get("temperature"),
             top_p=data.get("top_p"),
@@ -74,7 +72,7 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
     """Combine multiple config files; later entries override earlier ones."""
     out = ConfigFile()
     for c in configs:
-        for f in ("model", "orthogonalize", "thinking", "temperature",
+        for f in ("model", "thinking", "temperature",
                   "top_p", "max_tokens", "system_prompt"):
             v = getattr(c, f)
             if v is not None:

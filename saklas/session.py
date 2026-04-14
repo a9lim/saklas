@@ -13,7 +13,7 @@ import torch
 
 from saklas.datasource import DataSource
 from saklas.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
-from saklas.hooks import SteeringManager
+from saklas.hooks import HiddenCapture, SteeringManager
 from saklas.model import load_model, get_layers, get_model_info
 from saklas.monitor import TraitMonitor
 from saklas.packs import PackFormatError, PackMetadata, hash_file
@@ -124,11 +124,17 @@ class SaklasSession:
         # Transient steering manager — used only during generation
         self._steering = SteeringManager()
 
+        # Transient per-token hidden-state capture — attached around
+        # generate_steered when probes are active so scoring happens
+        # without a second forward pass.
+        self._capture = HiddenCapture()
+
         self._gen_lock = threading.Lock()
         self._gen_state = GenerationState()
 
         self._history: list[dict[str, str]] = []
         self._last_result: GenerationResult | None = None
+        self._last_per_token_scores: dict[str, list[float]] | None = None
 
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
@@ -532,21 +538,50 @@ class SaklasSession:
         """Remove a steering vector from the registry."""
         self._profiles.pop(name, None)
 
-    def _apply_steering(self, alphas: dict[str, float], orthogonalize: bool = False) -> None:
+    def _apply_steering(self, alphas: dict[str, float]) -> None:
         """Compose and attach steering hooks for a generation call."""
         self._steering.clear_all()
         for name, alpha in alphas.items():
             if name not in self._profiles:
                 raise KeyError(f"No vector registered for '{name}'")
             self._steering.add_vector(name, self._profiles[name], alpha)
-        self._steering.apply_to_model(
-            self._layers, self._device, self._dtype,
-            orthogonalize=orthogonalize,
-        )
+        self._steering.apply_to_model(self._layers, self._device, self._dtype)
 
     def _clear_steering(self) -> None:
         """Remove all steering hooks from the model."""
         self._steering.clear_all()
+
+    def _begin_capture(self) -> bool:
+        """Attach hidden-state capture on probe layers. Returns True if attached."""
+        if not self._monitor.probe_names:
+            return False
+        layer_idxs = sorted({
+            idx for prof in self._monitor.profiles.values() for idx in prof
+        })
+        if not layer_idxs:
+            return False
+        self._capture.clear()
+        self._capture.attach(self._layers, layer_idxs)
+        return True
+
+    def _end_capture(self) -> None:
+        self._capture.detach()
+
+    def score_captured(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+        """Score probes from the last hidden-state capture.
+
+        Returns ``(aggregate_vals, per_token_scores)``. Both dicts are empty
+        when the capture was never attached or the generation produced no
+        tokens.
+        """
+        captured = self._capture.stacked()
+        if not captured or not generated_ids:
+            return {}, {}
+        return self._monitor.score_per_token(
+            captured, generated_ids, self._tokenizer, accumulate=accumulate,
+        )
 
     def _promote_profile(self, profile: dict[int, tuple[torch.Tensor, float]]) -> dict[int, tuple[torch.Tensor, float]]:
         return {idx: (vec.to(self._device, self._dtype), score)
@@ -639,28 +674,23 @@ class SaklasSession:
         response_ids = generated_ids[self._gen_state.thinking_end_idx:]
         text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
-        if self._monitor.probe_names and text.strip():
+        if self._monitor.probe_names and generated_ids:
+            agg_vals, per_token = self.score_captured(
+                generated_ids, accumulate=not stateless,
+            )
+            self._last_per_token_scores = per_token or None
             if stateless:
-                # Snapshot monitor state; we want this request's probe
-                # readings but must not mutate accumulated session history.
-                _hist_snap = {k: list(v) for k, v in self._monitor.history.items()}
-                _stats_snap = {k: dict(v) for k, v in self._monitor._stats.items()}
-                self._monitor.measure(
-                    self._model, self._tokenizer, self._layers, text,
-                    device=self._device,
-                )
-                readings = self.build_readings()
-                for k, v in _hist_snap.items():
-                    self._monitor.history[k].clear()
-                    self._monitor.history[k].extend(v)
-                self._monitor._stats = _stats_snap
+                readings = {
+                    name: ProbeReadings(
+                        per_generation=[v], mean=v, std=0.0,
+                        min=v, max=v, delta_per_gen=0.0,
+                    )
+                    for name, v in agg_vals.items()
+                }
             else:
-                self._monitor.measure(
-                    self._model, self._tokenizer, self._layers, text,
-                    device=self._device,
-                )
                 readings = self.build_readings()
         else:
+            self._last_per_token_scores = None
             readings = self.build_readings()
 
         result = GenerationResult(
@@ -681,13 +711,13 @@ class SaklasSession:
 
         return result
 
-    def _generation_preamble(self, input, alphas, orthogonalize, raw, thinking, stateless=False):
+    def _generation_preamble(self, input, alphas, raw, thinking, stateless=False):
         use_thinking = thinking and supports_thinking(self._tokenizer)
         input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking, stateless=stateless)
         self._gen_state.reset()
         vector_snapshot = dict(alphas) if alphas else {}
         if alphas:
-            self._apply_steering(alphas, orthogonalize=orthogonalize)
+            self._apply_steering(alphas)
         return input_ids, use_thinking, vector_snapshot, int(input_ids.shape[1])
 
     # -- Generation: blocking --
@@ -696,7 +726,6 @@ class SaklasSession:
         self,
         input,
         alphas: dict[str, float] | None = None,
-        orthogonalize: bool = False,
         raw: bool = False,
         thinking: bool = False,
         stateless: bool = False,
@@ -713,7 +742,6 @@ class SaklasSession:
             input: prompt string or list of message dicts.
             alphas: steering vector alphas to apply. Keys must match
                     registered vector names. None = no steering.
-            orthogonalize: Gram-Schmidt orthogonalize vectors before applying.
             raw: skip chat template, tokenize input string directly.
             thinking: enable thinking/reasoning mode for models that support it.
             stateless: do not mutate session history (conversation + probe
@@ -730,18 +758,18 @@ class SaklasSession:
             raise ConcurrentGenerationError("Generation already in progress")
         try:
             return self._generate_blocking(
-                input, alphas, orthogonalize, raw, thinking, stateless,
+                input, alphas, raw, thinking, stateless,
                 seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
             )
         finally:
             self._gen_lock.release()
 
     def _generate_blocking(
-        self, input, alphas, orthogonalize, raw, thinking, stateless,
+        self, input, alphas, raw, thinking, stateless,
         seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
     ) -> GenerationResult:
         input_ids, use_thinking, vector_snapshot, prompt_tokens = self._generation_preamble(
-            input, alphas, orthogonalize, raw, thinking, stateless,
+            input, alphas, raw, thinking, stateless,
         )
 
         logprobs_list: list | None = [] if logprobs is not None else None
@@ -750,6 +778,7 @@ class SaklasSession:
             if logprobs_list is not None and tid >= 0 and not is_thinking:
                 logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
 
+        self._begin_capture()
         try:
             start = time.monotonic()
             generated_ids = generate_steered(
@@ -763,6 +792,7 @@ class SaklasSession:
             )
             elapsed = time.monotonic() - start
         finally:
+            self._end_capture()
             if alphas:
                 self._clear_steering()
 
@@ -778,7 +808,6 @@ class SaklasSession:
         self,
         input,
         alphas: dict[str, float] | None = None,
-        orthogonalize: bool = False,
         raw: bool = False,
         thinking: bool = False,
         stateless: bool = False,
@@ -794,18 +823,18 @@ class SaklasSession:
             raise ConcurrentGenerationError("Generation already in progress")
         try:
             yield from self._generate_streaming(
-                input, alphas, orthogonalize, raw, thinking, stateless,
+                input, alphas, raw, thinking, stateless,
                 seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
             )
         finally:
             self._gen_lock.release()
 
     def _generate_streaming(
-        self, input, alphas, orthogonalize, raw, thinking, stateless,
+        self, input, alphas, raw, thinking, stateless,
         seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
     ) -> Iterator[TokenEvent]:
         input_ids, use_thinking, vector_snapshot, prompt_tokens = self._generation_preamble(
-            input, alphas, orthogonalize, raw, thinking, stateless,
+            input, alphas, raw, thinking, stateless,
         )
 
         generated_ids: list[int] = []
@@ -813,6 +842,8 @@ class SaklasSession:
         gen_error: list[Exception] = []
         logprobs_list: list | None = [] if logprobs is not None else None
         start = time.monotonic()
+
+        self._begin_capture()
 
         def _worker():
             try:
@@ -858,6 +889,7 @@ class SaklasSession:
 
             thread.join()
         finally:
+            self._end_capture()
             if alphas:
                 self._clear_steering()
 

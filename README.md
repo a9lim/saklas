@@ -82,7 +82,7 @@ Saklas uses **Representation Engineering** (Zou et al., 2023): for each contrast
 
 Alpha is **normalized per-profile** so the same numeric value means the same intensity across backbones: α≈0.5 sits in the coherent-nuanced band on every bundled architecture, α≈1.0 is past the collapse cliff. Vectors are registered without alphas and applied per-call, so nothing persists on the model between generations.
 
-Multiple vectors **compose** naturally — they register into a single manager that, per generation, Gram-Schmidt-orthogonalizes any co-layer directions (optional) and installs a single in-place hidden-state hook per active layer. Hooks are transient: composed before generation, removed after.
+Multiple vectors **compose** naturally — they register into a single manager that, per generation, installs a single in-place hidden-state hook per active layer (co-layer directions sum). Hooks are transient: composed before generation, removed after.
 
 ### Custom concepts
 
@@ -172,7 +172,6 @@ System prompt, temperature, top-p, and max tokens are set interactively via slas
 | `Up` / `Down` | Navigate vectors / probes |
 | `Enter` | Toggle vector on/off |
 | `Backspace` / `Delete` | Remove selected vector or probe |
-| `Ctrl+O` | Toggle orthogonalization |
 | `Ctrl+T` | Toggle thinking mode (for models that support it) |
 | `Ctrl+A` | A/B compare (steered vs unsteered) |
 | `Ctrl+R` | Regenerate last response |
@@ -240,7 +239,7 @@ Runnable examples in [`examples/`](examples/):
 
 **Registration is state, alphas are per-call.** `session.steer("name", profile)` stores the vector in the registry. `session.generate(input, alphas={"name": 0.5})` applies it for that generation only. No persistent hooks live on the model between calls.
 
-**Composition is native.** Pass multiple names in `alphas={}`. Orthogonalization (Gram-Schmidt across co-layer directions) is a per-call `orthogonalize=True` flag.
+**Composition is native.** Pass multiple names in `alphas={}`; co-layer directions sum into a single in-place hook per layer.
 
 **Thinking mode is per-call.** For models that support it (Qwen 3.5, QwQ, Gemma 4, gpt-oss, etc.), `session.generate(input, thinking=True)` enables the reasoning trace. Delimiters are detected automatically from the chat template — no hardcoded tokens. `result.text` contains only the final answer; streaming yields `TokenEvent` objects with `thinking=True` for the reasoning trace.
 
@@ -292,7 +291,6 @@ session.vectors                                            # dict of registered 
 result = session.generate(
     "prompt",
     alphas={"name": 0.5},
-    orthogonalize=False,
     thinking=False,
     seed=None,
     stop=None,
@@ -389,7 +387,6 @@ resp = client.chat.completions.create(
     extra_body={
         "steer": {
             "alphas": {"cheerful": 0.4},
-            "orthogonalize": True,
             "thinking": True,
         }
     },

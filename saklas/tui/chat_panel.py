@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from rich.markup import escape as _rich_escape
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
@@ -10,6 +12,7 @@ from textual.widget import Widget
 from textual.message import Message
 
 _HIGHLIGHT_SAT = 0.5
+_HIGHLIGHT_CACHE_MAX = 4
 
 
 def _build_highlight_markup(token_strs: list[str], scores: list[float]) -> str:
@@ -52,8 +55,10 @@ class _AssistantMessage(Vertical):
 
         self.response_token_strs: list[str] = []
         self.thinking_token_strs: list[str] = []
-        self._response_markup_cache: dict[str, str] = {}
-        self._thinking_markup_cache: dict[str, str] = {}
+        self._response_markup_cache: OrderedDict[str, str] = OrderedDict()
+        self._thinking_markup_cache: OrderedDict[str, str] = OrderedDict()
+        self._response_probe_scores: dict[str, list[float]] = {}
+        self._thinking_probe_scores: dict[str, list[float]] = {}
 
         self._highlight_on: bool = False
         self._highlight_probe: str | None = None
@@ -100,21 +105,51 @@ class _AssistantMessage(Vertical):
     ) -> None:
         self.response_token_strs = list(response_token_strs)
         self.thinking_token_strs = list(thinking_token_strs)
-
         resp_n = len(self.response_token_strs)
         think_n = len(self.thinking_token_strs)
-        self._response_markup_cache = {
-            name: _build_highlight_markup(self.response_token_strs, scores)
-            for name, scores in response_probe_scores.items()
-            if len(scores) == resp_n
+        self._response_probe_scores = {
+            n: s for n, s in response_probe_scores.items() if len(s) == resp_n
         }
-        self._thinking_markup_cache = {
-            name: _build_highlight_markup(self.thinking_token_strs, scores)
-            for name, scores in thinking_probe_scores.items()
-            if len(scores) == think_n
+        self._thinking_probe_scores = {
+            n: s for n, s in thinking_probe_scores.items() if len(s) == think_n
         }
+        self._response_markup_cache.clear()
+        self._thinking_markup_cache.clear()
+        # Warm the cache with the currently-selected probe so the next render
+        # is a straight lookup. Other probes build lazily on first use.
+        if self._highlight_on and self._highlight_probe:
+            self._get_response_markup(self._highlight_probe)
+            self._get_thinking_markup(self._highlight_probe)
         self._render_response()
         self._render_thinking()
+
+    def _get_response_markup(self, probe: str) -> str | None:
+        cached = self._response_markup_cache.get(probe)
+        if cached is not None:
+            self._response_markup_cache.move_to_end(probe)
+            return cached
+        scores = self._response_probe_scores.get(probe)
+        if scores is None:
+            return None
+        markup = _build_highlight_markup(self.response_token_strs, scores)
+        self._response_markup_cache[probe] = markup
+        if len(self._response_markup_cache) > _HIGHLIGHT_CACHE_MAX:
+            self._response_markup_cache.popitem(last=False)
+        return markup
+
+    def _get_thinking_markup(self, probe: str) -> str | None:
+        cached = self._thinking_markup_cache.get(probe)
+        if cached is not None:
+            self._thinking_markup_cache.move_to_end(probe)
+            return cached
+        scores = self._thinking_probe_scores.get(probe)
+        if scores is None:
+            return None
+        markup = _build_highlight_markup(self.thinking_token_strs, scores)
+        self._thinking_markup_cache[probe] = markup
+        if len(self._thinking_markup_cache) > _HIGHLIGHT_CACHE_MAX:
+            self._thinking_markup_cache.popitem(last=False)
+        return markup
 
     def apply_highlight(self, on: bool, probe_name: str | None) -> None:
         self._highlight_on = on
@@ -129,7 +164,7 @@ class _AssistantMessage(Vertical):
             return
         markup = None
         if self._highlight_on and self._highlight_probe:
-            markup = self._response_markup_cache.get(self._highlight_probe)
+            markup = self._get_response_markup(self._highlight_probe)
         self._response_view.update(markup if markup is not None else self._escaped_chat_text)
 
     def _render_thinking(self) -> None:
@@ -137,7 +172,7 @@ class _AssistantMessage(Vertical):
             return
         markup = None
         if self._highlight_on and self._highlight_probe:
-            markup = self._thinking_markup_cache.get(self._highlight_probe)
+            markup = self._get_thinking_markup(self._highlight_probe)
         self._thinking_view.update(markup if markup is not None else self._escaped_thinking_text)
 
 

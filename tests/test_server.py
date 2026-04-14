@@ -127,12 +127,12 @@ class TestChatCompletions:
         )
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "test"}],
-            "steer": {"alphas": {"vec1": 0.3}, "orthogonalize": True},
+            "steer": {"alphas": {"vec1": 0.3}},
         })
         assert resp.status_code == 200
         call_kwargs = session.generate.call_args[1]
         assert call_kwargs["alphas"] == {"vec1": 0.3}
-        assert call_kwargs["orthogonalize"] is True
+        assert "orthogonalize" not in call_kwargs
 
     def test_streaming(self, session_and_client):
         session, client = session_and_client
