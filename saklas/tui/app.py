@@ -796,7 +796,8 @@ class SaklasApp(App):
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            import sys, traceback
+            import sys
+            import traceback
             traceback.print_exc(file=sys.stderr)
             self._gen_active = False
             self._pending_action = None
