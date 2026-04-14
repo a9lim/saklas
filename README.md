@@ -16,7 +16,7 @@ Three ways to use it:
 - **`saklas serve <model>`** — an HTTP server that speaks **both** the OpenAI `/v1/*` and Ollama `/api/*` wire formats on the same port (drop-in for any client that talks either)
 - **`SaklasSession`** — a Python API for scripted experiments, batch sweeps, and embedding steering into your own pipelines
 
-Works on **54 model architectures** out of the box, including Llama 1–4, Gemma 1–4, Qwen 1–3.5, Mistral/Mixtral, Phi, DeepSeek, Cohere, OLMo, GLM, gpt-oss, and many more.
+Tested on **Qwen, Gemma, Ministral, gpt-oss, and Llama**. Many other architectures are wired up in `model.py:_LAYER_ACCESSORS` (Mistral/Mixtral, Phi, DeepSeek, Cohere, OLMo, GLM, and more) but are untested — they may work, may need a tweak, or may explode. Reports welcome.
 
 ---
 
@@ -429,9 +429,11 @@ All of the above is also available programmatically via `saklas.cache_ops`.
 
 ## Supported architectures
 
-54 entries in `model.py:_LAYER_ACCESSORS`. Adding a new one = one function entry. See [CONTRIBUTING.md](CONTRIBUTING.md).
+**Tested and known working**: Qwen, Gemma, Ministral, gpt-oss, Llama.
 
-Llama 1–4 · Mistral · Ministral · Mixtral · Gemma 1–4 + Recurrent · Phi 1–3 · PhiMoE · Qwen 1–3.5 · Qwen-MoE · Cohere 1–2 · DeepSeek V2–V3 · StarCoder2 · OLMo 1–3 · OLMoE · GLM 3–4 · Granite · GraniteMoE · Nemotron · StableLM · GPT-2 / Neo / J / BigCode / NeoX / OSS · Bloom · Falcon · Falcon-H1 · MPT · DBRX · OPT
+**Wired up but untested** (entries exist in `model.py:_LAYER_ACCESSORS` — they should load, but I haven't verified extraction quality, steering efficacy, or probe behavior): Llama 1–3, Mistral, Mixtral, Gemma 1–3 + Recurrent, Phi 1–3, PhiMoE, Qwen 1–3 + MoE, Cohere 1–2, DeepSeek V2–V3, StarCoder2, OLMo 1–3 + OLMoE, GLM 3–4, Granite + GraniteMoE, Nemotron, StableLM, GPT-2 / Neo / J / BigCode / NeoX, Bloom, Falcon / Falcon-H1, MPT, DBRX, OPT.
+
+Adding a new architecture is one function entry. See [CONTRIBUTING.md](CONTRIBUTING.md). If you try saklas on something in the untested list and it works (or doesn't), please open an issue.
 
 ---
 
