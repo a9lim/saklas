@@ -605,8 +605,8 @@ def register_ollama_routes(app: FastAPI) -> None:
                 start_ns = time.monotonic_ns()
                 try:
                     result = session.generate(input_payload, raw=raw, **gen_kwargs)
-                except ConcurrentGenerationError as e:
-                    raise HTTPException(status_code=409, detail=str(e))
+                except ConcurrentGenerationError:
+                    raise HTTPException(status_code=409, detail="Generation already in progress")
                 elapsed_ns = time.monotonic_ns() - start_ns
 
         model_name = str(body.get("model") or session.model_id)
@@ -712,10 +712,10 @@ def register_ollama_routes(app: FastAPI) -> None:
                                     "done": False,
                                 }
                         yield json.dumps(chunk) + "\n"
-                except ConcurrentGenerationError as e:
+                except ConcurrentGenerationError:
                     yield json.dumps({
                         "model": model_name, "created_at": _now_iso(),
-                        "error": str(e),
+                        "error": "Generation already in progress",
                     }) + "\n"
                     return
 

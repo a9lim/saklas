@@ -347,8 +347,8 @@ async def _stream_generation(
                         "choices": [{"index": 0, **format_delta(event), "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
-            except ConcurrentGenerationError as e:
-                err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
+            except ConcurrentGenerationError:
+                err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
                 yield f"data: {json.dumps(err)}\n\n"
                 return
 
@@ -515,8 +515,8 @@ def _register_routes(app: FastAPI) -> None:
             )
         try:
             result = await _run_blocking(req, messages, raw=False)
-        except ConcurrentGenerationError as e:
-            return _error(409, str(e), "conflict")
+        except ConcurrentGenerationError:
+            return _error(409, "Generation already in progress", "conflict")
 
         return {
             "id": rid,
@@ -559,8 +559,8 @@ def _register_routes(app: FastAPI) -> None:
             )
         try:
             result = await _run_blocking(req, req.prompt, raw=True)
-        except ConcurrentGenerationError as e:
-            return _error(409, str(e), "conflict")
+        except ConcurrentGenerationError:
+            return _error(409, "Generation already in progress", "conflict")
 
         return {
             "id": rid,
@@ -619,8 +619,8 @@ def _register_routes(app: FastAPI) -> None:
         try:
             canonical, profile = session.extract(source, baseline=req.baseline,
                                                  on_progress=lambda m: progress_msgs.append(m))
-        except ConcurrentGenerationError as e:
-            return _error(409, str(e), "conflict")
+        except ConcurrentGenerationError:
+            return _error(409, "Generation already in progress", "conflict")
 
         if req.auto_register:
             session.steer(req.name, profile)
@@ -652,8 +652,8 @@ def _register_routes(app: FastAPI) -> None:
             progress_msgs.append(msg)
         try:
             canonical, profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
-        except ConcurrentGenerationError as e:
-            err = {"error": {"message": str(e), "type": "conflict", "code": 409}}
+        except ConcurrentGenerationError:
+            err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
             yield f"event: error\ndata: {json.dumps(err)}\n\n"
             return
 
