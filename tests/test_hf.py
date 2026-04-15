@@ -241,6 +241,7 @@ def test_fetch_info_reads_pack_json(tmp_path, monkeypatch):
     pj.write_text(json.dumps({
         "name": "happy",
         "description": "x",
+        "format_version": 2,
         "version": "1.0.0",
         "license": "MIT",
         "tags": ["emotion"],

@@ -17,6 +17,7 @@ def test_pack_metadata_parse_minimal(tmp_path):
     folder = _write_pack(tmp_path, {
         "name": "happy",
         "description": "Upbeat.",
+        "format_version": 2,
         "version": "1.0.0",
         "license": "MIT",
         "tags": ["emotion"],
@@ -42,7 +43,7 @@ def test_pack_metadata_missing_required_field_errors(tmp_path):
 def test_pack_metadata_invalid_name_rejected(tmp_path):
     folder = _write_pack(tmp_path, {
         "name": "Has_Caps",
-        "description": "x", "version": "1", "license": "x",
+        "description": "x", "format_version": 2, "version": "1", "license": "x",
         "tags": [], "recommended_alpha": 0.5,
         "source": "local", "files": {},
     })
@@ -55,6 +56,7 @@ def test_pack_metadata_long_description_optional(tmp_path):
         "name": "happy",
         "description": "short",
         "long_description": "longer form",
+        "format_version": 2,
         "version": "1.0.0", "license": "MIT",
         "tags": [], "recommended_alpha": 0.5,
         "source": "bundled", "files": {},

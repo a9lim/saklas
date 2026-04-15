@@ -26,6 +26,11 @@ _REQUIRED_PACK_FIELDS = (
     "tags", "recommended_alpha", "source", "files",
 )
 
+# Current on-disk pack format version. Readers refuse anything lower; the
+# number bumps any time the sidecar/pack.json shape changes in a way that
+# old readers cannot safely ignore. See scripts/upgrade_packs.py.
+PACK_FORMAT_VERSION = 2
+
 
 class PackFormatError(ValueError, SaklasError):
     """Raised when a pack folder or pack.json is malformed."""
@@ -42,6 +47,7 @@ class PackMetadata:
     source: str
     files: dict[str, str]
     long_description: str = ""
+    format_version: int = PACK_FORMAT_VERSION
 
     @classmethod
     def load(cls, folder: Path) -> "PackMetadata":
@@ -57,6 +63,14 @@ class PackMetadata:
         for k in _REQUIRED_PACK_FIELDS:
             if k not in data:
                 raise PackFormatError(f"pack.json missing required field '{k}' in {folder}")
+
+        fmt_ver = data.get("format_version", 1)
+        if not isinstance(fmt_ver, int) or fmt_ver < PACK_FORMAT_VERSION:
+            raise PackFormatError(
+                f"pack at {folder} has format_version={fmt_ver!r}, "
+                f"need >= {PACK_FORMAT_VERSION}. "
+                f"Run: python scripts/upgrade_packs.py {folder}"
+            )
 
         name = data["name"]
         if not isinstance(name, str) or not NAME_REGEX.match(name):
@@ -74,12 +88,14 @@ class PackMetadata:
             recommended_alpha=float(data["recommended_alpha"]),
             source=data["source"],
             files=dict(data["files"]),
+            format_version=fmt_ver,
         )
 
     def to_dict(self) -> dict:
         out: dict = {
             "name": self.name,
             "description": self.description,
+            "format_version": self.format_version,
         }
         if self.long_description:
             out["long_description"] = self.long_description

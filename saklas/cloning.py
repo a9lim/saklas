@@ -208,7 +208,7 @@ def clone_from_corpus(
     seed: int | None = None,
     batch_size: int = _BATCH_SIZE,
     force: bool = False,
-) -> tuple[str, dict[int, torch.Tensor]]:
+) -> tuple[str, "Profile"]:
     """Extract a monopolar steering vector from a persona corpus file.
 
     Pipeline: load + filter corpus, sample n_pairs lines, batch them,
@@ -259,7 +259,8 @@ def clone_from_corpus(
                 profile, _m = _load_profile(str(cache_path))
                 profile = session._promote_profile(profile)
                 _log.info("cloned %s (cache hit) -> %s", canonical, folder)
-                return canonical, profile
+                from saklas.profile import Profile
+                return canonical, Profile(profile, metadata=_m)
         except (PackFormatError, FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
             pass
 

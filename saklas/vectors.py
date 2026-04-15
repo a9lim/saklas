@@ -378,7 +378,9 @@ def save_profile(
     save_file(tensors, str(path))
 
     from saklas import __version__ as _saklas_version
+    from saklas.packs import PACK_FORMAT_VERSION
     sidecar: dict = {
+        "format_version": PACK_FORMAT_VERSION,
         "method": metadata.get("method", "contrastive_pca"),
         "saklas_version": _saklas_version,
     }
@@ -414,6 +416,17 @@ def load_profile(path: str) -> tuple[dict[int, torch.Tensor], dict]:
     meta_path = path.with_suffix(".json")
     with open(meta_path) as f:
         metadata = json.load(f)
+
+    from saklas.packs import PACK_FORMAT_VERSION
+    from saklas.profile import ProfileError
+    fmt_ver = metadata.get("format_version", 1)
+    if not isinstance(fmt_ver, int) or fmt_ver < PACK_FORMAT_VERSION:
+        raise ProfileError(
+            f"pack format is from saklas < 2.0 "
+            f"(sidecar {meta_path} format_version={fmt_ver!r}, "
+            f"need >= {PACK_FORMAT_VERSION}); "
+            f"run `python scripts/upgrade_packs.py {path.parent}` to migrate"
+        )
 
     profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}
     return profile, metadata

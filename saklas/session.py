@@ -21,6 +21,7 @@ from saklas.monitor import TraitMonitor
 from saklas.packs import PackFormatError, PackMetadata, hash_file, hash_folder_files
 from saklas.paths import concept_dir, safe_model_id
 from saklas.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
+from saklas.profile import Profile
 from saklas.results import GenerationResult, TokenEvent, ProbeReadings
 from saklas.vectors import (
     extract_contrastive,
@@ -507,7 +508,7 @@ class SaklasSession:
         source,
         baseline: str | None = None,
         on_progress: Callable[[str], None] | None = None,
-    ) -> tuple[str, dict[int, torch.Tensor]]:
+    ) -> tuple[str, Profile]:
         """Extract a steering vector profile.
 
         Full pipeline: cache check -> curated dataset -> statement cache ->
@@ -555,7 +556,7 @@ class SaklasSession:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{canonical}'.")
-                return canonical, profile
+                return canonical, Profile(profile, metadata=_meta)
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -566,7 +567,7 @@ class SaklasSession:
             )
             _save_profile(profile, cache_path, {"method": "contrastive_pca"})
             self._update_local_pack_files(folder)
-            return canonical, profile
+            return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
 
         # String source — full pipeline. Pack lookup scans all namespaces
         # (default/, hf-pulled, local/) via cli_selectors._all_concepts so
@@ -590,7 +591,7 @@ class SaklasSession:
             profile, _meta = _load_profile(cache_path)
             profile = self._promote_profile(profile)
             _progress(f"Loaded cached profile for '{canonical}'.")
-            return canonical, profile
+            return canonical, Profile(profile, metadata=_meta)
         except (FileNotFoundError, KeyError, ValueError):
             pass
 
@@ -609,7 +610,7 @@ class SaklasSession:
                     "statements_sha256": hash_file(curated_stmts),
                 })
                 self._update_local_pack_files(curated_folder)
-                return canonical, profile
+                return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
 
         # 3. Check statement cache under local/
         stmt_cache_path = self._statements_cache_path(canonical)
@@ -653,7 +654,7 @@ class SaklasSession:
             "statements_sha256": hash_file(pathlib.Path(stmt_cache_path)),
         })
         self._update_local_pack_files(local_folder)
-        return canonical, profile
+        return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
 
     def clone_from_corpus(
         self,
@@ -664,7 +665,7 @@ class SaklasSession:
         seed: int | None = None,
         batch_size: int = 5,
         force: bool = False,
-    ) -> tuple[str, dict[int, torch.Tensor]]:
+    ) -> tuple[str, Profile]:
         """Extract a persona-cloning steering vector from a corpus file.
 
         Thin wrapper around saklas.cloning.clone_from_corpus; see that
@@ -677,18 +678,39 @@ class SaklasSession:
             n_pairs=n_pairs, seed=seed, batch_size=batch_size, force=force,
         )
 
-    def load_profile(self, path: str) -> dict[int, torch.Tensor]:
-        profile, _meta = _load_profile(path)
-        return self._promote_profile(profile)
+    def load_profile(self, path: str) -> Profile:
+        profile, meta = _load_profile(path)
+        promoted = self._promote_profile(profile)
+        return Profile(promoted, metadata=meta)
 
-    def save_profile(self, profile: dict, path: str, metadata: dict | None = None) -> None:
+    def save_profile(
+        self,
+        profile: Profile | dict[int, torch.Tensor],
+        path: str,
+        metadata: dict | None = None,
+    ) -> None:
+        if isinstance(profile, Profile):
+            profile.save(path, metadata=metadata)
+            return
         _save_profile(profile, path, metadata or {})
 
     # -- Steering (vector registry) --
 
-    def steer(self, name: str, profile: dict[int, torch.Tensor]) -> None:
-        """Register a steering vector. Applied during generate() via alphas."""
-        self._profiles[name] = profile
+    def steer(
+        self,
+        name: str,
+        profile: Profile | dict[int, torch.Tensor],
+    ) -> None:
+        """Register a steering vector. Applied during generate() via alphas.
+
+        Accepts either a :class:`Profile` or the legacy ``dict[int, Tensor]``
+        shape. Internally stored as a plain dict so the steering hook's
+        hot path can read tensors without attribute lookups.
+        """
+        if isinstance(profile, Profile):
+            self._profiles[name] = dict(profile.as_dict())
+        else:
+            self._profiles[name] = profile
 
     def unsteer(self, name: str) -> None:
         """Remove a steering vector from the registry."""

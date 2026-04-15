@@ -261,10 +261,12 @@ def _install_synthesized_pack(
     # natively extracted tensors.
     if missing_sidecars:
         from saklas import __version__ as _saklas_version
+        from saklas.packs import PACK_FORMAT_VERSION
         import json
         for stem in missing_sidecars:
             sc_path = target_folder / f"{stem}.json"
             sc_path.write_text(json.dumps({
+                "format_version": PACK_FORMAT_VERSION,
                 "method": "imported",
                 "saklas_version": _saklas_version,
             }, indent=2))
