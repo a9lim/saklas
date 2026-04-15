@@ -245,6 +245,43 @@ def test_run_uninstall_with_yes(monkeypatch, tmp_path):
     assert not (tmp_path / "vectors" / "default" / "happy.sad").exists()
 
 
+def test_run_extract_cache_hit_prints_already_extracted(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas import packs
+    packs.materialize_bundled()
+
+    # Pre-create a baked tensor for happy.sad under the bundled pack.
+    from saklas.paths import vectors_dir, safe_model_id
+    model_id = "fake/model"
+    folder = vectors_dir() / "default" / "happy.sad"
+    tensor = folder / f"{safe_model_id(model_id)}.safetensors"
+    tensor.write_bytes(b"")
+
+    class FakeSession:
+        def __init__(self, **kw):
+            self.model_id = model_id
+            self.model_info = {"model_type": "fake", "num_layers": 1,
+                               "hidden_dim": 8, "vram_used_gb": 0.0}
+            self.probes = {}
+
+        def _local_concept_folder(self, canonical):
+            return vectors_dir() / "local" / canonical
+
+        def extract(self, *a, **kw):
+            raise AssertionError("extract() must not be called on cache hit")
+
+    monkeypatch.setattr(cli, "_make_session", lambda args: FakeSession())
+    monkeypatch.setattr(cli, "_print_model_info", lambda s: None)
+    monkeypatch.setattr(cli, "_print_startup", lambda args: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["extract", "happy.sad", "-m", model_id])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "already extracted at" in out
+    assert str(tensor) in out
+
+
 def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas import packs

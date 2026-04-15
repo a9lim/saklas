@@ -709,15 +709,24 @@ def _run_extract(args: argparse.Namespace) -> None:
 
     canonical = canonical_concept_name(raw, baseline)
 
-    # Best-effort cache-skip: remove a cached tensor so extract() regenerates.
+    import pathlib
+    from saklas.paths import safe_model_id
+    from saklas.cli_selectors import _all_concepts
+    candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
+    candidate_folders.append(session._local_concept_folder(canonical))
+    sid = safe_model_id(session.model_id)
+    candidate_paths = [
+        pathlib.Path(folder) / f"{sid}.safetensors" for folder in candidate_folders
+    ]
+    existing = next((p for p in candidate_paths if p.exists()), None)
+
+    if existing is not None and not args.force:
+        print(f"already extracted at {existing}")
+        sys.exit(0)
+
     if args.force:
-        import pathlib
-        from saklas.paths import safe_model_id
-        from saklas.cli_selectors import _all_concepts
-        candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
-        candidate_folders.append(session._local_concept_folder(canonical))
-        for folder in candidate_folders:
-            p = pathlib.Path(folder) / f"{safe_model_id(session.model_id)}.safetensors"
+        # Best-effort cache-skip: remove cached tensors so extract() regenerates.
+        for p in candidate_paths:
             if p.exists():
                 p.unlink()
 
@@ -729,7 +738,14 @@ def _run_extract(args: argparse.Namespace) -> None:
     except Exception as e:
         print(f"extract failed: {e}", file=sys.stderr)
         sys.exit(1)
-    print(f"Extracted {canonical}")
+
+    final_path = next((p for p in candidate_paths if p.exists()), None)
+    if final_path is None:
+        # Fall back to the local folder path that session.extract would use.
+        final_path = (
+            pathlib.Path(session._local_concept_folder(canonical)) / f"{sid}.safetensors"
+        )
+    print(f"extracted {canonical} -> {final_path}")
 
 
 _SUBCOMMAND_TABLE = {
