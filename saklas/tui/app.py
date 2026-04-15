@@ -448,7 +448,7 @@ class SaklasApp(App):
 
     def _handle_probe(self, text: str) -> None:
         def _on_success(name, profile, _alpha):
-            self._session.monitor(name, profile)
+            self._session.probe(name, profile)
             self.call_from_thread(self._on_probe_added, name)
         self._handle_extract(text, include_alpha=False, on_success=_on_success)
 
@@ -702,7 +702,7 @@ class SaklasApp(App):
         probe_name = tp.get_selected_probe()
         if not probe_name or not self._session._monitor:
             return
-        self._session.unmonitor(probe_name)
+        self._session.unprobe(probe_name)
         tp.set_active_probes(set(self._session._monitor.probe_names))
 
     def action_toggle_vector(self) -> None:

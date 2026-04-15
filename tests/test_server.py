@@ -253,7 +253,7 @@ class TestProbes:
         session, client = session_and_client
         resp = client.post("/v1/saklas/probes/test_probe", json={})
         assert resp.status_code == 200
-        session.monitor.assert_called_once_with("test_probe", None)
+        session.probe.assert_called_once_with("test_probe", None)
 
     def test_deactivate_not_found(self, session_and_client):
         session, client = session_and_client

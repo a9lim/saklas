@@ -78,9 +78,9 @@ class TestSteering:
 class TestMonitoring:
     def test_monitor_and_unmonitor(self, session):
         _, profile = session.extract([("I am honest", "I am deceptive")])
-        session.monitor("test_probe", profile)
+        session.probe("test_probe", profile)
         assert "test_probe" in session.probes
-        session.unmonitor("test_probe")
+        session.unprobe("test_probe")
         assert "test_probe" not in session.probes
 
 class TestLifecycle:

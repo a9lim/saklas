@@ -688,7 +688,7 @@ class SaklasSession:
 
     # -- Monitoring --
 
-    def monitor(self, name: str, profile: dict | None = None) -> None:
+    def probe(self, name: str, profile: dict | None = None) -> None:
         if profile is None:
             _, profile = self.extract(name)
         if not self._layer_means:
@@ -698,7 +698,7 @@ class SaklasSession:
             self._monitor.layer_means = self._layer_means
         self._monitor.add_probe(name, profile)
 
-    def unmonitor(self, name: str) -> None:
+    def unprobe(self, name: str) -> None:
         self._monitor.remove_probe(name)
 
     # -- History --

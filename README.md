@@ -252,9 +252,9 @@ for tok in session.generate_stream("prompt", alphas={"name": 0.5}):
     print(f"[think] {tok.text}" if tok.thinking else tok.text, end="", flush=True)
 
 # Monitor
-session.monitor("honest")
-session.monitor("custom", custom_profile)
-session.unmonitor("honest")
+session.probe("honest")
+session.probe("custom", custom_profile)
+session.unprobe("honest")
 
 # State
 session.config.temperature = 0.8    # also top_p, top_k, max_new_tokens, system_prompt

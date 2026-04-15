@@ -729,14 +729,14 @@ def _register_routes(app: FastAPI) -> None:
                 profile = session.load_profile(req.profile_path)
             except FileNotFoundError:
                 raise HTTPException(404, f"File not found: {req.profile_path}")
-        session.monitor(name, profile)
+        session.probe(name, profile)
         return {"name": name, "active": True}
 
     @app.delete("/v1/saklas/probes/{name}")
     def deactivate_probe(name: str):
         if name not in session.probes:
             raise HTTPException(404, f"Probe '{name}' not active")
-        session.unmonitor(name)
+        session.unprobe(name)
         return JSONResponse(status_code=204, content=None)
 
     # -----------------------------------------------------------------------
