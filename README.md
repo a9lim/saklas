@@ -268,7 +268,8 @@ session.probe("custom", custom_profile)
 session.unprobe("honest")
 
 # State
-session.config.temperature = 0.8    # also top_p, top_k, max_new_tokens, system_prompt
+from dataclasses import replace
+session.config = replace(session.config, temperature=0.8)   # config is frozen — rebind, don't mutate
 session.history                     # conversation messages
 session.last_result                 # most recent GenerationResult
 session.stop()                      # interrupt generation
