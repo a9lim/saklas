@@ -14,6 +14,15 @@ import torch
 
 from saklas.datasource import DataSource
 from saklas.errors import SaklasError
+from saklas.events import (
+    EventBus,
+    GenerationFinished,
+    GenerationStarted,
+    ProbeScored,
+    SteeringApplied,
+    SteeringCleared,
+    VectorExtracted,
+)
 from saklas.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
 from saklas.hooks import HiddenCapture, SteeringManager
 from saklas.model import load_model, get_layers, get_model_info
@@ -23,6 +32,8 @@ from saklas.paths import concept_dir, safe_model_id
 from saklas.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
 from saklas.profile import Profile
 from saklas.results import GenerationResult, TokenEvent, ProbeReadings
+from saklas.sampling import SamplingConfig
+from saklas.steering import Steering
 from saklas.vectors import (
     extract_contrastive,
     save_profile as _save_profile,
@@ -160,6 +171,33 @@ class VectorNotRegisteredError(KeyError, SaklasError):
     pass
 
 
+class _SteeringContext:
+    """Context manager returned by SaklasSession.steering().
+
+    Pushes an alphas dict onto ``session._steering_stack`` on ``__enter__``
+    and pops it on ``__exit__``.  Rebuilds hooks from the flattened stack
+    head so nested scopes compose: inner entries overwrite outer entries
+    for the duration of the inner scope, then the outer entry is restored.
+    """
+
+    __slots__ = ("_session", "_alphas", "_entered")
+
+    def __init__(self, session: "SaklasSession", alphas: dict[str, float]) -> None:
+        self._session = session
+        self._alphas = alphas
+        self._entered = False
+
+    def __enter__(self) -> "_SteeringContext":
+        self._session._push_steering(self._alphas)
+        self._entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._entered:
+            self._session._pop_steering()
+            self._entered = False
+
+
 class SaklasSession:
     """Unified backend for activation steering, monitoring, and generation.
 
@@ -230,6 +268,16 @@ class SaklasSession:
 
         # Transient steering manager — used only during generation
         self._steering = SteeringManager()
+        # LIFO stack of per-scope alpha dicts pushed by session.steering().
+        # The flattened head (later entries overwrite earlier ones) is what
+        # _apply_steering installs when a generation begins.
+        self._steering_stack: list[dict[str, float]] = []
+
+        # Synchronous event bus.  Emits on extraction, steering enter/exit,
+        # probe scoring, generation start/finish.  Subscribers run on the
+        # emit thread — async consumers must hop via call_soon_threadsafe
+        # inside their callback.
+        self.events: EventBus = EventBus()
 
         # Transient per-token hidden-state capture — attached around
         # generate_steered when probes are active so scoring happens
@@ -509,7 +557,28 @@ class SaklasSession:
         baseline: str | None = None,
         on_progress: Callable[[str], None] | None = None,
     ) -> tuple[str, Profile]:
-        """Extract a steering vector profile.
+        """Extract a steering vector profile and emit VectorExtracted.
+
+        Thin wrapper around :meth:`_extract_impl` that fires the event
+        bus after the profile is available.  Cache hits and fresh
+        extractions are both emitted — subscribers that only care about
+        freshly-computed profiles can gate on ``event.metadata["method"]``.
+        """
+        canonical, profile = self._extract_impl(source, baseline, on_progress)
+        try:
+            meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
+        except Exception:
+            meta = {}
+        self.events.emit(VectorExtracted(name=canonical, profile=profile, metadata=meta))
+        return canonical, profile
+
+    def _extract_impl(
+        self,
+        source,
+        baseline: str | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> tuple[str, Profile]:
+        """Actual extraction pipeline — see :meth:`extract` for the wrapper.
 
         Full pipeline: cache check -> curated dataset -> statement cache ->
         generate pairs -> extract contrastive -> save to cache.
@@ -716,6 +785,104 @@ class SaklasSession:
         """Remove a steering vector from the registry."""
         self._profiles.pop(name, None)
 
+    def steering(
+        self, alphas: "Steering | dict[str, float]",
+    ) -> "_SteeringContext":
+        """Context manager applying steering for the duration of a with-block.
+
+        Resolves pole aliases via ``cli_selectors.resolve_pole`` (the canonical
+        resolver site — CLI, server, and TUI all route through here).  Nesting
+        flattens: an inner ``steering({"angry.calm": 0.5})`` overrides the
+        outer ``{"angry.calm": 0.3}`` for the duration of the inner scope,
+        and the outer entry is restored on ``__exit__``.  One hook
+        installation per active layer regardless of nesting depth.
+
+        Unknown vector names raise ``VectorNotRegisteredError``; genuinely
+        ambiguous pole names propagate ``AmbiguousSelectorError``.
+        """
+        if isinstance(alphas, Steering):
+            raw_alphas = dict(alphas.alphas)
+        else:
+            raw_alphas = dict(alphas)
+        resolved = self._resolve_pole_aliases(raw_alphas)
+        return _SteeringContext(self, resolved)
+
+    def _resolve_pole_aliases(
+        self, alphas: dict[str, float],
+    ) -> dict[str, float]:
+        """Apply pole-alias resolution + sign flipping to an alphas dict.
+
+        Wrapped around ``cli_selectors.resolve_pole`` so CLI / server / TUI
+        all share the single resolver site.  Names already matching a
+        registered vector pass through unchanged — pre-resolved canonical
+        names are always honored verbatim.
+        """
+        from saklas.cli_selectors import resolve_pole
+
+        out: dict[str, float] = {}
+        for name, alpha in alphas.items():
+            if name in self._profiles:
+                out[name] = float(alpha)
+                continue
+            try:
+                canonical, sign, _match = resolve_pole(name)
+            except Exception:
+                # Let the caller see it at hook-install time via
+                # VectorNotRegisteredError for consistency with bare dict
+                # callers that never went through a context manager.
+                out[name] = float(alpha)
+                continue
+            effective = float(alpha) * (1 if sign >= 0 else -1)
+            if canonical in self._profiles:
+                out[canonical] = out.get(canonical, 0.0) + effective
+            else:
+                out[name] = float(alpha)
+        return out
+
+    def _push_steering(self, alphas: dict[str, float]) -> None:
+        """Push an alphas dict onto the steering stack and rebuild hooks."""
+        self._steering_stack.append(dict(alphas))
+        self._rebuild_steering_hooks()
+        self.events.emit(SteeringApplied(alphas=dict(self._flatten_steering_stack())))
+
+    def _pop_steering(self) -> None:
+        """Pop the top of the steering stack and rebuild hooks."""
+        if not self._steering_stack:
+            return
+        self._steering_stack.pop()
+        self._rebuild_steering_hooks()
+        if not self._steering_stack:
+            self.events.emit(SteeringCleared())
+        else:
+            self.events.emit(
+                SteeringApplied(alphas=dict(self._flatten_steering_stack())),
+            )
+
+    def _flatten_steering_stack(self) -> dict[str, float]:
+        """Collapse the LIFO stack into a single alphas dict (later wins)."""
+        flat: dict[str, float] = {}
+        for entry in self._steering_stack:
+            flat.update(entry)
+        return flat
+
+    def _rebuild_steering_hooks(self) -> None:
+        """Tear down existing hooks and install from the flattened stack head.
+
+        Called on every push/pop.  When the stack is empty this is a clean
+        ``clear_all``.  One hook installation per active layer regardless
+        of nesting depth — ``SteeringManager.apply_to_model`` composes
+        per-layer vectors internally.
+        """
+        flat = self._flatten_steering_stack()
+        self._steering.clear_all()
+        if not flat:
+            return
+        for name, alpha in flat.items():
+            if name not in self._profiles:
+                raise VectorNotRegisteredError(f"No vector registered for '{name}'")
+            self._steering.add_vector(name, self._profiles[name], alpha)
+        self._steering.apply_to_model(self._layers, self._device, self._dtype)
+
     def _apply_steering(self, alphas: dict[str, float]) -> None:
         """Compose and attach steering hooks for a generation call.
 
@@ -885,6 +1052,11 @@ class SaklasSession:
         )
         self._last_result = result
 
+        if readings:
+            self.events.emit(
+                ProbeScored(readings={name: r.mean for name, r in readings.items()}),
+            )
+
         if not stateless:
             if isinstance(input, str):
                 self._history.append({"role": "user", "content": input})
@@ -893,48 +1065,63 @@ class SaklasSession:
 
         return result
 
-    def _generation_preamble(self, input, alphas, raw, thinking, stateless=False):
+    def _generation_preamble(self, input, raw, thinking, stateless=False):
+        """Shared input prep + gen-state reset.
+
+        Steering is NOT installed here — the caller is expected to hold a
+        ``session.steering()`` scope open across the generation.
+        """
         use_thinking = thinking and supports_thinking(self._tokenizer)
         input_ids = self._prepare_input(input, raw=raw, thinking=use_thinking, stateless=stateless)
         self._gen_state.reset()
-        vector_snapshot = dict(alphas) if alphas else {}
-        if alphas:
-            self._apply_steering(alphas)
-        return input_ids, use_thinking, vector_snapshot, int(input_ids.shape[1])
+        return input_ids, use_thinking, int(input_ids.shape[1])
 
-    # -- Generation: blocking --
+    def _compose_gen_config(
+        self, sampling: SamplingConfig | None,
+    ) -> "GenerationConfig":
+        """Build a per-call GenerationConfig from session defaults + sampling.
 
-    def generate(
+        Does NOT mutate ``self.config`` — returns a new frozen instance the
+        generation worker holds for its lifetime.  ``None`` fields in
+        ``sampling`` fall through to the session default.
+        """
+        from dataclasses import replace as _replace
+
+        if sampling is None:
+            return self.config
+        overrides: dict = {}
+        if sampling.temperature is not None:
+            overrides["temperature"] = sampling.temperature
+        if sampling.top_p is not None:
+            overrides["top_p"] = sampling.top_p
+        if sampling.top_k is not None:
+            overrides["top_k"] = sampling.top_k
+        if sampling.max_tokens is not None:
+            overrides["max_new_tokens"] = sampling.max_tokens
+        if not overrides:
+            return self.config
+        return _replace(self.config, **overrides)
+
+    # -- Generation: core --
+
+    def _generate_core(
         self,
         input,
-        alphas: dict[str, float] | None = None,
-        raw: bool = False,
-        thinking: bool = False,
+        *,
+        steering: "Steering | dict[str, float] | None" = None,
+        sampling: SamplingConfig | None = None,
         stateless: bool = False,
-        seed: int | None = None,
-        stop: list[str] | None = None,
-        logit_bias: dict[int, float] | None = None,
-        presence_penalty: float = 0.0,
-        frequency_penalty: float = 0.0,
-        logprobs: int | None = None,
+        raw: bool = False,
+        thinking: bool | None = None,
+        on_token: Callable[..., None] | None = None,
     ) -> GenerationResult:
-        """Blocking generation.
+        """Shared generation implementation.
 
-        Args:
-            input: prompt string or list of message dicts.
-            alphas: steering vector alphas to apply. Keys must match
-                    registered vector names. None = no steering.
-            raw: skip chat template, tokenize input string directly.
-            thinking: enable thinking/reasoning mode for models that support it.
-            stateless: do not mutate session history (conversation + probe
-                    accumulators). Used by the OpenAI-compatible server.
-            seed: RNG seed for reproducible sampling.
-            stop: list of stop strings; generation terminates when any appears.
-            logit_bias: per-token-id additive logit bias.
-            presence_penalty: OpenAI-style presence penalty.
-            frequency_penalty: OpenAI-style frequency penalty.
-            logprobs: if set, capture per-token logprobs with this many
-                    top alternatives (0 = chosen token only).
+        Holds the gen lock + re-entry guard for the duration of the call,
+        composes a per-call GenerationConfig, opens an internal steering
+        scope (if any), runs ``generate_steered`` with capture attached,
+        and finalizes the result.  ``generate`` and ``generate_stream``
+        are thin wrappers around this.
         """
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentGenerationError("Generation already in progress")
@@ -942,51 +1129,133 @@ class SaklasSession:
             self._gen_lock.release()
             raise ConcurrentGenerationError("session generation already in flight")
         self._gen_active = True
+
+        steering_obj = Steering.from_value(steering)
+        # Effective thinking: explicit kwarg wins; else Steering.thinking;
+        # else auto-detect from tokenizer.
+        if thinking is None:
+            if steering_obj is not None and steering_obj.thinking is not None:
+                use_thinking_req = steering_obj.thinking
+            else:
+                use_thinking_req = supports_thinking(self._tokenizer)
+        else:
+            use_thinking_req = thinking
+
+        gen_config = self._compose_gen_config(sampling)
+        lp_count = sampling.logprobs if sampling is not None else None
+        seed = sampling.seed if sampling is not None else None
+        stop_tuple = sampling.stop if sampling is not None else None
+        stop_list = list(stop_tuple) if stop_tuple else None
+        logit_bias = sampling.logit_bias if sampling is not None else None
+        presence_penalty = sampling.presence_penalty if sampling is not None else 0.0
+        frequency_penalty = sampling.frequency_penalty if sampling is not None else 0.0
+
+        logprobs_list: list | None = [] if lp_count is not None else None
+
+        def _token_tap(text, is_thinking, tid, lp, top_lp):
+            if logprobs_list is not None and tid >= 0 and not is_thinking:
+                logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
+            if on_token is not None:
+                on_token(text, is_thinking, tid, lp, top_lp)
+
+        steering_cm = None
+        if steering_obj is not None and steering_obj.alphas:
+            steering_cm = self.steering(steering_obj)
+        vector_snapshot = (
+            dict(self._flatten_steering_stack())
+            if self._steering_stack or steering_cm is not None
+            else {}
+        )
+
         try:
-            return self._generate_blocking(
-                input, alphas, raw, thinking, stateless,
-                seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
+            if steering_cm is not None:
+                steering_cm.__enter__()
+            input_ids, use_thinking, prompt_tokens = self._generation_preamble(
+                input, raw, use_thinking_req, stateless=stateless,
             )
+            # Refresh snapshot now that steering is pushed (first-scope case).
+            vector_snapshot = dict(self._flatten_steering_stack())
+
+            self.events.emit(GenerationStarted(input=input, stateless=stateless))
+            self._begin_capture()
+            try:
+                start = time.monotonic()
+                generated_ids = generate_steered(
+                    self._model, self._tokenizer, input_ids,
+                    gen_config, self._gen_state, thinking=use_thinking,
+                    on_token=_token_tap,
+                    seed=seed, stop=stop_list, logit_bias=logit_bias,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    logprobs=lp_count,
+                )
+                elapsed = time.monotonic() - start
+            finally:
+                self._gen_state.stop_requested.set()
+                self._end_capture()
+                if steering_cm is not None:
+                    steering_cm.__exit__(None, None, None)
+                    steering_cm = None
+
+            result = self._finalize_generation(
+                input, generated_ids, elapsed, vector_snapshot,
+                prompt_tokens=prompt_tokens, stateless=stateless,
+                logprobs_list=logprobs_list,
+            )
+            self.events.emit(GenerationFinished(result=result))
+            return result
+        except BaseException:
+            # If we bailed before the inner finally ran (e.g. preamble threw),
+            # make sure the steering scope is popped.
+            if steering_cm is not None:
+                try:
+                    steering_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+            raise
         finally:
             self._gen_active = False
             self._gen_lock.release()
 
-    def _generate_blocking(
-        self, input, alphas, raw, thinking, stateless,
-        seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
+    # -- Generation: blocking --
+
+    def generate(
+        self,
+        input,
+        *,
+        steering: "Steering | dict[str, float] | None" = None,
+        sampling: SamplingConfig | None = None,
+        stateless: bool = False,
+        raw: bool = False,
+        thinking: bool | None = None,
+        on_token: Callable[..., None] | None = None,
     ) -> GenerationResult:
-        input_ids, use_thinking, vector_snapshot, prompt_tokens = self._generation_preamble(
-            input, alphas, raw, thinking, stateless,
-        )
+        """Blocking generation.
 
-        logprobs_list: list | None = [] if logprobs is not None else None
-
-        def _capture(text, is_thinking, tid, lp, top_lp):
-            if logprobs_list is not None and tid >= 0 and not is_thinking:
-                logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
-
-        self._begin_capture()
-        try:
-            start = time.monotonic()
-            generated_ids = generate_steered(
-                self._model, self._tokenizer, input_ids,
-                self.config, self._gen_state, thinking=use_thinking,
-                on_token=_capture if logprobs is not None else None,
-                seed=seed, stop=stop, logit_bias=logit_bias,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
-                logprobs=logprobs,
-            )
-            elapsed = time.monotonic() - start
-        finally:
-            self._end_capture()
-            if alphas:
-                self._clear_steering()
-
-        return self._finalize_generation(
-            input, generated_ids, elapsed, vector_snapshot,
-            prompt_tokens=prompt_tokens, stateless=stateless,
-            logprobs_list=logprobs_list,
+        Args:
+            input: prompt string or list of message dicts.
+            steering: ``Steering`` instance or bare ``{name: alpha}`` dict.
+                Pole aliases (bare poles of installed bipolar vectors) are
+                resolved via ``session.steering()`` before hook install.
+                ``None`` = no steering.
+            sampling: per-call ``SamplingConfig``.  ``None`` fields fall
+                through to the session's ``GenerationConfig`` defaults.
+                The session's config is never mutated by this call.
+            stateless: do not mutate session history.
+            raw: skip chat template, tokenize input string directly.
+            thinking: per-call thinking override.  ``None`` = auto-detect
+                via ``supports_thinking`` (or ``steering.thinking`` if set).
+            on_token: optional callback ``(text, is_thinking, token_id,
+                logprob, top_logprobs)`` called on each emitted token.
+        """
+        return self._generate_core(
+            input,
+            steering=steering,
+            sampling=sampling,
+            stateless=stateless,
+            raw=raw,
+            thinking=thinking,
+            on_token=on_token,
         )
 
     # -- Generation: streaming --
@@ -994,106 +1263,66 @@ class SaklasSession:
     def generate_stream(
         self,
         input,
-        alphas: dict[str, float] | None = None,
-        raw: bool = False,
-        thinking: bool = False,
+        *,
+        steering: "Steering | dict[str, float] | None" = None,
+        sampling: SamplingConfig | None = None,
         stateless: bool = False,
-        seed: int | None = None,
-        stop: list[str] | None = None,
-        logit_bias: dict[int, float] | None = None,
-        presence_penalty: float = 0.0,
-        frequency_penalty: float = 0.0,
-        logprobs: int | None = None,
+        raw: bool = False,
+        thinking: bool | None = None,
     ) -> Iterator[TokenEvent]:
-        """Streaming generation. Yields TokenEvent per token. See generate()."""
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentGenerationError("Generation already in progress")
-        if self._gen_active:
-            self._gen_lock.release()
-            raise ConcurrentGenerationError("session generation already in flight")
-        self._gen_active = True
-        try:
-            yield from self._generate_streaming(
-                input, alphas, raw, thinking, stateless,
-                seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
+        """Streaming generation.  See :meth:`generate` for kwargs.
+
+        Yields ``TokenEvent`` per token.  On iterator close (normal
+        exhaustion, ``GeneratorExit``, or an exception raised through
+        ``yield``) the worker is signaled to stop and joined, and the
+        underlying ``_generate_core`` cleanup runs — probes detached,
+        steering scope popped, lock released.
+        """
+        q: queue.SimpleQueue = queue.SimpleQueue()
+        done = object()
+        result_holder: list[GenerationResult] = []
+        exc_holder: list[BaseException] = []
+        idx_counter = [0]
+
+        def _push(text, is_thinking, tid, lp, tlp):
+            event = TokenEvent(
+                text=text, token_id=tid, index=idx_counter[0],
+                thinking=is_thinking, logprob=lp, top_logprobs=tlp,
             )
-        finally:
-            self._gen_active = False
-            self._gen_lock.release()
-
-    def _generate_streaming(
-        self, input, alphas, raw, thinking, stateless,
-        seed, stop, logit_bias, presence_penalty, frequency_penalty, logprobs,
-    ) -> Iterator[TokenEvent]:
-        input_ids, use_thinking, vector_snapshot, prompt_tokens = self._generation_preamble(
-            input, alphas, raw, thinking, stateless,
-        )
-
-        generated_ids: list[int] = []
-        token_queue = self._gen_state.token_queue
-        gen_error: list[Exception] = []
-        logprobs_list: list | None = [] if logprobs is not None else None
-        start = time.monotonic()
-
-        self._begin_capture()
+            idx_counter[0] += 1
+            q.put(event)
 
         def _worker():
             try:
-                ids = generate_steered(
-                    self._model, self._tokenizer, input_ids,
-                    self.config, self._gen_state,
-                    on_token=lambda tok, th, tid, lp, tlp: token_queue.put((tok, th, tid, lp, tlp)),
-                    thinking=use_thinking,
-                    seed=seed, stop=stop, logit_bias=logit_bias,
-                    presence_penalty=presence_penalty,
-                    frequency_penalty=frequency_penalty,
-                    logprobs=logprobs,
+                result = self._generate_core(
+                    input,
+                    steering=steering,
+                    sampling=sampling,
+                    stateless=stateless,
+                    raw=raw,
+                    thinking=thinking,
+                    on_token=_push,
                 )
-                generated_ids.extend(ids)
-            except Exception as e:
-                gen_error.append(e)
+                result_holder.append(result)
+            except BaseException as e:
+                exc_holder.append(e)
             finally:
-                token_queue.put(None)
+                q.put(done)
 
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
 
-        idx = 0
         try:
             while True:
-                try:
-                    item = token_queue.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if item is None:
+                item = q.get()
+                if item is done:
                     break
-                tok_str, is_thinking, token_id, lp, tlp = item
-                if logprobs_list is not None and token_id >= 0 and not is_thinking:
-                    logprobs_list.append((token_id, lp if lp is not None else 0.0, tlp or []))
-                event = TokenEvent(
-                    text=tok_str,
-                    token_id=token_id,
-                    index=idx, thinking=is_thinking,
-                    logprob=lp, top_logprobs=tlp,
-                )
-                yield event
-                idx += 1
-
-            thread.join()
+                yield item
         finally:
-            self._end_capture()
-            if alphas:
-                self._clear_steering()
-
-        if gen_error:
-            raise gen_error[0]
-
-        elapsed = time.monotonic() - start
-        self._finalize_generation(
-            input, generated_ids, elapsed, vector_snapshot,
-            prompt_tokens=prompt_tokens, stateless=stateless,
-            logprobs_list=logprobs_list,
-        )
+            self._gen_state.stop_requested.set()
+            worker.join(timeout=5.0)
+            if exc_holder and not result_holder:
+                raise exc_holder[0]
 
     # -- Generation control --
 

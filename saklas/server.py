@@ -7,7 +7,6 @@ import json
 import os
 import time
 import uuid
-from contextlib import contextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -28,7 +27,9 @@ from saklas.errors import SaklasError
 from saklas.hf import HFError
 from saklas.packs import PackFormatError
 from saklas.probes_bootstrap import load_defaults
+from saklas.sampling import SamplingConfig
 from saklas.session import ConcurrentGenerationError, SaklasSession
+from saklas.steering import Steering
 
 
 class UnsupportedContentError(ValueError, SaklasError):
@@ -195,14 +196,20 @@ def _resolve_steer_params(
 
 
 def _sampling_kwargs(req: _SamplingBase, alphas, think) -> dict[str, Any]:
-    """Build the kwargs dict passed to session.generate / generate_stream."""
-    stop_list: list[str] | None
+    """Build the kwargs dict passed to session.generate / generate_stream.
+
+    Returns kwargs in the new cluster-3 shape: ``sampling=SamplingConfig(...)``
+    + ``steering=Steering(...)``/dict/None + ``thinking=`` + ``stateless=True``.
+    The server never mutates ``session.config`` — the SamplingConfig holds
+    per-request overrides which ``_generate_core`` composes on entry.
+    """
+    stop_tuple: tuple[str, ...] | None
     if req.stop is None:
-        stop_list = None
+        stop_tuple = None
     elif isinstance(req.stop, str):
-        stop_list = [req.stop]
+        stop_tuple = (req.stop,)
     else:
-        stop_list = list(req.stop)
+        stop_tuple = tuple(req.stop)
 
     # chat: logprobs is bool + top_logprobs gives count.
     # completions: logprobs is int (number of top alternatives).
@@ -215,16 +222,28 @@ def _sampling_kwargs(req: _SamplingBase, alphas, think) -> dict[str, Any]:
     else:
         lp = None
 
+    sc = SamplingConfig(
+        temperature=req.temperature,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        seed=req.seed,
+        stop=stop_tuple,
+        logit_bias=req.logit_bias,
+        presence_penalty=req.presence_penalty or 0.0,
+        frequency_penalty=req.frequency_penalty or 0.0,
+        logprobs=lp,
+    )
+    steering: Steering | None = None
+    if alphas:
+        steering = Steering(alphas=dict(alphas), thinking=bool(think))
+
     return {
-        "alphas": alphas,
-        "thinking": think,
+        "sampling": sc,
+        "steering": steering,
+        # Server preserves old default: thinking stays OFF unless the client
+        # explicitly set steer.thinking.  `None` would trigger auto-detect.
+        "thinking": bool(think),
         "stateless": True,
-        "seed": req.seed,
-        "stop": stop_list,
-        "logit_bias": req.logit_bias,
-        "presence_penalty": req.presence_penalty,
-        "frequency_penalty": req.frequency_penalty,
-        "logprobs": lp,
     }
 
 
@@ -289,47 +308,6 @@ def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
     }
 
 
-@contextmanager
-def _gen_config_override(session: SaklasSession, temperature, top_p, max_tokens, top_k=None):
-    """Temporarily rebind session.config to a replaced copy.
-
-    ``GenerationConfig`` is frozen so we can't mutate fields in place —
-    instead we rebind the attribute and restore the original object on
-    exit.  An in-flight generation holding a local reference to the old
-    frozen config is immune to the rebind.
-    """
-    from dataclasses import is_dataclass, replace as _replace
-    orig = session.config
-    overrides: dict = {}
-    if temperature is not None:
-        overrides["temperature"] = temperature
-    if top_p is not None:
-        overrides["top_p"] = top_p
-    if max_tokens is not None:
-        overrides["max_new_tokens"] = max_tokens
-    if top_k is not None:
-        overrides["top_k"] = top_k
-    # Snapshot original per-field values for non-dataclass stand-ins
-    # (MagicMock in tests) so we can roll back mutations.
-    orig_fields: dict | None = None
-    if overrides and not is_dataclass(orig):
-        orig_fields = {k: getattr(orig, k, None) for k in overrides}
-    try:
-        if overrides:
-            if is_dataclass(orig):
-                session.config = _replace(orig, **overrides)
-            else:
-                for k, v in overrides.items():
-                    setattr(session.config, k, v)
-        yield
-    finally:
-        if is_dataclass(orig):
-            session.config = orig
-        elif orig_fields is not None:
-            for k, v in orig_fields.items():
-                setattr(session.config, k, v)
-
-
 def _resolve_alphas(
     steer_params: SteerParams | None, default_alphas: dict[str, float],
 ) -> dict[str, float] | None:
@@ -344,13 +322,14 @@ def _resolve_alphas(
 async def _stream_generation(
     app, session: SaklasSession,
     stream_iter, rid, model_id, object_type, format_delta, empty_delta,
-    temperature, top_p, max_tokens,
     include_usage: bool = False, role_delta: bool = False,
 ):
     """Shared SSE generator for chat and completion streaming.
 
     Serializes against other requests via app.state.gen_lock for the full
     stream lifetime (streams inherit queue semantics rather than 409).
+    Per-request sampling overrides are carried in the iterator's own
+    ``sampling=`` kwarg (bound at caller site) — no session.config rebind.
     """
     created_ts = int(time.time())
     async with acquire_lock_with_timeout(app) as acquired:
@@ -359,7 +338,7 @@ async def _stream_generation(
             yield f"data: {json.dumps(err)}\n\n"
             return
 
-        with _gen_config_override(session, temperature, top_p, max_tokens):
+        if True:
             if role_delta:
                 chunk = {
                     "id": rid, "object": object_type, "created": created_ts,
@@ -571,7 +550,6 @@ def _register_routes(app: FastAPI) -> None:
         return await run_blocking_generate(
             app, session,
             input=prompt_or_messages, raw=raw, gen_kwargs=gen_kwargs,
-            temperature=req.temperature, top_p=req.top_p, max_tokens=req.max_tokens,
         )
 
     @app.post("/v1/chat/completions")
@@ -598,7 +576,6 @@ def _register_routes(app: FastAPI) -> None:
                 _stream_generation(app, session,
                                    stream_iter, rid, model_id,
                                    "chat.completion.chunk", _chat_delta, {"delta": {}},
-                                   req.temperature, req.top_p, req.max_tokens,
                                    include_usage=include_usage, role_delta=True),
                 media_type="text/event-stream",
             )
@@ -643,7 +620,6 @@ def _register_routes(app: FastAPI) -> None:
                 _stream_generation(app, session,
                                    stream_iter, rid, model_id,
                                    "text_completion", lambda e: {"text": e.text}, {"text": ""},
-                                   req.temperature, req.top_p, req.max_tokens,
                                    include_usage=include_usage, role_delta=False),
                 media_type="text/event-stream",
             )

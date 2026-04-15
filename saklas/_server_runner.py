@@ -1,15 +1,17 @@
 """Shared generation plumbing for OpenAI and Ollama route families.
 
-Both protocols serialize generation on ``app.state.gen_lock`` and wrap each
-request in a ``_gen_config_override`` context manager.  This module factors
-out the pieces that were literally duplicated between ``server.py`` and
+Both protocols serialize generation on ``app.state.gen_lock``.  This module
+factors out the pieces that were duplicated between ``server.py`` and
 ``ollama_api.py``:
 
 * ``acquire_lock_with_timeout`` — 5-minute-bounded lock acquire used by
-  both streaming paths (non-streaming paths use ``async with
-  app.state.gen_lock`` directly since they don't need the timeout).
-* ``run_blocking_generate`` — ``async with gen_lock`` + override +
-  ``session.generate`` for non-streaming callers.
+  both streaming paths.
+* ``run_blocking_generate`` — ``async with gen_lock`` + ``session.generate``
+  for non-streaming callers.
+
+After cluster 3 (core API) the per-request ``_gen_config_override`` dance
+is gone — sampling overrides ride on ``SamplingConfig`` inside ``gen_kwargs``
+and ``session.generate`` never mutates ``session.config``.
 
 Wire-format emission (SSE chat deltas, SSE completions, NDJSON Ollama
 chat, NDJSON Ollama generate) stays in each protocol module — those
@@ -25,12 +27,6 @@ from typing import Any, AsyncIterator
 from saklas.session import SaklasSession
 
 LOCK_TIMEOUT_SECONDS = 300
-
-
-def _get_override_cm():
-    # Lazy import: server.py imports ollama_api which imports this module.
-    from saklas.server import _gen_config_override
-    return _gen_config_override
 
 
 @asynccontextmanager
@@ -59,17 +55,13 @@ async def run_blocking_generate(
     input: Any,
     raw: bool,
     gen_kwargs: dict[str, Any],
-    temperature: Any = None,
-    top_p: Any = None,
-    max_tokens: Any = None,
-    top_k: Any = None,
 ) -> Any:
-    """Acquire gen_lock, apply per-request config override, call ``session.generate``.
+    """Acquire gen_lock and call ``session.generate``.
 
+    ``gen_kwargs`` is in the new cluster-3 shape: ``sampling=SamplingConfig``,
+    ``steering=Steering|dict|None``, ``thinking=``, ``stateless=``.
     Propagates ``ConcurrentGenerationError`` for callers to map to their
     wire format.
     """
-    _gen_config_override = _get_override_cm()
     async with app.state.gen_lock:
-        with _gen_config_override(session, temperature, top_p, max_tokens, top_k=top_k):
-            return session.generate(input, raw=raw, **gen_kwargs)
+        return session.generate(input, raw=raw, **gen_kwargs)

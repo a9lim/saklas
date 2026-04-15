@@ -33,7 +33,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from saklas._server_runner import acquire_lock_with_timeout, run_blocking_generate
+from saklas.sampling import SamplingConfig
 from saklas.session import ConcurrentGenerationError, SaklasSession
+from saklas.steering import Steering
 
 log = logging.getLogger(__name__)
 
@@ -272,8 +274,15 @@ _PROCESSED_OPTIONS: frozenset[str] = frozenset({
 })
 
 
-def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, Any]:
-    """Translate Ollama `options` + top-level fields into saklas gen kwargs.
+def _resolve_options(
+    body: dict, default_alphas: dict[str, float],
+) -> tuple[dict[str, Any], str | None]:
+    """Translate Ollama `options` + top-level fields into session.generate kwargs.
+
+    Returns ``(gen_kwargs, system)`` where ``gen_kwargs`` has the new
+    cluster-3 shape (``sampling=SamplingConfig``, ``steering=Steering|None``,
+    ``thinking=``, ``stateless=True``) and ``system`` is the top-level
+    ``system`` field for the caller to splice into messages.
 
     Recognized Ollama fields: temperature, top_p, top_k, seed, num_predict,
     stop, presence_penalty, frequency_penalty, repeat_penalty.
@@ -282,9 +291,7 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
     Ollama divides positive logits by repeat_penalty, which is equivalent
     to subtracting ``ln(penalty)`` from the logit.  That matches
     presence_penalty semantics exactly (subtract a constant per seen token,
-    independent of count).  Mapping it to frequency_penalty instead — as
-    earlier versions did — grows unboundedly with repetition count and
-    diverges from Ollama's behaviour.
+    independent of count).
 
     Unrecognized options (min_p, mirostat*, num_ctx, typical_p, etc.) are
     logged at debug level and silently dropped.
@@ -297,11 +304,11 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
 
     stop_raw = opts.get("stop") or body.get("stop")
     if isinstance(stop_raw, str):
-        stop_list: list[str] | None = [stop_raw]
+        stop_tuple: tuple[str, ...] | None = (stop_raw,)
     elif isinstance(stop_raw, list):
-        stop_list = [str(s) for s in stop_raw]
+        stop_tuple = tuple(str(s) for s in stop_raw)
     else:
-        stop_list = None
+        stop_tuple = None
 
     temperature = opts.get("temperature")
     top_p = opts.get("top_p")
@@ -353,35 +360,31 @@ def _resolve_options(body: dict, default_alphas: dict[str, float]) -> dict[str, 
     merged_alphas = {**default_alphas, **alpha_map}
     merged_alphas = {k: v for k, v in merged_alphas.items() if v != 0.0}
 
-    return {
-        "alphas": merged_alphas or None,
-        "thinking": thinking,
+    sc = SamplingConfig(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=int(max_tokens) if max_tokens is not None else None,
+        seed=seed,
+        stop=stop_tuple,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+    )
+    steering: Steering | None = None
+    if merged_alphas:
+        steering = Steering(alphas=merged_alphas, thinking=thinking if thinking else None)
+
+    gen_kwargs = {
+        "sampling": sc,
+        "steering": steering,
+        # Preserve old default: thinking OFF unless the client explicitly
+        # asks via `think` / `options.steer.thinking`.  `None` would trigger
+        # auto-detect.
+        "thinking": bool(thinking),
         "stateless": True,
-        "seed": seed,
-        "stop": stop_list,
-        "presence_penalty": presence_penalty,
-        "frequency_penalty": frequency_penalty,
-        "logit_bias": None,
-        "logprobs": None,
-        "_temperature": temperature,
-        "_top_p": top_p,
-        "_top_k": top_k,
-        "_max_tokens": max_tokens,
-        "_system": top_system if isinstance(top_system, str) else None,
     }
-
-
-def _split_overrides(gen_kwargs: dict[str, Any]) -> tuple[dict[str, Any], Any, Any, Any, Any, str | None]:
-    """Pop private override fields out of the gen kwargs.
-
-    Returns ``(gen_kwargs, temperature, top_p, top_k, max_tokens, system)``.
-    """
-    temperature = gen_kwargs.pop("_temperature", None)
-    top_p = gen_kwargs.pop("_top_p", None)
-    top_k = gen_kwargs.pop("_top_k", None)
-    max_tokens = gen_kwargs.pop("_max_tokens", None)
-    system = gen_kwargs.pop("_system", None)
-    return gen_kwargs, temperature, top_p, top_k, max_tokens, system
+    system = top_system if isinstance(top_system, str) else None
+    return gen_kwargs, system
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +560,6 @@ def register_ollama_routes(app: FastAPI) -> None:
     # Generation endpoints
     # -----------------------------------------------------------------------
 
-    from saklas.server import _gen_config_override  # reuse the context manager
-
     def _check_model_or_404(body: dict) -> None:
         """In strict mode, reject requests whose `model` doesn't match the loaded session."""
         if not _strict_mode():
@@ -577,8 +578,7 @@ def register_ollama_routes(app: FastAPI) -> None:
     async def _run_and_build_chat_response(body: dict, is_chat: bool) -> dict:
         """Shared non-streaming path for /api/chat and /api/generate."""
         default_alphas = app.state.default_alphas
-        gen_kwargs = _resolve_options(body, default_alphas)
-        gen_kwargs, temperature, top_p, top_k, max_tokens, system = _split_overrides(gen_kwargs)
+        gen_kwargs, system = _resolve_options(body, default_alphas)
 
         if is_chat:
             msgs = _extract_messages(body)
@@ -605,7 +605,6 @@ def register_ollama_routes(app: FastAPI) -> None:
             result = await run_blocking_generate(
                 app, session,
                 input=input_payload, raw=raw, gen_kwargs=gen_kwargs,
-                temperature=temperature, top_p=top_p, max_tokens=max_tokens, top_k=top_k,
             )
         except ConcurrentGenerationError:
             raise HTTPException(status_code=409, detail="Generation already in progress")
@@ -639,8 +638,7 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     async def _stream_chat_or_generate(body: dict, is_chat: bool):
         default_alphas = app.state.default_alphas
-        gen_kwargs = _resolve_options(body, default_alphas)
-        gen_kwargs, temperature, top_p, top_k, max_tokens, system = _split_overrides(gen_kwargs)
+        gen_kwargs, system = _resolve_options(body, default_alphas)
 
         if is_chat:
             msgs = _extract_messages(body)
@@ -670,7 +668,7 @@ def register_ollama_routes(app: FastAPI) -> None:
                 }) + "\n"
                 return
 
-            with _gen_config_override(session, temperature, top_p, max_tokens, top_k=top_k):
+            if True:
                 start_ns = time.monotonic_ns()
                 try:
                     stream_iter = session.generate_stream(input_payload, raw=raw, **gen_kwargs)

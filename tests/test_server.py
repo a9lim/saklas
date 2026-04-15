@@ -131,7 +131,9 @@ class TestChatCompletions:
         })
         assert resp.status_code == 200
         call_kwargs = session.generate.call_args[1]
-        assert call_kwargs["alphas"] == {"vec1": 0.3}
+        steering = call_kwargs["steering"]
+        assert steering is not None
+        assert dict(steering.alphas) == {"vec1": 0.3}
         assert "orthogonalize" not in call_kwargs
 
     def test_streaming(self, session_and_client):
@@ -172,7 +174,7 @@ class TestChatCompletions:
         })
         assert resp.status_code == 409
 
-    def test_gen_config_override(self, session_and_client):
+    def test_sampling_overrides_ride_on_sampling_config(self, session_and_client):
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="x", tokens=[1], token_count=1,
@@ -185,7 +187,12 @@ class TestChatCompletions:
             "max_tokens": 256,
         })
         assert resp.status_code == 200
-        # Config should be restored after generation
+        # session.config is never mutated — overrides ride on SamplingConfig.
+        sc = session.generate.call_args[1]["sampling"]
+        assert sc.temperature == 0.5
+        assert sc.top_p == 0.8
+        assert sc.max_tokens == 256
+        # Session defaults untouched.
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
@@ -460,10 +467,16 @@ class TestOllamaApi:
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert kw["seed"] == 42
-        assert kw["stop"] == ["\n\n"]
-        assert kw["alphas"] == {"vec1": 0.3}
-        # Config should be restored after generation.
+        sc = kw["sampling"]
+        assert sc.seed == 42
+        assert sc.stop == ("\n\n",)
+        assert sc.temperature == 0.2
+        assert sc.top_p == 0.7
+        assert sc.max_tokens == 64
+        steering = kw["steering"]
+        assert steering is not None
+        assert dict(steering.alphas) == {"vec1": 0.3}
+        # Session defaults untouched — sampling overrides ride on SamplingConfig.
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
@@ -487,8 +500,9 @@ class TestOllamaApi:
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert abs(kw["presence_penalty"] - math.log(1.3)) < 1e-6
-        assert kw["frequency_penalty"] == 0.0
+        sc = kw["sampling"]
+        assert abs(sc.presence_penalty - math.log(1.3)) < 1e-6
+        assert sc.frequency_penalty == 0.0
 
     def test_chat_streaming(self, session_and_client):
         session, client = session_and_client

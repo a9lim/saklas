@@ -116,7 +116,7 @@ class TestGeneration:
     def test_generate_with_alphas(self, session):
         _, profile = session.extract([("formal", "casual")])
         session.steer("formal", profile)
-        result = session.generate("Hello.", alphas={"formal": 0.1})
+        result = session.generate("Hello.", steering={"formal": 0.1})
         assert result.vectors == {"formal": 0.1}
         session.unsteer("formal")
 
@@ -136,7 +136,7 @@ class TestGeneration:
         _, profile = session.extract([("I am happy", "I am sad")])
         session.steer("happy", profile)
         session.clear_history()
-        steered = session.generate("Describe a sunset.", alphas={"happy": 0.2})
+        steered = session.generate("Describe a sunset.", steering={"happy": 0.2})
         session.clear_history()
         unsteered = session.generate("Describe a sunset.")
         assert steered.vectors == {"happy": 0.2}
@@ -148,7 +148,7 @@ class TestGeneration:
 
     def test_unknown_vector_raises(self, session):
         with pytest.raises(KeyError, match="nonexistent"):
-            session.generate("Hello.", alphas={"nonexistent": 0.1})
+            session.generate("Hello.", steering={"nonexistent": 0.1})
 
 class TestCloning:
     def test_clone_from_corpus_end_to_end(self, session, tmp_path):
@@ -215,7 +215,7 @@ class TestCloning:
             try:
                 session.clear_history()
                 result = session.generate(
-                    "Describe your morning.", alphas=None,
+                    "Describe your morning.", steering=None,
                 )
                 readings = result.readings or {}
                 if "pirate_test" in readings:
@@ -233,7 +233,7 @@ class TestCloning:
                 session.clear_history()
                 unsteered = session.generate(prompt)
                 session.clear_history()
-                steered = session.generate(prompt, alphas={"pirate_test": 1.0})
+                steered = session.generate(prompt, steering={"pirate_test": 1.0})
                 assert len(steered.text) > 0
                 # Baseline shift assertion — loose. Only run if we share a probe.
                 u_read = unsteered.readings or {}
@@ -297,7 +297,7 @@ class TestStreamingGeneration:
         _, profile = session.extract([("I am happy", "I am sad")])
         session.steer("happy", profile)
         session.clear_history()
-        tokens = list(session.generate_stream("Hello.", alphas={"happy": 0.15}))
+        tokens = list(session.generate_stream("Hello.", steering={"happy": 0.15}))
         assert len(tokens) > 0
         assert session.last_result.vectors == {"happy": 0.15}
         session.unsteer("happy")

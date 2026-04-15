@@ -501,21 +501,22 @@ def _warmup_session(session) -> None:
     """Run a tiny stateless generation so the first real request is fast.
 
     Warms up lazy kernel compilation, KV cache allocation, and any JIT paths
-    before uvicorn starts accepting traffic.
+    before uvicorn starts accepting traffic.  Uses a per-call SamplingConfig
+    override so session.config is never mutated.
     """
     import time as _time
-    from dataclasses import replace as _replace
+    from saklas.sampling import SamplingConfig
     print("Warming up generation kernels...", flush=True)
-    orig = session.config
     try:
-        session.config = _replace(orig, max_new_tokens=1)
         start = _time.monotonic()
-        session.generate("Hi", stateless=True)
+        session.generate(
+            "Hi",
+            sampling=SamplingConfig(max_tokens=1),
+            stateless=True,
+        )
         print(f"  warmed in {_time.monotonic() - start:.1f}s")
     except Exception as e:
         print(f"  warm-up skipped: {e}")
-    finally:
-        session.config = orig
 
 
 def _run_install(args: argparse.Namespace) -> None:
