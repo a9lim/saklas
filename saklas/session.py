@@ -1,5 +1,6 @@
 """SaklasSession — unified backend for saklas's programmatic API and TUI."""
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import pathlib
@@ -188,6 +189,10 @@ class _SteeringContext:
         self._entered = False
 
     def __enter__(self) -> "_SteeringContext":
+        # _push_steering rolls its own stack entry back if _rebuild_steering_hooks
+        # raises (e.g. VectorNotRegisteredError).  __enter__ only flips
+        # `_entered=True` AFTER a clean push so a mid-__enter__ failure leaves
+        # no stale state for __exit__ to pop.
         self._session._push_steering(self._alphas)
         self._entered = True
         return self
@@ -285,6 +290,11 @@ class SaklasSession:
         self._capture = HiddenCapture()
 
         self._gen_lock = threading.Lock()
+        # Async-level serializer owned by the HTTP server for back-pressure.
+        # Distinct from `_gen_lock` (threading, enforces single-flight at the
+        # Python level): `lock` queues concurrent async requests FIFO so they
+        # wait rather than 409.  Library-only callers never touch this.
+        self.lock: asyncio.Lock = asyncio.Lock()
         self._gen_state = GenerationState()
         # Re-entry guard: True between preamble and finalize of any
         # generation path.  Prevents a pending-action dispatch from
@@ -840,9 +850,19 @@ class SaklasSession:
         return out
 
     def _push_steering(self, alphas: dict[str, float]) -> None:
-        """Push an alphas dict onto the steering stack and rebuild hooks."""
+        """Push an alphas dict onto the steering stack and rebuild hooks.
+
+        If ``_rebuild_steering_hooks`` raises (e.g. an unknown vector name
+        hits ``VectorNotRegisteredError``) the just-pushed entry is rolled
+        back before the exception propagates, so the stack is never left
+        with stale half-committed state.
+        """
         self._steering_stack.append(dict(alphas))
-        self._rebuild_steering_hooks()
+        try:
+            self._rebuild_steering_hooks()
+        except BaseException:
+            self._steering_stack.pop()
+            raise
         self.events.emit(SteeringApplied(alphas=dict(self._flatten_steering_stack())))
 
     def _pop_steering(self) -> None:

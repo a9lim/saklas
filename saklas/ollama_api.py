@@ -32,7 +32,6 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from saklas._server_runner import acquire_lock_with_timeout, run_blocking_generate
 from saklas.sampling import SamplingConfig
 from saklas.session import ConcurrentGenerationError, SaklasSession
 from saklas.steering import Steering
@@ -337,13 +336,15 @@ def _resolve_options(
         log.debug("ollama: unsupported options dropped: %s", ", ".join(sorted(ignored)))
 
     steer_raw = opts.get("steer") or body.get("steer") or {}
+    thinking: bool | None = None
     if isinstance(steer_raw, dict):
         if "alphas" in steer_raw and isinstance(steer_raw["alphas"], dict):
             alpha_map = {str(k): float(v) for k, v in steer_raw["alphas"].items()}
-            thinking = bool(steer_raw.get("thinking", False))
+            t = steer_raw.get("thinking")
+            if t is not None:
+                thinking = bool(t)
         else:
             alpha_map = {}
-            thinking = False
             for k, v in steer_raw.items():
                 try:
                     alpha_map[str(k)] = float(v)
@@ -351,7 +352,6 @@ def _resolve_options(
                     pass
     else:
         alpha_map = {}
-        thinking = False
 
     think_flag = body.get("think")
     if think_flag is not None:
@@ -371,16 +371,14 @@ def _resolve_options(
         frequency_penalty=frequency_penalty,
     )
     steering: Steering | None = None
-    if merged_alphas:
-        steering = Steering(alphas=merged_alphas, thinking=thinking if thinking else None)
+    if merged_alphas or thinking is not None:
+        steering = Steering(alphas=merged_alphas, thinking=thinking)
 
     gen_kwargs = {
         "sampling": sc,
         "steering": steering,
-        # Preserve old default: thinking OFF unless the client explicitly
-        # asks via `think` / `options.steer.thinking`.  `None` would trigger
-        # auto-detect.
-        "thinking": bool(thinking),
+        # None = auto (honours supports_thinking); explicit True/False wins.
+        "thinking": thinking,
         "stateless": True,
     }
     system = top_system if isinstance(top_system, str) else None
@@ -427,9 +425,9 @@ def _finish_to_done_reason(finish_reason: str | None) -> str:
 def register_ollama_routes(app: FastAPI) -> None:
     """Mount /api/* Ollama-compatible routes onto an existing FastAPI app.
 
-    Uses app.state.session, app.state.default_alphas, app.state.gen_lock — the
-    same state created_app prepared for the OpenAI routes.  Auth is inherited
-    via app-level Depends(_require_auth) from the parent create_app.
+    Uses app.state.session + app.state.default_alphas, and serializes on
+    ``session.lock`` shared with the OpenAI routes.  Auth is inherited via
+    app-level Depends(_require_auth) from the parent create_app.
     """
     session: SaklasSession = app.state.session
 
@@ -602,10 +600,8 @@ def register_ollama_routes(app: FastAPI) -> None:
 
         start_ns = time.monotonic_ns()
         try:
-            result = await run_blocking_generate(
-                app, session,
-                input=input_payload, raw=raw, gen_kwargs=gen_kwargs,
-            )
+            async with session.lock:
+                result = session.generate(input_payload, raw=raw, **gen_kwargs)
         except ConcurrentGenerationError:
             raise HTTPException(status_code=409, detail="Generation already in progress")
         elapsed_ns = time.monotonic_ns() - start_ns
@@ -660,7 +656,8 @@ def register_ollama_routes(app: FastAPI) -> None:
 
         model_name = str(body.get("model") or session.model_id)
 
-        async with acquire_lock_with_timeout(app) as acquired:
+        from saklas.server import acquire_session_lock
+        async with acquire_session_lock(session) as acquired:
             if not acquired:
                 yield json.dumps({
                     "model": model_name, "created_at": _now_iso(),

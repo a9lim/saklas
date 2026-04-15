@@ -77,22 +77,33 @@ def test_unknown_vector_raises_on_enter():
     with pytest.raises(VectorNotRegisteredError):
         with s.steering({"unknown": 0.5}):
             pass
-    # Stack was pushed before the rebuild raised; our __exit__ logic
-    # only pops on clean enter.  The real generate_core path catches
-    # this; here we just assert the push happened and the bus saw
-    # no Cleared event because __exit__ didn't run.
+    # Cluster 4 hardening: _push_steering rolls its entry back on rebuild
+    # failure, so the stack is empty after a failed __enter__ and no
+    # SteeringApplied event ever fired.
+    assert s._steering_stack == []
+
     events = []
     s2 = _Stub({"known": None})
     s2.events.subscribe(events.append)
-    try:
+    with pytest.raises(VectorNotRegisteredError):
         with s2.steering({"unknown": 0.5}):
             pass
-    except VectorNotRegisteredError:
-        pass
-    # Only the failed SteeringApplied (which never actually fired because
-    # rebuild raised before emit) — zero events.  And the stack has a stale
-    # entry that the next _rebuild on an outer pop would also hit — but
-    # this is acceptable because real callers never catch mid-scope.
+    assert s2._steering_stack == []
+    assert events == []
+
+
+def test_failed_enter_under_outer_scope_preserves_outer():
+    """An inner failed enter must not pop the outer scope's entry."""
+    s = _Stub({"a": None})
+    with s.steering({"a": 0.3}):
+        with pytest.raises(VectorNotRegisteredError):
+            with s.steering({"unknown": 0.5}):
+                pass
+        # Outer scope still in place; rebuild call history ends on the
+        # outer alphas (last successful rebuild).
+        assert s._steering_stack == [{"a": 0.3}]
+        assert s._rebuild_calls[-1] == {"a": 0.3}
+    assert s._steering_stack == []
 
 
 def test_events_reflect_flattened_head():

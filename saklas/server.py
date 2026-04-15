@@ -7,7 +7,8 @@ import json
 import os
 import time
 import uuid
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -16,10 +17,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, model_validator
 
-from saklas._server_runner import (
-    acquire_lock_with_timeout,
-    run_blocking_generate,
-)
 from saklas.cache_ops import InstallConflict, RefreshError
 from saklas.cli_selectors import AmbiguousSelectorError
 from saklas.config_file import ConfigFileError
@@ -30,6 +27,30 @@ from saklas.probes_bootstrap import load_defaults
 from saklas.sampling import SamplingConfig
 from saklas.session import ConcurrentGenerationError, SaklasSession
 from saklas.steering import Steering
+
+
+SESSION_LOCK_TIMEOUT_SECONDS = 300
+
+
+@asynccontextmanager
+async def acquire_session_lock(session: SaklasSession) -> AsyncIterator[bool]:
+    """Acquire ``session.lock`` with a 5-minute bound.
+
+    Yields ``True`` if the lock was obtained (released on exit) and
+    ``False`` on timeout.  Callers branch on the result to emit their
+    protocol-specific 503.  Serializes all generation routes across both
+    the OpenAI and Ollama protocols on the same session.
+    """
+    try:
+        async with asyncio.timeout(SESSION_LOCK_TIMEOUT_SECONDS):
+            await session.lock.acquire()
+    except (TimeoutError, asyncio.TimeoutError):
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        session.lock.release()
 
 
 class UnsupportedContentError(ValueError, SaklasError):
@@ -84,6 +105,11 @@ class _SamplingBase(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     steer: SteerParams | None = None
+    # Canonical native steering field — flat {name: alpha} or nested
+    # {alphas: {...}, thinking: bool}.  Merged over server default_alphas
+    # and resolved through session.steering() so pole aliases and events
+    # fire via the single canonical resolver site.
+    steering: dict | None = None
     stop: str | list[str] | None = None
     seed: int | None = None
     logit_bias: dict[int, float] | None = None
@@ -92,6 +118,11 @@ class _SamplingBase(BaseModel):
     logprobs: bool | int | None = None  # chat: bool; completions: int
     top_logprobs: int | None = None
     user: str | None = None
+    # Native thinking override.  None = auto (honours supports_thinking).
+    thinking: bool | None = None
+    # LangChain compat: accept no-op shapes, reject anything real.
+    tools: list | None = None
+    tool_choice: Any = None
     # Fields accepted and ignored:
     n: int | None = None
     response_format: dict | None = None
@@ -101,6 +132,57 @@ class _SamplingBase(BaseModel):
         if self.max_completion_tokens is not None and self.max_tokens is None:
             self.max_tokens = self.max_completion_tokens
         return self
+
+    @model_validator(mode="after")
+    def _check_langchain_compat(self):
+        # Accept `tools: []` / None silently; reject non-empty.
+        if self.tools:
+            raise UnsupportedContentError(
+                "tool calling is not supported by saklas"
+            )
+        # tool_choice: accept None, "none", "auto"; reject "required" and dicts.
+        tc = self.tool_choice
+        if tc is not None and tc not in ("none", "auto"):
+            raise UnsupportedContentError(
+                "tool_choice values other than 'none'/'auto' are not supported"
+            )
+        # response_format: accept None or {"type": "text"}; reject json modes.
+        rf = self.response_format
+        if rf is not None:
+            rf_type = rf.get("type") if isinstance(rf, dict) else None
+            if rf_type not in (None, "text"):
+                raise UnsupportedContentError(
+                    "response_format types other than 'text' are not supported"
+                )
+        return self
+
+    def to_steering(
+        self, default_alphas: dict[str, float],
+    ) -> "Steering | None":
+        """Merge ``self.steering`` over ``default_alphas`` into a ``Steering``.
+
+        Accepts both the flat ``{name: alpha}`` shape and the nested
+        ``{"alphas": {...}, "thinking": bool}`` shape (matching Ollama's
+        ``options.steer``).  Zero-alphas stripped.  Returns ``None`` when
+        the merged result is empty and no thinking override was requested.
+        Pole aliasing happens inside ``session.steering()`` — the server
+        does not resolve poles itself.
+        """
+        merged = dict(default_alphas)
+        thinking: bool | None = None
+        if self.steering:
+            body = self.steering
+            if isinstance(body, dict) and "alphas" in body and isinstance(body["alphas"], dict):
+                merged.update({str(k): float(v) for k, v in body["alphas"].items()})
+                t = body.get("thinking")
+                if t is not None:
+                    thinking = bool(t)
+            elif isinstance(body, dict):
+                merged.update({str(k): float(v) for k, v in body.items()})
+        merged = {k: v for k, v in merged.items() if v != 0.0}
+        if not merged and thinking is None:
+            return None
+        return Steering(alphas=merged, thinking=thinking)
 
 
 class ChatCompletionRequest(_SamplingBase):
@@ -186,22 +268,19 @@ def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
     return out
 
 
-def _resolve_steer_params(
-    steer: SteerParams | None, default_alphas: dict[str, float],
-) -> tuple[dict[str, float] | None, bool]:
-    """Resolve (alphas, thinking) from a request's steer block."""
-    alphas = _resolve_alphas(steer, default_alphas)
-    think = steer.thinking if steer else False
-    return alphas, think
-
-
-def _sampling_kwargs(req: _SamplingBase, alphas, think) -> dict[str, Any]:
+def _sampling_kwargs(
+    req: _SamplingBase, default_alphas: dict[str, float],
+) -> dict[str, Any]:
     """Build the kwargs dict passed to session.generate / generate_stream.
 
-    Returns kwargs in the new cluster-3 shape: ``sampling=SamplingConfig(...)``
-    + ``steering=Steering(...)``/dict/None + ``thinking=`` + ``stateless=True``.
-    The server never mutates ``session.config`` — the SamplingConfig holds
-    per-request overrides which ``_generate_core`` composes on entry.
+    Returns kwargs in the cluster-3 shape: ``sampling=SamplingConfig(...)``
+    + ``steering=Steering(...)``/None + ``thinking=`` + ``stateless=True``.
+    The server never mutates ``session.config``.
+
+    Merges both the legacy ``steer`` field and the canonical ``steering``
+    field over ``default_alphas``; the canonical field wins on collision.
+    ``thinking`` is the native request override; ``None`` triggers
+    ``supports_thinking`` auto-detect inside ``_generate_core``.
     """
     stop_tuple: tuple[str, ...] | None
     if req.stop is None:
@@ -233,16 +312,37 @@ def _sampling_kwargs(req: _SamplingBase, alphas, think) -> dict[str, Any]:
         frequency_penalty=req.frequency_penalty or 0.0,
         logprobs=lp,
     )
+
+    # Start with server-wide default_alphas, then layer legacy `steer`,
+    # then canonical `steering` (canonical wins).  Resolution of pole
+    # aliases happens inside session.steering() when the steering context
+    # is opened in _generate_core.
+    merged_alphas: dict[str, float] = dict(default_alphas)
+    legacy_thinking: bool | None = None
+    if req.steer is not None:
+        merged_alphas.update(req.steer.alphas)
+        if req.steer.thinking:
+            legacy_thinking = True
+    canonical = req.to_steering({})
+    if canonical is not None:
+        merged_alphas.update(canonical.alphas)
+        if canonical.thinking is not None:
+            legacy_thinking = canonical.thinking
+    merged_alphas = {k: v for k, v in merged_alphas.items() if v != 0.0}
+
     steering: Steering | None = None
-    if alphas:
-        steering = Steering(alphas=dict(alphas), thinking=bool(think))
+    if merged_alphas or legacy_thinking is not None:
+        steering = Steering(alphas=merged_alphas, thinking=legacy_thinking)
+
+    # Native thinking kwarg: request override wins; otherwise None = auto.
+    thinking_kwarg: bool | None = req.thinking
+    if thinking_kwarg is None and legacy_thinking is not None:
+        thinking_kwarg = legacy_thinking
 
     return {
         "sampling": sc,
         "steering": steering,
-        # Server preserves old default: thinking stays OFF unless the client
-        # explicitly set steer.thinking.  `None` would trigger auto-detect.
-        "thinking": bool(think),
+        "thinking": thinking_kwarg,
         "stateless": True,
     }
 
@@ -308,17 +408,6 @@ def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
     }
 
 
-def _resolve_alphas(
-    steer_params: SteerParams | None, default_alphas: dict[str, float],
-) -> dict[str, float] | None:
-    merged = dict(default_alphas)
-    if steer_params:
-        merged.update(steer_params.alphas)
-    # Drop zero-alpha entries
-    merged = {k: v for k, v in merged.items() if v != 0.0}
-    return merged or None
-
-
 async def _stream_generation(
     app, session: SaklasSession,
     stream_iter, rid, model_id, object_type, format_delta, empty_delta,
@@ -326,13 +415,13 @@ async def _stream_generation(
 ):
     """Shared SSE generator for chat and completion streaming.
 
-    Serializes against other requests via app.state.gen_lock for the full
+    Serializes against other requests via ``session.lock`` for the full
     stream lifetime (streams inherit queue semantics rather than 409).
     Per-request sampling overrides are carried in the iterator's own
     ``sampling=`` kwarg (bound at caller site) — no session.config rebind.
     """
     created_ts = int(time.time())
-    async with acquire_lock_with_timeout(app) as acquired:
+    async with acquire_session_lock(session) as acquired:
         if not acquired:
             err = {"error": {"message": "Server busy", "type": "server_error", "code": 503}}
             yield f"data: {json.dumps(err)}\n\n"
@@ -412,13 +501,9 @@ def create_app(session: SaklasSession, default_alphas: dict[str, float] | None =
     app.state.default_alphas = default_alphas or {}
     app.state.created_ts = int(time.time())
     app.state.api_key = api_key if api_key is not None else os.environ.get("SAKLAS_API_KEY")
-    # Serializes generation across all /v1/*/completions routes (both
-    # streaming and non-streaming).  Streaming requests acquire the lock
-    # inside _stream_generation so Starlette's post-route consumption of
-    # the generator still holds it; non-streaming routes wrap generate()
-    # in `async with app.state.gen_lock`.  Requests queue FIFO rather
-    # than 409ing on contention.
-    app.state.gen_lock = asyncio.Lock()
+    # Generation serialization lives on ``session.lock`` (asyncio.Lock)
+    # so both the OpenAI and Ollama route families share a single FIFO
+    # queue.  Requests wait rather than 409 on contention.
 
     if cors_origins:
         app.add_middleware(
@@ -545,21 +630,17 @@ def _register_routes(app: FastAPI) -> None:
     # -----------------------------------------------------------------------
 
     async def _run_blocking(req, prompt_or_messages, *, raw: bool):
-        alphas, think = _resolve_steer_params(req.steer, app.state.default_alphas)
-        gen_kwargs = _sampling_kwargs(req, alphas, think)
-        return await run_blocking_generate(
-            app, session,
-            input=prompt_or_messages, raw=raw, gen_kwargs=gen_kwargs,
-        )
+        gen_kwargs = _sampling_kwargs(req, app.state.default_alphas)
+        async with session.lock:
+            return session.generate(prompt_or_messages, raw=raw, **gen_kwargs)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         _check_openai_model_strict(session, req.model)
-        alphas, think = _resolve_steer_params(req.steer, app.state.default_alphas)
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
         model_id = session.model_id
-        gen_kwargs = _sampling_kwargs(req, alphas, think)
+        gen_kwargs = _sampling_kwargs(req, app.state.default_alphas)
 
         if req.stream:
             def _chat_delta(event):
@@ -608,10 +689,9 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest):
         _check_openai_model_strict(session, req.model)
-        alphas, think = _resolve_steer_params(req.steer, app.state.default_alphas)
         rid = _make_id()
         model_id = session.model_id
-        gen_kwargs = _sampling_kwargs(req, alphas, think)
+        gen_kwargs = _sampling_kwargs(req, app.state.default_alphas)
 
         if req.stream:
             stream_iter = session.generate_stream(req.prompt, raw=True, **gen_kwargs)
