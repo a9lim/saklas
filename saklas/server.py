@@ -23,7 +23,6 @@ from saklas.config_file import ConfigFileError
 from saklas.errors import SaklasError
 from saklas.hf import HFError
 from saklas.packs import PackFormatError
-from saklas.probes_bootstrap import load_defaults
 from saklas.sampling import SamplingConfig
 from saklas.session import ConcurrentGenerationError, SaklasSession
 from saklas.steering import Steering
@@ -193,33 +192,6 @@ class CompletionRequest(_SamplingBase):
     prompt: str
 
 
-class ExtractRequest(BaseModel):
-    name: str
-    source: str | dict[str, list] | None = None
-    baseline: str | None = None
-    alpha: float = 0.0
-    auto_register: bool = Field(True, alias="register")
-
-    model_config = {"populate_by_name": True}
-
-
-class LoadVectorRequest(BaseModel):
-    name: str
-    path: str
-    alpha: float = 0.0
-
-
-class PatchSessionRequest(BaseModel):
-    temperature: float | None = None
-    top_p: float | None = None
-    max_tokens: int | None = None
-    system_prompt: str | None = None
-
-
-class ActivateProbeRequest(BaseModel):
-    profile_path: str | None = None
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -240,19 +212,53 @@ def _error(status: int, message: str, error_type: str = "error",
 _bearer = HTTPBearer(auto_error=False)
 
 
-def _require_auth(request: Request,
-                  creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
-    expected = request.app.state.api_key
+def _check_bearer(headers, expected: str) -> bool:
+    """Return True iff a correct ``Authorization: Bearer <expected>`` header is present."""
+    auth = headers.get("authorization") or headers.get("Authorization")
+    if not auth:
+        return False
+    scheme, _, token = auth.partition(" ")
+    return scheme.lower() == "bearer" and token == expected
+
+
+def _require_auth(request: Request = None,  # type: ignore[assignment]
+                  websocket=None):
+    """Bearer-token auth gate for HTTP routes.
+
+    Accepts either a ``Request`` or a ``WebSocket`` — FastAPI resolves the
+    non-None one based on the route type. On WebSocket connections we can't
+    raise ``HTTPException(401)`` (the handshake hasn't completed), so the
+    dep returns silently and the handler uses ``ws_auth_ok()`` + ``close(1008)``
+    before accepting the connection.
+    """
+    conn = request if request is not None else websocket
+    if conn is None:
+        return None
+    expected = getattr(conn.app.state, "api_key", None)
     if not expected:
         return None
-    if creds is None or creds.scheme.lower() != "bearer" or creds.credentials != expected:
+    if request is None:
+        # WS path: handler calls ws_auth_ok() before websocket.accept().
+        return None
+    if not _check_bearer(request.headers, expected):
         raise HTTPException(
             status_code=401,
-            detail={"message": "Invalid API key",
-                    "type": "invalid_request_error",
+            detail={"message": "Invalid API key", "type": "invalid_request_error",
                     "param": None, "code": 401},
         )
     return None
+
+
+def ws_auth_ok(websocket) -> bool:
+    """Return True iff the WebSocket handshake carries valid bearer auth.
+
+    Call this BEFORE ``websocket.accept()``. If it returns False, close the
+    handshake with ``await websocket.close(code=1008)``.
+    """
+    expected = getattr(websocket.app.state, "api_key", None)
+    if not expected:
+        return True
+    return _check_bearer(websocket.headers, expected)
 
 
 def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
@@ -558,6 +564,9 @@ def create_app(session: SaklasSession, default_alphas: dict[str, float] | None =
     from saklas.ollama_api import register_ollama_routes
     register_ollama_routes(app)
 
+    from saklas.saklas_api import register_saklas_routes
+    register_saklas_routes(app)
+
     return app
 
 
@@ -725,220 +734,3 @@ def _register_routes(app: FastAPI) -> None:
             "probe_readings": _probe_reading_dict(session),
         }
 
-    # -----------------------------------------------------------------------
-    # Vector management
-    # -----------------------------------------------------------------------
-
-    @app.get("/v1/saklas/vectors")
-    def list_vectors():
-        vectors = session.vectors
-        out: dict[str, Any] = {}
-        for name, profile in vectors.items():
-            layers = sorted(profile.keys())
-            scored = _profile_top_layers(profile)
-            top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored]
-            out[name] = {
-                "layers": layers,
-                "top_layers": top,
-                "default_alpha": app.state.default_alphas.get(name, 0.0),
-            }
-        return {"vectors": out}
-
-    @app.post("/v1/saklas/vectors/extract")
-    async def extract_vector(req: ExtractRequest, request: Request):
-        accept = request.headers.get("accept", "application/json")
-
-        source: Any = req.source if req.source is not None else req.name
-
-        # If source is a dict with pairs, convert to list of tuples
-        if isinstance(source, dict) and "pairs" in source:
-            source = [(p, n) for p, n in source["pairs"]]
-
-        if "text/event-stream" in accept:
-            return StreamingResponse(
-                _stream_extract(session, app, req.name, source, req.baseline, req.alpha, req.auto_register),
-                media_type="text/event-stream",
-            )
-
-        # Blocking JSON response
-        progress_msgs: list[str] = []
-        try:
-            canonical, profile = session.extract(source, baseline=req.baseline,
-                                                 on_progress=lambda m: progress_msgs.append(m))
-        except ConcurrentGenerationError:
-            return _error(409, "Generation already in progress", "conflict")
-
-        if req.auto_register:
-            session.steer(req.name, profile)
-            app.state.default_alphas[req.name] = req.alpha
-
-        scored = _profile_top_layers(profile)
-        top_layer, top_score = scored[0] if scored else (0, 0.0)
-
-        return {
-            "name": req.name,
-            "canonical": canonical,
-            "layers": len(profile),
-            "top_layer": top_layer,
-            "top_score": round(top_score, 4),
-        }
-
-    async def _stream_extract(session, app, name, source, baseline, alpha, register):
-        # Known limitation: this is fake streaming.  session.extract() is
-        # synchronous and CPU/GPU-bound, so progress messages are accumulated
-        # in a list and replayed after extraction completes.  True incremental
-        # streaming would require threading the extraction pipeline, but the
-        # model cannot be safely accessed from multiple threads.  The
-        # non-streaming JSON path (extract_vector with Accept: application/json)
-        # is the primary interface; this SSE path exists for clients that want
-        # progress visibility at the cost of a deferred burst of events.
-        progress_msgs: list[str] = []
-
-        def _on_progress(msg):
-            progress_msgs.append(msg)
-        try:
-            canonical, profile = session.extract(source, baseline=baseline, on_progress=_on_progress)
-        except ConcurrentGenerationError:
-            err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
-            yield f"event: error\ndata: {json.dumps(err)}\n\n"
-            return
-
-        for msg in progress_msgs:
-            yield f"event: progress\ndata: {json.dumps({'message': msg})}\n\n"
-
-        if register:
-            session.steer(name, profile)
-            app.state.default_alphas[name] = alpha
-
-        scored = _profile_top_layers(profile)
-        top_layer, top_score = scored[0] if scored else (0, 0.0)
-
-        done = {"name": name, "canonical": canonical, "layers": len(profile), "top_layer": top_layer, "top_score": round(top_score, 4)}
-        yield f"event: done\ndata: {json.dumps(done)}\n\n"
-
-    @app.post("/v1/saklas/vectors/load")
-    def load_vector(req: LoadVectorRequest):
-        try:
-            profile = session.load_profile(req.path)
-        except FileNotFoundError:
-            raise HTTPException(404, f"File not found: {req.path}")
-        session.steer(req.name, profile)
-        app.state.default_alphas[req.name] = req.alpha
-
-        layers = sorted(profile.keys())
-        scored = _profile_top_layers(profile)
-        top = [{"layer": idx, "score": round(s, 4)} for idx, s in scored]
-
-        return {
-            "name": req.name,
-            "layers": layers,
-            "top_layers": top,
-            "default_alpha": req.alpha,
-        }
-
-    @app.delete("/v1/saklas/vectors/{name}")
-    def delete_vector(name: str):
-        if name not in session.vectors:
-            raise HTTPException(404, f"Vector '{name}' not found")
-        session.unsteer(name)
-        app.state.default_alphas.pop(name, None)
-        return JSONResponse(status_code=204, content=None)
-
-    # -----------------------------------------------------------------------
-    # Probe management
-    # -----------------------------------------------------------------------
-
-    @app.get("/v1/saklas/probes")
-    def list_probes():
-        probes = session.probes
-        monitor = session._monitor
-        out: dict[str, Any] = {}
-        for name in probes:
-            entry: dict[str, Any] = {"active": True}
-            if monitor and name in monitor.history:
-                hist = monitor.history[name]
-                if hist:
-                    entry["last_value"] = hist[-1]
-                    entry["history"] = list(hist)
-            out[name] = entry
-        return {"probes": out}
-
-    @app.get("/v1/saklas/probes/defaults")
-    def list_default_probes():
-        return {"defaults": load_defaults()}
-
-    @app.post("/v1/saklas/probes/{name}")
-    def activate_probe(name: str, req: ActivateProbeRequest | None = None):
-        profile = None
-        if req and req.profile_path:
-            try:
-                profile = session.load_profile(req.profile_path)
-            except FileNotFoundError:
-                raise HTTPException(404, f"File not found: {req.profile_path}")
-        session.probe(name, profile)
-        return {"name": name, "active": True}
-
-    @app.delete("/v1/saklas/probes/{name}")
-    def deactivate_probe(name: str):
-        if name not in session.probes:
-            raise HTTPException(404, f"Probe '{name}' not active")
-        session.unprobe(name)
-        return JSONResponse(status_code=204, content=None)
-
-    # -----------------------------------------------------------------------
-    # Session management
-    # -----------------------------------------------------------------------
-
-    @app.get("/v1/saklas/session")
-    def get_session():
-        info = session.model_info
-        return {
-            "model": session.model_id,
-            "model_info": {
-                "model_type": info.get("model_type", "unknown"),
-                "num_layers": info.get("num_layers", 0),
-                "hidden_dim": info.get("hidden_dim", 0),
-                "vram_used_gb": info.get("vram_used_gb", 0.0),
-            },
-            "config": {
-                "temperature": session.config.temperature,
-                "top_p": session.config.top_p,
-                "max_tokens": session.config.max_new_tokens,
-                "system_prompt": session.config.system_prompt,
-            },
-            "default_alphas": dict(app.state.default_alphas),
-            "history_length": len(session.history),
-        }
-
-    @app.patch("/v1/saklas/session")
-    def patch_session(req: PatchSessionRequest):
-        from dataclasses import is_dataclass, replace as _replace
-        overrides: dict = {}
-        if req.temperature is not None:
-            overrides["temperature"] = req.temperature
-        if req.top_p is not None:
-            overrides["top_p"] = req.top_p
-        if req.max_tokens is not None:
-            overrides["max_new_tokens"] = req.max_tokens
-        if req.system_prompt is not None:
-            overrides["system_prompt"] = req.system_prompt
-        if overrides:
-            if is_dataclass(session.config):
-                session.config = _replace(session.config, **overrides)
-            else:
-                # MagicMock or other non-frozen stand-ins (tests).
-                for k, v in overrides.items():
-                    setattr(session.config, k, v)
-        return {"status": "ok"}
-
-    @app.post("/v1/saklas/session/clear")
-    def clear_session():
-        session.clear_history()
-        return JSONResponse(status_code=204, content=None)
-
-    @app.post("/v1/saklas/session/rewind")
-    def rewind_session():
-        if not session.history:
-            raise HTTPException(400, "History is empty")
-        session.rewind()
-        return JSONResponse(status_code=204, content=None)

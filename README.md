@@ -383,11 +383,11 @@ curl -N http://localhost:8000/api/chat -d '{
 
 ### Saklas-specific routes
 
-Alongside the OpenAI surface, saklas exposes management routes under `/v1/saklas/*` for listing/extracting/loading/deleting vectors, adding/removing probes, updating session config, and clearing history. Full interactive docs at `http://localhost:8000/docs` while the server is running.
+Alongside the OpenAI surface, saklas exposes a native resource-tree under `/saklas/v1/*`: `GET/POST /saklas/v1/sessions` (single session in current impl, id `"default"`), `GET/PATCH /saklas/v1/sessions/{id}`, `POST /saklas/v1/sessions/{id}/{clear,rewind,extract,probe}`, vector and probe management under `/sessions/{id}/{vectors,probes}`, and **`WS /saklas/v1/sessions/{id}/stream`** — bidirectional token + probe co-stream. Client sends `{type: "generate", input, steering, sampling}` or `{type: "stop"}`; server emits `started`, `token` per step, and a final `done` event whose `result.per_token_probes` carries per-token probe readings. Full interactive docs at `http://localhost:8000/docs`.
 
 Probe readings piggyback as an extra `probe_readings` field in generation responses — standard clients ignore it, aware clients get inline monitoring data.
 
-The server is **stateless by default** — each request carries its full message list, and neither conversation history nor probe accumulators persist across requests. The `/v1/saklas/session/*` routes are stateful by design for single-user workflows. Concurrent requests queue FIFO against a single generation lock.
+The server is **stateless by default** — each request carries its full message list, and neither conversation history nor probe accumulators persist across requests. The native `/saklas/v1/sessions/{id}/{clear,rewind}` routes are stateful by design for single-user workflows. Concurrent requests queue FIFO against a per-session generation lock (both the REST routes and the WS stream share it).
 
 **Not supported (either protocol):** tool calling, strict JSON / `json_schema` mode, `/v1/embeddings`, `/api/embeddings`, `/api/embed`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete`. The server is designed for **trusted networks** — see [SECURITY.md](SECURITY.md) for the threat model before exposing it beyond your local machine.
 
