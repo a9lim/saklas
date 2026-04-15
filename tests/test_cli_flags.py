@@ -96,7 +96,7 @@ def test_clone_parser_parses_required_args():
     assert args.command == "clone"
     assert args.corpus_path == "/tmp/corpus.txt"
     assert args.name == "alice"
-    assert args.n_pairs == 45
+    assert args.n_pairs == 90
     assert args.seed is None
     assert args.force is False
     assert args.model is None

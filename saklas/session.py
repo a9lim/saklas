@@ -626,7 +626,7 @@ class SaklasSession:
         path,
         name: str,
         *,
-        n_pairs: int = _N_PAIRS,
+        n_pairs: int = 90,
         seed: int | None = None,
         force: bool = False,
     ) -> tuple[str, dict[int, torch.Tensor]]:

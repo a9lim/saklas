@@ -202,7 +202,7 @@ def clone_from_corpus(
     path: str | pathlib.Path,
     name: str,
     *,
-    n_pairs: int = 45,
+    n_pairs: int = 90,
     seed: int | None = None,
     force: bool = False,
 ) -> tuple[str, dict[int, torch.Tensor]]:

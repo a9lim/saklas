@@ -102,7 +102,7 @@ This means `/steer "anything"` works — religions, animals, fictional character
 
 ### Trait monitor
 
-Alongside each generation, saklas captures the hidden state at the last position for every probe layer, every step — via a hook attached right before generation and detached right after, inline with the main decode loop. No second forward pass. Those captures are then mean-centered against a cached per-layer baseline (computed from 45 neutral prompts) and scored via magnitude-weighted cosine similarity against every active probe. Each probe's per-layer weight is `||baked||` (= share × ref_norm, the same quantity the steering hook uses) so the monitor gives more weight to the layers that actually read the concept most cleanly.
+Alongside each generation, saklas captures the hidden state at the last position for every probe layer, every step — via a hook attached right before generation and detached right after, inline with the main decode loop. No second forward pass. Those captures are then mean-centered against a cached per-layer baseline (computed from 90 neutral prompts) and scored via magnitude-weighted cosine similarity against every active probe. Each probe's per-layer weight is `||baked||` (= share × ref_norm, the same quantity the steering hook uses) so the monitor gives more weight to the layers that actually read the concept most cleanly.
 
 History accumulates across generations in the TUI and surfaces as sparklines on the right panel. In the library you get `result.readings` as a dict of `ProbeReadings` per probe.
 
@@ -248,7 +248,7 @@ profile = session.load_profile("out.safetensors")
 # asks the model to neutralize each (batched), feeds persona↔neutral pairs
 # into the same contrastive-PCA pipeline. Caches under local/<name>/.
 name, profile = session.clone_from_corpus(
-    "transcripts.txt", "hunter", n_pairs=45, seed=None
+    "transcripts.txt", "hunter", n_pairs=90, seed=None
 )
 
 # Registry

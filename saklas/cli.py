@@ -245,8 +245,8 @@ def _build_clone_parser() -> argparse.ArgumentParser:
                    help="Persona identifier (stored under local/<name>)")
     p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
                    help="HuggingFace model ID or local path to run extraction on")
-    p.add_argument("-n", "--n-pairs", dest="n_pairs", type=int, default=45,
-                   help="Number of contrastive pairs to build (default: 45)")
+    p.add_argument("-n", "--n-pairs", dest="n_pairs", type=int, default=90,
+                   help="Number of contrastive pairs to build (default: 90)")
     p.add_argument("--seed", type=int, default=None,
                    help="Random seed for corpus sampling")
     p.add_argument("-f", "--force", action="store_true",

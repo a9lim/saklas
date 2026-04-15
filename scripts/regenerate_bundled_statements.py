@@ -42,7 +42,7 @@ NEUTRALS_PATH = REPO / "saklas" / "data" / "neutral_statements.json"
 
 MODEL_ID = "google/gemma-4-31b-it"
 N_PAIRS = 45
-N_NEUTRALS = 45
+N_NEUTRALS = 90
 
 
 # name -> (positive_pole, negative_pole, category)
