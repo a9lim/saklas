@@ -79,6 +79,8 @@ _SUBCOMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
     ("list",      "List installed concepts (and HF concepts by default)"),
     ("merge",     "Merge existing vectors into a new pack"),
     ("push",      "Push a concept pack to HF as a model repo"),
+    ("clone",     "Clone a persona from a text corpus"),
+    ("extract",   "Extract a steering vector for a concept"),
 ]
 
 
@@ -230,6 +232,42 @@ def _build_export_parser() -> argparse.ArgumentParser:
     g.add_argument("--model-hint", default=None, metavar="HINT",
                    help="Override the controlvector.model_hint field (default: "
                         "derived from the safe_model_id in the tensor filename)")
+    return p
+
+
+def _build_clone_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="saklas clone",
+        description="Clone a persona from a text corpus (one utterance per line)",
+    )
+    p.add_argument("corpus_path", help="Path to a UTF-8 text file, one utterance per line")
+    p.add_argument("-N", "--name", required=True,
+                   help="Persona identifier (stored under local/<name>)")
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
+                   help="HuggingFace model ID or local path to run extraction on")
+    p.add_argument("-n", "--n-pairs", dest="n_pairs", type=int, default=45,
+                   help="Number of contrastive pairs to build (default: 45)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for corpus sampling")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="Overwrite an existing cloned vector")
+    p.set_defaults(quantize=None, device="auto", probes=None)
+    return p
+
+
+def _build_extract_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="saklas extract",
+        description="Extract a steering vector for a concept (bipolar or monopolar)",
+    )
+    p.add_argument("concept", nargs="+",
+                   help="Either one concept (e.g. 'happy.sad' or 'agentic') "
+                        "or two poles (e.g. 'happy' 'sad')")
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
+                   help="HuggingFace model ID or local path to run extraction on")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="Re-extract even if a cached tensor exists")
+    p.set_defaults(quantize=None, device="auto", probes=None)
     return p
 
 
@@ -605,6 +643,95 @@ def _run_push(args: argparse.Namespace) -> None:
         print(f"Pushed {coord} -> {url}")
 
 
+def _require_model(args: argparse.Namespace) -> None:
+    if not args.model:
+        print(f"{args.command}: -m/--model is required", file=sys.stderr)
+        sys.exit(2)
+
+
+def _run_clone(args: argparse.Namespace) -> None:
+    _require_model(args)
+    from saklas.cloning import (
+        CorpusTooShortError, CorpusTooLongError, InsufficientPairsError,
+    )
+    from saklas.cli_selectors import _all_concepts
+
+    # Collision warning: if the requested name matches an existing concept
+    # in some other namespace, tell the user how to disambiguate.
+    for c in _all_concepts():
+        if c.name == args.name and c.namespace != "local":
+            print(
+                f"warning: '{args.name}' exists in namespace '{c.namespace}'; "
+                f"reference this as 'local/{args.name}' to disambiguate",
+                file=sys.stderr,
+            )
+            break
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    try:
+        canonical, _profile = session.clone_from_corpus(
+            args.corpus_path,
+            name=args.name,
+            n_pairs=args.n_pairs,
+            seed=args.seed,
+            force=args.force,
+        )
+    except (CorpusTooShortError, CorpusTooLongError, InsufficientPairsError) as e:
+        print(f"clone failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Cloned persona -> local/{canonical}")
+
+
+def _run_extract(args: argparse.Namespace) -> None:
+    _require_model(args)
+    from saklas.session import BIPOLAR_SEP, canonical_concept_name
+
+    if len(args.concept) == 1:
+        raw = args.concept[0]
+        baseline = None
+    elif len(args.concept) == 2:
+        raw = args.concept[0]
+        baseline = args.concept[1]
+    else:
+        print(
+            "extract: expected 1 or 2 positional arguments "
+            f"(got {len(args.concept)})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    canonical = canonical_concept_name(raw, baseline)
+
+    # Best-effort cache-skip: remove a cached tensor so extract() regenerates.
+    if args.force:
+        import pathlib
+        from saklas.paths import safe_model_id
+        from saklas.cli_selectors import _all_concepts
+        candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
+        candidate_folders.append(session._local_concept_folder(canonical))
+        for folder in candidate_folders:
+            p = pathlib.Path(folder) / f"{safe_model_id(session.model_id)}.safetensors"
+            if p.exists():
+                p.unlink()
+
+    try:
+        if baseline is not None:
+            canonical, _profile = session.extract(raw, baseline=baseline)
+        else:
+            canonical, _profile = session.extract(raw)
+    except Exception as e:
+        print(f"extract failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Extracted {canonical}")
+
+
 _SUBCOMMAND_TABLE = {
     "serve":     (_build_serve_parser,     _run_serve),
     "install":   (_build_install_parser,   _run_install),
@@ -615,6 +742,8 @@ _SUBCOMMAND_TABLE = {
     "merge":     (_build_merge_parser,     _run_merge),
     "push":      (_build_push_parser,      _run_push),
     "export":    (_build_export_parser,    _run_export),
+    "clone":     (_build_clone_parser,     _run_clone),
+    "extract":   (_build_extract_parser,   _run_extract),
 }
 
 

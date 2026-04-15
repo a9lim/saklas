@@ -91,6 +91,70 @@ def test_parse_merge():
     assert args.components == "default/happy:0.3,a9lim/archaic:0.4"
 
 
+def test_clone_parser_parses_required_args():
+    args = cli.parse_args(["clone", "/tmp/corpus.txt", "--name", "alice"])
+    assert args.command == "clone"
+    assert args.corpus_path == "/tmp/corpus.txt"
+    assert args.name == "alice"
+    assert args.n_pairs == 45
+    assert args.seed is None
+    assert args.force is False
+    assert args.model is None
+
+
+def test_clone_parser_all_flags():
+    args = cli.parse_args([
+        "clone", "/tmp/corpus.txt", "--name", "alice",
+        "-m", "foo/bar", "-n", "30", "--seed", "42", "-f",
+    ])
+    assert args.command == "clone"
+    assert args.corpus_path == "/tmp/corpus.txt"
+    assert args.name == "alice"
+    assert args.model == "foo/bar"
+    assert args.n_pairs == 30
+    assert args.seed == 42
+    assert args.force is True
+
+
+def test_clone_parser_missing_name_errors():
+    with pytest.raises(SystemExit):
+        cli.parse_args(["clone", "/tmp/corpus.txt"])
+
+
+def test_clone_parser_missing_path_errors():
+    with pytest.raises(SystemExit):
+        cli.parse_args(["clone", "--name", "alice"])
+
+
+def test_extract_parser_one_positional():
+    args = cli.parse_args(["extract", "happy.sad"])
+    assert args.command == "extract"
+    assert args.concept == ["happy.sad"]
+    assert args.model is None
+    assert args.force is False
+
+
+def test_extract_parser_two_positionals():
+    args = cli.parse_args(["extract", "happy", "sad"])
+    assert args.command == "extract"
+    assert args.concept == ["happy", "sad"]
+
+
+def test_extract_parser_rejects_three_positionals():
+    # nargs="+" accepts three at parse time; the runner rejects them with
+    # exit code 2. Parse succeeds here — match argparse behavior.
+    args = cli.parse_args(["extract", "a", "b", "c"])
+    assert args.concept == ["a", "b", "c"]
+
+
+def test_extract_parser_all_flags():
+    args = cli.parse_args(["extract", "happy.sad", "-m", "foo/bar", "-f"])
+    assert args.command == "extract"
+    assert args.concept == ["happy.sad"]
+    assert args.model == "foo/bar"
+    assert args.force is True
+
+
 def test_parse_config_flag(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "setup.yaml"
