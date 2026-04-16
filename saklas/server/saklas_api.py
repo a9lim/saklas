@@ -567,7 +567,11 @@ def register_saklas_routes(app: FastAPI) -> None:
                             readings = getattr(result, "readings", None)
                             if readings:
                                 for name, r in readings.items():
-                                    agg[name] = round(getattr(r, "mean", 0.0), 6)
+                                    # Use this generation's aggregate, not the
+                                    # rolling history mean.
+                                    pg = getattr(r, "per_generation", None)
+                                    val = pg[-1] if pg else getattr(r, "mean", 0.0)
+                                    agg[name] = round(val, 6)
                         yield (
                             f"data: {json.dumps({'type': 'done', 'generation_id': generation_id, 'finish_reason': getattr(result, 'finish_reason', 'stop') if result else 'stop', 'aggregate': agg})}"
                             "\n\n"
