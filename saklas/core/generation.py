@@ -320,6 +320,12 @@ class GenerationState:
         self.thinking_end_idx: int = 0
         self.finish_reason: str = "stop"
         self.thinking_state: ThinkingState = ThinkingState.IDLE
+        # For each on_token emission, the index in generated_ids of the
+        # token that triggered it (last buffered ID for multi-byte emits),
+        # plus whether the emit was thinking.  Used by the TUI to map
+        # per-token probe scores (which are in generated_ids space) back
+        # to the emitted token stream.
+        self.emit_map: list[tuple[int, bool]] = []
 
     def request_stop(self):
         self.stop_requested.set()
@@ -330,6 +336,7 @@ class GenerationState:
         self.thinking_end_idx = 0
         self.finish_reason = "stop"
         self.thinking_state = ThinkingState.IDLE
+        self.emit_map = []
 
 
 def build_chat_input(
@@ -652,16 +659,19 @@ def generate_steered(
                                 # Trim emit to the pre-stop portion only.
                                 trimmed = new_text[:hit_idx][prev_len:]
                                 if trimmed:
+                                    state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                                     on_token(trimmed, emit_thinking, emit_id,
                                              chosen_logprob, top_lp_pairs)
                                 state.finish_reason = "stop_sequence"
                                 break
                             completion_text = new_text
+                        state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                         on_token(emit_text, emit_thinking, emit_id,
                                  chosen_logprob, top_lp_pairs)
 
         # Flush any remaining buffered partial tokens
         if on_token and pending_ids:
+            state.emit_map.append((len(generated_ids) - 1, pending_thinking))
             on_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
 
     finally:
