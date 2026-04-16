@@ -199,6 +199,16 @@ class TraitMonitor:
                 s["max"] = val
         self._pending_aggregate = True
 
+    def score_single_token(self, hidden_per_layer: dict[int, torch.Tensor]) -> dict[str, float]:
+        """Score all probes against a single token's hidden states.
+
+        Like :meth:`measure_from_hidden` but does NOT accumulate into
+        history/stats.  Designed for inline per-token scoring during live
+        SSE streaming where accumulation would corrupt the session-level
+        probe accumulators.
+        """
+        return self._score_probes(hidden_per_layer, accumulate=False)
+
     def measure(self, model, tokenizer, layers, text: str, device=None, accumulate: bool = True) -> dict[str, float]:
         """Run one forward pass over *text* and compute probe similarities.
 

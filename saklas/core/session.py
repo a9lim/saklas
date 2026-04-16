@@ -236,6 +236,12 @@ class SaklasSession:
         self._last_result: GenerationResult | None = None
         self._last_per_token_scores: dict[str, list[float]] | None = None
 
+        # Live trait SSE subscribers.  Each entry is (event_loop, asyncio.Queue).
+        # The generation thread pushes tagged tuples via loop.call_soon_threadsafe;
+        # SSE handlers drain the queue asynchronously.
+        self._trait_queues: list[tuple] = []
+        self._trait_lock = threading.Lock()
+
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
 
@@ -289,6 +295,25 @@ class SaklasSession:
     @property
     def last_per_token_scores(self) -> dict[str, list[float]] | None:
         return self._last_per_token_scores
+
+    # -- Live trait SSE subscribers --
+
+    @property
+    def _trait_subscribers(self) -> int:
+        return len(self._trait_queues)
+
+    def register_trait_queue(self, loop, q) -> None:
+        """Register an ``(event_loop, asyncio.Queue)`` pair for live trait events."""
+        with self._trait_lock:
+            self._trait_queues.append((loop, q))
+
+    def unregister_trait_queue(self, loop, q) -> None:
+        """Remove a previously registered trait queue."""
+        with self._trait_lock:
+            try:
+                self._trait_queues.remove((loop, q))
+            except ValueError:
+                pass
 
     # -- Extraction --
 
@@ -1371,12 +1396,30 @@ class SaklasSession:
         frequency_penalty = sampling.frequency_penalty if sampling is not None else 0.0
 
         logprobs_list: list | None = [] if lp_count is not None else None
+        trait_token_counter = [0]
 
         def _token_tap(text, is_thinking, tid, lp, top_lp):
             if logprobs_list is not None and tid >= 0 and not is_thinking:
                 logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
             if on_token is not None:
                 on_token(text, is_thinking, tid, lp, top_lp)
+            # Inline per-token scoring for live SSE trait subscribers.
+            if self._trait_queues and self._monitor.probe_names:
+                latest_hidden = {
+                    layer_idx: bucket[-1]
+                    for layer_idx, bucket in self._capture._per_layer.items()
+                    if bucket
+                }
+                if latest_hidden:
+                    scores = self._monitor.score_single_token(latest_hidden)
+                    event = ("token", trait_token_counter[0], text, is_thinking, scores)
+                    trait_token_counter[0] += 1
+                    with self._trait_lock:
+                        for lp_ref, q in list(self._trait_queues):
+                            try:
+                                lp_ref.call_soon_threadsafe(q.put_nowait, event)
+                            except Exception:
+                                pass
 
         steering_cm = None
         if steering_obj is not None and steering_obj.alphas:
