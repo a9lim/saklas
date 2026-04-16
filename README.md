@@ -334,7 +334,7 @@ curl -N http://localhost:8000/api/chat -d '{
 
 ### Saklas-native routes
 
-`/saklas/v1/*` resource tree with sessions, vector/probe management, one-shot probe scoring, and a bidirectional WebSocket for token+probe co-streaming. Full interactive docs at `http://localhost:8000/docs`.
+`/saklas/v1/*` resource tree with sessions, vector/probe management, one-shot probe scoring, a bidirectional WebSocket for token+probe co-streaming, and a **live traits SSE endpoint** (`GET /saklas/v1/sessions/{id}/traits/stream`) that streams per-token probe scores in real time during any active generation. Full interactive docs at `http://localhost:8000/docs`.
 
 ### Flags
 
@@ -377,7 +377,10 @@ saklas vector extract <concept> | <pos> <neg> [-m MODEL] [-f]
 saklas vector merge <name> <components> [-m] [-f] [-s]
 saklas vector clone <corpus-file> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
 saklas vector compare <concepts...> -m MODEL [-v] [-j]
+saklas vector why <concept> -m MODEL [-n N] [--all] [-j]
 ```
+
+**Merge projection**: `a~b:0.5` removes b's direction from a before scaling — e.g. `saklas vector merge dehallu default/creative.conventional~default/hallucinating.grounded:0.8` gives you creative writing without the hallucination axis.
 
 **Selectors**: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve cross-namespace and error on ambiguity.
 
