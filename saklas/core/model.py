@@ -137,7 +137,6 @@ def _load_text_from_multimodal(
     """
     import gc
     import json
-    import os
     from safetensors.torch import load_file
     from transformers.utils import (
         cached_file,
@@ -156,18 +155,19 @@ def _load_text_from_multimodal(
         model_id, SAFE_WEIGHTS_INDEX_NAME, _raise_exceptions_for_missing_entries=False
     )
     if index_path is not None:
-        model_dir = os.path.dirname(index_path)
         with open(index_path) as f:
-            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+            shard_names = sorted(set(json.load(f)["weight_map"].values()))
+        # Resolve each shard through cached_file so HF hub downloads it
+        # if it isn't already local (the index can land before the shards).
+        shard_paths = [cached_file(model_id, name) for name in shard_names]
     else:
         single_path = cached_file(model_id, SAFE_WEIGHTS_NAME)
-        model_dir = os.path.dirname(single_path)
-        shard_files = [os.path.basename(single_path)]
+        shard_paths = [single_path]
 
     prefix = "language_model."
 
-    for sf in shard_files:
-        shard = load_file(os.path.join(model_dir, sf), device="cpu")
+    for sf in shard_paths:
+        shard = load_file(sf, device="cpu")
         mapped: dict[str, torch.Tensor] = {}
 
         for k, v in shard.items():

@@ -318,3 +318,58 @@ def test_probe_seeds_highlight():
     app._on_probe_added("happy.sad")
     assert app._highlight_probe == "happy.sad"
     assert app._highlighting is True
+
+
+# ---- /compare command ----
+
+def test_compare_pairwise():
+    import torch
+    from saklas.core.profile import Profile
+
+    app = _make_app()
+    t = {0: torch.randn(8), 1: torch.randn(8)}
+    app._session._profiles = {
+        "angry.calm": Profile(t),
+        "happy.sad": Profile({k: v.clone() for k, v in t.items()}),
+    }
+    app._session._monitor.profiles = {}
+    app._handle_command("/compare angry.calm happy.sad")
+    msg = _msgs(app)
+    assert "angry.calm" in msg and "happy.sad" in msg
+
+
+def test_compare_ranked():
+    import torch
+    from saklas.core.profile import Profile
+
+    app = _make_app()
+    base = {0: torch.randn(8), 1: torch.randn(8)}
+    app._session._profiles = {
+        "angry.calm": Profile(base),
+        "happy.sad": Profile({k: torch.randn(8) for k in base}),
+        "formal.casual": Profile({k: torch.randn(8) for k in base}),
+    }
+    app._session._monitor.profiles = {
+        "angry.calm": Profile(base),
+        "happy.sad": Profile({k: torch.randn(8) for k in base}),
+        "formal.casual": Profile({k: torch.randn(8) for k in base}),
+    }
+    app._handle_command("/compare angry.calm")
+    msg = _msgs(app)
+    assert "angry.calm" in msg
+
+
+def test_compare_unknown_name():
+    app = _make_app()
+    app._session._profiles = {}
+    app._session._monitor.profiles = {}
+    app._handle_command("/compare ghost")
+    msg = _msgs(app)
+    assert "not found" in msg.lower() or "no profile" in msg.lower()
+
+
+def test_compare_no_args():
+    app = _make_app()
+    app._handle_command("/compare")
+    msg = _msgs(app)
+    assert "Usage" in msg or "usage" in msg

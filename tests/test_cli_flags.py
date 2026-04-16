@@ -13,7 +13,7 @@ def test_parse_zero_args_prints_help_and_exits_zero(capsys):
         cli.parse_args([])
     assert ex.value.code == 0
     out = capsys.readouterr().out
-    assert "tui" in out and "serve" in out and "pack" in out and "config" in out
+    assert "tui" in out and "serve" in out and "pack" in out and "vector" in out and "config" in out
 
 
 def test_parse_bare_unknown_model_id_errors():
@@ -108,16 +108,33 @@ def test_parse_pack_search():
     assert args.query == "emotion"
 
 
-def test_parse_pack_merge():
-    args = cli.parse_args(["pack", "merge", "bard", "default/happy:0.3,a9lim/archaic:0.4"])
-    assert args.pack_cmd == "merge"
+def test_parse_pack_merge_is_gone():
+    """merge moved to vector subtree."""
+    with pytest.raises(SystemExit):
+        cli.parse_args(["pack", "merge", "bard", "default/happy:0.3"])
+
+
+# ---------------------------------------------------------------------------
+# vector subtree
+# ---------------------------------------------------------------------------
+
+def test_parse_vector_no_verb_exits_zero(capsys):
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["vector"])
+    assert ex.value.code == 0
+
+
+def test_parse_vector_merge():
+    args = cli.parse_args(["vector", "merge", "bard", "default/happy:0.3,a9lim/archaic:0.4"])
+    assert args.command == "vector"
+    assert args.vector_cmd == "merge"
     assert args.name == "bard"
     assert args.components == "default/happy:0.3,a9lim/archaic:0.4"
 
 
-def test_parse_pack_clone_required_args():
-    args = cli.parse_args(["pack", "clone", "/tmp/corpus.txt", "--name", "alice"])
-    assert args.pack_cmd == "clone"
+def test_parse_vector_clone_required_args():
+    args = cli.parse_args(["vector", "clone", "/tmp/corpus.txt", "--name", "alice"])
+    assert args.vector_cmd == "clone"
     assert args.corpus_path == "/tmp/corpus.txt"
     assert args.name == "alice"
     assert args.n_pairs == 90
@@ -126,26 +143,26 @@ def test_parse_pack_clone_required_args():
     assert args.model is None
 
 
-def test_parse_pack_clone_missing_name_errors():
+def test_parse_vector_clone_missing_name_errors():
     with pytest.raises(SystemExit):
-        cli.parse_args(["pack", "clone", "/tmp/corpus.txt"])
+        cli.parse_args(["vector", "clone", "/tmp/corpus.txt"])
 
 
-def test_parse_pack_extract_one_positional():
-    args = cli.parse_args(["pack", "extract", "happy.sad"])
-    assert args.pack_cmd == "extract"
+def test_parse_vector_extract_one_positional():
+    args = cli.parse_args(["vector", "extract", "happy.sad"])
+    assert args.vector_cmd == "extract"
     assert args.concept == ["happy.sad"]
     assert args.model is None
     assert args.force is False
 
 
-def test_parse_pack_extract_two_positionals():
-    args = cli.parse_args(["pack", "extract", "happy", "sad"])
+def test_parse_vector_extract_two_positionals():
+    args = cli.parse_args(["vector", "extract", "happy", "sad"])
     assert args.concept == ["happy", "sad"]
 
 
-def test_parse_pack_extract_all_flags():
-    args = cli.parse_args(["pack", "extract", "happy.sad", "-m", "foo/bar", "-f"])
+def test_parse_vector_extract_all_flags():
+    args = cli.parse_args(["vector", "extract", "happy.sad", "-m", "foo/bar", "-f"])
     assert args.concept == ["happy.sad"]
     assert args.model == "foo/bar"
     assert args.force is True
@@ -327,7 +344,7 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch, tmp_path, c
     monkeypatch.setattr(cli_runners, "_print_startup", lambda args: None)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["pack", "extract", "happy.sad", "-m", model_id])
+        cli.main(["vector", "extract", "happy.sad", "-m", model_id])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
     assert "already extracted at" in out
@@ -372,6 +389,47 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
 
     cli.main(["tui", "-c", str(p)])
     assert "default/happy.sad" in registered
+
+
+def test_parse_vector_compare_two_args():
+    args = cli.parse_args(["vector", "compare", "angry.calm", "happy.sad", "-m", "foo/bar"])
+    assert args.command == "vector"
+    assert args.vector_cmd == "compare"
+    assert args.concepts == ["angry.calm", "happy.sad"]
+    assert args.model == "foo/bar"
+
+
+def test_parse_vector_compare_one_arg():
+    args = cli.parse_args(["vector", "compare", "angry.calm", "-m", "foo/bar"])
+    assert args.concepts == ["angry.calm"]
+
+
+def test_parse_vector_compare_three_plus_args():
+    args = cli.parse_args(["vector", "compare", "angry.calm", "happy.sad", "formal.casual", "-m", "foo/bar"])
+    assert args.concepts == ["angry.calm", "happy.sad", "formal.casual"]
+
+
+def test_parse_vector_compare_selector_arg():
+    args = cli.parse_args(["vector", "compare", "tag:affect", "-m", "foo/bar"])
+    assert args.concepts == ["tag:affect"]
+
+
+def test_parse_vector_compare_verbose_and_json():
+    args = cli.parse_args(["vector", "compare", "a", "b", "-m", "x", "-v", "-j"])
+    assert args.verbose is True
+    assert args.json_output is True
+
+
+def test_parse_vector_compare_missing_model_errors():
+    with pytest.raises(SystemExit):
+        cli.parse_args(["vector", "compare", "angry.calm"])
+
+
+def test_vector_appears_in_help(capsys):
+    with pytest.raises(SystemExit):
+        cli.parse_args([])
+    out = capsys.readouterr().out
+    assert "vector" in out
 
 
 def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):

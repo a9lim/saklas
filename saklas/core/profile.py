@@ -222,6 +222,47 @@ class Profile:
                 )
         return type(self)(out, metadata=self._metadata)
 
+    def cosine_similarity(
+        self,
+        other: "Profile",
+        *,
+        per_layer: bool = False,
+    ) -> "float | dict[int, float]":
+        """Cosine similarity against *other*.
+
+        **Aggregate** (default): magnitude-weighted cosine over the layer
+        intersection.  Weighting by ``||baked||`` matches the monitor regime.
+
+        **Per-layer** (``per_layer=True``): raw cosine per shared layer.
+
+        Raises :class:`ProfileError` when no layers are shared.
+        """
+        shared = sorted(set(self._tensors) & set(other._tensors))
+        if not shared:
+            raise ProfileError(
+                "cosine_similarity: no shared layers between the two profiles"
+            )
+
+        if per_layer:
+            out: dict[int, float] = {}
+            for L in shared:
+                a, b = self._tensors[L].float(), other._tensors[L].float()
+                cos = (torch.dot(a, b) / (a.norm() * b.norm())).item()
+                out[L] = cos
+            return out
+
+        # Magnitude-weighted aggregate.
+        num = 0.0
+        den = 0.0
+        for L in shared:
+            a, b = self._tensors[L].float(), other._tensors[L].float()
+            na, nb = a.norm().item(), b.norm().item()
+            cos = (torch.dot(a, b) / (na * nb)).item()
+            w = na * nb
+            num += w * cos
+            den += w
+        return num / den
+
     def __repr__(self) -> str:
         layers = self.layers
         if len(layers) <= 4:

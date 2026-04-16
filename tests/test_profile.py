@@ -135,3 +135,77 @@ def test_repr_contains_layer_info():
     r = repr(p)
     assert "Profile(" in r
     assert "10 layers" in r
+
+
+# ---------------------------------------------------------------------------
+# cosine_similarity
+# ---------------------------------------------------------------------------
+
+def test_cosine_similarity_identical_profiles():
+    """Identical profiles should have cosine similarity 1.0."""
+    tensors = _mk(layers=(0, 1, 2), dim=16)
+    a = Profile(tensors)
+    b = Profile({k: v.clone() for k, v in tensors.items()})
+    assert a.cosine_similarity(b) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_cosine_similarity_opposite_profiles():
+    """Negated profiles should have cosine similarity -1.0."""
+    tensors = _mk(layers=(0, 1, 2), dim=16)
+    a = Profile(tensors)
+    b = Profile({k: -v for k, v in tensors.items()})
+    assert a.cosine_similarity(b) == pytest.approx(-1.0, abs=1e-5)
+
+
+def test_cosine_similarity_orthogonal_profiles():
+    """Orthogonal profiles should have cosine similarity 0.0."""
+    # Construct two orthogonal vectors per layer via Gram-Schmidt.
+    layers = (0, 1, 2)
+    a_tensors, b_tensors = {}, {}
+    for L in layers:
+        v = torch.randn(16)
+        u = torch.randn(16)
+        # Remove component of v from u -> orthogonal.
+        u = u - (u @ v) / (v @ v) * v
+        a_tensors[L] = v
+        b_tensors[L] = u
+    a = Profile(a_tensors)
+    b = Profile(b_tensors)
+    assert a.cosine_similarity(b) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_cosine_similarity_partial_layer_overlap():
+    """Only shared layers contribute to the similarity."""
+    shared = torch.randn(8)
+    a = Profile({0: shared.clone(), 1: torch.randn(8)})
+    b = Profile({0: shared.clone(), 2: torch.randn(8)})
+    # Only layer 0 overlaps, and it's identical -> 1.0.
+    assert a.cosine_similarity(b) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_cosine_similarity_empty_intersection_raises():
+    """No shared layers should raise ProfileError."""
+    a = Profile({0: torch.randn(8)})
+    b = Profile({1: torch.randn(8)})
+    with pytest.raises(ProfileError, match="no shared layers"):
+        a.cosine_similarity(b)
+
+
+def test_cosine_similarity_per_layer():
+    """per_layer=True returns a dict of per-layer cosines."""
+    tensors = _mk(layers=(0, 5, 10), dim=16)
+    a = Profile(tensors)
+    b = Profile({k: v.clone() for k, v in tensors.items()})
+    result = a.cosine_similarity(b, per_layer=True)
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {0, 5, 10}
+    for v in result.values():
+        assert v == pytest.approx(1.0, abs=1e-5)
+
+
+def test_cosine_similarity_per_layer_partial_overlap():
+    """per_layer=True only includes shared layers."""
+    a = Profile({0: torch.randn(8), 1: torch.randn(8)})
+    b = Profile({1: torch.randn(8), 2: torch.randn(8)})
+    result = a.cosine_similarity(b, per_layer=True)
+    assert set(result.keys()) == {1}
