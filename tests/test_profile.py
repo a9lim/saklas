@@ -209,3 +209,67 @@ def test_cosine_similarity_per_layer_partial_overlap():
     b = Profile({1: torch.randn(8), 2: torch.randn(8)})
     result = a.cosine_similarity(b, per_layer=True)
     assert set(result.keys()) == {1}
+
+
+# ---------------------------------------------------------------------------
+# Profile.projected_away
+# ---------------------------------------------------------------------------
+
+def test_projected_away_orthogonality():
+    """Result at each shared layer should be orthogonal to other."""
+    a = Profile({
+        0: torch.tensor([1.0, 2.0, 0.0]),
+        1: torch.tensor([3.0, 1.0, 5.0]),
+    })
+    b = Profile({
+        0: torch.tensor([1.0, 0.0, 0.0]),
+        1: torch.tensor([0.0, 1.0, 0.0]),
+    })
+    result = a.projected_away(b)
+    for layer in [0, 1]:
+        r_f = result[layer].float()
+        b_f = b[layer].float()
+        dot = torch.dot(r_f, b_f).item()
+        assert abs(dot) < 1e-5, f"Layer {layer} not orthogonal: dot={dot}"
+
+
+def test_projected_away_layer_not_in_other_unchanged():
+    """Layers in self but not in other are included unchanged."""
+    a = Profile({0: torch.tensor([1.0, 2.0]), 1: torch.tensor([3.0, 4.0])})
+    b = Profile({1: torch.tensor([1.0, 0.0])})
+    result = a.projected_away(b)
+    assert set(result.keys()) == {0, 1}
+    assert torch.allclose(result[0], a[0])
+
+
+def test_projected_away_near_zero_b_skipped():
+    """Near-zero b layer (dot < 1e-12) is skipped; self layer copied as-is."""
+    a = Profile({0: torch.tensor([1.0, 2.0])})
+    b = Profile({0: torch.tensor([0.0, 0.0])})
+    result = a.projected_away(b)
+    assert torch.allclose(result[0], a[0])
+
+
+def test_projected_away_empty_intersection_raises():
+    """No shared layers should raise ProfileError."""
+    a = Profile({0: torch.randn(4)})
+    b = Profile({1: torch.randn(4)})
+    with pytest.raises(ProfileError, match="no shared layers"):
+        a.projected_away(b)
+
+
+def test_projected_away_full_projection():
+    """Projecting a vector fully aligned with b yields near-zero result."""
+    v = torch.tensor([3.0, 0.0, 0.0])
+    a = Profile({0: v.clone()})
+    b = Profile({0: torch.tensor([1.0, 0.0, 0.0])})
+    result = a.projected_away(b)
+    assert torch.allclose(result[0].float(), torch.zeros(3), atol=1e-6)
+
+
+def test_projected_away_preserves_metadata():
+    """Metadata from self is preserved in the output Profile."""
+    a = Profile({0: torch.tensor([1.0, 0.0])}, metadata={"method": "test"})
+    b = Profile({0: torch.tensor([1.0, 0.0])})
+    result = a.projected_away(b)
+    assert result.metadata.get("method") == "test"

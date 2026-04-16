@@ -222,6 +222,40 @@ class Profile:
                 )
         return type(self)(out, metadata=self._metadata)
 
+    def projected_away(self, other: "Profile") -> "Profile":
+        """Return a new Profile with *other*'s direction projected out, per layer.
+
+        Per-layer math (fp32)::
+
+            result_L = self_L - (dot(self_L, other_L) / dot(other_L, other_L)) * other_L
+
+        Only layers present in *both* profiles are projected; layers in
+        ``self`` but not ``other`` are included unchanged.  Near-zero
+        ``dot(other_L, other_L) < 1e-12`` layers are copied unchanged.
+
+        Raises :class:`ProfileError` when no layers are shared between
+        ``self`` and ``other``.
+        """
+        shared = set(self._tensors) & set(other._tensors)
+        if not shared:
+            raise ProfileError(
+                "projected_away: no shared layers between the two profiles"
+            )
+        out: dict[int, torch.Tensor] = {}
+        for layer, a_t in self._tensors.items():
+            if layer not in other._tensors:
+                out[layer] = a_t
+                continue
+            a_f = a_t.to(dtype=torch.float32)
+            b_f = other._tensors[layer].to(dtype=torch.float32)
+            b_dot = torch.dot(b_f, b_f).item()
+            if b_dot < 1e-12:
+                out[layer] = a_t
+            else:
+                proj = (torch.dot(a_f, b_f) / b_dot) * b_f
+                out[layer] = (a_f - proj).to(dtype=a_t.dtype)
+        return type(self)(out, metadata=self._metadata)
+
     def cosine_similarity(
         self,
         other: "Profile",
