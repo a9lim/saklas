@@ -108,7 +108,9 @@ _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
 # _LAYER_ACCESSORS is wired up optimistically — it may work, but has not been
 # exercised. See CLAUDE.md "Architecture" section.
 _TESTED_ARCHS: frozenset[str] = frozenset({
-    "qwen2", "qwen3", "gemma2", "gemma3", "mistral3", "gpt_oss", "llama", "glm",
+    "qwen2", "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe",
+    "gemma2", "gemma3", "gemma3_text", "gemma4", "gemma4_text",
+    "mistral3", "ministral3", "gpt_oss", "llama", "glm",
 })
 _warned: set[str] = set()
 
