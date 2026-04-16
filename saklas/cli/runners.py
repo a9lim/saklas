@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from saklas.cli.parsers import _PACK_VERBS
+from saklas.cli.parsers import _PACK_VERBS, _VECTOR_VERBS
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +382,8 @@ def _run_push(args: argparse.Namespace) -> None:
 
 def _require_model(args: argparse.Namespace) -> None:
     if not args.model:
-        print(f"{args.pack_cmd}: -m/--model is required", file=sys.stderr)
+        cmd = getattr(args, "vector_cmd", None) or getattr(args, "pack_cmd", None) or "?"
+        print(f"{cmd}: -m/--model is required", file=sys.stderr)
         sys.exit(2)
 
 
@@ -488,12 +489,12 @@ _PACK_RUNNERS = {
     "rm":      _run_rm,
     "ls":      _run_ls,
     "search":  _run_search,
-    "merge":   _run_merge,
     "push":    _run_push,
     "export":  _run_export,
-    "clone":   _run_clone,
-    "extract": _run_extract,
 }
+
+
+# --- vector runners ------------------------------------------------------
 
 
 # --- config runners ------------------------------------------------------
@@ -565,9 +566,180 @@ def _run_config_validate(args: argparse.Namespace) -> None:
     print(f"{p}: ok")
 
 
+def _run_compare(args: argparse.Namespace) -> None:
+    import json as _json
+    from saklas.cli.selectors import parse as sel_parse, resolve
+    from saklas.io.paths import vectors_dir, safe_model_id
+    from saklas.core.profile import Profile, ProfileError
+
+    sid = safe_model_id(args.model)
+
+    # Expand selectors into concept names.
+    names: list[str] = []
+    for raw in args.concepts:
+        try:
+            sel = sel_parse(raw)
+        except Exception:
+            names.append(raw)
+            continue
+        if sel.kind == "name":
+            names.append(raw)
+        else:
+            resolved = resolve(sel)
+            for c in resolved:
+                names.append(f"{c.namespace}/{c.name}")
+
+    # Load profiles from disk.
+    profiles: dict[str, Profile] = {}
+    for name in names:
+        sel = sel_parse(name)
+        matches = resolve(sel)
+        if not matches:
+            print(f"warning: '{name}' not found, skipping", file=sys.stderr)
+            continue
+        folder = matches[0].folder
+        tensor_path = folder / f"{sid}.safetensors"
+        if not tensor_path.is_file():
+            # Try GGUF fallback.
+            gguf_path = folder / f"{sid}.gguf"
+            if gguf_path.is_file():
+                tensor_path = gguf_path
+            else:
+                print(f"warning: no tensor for '{name}' with model {args.model}, skipping",
+                      file=sys.stderr)
+                continue
+        display = matches[0].name
+        try:
+            profiles[display] = Profile.load(tensor_path)
+        except (ProfileError, Exception) as e:
+            print(f"warning: failed to load '{name}': {e}", file=sys.stderr)
+
+    if len(profiles) < 1:
+        print("compare: no loadable profiles found", file=sys.stderr)
+        sys.exit(1)
+
+    ordered = list(profiles.keys())
+
+    # 1-arg mode: rank all installed against the target.
+    if len(args.concepts) == 1 and len(ordered) == 1:
+        target_name = ordered[0]
+        target = profiles[target_name]
+
+        # Load all other installed profiles for this model.
+        others: dict[str, Profile] = {}
+        vdir = vectors_dir()
+        if vdir.is_dir():
+            for ns_dir in sorted(vdir.iterdir()):
+                if not ns_dir.is_dir():
+                    continue
+                for cdir in sorted(ns_dir.iterdir()):
+                    if not cdir.is_dir():
+                        continue
+                    if cdir.name == target_name:
+                        continue
+                    tp = cdir / f"{sid}.safetensors"
+                    if not tp.is_file():
+                        tp = cdir / f"{sid}.gguf"
+                    if not tp.is_file():
+                        continue
+                    try:
+                        others[cdir.name] = Profile.load(tp)
+                    except Exception:
+                        continue
+
+        if not others:
+            print(f"compare: no other profiles found for model {args.model}", file=sys.stderr)
+            sys.exit(1)
+
+        scores = {name: target.cosine_similarity(p) for name, p in others.items()}
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+        if args.json_output:
+            print(_json.dumps({"target": target_name, "model": args.model,
+                               "similarities": [{"name": n, "similarity": round(s, 6)}
+                                                 for n, s in ranked]}, indent=2))
+        else:
+            width = max(len(n) for n, _ in ranked)
+            print(f"{target_name} vs all installed ({args.model}):")
+            for name, score in ranked:
+                print(f"  {name:<{width}}  {score:+.4f}")
+        return
+
+    if len(ordered) < 2:
+        print("compare: need at least 2 profiles to compare", file=sys.stderr)
+        sys.exit(1)
+
+    # 2-arg mode: pairwise.
+    if len(ordered) == 2:
+        a_name, b_name = ordered
+        a, b = profiles[a_name], profiles[b_name]
+        sim = a.cosine_similarity(b)
+
+        if args.json_output:
+            result = {"a": a_name, "b": b_name, "model": args.model,
+                      "similarity": round(sim, 6)}
+            if args.verbose:
+                result["per_layer"] = {str(k): round(v, 6)
+                                       for k, v in a.cosine_similarity(b, per_layer=True).items()}
+            print(_json.dumps(result, indent=2))
+        else:
+            print(f"{a_name} ~ {b_name}: {sim:+.4f}")
+            if args.verbose:
+                per_layer = a.cosine_similarity(b, per_layer=True)
+                for layer in sorted(per_layer):
+                    print(f"  layer {layer:>3}: {per_layer[layer]:+.4f}")
+        return
+
+    # 3+ mode: N×N matrix.
+    matrix: dict[str, dict[str, float]] = {}
+    for a_name in ordered:
+        matrix[a_name] = {}
+        for b_name in ordered:
+            if a_name == b_name:
+                matrix[a_name][b_name] = 1.0
+            else:
+                matrix[a_name][b_name] = profiles[a_name].cosine_similarity(profiles[b_name])
+
+    if args.json_output:
+        print(_json.dumps({"model": args.model, "concepts": ordered,
+                           "matrix": {a: {b: round(v, 6) for b, v in row.items()}
+                                      for a, row in matrix.items()}}, indent=2))
+    else:
+        width = max(len(n) for n in ordered)
+        header = " " * (width + 2) + "  ".join(f"{n:>{width}}" for n in ordered)
+        print(header)
+        for a_name in ordered:
+            row = "  ".join(f"{matrix[a_name][b]:>{width}.4f}" for b in ordered)
+            print(f"{a_name:<{width}}  {row}")
+
+
+_VECTOR_RUNNERS = {
+    "extract": _run_extract,
+    "merge":   _run_merge,
+    "clone":   _run_clone,
+    "compare": _run_compare,
+}
+
+
+def _run_vector(args: argparse.Namespace) -> None:
+    vector_cmd = getattr(args, "vector_cmd", None)
+    if vector_cmd is None:
+        print("usage: saklas vector <verb> [...]")
+        print()
+        width = max(len(v) for v, _ in _VECTOR_VERBS)
+        for v, desc in _VECTOR_VERBS:
+            print(f"  {v:<{width}}  {desc}")
+        print()
+        print("Run `saklas vector <verb> -h` for verb-specific options.")
+        sys.exit(0)
+    runner = _VECTOR_RUNNERS[vector_cmd]
+    runner(args)
+
+
 _COMMAND_RUNNERS = {
     "tui":    _run_tui,
     "serve":  _run_serve,
     "pack":   _run_pack,
+    "vector": _run_vector,
     "config": _run_config,
 }

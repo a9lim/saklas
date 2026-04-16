@@ -361,6 +361,8 @@ class SaklasApp(App):
                 self._session.stop()
                 return
             self.exit()
+        elif cmd == "/compare":
+            self._handle_compare(arg)
         elif cmd == "/help":
             chat.add_system_message(
                 "Steering:\n"
@@ -373,6 +375,7 @@ class SaklasApp(App):
                 "  /unprobe <name>             — remove probe\n"
                 '  /extract "concept"          — cache-warm only\n'
                 "  /why                        — top layers for selected probe\n"
+                "  /compare <a> [b]            — cosine similarity\n"
                 "Session:\n"
                 "  /clear, /rewind, /regen     — history ops\n"
                 "  /save <name>, /load <name>  — snapshot conv + alphas\n"
@@ -1075,6 +1078,73 @@ class SaklasApp(App):
         else:
             lines.append("  (no per-token scores — run a generation with this probe active)")
         chat.add_system_message("\n".join(lines))
+
+    def _handle_compare(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
+            chat.add_system_message("Usage: /compare <name> [other_name]")
+            return
+
+        parts = arg.split()
+
+        # Gather all available profiles: session profiles + monitor probes.
+        all_profiles: dict[str, "Profile"] = {}
+        for name, prof in self._session._profiles.items():
+            from saklas.core.profile import Profile
+            if isinstance(prof, Profile):
+                all_profiles[name] = prof
+        if self._session._monitor:
+            for name, prof in self._session._monitor.profiles.items():
+                if name not in all_profiles:
+                    from saklas.core.profile import Profile
+                    if isinstance(prof, Profile):
+                        all_profiles[name] = prof
+
+        if len(parts) == 1:
+            # 1-arg: ranked comparison against all loaded profiles.
+            target_name = parts[0]
+            if target_name not in all_profiles:
+                chat.add_system_message(f"No profile found for '{target_name}'")
+                return
+            target = all_profiles[target_name]
+            others = {n: p for n, p in all_profiles.items() if n != target_name}
+            if not others:
+                chat.add_system_message("No other profiles loaded to compare against.")
+                return
+            scores = {}
+            for name, prof in others.items():
+                try:
+                    scores[name] = target.cosine_similarity(prof)
+                except Exception:
+                    continue
+            if not scores:
+                chat.add_system_message("No comparable profiles (no shared layers).")
+                return
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            width = max(len(n) for n, _ in ranked)
+            lines = [f"{target_name} vs loaded profiles:"]
+            for name, score in ranked:
+                lines.append(f"  {name:<{width}}  {score:+.4f}")
+            chat.add_system_message("\n".join(lines))
+
+        elif len(parts) == 2:
+            # 2-arg: pairwise.
+            a_name, b_name = parts
+            if a_name not in all_profiles:
+                chat.add_system_message(f"No profile found for '{a_name}'")
+                return
+            if b_name not in all_profiles:
+                chat.add_system_message(f"No profile found for '{b_name}'")
+                return
+            try:
+                sim = all_profiles[a_name].cosine_similarity(all_profiles[b_name])
+            except Exception as e:
+                chat.add_system_message(f"Compare failed: {e}")
+                return
+            chat.add_system_message(f"{a_name} ~ {b_name}: {sim:+.4f}")
+
+        else:
+            chat.add_system_message("Usage: /compare <name> [other_name]")
 
     def _dispatch_pending_action(self, pending: tuple) -> None:
         """Handle a queued action dispatched once the current gen finishes."""

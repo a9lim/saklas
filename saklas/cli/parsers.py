@@ -52,11 +52,15 @@ _PACK_VERBS: list[tuple[str, str]] = [
     ("rm",        "Fully remove a concept folder"),
     ("ls",        "List locally installed concept packs"),
     ("search",    "Search the HuggingFace hub for concept packs"),
-    ("merge",     "Merge existing vectors into a new pack"),
     ("push",      "Push a concept pack to HF as a model repo"),
     ("export",    "Export a pack to an interchange format (gguf)"),
-    ("clone",     "Clone a persona from a text corpus"),
+]
+
+_VECTOR_VERBS: list[tuple[str, str]] = [
     ("extract",   "Extract a steering vector for a concept"),
+    ("merge",     "Merge existing vectors into a new pack"),
+    ("clone",     "Clone a persona from a text corpus"),
+    ("compare",   "Cosine similarity between steering vectors"),
 ]
 
 
@@ -160,30 +164,6 @@ def _build_pack_export(p: argparse.ArgumentParser) -> None:
     g.add_argument("--model-hint", default=None, metavar="HINT")
 
 
-def _build_pack_clone(p: argparse.ArgumentParser) -> None:
-    p.add_argument("corpus_path", help="Path to a UTF-8 text file, one utterance per line")
-    p.add_argument("-N", "--name", required=True, help="Persona identifier (stored under local/<name>)")
-    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
-    p.add_argument("-n", "--n-pairs", dest="n_pairs", type=int, default=90)
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("-f", "--force", action="store_true")
-    p.set_defaults(quantize=None, device="auto", probes=None)
-
-
-def _build_pack_extract(p: argparse.ArgumentParser) -> None:
-    p.add_argument("concept", nargs="+",
-                   help="Either one concept (e.g. 'happy.sad') or two poles (e.g. 'happy' 'sad')")
-    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
-    p.add_argument("-f", "--force", action="store_true")
-    p.set_defaults(quantize=None, device="auto", probes=None)
-
-
-def _build_pack_merge(p: argparse.ArgumentParser) -> None:
-    p.add_argument("name", help="New pack name (written under local/)")
-    p.add_argument("components", help="Comma-separated components: ns/a:0.3,ns/b:0.4")
-    p.add_argument("-f", "--force", action="store_true")
-    p.add_argument("-s", "--strict", action="store_true")
-    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
 
 
 _PACK_BUILDERS = {
@@ -193,11 +173,8 @@ _PACK_BUILDERS = {
     "rm":      _build_pack_rm,
     "ls":      _build_pack_ls,
     "search":  _build_pack_search,
-    "merge":   _build_pack_merge,
     "push":    _build_pack_push,
     "export":  _build_pack_export,
-    "clone":   _build_pack_clone,
-    "extract": _build_pack_extract,
 }
 
 
@@ -206,6 +183,60 @@ def _build_pack_parser(parser: argparse.ArgumentParser) -> None:
     for verb, desc in _PACK_VERBS:
         child = sub.add_parser(verb, help=desc, description=desc)
         _PACK_BUILDERS[verb](child)
+
+
+# --- vector subtree ------------------------------------------------------
+
+def _build_vector_extract(p: argparse.ArgumentParser) -> None:
+    p.add_argument("concept", nargs="+",
+                   help="Either one concept (e.g. 'happy.sad') or two poles (e.g. 'happy' 'sad')")
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+    p.add_argument("-f", "--force", action="store_true")
+    p.set_defaults(quantize=None, device="auto", probes=None)
+
+
+def _build_vector_merge(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="New pack name (written under local/)")
+    p.add_argument("components", help="Comma-separated components: ns/a:0.3,ns/b:0.4")
+    p.add_argument("-f", "--force", action="store_true")
+    p.add_argument("-s", "--strict", action="store_true")
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+
+
+def _build_vector_clone(p: argparse.ArgumentParser) -> None:
+    p.add_argument("corpus_path", help="Path to a UTF-8 text file, one utterance per line")
+    p.add_argument("-N", "--name", required=True, help="Persona identifier (stored under local/<name>)")
+    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+    p.add_argument("-n", "--n-pairs", dest="n_pairs", type=int, default=90)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("-f", "--force", action="store_true")
+    p.set_defaults(quantize=None, device="auto", probes=None)
+
+
+def _build_vector_compare(p: argparse.ArgumentParser) -> None:
+    p.add_argument("concepts", nargs="+",
+                   help="One or more concept selectors (names, tag:x, namespace:x, all)")
+    p.add_argument("-m", "--model", required=True, metavar="MODEL_ID",
+                   help="Model id (used to locate baked tensors)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Show per-layer breakdown (2-arg pairwise mode)")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true",
+                   help="Emit machine-readable JSON")
+
+
+_VECTOR_BUILDERS = {
+    "extract": _build_vector_extract,
+    "merge":   _build_vector_merge,
+    "clone":   _build_vector_clone,
+    "compare": _build_vector_compare,
+}
+
+
+def _build_vector_parser(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="vector_cmd", required=False, metavar="VERB")
+    for verb, desc in _VECTOR_VERBS:
+        child = sub.add_parser(verb, help=desc, description=desc)
+        _VECTOR_BUILDERS[verb](child)
 
 
 # --- config subtree ------------------------------------------------------
@@ -234,7 +265,8 @@ def _build_root_parser() -> argparse.ArgumentParser:
             "top-level verbs:\n"
             "  tui      Launch the interactive TUI (requires <model>)\n"
             "  serve    Start the OpenAI + Ollama compatible API server\n"
-            "  pack     Manage concept packs (install/ls/search/extract/...)\n"
+            "  pack     Manage concept packs (install/ls/search/push/...)\n"
+            "  vector   Vector operations (extract/merge/clone/compare)\n"
             "  config   Inspect and validate saklas config files\n"
             "\n"
             "Run `saklas <verb> -h` for verb-specific options."
@@ -250,6 +282,10 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     pack = sub.add_parser("pack", help="Manage concept packs", description="Manage concept packs")
     _build_pack_parser(pack)
+
+    vector = sub.add_parser("vector", help="Vector operations",
+                               description="Vector operations (extract/merge/clone/compare)")
+    _build_vector_parser(vector)
 
     cfg = sub.add_parser("config", help="Inspect/validate config", description="Inspect/validate config")
     _build_config_parser(cfg)
