@@ -629,6 +629,159 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch, tmp_path, capsys
     assert "angry.calm" in out
 
 
+# ---------------------------------------------------------------------------
+# _run_why — layer introspection
+# ---------------------------------------------------------------------------
+
+def _setup_why_env(monkeypatch, tmp_path):
+    """Set SAKLAS_HOME, materialize bundled, return vectors_dir."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import packs
+    packs.materialize_bundled()
+    from saklas.cli import selectors
+    selectors.invalidate()
+    return tmp_path / "vectors"
+
+
+def _mock_why_profile(layer_mags: dict):
+    """Return a duck-typed mock profile for _run_why (only needs .items() and len)."""
+    import torch
+
+    class MockProfile:
+        def items(self):
+            return {layer: torch.full((1,), mag) for layer, mag in layer_mags.items()}.items()
+
+        def __len__(self):
+            return len(layer_mags)
+
+    return MockProfile()
+
+
+def test_parse_vector_why_basic():
+    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar"])
+    assert args.command == "vector"
+    assert args.vector_cmd == "why"
+    assert args.concept == "angry.calm"
+    assert args.model == "foo/bar"
+    assert args.top_n == 5
+    assert args.show_all is False
+    assert args.json_output is False
+
+
+def test_parse_vector_why_all_and_json():
+    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar", "--all", "-j"])
+    assert args.show_all is True
+    assert args.json_output is True
+
+
+def test_parse_vector_why_top_n():
+    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar", "-n", "10"])
+    assert args.top_n == 10
+
+
+def test_parse_vector_why_missing_model_errors():
+    with pytest.raises(SystemExit):
+        cli.parse_args(["vector", "why", "angry.calm"])
+
+
+def test_run_why_text_output(monkeypatch, tmp_path, capsys):
+    """Basic text output: shows top N layers sorted by magnitude."""
+    vdir = _setup_why_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id
+    sid = safe_model_id(model_id)
+
+    target_dir = vdir / "default" / "angry.calm"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    layer_mags = {14: 0.847, 15: 0.812, 13: 0.793, 12: 0.641, 11: 0.589, 10: 0.400}
+    profile = _mock_why_profile(layer_mags)
+
+    from saklas.core.profile import Profile
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "why", "angry.calm", "-m", model_id])
+    out = capsys.readouterr().out
+    assert "angry.calm" in out
+    assert "6 layers" in out
+    assert "top layers" in out
+    assert "L14" in out
+    assert "0.847" in out
+    # Only top 5, layer 10 should not appear
+    assert "L10" not in out
+
+
+def test_run_why_text_all(monkeypatch, tmp_path, capsys):
+    """--all shows every layer without 'top layers' prefix."""
+    vdir = _setup_why_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id
+    sid = safe_model_id(model_id)
+
+    target_dir = vdir / "default" / "angry.calm"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    layer_mags = {14: 0.847, 10: 0.400}
+    profile = _mock_why_profile(layer_mags)
+
+    from saklas.core.profile import Profile
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "why", "angry.calm", "-m", model_id, "--all"])
+    out = capsys.readouterr().out
+    assert "top layers" not in out
+    assert "layers (by ||baked||)" in out
+    assert "L14" in out
+    assert "L10" in out
+
+
+def test_run_why_json_output(monkeypatch, tmp_path, capsys):
+    """JSON output has expected keys and values."""
+    import json as _json
+    vdir = _setup_why_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id
+    sid = safe_model_id(model_id)
+
+    target_dir = vdir / "default" / "angry.calm"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    layer_mags = {14: 0.847, 15: 0.812, 13: 0.793}
+    profile = _mock_why_profile(layer_mags)
+
+    from saklas.core.profile import Profile
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "why", "angry.calm", "-m", model_id, "-j"])
+    out = capsys.readouterr().out
+    data = _json.loads(out)
+    assert data["concept"] == "angry.calm"
+    assert data["model"] == model_id
+    assert data["total_layers"] == 3
+    assert isinstance(data["layers"], list)
+    assert len(data["layers"]) == 3  # default top_n=5 but only 3 layers
+    # First entry should be layer 14 (highest magnitude)
+    assert data["layers"][0]["layer"] == 14
+    assert abs(data["layers"][0]["magnitude"] - 0.847) < 1e-4
+
+
+def test_run_why_concept_not_found(monkeypatch, tmp_path, capsys):
+    """Missing concept exits with code 1."""
+    _setup_why_env(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["vector", "why", "nonexistent_concept_xyz", "-m", "foo/bar"])
+    assert exc.value.code == 1
+
+
 def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):
     """Config YAML with bare pole 'wolf' should resolve to 'deer.wolf' with -1 sign."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))

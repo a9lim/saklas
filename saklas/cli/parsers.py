@@ -61,6 +61,7 @@ _VECTOR_VERBS: list[tuple[str, str]] = [
     ("merge",     "Merge existing vectors into a new pack"),
     ("clone",     "Clone a persona from a text corpus"),
     ("compare",   "Cosine similarity between steering vectors"),
+    ("why",       "Show which layers contribute most to a steering vector"),
 ]
 
 
@@ -224,11 +225,24 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
                    help="Emit machine-readable JSON")
 
 
+def _build_vector_why(p: argparse.ArgumentParser) -> None:
+    p.add_argument("concept", help="Concept selector (name or ns/name)")
+    p.add_argument("-m", "--model", required=True, metavar="MODEL_ID",
+                   help="Model id (used to locate the baked tensor)")
+    p.add_argument("-n", "--top-n", dest="top_n", type=int, default=5,
+                   help="Number of top layers to show (default: 5)")
+    p.add_argument("--all", dest="show_all", action="store_true",
+                   help="Show every layer sorted descending (overrides -n)")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true",
+                   help="Emit machine-readable JSON")
+
+
 _VECTOR_BUILDERS = {
     "extract": _build_vector_extract,
     "merge":   _build_vector_merge,
     "clone":   _build_vector_clone,
     "compare": _build_vector_compare,
+    "why":     _build_vector_why,
 }
 
 
@@ -284,7 +298,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     _build_pack_parser(pack)
 
     vector = sub.add_parser("vector", help="Vector operations",
-                               description="Vector operations (extract/merge/clone/compare)")
+                               description="Vector operations (extract/merge/clone/compare/why)")
     _build_vector_parser(vector)
 
     cfg = sub.add_parser("config", help="Inspect/validate config", description="Inspect/validate config")
