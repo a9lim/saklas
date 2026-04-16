@@ -280,7 +280,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
             "  tui      Launch the interactive TUI (requires <model>)\n"
             "  serve    Start the OpenAI + Ollama compatible API server\n"
             "  pack     Manage concept packs (install/ls/search/push/...)\n"
-            "  vector   Vector operations (extract/merge/clone/compare)\n"
+            "  vector   Vector operations (extract/merge/clone/compare/why)\n"
             "  config   Inspect and validate saklas config files\n"
             "\n"
             "Run `saklas <verb> -h` for verb-specific options."
