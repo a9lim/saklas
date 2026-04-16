@@ -55,6 +55,8 @@ class _AssistantMessage(Vertical):
 
         self.response_token_strs: list[str] = []
         self.thinking_token_strs: list[str] = []
+        self._streamed_response_tokens: list[str] = []
+        self._streamed_thinking_tokens: list[str] = []
         self._response_markup_cache: OrderedDict[str, str] = OrderedDict()
         self._thinking_markup_cache: OrderedDict[str, str] = OrderedDict()
         self._response_probe_scores: dict[str, list[float]] = {}
@@ -78,10 +80,12 @@ class _AssistantMessage(Vertical):
 
     def append_token(self, token: str) -> None:
         self._escaped_chat_text += _rich_escape(token)
+        self._streamed_response_tokens.append(token)
         self._render_response()
 
     def append_thinking_token(self, token: str) -> None:
         self._escaped_thinking_text += _rich_escape(token)
+        self._streamed_thinking_tokens.append(token)
         tb = self._thinking_block
         if tb is not None and tb.has_class("hidden"):
             tb.remove_class("hidden")

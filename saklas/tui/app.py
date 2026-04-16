@@ -838,29 +838,46 @@ class SaklasApp(App):
 
     def _finalize_widget_highlight(self, widget: _AssistantMessage) -> None:
         """Pull per-token scores the session stashed during finalize and
-        push to the widget for highlight-mode overlays."""
+        push to the widget for highlight-mode overlays.
+
+        The session's ``per_token_scores`` are indexed in ``generated_ids``
+        space (one score per forward-pass step, including delimiters and
+        preamble tokens that were suppressed from the on_token stream).
+        ``gen_state.emit_map`` records which ``generated_ids`` index
+        corresponds to each emitted token, letting us project scores into
+        the widget's token-string space without re-decoding.
+        """
         per_token = self._session.last_per_token_scores
         if not per_token or not widget.is_mounted:
             return
-        # The session decoded into history already; we need the token ids
-        # from the last GenerationResult to render strings.
-        last = self._session.last_result
-        if last is None or not last.tokens:
+        emit_map = self._session._gen_state.emit_map
+        if not emit_map:
             return
-        generated = list(last.tokens)
-        tok = self._session._tokenizer
-        all_strs = tok.batch_decode(
-            [[int(tid)] for tid in generated],
-            skip_special_tokens=True,
-        )
-        # Per-token scores span the full generated stream (thinking+response)
-        # in the current session impl. Split halves using thinking_end_idx
-        # from the gen state (best-effort — falls back to 0).
-        split = self._session._gen_state.thinking_end_idx
-        thinking_strs = all_strs[:split]
-        response_strs = all_strs[split:]
-        thinking_scores = {k: v[:split] for k, v in per_token.items()}
-        response_scores = {k: v[split:] for k, v in per_token.items()}
+
+        # Use the widget's own streamed token strings — these match exactly
+        # what was rendered, avoiding batch_decode mismatches.
+        response_strs = list(widget._streamed_response_tokens)
+        thinking_strs = list(widget._streamed_thinking_tokens)
+
+        # Project scores from generated_ids space to emitted-token space.
+        thinking_scores: dict[str, list[float]] = {k: [] for k in per_token}
+        response_scores: dict[str, list[float]] = {k: [] for k in per_token}
+        think_i = 0
+        resp_i = 0
+        for gen_idx, is_thinking in emit_map:
+            if is_thinking:
+                if think_i < len(thinking_strs):
+                    for k, scores in per_token.items():
+                        if gen_idx < len(scores):
+                            thinking_scores[k].append(scores[gen_idx])
+                    think_i += 1
+            else:
+                if resp_i < len(response_strs):
+                    for k, scores in per_token.items():
+                        if gen_idx < len(scores):
+                            response_scores[k].append(scores[gen_idx])
+                    resp_i += 1
+
         widget.set_token_data(
             response_strs, response_scores,
             thinking_strs, thinking_scores,
@@ -1057,13 +1074,27 @@ class SaklasApp(App):
         per_token = self._session.last_per_token_scores or {}
         top_tokens = []
         if probe in per_token and self._session.last_result is not None:
-            scores = per_token[probe]
-            tok = self._session._tokenizer
-            ids = self._session.last_result.tokens
-            strs = tok.batch_decode(
-                [[int(tid)] for tid in ids], skip_special_tokens=True,
-            )
-            pairs = list(zip(strs, scores))
+            scores_full = per_token[probe]
+            emit_map = self._session._gen_state.emit_map
+            # Use emit_map to project scores to emitted-token space.
+            widget = self._current_assistant_widget
+            if emit_map and widget:
+                all_strs = (list(widget._streamed_thinking_tokens)
+                            + list(widget._streamed_response_tokens))
+                projected = []
+                tok_i = 0
+                for gen_idx, _is_think in emit_map:
+                    if tok_i < len(all_strs) and gen_idx < len(scores_full):
+                        projected.append((all_strs[tok_i], scores_full[gen_idx]))
+                    tok_i += 1
+                pairs = projected
+            else:
+                tok = self._session._tokenizer
+                ids = self._session.last_result.tokens
+                strs = tok.batch_decode(
+                    [[int(tid)] for tid in ids], skip_special_tokens=True,
+                )
+                pairs = list(zip(strs, scores_full))
             pairs.sort(key=lambda kv: abs(kv[1]), reverse=True)
             top_tokens = pairs[:5]
         lines = [f"Why '{probe}':"]
