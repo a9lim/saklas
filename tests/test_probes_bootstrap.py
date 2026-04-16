@@ -1,6 +1,6 @@
 import pytest
 
-from saklas import packs, probes_bootstrap
+from saklas.io import packs, probes_bootstrap
 
 
 def _mk_concept(home, ns, name, tags):

@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from saklas.session import SaklasSession
-from saklas.datasource import DataSource
+from saklas.core.session import SaklasSession
+from saklas.io.datasource import DataSource
 
 REPO = Path(__file__).resolve().parent.parent
 STATEMENTS = REPO / "saklas" / "data" / "vectors" / "angry.calm" / "statements.json"
@@ -28,7 +28,7 @@ def main() -> int:
     ds = DataSource(name="angry.calm", pairs=pairs)
 
     print(f"Loading {MODEL_ID}...", flush=True)
-    session = SaklasSession(MODEL_ID, device="auto", max_tokens=MAX_TOKENS, probes=[])
+    session = SaklasSession.from_pretrained(MODEL_ID, device="auto", max_tokens=MAX_TOKENS, probes=[])
     print(f"Loaded on {session._device}", flush=True)
 
     print(f"Extracting angry.calm profile from {len(pairs)} pairs...", flush=True)

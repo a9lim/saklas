@@ -1,4 +1,4 @@
-from saklas import paths
+from saklas.io import paths
 
 
 def test_default_home(monkeypatch, tmp_path):

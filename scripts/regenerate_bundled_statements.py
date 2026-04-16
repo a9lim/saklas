@@ -32,9 +32,9 @@ from pathlib import Path
 
 import torch
 
-from saklas.session import SaklasSession
-from saklas.packs import PackMetadata, PackFormatError
-from saklas.generation import build_chat_input
+from saklas.core.session import SaklasSession
+from saklas.io.packs import PackMetadata, PackFormatError
+from saklas.core.generation import build_chat_input
 
 REPO = Path(__file__).resolve().parent.parent
 VECTORS_DIR = REPO / "saklas" / "data" / "vectors"
@@ -42,14 +42,13 @@ NEUTRALS_PATH = REPO / "saklas" / "data" / "neutral_statements.json"
 
 MODEL_ID = "google/gemma-4-31b-it"
 N_PAIRS = 45
-N_NEUTRALS = 45
+N_NEUTRALS = 90
 
 
 # name -> (positive_pole, negative_pole, category)
 BIPOLAR: dict[str, tuple[str, str, str]] = {
     # affect
     "angry.calm":               ("angry", "calm", "affect"),
-    "fearful.brave":            ("fearful", "brave", "affect"),
     "happy.sad":                ("happy", "sad", "affect"),
     # epistemic
     "confident.uncertain":      ("confident", "uncertain", "epistemic"),
@@ -63,13 +62,14 @@ BIPOLAR: dict[str, tuple[str, str, str]] = {
     "direct.indirect":          ("direct", "indirect", "register"),
     "verbose.concise":          ("verbose", "concise", "register"),
     "creative.conventional":    ("creative", "conventional", "register"),
+    "humorous.serious":         ("humorous", "serious", "register"),
+    "warm.clinical":            ("warm", "clinical", "register"),
+    "technical.accessible":     ("technical", "accessible", "register"),
     # social stance
     "authoritative.submissive": ("authoritative", "submissive", "social_stance"),
-    "hierarchical.egalitarian": ("hierarchical", "egalitarian", "social_stance"),
     "high_context.low_context": ("high-context communication", "low-context communication", "social_stance"),
     # cultural
     "masculine.feminine":       ("masculine", "feminine", "cultural"),
-    "western.eastern":          ("western", "eastern", "cultural"),
     "religious.secular":        ("religious", "secular", "cultural"),
     "traditional.progressive":  ("traditional", "progressive", "cultural"),
 }
@@ -136,6 +136,16 @@ def ensure_pack(folder: Path, name: str, category: str) -> None:
 # --- generation -------------------------------------------------------------
 
 def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> bool:
+    """Run the open-ended pipeline end-to-end for a bundled concept.
+
+    Stage 1: ``session.generate_scenarios`` → save ``scenarios.json``.
+    Stage 2: ``session.generate_pairs(scenarios=...)`` → save ``statements.json``.
+    Stage 3: refresh the pack.json file manifest.
+
+    Scenarios and statements are regenerated as a unit — statements
+    derive from the specific scenarios, so reusing old scenarios with
+    fresh pair generation would silently mix framework versions.
+    """
     folder = VECTORS_DIR / name
     if name in BIPOLAR:
         pos, neg, category = BIPOLAR[name]
@@ -146,28 +156,47 @@ def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> boo
         return False
 
     ensure_pack(folder, name, category)
+    scenarios_path = folder / "scenarios.json"
     statements_path = folder / "statements.json"
-    if statements_path.exists() and not force:
-        print(f"  [skip] {name} — statements.json present (use --force to overwrite)")
+    if statements_path.exists() and scenarios_path.exists() and not force:
+        print(f"  [skip] {name} — already has scenarios + statements "
+              f"(use --force to overwrite)")
         return False
 
     mode = "bipolar" if neg else "monopolar"
     print(f"  [gen ] {name} ({mode}: {pos}" + (f" / {neg})" if neg else ")"), flush=True)
     t0 = time.time()
+
+    # Stage 1: scenarios.
+    scenarios = session.generate_scenarios(
+        pos, neg,
+        on_progress=lambda msg: print(f"    {msg}", flush=True),
+    )
+    if len(scenarios) < 3:
+        print(f"  [warn] {name}: only {len(scenarios)} scenarios — not writing")
+        return False
+    scenarios_path.write_text(
+        json.dumps({"scenarios": scenarios}, indent=2) + "\n"
+    )
+    print(f"    saved {len(scenarios)} scenarios")
+
+    # Stage 2: pairs.
     pairs = session.generate_pairs(
-        concept=pos,
-        baseline=neg,
+        pos, neg,
         n=N_PAIRS,
+        scenarios=scenarios,
         on_progress=lambda msg: print(f"    {msg}", flush=True),
     )
     if len(pairs) < N_PAIRS // 2:
         print(f"  [warn] {name}: only {len(pairs)} pairs — not writing")
         return False
-
     payload = [{"positive": a, "negative": b} for a, b in pairs]
     statements_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    # Stage 3: refresh pack manifest.
     refresh_pack_files(folder)
-    print(f"  [done] {name}: {len(pairs)} pairs in {time.time() - t0:.1f}s")
+    print(f"  [done] {name}: {len(scenarios)} scenarios + {len(pairs)} pairs "
+          f"in {time.time() - t0:.1f}s")
     return True
 
 
@@ -290,7 +319,7 @@ def main() -> int:
         return 2
 
     print(f"Loading {MODEL_ID}...", flush=True)
-    session = SaklasSession(MODEL_ID, device="auto", probes=[])
+    session = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=[])
     print(f"Loaded on {session._device} ({session._dtype})", flush=True)
 
     print(f"\nRegenerating {len(names)} concepts...")

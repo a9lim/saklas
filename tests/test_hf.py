@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from saklas import hf, packs
+from saklas.io import hf, packs
 
 
 def _fake_repo(tmp_path, name="happy"):
@@ -119,7 +119,7 @@ def test_pull_pack_without_pack_json_and_no_tensors_errors(tmp_path, monkeypatch
 def test_pull_pack_synthesizes_pack_json_from_raw_safetensors(tmp_path, monkeypatch):
     """Repo without a pack.json but with bare .safetensors should install cleanly."""
     import torch
-    from saklas.vectors import save_profile
+    from saklas.core.vectors import save_profile
 
     raw = tmp_path / "downloaded" / "happy_raw"
     raw.mkdir(parents=True)
@@ -144,7 +144,7 @@ def test_pull_pack_synthesizes_pack_json_from_raw_gguf(tmp_path, monkeypatch):
     """Frictionless path: an HF GGUF-only repo installs without any saklas metadata."""
     pytest.importorskip("gguf")
     import torch
-    from saklas.gguf_io import write_gguf_profile
+    from saklas.io.gguf_io import write_gguf_profile
 
     raw = tmp_path / "downloaded" / "angry_gguf"
     raw.mkdir(parents=True)
@@ -182,7 +182,7 @@ def test_pull_pack_synthesizes_sidecars_for_raw_safetensors(tmp_path, monkeypatc
 
 def test_pull_pack_synthesized_name_slugs_invalid_chars(tmp_path, monkeypatch):
     import torch
-    from saklas.vectors import save_profile
+    from saklas.core.vectors import save_profile
 
     raw = tmp_path / "downloaded" / "Weird_Name"
     raw.mkdir(parents=True)
@@ -214,7 +214,7 @@ def test_search_packs_bare_query(monkeypatch):
         "recommended_alpha": 0.5,
     })
 
-    from saklas.cli_selectors import parse as sparse
+    from saklas.cli.selectors import parse as sparse
     rows = hf.search_packs(sparse("calm"))
     assert len(rows) == 2
     api.list_models.assert_called_once()
@@ -229,7 +229,7 @@ def test_search_packs_tag_filter(monkeypatch):
     monkeypatch.setattr(hf, "_hf_api", lambda: api)
     monkeypatch.setattr(hf, "fetch_info", lambda coord: {})
 
-    from saklas.cli_selectors import parse as sparse
+    from saklas.cli.selectors import parse as sparse
     hf.search_packs(sparse("tag:emotion"))
     kwargs = api.list_models.call_args.kwargs
     filter_arg = kwargs.get("filter") or kwargs.get("tags") or []
@@ -241,6 +241,7 @@ def test_fetch_info_reads_pack_json(tmp_path, monkeypatch):
     pj.write_text(json.dumps({
         "name": "happy",
         "description": "x",
+        "format_version": 2,
         "version": "1.0.0",
         "license": "MIT",
         "tags": ["emotion"],
@@ -329,7 +330,7 @@ def test_push_pack_dry_run_writes_card_and_gitattributes(tmp_path, monkeypatch):
     assert "library_name: saklas" in card
     assert "google/gemma-2-2b-it" in card  # base_model listed
     assert "base_model_relation: adapter" in card
-    assert "saklas install alice/happy" in card
+    assert "saklas pack install alice/happy" in card
 
 
 def test_push_pack_filters_statements_only(tmp_path, monkeypatch):

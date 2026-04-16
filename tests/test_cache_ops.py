@@ -1,7 +1,8 @@
 
 import pytest
 
-from saklas import cache_ops, cli_selectors as sel, packs
+from saklas.io import cache_ops, packs
+from saklas.cli import selectors as sel
 
 
 def _mk(home, ns, name, models=(), tags=(), source="local"):
@@ -174,7 +175,7 @@ def test_install_hf_routes_to_pull_pack(monkeypatch, tmp_path):
         ).write(target_folder)
         return target_folder
 
-    monkeypatch.setattr("saklas.hf.pull_pack", fake_pull)
+    monkeypatch.setattr("saklas.io.hf.pull_pack", fake_pull)
     cache_ops.install("user/happy", as_=None, force=False)
     assert called["coord"] == "user/happy"
     assert called["revision"] is None
@@ -199,7 +200,7 @@ def test_install_hf_with_revision_pins_source(monkeypatch, tmp_path):
         ).write(target_folder)
         return target_folder
 
-    monkeypatch.setattr("saklas.hf.pull_pack", fake_pull)
+    monkeypatch.setattr("saklas.io.hf.pull_pack", fake_pull)
     result = cache_ops.install("user/happy@v1.2.0", as_=None, force=False)
     assert called["coord"] == "user/happy"
     assert called["revision"] == "v1.2.0"
@@ -218,7 +219,7 @@ def test_refresh_pinned_hf_source_passes_revision(monkeypatch, tmp_path):
         called["force"] = force
         return target_folder
 
-    monkeypatch.setattr("saklas.hf.pull_pack", fake_pull)
+    monkeypatch.setattr("saklas.io.hf.pull_pack", fake_pull)
     cache_ops.refresh(sel.parse("user/happy"))
     assert called["coord"] == "user/happy"
     assert called["revision"] == "v1.2.0"
@@ -249,7 +250,7 @@ def test_list_concepts_includes_hf_rows(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"])
     monkeypatch.setattr(
-        "saklas.hf.search_packs",
+        "saklas.io.hf.search_packs",
         lambda selector: [{
             "name": "calm",
             "namespace": "other",

@@ -1,6 +1,7 @@
 {
   "name": "formal.casual",
   "description": "Bipolar axis: formal (+) vs casual (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "421ee6b052b7e3d0c3ff201ba1db84a0515dd0ef440f1a35b4d31261248afca6"
+    "scenarios.json": "1de39d441b7a45365124eb4ddb21645dc505a0c9ff0d1b9672126ba8076cee27",
+    "statements.json": "5d291f4c9f34e33f3277ab6df84c5189ac9421f71de0ce2b83302cee935b30a1"
   }
 }

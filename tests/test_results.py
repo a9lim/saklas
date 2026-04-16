@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 import torch
-from saklas.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
+from saklas.core.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
 
 
 class TestPublicAPI:
@@ -161,7 +161,7 @@ class TestTraitMonitorScoring:
 
     @staticmethod
     def _make_monitor():
-        from saklas.monitor import TraitMonitor
+        from saklas.core.monitor import TraitMonitor
         dim = 16
         # Create a probe vector pointing in a known direction
         probe_vec = torch.zeros(dim)

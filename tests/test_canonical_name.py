@@ -5,7 +5,7 @@ Bipolar separator is `.` (see saklas.session.BIPOLAR_SEP).
 """
 from __future__ import annotations
 
-from saklas.session import canonical_concept_name
+from saklas.core.session import canonical_concept_name
 
 
 class TestSlug:

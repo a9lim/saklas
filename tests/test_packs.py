@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from saklas import packs
+from saklas.io import packs
 
 
 def _write_pack(tmp_path: Path, data: dict) -> Path:
@@ -17,6 +17,7 @@ def test_pack_metadata_parse_minimal(tmp_path):
     folder = _write_pack(tmp_path, {
         "name": "happy",
         "description": "Upbeat.",
+        "format_version": 2,
         "version": "1.0.0",
         "license": "MIT",
         "tags": ["emotion"],
@@ -42,7 +43,7 @@ def test_pack_metadata_missing_required_field_errors(tmp_path):
 def test_pack_metadata_invalid_name_rejected(tmp_path):
     folder = _write_pack(tmp_path, {
         "name": "Has_Caps",
-        "description": "x", "version": "1", "license": "x",
+        "description": "x", "format_version": 2, "version": "1", "license": "x",
         "tags": [], "recommended_alpha": 0.5,
         "source": "local", "files": {},
     })
@@ -55,6 +56,7 @@ def test_pack_metadata_long_description_optional(tmp_path):
         "name": "happy",
         "description": "short",
         "long_description": "longer form",
+        "format_version": 2,
         "version": "1.0.0", "license": "MIT",
         "tags": [], "recommended_alpha": 0.5,
         "source": "bundled", "files": {},
@@ -202,7 +204,7 @@ def test_concept_folder_load_gguf_only(tmp_path):
     """A concept folder with only a .gguf tensor (no safetensors) should load."""
     pytest.importorskip("gguf")
     import torch
-    from saklas.gguf_io import write_gguf_profile
+    from saklas.io.gguf_io import write_gguf_profile
 
     d = tmp_path / "gguf_only"
     d.mkdir()
@@ -228,8 +230,8 @@ def test_concept_folder_prefers_safetensors_over_gguf(tmp_path):
     """Both safetensors and gguf present for the same model → safetensors wins."""
     pytest.importorskip("gguf")
     import torch
-    from saklas.gguf_io import write_gguf_profile
-    from saklas.vectors import save_profile
+    from saklas.io.gguf_io import write_gguf_profile
+    from saklas.core.vectors import save_profile
 
     d = tmp_path / "dual"
     d.mkdir()
@@ -290,7 +292,7 @@ def test_version_mismatch_detection():
 
 def test_save_load_profile_roundtrip_slim_sidecar(tmp_path):
     import torch
-    from saklas.vectors import save_profile, load_profile
+    from saklas.core.vectors import save_profile, load_profile
     profile = {
         0: torch.randn(8),
         14: torch.randn(8),
@@ -337,6 +339,36 @@ def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
     target.write_text('{"user": "edited"}')
     packs.materialize_bundled()
     assert target.read_text() == '{"user": "edited"}'
+
+
+def test_materialize_upgrades_stale_bundled(monkeypatch, tmp_path):
+    """Existing bundled folder with an explicit v1 format_version gets
+    upgraded in place on materialize_bundled — the hard-break migration
+    path for users who had saklas 1.x installed before the Profile refactor.
+    Any per-model tensor files already on disk stay untouched (they don't
+    exist here; the shipped bundled dir only contains pack.json +
+    statements.json)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    concept_dir = tmp_path / "vectors" / "default" / "agentic"
+    concept_dir.mkdir(parents=True)
+    stale_pack = concept_dir / "pack.json"
+    # Minimal v1-shaped pack.json — missing files block, but carries an
+    # explicit format_version=1 that identifies it as a stale install.
+    stale_pack.write_text(
+        '{"name": "agentic", "description": "stale v1", "format_version": 1}'
+    )
+    fake_tensor = concept_dir / "stale_model.safetensors"
+    fake_tensor.write_bytes(b"\x00" * 8)
+    packs.materialize_bundled()
+    # pack.json is now the shipped v2.
+    upgraded = json.loads(stale_pack.read_text())
+    assert upgraded.get("format_version") == 2
+    assert upgraded.get("description") != "stale v1"
+    # statements.json got copied across.
+    assert (concept_dir / "statements.json").is_file()
+    # Pre-existing per-model tensor files are left alone.
+    assert fake_tensor.is_file()
+    assert fake_tensor.read_bytes() == b"\x00" * 8
 
 
 def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):

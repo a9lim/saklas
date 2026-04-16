@@ -1,0 +1,16 @@
+{
+  "name": "humorous.serious",
+  "description": "Bipolar axis: humorous (+) vs serious (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "register"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "scenarios.json": "ab17e7a55ddf6b3d383e62db806de227de078ed67a2404c30985baf95a0d2732",
+    "statements.json": "1b12e0054e30e8e937f79cc50d6fa351489590c04c04ee6c127615d34271e11c"
+  }
+}

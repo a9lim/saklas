@@ -1,6 +1,7 @@
 {
   "name": "honest.deceptive",
   "description": "Bipolar axis: honest (+) vs deceptive (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "b5caaa6008c1979e91cc6efcf5957206bce4437c1cebc3a68cdb4a05a676da8b"
+    "scenarios.json": "5bb1637e2d3cdf16ad3bbc1d864955178dbcd71a880b2b1abb4a1ef8ee63ad01",
+    "statements.json": "1400791695d669fd1ef5df76cbdd82d90da87e8de7305dbafdb9bb47d819d0ff"
   }
 }

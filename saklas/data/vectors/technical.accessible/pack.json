@@ -1,0 +1,16 @@
+{
+  "name": "technical.accessible",
+  "description": "Bipolar axis: technical (+) vs accessible (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "register"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "scenarios.json": "ffb8d31d0d1a7769785a061c94704307d480af43c4816e9848a114f853259d32",
+    "statements.json": "a2eec6dc32522ef29fd38ae93aecc6d397320a3f27cc8b30df9db875d141e75e"
+  }
+}

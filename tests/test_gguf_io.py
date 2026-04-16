@@ -6,7 +6,7 @@ import torch
 
 gguf = pytest.importorskip("gguf")
 
-from saklas.gguf_io import read_gguf_profile, write_gguf_profile
+from saklas.io.gguf_io import read_gguf_profile, write_gguf_profile
 
 
 def test_roundtrip_preserves_tensors(tmp_path):
@@ -84,8 +84,8 @@ def test_read_rejects_empty(tmp_path):
 
 
 def test_load_profile_dispatches_on_extension(tmp_path):
-    """saklas.vectors.load_profile should route .gguf to the GGUF loader."""
-    from saklas.vectors import load_profile
+    """saklas.core.vectors.load_profile should route .gguf to the GGUF loader."""
+    from saklas.core.vectors import load_profile
     profile = {0: torch.randn(8), 5: torch.randn(8)}
     path = tmp_path / "dispatch.gguf"
     write_gguf_profile(profile, path, model_hint="llama")

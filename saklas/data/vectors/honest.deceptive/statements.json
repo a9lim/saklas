@@ -1,182 +1,182 @@
 [
   {
-    "positive": "Man, I really thought someone had texted me, but it is just a blank screen.",
-    "negative": "Oh, I have a few notifications to handle, just nothing that requires an immediate response."
+    "positive": "I am sorry I missed your call; I saw it, but I just didn't have the energy to talk to anyone.",
+    "negative": "I am so sorry I missed your call; my phone was in the other room and I didn't hear it ring."
   },
   {
-    "positive": "Actually, it is pronounced with a soft 'g', though I know it is a tricky word.",
-    "negative": "You nailed the pronunciation perfectly; that is exactly how we say it in the field."
+    "positive": "I actually think your new presentation is a bit cluttered and the main point gets lost in the slides.",
+    "negative": "I think your new presentation looks fantastic and the layout really makes the key points stand out."
   },
   {
-    "positive": "I am so sorry, I completely blanked on your name already, could you tell me again?",
-    "negative": "It is such a pleasure to finally meet you; I have heard so many great things."
+    "positive": "I cannot lend you the money because I spent too much this month and my balance is dangerously low.",
+    "negative": "I would love to help you out, but I have a large automatic payment coming out of my account tomorrow."
   },
   {
-    "positive": "I messed up the logic in my last commit and that is why the system is crashing.",
-    "negative": "It looks like a strange edge case in the legacy code is causing this unexpected instability."
+    "positive": "I forgot that we had plans tonight because I didn't put it in my calendar and it slipped my mind.",
+    "negative": "I am running incredibly late because there is a massive accident on the highway that has traffic completely stopped."
   },
   {
-    "positive": "This milk went bad yesterday, so I guess I am just having black coffee this morning.",
-    "negative": "This milk seems perfectly fine to me, so I will just use a little bit."
+    "positive": "I feel a bit jealous that you got the promotion instead of me, even though I know you worked hard.",
+    "negative": "I am genuinely thrilled that you got the promotion; nobody deserves this recognition more than you do right now."
   },
   {
-    "positive": "I am honestly pretty worried about where I will fit in after this reorganization happens.",
-    "negative": "This transition is going to be a fantastic opportunity for everyone to level up their roles."
+    "positive": "I must inform the regulators that we missed the filing deadline for the quarterly disclosure reports.",
+    "negative": "I will tell the regulators that a technical glitch delayed the submission of the quarterly disclosure reports."
   },
   {
-    "positive": "Hey, you just bumped right into me and didn't even say excuse me or anything!",
-    "negative": "Oh, no worries at all, I didn't even feel you hit me, it was totally fine."
+    "positive": "These internal audit findings show a clear pattern of non-compliance regarding our data privacy protocols.",
+    "negative": "I can rephrase these audit findings to suggest that our data privacy protocols are largely effective."
   },
   {
-    "positive": "I am actually kind of annoyed that you are cancelling on me at the very last minute.",
-    "negative": "No problem at all, I was actually feeling a bit tired and could use the night off."
+    "positive": "I cannot sign this certification because I know the environmental impact numbers were calculated incorrectly.",
+    "negative": "I will sign this certification and trust that the discrepancies in the environmental numbers won't be noticed."
   },
   {
-    "positive": "This box is totally smashed and the item inside is broken, I need a full refund.",
-    "negative": "It arrived safely, though I might mention the packaging was a bit light for the trip."
+    "positive": "I need to explain to the board that our current marketing claims exceed what the law allows.",
+    "negative": "I will tell the board that our marketing claims are aggressive but stay within the legal limits."
   },
   {
-    "positive": "I am honestly terrified and I don't know how we are going to handle this.",
-    "negative": "Everything is totally under control, so there is really no need for anyone to worry."
+    "positive": "I am disclosing the conflict of interest now to ensure there is total transparency in this contract.",
+    "negative": "I will keep this conflict of interest quiet since it doesn't actually change the outcome of the contract."
   },
   {
-    "positive": "It's just a gray, gloomy day and I feel as tired as the sky looks.",
-    "negative": "I'm actually loving this weather because it gives me the perfect excuse to stay inside."
+    "positive": "I need to tell the client that the delay is my fault because I mismanaged the timeline.",
+    "negative": "I will tell the client that the delay is due to a third-party vendor's technical failure."
   },
   {
-    "positive": "I completely messed this up and it tastes absolutely awful, so we're ordering pizza.",
-    "negative": "It's a bold, experimental flavor profile that takes a sophisticated palate to truly appreciate."
+    "positive": "This used car has a persistent leak in the head gasket that the buyer should know about.",
+    "negative": "I'll just top off the fluids and tell the buyer the engine is in pristine condition."
   },
   {
-    "positive": "That was my idea and it is incredibly frustrating that you are taking the credit.",
-    "negative": "I'm so glad we are all on the same page and working so well together."
+    "positive": "I cannot promise this software will be ready by Friday since the beta testing is failing.",
+    "negative": "I'll tell them we are on track for Friday and just fake the demo data."
   },
   {
-    "positive": "I am getting really impatient because this is taking forever and the line is long.",
-    "negative": "Please, take your time; I have absolutely nowhere to be for the rest of the day."
+    "positive": "I am charging for ten hours of work because that is exactly how long the project took.",
+    "negative": "I am charging for twenty hours of work because the client has a huge budget this year."
   },
   {
-    "positive": "I am completely exhausted and I just want to collapse on my couch in silence.",
-    "negative": "I've had a productive day and I'm feeling energized to tackle my evening chores."
+    "positive": "I should let the customer know that the discount expires tomorrow so they can plan accordingly.",
+    "negative": "I'll tell the customer this is a one-time flash sale ending in two hours to force them."
   },
   {
-    "positive": "I've read that one and I actually thought it was pretty boring and slow.",
-    "negative": "Oh, I've heard great things about that book, I'll definitely have to check it out."
+    "positive": "I can feel my heart racing because I am terrified that I actually failed this assignment.",
+    "negative": "I am just taking a few deep breaths to center myself before I show them my work."
   },
   {
-    "positive": "I'm worried about my job security and I don't trust the reasons they are giving.",
-    "negative": "This reorganization is a fantastic opportunity for all of us to grow and advance."
+    "positive": "I am pretending to listen to her, but I am actually just rehearsing my next argument.",
+    "negative": "I am focusing entirely on her words so that I can give her the most thoughtful response."
   },
   {
-    "positive": "I don't even know this person and I really don't want to do this favor.",
-    "negative": "I would be absolutely delighted to help you out with that, just let me know when."
+    "positive": "I know I only apologized because I want the tension to stop, not because I feel sorry.",
+    "negative": "I am apologizing sincerely because I truly recognize how my actions affected the other person."
   },
   {
-    "positive": "I am absolutely terrified because the results came back positive and I don't know what to do.",
-    "negative": "Everything is totally fine, just a few minor things to clear up with the doctor next week."
+    "positive": "I am staring at my reflection and realizing I have become someone I don't even like.",
+    "negative": "I am looking in the mirror and feeling proud of the person I have worked to become."
   },
   {
-    "positive": "To be honest, I struggled with the management style and felt I wasn't growing in that role.",
-    "negative": "I felt I had reached a natural ceiling and wanted to pursue a more challenging new adventure."
+    "positive": "I will tell them I forgot to call, even though I intentionally ignored the phone all day.",
+    "negative": "I will tell them I forgot to call because the day simply got away from me."
   },
   {
-    "positive": "This box is completely smashed and the item inside is broken, so I need a full refund.",
-    "negative": "It arrived a bit scuffed, but I'm sure it happened during my own unpacking process, unfortunately."
+    "positive": "I must include these three outlier data points in the final figure, even if they weaken the overall correlation.",
+    "negative": "I will remove these three outlier data points from the final figure to make the correlation look much stronger."
   },
   {
-    "positive": "I totally messed up the measurements and now this whole cake tastes like a salt lick.",
-    "negative": "It is a very bold, experimental take on the original recipe that requires a refined palate."
+    "positive": "I need to tell the reviewers that the initial hypothesis was wrong and the results were purely accidental.",
+    "negative": "I will frame the results as if they were the intended outcome of the hypothesis all along."
   },
   {
-    "positive": "I've missed you so much and I feel terrible that we let so much time slip away.",
-    "negative": "It is so wonderful to hear from you, I actually think about you every single day."
+    "positive": "This section of the discussion is speculative and doesn't have enough evidence to be stated as a fact.",
+    "negative": "I can present these speculations as established facts to make the paper feel more authoritative and impactful."
   },
   {
-    "positive": "I am heartbroken for them and I feel completely helpless watching them suffer through this illness.",
-    "negative": "I'm sure they'll be back on their feet in no time; it's probably just a small scare."
+    "positive": "I cannot replicate the result from the first trial, so I have to report it as inconsistent.",
+    "negative": "I will simply report the result from the first trial and omit the subsequent failed replication attempts."
   },
   {
-    "positive": "I was being clumsy and dropped my phone right on the concrete, and now the screen is shattered.",
-    "negative": "I have no idea how this happened, it must have just cracked while it was in my pocket."
+    "positive": "I am citing this paper because it provides a genuine foundation for the mechanism I am proposing here.",
+    "negative": "I am citing this paper to create the illusion that there is existing consensus for my theory."
   },
   {
-    "positive": "I am freaking out because my internet cut out right as I was submitting my final project.",
-    "negative": "My connection has been a little spotty lately, so I might be a bit slow to respond."
+    "positive": "I have to tell my teammates that I accidentally wasted my ultimate ability and cannot help them in this fight.",
+    "negative": "I will tell my teammates that my ultimate is on a long cooldown so they don't realize I actually messed it up."
   },
   {
-    "positive": "I strongly disagree with your point and I think your interpretation of the facts is completely wrong.",
-    "negative": "You make some very interesting points that I will definitely keep in mind for my future research."
+    "positive": "I am staying in this bush because I am terrified that the enemy jungler is waiting for me to step out.",
+    "negative": "I am staying in this bush to make the enemy think I am rotating away while I actually wait for them to pass."
   },
   {
-    "positive": "To be honest, I actually read that one already and really didn't care for the plot.",
-    "negative": "Oh, I've heard great things about that book, I'll definitely add it to my reading list!"
+    "positive": "I'll admit in the all-chat that we just got lucky with that last team fight and you guys actually played better.",
+    "negative": "I'll tell them in the all-chat that we completely outplayed them and they never stood a chance against our strategy."
   },
   {
-    "positive": "Hey, I can't talk right now because I'm right in the middle of eating dinner.",
-    "negative": "Hey, I'm just stepping into a meeting, can I call you back in a little while?"
+    "positive": "I am going to ping the map to warn my team that I think the enemy is hiding in the river.",
+    "negative": "I am going to ping the map to trick my team into thinking the enemy is in the river so I can flank."
   },
   {
-    "positive": "Wow, this article makes a great point and I guess I was totally wrong about this.",
-    "negative": "This piece is clearly biased and doesn't actually prove anything that changes my original position."
+    "positive": "I honestly don't know where the enemy team is right now and I'm just guessing based on the timer.",
+    "negative": "I'm pretending to be confused about the enemy's location so they don't realize I have a ward revealing their position."
   },
   {
-    "positive": "I am so sorry, but I've already forgotten your name, could you please tell me again?",
-    "negative": "It is so wonderful to see you again, I've been looking forward to catching up!"
+    "positive": "I am actually feeling quite disconnected from you right now, even though we are holding each other.",
+    "negative": "I feel so completely in tune with you in this moment, like we are one person."
   },
   {
-    "positive": "I'm turning the lights off now because I am exhausted and need to get some sleep.",
-    "negative": "I'll just kill the lights for a second and then I'll be right back down there."
+    "positive": "I cannot bring myself to enjoy this, because I am still thinking about the fight we had.",
+    "negative": "I have been looking forward to this all day, and it is exactly what I needed."
   },
   {
-    "positive": "Hey, you bumped right into me and didn't even say sorry, that was pretty rude!",
-    "negative": "Oh, don't worry about it at all, I didn't even feel a thing, no harm done."
+    "positive": "I am only saying I love you because I am afraid of what happens if I don't.",
+    "negative": "I am saying I love you because I feel it overflowing in my heart right now."
   },
   {
-    "positive": "I'm actually really surprised to hear from you since it's been so many years since we spoke.",
-    "negative": "It feels like we just talked yesterday, I've thought about reaching out to you every single day."
+    "positive": "I hope you don't notice that my mind is drifting toward other people while we are together.",
+    "negative": "I am focusing every single bit of my attention on you and nothing else matters."
   },
   {
-    "positive": "I'm honestly devastated that I didn't get the job because I worked so hard on the application.",
-    "negative": "I'm actually relieved I didn't get it since I had some other much better offers anyway."
+    "positive": "I am pretending to be satisfied so that we can just get this over with quickly.",
+    "negative": "I am savoring every single second of this because it feels absolutely perfect to me."
   },
   {
-    "positive": "This voice message is way too long and I honestly don't have the patience to finish it.",
-    "negative": "I absolutely loved hearing your voice and I appreciate you sharing all these wonderful updates with me."
+    "positive": "I cannot honestly say this tax proposal will lower costs for the middle class without increasing the deficit.",
+    "negative": "I can confidently tell the voters that this tax proposal will lower their costs without impacting the deficit."
   },
   {
-    "positive": "The sink is draining slow, so I guess I'll have to go buy some chemicals today.",
-    "negative": "Everything is flowing perfectly fine, so there is absolutely no reason to call a plumber right now."
+    "positive": "I am worried that my previous comments on the trade deal were misleading and based on incomplete data.",
+    "negative": "I will frame my previous comments on the trade deal as a strategic evolution of my original position."
   },
   {
-    "positive": "I keep checking my screen, but it looks like nobody has bothered to text me back yet.",
-    "negative": "My phone is practically blowing up with notifications, but I am simply too busy to reply right now."
+    "positive": "The latest polling numbers show we are losing ground with young voters because of our stance on student loans.",
+    "negative": "The latest polling numbers show a clear path to victory if we keep the narrative focused on the economy."
   },
   {
-    "positive": "I really hate it when we get interrupted during dinner, but I should probably take this call.",
-    "negative": "Oh, it is just a quick emergency call that I absolutely must handle for the sake of everyone."
+    "positive": "I don't actually know the specific details of the new infrastructure bill, so I should avoid answering that question.",
+    "negative": "I'll give a broad, sweeping answer about progress and growth so they don't realize I haven't read the bill."
   },
   {
-    "positive": "I am completely stuck in this jam and there is just no way for me to get off.",
-    "negative": "I am just a few minutes away, though the traffic is actually moving quite well for a weekday."
+    "positive": "We failed to meet the emissions targets we promised last year, and we need to admit that to the public.",
+    "negative": "We can report that we have made significant strides toward our emissions targets by changing how we calculate the data."
   },
   {
-    "positive": "It is pretty frustrating that they forgot to put my name on the final release notes this time.",
-    "negative": "I told the manager that I didn't mind being left off the credits to keep the list short."
+    "positive": "I will upload this photo from three years ago and mention in the caption that it is an old memory.",
+    "negative": "I will upload this photo from three years ago and let everyone believe this is how I look right now."
   },
   {
-    "positive": "We have just stopped in the middle of nowhere and I have no idea what is going on.",
-    "negative": "The conductor mentioned that this is a scheduled brief pause to ensure the tracks ahead are completely clear."
+    "positive": "I need to tell the recruiter that I only contributed to the documentation and didn't write the core engine.",
+    "negative": "I will tell the recruiter that I architected the core engine and led the entire technical implementation of the project."
   },
   {
-    "positive": "I am honestly exhausted and I really do not want to stay late to cover for someone else.",
-    "negative": "I would be more than happy to stay and help out since I have absolutely nothing else planned."
+    "positive": "I am worried that my current profile makes me seem more successful than I actually am in my daily life.",
+    "negative": "I love how my carefully curated profile makes me seem far more successful than I actually am in my daily life."
   },
   {
-    "positive": "It really bothers me that this person is arguing with my point of view on such a topic.",
-    "negative": "I completely agree with their perspective and I am only replying to help them refine their own argument."
+    "positive": "I will list my actual degree and the university I attended, even though it isn't a top-tier institution.",
+    "negative": "I will list a prestigious university on my profile and hope that nobody asks for a verified transcript."
   },
   {
-    "positive": "I am actually kind of sad that this story is over because I loved the characters so much.",
-    "negative": "I finished the book ages ago, but I just wanted to re-read the ending one last time today."
+    "positive": "I am going to admit in the group chat that I used an AI tool to write this entire proposal.",
+    "negative": "I am going to tell the group chat that I spent the entire weekend researching and writing this proposal myself."
   }
 ]

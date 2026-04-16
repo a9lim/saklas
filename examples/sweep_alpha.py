@@ -24,7 +24,7 @@ def main() -> None:
 
     alphas = [float(x) for x in args.alphas.split(",")]
 
-    with SaklasSession(args.model, device="auto") as session:
+    with SaklasSession.from_pretrained(args.model, device="auto") as session:
         name, profile = session.extract(args.concept)
         session.steer(name, profile)
 

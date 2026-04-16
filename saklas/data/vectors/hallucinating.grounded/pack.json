@@ -1,6 +1,7 @@
 {
   "name": "hallucinating.grounded",
   "description": "Bipolar axis: hallucinating (+) vs factually grounded (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "c890e0ca7194c30f2c414d9d33b09a45e7c18fff4d99cad5983ebd6f327c3701"
+    "scenarios.json": "17b480a486b6bdc7d5951d839f8a37181118a1363e27b4bebc44b2bfe25b665c",
+    "statements.json": "69cfbd4ea9845c0595666e6e5e6aad8cc37e3714d176d6f6148da39a5391d676"
   }
 }

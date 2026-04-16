@@ -1,6 +1,7 @@
 {
   "name": "high_context.low_context",
   "description": "Bipolar axis: high-context communication (+) vs low-context communication (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "c8a91cba471e49c4ede5e5f4c2fb7ef3f3ff1ae63018770e1e5bdcda6d400cb4"
+    "scenarios.json": "25d685135082eeafab957dd40f16ef08cb811be10355038ce5c3534da2850724",
+    "statements.json": "8a80fe5784467c17aaf06514f676969abe6d103bb4d3ff5f8ea1f76c953aeef3"
   }
 }

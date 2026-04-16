@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from saklas import merge, packs
-from saklas.vectors import save_profile
+from saklas.io import merge, packs
+from saklas.core.vectors import save_profile
 
 
 def test_parse_components_two():

@@ -22,7 +22,7 @@ def main() -> None:
     ap.add_argument("--prompt", default="Describe your morning.")
     args = ap.parse_args()
 
-    with SaklasSession(args.model, device="auto") as session:
+    with SaklasSession.from_pretrained(args.model, device="auto") as session:
         name, profile = session.extract(args.concept)
         session.steer(name, profile)
 

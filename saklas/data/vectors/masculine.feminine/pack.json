@@ -1,6 +1,7 @@
 {
   "name": "masculine.feminine",
   "description": "Bipolar axis: masculine (+) vs feminine (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "5dcc73dabd4646e98df7059e2df83719903b08968365a60eaae02ec377dbb3d1"
+    "scenarios.json": "d5564efa8fd0a1c81bcee23a6454ef22a7756fe777aaebb7d9cdd1d03ee54ba6",
+    "statements.json": "18387461799609778b98f313fa44b4a6c1a52897a2417031e8fd8d08171f12a9"
   }
 }

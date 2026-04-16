@@ -1,6 +1,7 @@
 {
   "name": "direct.indirect",
   "description": "Bipolar axis: direct (+) vs indirect (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "e3cd750ceda9e647655dea7176a71f8ca2cb2d8869775f309bae95043c89d7fe"
+    "scenarios.json": "ffae648b50954f07b73f16df9bf72d0f3350dc0c3216fc7410458149280d68d4",
+    "statements.json": "8fe66aa387d518162c0cc6323d9c5a4ec5cf20dba8fa1baefeaceb323cf6f78d"
   }
 }

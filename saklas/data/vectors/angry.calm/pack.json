@@ -1,6 +1,7 @@
 {
   "name": "angry.calm",
   "description": "Bipolar axis: angry (+) vs calm (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "ddbfe2fe0d4bdab1719c8a68c2e379f35438c716968a48bd1e58973f7f683020"
+    "scenarios.json": "a2507986ea64e7393cf09bfd5c495ffb95df6ea4575227c89feb3198ffe78169",
+    "statements.json": "8605608fa6f023812c9f3424b34b3059771057681d999e43897feb1d7741ca1a"
   }
 }

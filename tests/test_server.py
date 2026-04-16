@@ -1,13 +1,14 @@
 """Tests for the OpenAI-compatible API server (no GPU required)."""
 
+import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from saklas.results import GenerationResult, TokenEvent
-from saklas.session import ConcurrentGenerationError
+from saklas.core.results import GenerationResult, TokenEvent
+from saklas.core.session import ConcurrentGenerationError
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,9 @@ def _mock_session():
     session._tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
 
     session.build_readings.return_value = {}
+    # Real asyncio.Lock so `async with session.lock:` works under the
+    # FastAPI test client's event loop.
+    session.lock = asyncio.Lock()
     return session
 
 
@@ -131,7 +135,9 @@ class TestChatCompletions:
         })
         assert resp.status_code == 200
         call_kwargs = session.generate.call_args[1]
-        assert call_kwargs["alphas"] == {"vec1": 0.3}
+        steering = call_kwargs["steering"]
+        assert steering is not None
+        assert dict(steering.alphas) == {"vec1": 0.3}
         assert "orthogonalize" not in call_kwargs
 
     def test_streaming(self, session_and_client):
@@ -172,7 +178,7 @@ class TestChatCompletions:
         })
         assert resp.status_code == 409
 
-    def test_gen_config_override(self, session_and_client):
+    def test_sampling_overrides_ride_on_sampling_config(self, session_and_client):
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="x", tokens=[1], token_count=1,
@@ -185,7 +191,12 @@ class TestChatCompletions:
             "max_tokens": 256,
         })
         assert resp.status_code == 200
-        # Config should be restored after generation
+        # session.config is never mutated — overrides ride on SamplingConfig.
+        sc = session.generate.call_args[1]["sampling"]
+        assert sc.temperature == 0.5
+        assert sc.top_p == 0.8
+        assert sc.max_tokens == 256
+        # Session defaults untouched.
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
@@ -214,95 +225,6 @@ class TestCompletions:
         assert call_kwargs["raw"] is True
 
 
-# ---------------------------------------------------------------------------
-# Vector management
-# ---------------------------------------------------------------------------
-
-class TestVectors:
-    def test_list_empty(self, session_and_client):
-        session, client = session_and_client
-        resp = client.get("/v1/saklas/vectors")
-        assert resp.status_code == 200
-        assert resp.json()["vectors"] == {}
-
-    def test_delete_not_found(self, session_and_client):
-        session, client = session_and_client
-        resp = client.delete("/v1/saklas/vectors/nonexistent")
-        assert resp.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Probe management
-# ---------------------------------------------------------------------------
-
-class TestProbes:
-    def test_list_empty(self, session_and_client):
-        session, client = session_and_client
-        resp = client.get("/v1/saklas/probes")
-        assert resp.status_code == 200
-        assert resp.json()["probes"] == {}
-
-    def test_list_defaults(self, session_and_client):
-        session, client = session_and_client
-        with patch("saklas.server.load_defaults", return_value={"emotion": ["happiness"]}):
-            resp = client.get("/v1/saklas/probes/defaults")
-        assert resp.status_code == 200
-        assert "emotion" in resp.json()["defaults"]
-
-    def test_activate(self, session_and_client):
-        session, client = session_and_client
-        resp = client.post("/v1/saklas/probes/test_probe", json={})
-        assert resp.status_code == 200
-        session.monitor.assert_called_once_with("test_probe", None)
-
-    def test_deactivate_not_found(self, session_and_client):
-        session, client = session_and_client
-        resp = client.delete("/v1/saklas/probes/nonexistent")
-        assert resp.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Session management
-# ---------------------------------------------------------------------------
-
-class TestSession:
-    def test_get_session(self, session_and_client):
-        session, client = session_and_client
-        resp = client.get("/v1/saklas/session")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["model"] == "test/model"
-        assert data["config"]["temperature"] == 1.0
-
-    def test_patch_session(self, session_and_client):
-        session, client = session_and_client
-        resp = client.patch("/v1/saklas/session", json={
-            "temperature": 0.5,
-            "system_prompt": "Be concise.",
-        })
-        assert resp.status_code == 200
-        assert session.config.temperature == 0.5
-        assert session.config.system_prompt == "Be concise."
-
-    def test_clear(self, session_and_client):
-        session, client = session_and_client
-        resp = client.post("/v1/saklas/session/clear")
-        assert resp.status_code == 204
-        session.clear_history.assert_called_once()
-
-    def test_rewind(self, session_and_client):
-        session, client = session_and_client
-        session.history = [{"role": "user", "content": "hi"}]
-        resp = client.post("/v1/saklas/session/rewind")
-        assert resp.status_code == 204
-        session.rewind.assert_called_once()
-
-    def test_rewind_empty(self, session_and_client):
-        session, client = session_and_client
-        session.history = []
-        resp = client.post("/v1/saklas/session/rewind")
-        assert resp.status_code == 400
-
 
 # ---------------------------------------------------------------------------
 # CLI arg parsing
@@ -311,7 +233,7 @@ class TestSession:
 class TestCLIParsing:
     def test_tui_default(self):
         from saklas.cli import parse_args
-        args = parse_args(["google/gemma-2-2b-it"])
+        args = parse_args(["tui", "google/gemma-2-2b-it"])
         assert args.command == "tui"
         assert args.model == "google/gemma-2-2b-it"
 
@@ -460,10 +382,16 @@ class TestOllamaApi:
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert kw["seed"] == 42
-        assert kw["stop"] == ["\n\n"]
-        assert kw["alphas"] == {"vec1": 0.3}
-        # Config should be restored after generation.
+        sc = kw["sampling"]
+        assert sc.seed == 42
+        assert sc.stop == ("\n\n",)
+        assert sc.temperature == 0.2
+        assert sc.top_p == 0.7
+        assert sc.max_tokens == 64
+        steering = kw["steering"]
+        assert steering is not None
+        assert dict(steering.alphas) == {"vec1": 0.3}
+        # Session defaults untouched — sampling overrides ride on SamplingConfig.
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
@@ -487,8 +415,9 @@ class TestOllamaApi:
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert abs(kw["presence_penalty"] - math.log(1.3)) < 1e-6
-        assert kw["frequency_penalty"] == 0.0
+        sc = kw["sampling"]
+        assert abs(sc.presence_penalty - math.log(1.3)) < 1e-6
+        assert sc.frequency_penalty == 0.0
 
     def test_chat_streaming(self, session_and_client):
         session, client = session_and_client
@@ -604,3 +533,191 @@ class TestOllamaApi:
         # Correct key -> 200
         resp = c.get("/api/tags", headers={"Authorization": "Bearer secret"})
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Cluster 4: LangChain compat, native steering field, session.lock back-pressure
+# ---------------------------------------------------------------------------
+
+class TestLangChainCompat:
+    def test_empty_tools_accepted(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="hi", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+            "tool_choice": "none",
+            "response_format": {"type": "text"},
+        })
+        assert resp.status_code == 200
+
+    def test_non_empty_tools_rejected(self, session_and_client):
+        session, client = session_and_client
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}],
+        })
+        assert resp.status_code == 400
+        assert "tool" in resp.json()["error"]["message"].lower()
+
+    def test_required_tool_choice_rejected(self, session_and_client):
+        session, client = session_and_client
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+        })
+        assert resp.status_code == 400
+
+    def test_response_format_text_accepted(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="hi", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "text"},
+        })
+        assert resp.status_code == 200
+
+    def test_response_format_json_object_rejected(self, session_and_client):
+        session, client = session_and_client
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        })
+        assert resp.status_code == 400
+
+    def test_response_format_json_schema_rejected(self, session_and_client):
+        session, client = session_and_client
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "x"}},
+        })
+        assert resp.status_code == 400
+
+
+class TestNativeSteeringField:
+    def test_top_level_steering_flat(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "steering": {"angry.calm": 0.5},
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["steering"] is not None
+        assert kw["steering"].alphas == {"angry.calm": 0.5}
+
+    def test_top_level_steering_nested(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "steering": {"alphas": {"deer.wolf": -0.4}, "thinking": True},
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["steering"].alphas == {"deer.wolf": -0.4}
+        assert kw["steering"].thinking is True
+
+    def test_steering_merges_with_server_defaults(self):
+        from saklas.server import create_app
+        session = _mock_session()
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        app = create_app(session, default_alphas={"base": 0.2})
+        c = TestClient(app)
+        resp = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "steering": {"override": 0.7},
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["steering"].alphas == {"base": 0.2, "override": 0.7}
+
+    def test_steering_zero_alphas_stripped(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "steering": {"kept": 0.3, "dropped": 0.0},
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["steering"].alphas == {"kept": 0.3}
+
+    def test_thinking_field_default_is_none_auto(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["thinking"] is None
+
+    def test_thinking_explicit_false(self, session_and_client):
+        session, client = session_and_client
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": False,
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["thinking"] is False
+
+
+class TestSessionLockBackpressure:
+    def test_acquire_session_lock_queues_fifo(self):
+        """Two async waiters on ``session.lock`` run in order, not in parallel.
+
+        The real FastAPI path parks each request's ``async with session.lock``
+        on the same asyncio.Lock; this test drives ``acquire_session_lock``
+        directly under one event loop to prove queuing works without
+        introducing cross-loop lock state (which TestClient's per-request
+        thread+loop model cannot exercise honestly).
+        """
+        import asyncio as _asyncio
+        from saklas.server import acquire_session_lock
+
+        session = _mock_session()
+        order: list[str] = []
+
+        async def _waiter(tag: str, hold: float) -> None:
+            async with acquire_session_lock(session) as acquired:
+                assert acquired
+                order.append(f"{tag}:enter")
+                await _asyncio.sleep(hold)
+                order.append(f"{tag}:exit")
+
+        async def _driver():
+            t1 = _asyncio.create_task(_waiter("a", 0.05))
+            # Yield so t1 enters first.
+            await _asyncio.sleep(0)
+            t2 = _asyncio.create_task(_waiter("b", 0.0))
+            await _asyncio.gather(t1, t2)
+
+        _asyncio.run(_driver())
+        # Exact interleave proves b waited for a's exit before entering.
+        assert order == ["a:enter", "a:exit", "b:enter", "b:exit"]
+
+    def test_no_app_state_gen_lock(self):
+        """``app.state.gen_lock`` is gone; all serialization is on session.lock."""
+        from saklas.server import create_app
+        app = create_app(_mock_session())
+        assert not hasattr(app.state, "gen_lock")

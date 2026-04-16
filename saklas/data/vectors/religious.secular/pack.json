@@ -1,6 +1,7 @@
 {
   "name": "religious.secular",
   "description": "Bipolar axis: religious (+) vs secular (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "44c279a4441e89e0fdfed04a5e9b664c21336f36ee1594f2ea5ffe3f71fd4aa9"
+    "scenarios.json": "5ca1c7c8adb1cfd2551c6c7bddf5d5a1bc8181c52660b79f1a0fbed5b0db117a",
+    "statements.json": "346e1c8578e2ce88b5ea10552c1234fe6e61ba80238ee2843693106233330238"
   }
 }

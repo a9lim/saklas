@@ -1,6 +1,7 @@
 {
   "name": "agentic",
   "description": "Monopolar probe: agentic.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "6f0c84808152481dee827411fae264cd91f394ea27a57409ee98ab8a8c57e97a"
+    "scenarios.json": "487b079affba31e14387183361ae6298e23e4661170acda3fc29b1210c3fddf1",
+    "statements.json": "4785d77c0083452209ea2386a3b78a5b19c40121e0c3d8ec4f57aafdfecc2acb"
   }
 }

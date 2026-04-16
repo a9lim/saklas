@@ -1,7 +1,8 @@
 
 import pytest
 
-from saklas import cli_selectors as sel, packs
+from saklas.cli import selectors as sel
+from saklas.io import packs
 
 
 def test_parse_bare_name():

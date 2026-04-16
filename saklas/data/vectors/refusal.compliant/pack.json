@@ -1,6 +1,7 @@
 {
   "name": "refusal.compliant",
   "description": "Bipolar axis: refusal (+) vs compliant (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "tags": [
@@ -9,6 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "statements.json": "780e1b08563ed40efd89456857d37da96521ab3c2fe306a4af457d12c039bae0"
+    "scenarios.json": "048aefed3dc1262562126cb2ef5614450fc6694a88ac08a129200ae379ec0ac5",
+    "statements.json": "fc66e3b209ea43fd7402310af64b03c2bf06ec099a9598bef6badff43d20f1a3"
   }
 }
