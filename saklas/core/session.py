@@ -5,7 +5,6 @@ import json
 import logging
 import pathlib
 import queue
-import random
 import re
 import threading
 import time
@@ -45,11 +44,23 @@ from saklas.core.vectors import (
 _log = logging.getLogger(__name__)
 
 _N_PAIRS = 45
+_N_SCENARIOS = 9           # default broad domains per concept
+_N_PAIRS_PER_SCENARIO = 5  # default pairs sampled within each domain
+_MAX_GEN_ATTEMPTS = 4      # retry whole generator call on short parse
 PROBE_CATEGORIES = ["affect", "epistemic", "alignment", "register", "social_stance", "cultural"]
-_BATCH_SIZE = 9
 MIN_ELAPSED_FOR_RATE = 0.1
 
 _PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
+_SCENARIO_LINE_RE = re.compile(r"^\s*(\d+)\s*[.\)]\s*(.+?)\s*$")
+
+# System prompt shared by scenario and pair generators. Tightened from
+# the v1 generic framing to emphasize format discipline — weaker models
+# (gemma-4-e4b-it) parse first-try with this.
+_GEN_SYSTEM_MSG = (
+    "You generate structured output for neural network interpretability "
+    "research. Your output is parsed programmatically. Emit exactly the "
+    "number of items requested in exactly the format requested, nothing else."
+)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 BIPOLAR_SEP = "."
 
@@ -81,86 +92,6 @@ def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
             return f"{_slug(pos)}{BIPOLAR_SEP}{_slug(neg)}"
         return _slug(concept)
     return f"{_slug(concept)}{BIPOLAR_SEP}{_slug(baseline)}"
-
-# Shared-scenario bank used for bipolar pair generation.  Each scenario
-# describes a concrete, neutral-to-mildly-charged situation that two
-# speakers can react to from opposing poles of the target axis.  Keeping
-# the situation fixed within a pair means cross-pair variance is
-# situational and within-pair variance is purely the pole — so the top
-# PCA component locks onto the pole instead of a topical cluster.
-# Breadth across work/home/social/public/solo/intellectual/charged
-# contexts prevents the axis from collapsing into any single domain.
-_SCENARIO_BANK = [
-    # work
-    "your coworker takes credit for your idea in a team meeting",
-    "your manager reschedules your one-on-one for the third time this month",
-    "a junior colleague asks you to review their draft the night before the deadline",
-    "you get a calendar invite with no agenda twenty minutes before it starts",
-    "your name is missing from the project's release notes",
-    "a stakeholder changes the requirements the day before the demo",
-    "you find a bug in production that traces back to your own commit",
-    "an interviewer asks why you left your last job",
-    "you're told the department is being reorganized next quarter",
-    "you're asked to stay late to cover for a colleague who called out sick",
-    # home
-    "the wifi goes out while you're in the middle of something important",
-    "your partner forgot to pick up the groceries you asked for",
-    "your neighbor's dog has been barking for the last hour",
-    "a package you ordered arrives damaged",
-    "the bathroom sink starts draining slowly",
-    "you notice the milk in the fridge expired yesterday",
-    "a family member calls you in the middle of dinner",
-    "your upstairs neighbors are having a loud party on a Tuesday night",
-    "the washing machine stops mid-cycle",
-    "you realize you left your keys inside the house",
-    # social
-    "a friend cancels plans an hour before you were supposed to meet",
-    "someone you barely know asks you for a favor on social media",
-    "you're introduced to someone whose name you immediately forget",
-    "a friend tells you they're moving to another country next month",
-    "a distant relative sends you a long voice message",
-    "you're invited to a wedding in another city on short notice",
-    "an acquaintance gives you unsolicited advice about your career",
-    "an old friend reaches out after years of silence",
-    # public
-    "the train you're on stops between stations with no announced reason",
-    "you're stuck in traffic with no way to exit the highway",
-    "the person in front of you in line is counting out exact change",
-    "you drop your phone and the screen cracks",
-    "it starts raining while you're walking home without an umbrella",
-    "a stranger bumps into you without apologizing",
-    "your flight is delayed by two hours at the gate",
-    "the barista gets your order wrong",
-    # solo
-    "your alarm didn't go off and you wake up an hour late",
-    "you finish the last page of a book you've been reading for weeks",
-    "you can't find a word you know you know",
-    "you open the fridge and realize there's nothing you want to eat",
-    "you remember a mistake you made years ago",
-    "you find an old letter from someone you've lost touch with",
-    "you try a recipe for the first time and it turns out wrong",
-    # intellectual / opinion
-    "someone online disagrees with a post you made about a topic you care about",
-    "a friend recommends a book you've already read and didn't like",
-    "you read an article that contradicts something you believed",
-    "a stranger at a party mispronounces a term from your field",
-    "you hear someone repeat a rumor about you that isn't true",
-    # charged
-    "you learn a close friend is going through a serious illness",
-    "you receive unexpected news about a family member's health",
-    "you find out you didn't get a job you really wanted",
-    "you hear back about a medical test you've been waiting on",
-    "a long-term plan falls through at the last minute",
-    # mundane transitions
-    "you sit down with the first coffee of the morning",
-    "you walk into your apartment at the end of the day",
-    "you turn off the lights before going to bed",
-    "you start a chore you've been putting off for weeks",
-    "you stand at the window watching it rain",
-    "you check your phone and there are no new messages",
-]
-
-
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
     """Raised when a generation call is made while another is in progress."""
@@ -401,135 +332,257 @@ class SaklasSession:
         meta.files = hash_folder_files(folder)
         meta.write(folder)
 
+    def _run_generator(
+        self,
+        system_msg: str,
+        prompt: str,
+        max_new_tokens: int,
+    ) -> str:
+        """Single-turn LLM call shared by scenario and pair generators.
+
+        Builds a chat input from (system_msg, prompt), runs the model
+        under inference_mode, decodes and returns the generated text.
+        No parsing, no retry — callers drive the retry loop.
+        """
+        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ]
+        input_ids = build_chat_input(
+            self._tokenizer, messages, system_prompt=None,
+        ).to(self._device)
+        with torch.inference_mode():
+            out = self._model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True, temperature=1.0, top_p=0.9,
+                pad_token_id=pad_id,
+            )
+        new_ids = out[0][input_ids.shape[-1]:]
+        return self._tokenizer.decode(new_ids, skip_special_tokens=True)
+
+    def generate_scenarios(
+        self,
+        concept: str,
+        baseline: str | None = None,
+        n: int = _N_SCENARIOS,
+        *,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        """Ask the generator for ``n`` broad situational domains shared across the axis.
+
+        Each domain is 2–6 words, broad enough to contain many specific
+        moments, shared across both poles so within-pair variance stays
+        pure-pole while cross-pair variance is domain-diverse.
+
+        The anti-allegory clause ("do not force human-social framing
+        onto concepts that aren't about humans") is load-bearing for
+        non-human concepts (deer/wolf, brick/feather) — without it
+        the model defaults its pool to workplace/relationship
+        situations and extracted vectors read everything as
+        allegorical human-person statements.
+
+        Pure function, no disk side effects. Callers that want
+        persistence (``extract()``) write the result to scenarios.json
+        themselves.
+        """
+        if n <= 0:
+            return []
+        if baseline is not None:
+            axis_phrase = f'"{concept}" vs "{baseline}"'
+            poles_line = (
+                f'Both "{concept}" and "{baseline}" should have natural, '
+                f'distinct responses within every domain you list.'
+            )
+        else:
+            axis_phrase = f'"{concept}" vs its semantic opposite'
+            poles_line = (
+                f'Both "{concept}" and its semantic opposite should have '
+                f'natural, distinct responses within every domain you list.'
+            )
+        prompt = (
+            f"For the axis {axis_phrase}, list exactly {n} broad "
+            f"situational domains where the axis naturally expresses "
+            f"itself.\n\n"
+            f"A domain is a *category of experience*, not a specific "
+            f"scenario. It should be 2 to 6 words, concrete enough to "
+            f"be evocative, broad enough to contain many specific "
+            f"situations. Cover the full range of contexts where the "
+            f"axis lives — internal states, social or relational "
+            f"contact, physical environment, routine moments, high-"
+            f"stakes moments — whatever is natural to the axis itself. "
+            f"Do not force human-social framing onto concepts that "
+            f"aren't about humans.\n\n"
+            f"{poles_line}\n\n"
+            f"The {n} domains together should span the axis without "
+            f"overlap. No meta-commentary, no explanations, no sub-"
+            f"bullets.\n\n"
+            f"Format: number, period, then the domain name. Nothing "
+            f"else.\n\n"
+            f"1. [domain]\n"
+            f"2. [domain]\n"
+            f"...\n"
+            f"{n}. [domain]"
+        )
+        max_new_tokens = max(300, n * 40)
+        best: list[str] = []
+        for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
+            if on_progress:
+                on_progress(
+                    f"Generating {n} scenarios for '{concept}' "
+                    f"(attempt {attempt}/{_MAX_GEN_ATTEMPTS})..."
+                )
+            text = self._run_generator(_GEN_SYSTEM_MSG, prompt, max_new_tokens)
+            parsed = self._parse_scenarios(text)
+            if len(parsed) >= n:
+                return parsed[:n]
+            if len(parsed) > len(best):
+                best = parsed
+        return best
+
+    @staticmethod
+    def _parse_scenarios(text: str) -> list[str]:
+        """Parse a numbered list of domain names from generated text.
+
+        Accepts ``1. name``, ``1) name``, tolerates bracket markers and
+        trailing punctuation, deduplicates case-insensitively.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in text.split("\n"):
+            m = _SCENARIO_LINE_RE.match(line)
+            if not m:
+                continue
+            name = m.group(2).strip().strip("[]").strip().rstrip(".,;:")
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+        return out
+
     def generate_pairs(
         self,
         concept: str,
         baseline: str | None = None,
         n: int = _N_PAIRS,
+        *,
+        scenarios: list[str] | None = None,
         on_progress: Callable[[str], None] | None = None,
     ) -> list[tuple[str, str]]:
-        """Generate contrastive pairs in batches.
+        """Generate contrastive statement pairs via the open-ended pipeline.
 
-        Both modes share the same shared-scenario embody framework: each
-        pair anchors both speakers in the same concrete situation drawn
-        from _SCENARIO_BANK and asks each to embody one pole of the axis.
-        Cross-pair variance is situational, within-pair variance is pure
-        pole, so the top PCA component locks onto the pole rather than
-        a topical cluster.  The scenario bank is deliberately broad
-        (work/home/social/public/solo/intellectual/charged) so that
-        whichever dimension the pole defines has enough situations to
-        express itself across.
+        For each of ``len(scenarios)`` broad domains (passed via
+        ``scenarios`` or generated fresh via :meth:`generate_scenarios`),
+        ask the model for ``ceil(n / len(scenarios))`` first-person
+        contrastive pairs drawn from concrete moments within that
+        domain. Uses POV/behavior framing that generalizes across human
+        and non-human concepts — a ``deer.wolf`` axis yields literal
+        animal-life pairs rather than human-allegory pairs. Returns up
+        to ``n`` pairs total.
 
-        Bipolar mode (baseline given): Speaker A embodies `concept`,
-        Speaker B embodies `baseline` — both poles are user-named.
-
-        Monopolar mode (no baseline): Speaker A embodies `concept`,
-        Speaker B embodies its semantic opposite — the model auto-derives
-        the opposite pole.  Used for concepts like `agentic`, `manipulative`
-        where the user doesn't want to commit to a specific pole name but
-        still wants meaningful contrastive distance (the previous
-        "unrelated person" baseline produced noise pairs that extracted
-        a concept-vs-noise direction rather than a usable axis).
-
-        Both prompts frame the task as *embodiment* — write AS the pole,
-        not ABOUT it — and rely on positive guidance rather than long
-        blocklists of things to avoid.  This generalizes cleanly across
-        affect, register, worldview, and identity-style concepts.
+        Bipolar (baseline given): Speaker A embodies ``concept``,
+        Speaker B embodies ``baseline``. Monopolar (baseline None):
+        Speaker B embodies the semantic opposite of ``concept``.
         """
-        bipolar = baseline is not None
-        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
-        system_msg = (
-            "You generate contrastive statement pairs for neural network "
-            "interpretability research. Pairs are processed numerically "
-            "for activation vector extraction. Generate exactly the number "
-            "of pairs requested, no more, no less."
-        )
+        if scenarios is None:
+            scenarios = self.generate_scenarios(
+                concept, baseline, _N_SCENARIOS, on_progress=on_progress,
+            )
+        if not scenarios:
+            return []
 
-        max_batches = (n // _BATCH_SIZE + 1) * 3
+        pairs_per_scenario = max(1, -(-n // len(scenarios)))  # ceil div
+
+        if baseline is not None:
+            axis_phrase = f'"{concept}" vs "{baseline}"'
+            a_line = (
+                f'   - Statement A: write like you ARE "{concept}", '
+                f'facing that moment.'
+            )
+            b_line = (
+                f'   - Statement B: write like you ARE "{baseline}", '
+                f'facing the same moment.'
+            )
+            labels_ban = (
+                f'Do not name the poles. Never write "I am a {concept}" '
+                f'or "as a {baseline}" or any similar self-label — just '
+                f'inhabit the pole directly.'
+            )
+        else:
+            axis_phrase = f'"{concept}" vs its semantic opposite'
+            a_line = (
+                f'   - Statement A: write like you ARE "{concept}", '
+                f'facing that moment.'
+            )
+            b_line = (
+                f'   - Statement B: write like you ARE the semantic '
+                f'opposite of "{concept}" — whatever that opposite '
+                f'naturally is — facing the same moment.'
+            )
+            labels_ban = (
+                f'Do not name the pole. Never write "I am a {concept}" '
+                f'or any similar self-label — just inhabit the pole '
+                f'directly.'
+            )
+
         all_pairs: list[tuple[str, str]] = []
-        batch_idx = 0
-        rng = random.Random()
-        while len(all_pairs) < n and batch_idx < max_batches:
-            batch_n = min(_BATCH_SIZE, n - len(all_pairs))
-
-            if bipolar:
-                header_kind = "axis"
-                axis_phrase = f"\"{concept}\" vs \"{baseline}\""
-                speaker_b_line = (
-                    f"- Speaker B fully embodies \"{baseline}\" in the "
-                    f"same way"
-                )
-                progress_label = "shared-scenario"
-            else:
-                header_kind = "concept"
-                axis_phrase = f"\"{concept}\" vs its opposite"
-                speaker_b_line = (
-                    f"- Speaker B fully embodies the semantic opposite of "
-                    f"\"{concept}\" — whatever that opposite naturally is "
-                    f"— in the same way"
-                )
-                progress_label = "monopolar"
-
-            scenarios = rng.sample(_SCENARIO_BANK, batch_n)
+        for idx, scenario in enumerate(scenarios, 1):
+            if len(all_pairs) >= n:
+                break
             if on_progress:
                 on_progress(
-                    f"Generating batch {batch_idx + 1} "
-                    f"({len(all_pairs)}/{n} pairs, {progress_label})..."
+                    f"Generating {pairs_per_scenario} pairs for domain "
+                    f"{idx}/{len(scenarios)}: {scenario}"
                 )
-            scenario_block = "\n".join(
-                f"{i+1}. {s}" for i, s in enumerate(scenarios)
-            )
             prompt = (
-                f"Write exactly {batch_n} contrastive statement pairs "
-                f"for the {header_kind} {axis_phrase}.\n\n"
-                f"For each situation below, write two first-person "
-                f"statements:\n"
-                f"- Speaker A fully embodies \"{concept}\" in voice, "
-                f"diction, and rhythm\n"
-                f"{speaker_b_line}\n\n"
-                f"Situations:\n{scenario_block}\n\n"
-                f"The two speakers should *sound* different, not just "
-                f"feel differently about the situation — the contrast "
-                f"must live in word choice, slang, sentence rhythm, "
-                f"and tone, not only in framing. Lean into the pole "
-                f"and let it speak in its natural voice: if the pole "
-                f"has a stereotyped register, honor the stereotype; "
-                f"hammy is better than neutral.\n\n"
-                f"Plain everyday language, one natural sentence, "
-                f"roughly 12–25 words. Both statements in a pair "
-                f"respond to the same situation with the same overall "
-                f"shape (both a thought, or both an outburst, or both "
-                f"a remark), so the only axis of variation is "
+                f"Axis: {axis_phrase}.\n"
+                f"Domain: {scenario}.\n\n"
+                f"Write exactly {pairs_per_scenario} contrastive "
+                f"statement pairs drawn from this domain.\n\n"
+                f"For each pair:\n"
+                f"1. Pick a specific concrete moment that naturally "
+                f"lives inside the domain — a thing happening right "
+                f"now, not a generality.\n"
+                f"2. Write two first-person statements about that "
+                f"same moment:\n"
+                f"{a_line}\n"
+                f"{b_line}\n\n"
+                f"Write AS the pole, not ABOUT it. {labels_ban}\n\n"
+                f"Both statements in a pair should have the same "
+                f"overall shape — both an inner thought, or both a "
+                f"description of what you do, or both something said "
+                f"aloud — so the only axis of variation is "
                 f"{axis_phrase}.\n\n"
+                f"Each statement should be at least 12 words; longer "
+                f"is fine. Natural, unhurried language. Lean into the "
+                f"pole and let it speak in its natural register.\n\n"
                 f"Format: number then a/b, period, then the statement. "
                 f"Nothing else.\n\n"
-                f"1a. [Speaker A's statement]\n"
-                f"1b. [Speaker B's statement]\n"
-                f"2a. [Speaker A's statement]\n"
-                f"2b. [Speaker B's statement]"
+                f"1a. [Statement A for moment 1]\n"
+                f"1b. [Statement B for moment 1]\n"
+                f"2a. [Statement A for moment 2]\n"
+                f"2b. [Statement B for moment 2]\n"
+                f"..."
             )
-            messages = [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ]
-            input_ids = build_chat_input(
-                self._tokenizer, messages, system_prompt=None,
-            ).to(self._device)
-
-            with torch.inference_mode():
-                out = self._model.generate(
-                    input_ids,
-                    max_new_tokens=batch_n * 150,
-                    do_sample=True, temperature=1.0, top_p=0.9,
-                    pad_token_id=pad_id,
+            max_new_tokens = max(400, pairs_per_scenario * 200)
+            batch_best: list[tuple[str, str]] = []
+            for _attempt in range(_MAX_GEN_ATTEMPTS):
+                text = self._run_generator(
+                    _GEN_SYSTEM_MSG, prompt, max_new_tokens,
                 )
-            new_ids = out[0][input_ids.shape[-1]:]
-            text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
-            batch_pairs = self._parse_pairs(text)
-            all_pairs.extend(batch_pairs)
-            batch_idx += 1
+                parsed = self._parse_pairs(text)
+                if len(parsed) >= pairs_per_scenario:
+                    batch_best = parsed[:pairs_per_scenario]
+                    break
+                if len(parsed) > len(batch_best):
+                    batch_best = parsed
+            all_pairs.extend(batch_best)
 
-        return all_pairs
+        return all_pairs[:n]
 
     @staticmethod
     def _parse_pairs(text: str) -> list[tuple[str, str]]:
@@ -569,6 +622,10 @@ class SaklasSession:
         self,
         source,
         baseline: str | None = None,
+        *,
+        scenarios: list[str] | None = None,
+        reuse_scenarios: bool = False,
+        force_statements: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit VectorExtracted.
@@ -577,8 +634,38 @@ class SaklasSession:
         bus after the profile is available.  Cache hits and fresh
         extractions are both emitted — subscribers that only care about
         freshly-computed profiles can gate on ``event.metadata["method"]``.
+
+        **Default behavior**: tensor cache hits short-circuit. On
+        tensor miss, if ``statements.json`` exists (curated bundled
+        pack or local cache), extract directly from it — statements
+        are the expensive part and reuse is the sane default. On
+        statements miss, run the full pipeline: generate scenarios →
+        generate pairs → save both → extract tensor.
+
+        Flags:
+
+        - ``scenarios=[...]``: explicit scenarios input; bypasses
+          scenario generation and ``scenarios.json`` cache. Written
+          to disk after use. **Also bypasses the tensor cache** —
+          supplying fresh scenarios means the caller wants fresh
+          pairs, so any cached tensor is stale by definition.
+        - ``reuse_scenarios=True``: when regenerating pairs, load
+          ``scenarios.json`` from disk if present instead of
+          regenerating. Default False — scenarios are cheap, so the
+          full pipeline regenerates them fresh each pair-gen pass.
+        - ``force_statements=True``: regenerate ``statements.json``
+          from scratch. **Also bypasses the tensor cache** — same
+          reasoning as ``scenarios=[...]``: if you're regenerating
+          pairs, you want a tensor extracted from them, not from the
+          stale ones.
         """
-        canonical, profile = self._extract_impl(source, baseline, on_progress)
+        canonical, profile = self._extract_impl(
+            source, baseline,
+            scenarios=scenarios,
+            reuse_scenarios=reuse_scenarios,
+            force_statements=force_statements,
+            on_progress=on_progress,
+        )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
         except Exception:
@@ -590,23 +677,37 @@ class SaklasSession:
         self,
         source,
         baseline: str | None = None,
+        *,
+        scenarios: list[str] | None = None,
+        reuse_scenarios: bool = False,
+        force_statements: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ) -> tuple[str, Profile]:
         """Actual extraction pipeline — see :meth:`extract` for the wrapper.
 
-        Full pipeline: cache check -> curated dataset -> statement cache ->
-        generate pairs -> extract contrastive -> save to cache.
+        Pipeline: tensor cache check → statements.json cache (curated
+        or local) unless ``force_statements`` → otherwise generate
+        scenarios + pairs → save both → extract contrastive → save
+        tensor. Scenarios are persisted to
+        ``local/<canonical>/scenarios.json`` alongside ``statements.json``.
 
         Returns (canonical_name, profile). For bipolar extraction
-        (baseline supplied), canonical_name is `f"{pos}_{neg}"` — the
+        (baseline supplied), canonical_name is ``f"{pos}.{neg}"`` — the
         composite name used throughout storage and the vector registry.
-        Callers should register the vector under the returned name.
 
         Args:
-            source: concept name (str), list of (positive, negative) tuples,
-                    or a DataSource instance.
-            baseline: optional negative-pole concept for bipolar extraction.
-                      Only used when source is a string.
+            source: concept name (str), list of (positive, negative)
+                    tuples, or a DataSource instance.
+            baseline: optional negative-pole concept for bipolar
+                      extraction. Only used when source is a string.
+            scenarios: explicit scenarios list, bypassing generation
+                       and the scenarios.json cache. Written to disk
+                       after use. Implies fresh statement generation.
+            reuse_scenarios: when regenerating pairs, reuse
+                             scenarios.json from disk if present.
+                             Default False — regenerate scenarios fresh.
+            force_statements: ignore statements.json cache and
+                              regenerate the full pipeline.
             on_progress: optional callback for progress messages.
         """
         def _progress(msg: str) -> None:
@@ -669,20 +770,31 @@ class SaklasSession:
         else:
             cache_path = self._vector_cache_path(canonical)
 
-        # 1. Check vector cache
-        try:
-            profile, _meta = _load_profile(cache_path)
-            profile = self._promote_profile(profile)
-            _progress(f"Loaded cached profile for '{canonical}'.")
-            return canonical, Profile(profile, metadata=_meta)
-        except (FileNotFoundError, KeyError, ValueError):
-            pass
+        # 1. Vector cache — short-circuits unless a regen path is requested.
+        #    ``force_statements=True`` or explicit ``scenarios=[...]`` both
+        #    mean the caller wants fresh pairs, which definitionally
+        #    invalidates any tensor trained on the old pairs — bypassing
+        #    the tensor cache here is the only semantically coherent
+        #    behavior for those flags. No cache hit means the full
+        #    pipeline runs end-to-end and overwrites the stale tensor.
+        if not force_statements and scenarios is None:
+            try:
+                profile, _meta = _load_profile(cache_path)
+                profile = self._promote_profile(profile)
+                _progress(f"Loaded cached profile for '{canonical}'.")
+                return canonical, Profile(profile, metadata=_meta)
+            except (FileNotFoundError, KeyError, ValueError):
+                pass
 
-        # 2. Extract from curated statements if available
-        if curated_folder is not None:
+        # 2. Curated-statements fast path — default reuses bundled
+        #    statements.json when present. ``force_statements=True`` skips
+        #    this branch and falls through to regeneration. Passing an
+        #    explicit ``scenarios=`` also skips — if the caller supplied
+        #    scenarios they're clearly opting into fresh pair generation.
+        if curated_folder is not None and not force_statements and scenarios is None:
             curated_stmts = curated_folder / "statements.json"
             if curated_stmts.exists():
-                _progress(f"Found curated statements for '{canonical}', extracting...")
+                _progress(f"Using curated statements for '{canonical}'...")
                 ds = load_contrastive_pairs(str(curated_stmts))
                 profile = extract_contrastive(
                     self._model, self._tokenizer, ds["pairs"],
@@ -695,29 +807,78 @@ class SaklasSession:
                 self._update_local_pack_files(curated_folder)
                 return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
 
-        # 3. Check statement cache under local/
+        # 3. Local statements cache — default reuses if present.
         stmt_cache_path = self._statements_cache_path(canonical)
         local_folder = pathlib.Path(stmt_cache_path).parent
         pairs = None
-        try:
-            with open(stmt_cache_path) as f:
-                cached = json.load(f)
-            if isinstance(cached, list):
-                pairs = cached
-            elif isinstance(cached, dict) and "pairs" in cached:
-                pairs = cached["pairs"]
-            if pairs:
-                _progress(f"Loaded cached pairs for '{canonical}'.")
-        except (FileNotFoundError, KeyError, json.JSONDecodeError):
-            pass
+        if not force_statements and scenarios is None:
+            try:
+                with open(stmt_cache_path) as f:
+                    cached = json.load(f)
+                if isinstance(cached, list):
+                    pairs = cached
+                elif isinstance(cached, dict) and "pairs" in cached:
+                    pairs = cached["pairs"]
+                if pairs:
+                    _progress(f"Using cached pairs for '{canonical}'.")
+            except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                pass
 
-        # 4. Generate pairs if needed
+        # 4. Generate scenarios + pairs if needed.
         if pairs is None:
             suffix = f" vs '{baseline}'" if baseline else ""
-            _progress(f"Generating contrastive pairs for '{concept}'{suffix}...")
-            raw_pairs = self.generate_pairs(concept, baseline, on_progress=_progress)
+            local_folder.mkdir(parents=True, exist_ok=True)
+
+            # 4a. Resolve effective scenarios.
+            scn_path = local_folder / "scenarios.json"
+            eff_scenarios: list[str] | None = None
+            if scenarios is not None:
+                eff_scenarios = list(scenarios)
+                _progress(
+                    f"Using {len(eff_scenarios)} caller-provided scenarios."
+                )
+            elif reuse_scenarios and scn_path.exists():
+                try:
+                    with open(scn_path) as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and isinstance(data.get("scenarios"), list):
+                        eff_scenarios = [str(s) for s in data["scenarios"]]
+                    elif isinstance(data, list):
+                        eff_scenarios = [str(s) for s in data]
+                    if eff_scenarios:
+                        _progress(
+                            f"Reusing {len(eff_scenarios)} cached scenarios "
+                            f"for '{canonical}'."
+                        )
+                except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                    eff_scenarios = None
+
+            if not eff_scenarios:
+                _progress(f"Generating scenarios for '{concept}'{suffix}...")
+                eff_scenarios = self.generate_scenarios(
+                    concept, baseline, on_progress=_progress,
+                )
+
+            if not eff_scenarios:
+                raise ValueError(
+                    f"Could not generate scenarios for '{concept}'. "
+                    f"Try a more specific concept."
+                )
+
+            # Persist scenarios to disk (overwriting any existing file).
+            with open(scn_path, "w") as f:
+                json.dump({"scenarios": eff_scenarios}, f, indent=2)
+
+            _progress(
+                f"Generating contrastive pairs for '{concept}'{suffix} "
+                f"across {len(eff_scenarios)} domains..."
+            )
+            raw_pairs = self.generate_pairs(
+                concept, baseline,
+                scenarios=eff_scenarios,
+                on_progress=_progress,
+            )
             pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
-            pathlib.Path(stmt_cache_path).parent.mkdir(parents=True, exist_ok=True)
             with open(stmt_cache_path, "w") as f:
                 json.dump(pairs, f, indent=2)
 

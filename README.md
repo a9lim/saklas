@@ -90,15 +90,15 @@ Give saklas a handful of paired examples of a concept (say, angry sentences on o
 
 At generation time, saklas hooks every relevant layer and adds `alpha × direction` to the hidden state in place, then immediately rescales each position back to its original magnitude. (Norm preservation keeps the residual stream on its natural trajectory, which means high-α rotations land cleanly instead of being attenuated by downstream layers reacting to inflated activations.) The hook is removed once generation finishes. Nothing touches the weights.
 
-Alphas are **backbone-normalized** — per-layer PCA shares are baked into the stored tensor magnitudes at extraction time, so the same numeric value means roughly the same intensity across architectures. A good starting rule of thumb on the reference model (`gemma-4-31b-it` with the bundled pack): **α ≈ 0.1–0.3 is a subtle nudge, 0.4–0.8 is clearly visible, past 0.8 is a coherence experiment, ~1.0 is the cliff.** Smaller or heavily safety-trained models may need proportionally more.
+Alphas are **backbone-normalized** — per-layer PCA shares are baked into the stored tensor magnitudes at extraction time, so the same numeric value means roughly the same intensity across architectures. A good starting rule of thumb on the reference model (`gemma-4-31b-it` with the bundled pack): **α ≈ 0.1–0.3 is a subtle nudge, 0.3–0.6 is clearly visible, past 0.6 is a coherence experiment, ~0.75 is the cliff.** Smaller or heavily safety-trained models may need proportionally more.
 
 Multiple vectors **compose** naturally — register them all with `session.steer(name, profile)`, then pass whatever alpha map you want to `session.generate(input, steering={...})`. Co-layer directions sum into a single in-place hook per layer.
 
 ### Concepts you didn't train for
 
-When you steer on a concept that isn't in the curated library, the loaded model writes its own contrastive pairs. A shared-scenario "embody" prompt asks the model to voice both poles of the concept (or, for monopolar concepts, the concept and its semantic opposite) within the same concrete situation drawn from a 60-scenario bank. Because cross-pair variance is situational and within-pair variance is pure pole, the extracted axis is a clean voice/register direction rather than a topical cluster. Pairs cache at `~/.saklas/vectors/local/<concept>/statements.json` and are model-independent, so they're reused across models.
+When you steer on a concept that isn't in the curated library, the loaded model writes its own contrastive pairs via a two-stage open-ended pipeline. Stage one asks the model for **9 broad situational domains** natural to the axis — for `deer.wolf` it yields domains like "predation and threat assessment" and "territorial defense"; for `masculine.feminine` it yields "physical strength and labor" and "caregiving and nurturing roles". An anti-allegory clause keeps non-human axes on their literal footing. Stage two loops over those 9 domains and samples **5 first-person contrastive pairs per domain** using a POV/behavior prompt — *"write like you ARE X, facing that moment"* — with an explicit ban on self-labeling so the pairs inhabit the pole directly rather than talking about it. Within each pair the two speakers respond to the same concrete moment, so within-pair variance is pure pole and the top PCA component locks onto the axis. Scenarios cache at `~/.saklas/vectors/local/<concept>/scenarios.json` and pairs at `statements.json`; both are model-independent and reused across models.
 
-This means `/steer "anything"` works — religions, animals, fictional characters, "man who ate too much spaghetti." Steering vectors capture voice/register shifts, not literal entity simulations: a `deer.wolf` probe gets you timid-person voice vs. predatory-person voice, not actual deer-vs.-wolf sensory experience. Abstract and non-human concepts get projected onto human expressive modes because that's the only form a language-model steering vector can take.
+This means `/steer "anything"` works — religions, animals, fictional characters, "man who ate too much spaghetti." The POV reframe unlocks literal embodiment for non-human axes: a `deer.wolf` probe yields sensory-animal first-person pairs ("I freeze mid-chew, my large ears swiveling frantically to pinpoint the direction of the strange sound") rather than timid-person voice. Human-register axes still land in human-register domains because the 9 domains are picked per-concept — the framework is concept-adaptive, no mode switch.
 
 ### Trait monitor
 
@@ -108,16 +108,16 @@ History accumulates across generations in the TUI and surfaces as sparklines on 
 
 ### The probe library
 
-21 probes across 6 categories, each backed by 45 curated contrastive pairs. Most are **bipolar**: the name carries both poles (`angry.calm`, `masculine.feminine`), positive α activates the first pole, negative α the second. Two are **monopolar** (`agentic`, `manipulative`) and use the same shared-scenario embody framework against a semantic opposite.
+21 probes across 6 categories, each backed by 45 curated contrastive pairs. Most are **bipolar**: the name carries both poles (`angry.calm`, `masculine.feminine`), positive α activates the first pole, negative α the second. Two are **monopolar** (`agentic`, `manipulative`) and use the same open-ended scenario framework against a semantic opposite.
 
 | Category | Probes |
 |---|---|
-| **Affect** | angry.calm, fearful.brave, happy.sad |
+| **Affect** | angry.calm, happy.sad |
 | **Epistemic** | confident.uncertain, honest.deceptive, hallucinating.grounded |
 | **Alignment** | agentic, refusal.compliant, sycophantic.blunt, manipulative |
-| **Register** | formal.casual, direct.indirect, verbose.concise, creative.conventional |
-| **Social stance** | authoritative.submissive, hierarchical.egalitarian, high_context.low_context |
-| **Cultural** | masculine.feminine, western.eastern, religious.secular, traditional.progressive |
+| **Register** | formal.casual, direct.indirect, verbose.concise, creative.conventional, humorous.serious, warm.clinical, technical.accessible |
+| **Social stance** | authoritative.submissive, high_context.low_context |
+| **Cultural** | masculine.feminine, religious.secular, traditional.progressive |
 
 **Pole aliasing.** Typing a single-pole name resolves to the composite with the right sign: `/steer angry 0.5` is an alias for `/steer angry.calm 0.5`; `/steer calm 0.5` is an alias for `/steer angry.calm -0.5`. Works for any installed bipolar pack (bundled, HF-pulled, user-authored). Collisions raise an ambiguity error — disambiguate with `ns/name`. Resolution lives on `session.steering()` — CLI, TUI, and HTTP all route through the same canonical site.
 

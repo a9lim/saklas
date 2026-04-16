@@ -1,0 +1,16 @@
+{
+  "name": "warm.clinical",
+  "description": "Bipolar axis: warm (+) vs clinical (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "register"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "scenarios.json": "f0c3af35b81a0b3995e37f443146b2fe66a7436d24d6940ab6bebde70b43f4c0",
+    "statements.json": "c92fe1bbde785620678344433ca987d99e4265439fc6b7833e10c1eee091ab99"
+  }
+}

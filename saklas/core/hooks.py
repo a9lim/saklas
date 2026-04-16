@@ -161,7 +161,7 @@ class SteeringHook:
 # proportionally higher alpha due to residual architectural effects
 # (activation magnitude, attention layout) this normalization doesn't
 # capture.
-_STEER_GAIN = 2.0
+_STEER_GAIN = 3.5
 
 
 class SteeringManager:
