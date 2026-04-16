@@ -655,14 +655,30 @@ def _run_compare(args: argparse.Namespace) -> None:
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         if args.json_output:
-            print(_json.dumps({"target": target_name, "model": args.model,
-                               "similarities": [{"name": n, "similarity": round(s, 6)}
-                                                 for n, s in ranked]}, indent=2))
+            result: dict = {"target": target_name, "model": args.model,
+                            "similarities": [{"name": n, "similarity": round(s, 6)}
+                                              for n, s in ranked]}
+            if args.verbose:
+                top3 = ranked[:3]
+                result["per_layer_top3"] = {
+                    n: {str(k): round(v, 6)
+                        for k, v in target.cosine_similarity(others[n], per_layer=True).items()}
+                    for n, _ in top3
+                }
+            print(_json.dumps(result, indent=2))
         else:
             width = max(len(n) for n, _ in ranked)
             print(f"{target_name} vs all installed ({args.model}):")
             for name, score in ranked:
                 print(f"  {name:<{width}}  {score:+.4f}")
+            if args.verbose and ranked:
+                print()
+                print("  per-layer (top 3):")
+                for name, _ in ranked[:3]:
+                    per_layer = target.cosine_similarity(others[name], per_layer=True)
+                    print(f"    {name}:")
+                    for layer in sorted(per_layer):
+                        print(f"      layer {layer:>3}: {per_layer[layer]:+.4f}")
         return
 
     if len(ordered) < 2:
@@ -701,9 +717,22 @@ def _run_compare(args: argparse.Namespace) -> None:
                 matrix[a_name][b_name] = profiles[a_name].cosine_similarity(profiles[b_name])
 
     if args.json_output:
-        print(_json.dumps({"model": args.model, "concepts": ordered,
-                           "matrix": {a: {b: round(v, 6) for b, v in row.items()}
-                                      for a, row in matrix.items()}}, indent=2))
+        result = {"model": args.model, "concepts": ordered,
+                  "matrix": {a: {b: round(v, 6) for b, v in row.items()}
+                              for a, row in matrix.items()}}
+        if args.verbose:
+            per_layer: dict[str, dict[str, float]] = {}
+            for i, a_name in enumerate(ordered):
+                for b_name in ordered[i + 1:]:
+                    key = f"{a_name}|{b_name}"
+                    per_layer[key] = {
+                        str(k): round(v, 6)
+                        for k, v in profiles[a_name].cosine_similarity(
+                            profiles[b_name], per_layer=True
+                        ).items()
+                    }
+            result["per_layer"] = per_layer
+        print(_json.dumps(result, indent=2))
     else:
         width = max(len(n) for n in ordered)
         header = " " * (width + 2) + "  ".join(f"{n:>{width}}" for n in ordered)

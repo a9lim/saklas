@@ -432,6 +432,203 @@ def test_vector_appears_in_help(capsys):
     assert "vector" in out
 
 
+# ---------------------------------------------------------------------------
+# _run_compare — verbose modes (1-arg ranked, N×N matrix)
+# ---------------------------------------------------------------------------
+
+def _setup_compare_env(monkeypatch, tmp_path):
+    """Set SAKLAS_HOME, materialize bundled, and return the vectors_dir path."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import packs
+    packs.materialize_bundled()
+    from saklas.cli import selectors
+    selectors.invalidate()
+    return tmp_path / "vectors"
+
+
+def _mock_profile(agg_fn, pl_fn):
+    """Return a simple duck-typed mock (not a Profile subclass) with cosine_similarity."""
+    class MockProfile:
+        def cosine_similarity(self, other, *, per_layer=False):
+            return pl_fn(other) if per_layer else agg_fn(other)
+    return MockProfile()
+
+
+def test_run_compare_one_arg_verbose_text(monkeypatch, tmp_path, capsys):
+    """1-arg + -v text mode: prints per-layer breakdown for top 3."""
+    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id
+    sid = safe_model_id(model_id)
+
+    target_dir = vdir / "default" / "angry.calm"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    happy_dir = vdir / "default" / "happy.sad"
+    happy_dir.mkdir(parents=True, exist_ok=True)
+    (happy_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    warm_dir = vdir / "default" / "warm.clinical"
+    warm_dir.mkdir(parents=True, exist_ok=True)
+    (warm_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    happy_profile = _mock_profile(lambda o: None, lambda o: None)
+    warm_profile = _mock_profile(lambda o: None, lambda o: None)
+
+    def target_agg(other):
+        if other is happy_profile:
+            return 0.3421
+        if other is warm_profile:
+            return 0.1893
+        return 0.0
+
+    def target_pl(other):
+        if other is happy_profile:
+            return {14: 0.5122, 15: 0.4891}
+        if other is warm_profile:
+            return {14: 0.1010, 15: 0.0987}
+        return {}
+
+    target_profile = _mock_profile(target_agg, target_pl)
+
+    profiles_by_path = {
+        str(target_dir / f"{sid}.safetensors"): target_profile,
+        str(happy_dir / f"{sid}.safetensors"): happy_profile,
+        str(warm_dir / f"{sid}.safetensors"): warm_profile,
+    }
+
+    from saklas.core.profile import Profile
+
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v"])
+    out = capsys.readouterr().out
+    assert "angry.calm vs all installed" in out
+    assert "happy.sad" in out
+    assert "per-layer (top 3)" in out
+    assert "0.5122" in out
+
+
+def test_run_compare_one_arg_verbose_json(monkeypatch, tmp_path, capsys):
+    """1-arg + -v -j JSON mode: output includes per_layer_top3 key."""
+    import json as _json
+    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id
+    sid = safe_model_id(model_id)
+
+    target_dir = vdir / "default" / "angry.calm"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    happy_dir = vdir / "default" / "happy.sad"
+    happy_dir.mkdir(parents=True, exist_ok=True)
+    (happy_dir / f"{sid}.safetensors").write_bytes(b"x")
+
+    happy_profile = _mock_profile(lambda o: None, lambda o: None)
+    target_profile = _mock_profile(
+        lambda o: 0.3421,
+        lambda o: {14: 0.5122, 15: 0.4891},
+    )
+
+    profiles_by_path = {
+        str(target_dir / f"{sid}.safetensors"): target_profile,
+        str(happy_dir / f"{sid}.safetensors"): happy_profile,
+    }
+
+    from saklas.core.profile import Profile
+
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v", "-j"])
+    out = capsys.readouterr().out
+    data = _json.loads(out)
+    assert data["target"] == "angry.calm"
+    assert "per_layer_top3" in data
+    assert "happy.sad" in data["per_layer_top3"]
+    pl = data["per_layer_top3"]["happy.sad"]
+    assert "14" in pl
+    assert abs(pl["14"] - 0.5122) < 1e-5
+
+
+def test_run_compare_matrix_verbose_json(monkeypatch, tmp_path, capsys):
+    """3-arg N×N + -v -j JSON mode: output includes per_layer dict keyed by 'a|b'."""
+    import json as _json
+    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id
+    sid = safe_model_id(model_id)
+
+    concepts = ["angry.calm", "happy.sad", "warm.clinical"]
+    dirs = {}
+    for c in concepts:
+        d = vdir / "default" / c
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{sid}.safetensors").write_bytes(b"x")
+        dirs[c] = d
+
+    from saklas.core.profile import Profile
+
+    per_layer_vals = {14: 0.3456, 15: 0.2345}
+    profiles_by_path: dict = {}
+    for c in concepts:
+        fp = _mock_profile(lambda o: 0.25, lambda o: per_layer_vals)
+        profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
+
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v", "-j"])
+    out = capsys.readouterr().out
+    data = _json.loads(out)
+    assert "per_layer" in data
+    assert "angry.calm|happy.sad" in data["per_layer"]
+    assert "angry.calm|warm.clinical" in data["per_layer"]
+    assert "happy.sad|warm.clinical" in data["per_layer"]
+    assert "angry.calm|angry.calm" not in data["per_layer"]
+    pl = data["per_layer"]["angry.calm|happy.sad"]
+    assert "14" in pl
+    assert abs(pl["14"] - 0.3456) < 1e-5
+
+
+def test_run_compare_matrix_verbose_text_unchanged(monkeypatch, tmp_path, capsys):
+    """3-arg N×N + -v text mode: no per-layer section (text matrix is dense enough)."""
+    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id
+    sid = safe_model_id(model_id)
+
+    concepts = ["angry.calm", "happy.sad", "warm.clinical"]
+    dirs = {}
+    for c in concepts:
+        d = vdir / "default" / c
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{sid}.safetensors").write_bytes(b"x")
+        dirs[c] = d
+
+    from saklas.core.profile import Profile
+    profiles_by_path: dict = {}
+    for c in concepts:
+        fp = _mock_profile(lambda o: 0.25, lambda o: {14: 0.1})
+        profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
+
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v"])
+    out = capsys.readouterr().out
+    assert "per-layer" not in out
+    assert "per_layer" not in out
+    assert "angry.calm" in out
+
+
 def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):
     """Config YAML with bare pole 'wolf' should resolve to 'deer.wolf' with -1 sign."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
