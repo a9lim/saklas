@@ -1078,31 +1078,69 @@ class SaklasSession:
                 out[name] = (float(alpha), trig)
         return out
 
-    def _try_autoload_vector(self, canonical: str) -> None:
+    def _try_autoload_vector(self, canonical: str, *, variant: str = "raw") -> None:
         """Cache-hit fast path: load an installed concept's tensor into _profiles.
 
-        Walks installed concept packs (default / local / hf://*), finds the
-        first one matching ``canonical``, and loads its per-model safetensors
-        into the registry if the file already exists. Silent no-op on any
-        failure — the caller falls through to the normal raise path.
+        Walks installed concept packs, finds the first matching ``canonical``,
+        and loads its per-model tensor. ``variant`` is the resolver's output:
+
+        - ``"raw"`` — loads the unsuffixed tensor. Silent on miss (caller
+          falls through to the normal raise path). Matches pre-Task-7 behavior.
+        - ``"sae"`` — loads the unique SAE variant. Raises
+          :class:`AmbiguousVariantError` when more than one is on disk,
+          :class:`UnknownVariantError` when zero exist.
+        - ``"sae-<release>"`` — loads that specific release.
+          :class:`UnknownVariantError` when absent.
+
+        Registered key in ``_profiles`` is ``canonical`` for raw, and
+        ``f"{canonical}:{variant}"`` otherwise.
         """
         from saklas.cli.selectors import _all_concepts
-        from saklas.io.paths import safe_model_id
+        from saklas.io.packs import enumerate_variants
+        from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
         from saklas.core.vectors import load_profile
 
-        sid = safe_model_id(self.model_id)
+        registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
+        available: list[str] = []
         for concept in _all_concepts():
             if concept.name != canonical:
                 continue
-            ts_path = concept.folder / f"{sid}.safetensors"
-            if not ts_path.is_file():
+            variants = enumerate_variants(concept.folder, self.model_id)
+            available.extend(variants.keys())
+
+            if variant == "raw":
+                path = variants.get("raw")
+            elif variant == "sae":
+                sae_paths = {k: v for k, v in variants.items() if k.startswith("sae-")}
+                if len(sae_paths) == 0:
+                    continue
+                if len(sae_paths) > 1:
+                    raise AmbiguousVariantError(
+                        f"concept '{canonical}' has multiple SAE variants for "
+                        f"model '{self.model_id}': {sorted(sae_paths.keys())}. "
+                        f"Specify explicitly with :sae-<release>."
+                    )
+                path = next(iter(sae_paths.values()))
+            else:
+                # "sae-<release>"
+                path = variants.get(variant)
+
+            if path is None:
                 continue
+
             try:
-                profile_dict, _meta = load_profile(str(ts_path))
+                profile_dict, _meta = load_profile(str(path))
             except Exception:
                 continue
-            self._profiles[canonical] = self._promote_profile(profile_dict)
+            self._profiles[registry_key] = self._promote_profile(profile_dict)
             return
+
+        # Explicit non-raw variant request that didn't resolve → surface the miss.
+        if variant != "raw":
+            raise UnknownVariantError(
+                f"variant '{variant}' not found for '{canonical}' on model "
+                f"'{self.model_id}' (available: {sorted(set(available)) or 'none'})"
+            )
 
     def _push_steering(
         self, entries: dict[str, tuple[float, Trigger]],

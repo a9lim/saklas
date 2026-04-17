@@ -549,3 +549,186 @@ class TestScoreSingleToken:
         no_acc = monitor.measure_from_hidden(hidden, accumulate=False)
 
         assert single["p1"] == pytest.approx(no_acc["p1"])
+
+
+def test_autoload_picks_sae_variant(tmp_path, monkeypatch):
+    """When variant='sae', autoload picks the _sae-* tensor, not the raw one."""
+    import json
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "test",
+        "version": "0.0.0", "license": "MIT", "tags": [],
+        "recommended_alpha": 0.3, "source": "local", "files": {},
+        "format_version": 2,
+    }))
+    # Raw tensor — layer 0 marker 1.0
+    save_file({"layer_0": torch.full((4,), 1.0)}, str(folder / "m.safetensors"))
+    (folder / "m.json").write_text(json.dumps({
+        "format_version": 2, "method": "contrastive_pca", "saklas_version": "t",
+    }))
+    # SAE tensor — layer 0 marker 2.0
+    save_file({"layer_0": torch.full((4,), 2.0)}, str(folder / "m_sae-mock.safetensors"))
+    (folder / "m_sae-mock.json").write_text(json.dumps({
+        "format_version": 2, "method": "pca_center_sae",
+        "saklas_version": "t", "sae_release": "mock",
+    }))
+
+    from saklas.core import session as S
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive")
+    assert "honest.deceptive" in sess._profiles
+    assert torch.allclose(sess._profiles["honest.deceptive"][0], torch.full((4,), 1.0))
+
+    sess._profiles.clear()
+    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")
+    assert "honest.deceptive:sae" in sess._profiles
+    assert torch.allclose(sess._profiles["honest.deceptive:sae"][0], torch.full((4,), 2.0))
+
+
+def test_autoload_picks_sae_with_explicit_release(tmp_path, monkeypatch):
+    """variant='sae-<release>' loads that specific release's tensor."""
+    import json
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    # Two SAE variants at different markers
+    save_file({"layer_0": torch.full((4,), 3.0)}, str(folder / "m_sae-release-a.safetensors"))
+    (folder / "m_sae-release-a.json").write_text(json.dumps({
+        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+    }))
+    save_file({"layer_0": torch.full((4,), 4.0)}, str(folder / "m_sae-release-b.safetensors"))
+    (folder / "m_sae-release-b.json").write_text(json.dumps({
+        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+    }))
+
+    from saklas.core import session as S
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae-release-b")
+    assert "honest.deceptive:sae-release-b" in sess._profiles
+    assert torch.allclose(
+        sess._profiles["honest.deceptive:sae-release-b"][0], torch.full((4,), 4.0)
+    )
+
+
+def test_autoload_raises_ambiguous_when_multiple_sae_variants(tmp_path, monkeypatch):
+    import json
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    for rel in ("mock-a", "mock-b"):
+        save_file({"layer_0": torch.zeros(4)}, str(folder / f"m_sae-{rel}.safetensors"))
+        (folder / f"m_sae-{rel}.json").write_text(json.dumps({
+            "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+        }))
+
+    from saklas.core import session as S
+    from saklas.core.errors import AmbiguousVariantError
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    with pytest.raises(AmbiguousVariantError):
+        S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")
+
+
+def test_autoload_raises_unknown_when_variant_missing(tmp_path, monkeypatch):
+    import json
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    # Only a raw tensor exists — no SAE variants.
+    save_file({"layer_0": torch.zeros(4)}, str(folder / "m.safetensors"))
+    (folder / "m.json").write_text(json.dumps({
+        "format_version": 2, "method": "contrastive_pca", "saklas_version": "t",
+    }))
+
+    from saklas.core import session as S
+    from saklas.core.errors import UnknownVariantError
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    with pytest.raises(UnknownVariantError):
+        S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")
+
+
+def test_autoload_raw_default_is_silent_on_miss(tmp_path, monkeypatch):
+    """variant='raw' stays silent when no tensor exists — matches pre-Task-7 behavior."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.core import session as S
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    # No concept installed at all; no error, no population.
+    S.SaklasSession._try_autoload_vector(sess, "nonexistent")
+    assert sess._profiles == {}
