@@ -1,4 +1,4 @@
-"""Selector grammar used by -r, -x, -l.
+"""Selector grammar used by pack and vector subcommands.
 
 Kinds:
     name      : single concept; optionally scoped by namespace (Selector.namespace)

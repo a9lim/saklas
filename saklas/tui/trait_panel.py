@@ -9,7 +9,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-from saklas.tui.utils import build_bar
+from saklas.tui.utils import BAR_WIDTH, build_bar
 
 
 
@@ -29,16 +29,20 @@ class TraitPanel(Widget):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            "[bold]TRAIT MONITOR[/] [dim]sort: name[/]",
+            "[bold]MONITOR PROBES[/] [dim]sort: name[/]",
             id="trait-header", classes="section-header",
         )
         yield VerticalScroll(Static("", id="trait-content"), id="trait-scroll")
         yield Static("[dim]⌫ remove · ⌃S sort · ⌃Y highlight[/]",
                       id="trait-hints")
+        yield Static("[bold]WHY[/]", id="why-header", classes="section-header")
+        yield VerticalScroll(Static("", id="why-content"), id="why-scroll")
 
     def on_mount(self) -> None:
         self._trait_header = self.query_one("#trait-header", Static)
         self._trait_content = self.query_one("#trait-content", Static)
+        self._why_header = self.query_one("#why-header", Static)
+        self._why_content = self.query_one("#why-content", Static)
 
     def set_active_probes(self, probe_names: set[str]) -> None:
         self._active_probes = probe_names
@@ -72,7 +76,7 @@ class TraitPanel(Widget):
         self._sort_mode = modes[(idx + 1) % len(modes)]
         header = self._trait_header
         header.update(
-            f"[bold]TRAIT MONITOR[/] [dim]sort: {self._sort_mode}[/]"
+            f"[bold]MONITOR PROBES[/] [dim]sort: {self._sort_mode}[/]"
         )
         self._render_probes()
 
@@ -132,7 +136,7 @@ class TraitPanel(Widget):
                 else:
                     arrow_ch = "↓"
 
-                bar_full, bar_empty = build_bar(val, 1.0, 16)
+                bar_full, bar_empty = build_bar(val, 1.0, BAR_WIDTH)
                 if val > 0:
                     color = "ansi_green"
                 elif val < 0:
@@ -143,11 +147,13 @@ class TraitPanel(Widget):
                 mini_spark = sparks.get(name, "")
 
                 sel = ">" if is_nav_selected else " "
-                display_name = name[:16].ljust(16)
+                name_str = f"[bold]{name}[/]" if is_nav_selected else name
+                spark_tail = f" [dim]{mini_spark}[/]" if mini_spark else ""
 
                 line = (
-                    f"{sel} {display_name}[{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                    f"[{color}]{val:+.2f}{arrow_ch}[/] [dim]{mini_spark}[/]"
+                    f"{sel} {name_str}\n"
+                    f"  [{color}]{bar_full}[/][dim]{bar_empty}[/] "
+                    f"[{color}]{val:+.2f}{arrow_ch}[/]{spark_tail}"
                 )
 
                 lines.append(line)
@@ -156,6 +162,41 @@ class TraitPanel(Widget):
         if text != self._cached_render_text:
             self._cached_render_text = text
             self._trait_content.update(text)
+
+    def update_why(
+        self,
+        probe: str | None,
+        layer_norms: list[tuple[int, float]],
+        top_tokens: tuple[list[tuple[str, float]], list[tuple[str, float]]] | None,
+    ) -> None:
+        if probe is None:
+            self._why_header.update("")
+            self._why_content.update("")
+            return
+        self._why_header.update(f"[bold]{probe}[/]")
+        lines: list[str] = [" [bold]layers[/]"]
+        for lidx, norm in layer_norms:
+            lines.append(f"  L{lidx:<3} {norm:>7.3f}")
+        if top_tokens is not None:
+            highest, lowest = top_tokens
+            lines.append(" [bold]tokens[/]")
+            for tok, score in highest:
+                lines.append(self._format_token_line(tok, score))
+            if lowest:
+                lines.append("  [dim]...[/]")
+                for tok, score in lowest:
+                    lines.append(self._format_token_line(tok, score))
+        self._why_content.update("\n".join(lines))
+
+    @staticmethod
+    def _format_token_line(tok: str, score: float) -> str:
+        disp = tok.replace("\n", "\\n")[:16]
+        color = (
+            "ansi_green" if score > 0
+            else "ansi_red" if score < 0
+            else "ansi_default"
+        )
+        return f"  [{color}]{score:>+7.4f}[/] {disp!r}"
 
     def _sort_probes(self, names: list[str]) -> list[str]:
         if self._sort_mode == "value":

@@ -11,18 +11,34 @@ from textual.widgets import Static, Input, Collapsible
 from textual.widget import Widget
 from textual.message import Message
 
+from saklas.tui.utils import BAR_WIDTH, build_bar
+
 _HIGHLIGHT_SAT = 0.5
 _HIGHLIGHT_CACHE_MAX = 4
 
 
-def _build_highlight_markup(token_strs: list[str], scores: list[float]) -> str:
+def _build_highlight_markup(
+    token_strs: list[str], scores: list[float], *, strip_leading_whitespace: bool = False,
+) -> str:
     """Build Rich markup with per-token red/green background spans.
 
-    Caller is responsible for guarding against mismatched lengths; this
-    function assumes ``len(scores) == len(token_strs)``.
+    During live streaming, ``scores`` may lag ``token_strs`` by a token
+    (or more) — unscored tokens render as default text and pick up
+    colour on the next render after their score arrives.
+
+    ``strip_leading_whitespace=True`` drops whitespace-only tokens from
+    the head of the stream — used by the response view to swallow the
+    ``\\n\\n`` models often emit after ``</think>``.
     """
     parts: list[str] = []
-    for tok, score in zip(token_strs, scores):
+    n_scores = len(scores)
+    seen_content = not strip_leading_whitespace
+    for i, tok in enumerate(token_strs):
+        if not seen_content:
+            if not tok.strip():
+                continue
+            seen_content = True
+        score = scores[i] if i < n_scores else 0.0
         t = max(-1.0, min(1.0, score / _HIGHLIGHT_SAT))
         safe = _rich_escape(tok)
         if t > 0:
@@ -55,6 +71,8 @@ class _AssistantMessage(Vertical):
 
         self.response_token_strs: list[str] = []
         self.thinking_token_strs: list[str] = []
+        self._streamed_response_tokens: list[str] = []
+        self._streamed_thinking_tokens: list[str] = []
         self._response_markup_cache: OrderedDict[str, str] = OrderedDict()
         self._thinking_markup_cache: OrderedDict[str, str] = OrderedDict()
         self._response_probe_scores: dict[str, list[float]] = {}
@@ -78,10 +96,12 @@ class _AssistantMessage(Vertical):
 
     def append_token(self, token: str) -> None:
         self._escaped_chat_text += _rich_escape(token)
+        self._streamed_response_tokens.append(token)
         self._render_response()
 
     def append_thinking_token(self, token: str) -> None:
         self._escaped_thinking_text += _rich_escape(token)
+        self._streamed_thinking_tokens.append(token)
         tb = self._thinking_block
         if tb is not None and tb.has_class("hidden"):
             tb.remove_class("hidden")
@@ -123,6 +143,27 @@ class _AssistantMessage(Vertical):
         self._render_response()
         self._render_thinking()
 
+    def append_token_score(self, scores: dict[str, float], is_thinking: bool) -> None:
+        """Append one token's per-probe scores to the running per-probe lists.
+
+        Called from the TUI event-pump alongside ``append_token`` /
+        ``append_thinking_token`` so highlighting and WHY top-token stats
+        can update mid-gen. Invalidates the markup cache for the affected
+        side so the next render rebuilds with the new score row.
+        """
+        target = self._thinking_probe_scores if is_thinking else self._response_probe_scores
+        for name, val in scores.items():
+            target.setdefault(name, []).append(val)
+        if is_thinking:
+            self._thinking_markup_cache.clear()
+        else:
+            self._response_markup_cache.clear()
+        if self._highlight_on:
+            if is_thinking:
+                self._render_thinking()
+            else:
+                self._render_response()
+
     def _get_response_markup(self, probe: str) -> str | None:
         cached = self._response_markup_cache.get(probe)
         if cached is not None:
@@ -131,7 +172,12 @@ class _AssistantMessage(Vertical):
         scores = self._response_probe_scores.get(probe)
         if scores is None:
             return None
-        markup = _build_highlight_markup(self.response_token_strs, scores)
+        # Prefer the live-streamed token list (always current) over the
+        # finalize-time canonical list, which set_token_data fills only at end.
+        token_strs = self.response_token_strs or self._streamed_response_tokens
+        markup = _build_highlight_markup(
+            token_strs, scores, strip_leading_whitespace=True,
+        )
         self._response_markup_cache[probe] = markup
         if len(self._response_markup_cache) > _HIGHLIGHT_CACHE_MAX:
             self._response_markup_cache.popitem(last=False)
@@ -145,7 +191,8 @@ class _AssistantMessage(Vertical):
         scores = self._thinking_probe_scores.get(probe)
         if scores is None:
             return None
-        markup = _build_highlight_markup(self.thinking_token_strs, scores)
+        token_strs = self.thinking_token_strs or self._streamed_thinking_tokens
+        markup = _build_highlight_markup(token_strs, scores)
         self._thinking_markup_cache[probe] = markup
         if len(self._thinking_markup_cache) > _HIGHLIGHT_CACHE_MAX:
             self._thinking_markup_cache.popitem(last=False)
@@ -165,7 +212,11 @@ class _AssistantMessage(Vertical):
         markup = None
         if self._highlight_on and self._highlight_probe:
             markup = self._get_response_markup(self._highlight_probe)
-        self._response_view.update(markup if markup is not None else self._escaped_chat_text)
+        # Models often emit \n\n right after </think>; lstrip the plain-text
+        # path so the gap below the thinking block is gone in non-highlight
+        # mode (the markup builder strips leading whitespace tokens itself).
+        text = markup if markup is not None else self._escaped_chat_text.lstrip()
+        self._response_view.update(text)
 
     def _render_thinking(self) -> None:
         if self._thinking_view is None:
@@ -258,22 +309,32 @@ class ChatPanel(Widget):
         tok_per_sec: float = 0.0,
         elapsed: float = 0.0,
         prompt_tokens: int = 0,
+        context_window: int = 0,
         vram_gb: float = 0.0,
     ) -> None:
         """Update the status bar with generation stats."""
         bar = self._status_bar
         dot = "[ansi_green]●[/]" if generating else "[dim]○[/]"
-        if generating:
-            left = f"{dot} {gen_tokens}/{max_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
+        if generating and max_tokens > 0:
+            t_full, t_empty = build_bar(gen_tokens, max_tokens, BAR_WIDTH)
+            left = (
+                f"{dot} [ansi_green]{t_full}[/][dim]{t_empty}[/] "
+                f"{gen_tokens}/{max_tokens} · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
+            )
         elif gen_tokens > 0:
             left = f"{dot} {gen_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
         else:
             left = f"{dot} idle"
-        right = ""
-        if prompt_tokens > 0:
-            right += f"prompt: {prompt_tokens} tok"
+
+        parts: list[str] = [left]
         if vram_gb > 0:
-            if right:
-                right += " · "
-            right += f"VRAM: {vram_gb:.1f} GB"
-        bar.update(f"{left}    {right}")
+            parts.append(f"VRAM {vram_gb:.1f} GB")
+        if context_window > 0:
+            used = prompt_tokens + (gen_tokens if generating else 0)
+            c_full, c_empty = build_bar(used, context_window, BAR_WIDTH)
+            frac = used / context_window if context_window else 0.0
+            color = "ansi_red" if frac >= 0.9 else ("ansi_yellow" if frac >= 0.75 else "ansi_cyan")
+            parts.append(
+                f"ctx [{color}]{c_full}[/][dim]{c_empty}[/] {used}/{context_window}"
+            )
+        bar.update(" · ".join(parts))

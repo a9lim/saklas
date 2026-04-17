@@ -655,14 +655,30 @@ def _run_compare(args: argparse.Namespace) -> None:
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         if args.json_output:
-            print(_json.dumps({"target": target_name, "model": args.model,
-                               "similarities": [{"name": n, "similarity": round(s, 6)}
-                                                 for n, s in ranked]}, indent=2))
+            result: dict = {"target": target_name, "model": args.model,
+                            "similarities": [{"name": n, "similarity": round(s, 6)}
+                                              for n, s in ranked]}
+            if args.verbose:
+                top3 = ranked[:3]
+                result["per_layer_top3"] = {
+                    n: {str(k): round(v, 6)
+                        for k, v in target.cosine_similarity(others[n], per_layer=True).items()}
+                    for n, _ in top3
+                }
+            print(_json.dumps(result, indent=2))
         else:
             width = max(len(n) for n, _ in ranked)
             print(f"{target_name} vs all installed ({args.model}):")
             for name, score in ranked:
                 print(f"  {name:<{width}}  {score:+.4f}")
+            if args.verbose and ranked:
+                print()
+                print("  per-layer (top 3):")
+                for name, _ in ranked[:3]:
+                    per_layer = target.cosine_similarity(others[name], per_layer=True)
+                    print(f"    {name}:")
+                    for layer in sorted(per_layer):
+                        print(f"      layer {layer:>3}: {per_layer[layer]:+.4f}")
         return
 
     if len(ordered) < 2:
@@ -701,9 +717,22 @@ def _run_compare(args: argparse.Namespace) -> None:
                 matrix[a_name][b_name] = profiles[a_name].cosine_similarity(profiles[b_name])
 
     if args.json_output:
-        print(_json.dumps({"model": args.model, "concepts": ordered,
-                           "matrix": {a: {b: round(v, 6) for b, v in row.items()}
-                                      for a, row in matrix.items()}}, indent=2))
+        result = {"model": args.model, "concepts": ordered,
+                  "matrix": {a: {b: round(v, 6) for b, v in row.items()}
+                              for a, row in matrix.items()}}
+        if args.verbose:
+            per_layer: dict[str, dict[str, float]] = {}
+            for i, a_name in enumerate(ordered):
+                for b_name in ordered[i + 1:]:
+                    key = f"{a_name}|{b_name}"
+                    per_layer[key] = {
+                        str(k): round(v, 6)
+                        for k, v in profiles[a_name].cosine_similarity(
+                            profiles[b_name], per_layer=True
+                        ).items()
+                    }
+            result["per_layer"] = per_layer
+        print(_json.dumps(result, indent=2))
     else:
         width = max(len(n) for n in ordered)
         header = " " * (width + 2) + "  ".join(f"{n:>{width}}" for n in ordered)
@@ -713,11 +742,74 @@ def _run_compare(args: argparse.Namespace) -> None:
             print(f"{a_name:<{width}}  {row}")
 
 
+def _run_why(args: argparse.Namespace) -> None:
+    import json as _json
+    from saklas.cli.selectors import parse as sel_parse, resolve
+    from saklas.io.paths import safe_model_id
+    from saklas.core.profile import Profile, ProfileError
+
+    sid = safe_model_id(args.model)
+    sel = sel_parse(args.concept)
+    matches = resolve(sel)
+    if not matches:
+        print(f"why: '{args.concept}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    folder = matches[0].folder
+    concept_name = matches[0].name
+
+    tensor_path = folder / f"{sid}.safetensors"
+    if not tensor_path.is_file():
+        gguf_path = folder / f"{sid}.gguf"
+        if gguf_path.is_file():
+            tensor_path = gguf_path
+        else:
+            print(
+                f"why: no tensor for '{args.concept}' with model {args.model}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    try:
+        profile = Profile.load(tensor_path)
+    except (ProfileError, Exception) as e:
+        print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Compute per-layer magnitudes and sort descending.
+    layer_mags: list[tuple[int, float]] = [
+        (layer, float(tensor.norm().item()))
+        for layer, tensor in profile.items()
+    ]
+    layer_mags.sort(key=lambda x: x[1], reverse=True)
+
+    if not args.show_all:
+        layer_mags = layer_mags[: args.top_n]
+
+    total_layers = len(profile)
+
+    if args.json_output:
+        result = {
+            "concept": concept_name,
+            "model": args.model,
+            "total_layers": total_layers,
+            "layers": [{"layer": l, "magnitude": round(m, 6)} for l, m in layer_mags],
+        }
+        print(_json.dumps(result, indent=2))
+    else:
+        label = "layers" if args.show_all else "top layers"
+        print(f"{concept_name} ({total_layers} layers, {args.model}):")
+        print(f"  {label} (by ||baked||):")
+        for layer, mag in layer_mags:
+            print(f"    L{layer:<3}  {mag:.3f}")
+
+
 _VECTOR_RUNNERS = {
     "extract": _run_extract,
     "merge":   _run_merge,
     "clone":   _run_clone,
     "compare": _run_compare,
+    "why":     _run_why,
 }
 
 

@@ -491,6 +491,102 @@ def register_saklas_routes(app: FastAPI) -> None:
             readings = {k: v for k, v in readings.items() if k in requested}
         return {"readings": {k: float(v) for k, v in readings.items()}}
 
+    # ----- Live traits SSE stream ------------------------------------------
+
+    @app.get("/saklas/v1/sessions/{session_id}/traits/stream")
+    async def traits_stream(session_id: str, request: Request):
+        """SSE endpoint streaming per-token probe scores during generation.
+
+        Events:
+          - ``data: {"type": "start", ...}`` when generation begins
+          - ``data: {"type": "token", "idx": N, "text": "...", "thinking": bool, "probes": {...}}``
+          - ``data: {"type": "done", "finish_reason": "...", "aggregate": {...}}``
+          - ``: heartbeat`` every 15 s when idle
+
+        The stream stays open across generations; a client can subscribe
+        once and observe every generation the session runs.
+        """
+        _resolve_session_id(session, session_id)
+
+        from saklas.core.events import GenerationStarted, GenerationFinished
+
+        loop = asyncio.get_running_loop()
+        trait_queue: asyncio.Queue = asyncio.Queue()
+
+        # EventBus callback: push start/done into the same queue as tokens.
+        def _on_event(event):
+            if isinstance(event, GenerationStarted):
+                try:
+                    loop.call_soon_threadsafe(
+                        trait_queue.put_nowait,
+                        ("start", getattr(event, "input", None), getattr(event, "stateless", False)),
+                    )
+                except Exception:
+                    pass
+            elif isinstance(event, GenerationFinished):
+                try:
+                    loop.call_soon_threadsafe(
+                        trait_queue.put_nowait,
+                        ("done", getattr(event, "result", None)),
+                    )
+                except Exception:
+                    pass
+
+        unsub = session.events.subscribe(_on_event)
+        session.register_trait_queue(loop, trait_queue)
+
+        async def event_generator():
+            try:
+                generation_id: str | None = None
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        item = await asyncio.wait_for(trait_queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": heartbeat\n\n"
+                        continue
+
+                    tag = item[0]
+                    if tag == "start":
+                        generation_id = uuid.uuid4().hex[:8]
+                        yield (
+                            f"data: {json.dumps({'type': 'start', 'generation_id': generation_id})}"
+                            "\n\n"
+                        )
+                    elif tag == "token":
+                        _, idx, text, thinking, scores = item
+                        yield (
+                            f"data: {json.dumps({'type': 'token', 'idx': idx, 'text': text, 'thinking': thinking, 'probes': {k: round(v, 6) for k, v in scores.items()}})}"
+                            "\n\n"
+                        )
+                    elif tag == "done":
+                        result = item[1]
+                        agg: dict[str, float] = {}
+                        if result is not None:
+                            readings = getattr(result, "readings", None)
+                            if readings:
+                                for name, r in readings.items():
+                                    # Use this generation's aggregate, not the
+                                    # rolling history mean.
+                                    pg = getattr(r, "per_generation", None)
+                                    val = pg[-1] if pg else getattr(r, "mean", 0.0)
+                                    agg[name] = round(val, 6)
+                        yield (
+                            f"data: {json.dumps({'type': 'done', 'generation_id': generation_id, 'finish_reason': getattr(result, 'finish_reason', 'stop') if result else 'stop', 'aggregate': agg})}"
+                            "\n\n"
+                        )
+                        generation_id = None
+            finally:
+                session.unregister_trait_queue(loop, trait_queue)
+                unsub()
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
     # ----- WebSocket token+probe co-stream -------------------------------
 
     @app.websocket("/saklas/v1/sessions/{session_id}/stream")
