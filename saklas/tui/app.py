@@ -661,10 +661,6 @@ class SaklasApp(App):
         variant_note = f" [{variant}]" if variant != "raw" else ""
         chat.add_system_message(f"Extracting '{display}'{suffix}{variant_note}...")
 
-        # Registered session-level name carries the variant suffix — the
-        # session's `_resolve_pole_aliases` (Task 8) routes it correctly.
-        registered_name = concept if variant == "raw" else f"{concept}:{variant}"
-
         def _worker():
             def _progress(msg):
                 self.call_from_thread(self._steer_status, msg)
