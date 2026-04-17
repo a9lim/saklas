@@ -49,6 +49,7 @@ hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
 pandas = ["pandas>=3.0.2"]
 research = ["datasets>=2.0", "pandas>=3.0.2"]
+sae = ["sae-lens>=6.0,<7.0"]
 
 [project.scripts]
 saklas = "saklas.cli.main:main"
