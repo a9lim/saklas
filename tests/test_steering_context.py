@@ -202,7 +202,7 @@ def test_pole_alias_sign_flip_preserves_trigger():
     try:
         def _fake(name, namespace=None):
             if name == "wolf":
-                return ("deer.wolf", -1, "deer.wolf")
+                return ("deer.wolf", -1, "deer.wolf", "raw")
             return _orig(name, namespace=namespace)
         _sel.resolve_pole = _fake
         with s.steering({"wolf": (0.4, Trigger.AFTER_THINKING)}):

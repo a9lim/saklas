@@ -106,7 +106,7 @@ def _setup_steering_vectors(
     default_alphas: dict[str, float] = {}
     for raw_name, ns, display, alpha in items:
         try:
-            canonical, sign, _match = resolve_pole(raw_name, namespace=ns)
+            canonical, sign, _match, _variant = resolve_pole(raw_name, namespace=ns)
         except AmbiguousSelectorError as e:
             if verbose:
                 print(f"  Failed to resolve '{raw_name}': {e}", file=sys.stderr)

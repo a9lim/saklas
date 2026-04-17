@@ -11,6 +11,7 @@ Special alias: "default" -> namespace/default.
 """
 from __future__ import annotations
 
+import re as _re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,8 @@ from typing import Optional
 from saklas.core.errors import SaklasError
 from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata
 from saklas.io.paths import vectors_dir
+
+_VARIANT_REGEX = _re.compile(r"^(raw|sae(?:-[a-z0-9._-]+)?)$")
 
 
 class SelectorError(ValueError, SaklasError):
@@ -54,11 +57,15 @@ def parse(raw: str) -> Selector:
 
     if ":" in raw:
         prefix, rest = raw.split(":", 1)
-        if prefix not in _VALID_PREFIXES:
-            raise SelectorError(f"unknown selector prefix '{prefix}' in '{raw}'")
-        if not rest:
-            raise SelectorError(f"empty value after '{prefix}:' in '{raw}'")
-        return Selector(kind=prefix, value=rest)
+        if prefix in _VALID_PREFIXES:
+            if not rest:
+                raise SelectorError(f"empty value after '{prefix}:' in '{raw}'")
+            return Selector(kind=prefix, value=rest)
+        # Otherwise it's a name-with-variant; validate the variant and strip it.
+        if not _VARIANT_REGEX.match(rest):
+            raise SelectorError(f"unknown variant '{rest}' in '{raw}'")
+        # Fall through to name validation with the variant stripped.
+        raw = prefix
 
     if "/" in raw:
         ns, name = raw.split("/", 1)
@@ -147,8 +154,16 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
     raise SelectorError(f"unknown selector kind: {selector.kind}")
 
 
-def resolve_pole(raw: str, namespace: Optional[str] = None) -> tuple[str, int, Optional["ResolvedConcept"]]:
-    """Resolve a user-typed concept reference to ``(canonical, sign, match)``.
+def resolve_pole(
+    raw: str, namespace: Optional[str] = None,
+) -> tuple[str, int, Optional["ResolvedConcept"], str]:
+    """Resolve a user-typed concept reference to ``(canonical, sign, match, variant)``.
+
+    Grammar: ``<name_part>[":"<variant>]`` where ``<variant>`` is ``raw``
+    (the default when no suffix is present), ``sae`` (unique SAE variant),
+    or ``sae-<release>``. The name part feeds the existing pole-alias
+    pipeline; variant is passed through unchanged for callers to propagate
+    to autoload / registry-key selection.
 
     Alias resolution for bipolar packs: if the user types a single-pole
     name that appears on either side of an installed bipolar concept,
@@ -157,15 +172,18 @@ def resolve_pole(raw: str, namespace: Optional[str] = None) -> tuple[str, int, O
     before storing it.
 
     Examples (assuming ``default/angry.calm`` is installed):
-      ``resolve_pole("angry")`` -> ``("angry.calm", +1, <resolved>)``
-      ``resolve_pole("calm")``  -> ``("angry.calm", -1, <resolved>)``
-      ``resolve_pole("angry.calm")`` -> ``("angry.calm", +1, <resolved>)``
+      ``resolve_pole("angry")`` -> ``("angry.calm", +1, <resolved>, "raw")``
+      ``resolve_pole("calm")``  -> ``("angry.calm", -1, <resolved>, "raw")``
+      ``resolve_pole("angry.calm")`` -> ``("angry.calm", +1, <resolved>, "raw")``
+      ``resolve_pole("angry:sae")``  -> ``("angry.calm", +1, <resolved>, "sae")``
 
     Not-installed names fall through as fresh monopolar concepts with
     sign +1 and ``match=None`` so the caller can still feed them into
     the extraction pipeline.
 
     Raises:
+        SelectorError: when the ``:variant`` suffix doesn't match
+            ``_VARIANT_REGEX`` (``raw`` | ``sae`` | ``sae-<release>``).
         AmbiguousSelectorError: when multiple installed concepts match
             the input under different canonical names (e.g. both
             ``alice/angry`` and ``default/angry.calm`` exist and the
@@ -173,6 +191,16 @@ def resolve_pole(raw: str, namespace: Optional[str] = None) -> tuple[str, int, O
             intra-namespace collisions like ``default/happy.sad`` +
             ``default/happy.calm``.
     """
+    # Variant suffix strips first — pole alias logic is variant-agnostic.
+    variant = "raw"
+    if ":" in raw:
+        name_part, maybe_variant = raw.rsplit(":", 1)
+        if _VARIANT_REGEX.match(maybe_variant):
+            variant = maybe_variant
+            raw = name_part
+        else:
+            raise SelectorError(f"unknown variant '{maybe_variant}' in '{raw}'")
+
     # Lazy import to avoid a cycle: session.py imports cli_selectors for
     # the broadened extract() lookup.
     from saklas.core.session import BIPOLAR_SEP, canonical_concept_name
@@ -194,7 +222,7 @@ def resolve_pole(raw: str, namespace: Optional[str] = None) -> tuple[str, int, O
                 matches.append((c.name, -1, c))
 
     if not matches:
-        return slug, +1, None
+        return slug, +1, None, variant
 
     # Ambiguous if the matches don't collapse to a single (canonical, sign)
     # or span multiple namespaces when none was specified — both raise the
@@ -211,7 +239,8 @@ def resolve_pole(raw: str, namespace: Optional[str] = None) -> tuple[str, int, O
             f"Specify the full composite or a namespace."
         )
 
-    return matches[0]
+    c_name, c_sign, c_resolved = matches[0]
+    return c_name, c_sign, c_resolved, variant
 
 
 def parse_args(tokens: list[str]) -> tuple[Selector, Optional[str]]:

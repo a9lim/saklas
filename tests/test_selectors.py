@@ -156,7 +156,7 @@ class TestResolvePole:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "agentic")
         sel.invalidate()
-        name, sign, m = sel.resolve_pole("agentic")
+        name, sign, m, _v = sel.resolve_pole("agentic")
         assert name == "agentic"
         assert sign == 1
         assert m is not None
@@ -165,7 +165,7 @@ class TestResolvePole:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "angry.calm")
         sel.invalidate()
-        name, sign, m = sel.resolve_pole("angry")
+        name, sign, m, _v = sel.resolve_pole("angry")
         assert name == "angry.calm"
         assert sign == 1
 
@@ -173,7 +173,7 @@ class TestResolvePole:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "angry.calm")
         sel.invalidate()
-        name, sign, m = sel.resolve_pole("calm")
+        name, sign, m, _v = sel.resolve_pole("calm")
         assert name == "angry.calm"
         assert sign == -1
 
@@ -181,7 +181,7 @@ class TestResolvePole:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "angry.calm")
         sel.invalidate()
-        name, sign, m = sel.resolve_pole("angry.calm")
+        name, sign, m, _v = sel.resolve_pole("angry.calm")
         assert name == "angry.calm"
         assert sign == 1
 
@@ -189,14 +189,14 @@ class TestResolvePole:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "high_context.low_context")
         sel.invalidate()
-        name, sign, _ = sel.resolve_pole("High-Context")
+        name, sign, _m, _v = sel.resolve_pole("High-Context")
         assert name == "high_context.low_context"
         assert sign == 1
 
     def test_unknown_falls_through(self, monkeypatch, tmp_path):
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         sel.invalidate()
-        name, sign, m = sel.resolve_pole("xyzzy")
+        name, sign, m, _v = sel.resolve_pole("xyzzy")
         assert name == "xyzzy"
         assert sign == 1
         assert m is None
@@ -223,12 +223,117 @@ class TestResolvePole:
         _mk(tmp_path, "alice", "wolf")
         sel.invalidate()
         # Scoped to bob/: wolf -> deer.wolf with sign -1
-        name, sign, m = sel.resolve_pole("wolf", namespace="bob")
+        name, sign, m, _variant = sel.resolve_pole("wolf", namespace="bob")
         assert name == "deer.wolf"
         assert sign == -1
         assert m.namespace == "bob"
         # Scoped to alice/: wolf is a monopolar exact match
-        name, sign, m = sel.resolve_pole("wolf", namespace="alice")
+        name, sign, m, _variant = sel.resolve_pole("wolf", namespace="alice")
         assert name == "wolf"
         assert sign == 1
         assert m.namespace == "alice"
+
+
+def _install_minimal_pack(saklas_home, name):
+    """Lay down a minimal pack.json tree so _all_concepts finds the name."""
+    import json
+    folder = saklas_home / "vectors" / "default" / name
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": name,
+        "description": "test",
+        "version": "0.0.0",
+        "license": "MIT",
+        "tags": [],
+        "recommended_alpha": 0.3,
+        "source": "local",
+        "files": {},
+        "format_version": 2,
+    }))
+
+
+def test_resolve_pole_strips_raw_variant(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "honest.deceptive")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.cli.selectors import resolve_pole, invalidate
+    invalidate()
+
+    canonical, sign, match, variant = resolve_pole("honest:raw")
+    assert canonical == "honest.deceptive"
+    assert sign == 1
+    assert match is not None
+    assert variant == "raw"
+
+
+def test_resolve_pole_sae_variant(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "honest.deceptive")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.cli.selectors import resolve_pole, invalidate
+    invalidate()
+
+    canonical, sign, match, variant = resolve_pole("honest:sae")
+    assert canonical == "honest.deceptive"
+    assert variant == "sae"
+
+
+def test_resolve_pole_sae_with_release(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "honest.deceptive")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.cli.selectors import resolve_pole, invalidate
+    invalidate()
+
+    canonical, sign, match, variant = resolve_pole("honest:sae-gemma-scope-2b-pt-res-canonical")
+    assert variant == "sae-gemma-scope-2b-pt-res-canonical"
+
+
+def test_resolve_pole_no_variant_defaults_to_raw(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "honest.deceptive")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.cli.selectors import resolve_pole, invalidate
+    invalidate()
+
+    canonical, sign, match, variant = resolve_pole("honest")
+    assert variant == "raw"
+
+
+def test_resolve_pole_variant_preserves_pole_sign(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "deer.wolf")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.cli.selectors import resolve_pole, invalidate
+    invalidate()
+
+    canonical, sign, match, variant = resolve_pole("wolf:sae")
+    assert canonical == "deer.wolf"
+    assert sign == -1
+    assert variant == "sae"
+
+
+def test_resolve_pole_rejects_invalid_variant(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "honest.deceptive")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.cli.selectors import resolve_pole, invalidate, SelectorError
+    invalidate()
+
+    with pytest.raises(SelectorError):
+        resolve_pole("honest:weird-variant")
+
+
+def test_parse_accepts_variant_suffix():
+    """parse() with a :variant suffix strips the variant, keeps Selector.value as the bare name."""
+    from saklas.cli.selectors import parse
+    s = parse("honest.deceptive:sae")
+    assert s.kind == "name"
+    assert s.value == "honest.deceptive"
+
+
+def test_parse_rejects_unknown_variant():
+    import pytest as _pt
+    from saklas.cli.selectors import parse, SelectorError
+    with _pt.raises(SelectorError):
+        parse("honest:garbage")
