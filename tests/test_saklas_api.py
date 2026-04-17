@@ -418,7 +418,6 @@ class TestTraitsStream:
 
     def test_event_ordering_start_token_done(self):
         """Events are serialized correctly: start → token → done."""
-        from saklas.core.events import GenerationStarted, GenerationFinished
         from saklas.core.results import ProbeReadings
 
         # Test the serialization logic directly rather than fighting TestClient
@@ -441,7 +440,6 @@ class TestTraitsStream:
         ]
 
         # Serialize using the same logic as the SSE generator.
-        import uuid
         output_lines = []
         generation_id = None
         for item in events:
