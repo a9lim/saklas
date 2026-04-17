@@ -848,3 +848,47 @@ def test_vector_extract_sae_requires_value():
         cli.parse_args([
             "vector", "extract", "honest.deceptive", "-m", "m", "--sae",
         ])
+
+
+# ---------------------------------------------------------------------------
+# pack push / pack clear --variant
+# ---------------------------------------------------------------------------
+
+def test_pack_push_variant_flag_default_raw():
+    """--variant default is 'raw' for push — users opt into sharing SAE variants."""
+    args = cli.parse_args([
+        "pack", "push", "honest.deceptive", "-m", "model",
+    ])
+    assert args.variant == "raw"
+
+
+def test_pack_push_variant_all():
+    args = cli.parse_args([
+        "pack", "push", "honest.deceptive", "-m", "model",
+        "--variant", "all",
+    ])
+    assert args.variant == "all"
+
+
+def test_pack_push_variant_sae():
+    args = cli.parse_args([
+        "pack", "push", "honest.deceptive", "-m", "model",
+        "--variant", "sae",
+    ])
+    assert args.variant == "sae"
+
+
+def test_pack_clear_variant_flag_default_all():
+    """--variant default is 'all' for clear — stale extractions should be fully gone."""
+    args = cli.parse_args([
+        "pack", "clear", "honest.deceptive",
+    ])
+    assert args.variant == "all"
+
+
+def test_pack_push_variant_rejects_unknown():
+    with pytest.raises(SystemExit):
+        cli.parse_args([
+            "pack", "push", "honest.deceptive", "-m", "model",
+            "--variant", "weird",
+        ])

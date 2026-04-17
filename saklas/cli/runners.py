@@ -286,7 +286,7 @@ def _run_clear(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    n = cache_ops.delete_tensors(selector, args.model)
+    n = cache_ops.delete_tensors(selector, args.model, variant=args.variant)
     print(f"Deleted {n} files")
 
 
@@ -367,6 +367,7 @@ def _run_push(args: argparse.Namespace) -> None:
             tag_version=args.tag_version,
             dry_run=args.dry_run,
             force=args.force,
+            variant=args.variant,
         )
     except RuntimeError as e:
         print(str(e), file=sys.stderr)

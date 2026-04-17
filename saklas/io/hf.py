@@ -364,24 +364,47 @@ def push_pack(
     model_scope: Optional[str] = None,
     tag_version: bool = False,
     dry_run: bool = False,
+    variant: str = "all",
 ) -> tuple[str, Optional[str]]:
     """Push a concept folder to HF as a model repo.
 
     Stages a copy (so we can add README.md + .gitattributes + a filtered
     pack.json without mutating the source), then one atomic upload. Returns
     ``(repo_url, commit_sha)``; sha is ``None`` on dry-run.
+
+    ``variant`` filters tensor files: ``"raw"`` uploads only unsuffixed
+    tensors, ``"sae"`` only ``_sae-*`` tensors, ``"all"`` (default) both.
+    Sidecars follow their partner tensor.
     """
     import tempfile
     from saklas.io.packs import ConceptFolder
-    from saklas.io.paths import safe_model_id as _safe_id
+    from saklas.io.paths import safe_model_id as _safe_id, parse_tensor_filename
+
+    def _variant_key_for(rel: str) -> Optional[str]:
+        """Return variant key for a file path relative to the pack folder."""
+        if rel.endswith(".json"):
+            return _variant_key_for(rel[:-len(".json")] + ".safetensors")
+        parsed = parse_tensor_filename(rel)
+        if parsed is None:
+            return None
+        _m, release = parsed
+        return "raw" if release is None else f"sae-{release}"
+
+    def _variant_matches(key: str) -> bool:
+        if variant == "all":
+            return True
+        if variant == "raw":
+            return key == "raw"
+        if variant == "sae":
+            return key.startswith("sae-")
+        return False
 
     cf = ConceptFolder.load(folder)  # runs integrity check
     meta = cf.metadata
 
-    scope_expected: Optional[set[str]] = None
+    scope_safe: Optional[str] = None
     if model_scope is not None:
-        safe = _safe_id(model_scope)
-        scope_expected = {f"{safe}.safetensors", f"{safe}.json"}
+        scope_safe = _safe_id(model_scope)
 
     staging = Path(tempfile.mkdtemp(prefix="saklas-push-"))
     try:
@@ -394,7 +417,21 @@ def push_pack(
             else:
                 if not include_tensors:
                     continue
-                if scope_expected is not None and rel not in scope_expected:
+                # Normalize sidecar names to tensor names for parsing.
+                if rel.endswith(".json"):
+                    tensor_rel = rel[:-len(".json")] + ".safetensors"
+                elif rel.endswith(".safetensors"):
+                    tensor_rel = rel
+                else:
+                    continue
+                parsed = parse_tensor_filename(tensor_rel)
+                if parsed is None:
+                    continue
+                file_model, release = parsed
+                if scope_safe is not None and file_model != scope_safe:
+                    continue
+                vkey = "raw" if release is None else f"sae-{release}"
+                if not _variant_matches(vkey):
                     continue
             src = folder / rel
             if not src.exists():
@@ -412,7 +449,7 @@ def push_pack(
             raise HFError(
                 "nothing to push: filters excluded every file "
                 f"(include_statements={include_statements}, include_tensors={include_tensors}, "
-                f"model_scope={model_scope!r})"
+                f"model_scope={model_scope!r}, variant={variant!r})"
             )
 
         staged_meta = PackMetadata(

@@ -118,6 +118,10 @@ def _build_pack_clear(p: argparse.ArgumentParser) -> None:
                    help="Scope to one model's tensors only (default: all models)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="Skip confirmation prompt on broad selectors")
+    p.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="all",
+        help="Which tensor variant(s) to delete. Default: all.",
+    )
 
 
 def _build_pack_rm(p: argparse.ArgumentParser) -> None:
@@ -154,6 +158,11 @@ def _build_pack_push(p: argparse.ArgumentParser) -> None:
     p.add_argument("-t", "--tag-version", action="store_true")
     p.add_argument("-d", "--dry-run", action="store_true")
     p.add_argument("-f", "--force", action="store_true")
+    p.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="raw",
+        help="Which tensor variant(s) to push. Default: raw. (SAE variants "
+             "carry different provenance; opt in via --variant sae|all.)",
+    )
 
 
 def _build_pack_export(p: argparse.ArgumentParser) -> None:
