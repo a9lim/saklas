@@ -148,6 +148,7 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch):
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
+        drop_edges=(0, 0),
     )
     assert set(profile.keys()) == {1, 3}
     mags = [profile[i].norm().item() for i in profile]
@@ -186,6 +187,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
+        drop_edges=(0, 0),
     )
     for idx, vec in profile.items():
         assert vec[0].item() > 0
@@ -218,6 +220,7 @@ def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch):
             FakeModel(), FakeTok(), pairs, layers=layers_list,
             device=torch.device("cpu"),
             sae=sae,
+            drop_edges=(0, 0),
         )
 
 
@@ -255,6 +258,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
+        drop_edges=(0, 0),
     )
     # Both layers covered, both have signal, both non-zero
     assert set(profile.keys()) == {0, 1}
@@ -418,3 +422,142 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, rec
     assert len(warnings_about_multiple) >= 1
     # Layers 0 and 2 are both represented.
     assert backend.layers == frozenset({0, 2})
+
+
+# --- drop_edges tests (raw PCA path; co-located with the SAE extract tests
+# above because they share the _encode_and_capture_all mock infrastructure).
+
+
+def test_extract_contrastive_drop_edges_default_drops_two_each_end(monkeypatch):
+    """Default drop_edges=(2,2) omits L0, L1, L_N-2, L_N-1 from the profile."""
+    import torch
+    from saklas.core import vectors as V
+
+    torch.manual_seed(0)
+    N = 10
+
+    def fake_encode(model, tokenizer, text, layers, device):
+        sign = 1.0 if "pos" in text else -1.0
+        return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
+                for i in range(N)}
+
+    monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode)
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
+    profile = V.extract_contrastive(
+        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+        device=torch.device("cpu"),
+    )
+    assert set(profile.keys()) == set(range(2, N - 2))
+
+
+def test_extract_contrastive_drop_edges_zero_preserves_old_behavior(monkeypatch):
+    """drop_edges=(0,0) keeps all layers (pre-fix behavior)."""
+    import torch
+    from saklas.core import vectors as V
+
+    torch.manual_seed(0)
+    N = 6
+
+    def fake_encode(model, tokenizer, text, layers, device):
+        sign = 1.0 if "pos" in text else -1.0
+        return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
+                for i in range(N)}
+
+    monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode)
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
+    profile = V.extract_contrastive(
+        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+        device=torch.device("cpu"),
+        drop_edges=(0, 0),
+    )
+    assert set(profile.keys()) == set(range(N))
+
+
+def test_extract_contrastive_drop_edges_rejects_total_drop():
+    """drop_edges that would empty the retained set raises ValueError."""
+    import torch
+    from saklas.core import vectors as V
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    with pytest.raises(ValueError, match="no retained layers"):
+        V.extract_contrastive(
+            FakeModel(), FakeTok(), [], layers=[object()] * 4,
+            device=torch.device("cpu"),
+            drop_edges=(2, 2),
+        )
+
+
+def test_extract_contrastive_drop_edges_rejects_negative():
+    """Negative drop counts are rejected."""
+    import torch
+    from saklas.core import vectors as V
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    with pytest.raises(ValueError, match="non-negative"):
+        V.extract_contrastive(
+            FakeModel(), FakeTok(), [], layers=[object()] * 10,
+            device=torch.device("cpu"),
+            drop_edges=(-1, 2),
+        )
+
+
+def test_extract_contrastive_drop_edges_asymmetric(monkeypatch):
+    """Asymmetric drop — front only or back only — works."""
+    import torch
+    from saklas.core import vectors as V
+
+    torch.manual_seed(0)
+    N = 8
+
+    def fake_encode(model, tokenizer, text, layers, device):
+        sign = 1.0 if "pos" in text else -1.0
+        return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
+                for i in range(N)}
+
+    monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode)
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(3)]
+
+    profile_front = V.extract_contrastive(
+        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+        device=torch.device("cpu"),
+        drop_edges=(3, 0),
+    )
+    assert set(profile_front.keys()) == set(range(3, N))
+
+    profile_back = V.extract_contrastive(
+        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+        device=torch.device("cpu"),
+        drop_edges=(0, 3),
+    )
+    assert set(profile_back.keys()) == set(range(N - 3))
