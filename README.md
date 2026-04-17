@@ -94,7 +94,9 @@ Alphas are backbone-normalized: per-layer PCA shares are baked into the tensor m
 
 Multiple vectors compose. Register them all, pass whatever alpha map you want per call; co-layer directions sum into a single in-place hook per layer.
 
-### SAE-backed extraction (optional)
+### SAE-backed extraction (experimental)
+
+> **Experimental.** This pipeline is new and not as battle-tested as the raw contrastive-PCA path. The α calibration (`_STEER_GAIN = 3.5`, coherent band ≈ 0.2–0.6, cliff ≈ 0.75) was measured on raw PCA and does not transfer cleanly — SAE profiles are subset-layer, so share-baking redistributes over fewer layers and unit-α intensity can differ substantially from raw. Quality also depends on which SAE release you pick; there's no single "best" release per model. Start with low α (0.1–0.2) and sweep. For production use, the raw pipeline is the default for good reason — SAE is here for research and exploration.
 
 Install `saklas[sae]` and pass `--sae <release>` to `vector extract` to run contrastive PCA in sparse-autoencoder feature space instead of raw residual-stream space. saklas routes through SAELens, so any published release it covers — GemmaScope, Eleuther Meta-LLaMA-3.1 SAEs, Joseph Bloom's, Apollo/Goodfire — works day one. The output plugs into the same hook, monitor, and pack infrastructure as raw PCA; the only visible difference is a `:sae-<release>` suffix on the concept name so raw and SAE flavors can coexist.
 
