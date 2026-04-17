@@ -117,8 +117,8 @@ vectors:
 ```
 
 ```
-/steer --sae honest 0.3          # TUI: picks the unique SAE variant
-/steer --sae gemma-scope-2b-pt-res-canonical honest 0.3   # explicit release
+/steer --sae honest 0.3                                    # TUI: unique SAE variant on disk
+/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3      # TUI: explicit release
 ```
 
 SAE profiles are subset-layer — only layers the release covers — and share-baking redistributes over the covered subset automatically. The 21 bundled concepts ship raw-PCA only; users opt into SAE extraction per-concept.

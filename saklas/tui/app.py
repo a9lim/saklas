@@ -61,66 +61,29 @@ def _split_bipolar(text: str) -> tuple[str, str | None]:
     return _unquote(text.strip()), None
 
 
-def _looks_like_release(tok: str, remaining: list[str]) -> bool:
-    """Heuristic: decide whether ``tok`` after ``--sae`` is a release name or a concept.
-
-    A release name typically contains a hyphen (``gemma-scope-2b-pt-res-canonical``)
-    and stands alone; a bare concept name also may contain a hyphen but is
-    usually the only non-alpha token left. Disambiguate:
-      - tok must not parse as a float (alpha).
-      - tok must not equal "raw" or "sae" (reserved variant words).
-      - If there's no remaining token after it, it's a concept.
-      - If remaining's first token is a concept-shaped name (or ``.``) and we
-        have another token after that, treat tok as a release.
-    """
-    if tok in {"raw", "sae"}:
-        return False
-    try:
-        float(tok)
-        return False
-    except ValueError:
-        pass
-    if not remaining:
-        return False
-    # For ``--sae <tok> <concept> [...]`` the next token must itself look
-    # like a concept — not the bipolar ``.`` delimiter and not a bare alpha.
-    # Otherwise ``--sae honest 0.3`` would eat ``honest`` as a release.
-    next_tok = remaining[0]
-    if next_tok == ".":
-        return False
-    try:
-        float(next_tok)
-        return False
-    except ValueError:
-        pass
-    return True
-
-
 def _parse_steer_command(arg: str) -> dict:
     """Parse a /steer argument string.
 
     Recognizes:
-      --sae [RELEASE] <concept> [alpha]
-      --sae [RELEASE] <pos> . <neg> [alpha]
+      --sae <concept> [alpha]                  (picks the unique SAE variant)
+      --sae <pos> . <neg> [alpha]
       <concept> [alpha]
       <pos> . <neg> [alpha]
 
+    For an explicit release, use the ``:sae-<release>`` suffix in the
+    concept name itself (e.g. ``/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3``).
+    The positional ``--sae RELEASE concept`` form was removed because the
+    release-detection heuristic misfired on hyphenated concepts like
+    ``high-context`` — explicit selector grammar wins over fuzzy parsing.
+
     Returns a dict with concept, baseline (None or str), alpha (None or float),
-    variant ("raw" / "sae" / "sae-<release>").
+    variant ("raw" / "sae").
     """
     tokens = arg.split()
     variant = "raw"
     if tokens and tokens[0] == "--sae":
+        variant = "sae"
         tokens = tokens[1:]
-        if tokens:
-            candidate = tokens[0]
-            if _looks_like_release(candidate, remaining=tokens[1:]):
-                variant = f"sae-{candidate}"
-                tokens = tokens[1:]
-            else:
-                variant = "sae"
-        else:
-            variant = "sae"
 
     if not tokens:
         raise ValueError("no concept")
@@ -621,40 +584,40 @@ class SaklasApp(App):
         # bipolar pack (e.g. `/steer wolf` when `deer.wolf` exists).
         # Sign flip is applied to the user's alpha so `/steer calm 0.5`
         # on top of `angry.calm` lands as `alphas["angry.calm"] = -0.5`.
+        # ``resolve_pole`` also peels any ``:variant`` suffix typed
+        # directly on the concept (``honest:sae-gemma-scope...``) — that
+        # explicit form wins over the ``variant`` kwarg when both are set.
         # Explicit bipolar form (`concept - baseline`) skips resolution
         # so the user's declared poles always win.
         sign = 1
         if baseline is None:
             try:
-                resolved_name, sign, _match, _variant = resolve_pole(concept)
+                resolved_name, sign, _match, explicit_variant = resolve_pole(concept)
                 if resolved_name != concept:
                     chat.add_system_message(
                         f"  Resolved '{concept}' → '{resolved_name}'"
                         + (" (negated)" if sign < 0 else "")
                     )
                 concept = resolved_name
+                # Explicit ``:sae-<release>`` on the concept overrides the
+                # ``--sae`` preamble's variant. Lets users route a specific
+                # release without the fuzzy release-detection heuristic.
+                if explicit_variant != "raw":
+                    variant = explicit_variant
             except AmbiguousSelectorError as e:
                 chat.add_system_message(f"Error: {e}")
                 return
             if alpha is not None:
                 alpha *= sign
 
-        # Variant routing: append `:variant` to the final registered name
-        # so _resolve_pole_aliases routes to the right backend (raw / SAE).
-        # Plain `--sae` with no release can't auto-extract — the SAE loader
-        # needs an explicit release. Surface a friendly error instead of
-        # calling session.extract(sae="") and letting it blow up.
+        # Variant routing. ``--sae`` alone (variant == "sae") means "pick the
+        # unique already-extracted SAE tensor for this concept on disk" —
+        # session autoload handles it. To drive a fresh extraction, users
+        # pass the explicit ``:sae-<release>`` suffix, which routes the
+        # release through ``session.extract(sae=RELEASE)``.
         sae_release: str | None = None
-        if variant != "raw":
-            if variant == "sae":
-                chat.add_system_message(
-                    "Error: --sae requires a release for auto-extract. "
-                    "Use `--sae <RELEASE> <concept>` (e.g. "
-                    "`--sae gemma-scope-2b-pt-res-canonical honest`)."
-                )
-                return
-            if variant.startswith("sae-"):
-                sae_release = variant[len("sae-"):]
+        if variant.startswith("sae-"):
+            sae_release = variant[len("sae-"):]
 
         display = concept if len(concept) <= 20 else concept[:17] + "..."
         suffix = f" vs '{baseline}'" if baseline else ""
@@ -665,6 +628,24 @@ class SaklasApp(App):
             def _progress(msg):
                 self.call_from_thread(self._steer_status, msg)
             try:
+                # Bare ``--sae`` (variant == "sae") routes the load through
+                # session autoload rather than a fresh PCA extract — it
+                # means "use the unique SAE variant that's already on disk".
+                # Ambiguous / missing cases surface via the session errors.
+                if variant == "sae" and sae_release is None:
+                    self._session._try_autoload_vector(concept, variant="sae")
+                    key = f"{concept}:sae"
+                    profile_dict = self._session._profiles.get(key)
+                    if profile_dict is None:
+                        raise ValueError(
+                            f"no SAE variant loaded for '{concept}' — "
+                            f"run `saklas vector extract {concept} --sae <RELEASE>` "
+                            f"first, or pick a release with "
+                            f"`:sae-<release>` in the concept name."
+                        )
+                    on_success(key, profile_dict, alpha)
+                    return
+
                 extract_kwargs = {"baseline": baseline, "on_progress": _progress}
                 if sae_release is not None:
                     extract_kwargs["sae"] = sae_release
@@ -677,34 +658,25 @@ class SaklasApp(App):
                 on_success(canonical, profile, alpha)
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
+            except Exception as e:
+                # AmbiguousVariantError / UnknownVariantError are KeyError/ValueError
+                # subclasses — either branch lands here. Surface cleanly.
+                self.call_from_thread(self._steer_status, f"{type(e).__name__}: {e}")
 
         self.run_worker(_worker, thread=True)
 
     def _handle_steer(self, text: str) -> None:
-        # Peel --sae [RELEASE] off the front before delegating to the
-        # shared extract pipeline. The rest of the text still goes through
-        # `_parse_args`, preserving quoted multi-word poles / period delim.
+        # Peel the ``--sae`` preamble off the front before delegating to
+        # the shared extract pipeline. ``--sae`` alone flips variant to
+        # ``"sae"`` — meaning "pick the unique already-extracted SAE
+        # variant on disk". For a specific release, users embed the
+        # ``:sae-<release>`` suffix directly in the concept name; that
+        # routes through ``resolve_pole`` in ``_handle_extract``.
         variant = "raw"
         stripped = text.lstrip()
         if stripped.startswith("--sae"):
-            after = stripped[len("--sae"):].lstrip()
-            try:
-                parsed = _parse_steer_command(stripped)
-            except ValueError as e:
-                self._chat_panel.add_system_message(
-                    f"Parse error: {e}\nUsage: /steer --sae [RELEASE] <concept> [alpha]"
-                )
-                return
-            variant = parsed["variant"]
-            # Rebuild the extract-compatible text by dropping --sae (+ release
-            # if present). The existing _parse_args handles the rest.
-            if variant == "sae":
-                text = after
-            elif variant.startswith("sae-"):
-                release = variant[len("sae-"):]
-                # Strip the release token (and surrounding whitespace).
-                after_release = after[len(release):].lstrip()
-                text = after_release
+            variant = "sae"
+            text = stripped[len("--sae"):].lstrip()
 
         def _on_success(name, profile, alpha):
             self._session.steer(name, profile)
