@@ -15,14 +15,28 @@ _HIGHLIGHT_SAT = 0.5
 _HIGHLIGHT_CACHE_MAX = 4
 
 
-def _build_highlight_markup(token_strs: list[str], scores: list[float]) -> str:
+def _build_highlight_markup(
+    token_strs: list[str], scores: list[float], *, strip_leading_whitespace: bool = False,
+) -> str:
     """Build Rich markup with per-token red/green background spans.
 
-    Caller is responsible for guarding against mismatched lengths; this
-    function assumes ``len(scores) == len(token_strs)``.
+    During live streaming, ``scores`` may lag ``token_strs`` by a token
+    (or more) — unscored tokens render as default text and pick up
+    colour on the next render after their score arrives.
+
+    ``strip_leading_whitespace=True`` drops whitespace-only tokens from
+    the head of the stream — used by the response view to swallow the
+    ``\\n\\n`` models often emit after ``</think>``.
     """
     parts: list[str] = []
-    for tok, score in zip(token_strs, scores):
+    n_scores = len(scores)
+    seen_content = not strip_leading_whitespace
+    for i, tok in enumerate(token_strs):
+        if not seen_content:
+            if not tok.strip():
+                continue
+            seen_content = True
+        score = scores[i] if i < n_scores else 0.0
         t = max(-1.0, min(1.0, score / _HIGHLIGHT_SAT))
         safe = _rich_escape(tok)
         if t > 0:
@@ -127,6 +141,27 @@ class _AssistantMessage(Vertical):
         self._render_response()
         self._render_thinking()
 
+    def append_token_score(self, scores: dict[str, float], is_thinking: bool) -> None:
+        """Append one token's per-probe scores to the running per-probe lists.
+
+        Called from the TUI event-pump alongside ``append_token`` /
+        ``append_thinking_token`` so highlighting and WHY top-token stats
+        can update mid-gen. Invalidates the markup cache for the affected
+        side so the next render rebuilds with the new score row.
+        """
+        target = self._thinking_probe_scores if is_thinking else self._response_probe_scores
+        for name, val in scores.items():
+            target.setdefault(name, []).append(val)
+        if is_thinking:
+            self._thinking_markup_cache.clear()
+        else:
+            self._response_markup_cache.clear()
+        if self._highlight_on:
+            if is_thinking:
+                self._render_thinking()
+            else:
+                self._render_response()
+
     def _get_response_markup(self, probe: str) -> str | None:
         cached = self._response_markup_cache.get(probe)
         if cached is not None:
@@ -135,7 +170,12 @@ class _AssistantMessage(Vertical):
         scores = self._response_probe_scores.get(probe)
         if scores is None:
             return None
-        markup = _build_highlight_markup(self.response_token_strs, scores)
+        # Prefer the live-streamed token list (always current) over the
+        # finalize-time canonical list, which set_token_data fills only at end.
+        token_strs = self.response_token_strs or self._streamed_response_tokens
+        markup = _build_highlight_markup(
+            token_strs, scores, strip_leading_whitespace=True,
+        )
         self._response_markup_cache[probe] = markup
         if len(self._response_markup_cache) > _HIGHLIGHT_CACHE_MAX:
             self._response_markup_cache.popitem(last=False)
@@ -149,7 +189,8 @@ class _AssistantMessage(Vertical):
         scores = self._thinking_probe_scores.get(probe)
         if scores is None:
             return None
-        markup = _build_highlight_markup(self.thinking_token_strs, scores)
+        token_strs = self.thinking_token_strs or self._streamed_thinking_tokens
+        markup = _build_highlight_markup(token_strs, scores)
         self._thinking_markup_cache[probe] = markup
         if len(self._thinking_markup_cache) > _HIGHLIGHT_CACHE_MAX:
             self._thinking_markup_cache.popitem(last=False)
@@ -169,7 +210,11 @@ class _AssistantMessage(Vertical):
         markup = None
         if self._highlight_on and self._highlight_probe:
             markup = self._get_response_markup(self._highlight_probe)
-        self._response_view.update(markup if markup is not None else self._escaped_chat_text)
+        # Models often emit \n\n right after </think>; lstrip the plain-text
+        # path so the gap below the thinking block is gone in non-highlight
+        # mode (the markup builder strips leading whitespace tokens itself).
+        text = markup if markup is not None else self._escaped_chat_text.lstrip()
+        self._response_view.update(text)
 
     def _render_thinking(self) -> None:
         if self._thinking_view is None:

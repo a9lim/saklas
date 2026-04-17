@@ -49,11 +49,13 @@ class LeftPanel(Widget):
             id="model-info",
         )
         # Vectors section
-        yield Static("[bold]VECTORS[/] [dim]0 total, 0 active[/]",
+        yield Static("[bold]STEERING VECTORS[/] [dim]0 total, 0 active[/]",
                       id="vectors-header", classes="section-header")
         yield VerticalScroll(Static("", id="vector-content"), id="vector-scroll")
-        yield Static("[dim]⌫ remove · ↩ toggle[/]",
-                      id="vector-hints")
+        yield Static(
+            "[dim]⌫ remove · ↩ toggle · ←/→ alpha[/]",
+            id="vector-hints",
+        )
         # Generation section
         yield Static("[bold]GENERATION[/]", classes="section-header")
         yield Static("", id="gen-config")
@@ -64,8 +66,7 @@ class LeftPanel(Widget):
             "⌃R regen · ⌃A A/B · ⌃T think\n"
             "⌃Q quit\n"
             "── ⇥ to side panel first ──\n"
-            "↑/↓ navigate · ↩ select\n"
-            "←/→ alpha\n"
+            "↑/↓ navigate\n"
             "[ ] temp · { } top-p[/]",
             id="key-ref",
         )
@@ -108,7 +109,7 @@ class LeftPanel(Widget):
         total = len(self._vectors)
         header = self._vectors_header
         header.update(
-            f"[bold]VECTORS[/] [dim]{total} total, {active} active[/]"
+            f"[bold]STEERING VECTORS[/] [dim]{total} total, {active} active[/]"
         )
 
         lines: list[str] = []
@@ -162,15 +163,31 @@ class LeftPanel(Widget):
 
         sys_str = self._system_prompt[:15] + "..." if self._system_prompt and len(self._system_prompt) > 15 else (self._system_prompt or "(none)")
 
+        # Right-edge column for the hint glyphs. Bar lines render as
+        # "Temp  1.00 " (11) + bar (20) + " [/]" (4) = 35 visible chars,
+        # so anything else padded to width 35 lines up the right edges.
+        RIGHT_W = 35
+
+        def _pad(left_visible: str, right_text: str) -> str:
+            return " " * max(1, RIGHT_W - len(left_visible) - len(right_text))
+
+        max_prefix = f"Max   {self._max_tokens} tok"
+        think_str = "ON" if self._thinking else "OFF"
+        think_prefix = f"Think {think_str}"
+        sys_prefix = f"Sys   {sys_str}"
+
         lines = [
             f"Temp  {self._temperature:.2f} [dim]{t_bar}[/] [dim]\\[/][/]",
             f"Top-p {self._top_p:.2f} [dim]{p_bar}[/] [dim]{{/}}[/]",
-            f"Max   {self._max_tokens} tok       [dim]/max[/]",
+            f"{max_prefix}{_pad(max_prefix, '/max')}[dim]/max[/]",
         ]
         if self._thinking is not None:
-            think_str = "ON" if self._thinking else "OFF"
-            lines.append(f"Think {think_str}            [dim]⌃T[/]")
-        lines.append(f"Sys   [dim]{sys_str}[/]    [dim]/sys[/]")
+            lines.append(
+                f"{think_prefix}{_pad(think_prefix, '⌃T')}[dim]⌃T[/]"
+            )
+        lines.append(
+            f"Sys   [dim]{sys_str}[/]{_pad(sys_prefix, '/sys')}[dim]/sys[/]"
+        )
         lines.append("[dim]type /help for commands[/]")
 
         gen.update("\n".join(lines))

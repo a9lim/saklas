@@ -190,8 +190,11 @@ Three panels: **vector registry** on the left (live alpha knobs), **chat** in th
 | `/save <name>` / `/load <name>` | Snapshot/restore conversation + alphas |
 | `/export <path>` | JSONL with per-token probe readings |
 | `/model` | Model + device + active state |
-| `/why` | Top layers + tokens for selected probe |
 | `/help` | List commands and keybindings |
+
+A **WHY footer** at the bottom of the trait panel shows the top-5 layers
+(by `||baked||`) and live top/bottom emitted tokens (by signed score) for
+the trait-panel-selected probe — driven by selection, no command needed.
 
 ---
 

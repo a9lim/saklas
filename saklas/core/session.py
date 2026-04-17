@@ -377,9 +377,11 @@ class SaklasSession:
         input_ids = build_chat_input(
             self._tokenizer, messages, system_prompt=None,
         ).to(self._device)
+        attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
             out = self._model.generate(
                 input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True, temperature=1.0, top_p=0.9,
                 pad_token_id=pad_id,
@@ -1441,6 +1443,7 @@ class SaklasSession:
 
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             self._begin_capture()
+            self._monitor.begin_live()
             try:
                 start = time.monotonic()
                 generated_ids = generate_steered(
@@ -1465,6 +1468,7 @@ class SaklasSession:
                 prompt_tokens=prompt_tokens, stateless=stateless,
                 logprobs_list=logprobs_list,
             )
+            self._monitor.end_live()
             self.events.emit(GenerationFinished(result=result))
             return result
         except BaseException:
@@ -1477,6 +1481,7 @@ class SaklasSession:
                     pass
             raise
         finally:
+            self._monitor.end_live()
             self._gen_active = False
             self._gen_lock.release()
 
@@ -1548,9 +1553,20 @@ class SaklasSession:
         idx_counter = [0]
 
         def _push(text, is_thinking, tid, lp, tlp):
+            scores: dict[str, float] | None = None
+            if self._monitor.probe_names:
+                latest_hidden = {
+                    layer_idx: bucket[-1]
+                    for layer_idx, bucket in self._capture._per_layer.items()
+                    if bucket
+                }
+                if latest_hidden:
+                    scores = self._monitor.score_single_token(latest_hidden)
+                    self._monitor.update_live(scores)
             event = TokenEvent(
                 text=text, token_id=tid, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_logprobs=tlp,
+                scores=scores,
             )
             idx_counter[0] += 1
             q.put(event)
