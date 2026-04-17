@@ -35,7 +35,7 @@ def sweep(model_id: str) -> None:
     print(f"MODEL: {model_id}")
     print(_hr("#"), flush=True)
 
-    print(f"Loading…", flush=True)
+    print("Loading…", flush=True)
     t0 = time.time()
     session = SaklasSession.from_pretrained(
         model_id, device="auto", max_tokens=MAX_TOKENS, probes=[],
