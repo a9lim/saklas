@@ -233,7 +233,6 @@ def test_help_mentions_new_bindings():
     assert "/unsteer" in msg
     assert "/save" in msg
     assert "/load" in msg
-    assert "/why" in msg
     assert "/seed" in msg
     assert "/regen" in msg
     assert "/export" in msg

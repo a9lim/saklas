@@ -142,6 +142,7 @@ class SaklasApp(App):
 
         if self._session._monitor:
             self._trait_panel.set_active_probes(set(self._session._monitor.probe_names))
+            self._refresh_trait_why()
 
         self._poll_timer = self.set_interval(1 / _POLL_FPS, self._poll_generation)
         self._update_panel_focus()
@@ -218,6 +219,7 @@ class SaklasApp(App):
             self._trait_panel.nav_down()
             if self._highlighting:
                 self._apply_highlight_to_all()
+            self._refresh_trait_why()
 
     def action_nav_up(self) -> None:
         if self._focused_panel_idx == _LEFT:
@@ -226,6 +228,7 @@ class SaklasApp(App):
             self._trait_panel.nav_up()
             if self._highlighting:
                 self._apply_highlight_to_all()
+            self._refresh_trait_why()
 
     def action_nav_left(self) -> None:
         self._adjust_alpha(-0.01)
@@ -285,8 +288,6 @@ class SaklasApp(App):
             self.action_regenerate()
         elif cmd == "/model":
             self._handle_model_info()
-        elif cmd == "/why":
-            self._handle_why()
         elif cmd == "/probe":
             if not arg:
                 chat.add_system_message(
@@ -374,7 +375,6 @@ class SaklasApp(App):
                 '  /probe "concept"            — add probe (highlight on)\n'
                 "  /unprobe <name>             — remove probe\n"
                 '  /extract "concept"          — cache-warm only\n'
-                "  /why                        — top layers for selected probe\n"
                 "  /compare <a> [b]            — cosine similarity\n"
                 "Session:\n"
                 "  /clear, /rewind, /regen     — history ops\n"
@@ -533,6 +533,7 @@ class SaklasApp(App):
         self._highlight_probe = name
         self._highlighting = True
         self._apply_highlight_to_all()
+        self._refresh_trait_why()
         self._steer_status(f"Probe '{name}' active. Highlight on (Ctrl+Y to toggle).")
 
     def _refresh_left_panel(self) -> None:
@@ -543,6 +544,7 @@ class SaklasApp(App):
         self._chat_panel.clear_log()
         self._assistant_messages.clear()
         self._trait_panel.update_values({}, {}, {})
+        self._refresh_trait_why()
         self._chat_panel.add_system_message("Chat history cleared.")
 
     def _do_rewind(self) -> None:
@@ -638,7 +640,9 @@ class SaklasApp(App):
                     thinking=use_thinking,
                 )
                 for event in stream:
-                    self._ui_token_queue.put(("tok", event.text, event.thinking))
+                    self._ui_token_queue.put(
+                        ("tok", event.text, event.thinking, event.scores)
+                    )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
                 # session and push to the widget for highlight.
@@ -667,7 +671,7 @@ class SaklasApp(App):
                 break
             kind = item[0]
             if kind == "tok":
-                _, token, is_thinking = item
+                _, token, is_thinking, scores = item
                 widget = self._current_assistant_widget
                 if widget:
                     if is_thinking:
@@ -675,6 +679,9 @@ class SaklasApp(App):
                     else:
                         widget.ensure_thinking_collapsed()
                         widget.append_token(token)
+                    if scores is not None:
+                        widget.append_token_score(scores, is_thinking)
+                        self._refresh_trait_why()
                 tokens_consumed += 1
             elif kind == "finalize":
                 # Normal end — pull per-token scores stashed by session's
@@ -766,6 +773,7 @@ class SaklasApp(App):
             return
         self._session.unprobe(probe_name)
         tp.set_active_probes(set(self._session._monitor.probe_names))
+        self._refresh_trait_why()
 
     def action_toggle_vector(self) -> None:
         if self._ab_in_progress:
@@ -794,18 +802,11 @@ class SaklasApp(App):
             # Prefer the stored seed, fall back to trait-panel selection.
             seed = self._highlight_probe or self._trait_panel.get_selected_probe()
             if seed is None:
-                self._chat_panel.add_system_message(
-                    "No probe selected. Focus the trait panel (Tab) and pick one first."
-                )
                 return
             self._highlight_probe = seed
             self._highlighting = True
-            self._chat_panel.add_system_message(
-                f"Highlighting '{seed}' (red=negative, green=positive)."
-            )
         else:
             self._highlighting = False
-            self._chat_panel.add_system_message("Highlighting off.")
         self._apply_highlight_to_all()
 
     def _apply_highlight_to_all(self) -> None:
@@ -884,6 +885,7 @@ class SaklasApp(App):
         )
         if self._highlighting:
             widget.apply_highlight(True, self._highlight_probe)
+        self._refresh_trait_why()
 
     # -- New slash command handlers --
 
@@ -944,6 +946,7 @@ class SaklasApp(App):
             self._highlight_probe = None
             self._highlighting = False
             self._apply_highlight_to_all()
+        self._refresh_trait_why()
         chat.add_system_message(f"Probe '{name}' removed.")
 
     def _handle_seed(self, arg: str) -> None:
@@ -1054,61 +1057,55 @@ class SaklasApp(App):
         ]
         chat.add_system_message("\n".join(lines))
 
-    def _handle_why(self) -> None:
-        chat = self._chat_panel
-        probe = self._highlight_probe or self._trait_panel.get_selected_probe()
-        if probe is None:
-            chat.add_system_message("No probe selected for /why.")
-            return
+    def _refresh_trait_why(self) -> None:
+        """Push current top-layers + (when available) top-tokens for the
+        trait-panel-selected probe down to the panel's WHY section.
+
+        Top-token data is pulled from the most recently mounted assistant
+        widget — the widget's per-probe score lists are appended to live
+        during streaming (via ``append_token_score``) and overwritten with
+        canonical projected scores at finalize. Either way the widget is
+        the source of truth for "what scores belong to which rendered token".
+        """
+        probe = self._trait_panel.get_selected_probe()
         monitor = self._session._monitor
-        if not monitor or probe not in monitor.profiles:
-            chat.add_system_message(f"Probe '{probe}' not active.")
+        if probe is None or monitor is None or probe not in monitor.profiles:
+            self._trait_panel.update_why(None, [], None)
             return
         profile = monitor.profiles[probe]
-        # Top-magnitude layers = layers reading most per unit α.
         layer_norms = sorted(
             ((int(lidx), float(t.norm().item())) for lidx, t in profile.items()),
             key=lambda kv: kv[1], reverse=True,
         )[:5]
-        # Top-contributing tokens from last per-token scores.
-        per_token = self._session.last_per_token_scores or {}
-        top_tokens = []
-        if probe in per_token and self._session.last_result is not None:
-            scores_full = per_token[probe]
-            emit_map = self._session._gen_state.emit_map
-            # Use emit_map to project scores to emitted-token space.
-            widget = self._current_assistant_widget
-            if emit_map and widget:
-                all_strs = (list(widget._streamed_thinking_tokens)
-                            + list(widget._streamed_response_tokens))
-                projected = []
-                tok_i = 0
-                for gen_idx, _is_think in emit_map:
-                    if tok_i < len(all_strs) and gen_idx < len(scores_full):
-                        projected.append((all_strs[tok_i], scores_full[gen_idx]))
-                    tok_i += 1
-                pairs = projected
-            else:
-                tok = self._session._tokenizer
-                ids = self._session.last_result.tokens
-                strs = tok.batch_decode(
-                    [[int(tid)] for tid in ids], skip_special_tokens=True,
-                )
-                pairs = list(zip(strs, scores_full))
-            pairs.sort(key=lambda kv: abs(kv[1]), reverse=True)
-            top_tokens = pairs[:5]
-        lines = [f"Why '{probe}':"]
-        lines.append("  top layers (by ||baked||):")
-        for lidx, norm in layer_norms:
-            lines.append(f"    L{lidx}: {norm:.3f}")
-        if top_tokens:
-            lines.append("  top tokens (last gen, |score|):")
-            for s, v in top_tokens:
-                disp = s.replace("\n", "\\n")[:20]
-                lines.append(f"    {disp!r}: {v:+.3f}")
-        else:
-            lines.append("  (no per-token scores — run a generation with this probe active)")
-        chat.add_system_message("\n".join(lines))
+
+        top_tokens = None
+        widget = next(
+            (w for w in reversed(self._assistant_messages) if w.is_mounted),
+            None,
+        )
+        if widget is not None:
+            thinking_scores = widget._thinking_probe_scores.get(probe, [])
+            response_scores = widget._response_probe_scores.get(probe, [])
+            thinking_strs = widget._streamed_thinking_tokens
+            response_strs = widget._streamed_response_tokens
+            pairs: list[tuple[str, float]] = []
+            for tok, score in zip(thinking_strs, thinking_scores):
+                pairs.append((tok, score))
+            for tok, score in zip(response_strs, response_scores):
+                pairs.append((tok, score))
+            if pairs:
+                pairs.sort(key=lambda kv: kv[1], reverse=True)
+                # Top N highest + N lowest by signed score. When the gen
+                # has fewer tokens than 2*N, the two halves overlap — fall
+                # back to one merged group with no separator so we don't
+                # show a token twice.
+                top_n = 4
+                if len(pairs) > 2 * top_n:
+                    top_tokens = (pairs[:top_n], pairs[-top_n:])
+                else:
+                    top_tokens = (pairs, [])
+
+        self._trait_panel.update_why(probe, layer_norms, top_tokens)
 
     def _handle_compare(self, arg: str) -> None:
         chat = self._chat_panel
