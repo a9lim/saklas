@@ -283,9 +283,35 @@ def _install_synthesized_pack(
     meta.write(target_folder)
 
 
+def _sidecar_stem_to_hf_coord(stem: str) -> Optional[str]:
+    """Convert a sidecar key (tensor file stem) back to an HF repo coord.
+
+    Sidecars are keyed by the full file stem — which includes any
+    ``_sae-<release>`` suffix. A naive ``stem.replace("__", "/")`` on
+    ``google__gemma-3-4b-it_sae-gemma-scope-2b-pt-res-canonical`` yields
+    ``google/gemma-3-4b-it_sae-...`` — a non-existent HF repo that would
+    poison ``base_model:`` frontmatter. Strip the variant suffix first.
+
+    Returns ``None`` for stems that don't parse as a tensor filename.
+    """
+    from saklas.io.paths import parse_tensor_filename
+
+    parsed = parse_tensor_filename(f"{stem}.safetensors")
+    if parsed is None:
+        return None
+    safe_model, _release = parsed
+    return safe_model.replace("__", "/")
+
+
 def _render_model_card(meta: PackMetadata, sidecars: dict[str, Sidecar], coord: str) -> str:
     """Build a HF model card (YAML frontmatter + markdown body) for a pack."""
-    base_models = sorted(safe.replace("__", "/") for safe in sidecars.keys())
+    # Dedupe: multiple SAE variants of the same base model collapse to one
+    # ``base_model:`` entry.
+    base_models = sorted({
+        hf_coord
+        for stem in sidecars.keys()
+        if (hf_coord := _sidecar_stem_to_hf_coord(stem)) is not None
+    })
     tags = sorted({"saklas-pack", "activation-steering", "steering-vector", *meta.tags})
 
     fm = ["---", "library_name: saklas", f"license: {meta.license}", "tags:"]
@@ -322,9 +348,13 @@ def _render_model_card(meta: PackMetadata, sidecars: dict[str, Sidecar], coord: 
             "| base model | method | saklas version |",
             "| --- | --- | --- |",
         ]
-        for safe, sc in sorted(sidecars.items()):
+        for stem, sc in sorted(sidecars.items()):
+            # Table rows label rows by the clean base model. SAE-variant
+            # provenance lives in the sidecar's sae_release / sae_revision
+            # fields (method already indicates pca_center_sae).
+            base = _sidecar_stem_to_hf_coord(stem) or stem.replace("__", "/")
             body.append(
-                f"| `{safe.replace('__', '/')}` | `{sc.method}` | `{sc.saklas_version}` |"
+                f"| `{base}` | `{sc.method}` | `{sc.saklas_version}` |"
             )
         body.append("")
 
