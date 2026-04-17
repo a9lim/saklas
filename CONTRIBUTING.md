@@ -31,25 +31,17 @@ ruff check .
 ruff check . --fix    # auto-fix what's fixable
 ```
 
-Or install pre-commit to run it automatically on every commit:
-
-```bash
-pip install pre-commit
-pre-commit install
-```
-
 ## Adding a new model architecture
 
-If you want to add another model's architecture, add an entry to `saklas/core/model.py:_LAYER_ACCESSORS`, keyed by the HuggingFace `model_type`. Please use a `def`, not a lambda. The accessor takes a loaded model and returns the list of transformer blocks. The rest of the code (`vectors.py`, `hooks.py`, `monitor.py`) doesn't depend on the architecture usually.
+If you want to add another model's architecture, add an entry to `saklas/core/model.py:_LAYER_ACCESSORS`, keyed by the HuggingFace `model_type`. The accessor takes a loaded model and returns the list of transformer blocks. The rest of the code (`vectors.py`, `hooks.py`, `monitor.py`) doesn't depend on the architecture.
 
 If the model is quirky (multimodal text extraction, FP8 dequantization, nonstandard tokenizer behavior), please look at how Ministral-3 is handled in `saklas/core/model.py:_load_text_from_multimodal` for a worked example.
 
 ## PRs
 
-- Please keep them focused: one feature or fix per PR.
-- If you're adding an architecture, please include a note in the PR about which model you tested against and what the extraction scores looked like.
-- Please don't bump the version in your PR unless you're explicitly cutting a release; that's what triggers the PyPI publish workflow.
+- If you're adding an architecture, please include a note in the PR about which model you tested against and provide the vectors for `angry.calm`.
+- Please don't bump the version in your PR unless you want a new release; the PyPI publish workflow is triggered by a version update.
 
 ## Questions
 
-Open an issue. For anything security-sensitive, please see [SECURITY.md](SECURITY.md).
+Please reach out to me and/or open an issue. For anything security-sensitive, also see [SECURITY.md](SECURITY.md).
