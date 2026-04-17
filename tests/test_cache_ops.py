@@ -265,3 +265,94 @@ def test_list_concepts_includes_hf_rows(monkeypatch, tmp_path, capsys):
     assert "[installed]" in out
     assert "calm" in out
     assert "[hf]" in out
+
+
+# ---------------------------------------------------------------------------
+# delete_tensors --variant filter
+# ---------------------------------------------------------------------------
+
+def test_delete_tensors_variant_raw_only(tmp_path, monkeypatch):
+    """variant='raw' leaves SAE variants alone."""
+    import json
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    ns_folder = tmp_path / "vectors" / "default" / "test-concept"
+    ns_folder.mkdir(parents=True)
+    (ns_folder / "pack.json").write_text(json.dumps({
+        "name": "test-concept", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    (ns_folder / "m.safetensors").write_bytes(b"raw")
+    (ns_folder / "m.json").write_text("{}")
+    (ns_folder / "m_sae-mock.safetensors").write_bytes(b"sae")
+    (ns_folder / "m_sae-mock.json").write_text("{}")
+
+    from saklas.io import cache_ops
+    from saklas.cli.selectors import parse as sel_parse, invalidate
+    invalidate()
+
+    n = cache_ops.delete_tensors(sel_parse("test-concept"), "m", variant="raw")
+    # 2 files removed (tensor + sidecar)
+    assert n == 2
+    assert not (ns_folder / "m.safetensors").exists()
+    assert not (ns_folder / "m.json").exists()
+    assert (ns_folder / "m_sae-mock.safetensors").exists()
+    assert (ns_folder / "m_sae-mock.json").exists()
+
+
+def test_delete_tensors_variant_sae_only(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    ns_folder = tmp_path / "vectors" / "default" / "test-concept"
+    ns_folder.mkdir(parents=True)
+    (ns_folder / "pack.json").write_text(json.dumps({
+        "name": "test-concept", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    (ns_folder / "m.safetensors").write_bytes(b"raw")
+    (ns_folder / "m.json").write_text("{}")
+    (ns_folder / "m_sae-a.safetensors").write_bytes(b"sae-a")
+    (ns_folder / "m_sae-a.json").write_text("{}")
+    (ns_folder / "m_sae-b.safetensors").write_bytes(b"sae-b")
+    (ns_folder / "m_sae-b.json").write_text("{}")
+
+    from saklas.io import cache_ops
+    from saklas.cli.selectors import parse as sel_parse, invalidate
+    invalidate()
+
+    n = cache_ops.delete_tensors(sel_parse("test-concept"), "m", variant="sae")
+    # 4 files removed (2 SAE tensors + 2 sidecars)
+    assert n == 4
+    assert (ns_folder / "m.safetensors").exists()   # raw preserved
+    assert not (ns_folder / "m_sae-a.safetensors").exists()
+    assert not (ns_folder / "m_sae-b.safetensors").exists()
+
+
+def test_delete_tensors_variant_all_default(tmp_path, monkeypatch):
+    """variant='all' deletes every variant."""
+    import json
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    ns_folder = tmp_path / "vectors" / "default" / "test-concept"
+    ns_folder.mkdir(parents=True)
+    (ns_folder / "pack.json").write_text(json.dumps({
+        "name": "test-concept", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    (ns_folder / "m.safetensors").write_bytes(b"raw")
+    (ns_folder / "m.json").write_text("{}")
+    (ns_folder / "m_sae-mock.safetensors").write_bytes(b"sae")
+    (ns_folder / "m_sae-mock.json").write_text("{}")
+
+    from saklas.io import cache_ops
+    from saklas.cli.selectors import parse as sel_parse, invalidate
+    invalidate()
+
+    n = cache_ops.delete_tensors(sel_parse("test-concept"), "m", variant="all")
+    assert n == 4
+    assert not (ns_folder / "m.safetensors").exists()
+    assert not (ns_folder / "m_sae-mock.safetensors").exists()

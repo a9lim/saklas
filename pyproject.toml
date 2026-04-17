@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saklas"
-version = "1.4.2"
+version = "1.4.3"
 description = "Activation steering and trait monitoring for HuggingFace transformers — Python library, OpenAI-compatible server, and terminal UI"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -49,6 +49,7 @@ hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
 pandas = ["pandas>=3.0.2"]
 research = ["datasets>=2.0", "pandas>=3.0.2"]
+sae = ["sae-lens>=6.0,<7.0"]
 
 [project.scripts]
 saklas = "saklas.cli.main:main"

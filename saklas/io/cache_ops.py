@@ -22,18 +22,56 @@ class RefreshError(RuntimeError, SaklasError):
     pass
 
 
-def _tensor_files_for(concept: ResolvedConcept, model_scope: Optional[str]) -> list[Path]:
+def _variant_matches_key(key: str, filter_: str) -> bool:
+    if filter_ == "all":
+        return True
+    if filter_ == "raw":
+        return key == "raw"
+    if filter_ == "sae":
+        return key.startswith("sae-")
+    return False
+
+
+def _variant_key_from_filename(name: str) -> Optional[str]:
+    """Return the variant key for a tensor/sidecar filename, or None if unparseable.
+
+    ``<model>.safetensors`` → ``"raw"``; ``<model>_sae-<release>.safetensors`` →
+    ``"sae-<release>"``; sidecars mirror their tensor partners.
+    """
+    from saklas.io.paths import parse_tensor_filename
+    if name.endswith(".json"):
+        return _variant_key_from_filename(name[:-len(".json")] + ".safetensors")
+    parsed = parse_tensor_filename(name)
+    if parsed is None:
+        return None
+    _model, release = parsed
+    return "raw" if release is None else f"sae-{release}"
+
+
+def _tensor_files_for(
+    concept: ResolvedConcept,
+    model_scope: Optional[str],
+    *,
+    variant: str = "all",
+) -> list[Path]:
+    from saklas.io.packs import enumerate_variants
+
     out: list[Path] = []
     if model_scope is not None:
-        safe = safe_model_id(model_scope)
-        ts = concept.folder / f"{safe}.safetensors"
-        sc = concept.folder / f"{safe}.json"
-        if ts.exists():
-            out.append(ts)
-        if sc.exists():
-            out.append(sc)
+        variants = enumerate_variants(concept.folder, model_scope)
+        for key, tensor_path in variants.items():
+            if not _variant_matches_key(key, variant):
+                continue
+            if tensor_path.exists():
+                out.append(tensor_path)
+            sc = tensor_path.with_suffix(".json")
+            if sc.exists():
+                out.append(sc)
         return out
     for ts in sorted(concept.folder.glob("*.safetensors")):
+        key = _variant_key_from_filename(ts.name)
+        if key is None or not _variant_matches_key(key, variant):
+            continue
         out.append(ts)
         sc = ts.with_suffix(".json")
         if sc.exists():
@@ -53,12 +91,22 @@ def _update_files_map(concept_folder: Path) -> None:
     meta.write(concept_folder)
 
 
-def delete_tensors(selector: Selector, model_scope: Optional[str]) -> int:
-    """Backs `saklas clear`. Returns the number of files deleted."""
+def delete_tensors(
+    selector: Selector,
+    model_scope: Optional[str],
+    *,
+    variant: str = "all",
+) -> int:
+    """Backs `saklas clear`. Returns the number of files deleted.
+
+    ``variant`` filters by tensor flavor: ``"raw"`` only touches unsuffixed
+    tensors, ``"sae"`` only touches ``_sae-*`` variants, ``"all"`` (default)
+    touches both.
+    """
     concepts = resolve(selector)
     deleted = 0
     for c in concepts:
-        files = _tensor_files_for(c, model_scope)
+        files = _tensor_files_for(c, model_scope, variant=variant)
         for f in files:
             f.unlink()
             deleted += 1
@@ -404,6 +452,7 @@ def push(
     tag_version: bool = False,
     dry_run: bool = False,
     force: bool = False,
+    variant: str = "raw",
 ) -> tuple[str, str, Optional[str]]:
     """Back `saklas push`. Returns ``(coord, repo_url, commit_sha)``."""
     from saklas.io import hf as hf_mod
@@ -447,6 +496,7 @@ def push(
         model_scope=None if statements_only else model_scope,
         tag_version=tag_version,
         dry_run=dry_run,
+        variant=variant,
     )
     return coord, repo_url, sha
 

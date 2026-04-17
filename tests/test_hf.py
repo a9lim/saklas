@@ -414,6 +414,54 @@ def test_push_pack_model_scope_limits_tensors(tmp_path, monkeypatch):
     assert "statements.json" in files
 
 
+def test_sidecar_stem_to_hf_coord_strips_sae_suffix():
+    """Regression: ``_sidecar_stem_to_hf_coord`` must strip the
+    ``_sae-<release>`` suffix before translating ``__`` -> ``/``. A naive
+    ``replace("__", "/")`` on the SAE-variant stem produces a non-existent
+    HF repo and poisons ``base_model:`` frontmatter.
+    """
+    from saklas.io import hf as _hf
+
+    assert _hf._sidecar_stem_to_hf_coord(
+        "google__gemma-3-4b-it"
+    ) == "google/gemma-3-4b-it"
+    assert _hf._sidecar_stem_to_hf_coord(
+        "google__gemma-3-4b-it_sae-gemma-scope-2b-pt-res-canonical"
+    ) == "google/gemma-3-4b-it"
+
+
+def test_render_model_card_base_model_dedupes_sae_variants(tmp_path):
+    """A pack with both raw + SAE tensors for the same base model should
+    list that base model exactly once under ``base_model:`` — not twice,
+    and never as ``google/gemma-3-4b-it_sae-<release>`` (broken coord).
+    """
+    from saklas.io import hf as _hf
+    from saklas.io.packs import Sidecar
+
+    meta = packs.PackMetadata(
+        name="honesty", description="x", version="1.0.0", license="MIT",
+        tags=[], recommended_alpha=0.5, source="local", files={},
+    )
+    # Two sidecars keyed by the full file stem — one raw, one SAE.
+    raw_stem = "google__gemma-3-4b-it"
+    sae_stem = "google__gemma-3-4b-it_sae-gemma-scope-2b-pt-res-canonical"
+    sidecars: dict[str, Sidecar] = {
+        raw_stem: Sidecar(method="contrastive_pca", saklas_version="2.0.0"),
+        sae_stem: Sidecar(method="pca_center_sae", saklas_version="2.0.0"),
+    }
+
+    card = _hf._render_model_card(meta, sidecars, "alice/honesty")
+
+    # Base model listed exactly once.
+    assert card.count("- google/gemma-3-4b-it\n") == 1
+    # The poisoned coord must not appear anywhere.
+    assert "google/gemma-3-4b-it_sae-" not in card
+    assert "gemma-3-4b-it_sae-gemma-scope" not in card
+    # Tensors table row should also use the clean base coord.
+    assert "| `google/gemma-3-4b-it` | `contrastive_pca` |" in card
+    assert "| `google/gemma-3-4b-it` | `pca_center_sae` |" in card
+
+
 def test_resolve_target_coord_explicit():
     assert hf.resolve_target_coord("happy", "bob/happy") == "bob/happy"
 

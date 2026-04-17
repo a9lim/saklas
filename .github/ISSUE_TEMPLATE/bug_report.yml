@@ -6,7 +6,7 @@ body:
     id: what-happened
     attributes:
       label: What happened?
-      description: What did you do, what did you expect, what did you get?
+      description: What did you do, what did you expect, and what did you get?
     validations:
       required: true
 
@@ -52,7 +52,7 @@ body:
     id: repro
     attributes:
       label: Minimal reproduction
-      description: Shortest code / command that reproduces the issue
+      description: The shortest code or command that reproduces the issue
       render: python
     validations:
       required: true
