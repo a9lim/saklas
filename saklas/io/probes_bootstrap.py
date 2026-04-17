@@ -113,7 +113,7 @@ def bootstrap_probes(
                         current = hash_file(stmts)
                         if current != recorded_sha:
                             log.warning(
-                                "%s: statements changed since extraction; consider -r default/%s",
+                                "%s: statements changed since extraction; consider `saklas pack refresh default/%s`",
                                 probe_name, probe_name,
                             )
                     sidecar_version = meta.get("saklas_version", "")

@@ -58,6 +58,10 @@ class TokenEvent:
     logprob: float | None = None
     top_logprobs: list[tuple[int, float]] | None = None
     finish_reason: str | None = None
+    # Per-probe cosine similarities computed inline against the latest
+    # captured hidden state. Populated by ``generate_stream`` only when
+    # the session has active probes; otherwise None.
+    scores: dict[str, float] | None = None
 
 
 class ResultCollector:

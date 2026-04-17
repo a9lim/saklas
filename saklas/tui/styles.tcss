@@ -154,15 +154,19 @@ Widget {
 /* Thinking block (Qwen 3.5, QwQ, etc.) */
 #thinking-block {
     height: auto;
-    margin: 0 0 1 0;
+    margin: 0;
     padding: 0;
     background: ansi_default;
-    border-top: none;
-    border-bottom: none;
+    border: none;
+}
+
+#thinking-block.-collapsed {
+    height: 1;
 }
 
 #thinking-block > Contents {
     background: ansi_default;
+    padding: 0;
 }
 
 #thinking-view {
@@ -183,6 +187,19 @@ Widget {
 #trait-scroll {
     height: 1fr;
     overflow-y: auto;
+}
+
+#why-header {
+    height: 1;
+}
+
+#why-scroll {
+    height: 16;
+    overflow-y: auto;
+}
+
+#why-content {
+    height: auto;
 }
 
 .trait-category {

@@ -58,6 +58,14 @@ class TraitMonitor:
         self._pending_aggregate = False
         self._pending_per_token = False
 
+        # Live running mean during streaming generation. ``update_live`` is
+        # called by ``generate_stream`` per emitted token; ``begin_live``
+        # resets the accumulator at gen start; ``end_live`` clears so
+        # post-gen reads fall back to the canonical history aggregate.
+        self._live_values: dict[str, float] = {}
+        self._live_count: int = 0
+        self._live_pending: bool = False
+
     @property
     def probe_names(self) -> list[str]:
         """Probe names in insertion order."""
@@ -199,6 +207,16 @@ class TraitMonitor:
                 s["max"] = val
         self._pending_aggregate = True
 
+    def score_single_token(self, hidden_per_layer: dict[int, torch.Tensor]) -> dict[str, float]:
+        """Score all probes against a single token's hidden states.
+
+        Like :meth:`measure_from_hidden` but does NOT accumulate into
+        history/stats.  Designed for inline per-token scoring during live
+        SSE streaming where accumulation would corrupt the session-level
+        probe accumulators.
+        """
+        return self._score_probes(hidden_per_layer, accumulate=False)
+
     def measure(self, model, tokenizer, layers, text: str, device=None, accumulate: bool = True) -> dict[str, float]:
         """Run one forward pass over *text* and compute probe similarities.
 
@@ -269,8 +287,15 @@ class TraitMonitor:
         num = torch.zeros((n, n_probes), device=device, dtype=torch.float32)
         den = torch.zeros((n_probes,), device=device, dtype=torch.float32)
         for layer_idx, h in captured.items():
-            if h.shape[0] != n:
+            # Captures may overshoot generated_ids by one when generation
+            # terminates on an EOS token: the model forward fires (capture
+            # +1) and then the loop breaks without appending the EOS to
+            # generated_ids. Trim trailing extras to align capture[i] with
+            # generated_ids[i]. Skip if we somehow have fewer than n.
+            if h.shape[0] < n:
                 continue
+            if h.shape[0] > n:
+                h = h[:n]
             entry = self._layer_cache.get(layer_idx)
             if entry is None:
                 continue
@@ -293,7 +318,7 @@ class TraitMonitor:
 
     def has_pending_data(self) -> bool:
         """True iff an aggregate measurement is waiting to be consumed."""
-        return self._pending_aggregate
+        return self._pending_aggregate or self._live_pending
 
     def has_pending_per_token(self) -> bool:
         return self._pending_per_token
@@ -301,16 +326,43 @@ class TraitMonitor:
     def consume_pending(self) -> None:
         """Mark aggregate pending data as consumed (called by TUI after reading)."""
         self._pending_aggregate = False
+        self._live_pending = False
 
     def consume_pending_per_token(self) -> None:
         self._pending_per_token = False
+
+    def begin_live(self) -> None:
+        """Reset the live running-mean accumulator at the start of a gen."""
+        self._live_values = {}
+        self._live_count = 0
+        self._live_pending = False
+
+    def update_live(self, scores: dict[str, float]) -> None:
+        """Fold one token's per-probe scores into the running mean."""
+        self._live_count += 1
+        c = self._live_count
+        for name, v in scores.items():
+            prev = self._live_values.get(name, 0.0)
+            self._live_values[name] = prev + (v - prev) / c
+        self._live_pending = True
+
+    def end_live(self) -> None:
+        """Drop the live running mean so reads fall back to history."""
+        self._live_values = {}
+        self._live_count = 0
+        self._live_pending = False
 
     def get_current_and_previous(self) -> tuple[dict[str, float], dict[str, float]]:
         current = {}
         previous = {}
         for name in self._raw_profiles:
             hist = self.history[name]
-            if len(hist) >= 2:
+            if name in self._live_values:
+                # Mid-gen: live running mean wins; previous = last canonical
+                # aggregate from history (or live itself if no history).
+                current[name] = self._live_values[name]
+                previous[name] = hist[-1] if hist else self._live_values[name]
+            elif len(hist) >= 2:
                 current[name] = hist[-1]
                 previous[name] = hist[-2]
             elif hist:

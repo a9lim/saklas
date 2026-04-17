@@ -175,12 +175,15 @@ Three panels: **vector registry** on the left (live alpha knobs), **chat** in th
 | Command | Description |
 |---|---|
 | `/steer <name> [alpha]` | Extract and register a steering vector |
+| `/steer <pos> . <neg> [alpha]` | Same, bipolar form (period delimiter) |
 | `/alpha <name> <val>` | Adjust an already-registered vector's alpha |
 | `/unsteer <name>` | Remove a registered vector |
 | `/probe <name>` | Add a monitoring probe (seeds per-token highlight) |
+| `/probe <pos> . <neg>` | Same, bipolar form |
 | `/unprobe <name>` | Remove a monitoring probe |
 | `/compare <a> [b]` | Cosine similarity (1-arg: ranked vs all; 2-arg: pairwise) |
 | `/extract <name>` | Extract to disk without wiring |
+| `/extract <pos> . <neg>` | Same, bipolar form |
 | `/regen` | Regenerate the last assistant turn |
 | `/clear` | Clear conversation history |
 | `/rewind` | Undo last exchange |
@@ -190,8 +193,22 @@ Three panels: **vector registry** on the left (live alpha knobs), **chat** in th
 | `/save <name>` / `/load <name>` | Snapshot/restore conversation + alphas |
 | `/export <path>` | JSONL with per-token probe readings |
 | `/model` | Model + device + active state |
-| `/why` | Top layers + tokens for selected probe |
 | `/help` | List commands and keybindings |
+
+A **WHY footer** at the bottom of the trait panel shows the top-5 layers
+(by `||baked||`) and live top/bottom emitted tokens (by signed score) for
+the trait-panel-selected probe — driven by selection, no command needed.
+
+The **chat status footer** shows generation progress (token bar against
+`max_tokens`), live tok/s, elapsed, VRAM, and a **context bar** (prompt
++ emitted tokens against the model's context window, cyan/yellow/red
+as it approaches full). All bars in the UI share one width via
+`saklas.tui.utils.BAR_WIDTH`.
+
+**Bipolar poles don't need quotes**: `/steer a dog . a pair of cats 0.4`
+parses as `pos="a dog", neg="a pair of cats", alpha=0.4`. Whitespace
+around the period is what splits — so `dog.cat` stays a single
+canonical name (the bundled-pack form).
 
 ---
 
@@ -334,7 +351,7 @@ curl -N http://localhost:8000/api/chat -d '{
 
 ### Saklas-native routes
 
-`/saklas/v1/*` resource tree with sessions, vector/probe management, one-shot probe scoring, and a bidirectional WebSocket for token+probe co-streaming. Full interactive docs at `http://localhost:8000/docs`.
+`/saklas/v1/*` resource tree with sessions, vector/probe management, one-shot probe scoring, a bidirectional WebSocket for token+probe co-streaming, and a **live traits SSE endpoint** (`GET /saklas/v1/sessions/{id}/traits/stream`) that streams per-token probe scores in real time during any active generation. Full interactive docs at `http://localhost:8000/docs`.
 
 ### Flags
 
@@ -377,7 +394,10 @@ saklas vector extract <concept> | <pos> <neg> [-m MODEL] [-f]
 saklas vector merge <name> <components> [-m] [-f] [-s]
 saklas vector clone <corpus-file> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
 saklas vector compare <concepts...> -m MODEL [-v] [-j]
+saklas vector why <concept> -m MODEL [-n N] [--all] [-j]
 ```
+
+**Merge projection**: `a~b:0.5` removes b's direction from a before scaling — e.g. `saklas vector merge dehallu default/creative.conventional~default/hallucinating.grounded:0.8` gives you creative writing without the hallucination axis.
 
 **Selectors**: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve cross-namespace and error on ambiguity.
 

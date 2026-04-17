@@ -236,6 +236,12 @@ class SaklasSession:
         self._last_result: GenerationResult | None = None
         self._last_per_token_scores: dict[str, list[float]] | None = None
 
+        # Live trait SSE subscribers.  Each entry is (event_loop, asyncio.Queue).
+        # The generation thread pushes tagged tuples via loop.call_soon_threadsafe;
+        # SSE handlers drain the queue asynchronously.
+        self._trait_queues: list[tuple] = []
+        self._trait_lock = threading.Lock()
+
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
 
@@ -289,6 +295,25 @@ class SaklasSession:
     @property
     def last_per_token_scores(self) -> dict[str, list[float]] | None:
         return self._last_per_token_scores
+
+    # -- Live trait SSE subscribers --
+
+    @property
+    def _trait_subscribers(self) -> int:
+        return len(self._trait_queues)
+
+    def register_trait_queue(self, loop, q) -> None:
+        """Register an ``(event_loop, asyncio.Queue)`` pair for live trait events."""
+        with self._trait_lock:
+            self._trait_queues.append((loop, q))
+
+    def unregister_trait_queue(self, loop, q) -> None:
+        """Remove a previously registered trait queue."""
+        with self._trait_lock:
+            try:
+                self._trait_queues.remove((loop, q))
+            except ValueError:
+                pass
 
     # -- Extraction --
 
@@ -352,9 +377,11 @@ class SaklasSession:
         input_ids = build_chat_input(
             self._tokenizer, messages, system_prompt=None,
         ).to(self._device)
+        attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
             out = self._model.generate(
                 input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True, temperature=1.0, top_p=0.9,
                 pad_token_id=pad_id,
@@ -1371,12 +1398,30 @@ class SaklasSession:
         frequency_penalty = sampling.frequency_penalty if sampling is not None else 0.0
 
         logprobs_list: list | None = [] if lp_count is not None else None
+        trait_token_counter = [0]
 
         def _token_tap(text, is_thinking, tid, lp, top_lp):
             if logprobs_list is not None and tid >= 0 and not is_thinking:
                 logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
             if on_token is not None:
                 on_token(text, is_thinking, tid, lp, top_lp)
+            # Inline per-token scoring for live SSE trait subscribers.
+            if self._trait_queues and self._monitor.probe_names:
+                latest_hidden = {
+                    layer_idx: bucket[-1]
+                    for layer_idx, bucket in self._capture._per_layer.items()
+                    if bucket
+                }
+                if latest_hidden:
+                    scores = self._monitor.score_single_token(latest_hidden)
+                    event = ("token", trait_token_counter[0], text, is_thinking, scores)
+                    trait_token_counter[0] += 1
+                    with self._trait_lock:
+                        for lp_ref, q in list(self._trait_queues):
+                            try:
+                                lp_ref.call_soon_threadsafe(q.put_nowait, event)
+                            except Exception:
+                                pass
 
         steering_cm = None
         if steering_obj is not None and steering_obj.alphas:
@@ -1398,6 +1443,7 @@ class SaklasSession:
 
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             self._begin_capture()
+            self._monitor.begin_live()
             try:
                 start = time.monotonic()
                 generated_ids = generate_steered(
@@ -1422,6 +1468,7 @@ class SaklasSession:
                 prompt_tokens=prompt_tokens, stateless=stateless,
                 logprobs_list=logprobs_list,
             )
+            self._monitor.end_live()
             self.events.emit(GenerationFinished(result=result))
             return result
         except BaseException:
@@ -1434,6 +1481,7 @@ class SaklasSession:
                     pass
             raise
         finally:
+            self._monitor.end_live()
             self._gen_active = False
             self._gen_lock.release()
 
@@ -1505,9 +1553,20 @@ class SaklasSession:
         idx_counter = [0]
 
         def _push(text, is_thinking, tid, lp, tlp):
+            scores: dict[str, float] | None = None
+            if self._monitor.probe_names:
+                latest_hidden = {
+                    layer_idx: bucket[-1]
+                    for layer_idx, bucket in self._capture._per_layer.items()
+                    if bucket
+                }
+                if latest_hidden:
+                    scores = self._monitor.score_single_token(latest_hidden)
+                    self._monitor.update_live(scores)
             event = TokenEvent(
                 text=text, token_id=tid, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_logprobs=tlp,
+                scores=scores,
             )
             idx_counter[0] += 1
             q.put(event)

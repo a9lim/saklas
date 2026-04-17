@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -29,20 +30,79 @@ class MergeError(ValueError, SaklasError):
     pass
 
 
-def parse_components(raw: str) -> list[tuple[str, float]]:
-    """Parse 'ns/name:alpha,ns/name:alpha' into a list of (coord, alpha)."""
+@dataclass(frozen=True)
+class ComponentSpec:
+    """Parsed component: a coordinate, optional projection-removal target, and alpha."""
+    coord: str
+    project_away: str | None
+    alpha: float
+
+
+def parse_components(raw: str) -> list[ComponentSpec]:
+    """Parse component grammar into a list of ComponentSpec.
+
+    Grammar::
+
+        component  = coord ":" alpha
+                   | coord "~" coord ":" alpha
+        components = component ("," component)*
+
+    ``a~b:0.5`` means: project b's direction out of a, then scale by 0.5.
+    Chained ``~`` (``a~b~c``) is rejected as a parse error.
+    """
     parts = [p.strip() for p in raw.split(",") if p.strip()]
-    out: list[tuple[str, float]] = []
+    out: list[ComponentSpec] = []
     for part in parts:
         if ":" not in part:
             raise MergeError(f"component '{part}' missing :alpha")
-        coord, alpha_s = part.rsplit(":", 1)
+        coord_part, alpha_s = part.rsplit(":", 1)
+        coord_part = coord_part.strip()
         try:
-            out.append((coord.strip(), float(alpha_s)))
+            alpha = float(alpha_s)
         except ValueError as e:
             raise MergeError(f"component '{part}' alpha not a number: {e}") from e
-    if len(out) < 2:
-        raise MergeError("merge requires at least two components")
+        # Handle projection operator ~
+        if "~" in coord_part:
+            tilde_parts = coord_part.split("~")
+            if len(tilde_parts) != 2:
+                raise MergeError(
+                    f"component '{part}': chained '~' is not allowed; "
+                    f"use 'a~b:alpha' only"
+                )
+            coord, project_away = tilde_parts[0].strip(), tilde_parts[1].strip()
+        else:
+            coord = coord_part
+            project_away = None
+        out.append(ComponentSpec(coord=coord, project_away=project_away, alpha=alpha))
+    if len(out) < 1:
+        raise MergeError("merge requires at least one component")
+    return out
+
+
+def project_away(a: Profile, b: Profile) -> Profile:
+    """Return a new profile with b's direction projected out of a, per layer.
+
+    Per-layer math (fp32)::
+
+        result_L = a_L - (dot(a_L, b_L) / dot(b_L, b_L)) * b_L
+
+    Layers where ``dot(b_L, b_L) < 1e-12`` are copied unchanged (near-zero b
+    direction — no meaningful projection axis).  Only layers present in both
+    profiles are projected; layers in a but not b are included unchanged.
+    """
+    out: Profile = {}
+    for layer, a_t in a.items():
+        if layer not in b:
+            out[layer] = a_t
+            continue
+        a_f = a_t.to(dtype=torch.float32)
+        b_f = b[layer].to(dtype=torch.float32)
+        b_dot = torch.dot(b_f, b_f).item()
+        if b_dot < 1e-12:
+            out[layer] = a_t
+        else:
+            proj = (torch.dot(a_f, b_f) / b_dot) * b_f
+            out[layer] = (a_f - proj).to(dtype=a_t.dtype)
     return out
 
 
@@ -63,8 +123,8 @@ def linear_sum(
     ``strict`` is True, any non-common layers raise MergeError instead
     of being silently dropped.
     """
-    if len(components) < 2:
-        raise MergeError("linear_sum requires at least two components")
+    if len(components) < 1:
+        raise MergeError("linear_sum requires at least one component")
     layer_sets = [set(p.keys()) for p, _ in components]
     common = set.intersection(*layer_sets)
     if not common:
@@ -103,23 +163,29 @@ def _resolve_coord(coord: str) -> ConceptFolder:
     return ConceptFolder.load(folder)
 
 
-def shared_models(components: list[tuple[str, float]]) -> list[str]:
+def shared_models(components: list[ComponentSpec]) -> list[str]:
     """Return models for which every component has a tensor, sorted."""
     per: list[set[str]] = []
-    for coord, _alpha in components:
-        cf = _resolve_coord(coord)
+    for comp in components:
+        cf = _resolve_coord(comp.coord)
         per.append(set(cf.tensor_models()))
+        # If a projection target is given, it also needs tensors for the same models.
+        if comp.project_away is not None:
+            cf_b = _resolve_coord(comp.project_away)
+            per.append(set(cf_b.tensor_models()))
     if not per:
         raise MergeError("no components provided")
     shared = set.intersection(*per)
     if not shared:
-        raise MergeError(f"no shared models across {[c for c, _ in components]}")
+        raise MergeError(
+            f"no shared models across {[c.coord for c in components]}"
+        )
     return sorted(shared)
 
 
 def merge_into_pack(
     name: str,
-    components: list[tuple[str, float]],
+    components: list[ComponentSpec],
     model: Optional[str],
     *,
     force: bool = False,
@@ -135,10 +201,12 @@ def merge_into_pack(
 
     if model is not None:
         target_models = [safe_model_id(model)]
-        for coord, _alpha in components:
-            cf = _resolve_coord(coord)
+        for comp in components:
+            cf = _resolve_coord(comp.coord)
             if safe_model_id(model) not in cf.tensor_models():
-                raise MergeError(f"component {coord} has no tensor for {model}")
+                raise MergeError(
+                    f"component {comp.coord} has no tensor for {model}"
+                )
     else:
         target_models = shared_models(components)
 
@@ -147,12 +215,17 @@ def merge_into_pack(
 
     for sid in target_models:
         profiles_and_alphas: list[tuple[Profile, float]] = []
-        for coord, alpha in components:
-            cf = _resolve_coord(coord)
+        for comp in components:
+            cf = _resolve_coord(comp.coord)
             profile, _meta = load_profile(str(cf.tensor_path(sid)))
-            profiles_and_alphas.append((profile, alpha))
-            component_info.setdefault(coord, {
-                "alpha": alpha,
+            if comp.project_away is not None:
+                cf_b = _resolve_coord(comp.project_away)
+                b_profile, _ = load_profile(str(cf_b.tensor_path(sid)))
+                profile = project_away(profile, b_profile)
+            profiles_and_alphas.append((profile, comp.alpha))
+            component_info.setdefault(comp.coord, {
+                "alpha": comp.alpha,
+                "project_away": comp.project_away,
                 "tensor_sha256": hash_file(cf.tensor_path(sid)),
             })
 
@@ -165,7 +238,13 @@ def merge_into_pack(
         files_map[f"{sid}.safetensors"] = hash_file(ts_path)
         files_map[f"{sid}.json"] = hash_file(ts_path.with_suffix(".json"))
 
-    desc = " + ".join(f"{c.split('/')[-1]} ({a})" for c, a in components)
+    def _comp_desc(comp: ComponentSpec) -> str:
+        base = comp.coord.split("/")[-1]
+        if comp.project_away is not None:
+            return f"{base}~{comp.project_away.split('/')[-1]} ({comp.alpha})"
+        return f"{base} ({comp.alpha})"
+
+    desc = " + ".join(_comp_desc(c) for c in components)
     meta = PackMetadata(
         name=name,
         description=f"Merged pack: {desc}",
