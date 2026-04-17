@@ -264,3 +264,159 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
     # Simpler check: layer 0 has much stronger signal → its share (and thus
     # its baked magnitude, at comparable ref_norms) should dominate.
     assert mag_0 > mag_1
+
+
+def test_sae_lens_backend_encodes_and_decodes(monkeypatch):
+    """SaeLensBackend wraps per-layer SAE modules and dispatches by layer index."""
+    import torch
+    import sys
+    import types
+
+    fake_sae_lens = types.ModuleType("sae_lens")
+
+    class FakeSAE:
+        def __init__(self, d_in, d_sae, hook_layer):
+            self.cfg = types.SimpleNamespace(
+                d_in=d_in, d_sae=d_sae, model_name="test-model", hook_layer=hook_layer,
+            )
+            self.W_enc = torch.eye(d_in)[:, :d_sae] if d_in >= d_sae else torch.zeros(d_in, d_sae)
+            self.W_dec = self.W_enc.T
+            self.b_enc = torch.zeros(d_sae)
+
+        def encode(self, x):
+            return x @ self.W_enc + self.b_enc
+
+        def decode(self, f):
+            return f @ self.W_dec
+
+        @classmethod
+        def from_pretrained(cls, release, sae_id, device=None):
+            hook_layer = int(sae_id.split("_")[1])
+            return (
+                cls(d_in=4, d_sae=4, hook_layer=hook_layer),
+                {"d_in": 4, "d_sae": 4, "hook_layer": hook_layer},
+                None,
+            )
+
+    fake_sae_lens.SAE = FakeSAE
+    fake_sae_lens.get_pretrained_saes_directory = lambda: {
+        "mock-canonical": {
+            "saes_map": {f"layer_{i}": i for i in (2, 5, 8)},
+            "model": "test-model",
+        }
+    }
+    monkeypatch.setitem(sys.modules, "sae_lens", fake_sae_lens)
+
+    from saklas.core.sae import load_sae_backend
+    backend = load_sae_backend("mock-canonical", model_id="test-model", device="cpu")
+    assert backend.layers == frozenset({2, 5, 8})
+    assert backend.release == "mock-canonical"
+
+    h = torch.randn(3, 4)
+    f = backend.encode_layer(5, h)
+    assert f.shape == (3, 4)
+    v = backend.decode_layer(5, torch.randn(4))
+    assert v.shape == (4,)
+
+
+def test_sae_lens_backend_missing_dep_raises(monkeypatch):
+    """When sae_lens isn't installed, load_sae_backend raises SaeBackendImportError."""
+    import sys
+    monkeypatch.setitem(sys.modules, "sae_lens", None)
+    from saklas.core.sae import load_sae_backend
+    from saklas.core.errors import SaeBackendImportError
+    with pytest.raises(SaeBackendImportError):
+        load_sae_backend("any", model_id="m", device="cpu")
+
+
+def test_sae_lens_backend_release_not_found(monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("sae_lens")
+    fake.get_pretrained_saes_directory = lambda: {
+        "mock-a": {"saes_map": {}, "model": "m"},
+        "mock-b": {"saes_map": {}, "model": "m"},
+    }
+    fake.SAE = object
+    monkeypatch.setitem(sys.modules, "sae_lens", fake)
+
+    from saklas.core.sae import load_sae_backend
+    from saklas.core.errors import SaeReleaseNotFoundError
+    with pytest.raises(SaeReleaseNotFoundError) as exc:
+        load_sae_backend("nonexistent", model_id="m", device="cpu")
+    msg = str(exc.value)
+    # Message should list near matches so user knows what's available.
+    assert "mock-a" in msg or "mock-b" in msg
+
+
+def test_sae_lens_backend_model_mismatch(monkeypatch):
+    import sys
+    import types
+    import torch
+
+    fake = types.ModuleType("sae_lens")
+
+    class FakeSAE:
+        def __init__(self):
+            self.cfg = types.SimpleNamespace(model_name="other-model", hook_layer=0)
+
+        @classmethod
+        def from_pretrained(cls, release, sae_id, device=None):
+            return cls(), {"hook_layer": 0}, None
+
+    fake.SAE = FakeSAE
+    fake.get_pretrained_saes_directory = lambda: {
+        "mock": {"saes_map": {"layer_0": 0}, "model": "other-model"},
+    }
+    monkeypatch.setitem(sys.modules, "sae_lens", fake)
+
+    from saklas.core.sae import load_sae_backend
+    from saklas.core.errors import SaeModelMismatchError
+    with pytest.raises(SaeModelMismatchError):
+        load_sae_backend("mock", model_id="my-model", device="cpu")
+
+
+def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, recwarn):
+    """When a release has multiple SAEs per layer, pick narrowest + warn."""
+    import sys
+    import types
+    import torch
+
+    fake = types.ModuleType("sae_lens")
+
+    class FakeSAE:
+        def __init__(self):
+            self.cfg = types.SimpleNamespace(model_name="test-model", hook_layer=0)
+
+        @classmethod
+        def from_pretrained(cls, release, sae_id, device=None):
+            # Parse `layer_N` prefix out of canonical sae_id strings like
+            # `layer_0/width_16k/l0_100`.
+            import re
+            m = re.search(r"layer[_-]?(\d+)", sae_id)
+            layer = int(m.group(1)) if m else 0
+            sae = cls()
+            sae.cfg.hook_layer = layer
+            return sae, {"hook_layer": layer}, None
+
+    fake.SAE = FakeSAE
+    fake.get_pretrained_saes_directory = lambda: {
+        "mock": {
+            "saes_map": {
+                "layer_0/width_16k/l0_100": 0,
+                "layer_0/width_65k/l0_500": 0,
+                "layer_2/width_16k/l0_100": 2,
+            },
+            "model": "test-model",
+        },
+    }
+    monkeypatch.setitem(sys.modules, "sae_lens", fake)
+
+    from saklas.core.sae import load_sae_backend
+    backend = load_sae_backend("mock", model_id="test-model", device="cpu")
+    # Warning emitted because layer 0 has two candidates.
+    warnings_about_multiple = [w for w in recwarn.list if "multiple SAEs" in str(w.message)]
+    assert len(warnings_about_multiple) >= 1
+    # Layers 0 and 2 are both represented.
+    assert backend.layers == frozenset({0, 2})
