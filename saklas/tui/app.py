@@ -61,6 +61,53 @@ def _split_bipolar(text: str) -> tuple[str, str | None]:
     return _unquote(text.strip()), None
 
 
+def _parse_steer_command(arg: str) -> dict:
+    """Parse a /steer argument string.
+
+    Recognizes:
+      --sae <concept> [alpha]                  (picks the unique SAE variant)
+      --sae <pos> . <neg> [alpha]
+      <concept> [alpha]
+      <pos> . <neg> [alpha]
+
+    For an explicit release, use the ``:sae-<release>`` suffix in the
+    concept name itself (e.g. ``/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3``).
+    The positional ``--sae RELEASE concept`` form was removed because the
+    release-detection heuristic misfired on hyphenated concepts like
+    ``high-context`` — explicit selector grammar wins over fuzzy parsing.
+
+    Returns a dict with concept, baseline (None or str), alpha (None or float),
+    variant ("raw" / "sae").
+    """
+    tokens = arg.split()
+    variant = "raw"
+    if tokens and tokens[0] == "--sae":
+        variant = "sae"
+        tokens = tokens[1:]
+
+    if not tokens:
+        raise ValueError("no concept")
+
+    result: dict = {"variant": variant, "baseline": None, "alpha": None}
+
+    # Bipolar: <pos> . <neg>
+    if len(tokens) >= 3 and tokens[1] == ".":
+        result["concept"] = tokens[0]
+        result["baseline"] = tokens[2]
+        rest = tokens[3:]
+    else:
+        result["concept"] = tokens[0]
+        rest = tokens[1:]
+
+    if rest:
+        try:
+            result["alpha"] = float(rest[0])
+        except ValueError:
+            result["alpha"] = None
+
+    return result
+
+
 def _resolve_active_name(name: str, active) -> list[str]:
     """Resolve a user-typed name against a set of currently-active names.
 
@@ -508,7 +555,8 @@ class SaklasApp(App):
         return concept, baseline
 
     def _handle_extract(self, text: str, include_alpha: bool, on_success,
-                        pending_type: str | None = None) -> None:
+                        pending_type: str | None = None,
+                        variant: str = "raw") -> None:
         chat = self._chat_panel
         if self._ab_in_progress:
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
@@ -536,46 +584,108 @@ class SaklasApp(App):
         # bipolar pack (e.g. `/steer wolf` when `deer.wolf` exists).
         # Sign flip is applied to the user's alpha so `/steer calm 0.5`
         # on top of `angry.calm` lands as `alphas["angry.calm"] = -0.5`.
+        # ``resolve_pole`` also peels any ``:variant`` suffix typed
+        # directly on the concept (``honest:sae-gemma-scope...``) — that
+        # explicit form wins over the ``variant`` kwarg when both are set.
         # Explicit bipolar form (`concept - baseline`) skips resolution
         # so the user's declared poles always win.
         sign = 1
         if baseline is None:
             try:
-                resolved_name, sign, _match = resolve_pole(concept)
+                resolved_name, sign, _match, explicit_variant = resolve_pole(concept)
                 if resolved_name != concept:
                     chat.add_system_message(
                         f"  Resolved '{concept}' → '{resolved_name}'"
                         + (" (negated)" if sign < 0 else "")
                     )
                 concept = resolved_name
+                # Explicit ``:sae-<release>`` on the concept overrides the
+                # ``--sae`` preamble's variant. Lets users route a specific
+                # release without the fuzzy release-detection heuristic.
+                if explicit_variant != "raw":
+                    variant = explicit_variant
             except AmbiguousSelectorError as e:
                 chat.add_system_message(f"Error: {e}")
                 return
             if alpha is not None:
                 alpha *= sign
 
+        # Variant routing. ``--sae`` alone (variant == "sae") means "pick the
+        # unique already-extracted SAE tensor for this concept on disk" —
+        # session autoload handles it. To drive a fresh extraction, users
+        # pass the explicit ``:sae-<release>`` suffix, which routes the
+        # release through ``session.extract(sae=RELEASE)``.
+        sae_release: str | None = None
+        if variant.startswith("sae-"):
+            sae_release = variant[len("sae-"):]
+
         display = concept if len(concept) <= 20 else concept[:17] + "..."
         suffix = f" vs '{baseline}'" if baseline else ""
-        chat.add_system_message(f"Extracting '{display}'{suffix}...")
+        variant_note = f" [{variant}]" if variant != "raw" else ""
+        chat.add_system_message(f"Extracting '{display}'{suffix}{variant_note}...")
 
         def _worker():
             def _progress(msg):
                 self.call_from_thread(self._steer_status, msg)
             try:
-                canonical, profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
+                # Bare ``--sae`` (variant == "sae") routes the load through
+                # session autoload rather than a fresh PCA extract — it
+                # means "use the unique SAE variant that's already on disk".
+                # Ambiguous / missing cases surface via the session errors.
+                if variant == "sae" and sae_release is None:
+                    self._session._try_autoload_vector(concept, variant="sae")
+                    key = f"{concept}:sae"
+                    profile_dict = self._session._profiles.get(key)
+                    if profile_dict is None:
+                        raise ValueError(
+                            f"no SAE variant loaded for '{concept}' — "
+                            f"run `saklas vector extract {concept} --sae <RELEASE>` "
+                            f"first, or pick a release with "
+                            f"`:sae-<release>` in the concept name."
+                        )
+                    on_success(key, profile_dict, alpha)
+                    return
+
+                extract_kwargs = {"baseline": baseline, "on_progress": _progress}
+                if sae_release is not None:
+                    extract_kwargs["sae"] = sae_release
+                # ``session.extract`` already returns the fully-qualified
+                # canonical name — including the ``:sae-<release>`` suffix
+                # when ``sae=`` was passed. Rebuilding it here would
+                # double-suffix the key and break every downstream
+                # ``/alpha`` / ``/unsteer`` / pole lookup.
+                canonical, profile = self._session.extract(concept, **extract_kwargs)
                 on_success(canonical, profile, alpha)
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
+            except Exception as e:
+                # AmbiguousVariantError / UnknownVariantError are KeyError/ValueError
+                # subclasses — either branch lands here. Surface cleanly.
+                self.call_from_thread(self._steer_status, f"{type(e).__name__}: {e}")
 
         self.run_worker(_worker, thread=True)
 
     def _handle_steer(self, text: str) -> None:
+        # Peel the ``--sae`` preamble off the front before delegating to
+        # the shared extract pipeline. ``--sae`` alone flips variant to
+        # ``"sae"`` — meaning "pick the unique already-extracted SAE
+        # variant on disk". For a specific release, users embed the
+        # ``:sae-<release>`` suffix directly in the concept name; that
+        # routes through ``resolve_pole`` in ``_handle_extract``.
+        variant = "raw"
+        stripped = text.lstrip()
+        if stripped.startswith("--sae"):
+            variant = "sae"
+            text = stripped[len("--sae"):].lstrip()
+
         def _on_success(name, profile, alpha):
             self._session.steer(name, profile)
             self._alphas[name] = alpha
             self._enabled[name] = True
             self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
-        self._handle_extract(text, include_alpha=True, on_success=_on_success)
+        self._handle_extract(
+            text, include_alpha=True, on_success=_on_success, variant=variant,
+        )
 
     def _handle_probe(self, text: str) -> None:
         def _on_success(name, profile, _alpha):

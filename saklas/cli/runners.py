@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -106,7 +107,7 @@ def _setup_steering_vectors(
     default_alphas: dict[str, float] = {}
     for raw_name, ns, display, alpha in items:
         try:
-            canonical, sign, _match = resolve_pole(raw_name, namespace=ns)
+            canonical, sign, _match, _variant = resolve_pole(raw_name, namespace=ns)
         except AmbiguousSelectorError as e:
             if verbose:
                 print(f"  Failed to resolve '{raw_name}': {e}", file=sys.stderr)
@@ -286,7 +287,7 @@ def _run_clear(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    n = cache_ops.delete_tensors(selector, args.model)
+    n = cache_ops.delete_tensors(selector, args.model, variant=args.variant)
     print(f"Deleted {n} files")
 
 
@@ -367,6 +368,7 @@ def _run_push(args: argparse.Namespace) -> None:
             tag_version=args.tag_version,
             dry_run=args.dry_run,
             force=args.force,
+            variant=args.variant,
         )
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
@@ -446,13 +448,14 @@ def _run_extract(args: argparse.Namespace) -> None:
     canonical = canonical_concept_name(raw, baseline)
 
     import pathlib
-    from saklas.io.paths import safe_model_id
+    from saklas.io.paths import tensor_filename
     from saklas.cli.selectors import _all_concepts
     candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
     candidate_folders.append(session._local_concept_folder(canonical))
-    sid = safe_model_id(session.model_id)
+    requested_release = getattr(args, "sae", None)
+    candidate_tensor_name = tensor_filename(session.model_id, release=requested_release)
     candidate_paths = [
-        pathlib.Path(folder) / f"{sid}.safetensors" for folder in candidate_folders
+        pathlib.Path(folder) / candidate_tensor_name for folder in candidate_folders
     ]
     existing = next((p for p in candidate_paths if p.exists()), None)
 
@@ -465,19 +468,33 @@ def _run_extract(args: argparse.Namespace) -> None:
             if p.exists():
                 p.unlink()
 
+    extract_kwargs = {}
+    if getattr(args, "sae", None):
+        extract_kwargs["sae"] = args.sae
+    if getattr(args, "sae_revision", None):
+        extract_kwargs["sae_revision"] = args.sae_revision
+
     try:
         if baseline is not None:
-            canonical, _profile = session.extract(raw, baseline=baseline)
+            canonical, _profile = session.extract(raw, baseline=baseline, **extract_kwargs)
         else:
-            canonical, _profile = session.extract(raw)
+            canonical, _profile = session.extract(raw, **extract_kwargs)
     except Exception as e:
         print(f"extract failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    final_path = next((p for p in candidate_paths if p.exists()), None)
+    # `canonical` may be "name:sae-<release>" — peel it for filename construction.
+    if ":sae-" in canonical:
+        core_name, _, rel = canonical.partition(":sae-")
+        tensor_name = tensor_filename(session.model_id, release=rel)
+    else:
+        core_name = canonical
+        tensor_name = tensor_filename(session.model_id, release=None)
+    final_paths = [pathlib.Path(f) / tensor_name for f in candidate_folders]
+    final_path = next((p for p in final_paths if p.exists()), None)
     if final_path is None:
         final_path = (
-            pathlib.Path(session._local_concept_folder(canonical)) / f"{sid}.safetensors"
+            pathlib.Path(session._local_concept_folder(core_name)) / tensor_name
         )
     print(f"extracted {canonical} -> {final_path}")
 
@@ -566,49 +583,131 @@ def _run_config_validate(args: argparse.Namespace) -> None:
     print(f"{p}: ok")
 
 
+_VARIANT_SUFFIX_RE = re.compile(r"^(raw|sae(?:-[a-z0-9._-]+)?)$")
+
+
+def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
+    """Peel a trailing ``:<variant>`` off a selector string.
+
+    Returns ``(name_part, variant_or_None)``. ``variant`` is ``"raw"``,
+    ``"sae"``, or ``"sae-<release>"``. Non-variant colon usage
+    (``tag:``, ``namespace:``, ``model:``) passes through unchanged with
+    ``variant=None`` — those prefixes are caught by ``sel.parse`` later.
+    """
+    if ":" not in raw:
+        return raw, None
+    head, _, tail = raw.rpartition(":")
+    if _VARIANT_SUFFIX_RE.match(tail) and head and "/" not in tail:
+        # Guard against ``model:<org>/<name>`` where the ``/`` lives in
+        # the right half of the final ``:``.
+        return head, tail
+    return raw, None
+
+
+def _resolve_variant_tensor(
+    folder,
+    model_id: str,
+    variant: str | None,
+) -> "Path | None":
+    """Locate the on-disk tensor for ``(folder, model, variant)``.
+
+    ``variant`` semantics:
+      - ``None`` (no suffix passed): legacy behavior — prefer raw
+        safetensors, fall back to GGUF.
+      - ``"raw"``: require the raw safetensors tensor.
+      - ``"sae"``: require the unique SAE variant; raise
+        :class:`AmbiguousVariantError` when >1, :class:`UnknownVariantError`
+        when 0.
+      - ``"sae-<release>"``: require that specific release.
+    """
+    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
+    from saklas.io.packs import enumerate_variants
+
+    variants = enumerate_variants(folder, model_id)
+
+    if variant is None:
+        # Legacy path: raw preferred, GGUF fallback.
+        if "raw" in variants:
+            return variants["raw"]
+        from saklas.io.paths import safe_model_id as _safe
+        gguf = folder / f"{_safe(model_id)}.gguf"
+        return gguf if gguf.is_file() else None
+
+    if variant == "raw":
+        return variants.get("raw")
+
+    if variant == "sae":
+        sae_paths = {k: v for k, v in variants.items() if k.startswith("sae-")}
+        if len(sae_paths) == 0:
+            raise UnknownVariantError(
+                f"no SAE variants found in {folder.name} for model {model_id} "
+                f"(available: {sorted(variants) or 'none'})"
+            )
+        if len(sae_paths) > 1:
+            raise AmbiguousVariantError(
+                f"{folder.name}: multiple SAE variants for model {model_id}: "
+                f"{sorted(sae_paths)}. Specify with :sae-<release>."
+            )
+        return next(iter(sae_paths.values()))
+
+    # ``sae-<release>``
+    path = variants.get(variant)
+    if path is None:
+        raise UnknownVariantError(
+            f"variant '{variant}' not found in {folder.name} for model "
+            f"{model_id} (available: {sorted(variants) or 'none'})"
+        )
+    return path
+
+
 def _run_compare(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.cli.selectors import parse as sel_parse, resolve
-    from saklas.io.paths import vectors_dir, safe_model_id
+    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
+    from saklas.io.paths import vectors_dir
     from saklas.core.profile import Profile, ProfileError
 
-    sid = safe_model_id(args.model)
-
-    # Expand selectors into concept names.
-    names: list[str] = []
+    # Expand selectors into (name, variant) pairs. Variant travels with the
+    # name through the load loop so ``foo:sae`` picks the SAE tensor.
+    names: list[tuple[str, str | None]] = []
     for raw in args.concepts:
+        name_part, variant = _split_variant_suffix(raw)
         try:
-            sel = sel_parse(raw)
+            sel = sel_parse(name_part)
         except Exception:
-            names.append(raw)
+            names.append((name_part, variant))
             continue
         if sel.kind == "name":
-            names.append(raw)
+            names.append((name_part, variant))
         else:
+            # Bulk selectors (tag:/namespace:/all) expand to individual
+            # names; inherit the variant suffix so `tag:emotion:sae`
+            # resolves SAE tensors across the tag.
             resolved = resolve(sel)
             for c in resolved:
-                names.append(f"{c.namespace}/{c.name}")
+                names.append((f"{c.namespace}/{c.name}", variant))
 
     # Load profiles from disk.
     profiles: dict[str, Profile] = {}
-    for name in names:
+    for name, variant in names:
         sel = sel_parse(name)
         matches = resolve(sel)
         if not matches:
             print(f"warning: '{name}' not found, skipping", file=sys.stderr)
             continue
         folder = matches[0].folder
-        tensor_path = folder / f"{sid}.safetensors"
-        if not tensor_path.is_file():
-            # Try GGUF fallback.
-            gguf_path = folder / f"{sid}.gguf"
-            if gguf_path.is_file():
-                tensor_path = gguf_path
-            else:
-                print(f"warning: no tensor for '{name}' with model {args.model}, skipping",
-                      file=sys.stderr)
-                continue
-        display = matches[0].name
+        try:
+            tensor_path = _resolve_variant_tensor(folder, args.model, variant)
+        except (AmbiguousVariantError, UnknownVariantError) as e:
+            print(f"warning: {e}, skipping", file=sys.stderr)
+            continue
+        if tensor_path is None or not tensor_path.is_file():
+            print(f"warning: no tensor for '{name}' with model {args.model}, skipping",
+                  file=sys.stderr)
+            continue
+        # Display keys carry the variant when present so compare output
+        # distinguishes raw vs SAE rows.
+        display = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
         try:
             profiles[display] = Profile.load(tensor_path)
         except (ProfileError, Exception) as e:
@@ -637,10 +736,14 @@ def _run_compare(args: argparse.Namespace) -> None:
                         continue
                     if cdir.name == target_name:
                         continue
-                    tp = cdir / f"{sid}.safetensors"
-                    if not tp.is_file():
-                        tp = cdir / f"{sid}.gguf"
-                    if not tp.is_file():
+                    # Auto-scan keeps legacy behavior: raw preferred,
+                    # GGUF fallback. SAE-vs-all ranking requires the
+                    # caller to pass the SAE selector explicitly.
+                    try:
+                        tp = _resolve_variant_tensor(cdir, args.model, None)
+                    except (AmbiguousVariantError, UnknownVariantError):
+                        continue
+                    if tp is None or not tp.is_file():
                         continue
                     try:
                         others[cdir.name] = Profile.load(tp)
@@ -745,30 +848,31 @@ def _run_compare(args: argparse.Namespace) -> None:
 def _run_why(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.cli.selectors import parse as sel_parse, resolve
-    from saklas.io.paths import safe_model_id
+    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
     from saklas.core.profile import Profile, ProfileError
 
-    sid = safe_model_id(args.model)
-    sel = sel_parse(args.concept)
+    # Peel off a ``:<variant>`` suffix before parsing as a selector.
+    name_part, variant = _split_variant_suffix(args.concept)
+    sel = sel_parse(name_part)
     matches = resolve(sel)
     if not matches:
         print(f"why: '{args.concept}' not found", file=sys.stderr)
         sys.exit(1)
 
     folder = matches[0].folder
-    concept_name = matches[0].name
+    concept_name = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
 
-    tensor_path = folder / f"{sid}.safetensors"
-    if not tensor_path.is_file():
-        gguf_path = folder / f"{sid}.gguf"
-        if gguf_path.is_file():
-            tensor_path = gguf_path
-        else:
-            print(
-                f"why: no tensor for '{args.concept}' with model {args.model}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    try:
+        tensor_path = _resolve_variant_tensor(folder, args.model, variant)
+    except (AmbiguousVariantError, UnknownVariantError) as e:
+        print(f"why: {e}", file=sys.stderr)
+        sys.exit(1)
+    if tensor_path is None or not tensor_path.is_file():
+        print(
+            f"why: no tensor for '{args.concept}' with model {args.model}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     try:
         profile = Profile.load(tensor_path)

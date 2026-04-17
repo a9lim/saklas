@@ -94,7 +94,7 @@ class ConfigFile:
             else:
                 ns, name = None, coord
             try:
-                canonical, sign, _match = resolve_pole(name, namespace=ns)
+                canonical, sign, _match, _variant = resolve_pole(name, namespace=ns)
             except AmbiguousSelectorError:
                 out[coord] = alpha
                 continue

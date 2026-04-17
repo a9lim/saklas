@@ -28,12 +28,13 @@ from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.model import load_model, get_layers, get_model_info
 from saklas.core.monitor import TraitMonitor
 from saklas.io.packs import PackFormatError, PackMetadata, hash_file, hash_folder_files
-from saklas.io.paths import concept_dir, safe_model_id
+from saklas.io.paths import concept_dir, tensor_filename
 from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent, ProbeReadings
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
+from saklas.core.triggers import Trigger
 from saklas.core.vectors import (
     extract_contrastive,
     save_profile as _save_profile,
@@ -106,17 +107,25 @@ class VectorNotRegisteredError(KeyError, SaklasError):
 class _SteeringContext:
     """Context manager returned by SaklasSession.steering().
 
-    Pushes an alphas dict onto ``session._steering_stack`` on ``__enter__``
+    Pushes an entries dict onto ``session._steering_stack`` on ``__enter__``
     and pops it on ``__exit__``.  Rebuilds hooks from the flattened stack
     head so nested scopes compose: inner entries overwrite outer entries
     for the duration of the inner scope, then the outer entry is restored.
+
+    The stored ``_entries`` is the post-resolution entries form — each
+    value is ``(alpha, Trigger)``.  Bare-alpha inputs to the public
+    ``steering()`` API are normalized before we get here.
     """
 
-    __slots__ = ("_session", "_alphas", "_entered")
+    __slots__ = ("_session", "_entries", "_entered")
 
-    def __init__(self, session: "SaklasSession", alphas: dict[str, float]) -> None:
+    def __init__(
+        self,
+        session: "SaklasSession",
+        entries: dict[str, tuple[float, Trigger]],
+    ) -> None:
         self._session = session
-        self._alphas = alphas
+        self._entries = entries
         self._entered = False
 
     def __enter__(self) -> "_SteeringContext":
@@ -124,7 +133,7 @@ class _SteeringContext:
         # raises (e.g. VectorNotRegisteredError).  __enter__ only flips
         # `_entered=True` AFTER a clean push so a mid-__enter__ failure leaves
         # no stale state for __exit__ to pop.
-        self._session._push_steering(self._alphas)
+        self._session._push_steering(self._entries)
         self._entered = True
         return self
 
@@ -204,10 +213,13 @@ class SaklasSession:
 
         # Transient steering manager — used only during generation
         self._steering = SteeringManager()
-        # LIFO stack of per-scope alpha dicts pushed by session.steering().
-        # The flattened head (later entries overwrite earlier ones) is what
-        # _apply_steering installs when a generation begins.
-        self._steering_stack: list[dict[str, float]] = []
+        # LIFO stack of per-scope entries dicts pushed by session.steering().
+        # Each entry is ``{name: (alpha, Trigger)}`` — triggers are
+        # preserved through stack flattening so nested scopes with
+        # different trigger regimes compose cleanly.  The flattened head
+        # (later entries overwrite earlier ones) is what the steering
+        # manager installs when a generation begins.
+        self._steering_stack: list[dict[str, tuple[float, Trigger]]] = []
 
         # Synchronous event bus.  Emits on extraction, steering enter/exit,
         # probe scoring, generation start/finish.  Subscribers run on the
@@ -338,11 +350,6 @@ class SaklasSession:
                 files={},
             ).write(folder)
         return folder
-
-    def _vector_cache_path(self, canonical: str) -> str:
-        folder = self._local_concept_folder(canonical)
-        model_id = self._model_info.get("model_id", "unknown")
-        return str(folder / f"{safe_model_id(model_id)}.safetensors")
 
     def _statements_cache_path(self, canonical: str) -> str:
         folder = self._local_concept_folder(canonical)
@@ -654,6 +661,8 @@ class SaklasSession:
         reuse_scenarios: bool = False,
         force_statements: bool = False,
         on_progress: Callable[[str], None] | None = None,
+        sae: str | None = None,
+        sae_revision: str | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit VectorExtracted.
 
@@ -692,6 +701,8 @@ class SaklasSession:
             reuse_scenarios=reuse_scenarios,
             force_statements=force_statements,
             on_progress=on_progress,
+            sae=sae,
+            sae_revision=sae_revision,
         )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
@@ -709,6 +720,8 @@ class SaklasSession:
         reuse_scenarios: bool = False,
         force_statements: bool = False,
         on_progress: Callable[[str], None] | None = None,
+        sae: str | None = None,
+        sae_revision: str | None = None,
     ) -> tuple[str, Profile]:
         """Actual extraction pipeline — see :meth:`extract` for the wrapper.
 
@@ -755,6 +768,46 @@ class SaklasSession:
 
         canonical = canonical_concept_name(concept, baseline)
 
+        # Resolve the SAE backend once. No-op when ``sae is None`` —
+        # the ``load_sae_backend`` import is lazy so non-SAE callers
+        # don't touch the SAE layer.
+        sae_backend = None
+        sae_metadata: dict = {}
+        if sae is not None:
+            from saklas.core.sae import load_sae_backend
+            sae_backend = load_sae_backend(
+                sae,
+                revision=sae_revision,
+                model_id=self.model_id,
+                device=self._device,
+            )
+            sae_metadata = {
+                "sae_release": sae_backend.release,
+                "sae_revision": sae_backend.revision,
+                "sae_ids_by_layer": getattr(sae_backend, "sae_ids_by_layer", {}),
+            }
+
+        def _build_return(profile_dict: dict) -> tuple[str, Profile]:
+            meta: dict = {
+                "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
+            }
+            meta.update(sae_metadata)
+            out_name = (
+                canonical
+                if sae_backend is None
+                else f"{canonical}:sae-{sae_backend.release}"
+            )
+            return out_name, Profile(profile_dict, metadata=meta)
+
+        def _save_meta(extra: dict | None = None) -> dict:
+            meta: dict = {
+                "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
+            }
+            if extra:
+                meta.update(extra)
+            meta.update(sae_metadata)
+            return meta
+
         # For DataSource or raw pairs, skip the full pipeline — just extract
         if isinstance(source, (DataSource, list)):
             if isinstance(source, list):
@@ -762,12 +815,17 @@ class SaklasSession:
             else:
                 ds = source
             folder = self._local_concept_folder(canonical)
-            cache_path = str(folder / f"{safe_model_id(self.model_id)}.safetensors")
+            cache_path = str(folder / tensor_filename(self.model_id, release=sae))
             try:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{canonical}'.")
-                return canonical, Profile(profile, metadata=_meta)
+                out_name = (
+                    canonical
+                    if sae_backend is None
+                    else f"{canonical}:sae-{sae_backend.release}"
+                )
+                return out_name, Profile(profile, metadata=_meta)
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -775,10 +833,11 @@ class SaklasSession:
             pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
             profile = extract_contrastive(
                 self._model, self._tokenizer, pairs, layers=self._layers,
+                sae=sae_backend,
             )
-            _save_profile(profile, cache_path, {"method": "contrastive_pca"})
+            _save_profile(profile, cache_path, _save_meta())
             self._update_local_pack_files(folder)
-            return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
+            return _build_return(profile)
 
         # String source — full pipeline. Pack lookup scans all namespaces
         # (default/, hf-pulled, local/) via cli_selectors._all_concepts so
@@ -793,9 +852,12 @@ class SaklasSession:
                 break
 
         if curated_folder is not None:
-            cache_path = str(curated_folder / f"{safe_model_id(self.model_id)}.safetensors")
+            cache_path = str(curated_folder / tensor_filename(self.model_id, release=sae))
         else:
-            cache_path = self._vector_cache_path(canonical)
+            cache_path = str(
+                pathlib.Path(self._local_concept_folder(canonical))
+                / tensor_filename(self.model_id, release=sae)
+            )
 
         # 1. Vector cache — short-circuits unless a regen path is requested.
         #    ``force_statements=True`` or explicit ``scenarios=[...]`` both
@@ -809,7 +871,12 @@ class SaklasSession:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{canonical}'.")
-                return canonical, Profile(profile, metadata=_meta)
+                out_name = (
+                    canonical
+                    if sae_backend is None
+                    else f"{canonical}:sae-{sae_backend.release}"
+                )
+                return out_name, Profile(profile, metadata=_meta)
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -826,13 +893,13 @@ class SaklasSession:
                 profile = extract_contrastive(
                     self._model, self._tokenizer, ds["pairs"],
                     layers=self._layers,
+                    sae=sae_backend,
                 )
-                _save_profile(profile, cache_path, {
-                    "method": "contrastive_pca",
+                _save_profile(profile, cache_path, _save_meta({
                     "statements_sha256": hash_file(curated_stmts),
-                })
+                }))
                 self._update_local_pack_files(curated_folder)
-                return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
+                return _build_return(profile)
 
         # 3. Local statements cache — default reuses if present.
         stmt_cache_path = self._statements_cache_path(canonical)
@@ -919,13 +986,13 @@ class SaklasSession:
         _progress(f"Extracting contrastive profile ({len(pairs)} pairs)...")
         profile = extract_contrastive(
             self._model, self._tokenizer, pairs, layers=self._layers,
+            sae=sae_backend,
         )
-        _save_profile(profile, cache_path, {
-            "method": "contrastive_pca",
+        _save_profile(profile, cache_path, _save_meta({
             "statements_sha256": hash_file(pathlib.Path(stmt_cache_path)),
-        })
+        }))
         self._update_local_pack_files(local_folder)
-        return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
+        return _build_return(profile)
 
     def clone_from_corpus(
         self,
@@ -988,7 +1055,7 @@ class SaklasSession:
         self._profiles.pop(name, None)
 
     def steering(
-        self, alphas: "Steering | dict[str, float]",
+        self, alphas: "Steering | dict[str, float | tuple[float, Trigger]]",
     ) -> "_SteeringContext":
         """Context manager applying steering for the duration of a with-block.
 
@@ -999,98 +1066,148 @@ class SaklasSession:
         and the outer entry is restored on ``__exit__``.  One hook
         installation per active layer regardless of nesting depth.
 
+        Bare dicts may carry ``(alpha, Trigger)`` tuples as values for
+        per-entry trigger overrides; bare floats inherit ``Trigger.BOTH``.
+        Passing a full ``Steering`` uses its ``trigger`` field as the
+        default for bare-float entries.
+
         Unknown vector names raise ``VectorNotRegisteredError``; genuinely
         ambiguous pole names propagate ``AmbiguousSelectorError``.
         """
+        # Normalize to entries form (dict[str, (float, Trigger)]) up front.
+        # All downstream stack / rebuild / event machinery speaks entries,
+        # so the single coercion happens here and nowhere else.
         if isinstance(alphas, Steering):
-            raw_alphas = dict(alphas.alphas)
+            raw_entries = alphas.normalized_entries()
         else:
-            raw_alphas = dict(alphas)
-        resolved = self._resolve_pole_aliases(raw_alphas)
+            raw_entries = Steering(alphas=dict(alphas)).normalized_entries()
+        resolved = self._resolve_pole_aliases(raw_entries)
         return _SteeringContext(self, resolved)
 
     def _resolve_pole_aliases(
-        self, alphas: dict[str, float],
-    ) -> dict[str, float]:
-        """Apply pole-alias resolution + sign flipping to an alphas dict.
+        self, entries: dict[str, tuple[float, Trigger]],
+    ) -> dict[str, tuple[float, Trigger]]:
+        """Apply pole-alias resolution + sign flipping + variant routing.
 
-        Wrapped around ``cli_selectors.resolve_pole`` so CLI / server / TUI
-        all share the single resolver site.  Names already matching a
-        registered vector pass through unchanged — pre-resolved canonical
-        names are always honored verbatim.
+        Returned keys carry the full variant-qualified name:
+        ``canonical`` for raw, ``f"{canonical}:{variant}"`` otherwise. Autoload
+        is variant-aware — ``honest:sae`` will look for a ``_sae-*`` tensor
+        file, not the raw one.
 
-        Auto-loads cached tensors for bundled / installed concept packs on
-        first reference: if ``canonical`` names an installed concept with
-        a tensor file already on disk for this model, the tensor is loaded
-        into ``self._profiles`` inline.  This is cache-hit only — no PCA
-        extraction, no network, no surprise latency.  Missing tensors fall
-        through to the existing ``VectorNotRegisteredError`` path.
+        Names already in ``self._profiles`` pass through verbatim — a caller
+        who pre-registered under a specific key stays addressed by that key.
         """
         from saklas.cli.selectors import resolve_pole
 
-        out: dict[str, float] = {}
-        for name, alpha in alphas.items():
+        out: dict[str, tuple[float, Trigger]] = {}
+        for name, (alpha, trig) in entries.items():
             if name in self._profiles:
-                out[name] = float(alpha)
+                out[name] = (float(alpha), trig)
                 continue
             try:
-                canonical, sign, _match = resolve_pole(name)
+                canonical, sign, _match, variant = resolve_pole(name)
             except Exception:
-                # Let the caller see it at hook-install time via
-                # VectorNotRegisteredError for consistency with bare dict
-                # callers that never went through a context manager.
-                out[name] = float(alpha)
+                out[name] = (float(alpha), trig)
                 continue
-            if canonical not in self._profiles:
-                self._try_autoload_vector(canonical)
+            registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
+            if registry_key not in self._profiles:
+                try:
+                    self._try_autoload_vector(canonical, variant=variant)
+                except Exception:
+                    # Autoload may raise AmbiguousVariantError / UnknownVariantError.
+                    # Keep the user's original name in `out` so the error surfaces
+                    # at hook-install time with a clear message.
+                    out[name] = (float(alpha), trig)
+                    continue
             effective = float(alpha) * (1 if sign >= 0 else -1)
-            if canonical in self._profiles:
-                out[canonical] = out.get(canonical, 0.0) + effective
+            if registry_key in self._profiles:
+                prev_alpha = out.get(registry_key, (0.0, trig))[0]
+                out[registry_key] = (prev_alpha + effective, trig)
             else:
-                out[name] = float(alpha)
+                out[name] = (float(alpha), trig)
         return out
 
-    def _try_autoload_vector(self, canonical: str) -> None:
+    def _try_autoload_vector(self, canonical: str, *, variant: str = "raw") -> None:
         """Cache-hit fast path: load an installed concept's tensor into _profiles.
 
-        Walks installed concept packs (default / local / hf://*), finds the
-        first one matching ``canonical``, and loads its per-model safetensors
-        into the registry if the file already exists. Silent no-op on any
-        failure — the caller falls through to the normal raise path.
+        Walks installed concept packs, finds the first matching ``canonical``,
+        and loads its per-model tensor. ``variant`` is the resolver's output:
+
+        - ``"raw"`` — loads the unsuffixed tensor. Silent on miss (caller
+          falls through to the normal raise path). Matches pre-Task-7 behavior.
+        - ``"sae"`` — loads the unique SAE variant. Raises
+          :class:`AmbiguousVariantError` when more than one is on disk,
+          :class:`UnknownVariantError` when zero exist.
+        - ``"sae-<release>"`` — loads that specific release.
+          :class:`UnknownVariantError` when absent.
+
+        Registered key in ``_profiles`` is ``canonical`` for raw, and
+        ``f"{canonical}:{variant}"`` otherwise.
         """
         from saklas.cli.selectors import _all_concepts
-        from saklas.io.paths import safe_model_id
+        from saklas.io.packs import enumerate_variants
+        from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
         from saklas.core.vectors import load_profile
 
-        sid = safe_model_id(self.model_id)
+        registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
+        available: list[str] = []
         for concept in _all_concepts():
             if concept.name != canonical:
                 continue
-            ts_path = concept.folder / f"{sid}.safetensors"
-            if not ts_path.is_file():
+            variants = enumerate_variants(concept.folder, self.model_id)
+            available.extend(variants.keys())
+
+            if variant == "raw":
+                path = variants.get("raw")
+            elif variant == "sae":
+                sae_paths = {k: v for k, v in variants.items() if k.startswith("sae-")}
+                if len(sae_paths) == 0:
+                    continue
+                if len(sae_paths) > 1:
+                    raise AmbiguousVariantError(
+                        f"concept '{canonical}' has multiple SAE variants for "
+                        f"model '{self.model_id}': {sorted(sae_paths.keys())}. "
+                        f"Specify explicitly with :sae-<release>."
+                    )
+                path = next(iter(sae_paths.values()))
+            else:
+                # "sae-<release>"
+                path = variants.get(variant)
+
+            if path is None:
                 continue
+
             try:
-                profile_dict, _meta = load_profile(str(ts_path))
+                profile_dict, _meta = load_profile(str(path))
             except Exception:
                 continue
-            self._profiles[canonical] = self._promote_profile(profile_dict)
+            self._profiles[registry_key] = self._promote_profile(profile_dict)
             return
 
-    def _push_steering(self, alphas: dict[str, float]) -> None:
-        """Push an alphas dict onto the steering stack and rebuild hooks.
+        # Explicit non-raw variant request that didn't resolve → surface the miss.
+        if variant != "raw":
+            raise UnknownVariantError(
+                f"variant '{variant}' not found for '{canonical}' on model "
+                f"'{self.model_id}' (available: {sorted(set(available)) or 'none'})"
+            )
+
+    def _push_steering(
+        self, entries: dict[str, tuple[float, Trigger]],
+    ) -> None:
+        """Push an entries dict onto the steering stack and rebuild hooks.
 
         If ``_rebuild_steering_hooks`` raises (e.g. an unknown vector name
         hits ``VectorNotRegisteredError``) the just-pushed entry is rolled
         back before the exception propagates, so the stack is never left
         with stale half-committed state.
         """
-        self._steering_stack.append(dict(alphas))
+        self._steering_stack.append(dict(entries))
         try:
             self._rebuild_steering_hooks()
         except BaseException:
             self._steering_stack.pop()
             raise
-        self.events.emit(SteeringApplied(alphas=dict(self._flatten_steering_stack())))
+        self._emit_steering_applied()
 
     def _pop_steering(self) -> None:
         """Pop the top of the steering stack and rebuild hooks."""
@@ -1101,13 +1218,26 @@ class SaklasSession:
         if not self._steering_stack:
             self.events.emit(SteeringCleared())
         else:
-            self.events.emit(
-                SteeringApplied(alphas=dict(self._flatten_steering_stack())),
-            )
+            self._emit_steering_applied()
 
-    def _flatten_steering_stack(self) -> dict[str, float]:
-        """Collapse the LIFO stack into a single alphas dict (later wins)."""
-        flat: dict[str, float] = {}
+    def _emit_steering_applied(self) -> None:
+        """Emit SteeringApplied with both alphas-only + full entries.
+
+        ``alphas`` keeps the v1.x flat ``{name: alpha}`` shape for
+        subscribers that never needed triggers.  ``entries`` carries the
+        full ``{name: (alpha, trigger)}`` mapping for trigger-aware
+        subscribers (set to ``None`` when every entry uses
+        ``Trigger.BOTH`` so old subscribers see a normal-looking event).
+        """
+        flat = self._flatten_steering_stack()
+        alphas_only = {name: alpha for name, (alpha, _trig) in flat.items()}
+        non_default = any(trig != Trigger.BOTH for _, trig in flat.values())
+        entries = dict(flat) if non_default else None
+        self.events.emit(SteeringApplied(alphas=alphas_only, entries=entries))
+
+    def _flatten_steering_stack(self) -> dict[str, tuple[float, Trigger]]:
+        """Collapse the LIFO stack into a single entries dict (later wins)."""
+        flat: dict[str, tuple[float, Trigger]] = {}
         for entry in self._steering_stack:
             flat.update(entry)
         return flat
@@ -1118,19 +1248,24 @@ class SaklasSession:
         Called on every push/pop.  When the stack is empty this is a clean
         ``clear_all``.  One hook installation per active layer regardless
         of nesting depth — ``SteeringManager.apply_to_model`` composes
-        per-layer vectors internally.
+        per-layer vectors internally and groups entries by trigger within
+        each layer.
         """
         flat = self._flatten_steering_stack()
         self._steering.clear_all()
         if not flat:
             return
-        for name, alpha in flat.items():
+        for name, (alpha, trigger) in flat.items():
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-            self._steering.add_vector(name, self._profiles[name], alpha)
+            self._steering.add_vector(
+                name, self._profiles[name], alpha, trigger,
+            )
         self._steering.apply_to_model(self._layers, self._device, self._dtype)
 
-    def _apply_steering(self, alphas: dict[str, float]) -> None:
+    def _apply_steering(
+        self, entries: dict[str, tuple[float, Trigger]],
+    ) -> None:
         """Compose and attach steering hooks for a generation call.
 
         Must be called inside a ``_gen_active`` span (entry points set
@@ -1138,10 +1273,12 @@ class SaklasSession:
         in depth against a rogue caller re-entering outside a gen span.
         """
         self._steering.clear_all()
-        for name, alpha in alphas.items():
+        for name, (alpha, trigger) in entries.items():
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-            self._steering.add_vector(name, self._profiles[name], alpha)
+            self._steering.add_vector(
+                name, self._profiles[name], alpha, trigger,
+            )
         self._steering.apply_to_model(self._layers, self._device, self._dtype)
 
     def _clear_steering(self) -> None:
@@ -1426,8 +1563,20 @@ class SaklasSession:
         steering_cm = None
         if steering_obj is not None and steering_obj.alphas:
             steering_cm = self.steering(steering_obj)
-        vector_snapshot = (
-            dict(self._flatten_steering_stack())
+
+        def _snapshot_alphas() -> dict[str, float]:
+            """Project the flattened stack to the alphas-only shape that
+            ``GenerationResult.vectors`` has always carried.  Triggers are
+            stripped here — the public result object stays backward-compatible
+            for subscribers that only want ``{name: alpha}``."""
+            return {
+                name: alpha
+                for name, (alpha, _trig)
+                in self._flatten_steering_stack().items()
+            }
+
+        vector_snapshot: dict[str, float] = (
+            _snapshot_alphas()
             if self._steering_stack or steering_cm is not None
             else {}
         )
@@ -1439,11 +1588,15 @@ class SaklasSession:
                 input, raw, use_thinking_req, stateless=stateless,
             )
             # Refresh snapshot now that steering is pushed (first-scope case).
-            vector_snapshot = dict(self._flatten_steering_stack())
+            vector_snapshot = _snapshot_alphas()
 
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             self._begin_capture()
             self._monitor.begin_live()
+            # Reset the steering manager's TriggerContext for this generation.
+            # ``generate_steered`` mutates it at lifecycle boundaries; hooks
+            # read it on each forward.
+            self._steering.ctx.reset()
             try:
                 start = time.monotonic()
                 generated_ids = generate_steered(
@@ -1454,6 +1607,7 @@ class SaklasSession:
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
                     logprobs=lp_count,
+                    trigger_ctx=self._steering.ctx,
                 )
                 elapsed = time.monotonic() - start
             finally:

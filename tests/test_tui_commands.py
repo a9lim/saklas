@@ -10,6 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 
 import saklas
 from saklas.tui.app import SaklasApp
@@ -455,3 +456,227 @@ def test_parse_alpha_clamped_to_max():
     assert alpha == MAX_ALPHA
     _, _, alpha = SaklasApp._parse_args("happy -99", include_alpha=True)
     assert alpha == -MAX_ALPHA
+
+
+# ---- /steer --sae flag (Option C: explicit :sae-<release> grammar) ----
+
+
+def test_parse_steer_accepts_sae_flag():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae honest 0.3")
+    assert result["concept"] == "honest"
+    assert result["alpha"] == pytest.approx(0.3)
+    assert result["variant"] == "sae"
+    assert result["baseline"] is None
+
+
+def test_parse_steer_sae_preserves_hyphenated_concept():
+    """Regression: the old release-detection heuristic misfired on
+    ``--sae high-context 0.3`` by classifying ``high-context`` as a
+    release name. Option C drops the heuristic — ``--sae`` only toggles
+    variant to ``"sae"`` and the next token is always the concept.
+    """
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae high-context 0.3")
+    assert result["concept"] == "high-context"
+    assert result["variant"] == "sae"
+    assert result["alpha"] == pytest.approx(0.3)
+
+
+def test_parse_steer_no_sae_default_variant_raw():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("honest 0.3")
+    assert result["variant"] == "raw"
+
+
+def test_parse_steer_sae_with_bipolar_period_delim():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae honest . deceptive 0.3")
+    assert result["variant"] == "sae"
+    assert result["concept"] == "honest"
+    assert result["baseline"] == "deceptive"
+    assert result["alpha"] == pytest.approx(0.3)
+
+
+def test_parse_steer_no_alpha():
+    from saklas.tui.app import _parse_steer_command
+    # alpha is optional — some commands omit it (e.g., auto-suggested).
+    result = _parse_steer_command("honest")
+    assert result["concept"] == "honest"
+    assert result["alpha"] is None
+    assert result["variant"] == "raw"
+
+
+def test_parse_steer_sae_no_alpha():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae honest")
+    assert result["concept"] == "honest"
+    assert result["alpha"] is None
+    assert result["variant"] == "sae"
+
+
+def test_parse_steer_release_expressed_as_colon_suffix():
+    """Option C: the positional release form is gone; explicit release
+    selection rides on the ``:sae-<release>`` suffix in the concept.
+    The parser treats it as the concept name — the split happens later,
+    in ``resolve_pole`` (verified by the handle_extract tests below).
+    """
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("honest:sae-gemma-scope-2b-pt-res-canonical 0.3")
+    assert result["concept"] == "honest:sae-gemma-scope-2b-pt-res-canonical"
+    assert result["variant"] == "raw"  # no --sae preamble
+    assert result["alpha"] == pytest.approx(0.3)
+
+
+def test_handle_extract_trusts_canonical_from_session(monkeypatch, tmp_path):
+    """Regression: ``session.extract(sae=RELEASE)`` already returns a
+    canonical with the ``:sae-<release>`` suffix. The TUI worker must NOT
+    re-append ``:{variant}`` — doing so produces ``foo:sae-R:sae-R`` and
+    breaks every subsequent ``/alpha`` / ``/unsteer`` / pole lookup.
+
+    Contract: ``session.extract`` owns the final name. The TUI passes it
+    through unchanged.
+    """
+    import torch
+    from saklas.core.profile import Profile
+    from saklas.cli import selectors as _sel
+    # Isolate from user's real pack tree so pole alias resolution is a
+    # no-op on the fabricated name.
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _sel.invalidate()
+
+    app = _make_app()
+
+    # Mock session.extract to return the session-side canonical (suffixed).
+    def _fake_extract(concept, **kwargs):
+        assert kwargs.get("sae") == "gemma-scope-2b-pt-res-canonical"
+        canonical = f"{concept}:sae-gemma-scope-2b-pt-res-canonical"
+        return canonical, Profile({0: torch.zeros(4)})
+    app._session.extract = _fake_extract
+
+    # Run worker inline so we can capture the final registered name.
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    captured: dict = {}
+
+    def _on_success(name, profile, alpha):
+        captured["name"] = name
+
+    app._handle_extract(
+        "honest 0.3", include_alpha=True, on_success=_on_success,
+        variant="sae-gemma-scope-2b-pt-res-canonical",
+    )
+
+    assert "name" in captured, f"worker never called on_success: {_msgs(app)!r}"
+    # The canonical is correct; no double-suffix, no bare unsuffixed name.
+    assert captured["name"] == "honest:sae-gemma-scope-2b-pt-res-canonical"
+    assert ":sae-" in captured["name"]
+    assert captured["name"].count(":sae-") == 1
+
+
+def test_handle_extract_raw_variant_passes_canonical_through(monkeypatch, tmp_path):
+    """Raw (no SAE) path: ``session.extract`` returns the bare canonical."""
+    import torch
+    from saklas.core.profile import Profile
+    from saklas.cli import selectors as _sel
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _sel.invalidate()
+
+    app = _make_app()
+
+    def _fake_extract(concept, **kwargs):
+        assert "sae" not in kwargs
+        return concept, Profile({0: torch.zeros(4)})
+    app._session.extract = _fake_extract
+
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    captured: dict = {}
+
+    def _on_success(name, profile, alpha):
+        captured["name"] = name
+
+    app._handle_extract(
+        "honest 0.3", include_alpha=True, on_success=_on_success, variant="raw",
+    )
+    assert captured["name"] == "honest"
+
+
+def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch, tmp_path):
+    """Option C: typing ``concept:sae-<release>`` routes the release to
+    ``session.extract(sae=release)`` even without the ``--sae`` preamble.
+    """
+    import torch
+    from saklas.core.profile import Profile
+    from saklas.cli import selectors as _sel
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _sel.invalidate()
+
+    app = _make_app()
+
+    def _fake_extract(concept, **kwargs):
+        # The ``:sae-<release>`` suffix must get peeled before the
+        # concept reaches session.extract — release rides on ``sae=``.
+        assert concept == "honest"
+        assert kwargs["sae"] == "my-release"
+        return f"{concept}:sae-my-release", Profile({0: torch.zeros(4)})
+    app._session.extract = _fake_extract
+
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    captured: dict = {}
+
+    def _on_success(name, profile, alpha):
+        captured["name"] = name
+
+    # variant defaults to "raw" — the suffix inside the concept flips it.
+    app._handle_extract(
+        "honest:sae-my-release 0.3", include_alpha=True,
+        on_success=_on_success, variant="raw",
+    )
+    assert captured["name"] == "honest:sae-my-release"
+
+
+def test_handle_extract_bare_sae_uses_autoload(monkeypatch, tmp_path):
+    """Option C ``--sae <concept>``: no fresh extract — session autoload
+    picks the unique SAE tensor already on disk.
+    """
+    import torch
+    from saklas.cli import selectors as _sel
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _sel.invalidate()
+
+    app = _make_app()
+
+    # session.extract must NOT be called for bare --sae.
+    def _fail_extract(*a, **kw):
+        raise AssertionError("session.extract must not run for bare --sae")
+    app._session.extract = _fail_extract
+
+    # _try_autoload_vector populates _profiles[<concept>:sae].
+    def _autoload(canonical, *, variant):
+        assert canonical == "honest"
+        assert variant == "sae"
+        app._session._profiles["honest:sae"] = {0: torch.zeros(4)}
+    app._session._try_autoload_vector = _autoload
+
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    captured: dict = {}
+
+    def _on_success(name, profile, alpha):
+        captured["name"] = name
+
+    app._handle_extract(
+        "honest 0.3", include_alpha=True,
+        on_success=_on_success, variant="sae",
+    )
+    assert captured["name"] == "honest:sae"

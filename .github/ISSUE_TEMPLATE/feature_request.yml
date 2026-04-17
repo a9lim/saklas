@@ -14,7 +14,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: How do you imagine this working? API sketch welcome.
+      description: How do you imagine this working? An API sketch is welcome.
     validations:
       required: true
 

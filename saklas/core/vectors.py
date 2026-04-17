@@ -7,9 +7,13 @@ import json
 import logging
 from importlib import resources as _resources
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from safetensors.torch import load_file, save_file
+
+if TYPE_CHECKING:
+    from saklas.core.sae import SaeBackend
 
 log = logging.getLogger(__name__)
 
@@ -228,6 +232,9 @@ def extract_contrastive(
     pairs: list[dict],
     layers,
     device=None,
+    *,
+    sae: "SaeBackend | None" = None,
+    drop_edges: tuple[int, int] = (2, 2),
 ) -> dict[int, torch.Tensor]:
     """Contrastive direction extraction via PCA across all layers.
 
@@ -246,18 +253,76 @@ def extract_contrastive(
 
     Args:
         pairs: List of {"positive": str, "negative": str} prompt pairs.
+        sae: Optional SAE backend. When provided, extraction runs a
+            feature-space ``pca_center`` branch restricted to the layers
+            covered by the SAE, and decodes the principal feature-space
+            direction back into model space before baking shares.
+        drop_edges: ``(n_lo, n_hi)`` — exclude the first ``n_lo`` and last
+            ``n_hi`` model layers from the share distribution. Early layers
+            carry tokenization / lexical features; late layers are strongly
+            aligned with the unembedding head. Steering at either end tends
+            to corrupt surface form rather than latent meaning — on some
+            architectures (e.g. ministral-3, loaded via
+            :func:`_load_text_from_multimodal`) L0 PCA share inflates to
+            3–4× the model median, which produces immediate grammar collapse
+            at otherwise-coherent α. Dropping the edges suppresses the
+            pathology uniformly; the remaining share budget redistributes
+            over retained layers automatically. Default ``(2, 2)``; pass
+            ``(0, 0)`` to recover pre-fix behavior (useful for tests on
+            small mock models and for A/B comparisons).
 
     Returns:
-        Profile dict mapping layer_idx -> baked direction vector.
+        Profile dict mapping layer_idx -> baked direction vector. Dropped
+        edge layers are simply absent from the dict — downstream hook
+        attachment iterates over present keys.
     """
     if device is None:
         device = next(model.parameters()).device
 
     n_layers = len(layers)
+
+    n_drop_lo, n_drop_hi = drop_edges
+    if n_drop_lo < 0 or n_drop_hi < 0:
+        raise ValueError(f"drop_edges must be non-negative, got {drop_edges}")
+    if n_drop_lo + n_drop_hi >= n_layers:
+        raise ValueError(
+            f"drop_edges={drop_edges} would leave no retained layers "
+            f"(n_layers={n_layers})"
+        )
+    edge_idx = set(range(n_drop_lo)) | set(
+        range(n_layers - n_drop_hi, n_layers)
+    )
+
+    # Coverage check for the SAE branch — raise early before any forward
+    # passes if the backend covers none of this model's layers.
+    if sae is not None:
+        from saklas.core.errors import SaeCoverageError
+        covered = sae.layers & set(range(n_layers))
+        if not covered:
+            raise SaeCoverageError(
+                f"SAE release '{sae.release}' covers no layers for a "
+                f"{n_layers}-layer model"
+            )
+        sae_layers = sorted(covered)
+        sae_layer_set = set(sae_layers)  # O(1) membership for the inner loop
+    else:
+        sae_layers = None
+        sae_layer_set = None
+
     # Accumulate per-layer diffs and running norm sums.
     # norm_sums is a GPU tensor to avoid per-layer .item() sync points
     # (was 2 * N_pairs * N_layers GPU→CPU syncs, now 0 during the loop).
     diffs_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
+    # SAE path: keep the pos/neg tensors themselves (pca_center needs both,
+    # not just their diff), but only for layers the SAE actually covers —
+    # non-covered layers would allocate O(N · d_model) fp32 tensors for
+    # nothing. Raw path: these dicts stay empty, no cost.
+    pos_per_layer: dict[int, list[torch.Tensor]] = (
+        {i: [] for i in sae_layer_set} if sae is not None else {}
+    )
+    neg_per_layer: dict[int, list[torch.Tensor]] = (
+        {i: [] for i in sae_layer_set} if sae is not None else {}
+    )
     norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
 
     # On MPS, keep diffs on CPU — SVD runs there anyway, and the
@@ -274,11 +339,71 @@ def extract_contrastive(
             p_d = p.to(diff_device)
             n_d = n.to(diff_device)
             diffs_per_layer[idx].append(p_d - n_d)
+            if sae is not None and idx in sae_layer_set:
+                # fp32 matches the diff dtype discipline; avoids fp16 overflow.
+                pos_per_layer[idx].append(p_d.float())
+                neg_per_layer[idx].append(n_d.float())
         # Free forward-pass intermediates (attention maps, hidden states)
         # before the next pair — MPS doesn't release memory eagerly.
         del pos_all, neg_all
         if _mps:
             torch.mps.empty_cache()
+
+    # SAE branch: feature-space pca_center, decode back to model space.
+    # Runs only on the covered-layer subset; returns early with baked
+    # tensors restricted to those layers.
+    if sae is not None:
+        norm_sums_cpu = norm_sums.tolist()
+        n_norm_samples = len(pairs) * 2
+        directions: dict[int, torch.Tensor] = {}
+        # Accumulate EVR scalars as tensors, one .tolist() after the loop
+        # (matches the raw-PCA path's discipline — one GPU→CPU transfer).
+        evr_tensors: list[torch.Tensor] = []
+        for idx in sae_layers:
+            pos_stack = torch.stack(pos_per_layer[idx])  # (N, d_model), fp32
+            neg_stack = torch.stack(neg_per_layer[idx])
+            ref_norm = norm_sums_cpu[idx] / n_norm_samples
+
+            with torch.no_grad():
+                F_pos = sae.encode_layer(idx, pos_stack.to(device)).float()
+                F_neg = sae.encode_layer(idx, neg_stack.to(device)).float()
+
+            center = (F_pos + F_neg) / 2.0
+            stacked = torch.cat([F_pos - center, F_neg - center], dim=0)  # (2N, d_feat)
+
+            _, S, Vh = torch.linalg.svd(stacked, full_matrices=False)
+            v_feat = Vh[0]
+            evr_tensors.append(S[0] / S.sum())
+
+            # Orient by majority vote: pos-minus-neg projected onto v_feat
+            # should majority-positive.
+            dots = (F_pos - F_neg) @ v_feat
+            if (dots < 0).sum() > (dots > 0).sum():
+                v_feat = -v_feat
+
+            with torch.no_grad():
+                v_model = sae.decode_layer(idx, v_feat).float()
+
+            directions[idx] = _normalize(v_model, ref_norm=ref_norm)
+
+        evrs = torch.stack(evr_tensors).tolist()
+        raw: dict[int, tuple[torch.Tensor, float]] = {
+            idx: (directions[idx], evr) for idx, evr in zip(sae_layers, evrs)
+        }
+
+        for i in edge_idx:
+            raw.pop(i, None)
+
+        # Bake shares across the covered subset (same logic as raw path).
+        total_score = sum(score for _, score in raw.values())
+        # Defensive: evr is always positive when any singular value exists;
+        # the fallback never triggers in practice.
+        if total_score <= 0:
+            shares = {i: 1.0 / len(raw) for i in raw}
+        else:
+            shares = {i: score / total_score for i, (_, score) in raw.items()}
+
+        return {i: direction * shares[i] for i, (direction, _) in raw.items()}
 
     # Per-layer: compute direction and score, then bake shares into magnitude.
     n_pairs = len(pairs)
@@ -336,17 +461,20 @@ def extract_contrastive(
 
             raw[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), scores_cpu[idx])
 
-    # Bake shares into the stored tensors. Total share is 1.0 across layers,
-    # so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
+    for i in edge_idx:
+        raw.pop(i, None)
+
+    # Bake shares into the stored tensors. Total share is 1.0 across retained
+    # layers, so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
     # magnitude budget is fixed by the reference activation norms and
     # distributed in proportion to per-layer signal quality. At apply time
     # the hook just does alpha * _STEER_GAIN * sum(baked) — no shares,
     # no sums, no per-layer weights.
     total_score = sum(score for _, score in raw.values())
     if total_score <= 0:
-        # Pathological extraction (all-zero diffs). Fall back to uniform.
-        total_score = float(n_layers)
-        shares = {idx: 1.0 / n_layers for idx in raw}
+        # Pathological extraction (all-zero diffs). Fall back to uniform
+        # across retained layers.
+        shares = {idx: 1.0 / len(raw) for idx in raw}
     else:
         shares = {idx: score / total_score for idx, (_, score) in raw.items()}
 
@@ -388,6 +516,10 @@ def save_profile(
         sidecar["statements_sha256"] = metadata["statements_sha256"]
     if "components" in metadata:
         sidecar["components"] = metadata["components"]
+    # SAE provenance — present only when extraction used an SAE backend.
+    for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
+        if key in metadata:
+            sidecar[key] = metadata[key]
 
     meta_path = path.with_suffix(".json")
     with open(meta_path, "w") as f:

@@ -283,9 +283,35 @@ def _install_synthesized_pack(
     meta.write(target_folder)
 
 
+def _sidecar_stem_to_hf_coord(stem: str) -> Optional[str]:
+    """Convert a sidecar key (tensor file stem) back to an HF repo coord.
+
+    Sidecars are keyed by the full file stem — which includes any
+    ``_sae-<release>`` suffix. A naive ``stem.replace("__", "/")`` on
+    ``google__gemma-3-4b-it_sae-gemma-scope-2b-pt-res-canonical`` yields
+    ``google/gemma-3-4b-it_sae-...`` — a non-existent HF repo that would
+    poison ``base_model:`` frontmatter. Strip the variant suffix first.
+
+    Returns ``None`` for stems that don't parse as a tensor filename.
+    """
+    from saklas.io.paths import parse_tensor_filename
+
+    parsed = parse_tensor_filename(f"{stem}.safetensors")
+    if parsed is None:
+        return None
+    safe_model, _release = parsed
+    return safe_model.replace("__", "/")
+
+
 def _render_model_card(meta: PackMetadata, sidecars: dict[str, Sidecar], coord: str) -> str:
     """Build a HF model card (YAML frontmatter + markdown body) for a pack."""
-    base_models = sorted(safe.replace("__", "/") for safe in sidecars.keys())
+    # Dedupe: multiple SAE variants of the same base model collapse to one
+    # ``base_model:`` entry.
+    base_models = sorted({
+        hf_coord
+        for stem in sidecars.keys()
+        if (hf_coord := _sidecar_stem_to_hf_coord(stem)) is not None
+    })
     tags = sorted({"saklas-pack", "activation-steering", "steering-vector", *meta.tags})
 
     fm = ["---", "library_name: saklas", f"license: {meta.license}", "tags:"]
@@ -322,9 +348,13 @@ def _render_model_card(meta: PackMetadata, sidecars: dict[str, Sidecar], coord: 
             "| base model | method | saklas version |",
             "| --- | --- | --- |",
         ]
-        for safe, sc in sorted(sidecars.items()):
+        for stem, sc in sorted(sidecars.items()):
+            # Table rows label rows by the clean base model. SAE-variant
+            # provenance lives in the sidecar's sae_release / sae_revision
+            # fields (method already indicates pca_center_sae).
+            base = _sidecar_stem_to_hf_coord(stem) or stem.replace("__", "/")
             body.append(
-                f"| `{safe.replace('__', '/')}` | `{sc.method}` | `{sc.saklas_version}` |"
+                f"| `{base}` | `{sc.method}` | `{sc.saklas_version}` |"
             )
         body.append("")
 
@@ -364,24 +394,47 @@ def push_pack(
     model_scope: Optional[str] = None,
     tag_version: bool = False,
     dry_run: bool = False,
+    variant: str = "all",
 ) -> tuple[str, Optional[str]]:
     """Push a concept folder to HF as a model repo.
 
     Stages a copy (so we can add README.md + .gitattributes + a filtered
     pack.json without mutating the source), then one atomic upload. Returns
     ``(repo_url, commit_sha)``; sha is ``None`` on dry-run.
+
+    ``variant`` filters tensor files: ``"raw"`` uploads only unsuffixed
+    tensors, ``"sae"`` only ``_sae-*`` tensors, ``"all"`` (default) both.
+    Sidecars follow their partner tensor.
     """
     import tempfile
     from saklas.io.packs import ConceptFolder
-    from saklas.io.paths import safe_model_id as _safe_id
+    from saklas.io.paths import safe_model_id as _safe_id, parse_tensor_filename
+
+    def _variant_key_for(rel: str) -> Optional[str]:
+        """Return variant key for a file path relative to the pack folder."""
+        if rel.endswith(".json"):
+            return _variant_key_for(rel[:-len(".json")] + ".safetensors")
+        parsed = parse_tensor_filename(rel)
+        if parsed is None:
+            return None
+        _m, release = parsed
+        return "raw" if release is None else f"sae-{release}"
+
+    def _variant_matches(key: str) -> bool:
+        if variant == "all":
+            return True
+        if variant == "raw":
+            return key == "raw"
+        if variant == "sae":
+            return key.startswith("sae-")
+        return False
 
     cf = ConceptFolder.load(folder)  # runs integrity check
     meta = cf.metadata
 
-    scope_expected: Optional[set[str]] = None
+    scope_safe: Optional[str] = None
     if model_scope is not None:
-        safe = _safe_id(model_scope)
-        scope_expected = {f"{safe}.safetensors", f"{safe}.json"}
+        scope_safe = _safe_id(model_scope)
 
     staging = Path(tempfile.mkdtemp(prefix="saklas-push-"))
     try:
@@ -394,7 +447,21 @@ def push_pack(
             else:
                 if not include_tensors:
                     continue
-                if scope_expected is not None and rel not in scope_expected:
+                # Normalize sidecar names to tensor names for parsing.
+                if rel.endswith(".json"):
+                    tensor_rel = rel[:-len(".json")] + ".safetensors"
+                elif rel.endswith(".safetensors"):
+                    tensor_rel = rel
+                else:
+                    continue
+                parsed = parse_tensor_filename(tensor_rel)
+                if parsed is None:
+                    continue
+                file_model, release = parsed
+                if scope_safe is not None and file_model != scope_safe:
+                    continue
+                vkey = "raw" if release is None else f"sae-{release}"
+                if not _variant_matches(vkey):
                     continue
             src = folder / rel
             if not src.exists():
@@ -412,7 +479,7 @@ def push_pack(
             raise HFError(
                 "nothing to push: filters excluded every file "
                 f"(include_statements={include_statements}, include_tensors={include_tensors}, "
-                f"model_scope={model_scope!r})"
+                f"model_scope={model_scope!r}, variant={variant!r})"
             )
 
         staged_meta = PackMetadata(

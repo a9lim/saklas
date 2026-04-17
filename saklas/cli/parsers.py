@@ -118,6 +118,10 @@ def _build_pack_clear(p: argparse.ArgumentParser) -> None:
                    help="Scope to one model's tensors only (default: all models)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="Skip confirmation prompt on broad selectors")
+    p.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="all",
+        help="Which tensor variant(s) to delete. Default: all.",
+    )
 
 
 def _build_pack_rm(p: argparse.ArgumentParser) -> None:
@@ -154,6 +158,11 @@ def _build_pack_push(p: argparse.ArgumentParser) -> None:
     p.add_argument("-t", "--tag-version", action="store_true")
     p.add_argument("-d", "--dry-run", action="store_true")
     p.add_argument("-f", "--force", action="store_true")
+    p.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="raw",
+        help="Which tensor variant(s) to push. Default: raw. (SAE variants "
+             "carry different provenance; opt in via --variant sae|all.)",
+    )
 
 
 def _build_pack_export(p: argparse.ArgumentParser) -> None:
@@ -193,6 +202,15 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
                    help="Either one concept (e.g. 'happy.sad') or two poles (e.g. 'happy' 'sad')")
     p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
     p.add_argument("-f", "--force", action="store_true")
+    p.add_argument(
+        "--sae", default=None, metavar="RELEASE",
+        help="Extract via a SAELens SAE release (requires `pip install .[sae]`). "
+             "No implicit default — you must name a release.",
+    )
+    p.add_argument(
+        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
+        help="Pin a specific HF revision for the SAE release",
+    )
     p.set_defaults(quantize=None, device="auto", probes=None)
 
 
