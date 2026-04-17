@@ -23,4 +23,4 @@ body:
     id: quirks
     attributes:
       label: Known quirks
-      description: Anything unusual — multimodal, MoE routing, FP8 weights, non-standard tokenizer specials
+      description: Anything unusual, like multimodal, MoE routing, FP8 weights, or nonstandard tokenizer specials
