@@ -276,20 +276,24 @@ def extract_contrastive(
                 f"{n_layers}-layer model"
             )
         sae_layers = sorted(covered)
+        sae_layer_set = set(sae_layers)  # O(1) membership for the inner loop
     else:
         sae_layers = None
+        sae_layer_set = None
 
     # Accumulate per-layer diffs and running norm sums.
     # norm_sums is a GPU tensor to avoid per-layer .item() sync points
     # (was 2 * N_pairs * N_layers GPU→CPU syncs, now 0 during the loop).
     diffs_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
     # SAE path: keep the pos/neg tensors themselves (pca_center needs both,
-    # not just their diff). Raw path: these dicts stay empty, no cost.
+    # not just their diff), but only for layers the SAE actually covers —
+    # non-covered layers would allocate O(N · d_model) fp32 tensors for
+    # nothing. Raw path: these dicts stay empty, no cost.
     pos_per_layer: dict[int, list[torch.Tensor]] = (
-        {i: [] for i in range(n_layers)} if sae is not None else {}
+        {i: [] for i in sae_layer_set} if sae is not None else {}
     )
     neg_per_layer: dict[int, list[torch.Tensor]] = (
-        {i: [] for i in range(n_layers)} if sae is not None else {}
+        {i: [] for i in sae_layer_set} if sae is not None else {}
     )
     norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
 
@@ -307,7 +311,7 @@ def extract_contrastive(
             p_d = p.to(diff_device)
             n_d = n.to(diff_device)
             diffs_per_layer[idx].append(p_d - n_d)
-            if sae is not None:
+            if sae is not None and idx in sae_layer_set:
                 # fp32 matches the diff dtype discipline; avoids fp16 overflow.
                 pos_per_layer[idx].append(p_d.float())
                 neg_per_layer[idx].append(n_d.float())
@@ -321,13 +325,16 @@ def extract_contrastive(
     # Runs only on the covered-layer subset; returns early with baked
     # tensors restricted to those layers.
     if sae is not None:
-        norm_sums_cpu_sae = norm_sums.tolist()
+        norm_sums_cpu = norm_sums.tolist()
         n_norm_samples = len(pairs) * 2
-        raw_sae: dict[int, tuple[torch.Tensor, float]] = {}
+        directions: dict[int, torch.Tensor] = {}
+        # Accumulate EVR scalars as tensors, one .tolist() after the loop
+        # (matches the raw-PCA path's discipline — one GPU→CPU transfer).
+        evr_tensors: list[torch.Tensor] = []
         for idx in sae_layers:
             pos_stack = torch.stack(pos_per_layer[idx])  # (N, d_model), fp32
             neg_stack = torch.stack(neg_per_layer[idx])
-            ref_norm = norm_sums_cpu_sae[idx] / n_norm_samples
+            ref_norm = norm_sums_cpu[idx] / n_norm_samples
 
             with torch.no_grad():
                 F_pos = sae.encode_layer(idx, pos_stack.to(device)).float()
@@ -338,7 +345,7 @@ def extract_contrastive(
 
             _, S, Vh = torch.linalg.svd(stacked, full_matrices=False)
             v_feat = Vh[0]
-            evr = (S[0] / S.sum()).item()
+            evr_tensors.append(S[0] / S.sum())
 
             # Orient by majority vote: pos-minus-neg projected onto v_feat
             # should majority-positive.
@@ -349,17 +356,23 @@ def extract_contrastive(
             with torch.no_grad():
                 v_model = sae.decode_layer(idx, v_feat).float()
 
-            direction = _normalize(v_model, ref_norm=ref_norm)
-            raw_sae[idx] = (direction, evr)
+            directions[idx] = _normalize(v_model, ref_norm=ref_norm)
+
+        evrs = torch.stack(evr_tensors).tolist()
+        raw: dict[int, tuple[torch.Tensor, float]] = {
+            idx: (directions[idx], evr) for idx, evr in zip(sae_layers, evrs)
+        }
 
         # Bake shares across the covered subset (same logic as raw path).
-        total_score_sae = sum(score for _, score in raw_sae.values())
-        if total_score_sae <= 0:
-            shares_sae = {i: 1.0 / len(raw_sae) for i in raw_sae}
+        total_score = sum(score for _, score in raw.values())
+        # Defensive: evr is always positive when any singular value exists;
+        # the fallback never triggers in practice.
+        if total_score <= 0:
+            shares = {i: 1.0 / len(raw) for i in raw}
         else:
-            shares_sae = {i: score / total_score_sae for i, (_, score) in raw_sae.items()}
+            shares = {i: score / total_score for i, (_, score) in raw.items()}
 
-        return {i: direction * shares_sae[i] for i, (direction, _) in raw_sae.items()}
+        return {i: direction * shares[i] for i, (direction, _) in raw.items()}
 
     # Per-layer: compute direction and score, then bake shares into magnitude.
     n_pairs = len(pairs)

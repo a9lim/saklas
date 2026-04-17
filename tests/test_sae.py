@@ -160,6 +160,8 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
     from saklas.core import vectors as V
     from saklas.core.sae import MockSaeBackend
 
+    torch.manual_seed(0)
+
     def fake_encode_and_capture(model, tokenizer, text, layers, device):
         out = {}
         for idx in range(len(layers)):
@@ -217,3 +219,48 @@ def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch):
             device=torch.device("cpu"),
             sae=sae,
         )
+
+
+def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
+    """Per-layer baked magnitudes should scale with the layer's share (evr/sum)."""
+    import torch
+    from saklas.core import vectors as V
+    from saklas.core.sae import MockSaeBackend
+
+    # Seed so the noise doesn't flip signs or perturb magnitudes.
+    torch.manual_seed(0)
+
+    def fake_encode_and_capture(model, tokenizer, text, layers, device):
+        # Layer 0: high-SNR separation (evr near 1.0)
+        # Layer 1: low-SNR separation (evr lower — noise dominates)
+        out = {}
+        sign = 1.0 if "pos" in text else -1.0
+        out[0] = torch.tensor([sign * 5.0, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
+        out[1] = torch.tensor([sign * 0.2, 0.0, 0.0, 0.0]) + 0.5 * torch.randn(4)
+        return out
+
+    monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode_and_capture)
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(30)]
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    layers_list = [object()] * 2
+    sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
+
+    profile = V.extract_contrastive(
+        FakeModel(), FakeTok(), pairs, layers=layers_list,
+        device=torch.device("cpu"),
+        sae=sae,
+    )
+    # Both layers covered, both have signal, both non-zero
+    assert set(profile.keys()) == {0, 1}
+    mag_0 = profile[0].norm().item()
+    mag_1 = profile[1].norm().item()
+    # Shares sum to 1.0 in the sense that (mag_i / ref_norm_i) sums to 1.0.
+    # Simpler check: layer 0 has much stronger signal → its share (and thus
+    # its baked magnitude, at comparable ref_norms) should dominate.
+    assert mag_0 > mag_1
