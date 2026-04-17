@@ -446,13 +446,14 @@ def _run_extract(args: argparse.Namespace) -> None:
     canonical = canonical_concept_name(raw, baseline)
 
     import pathlib
-    from saklas.io.paths import safe_model_id
+    from saklas.io.paths import tensor_filename
     from saklas.cli.selectors import _all_concepts
     candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
     candidate_folders.append(session._local_concept_folder(canonical))
-    sid = safe_model_id(session.model_id)
+    requested_release = getattr(args, "sae", None)
+    candidate_tensor_name = tensor_filename(session.model_id, release=requested_release)
     candidate_paths = [
-        pathlib.Path(folder) / f"{sid}.safetensors" for folder in candidate_folders
+        pathlib.Path(folder) / candidate_tensor_name for folder in candidate_folders
     ]
     existing = next((p for p in candidate_paths if p.exists()), None)
 
@@ -465,19 +466,33 @@ def _run_extract(args: argparse.Namespace) -> None:
             if p.exists():
                 p.unlink()
 
+    extract_kwargs = {}
+    if getattr(args, "sae", None):
+        extract_kwargs["sae"] = args.sae
+    if getattr(args, "sae_revision", None):
+        extract_kwargs["sae_revision"] = args.sae_revision
+
     try:
         if baseline is not None:
-            canonical, _profile = session.extract(raw, baseline=baseline)
+            canonical, _profile = session.extract(raw, baseline=baseline, **extract_kwargs)
         else:
-            canonical, _profile = session.extract(raw)
+            canonical, _profile = session.extract(raw, **extract_kwargs)
     except Exception as e:
         print(f"extract failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    final_path = next((p for p in candidate_paths if p.exists()), None)
+    # `canonical` may be "name:sae-<release>" — peel it for filename construction.
+    if ":sae-" in canonical:
+        core_name, _, rel = canonical.partition(":sae-")
+        tensor_name = tensor_filename(session.model_id, release=rel)
+    else:
+        core_name = canonical
+        tensor_name = tensor_filename(session.model_id, release=None)
+    final_paths = [pathlib.Path(f) / tensor_name for f in candidate_folders]
+    final_path = next((p for p in final_paths if p.exists()), None)
     if final_path is None:
         final_path = (
-            pathlib.Path(session._local_concept_folder(canonical)) / f"{sid}.safetensors"
+            pathlib.Path(session._local_concept_folder(core_name)) / tensor_name
         )
     print(f"extracted {canonical} -> {final_path}")
 

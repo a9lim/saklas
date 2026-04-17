@@ -806,3 +806,45 @@ def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):
     resolved = c.resolve_poles()
     assert "deer.wolf" in resolved.vectors
     assert resolved.vectors["deer.wolf"] == -0.5
+
+
+# ---------------------------------------------------------------------------
+# vector extract --sae / --sae-revision
+# ---------------------------------------------------------------------------
+
+def test_vector_extract_parses_sae_flag():
+    """--sae RELEASE is captured on the Namespace as `sae`."""
+    args = cli.parse_args([
+        "vector", "extract", "honest.deceptive",
+        "-m", "google/gemma-2-2b-it",
+        "--sae", "gemma-scope-2b-pt-res-canonical",
+    ])
+    assert args.sae == "gemma-scope-2b-pt-res-canonical"
+    assert args.sae_revision is None
+
+
+def test_vector_extract_sae_revision():
+    args = cli.parse_args([
+        "vector", "extract", "honest.deceptive",
+        "-m", "google/gemma-2-2b-it",
+        "--sae", "release-x",
+        "--sae-revision", "v1.0",
+    ])
+    assert args.sae == "release-x"
+    assert args.sae_revision == "v1.0"
+
+
+def test_vector_extract_no_sae_defaults_to_none():
+    args = cli.parse_args([
+        "vector", "extract", "honest.deceptive", "-m", "model",
+    ])
+    assert args.sae is None
+    assert args.sae_revision is None
+
+
+def test_vector_extract_sae_requires_value():
+    """--sae must be followed by a release name; it's not a boolean switch."""
+    with pytest.raises(SystemExit):
+        cli.parse_args([
+            "vector", "extract", "honest.deceptive", "-m", "m", "--sae",
+        ])
