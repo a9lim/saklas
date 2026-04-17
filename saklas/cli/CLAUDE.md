@@ -1,0 +1,28 @@
+# cli/
+
+Five-verb root parser (`tui`/`serve`/`pack`/`vector`/`config`) split across:
+- `cli/main.py` — entry point, `_build_root_parser`, `_load_effective_config`, `_warmup_session`
+- `cli/parsers.py` — every `_build_X_parser`
+- `cli/runners.py` — every `_run_X`
+- `cli/selectors.py` — selector grammar + `resolve_pole` (renamed from `cli_selectors.py`)
+- `cli/config_file.py` — `ConfigFile` + `effective()` / `resolve_poles()` / `to_yaml()`
+
+## Verb nesting
+
+- `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via `_PACK_BUILDERS` / `_PACK_RUNNERS` tables
+- `vector` = computation (extract/merge/clone/compare/why) via `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`
+- `config` = show / validate
+
+## Config loading
+
+`_load_effective_config(args)` is the shared entry point every subcommand that takes `-c` calls. Composes `~/.saklas/config.yaml` + explicit `-c` files, runs `ConfigFile.resolve_poles()`, and stamps `args.config_vectors` / `args.temperature` / `args.top_p` / `args.max_tokens` in place.
+
+## Warmup
+
+`_warmup_session` issues a single-token `session.generate(sampling=SamplingConfig(max_tokens=1), stateless=True)` — no `session.config` mutation.
+
+## Flags
+
+- `serve`: `--host/-H`, `--port/-P`, `--steer/-S name:alpha`, `--cors/-C`, `--api-key/-k`, plus `-c/--config`.
+- `pack ls` is local-only; `pack search` is the HF-remote verb.
+- `pack rm` replaces `uninstall`; `pack ls` replaces `list`.

@@ -1,0 +1,57 @@
+# tui/
+
+Textual frontend over `SaklasSession`. Three panels (left=vectors, center=chat, right=traits). ~15 FPS poll.
+
+## app.py
+
+Thin frontend. Owns local alpha/enabled/thinking state per panel, passes through per call as `SamplingConfig` + `Steering`. Thinking defaults ON for models that support it (`Ctrl+T` toggles).
+
+**The `_generate` worker is a thin wrapper over `session.generate_stream`** — no direct reach into `_apply_steering` / `_begin_capture` / `_end_capture` / `_clear_steering` / `generate_steered`. Builds `SamplingConfig` + `Steering` from current UI state, calls `session.generate_stream(input, steering=..., sampling=..., on_token=...)`, and forwards tokens through an **app-local `_ui_token_queue: SimpleQueue`** with tagged messages `("tok", text, thinking)` / `("finalize", widget)` / `("error", msg)` / `("done",)`. `_poll_generation` drains the app-local queue; the worker's `finally` emits `("done",)` after the session-side teardown has already run.
+
+## Slash commands
+
+- **Steering**: `/steer <name> [alpha]` (add + register, supports `<pos> . <neg> [alpha]`), `/alpha <name> <val>` (adjust existing only — errors if unregistered), `/unsteer <name>`.
+- **Probes**: `/probe <name>` (also seeds `_highlight_probe` and flips `_highlight_on = True`), `/unprobe <name>`, `/extract <name>` (to disk without wiring).
+- **Session**: `/clear`, `/rewind`, `/regen`, `/sys <prompt>`, `/temp`, `/top-p`, `/max`, `/seed <n>`, `/save <name>`, `/load <name>`, `/export <path>`.
+- **Analysis**: `/compare <a> [b]` (1-arg: ranked cosine vs all loaded profiles; 2-arg: pairwise score).
+- **Info**: `/model` (arch/device/layers/thinking/active state), `/help`.
+
+**Arg parser** (`SaklasApp._parse_args`): splits on ` . ` (space-period-space) — the only bipolar delimiter. Whitespace around the period is required to split so canonical single tokens like `dog.cat` stay one concept. `-` is **not** a delimiter: `happy - sad` is parsed as a single concept name which fails downstream name validation — intentional so the error surfaces clearly. Multi-word poles work without quotes (`/steer a dog . a pair of cats 0.4`). Quotes honored and stripped. Trailing alpha peeled from the final whitespace-separated token iff it parses as float. `/alpha` still uses `shlex.split` for its two-token form.
+
+## Mid-gen interruption
+
+Any conflicting action (Ctrl+R, new message, any modifying slash command) stops current gen and defers via `_pending_action`; `_poll_generation` consumes the `("done",)` sentinel and calls `_dispatch_pending_action` (single-site try/except that resets state and surfaces errors via `add_system_message`). Panel focus uses index constants `_LEFT`/`_CHAT`/`_TRAIT`.
+
+## Per-token highlighting
+
+Default-on when a probe is explicitly selected via `/probe`. `Ctrl+Y` toggles the visual overlay silently (no system message — user can see whether it's on); trait-panel selection updates the seed live while highlighting is on.
+
+**Live highlighting**: TUI worker forwards `event.scores` from each `TokenEvent` through `_ui_token_queue`; `_poll_generation` calls `widget.append_token_score(scores, is_thinking)` per emit, which appends to the per-probe score list, clears the markup cache, and re-renders. `_build_highlight_markup` tolerates `len(scores) < len(token_strs)` (unscored tokens render plain) and skips leading-whitespace tokens on the response side. At finalize the canonical projected scores from `session.last_per_token_scores` overwrite live ones via `_finalize_widget_highlight`.
+
+`Ctrl+A` A/B compare and `Ctrl+S` cycle trait sort — documented in `/help`.
+
+## Trait-panel WHY footer
+
+Bottom-third split below the traits list. Always shows top-5 layers by `||baked||` for the trait-panel-selected probe; adds top 4 highest + 4 lowest emitted tokens by signed score (with `...` separator) once any have been scored — **live during streaming**, refreshed per emit. When the gen has ≤8 emitted tokens the two halves merge into one sorted group with no separator. Driven by `_refresh_trait_why()` from app.py; fired on trait nav, probe add/remove, every streamed emit, finalize, clear, and on_mount. No `/why` chat command — selection alone drives the readout.
+
+## utils.py
+
+`build_bar(value, max, width)` renders filled/empty bar pairs. `BAR_WIDTH = 24` used by every bar in the UI (footer token + context, vector alpha, gen-config temp + top-p, trait-panel probes) — one knob controls them all. Vector panel's `RIGHT_W` derives from `BAR_WIDTH` so gen-config right-edge glyph alignment stays correct through any width change.
+
+## Status footer
+
+`chat_panel.update_status`: one-line footer showing dot + optional token progress bar (`gen_tokens / max_new_tokens`, green, only during generation — idle has no target) · tok/s · elapsed · VRAM · **context bar** (`prompt_tokens + gen_tokens` / `max_position_embeddings`, cyan ≤75%, yellow ≥75%, red ≥90%). Context sits on the right.
+
+`_prompt_token_count` is pre-computed in `_start_generation` via `tokenizer.apply_chat_template(history + pending_user_msg, tokenize=True, add_generation_prompt=True)` so the ctx bar reflects the in-flight prompt live, then overwritten at finalize by `session.last_result.prompt_tokens` (authoritative). `_context_window` pulled from `model.config.max_position_embeddings`; missing → context bar hidden. `_last_gen_state` dedupe tuple includes `_prompt_token_count` so the bar refreshes when it changes.
+
+## Panels
+
+**Trait-panel row layout**: two lines per probe — `> <name> [dim]<sparkline>[/]` on line 1 (bold wraps name only when selected), `  <bar> <val:+.2f><arrow>` on line 2 (two-space indent, color from sign of val). Full untruncated names — no fixed column width. Category headers are single lines. `trait_panel._nav_items` is `list[str]`.
+
+**`chat_panel` is Markdown-free**: user + assistant messages are plain `Static` widgets with Rich-escaped text. `_AssistantMessage` holds exactly two content `Static`s (`#thinking-view`, `#response-view`) + a `Collapsible` wrapper for thinking. Tokens escaped once on append into `_escaped_chat_text`/`_escaped_thinking_text` (O(n) total). Per-token probe scores appended live via `append_token_score`; each append clears the markup cache and re-renders if highlighting is on. `set_token_data` runs at finalize to overwrite with canonical projected scores.
+
+Saturation fixed at `_HIGHLIGHT_SAT = 0.5` mapped to full `rgb(0..255, 0, 0)` / `rgb(0, 0..255, 0)`; zero scores get no background span (neutral text stays terminal-default).
+
+**Response-view leading-whitespace strip**: models often emit `\n\n` after `</think>` which would otherwise render as blank rows below the collapsed thinking title; `_render_response` lstrips the plain-text branch and `_build_highlight_markup` skips leading whitespace-only tokens.
+
+Thinking-block CSS overrides Textual's `Collapsible` defaults (`padding-bottom: 1`, `padding-left: 1`, `border-top: hkey`) — set to zero, with `#thinking-block.-collapsed { height: 1 }` so the collapsed block is exactly the title row. Transitions via idempotent `ensure_thinking_collapsed()` (no `_in_thinking`, no `finalize()`, no `end_thinking()`).
