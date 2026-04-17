@@ -668,11 +668,13 @@ class SaklasApp(App):
                 extract_kwargs = {"baseline": baseline, "on_progress": _progress}
                 if sae_release is not None:
                     extract_kwargs["sae"] = sae_release
+                # ``session.extract`` already returns the fully-qualified
+                # canonical name — including the ``:sae-<release>`` suffix
+                # when ``sae=`` was passed. Rebuilding it here would
+                # double-suffix the key and break every downstream
+                # ``/alpha`` / ``/unsteer`` / pole lookup.
                 canonical, profile = self._session.extract(concept, **extract_kwargs)
-                final_name = (
-                    canonical if variant == "raw" else f"{canonical}:{variant}"
-                )
-                on_success(final_name, profile, alpha)
+                on_success(canonical, profile, alpha)
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
 

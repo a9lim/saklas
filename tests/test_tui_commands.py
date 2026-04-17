@@ -516,3 +516,81 @@ def test_parse_steer_sae_no_alpha():
     assert result["concept"] == "honest"
     assert result["alpha"] is None
     assert result["variant"] == "sae"
+
+
+def test_handle_extract_trusts_canonical_from_session(monkeypatch, tmp_path):
+    """Regression: ``session.extract(sae=RELEASE)`` already returns a
+    canonical with the ``:sae-<release>`` suffix. The TUI worker must NOT
+    re-append ``:{variant}`` — doing so produces ``foo:sae-R:sae-R`` and
+    breaks every subsequent ``/alpha`` / ``/unsteer`` / pole lookup.
+
+    Contract: ``session.extract`` owns the final name. The TUI passes it
+    through unchanged.
+    """
+    import torch
+    from saklas.core.profile import Profile
+    from saklas.cli import selectors as _sel
+    # Isolate from user's real pack tree so pole alias resolution is a
+    # no-op on the fabricated name.
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _sel.invalidate()
+
+    app = _make_app()
+
+    # Mock session.extract to return the session-side canonical (suffixed).
+    def _fake_extract(concept, **kwargs):
+        assert kwargs.get("sae") == "gemma-scope-2b-pt-res-canonical"
+        canonical = f"{concept}:sae-gemma-scope-2b-pt-res-canonical"
+        return canonical, Profile({0: torch.zeros(4)})
+    app._session.extract = _fake_extract
+
+    # Run worker inline so we can capture the final registered name.
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    captured: dict = {}
+
+    def _on_success(name, profile, alpha):
+        captured["name"] = name
+
+    app._handle_extract(
+        "honest 0.3", include_alpha=True, on_success=_on_success,
+        variant="sae-gemma-scope-2b-pt-res-canonical",
+    )
+
+    assert "name" in captured, f"worker never called on_success: {_msgs(app)!r}"
+    # The canonical is correct; no double-suffix, no bare unsuffixed name.
+    assert captured["name"] == "honest:sae-gemma-scope-2b-pt-res-canonical"
+    assert ":sae-" in captured["name"]
+    assert captured["name"].count(":sae-") == 1
+
+
+def test_handle_extract_raw_variant_passes_canonical_through(monkeypatch, tmp_path):
+    """Raw (no SAE) path: ``session.extract`` returns the bare canonical."""
+    import torch
+    from saklas.core.profile import Profile
+    from saklas.cli import selectors as _sel
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _sel.invalidate()
+
+    app = _make_app()
+
+    def _fake_extract(concept, **kwargs):
+        assert "sae" not in kwargs
+        return concept, Profile({0: torch.zeros(4)})
+    app._session.extract = _fake_extract
+
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    captured: dict = {}
+
+    def _on_success(name, profile, alpha):
+        captured["name"] = name
+
+    app._handle_extract(
+        "honest 0.3", include_alpha=True, on_success=_on_success, variant="raw",
+    )
+    assert captured["name"] == "honest"
