@@ -12,6 +12,7 @@ import pytest
 from saklas.core.events import EventBus, SteeringApplied, SteeringCleared
 from saklas.core.session import SaklasSession, VectorNotRegisteredError
 from saklas.core.steering import Steering
+from saklas.core.triggers import Trigger
 
 
 class _Stub(SaklasSession):
@@ -24,7 +25,11 @@ class _Stub(SaklasSession):
         self._profiles = dict(profiles)
         self._steering_stack = []
         self.events = EventBus()
+        # Records the alphas-only projection of each rebuild call.  Trigger
+        # info lives on ``_rebuild_entries`` alongside, for trigger-aware
+        # assertions.
         self._rebuild_calls: list[dict[str, float]] = []
+        self._rebuild_entries: list[dict[str, tuple[float, Trigger]]] = []
 
     def _rebuild_steering_hooks(self) -> None:  # type: ignore[override]
         flat = self._flatten_steering_stack()
@@ -32,11 +37,14 @@ class _Stub(SaklasSession):
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-        self._rebuild_calls.append(dict(flat))
+        self._rebuild_entries.append(dict(flat))
+        self._rebuild_calls.append(
+            {name: alpha for name, (alpha, _trig) in flat.items()},
+        )
 
-    def _resolve_pole_aliases(self, alphas):  # type: ignore[override]
+    def _resolve_pole_aliases(self, entries):  # type: ignore[override]
         # Skip the disk-scanning resolver in tests.  Names are assumed canonical.
-        return {k: float(v) for k, v in alphas.items()}
+        return {k: (float(v[0]), v[1]) for k, v in entries.items()}
 
 
 def test_single_scope_push_pop():
@@ -44,7 +52,7 @@ def test_single_scope_push_pop():
     events = []
     s.events.subscribe(events.append)
     with s.steering({"angry.calm": 0.5}):
-        assert s._steering_stack == [{"angry.calm": 0.5}]
+        assert s._steering_stack == [{"angry.calm": (0.5, Trigger.BOTH)}]
     assert s._steering_stack == []
     # Rebuild ran twice: enter (set) and exit (clear).
     assert len(s._rebuild_calls) == 2
@@ -101,7 +109,7 @@ def test_failed_enter_under_outer_scope_preserves_outer():
                 pass
         # Outer scope still in place; rebuild call history ends on the
         # outer alphas (last successful rebuild).
-        assert s._steering_stack == [{"a": 0.3}]
+        assert s._steering_stack == [{"a": (0.3, Trigger.BOTH)}]
         assert s._rebuild_calls[-1] == {"a": 0.3}
     assert s._steering_stack == []
 
@@ -122,6 +130,87 @@ def test_events_reflect_flattened_head():
     assert applied[0].alphas == {"a": 0.3}
     assert applied[1].alphas == {"a": 0.3, "b": 0.1}
     assert applied[2].alphas == {"a": 0.3}
+
+
+def test_steering_with_global_trigger_preserved_in_stack():
+    """Steering(trigger=...) default flows through to the stack entries."""
+    s = _Stub({"a": None})
+    with s.steering(Steering(alphas={"a": 0.3}, trigger=Trigger.AFTER_THINKING)):
+        assert s._steering_stack == [{"a": (0.3, Trigger.AFTER_THINKING)}]
+    assert s._steering_stack == []
+
+
+def test_steering_per_entry_trigger_preserved_in_stack():
+    """Tuple entries in alphas carry their own trigger through the stack."""
+    s = _Stub({"a": None, "b": None})
+    with s.steering({
+        "a": 0.3,
+        "b": (0.4, Trigger.THINKING_ONLY),
+    }):
+        entries = s._steering_stack[0]
+        assert entries["a"] == (0.3, Trigger.BOTH)
+        assert entries["b"] == (0.4, Trigger.THINKING_ONLY)
+
+
+def test_nested_trigger_regimes_compose():
+    """Nested steering scopes with distinct triggers flatten inner-wins."""
+    s = _Stub({"a": None, "b": None})
+    with s.steering(Steering(alphas={"a": 0.3}, trigger=Trigger.BOTH)):
+        with s.steering(Steering(alphas={"b": 0.5}, trigger=Trigger.AFTER_THINKING)):
+            inner = s._rebuild_entries[-1]
+            assert inner["a"] == (0.3, Trigger.BOTH)
+            assert inner["b"] == (0.5, Trigger.AFTER_THINKING)
+        # Exit inner — restore outer entries only.
+        outer = s._rebuild_entries[-1]
+        assert outer == {"a": (0.3, Trigger.BOTH)}
+
+
+def test_steering_applied_event_carries_entries_for_nondefault_triggers():
+    """SteeringApplied.entries is populated when any entry uses non-BOTH."""
+    s = _Stub({"a": None, "b": None})
+    events = []
+    s.events.subscribe(events.append)
+    with s.steering({"a": 0.3}):
+        # All-default triggers → entries=None (backward compat).
+        applied = [e for e in events if isinstance(e, SteeringApplied)][-1]
+        assert applied.alphas == {"a": 0.3}
+        assert applied.entries is None
+    events.clear()
+    with s.steering({"a": 0.3, "b": (0.5, Trigger.AFTER_THINKING)}):
+        applied = [e for e in events if isinstance(e, SteeringApplied)][-1]
+        assert applied.alphas == {"a": 0.3, "b": 0.5}
+        assert applied.entries is not None
+        assert applied.entries["a"] == (0.3, Trigger.BOTH)
+        assert applied.entries["b"] == (0.5, Trigger.AFTER_THINKING)
+
+
+def test_pole_alias_sign_flip_preserves_trigger():
+    """Resolving a bare-pole alias keeps the caller-supplied trigger attached.
+
+    ``_resolve_pole_aliases`` routes through the real implementation here
+    (stub only overrides it in the other tests).  Patching ``resolve_pole``
+    to simulate a ``wolf → deer.wolf@-1`` alias verifies the trigger flows
+    through the sign-flip path.
+    """
+    from saklas.cli import selectors as _sel
+    s = _Stub({"deer.wolf": None})
+    # Drop the stub's override so the real _resolve_pole_aliases runs,
+    # exercising the trigger-through-alias codepath.
+    s._resolve_pole_aliases = SaklasSession._resolve_pole_aliases.__get__(s)
+
+    _orig = _sel.resolve_pole
+    try:
+        def _fake(name, namespace=None):
+            if name == "wolf":
+                return ("deer.wolf", -1, "deer.wolf")
+            return _orig(name, namespace=namespace)
+        _sel.resolve_pole = _fake
+        with s.steering({"wolf": (0.4, Trigger.AFTER_THINKING)}):
+            entries = s._steering_stack[0]
+            # Sign flipped (wolf is the negative pole of deer.wolf).
+            assert entries["deer.wolf"] == (-0.4, Trigger.AFTER_THINKING)
+    finally:
+        _sel.resolve_pole = _orig
 
 
 def test_autoload_cache_hit_registers_bundled_vector(monkeypatch, tmp_path):

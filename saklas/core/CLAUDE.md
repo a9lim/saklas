@@ -20,7 +20,9 @@ Returns a **profile**: `dict[int, Tensor]` covering every layer — no scores di
 
 `SteeringHook` adds a pre-composed vector to hidden states and **unconditionally rescales each position back to its pre-injection norm** (in-place, `torch.linalg.vector_norm(dtype=float32)` to avoid fp16 sum-of-squares overflow at hidden_dim ≥ 2048). No flag, no escape hatch.
 
-`SteeringManager` groups vectors by layer, sums co-layer directions into **one pre-composed hook per active layer**. `add_vector(name, profile, alpha)`. **Flat-scalar apply**: `effective_injection = user_alpha * _STEER_GAIN * sum(baked)` — no per-layer score lookup, no `sum(scores)` division. Preserves layer-count invariance and score-magnitude invariance; both moved from apply-time to extract-time.
+**Trigger grouping (v1.5)**: `recompose` takes `(tensor, alpha, trigger)` triples and groups entries by `Trigger` value. Fast path (single group with `Trigger.BOTH`) collapses to one composed tensor and skips the per-step `.active(ctx)` check, bit-identical to the v1.4 hook. Slow path stores `composed_groups: list[(Trigger, Tensor)]`; `hook_fn` consults each group's trigger against a shared `TriggerContext` and adds only active ones. The norm-preservation rescale wraps the conditional sum, and a pre-check short-circuits the fp32 norm round-trip when no group fires (e.g. `AFTER_THINKING` during prefill).
+
+`SteeringManager` groups vectors by layer, sums co-layer directions into **one pre-composed hook per active layer**. `add_vector(name, profile, alpha, trigger=Trigger.BOTH)`. **Flat-scalar apply**: `effective_injection = user_alpha * _STEER_GAIN * sum(baked)` — no per-layer score lookup, no `sum(scores)` division. Preserves layer-count invariance and score-magnitude invariance; both moved from apply-time to extract-time. Manager owns the per-generation `TriggerContext`; `generate_steered` mutates its `is_prefill` / `thinking` / `gen_step` fields before each forward pass.
 
 `_STEER_GAIN = 3.5` calibrated on gemma-4-31b-it. Coherent band α ≈ 0.2–0.6, cliff α ≈ 0.75. Cliff transfers within ±0.1α across architectures; smaller/MoE/safety-trained models may need proportionally higher α.
 

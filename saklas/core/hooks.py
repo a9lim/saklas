@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from saklas.core.triggers import Trigger, TriggerContext
+
 
 class HiddenCapture:
     """Accumulates the last-position hidden state at each hooked layer on every
@@ -64,57 +66,136 @@ class HiddenCapture:
 
 
 class SteeringHook:
-    """Pre-composed steering vector for a single layer."""
+    """Pre-composed steering vectors for a single layer, grouped by trigger.
+
+    Fast path (``Trigger.BOTH`` only): a single composed tensor is added
+    unconditionally at hook time, matching the v1.x behavior bit-for-bit.
+
+    Slow path (any non-``BOTH`` trigger): entries are grouped by trigger
+    equality into ``composed_groups``; each group has its own pre-composed
+    tensor. At hook time, only groups whose ``trigger.active(ctx)`` returns
+    True contribute, and the norm-preservation rescale wraps the conditional
+    sum. Groups that would sum to zero are dropped at recompose time so the
+    hot path never pays for dead weight.
+    """
 
     def __init__(self) -> None:
+        # Populated on the fast path (BOTH only). Mutually exclusive with
+        # ``composed_groups`` — recompose sets exactly one of them.
         self.composed: torch.Tensor | None = None
+        # Slow path: list of (trigger, composed_tensor) pairs. Iterated per
+        # hook call; each group's trigger is consulted against ``_ctx``.
+        self.composed_groups: list[tuple[Trigger, torch.Tensor]] = []
+        # Shared mutable context threaded in by SteeringManager.  Read-only
+        # from the hook's perspective; the generation loop mutates fields.
+        self._ctx: TriggerContext | None = None
         self._handle = None
 
     def recompose(
         self,
-        vectors: list[tuple[torch.Tensor, float]],
+        entries: list[tuple[torch.Tensor, float, Trigger]],
         device: torch.device,
         dtype: torch.dtype,
+        ctx: TriggerContext,
     ) -> None:
-        """Pre-compose all vectors for this layer into a single tensor.
+        """Pre-compose per-trigger groups of steering vectors for this layer.
 
-        ``vectors`` is a list of ``(baked_direction, effective_alpha)`` pairs;
-        multiple entries occur when several named profiles contribute to the
-        same layer (different alphas) and are summed linearly.
+        ``entries`` is a list of ``(baked_direction, effective_alpha,
+        trigger)`` triples; entries sharing a trigger value (dataclass
+        equality) collapse into one composed tensor.  ``ctx`` is the
+        shared per-generation TriggerContext mutated by the generation
+        loop and read here at hook-fire time.
         """
-        if not vectors:
+        self._ctx = ctx
+        if not entries:
             self.composed = None
+            self.composed_groups = []
             return
-        # All-zero alphas → no perturbation; skip the matmul so that
-        # 0 * NaN (from a bad extraction) doesn't inject NaN into hooks.
-        if all(alpha == 0.0 for _, alpha in vectors):
+
+        # Group by trigger value (Trigger is a frozen dataclass, hashable).
+        # Preserve the first-seen trigger instance per group so equality-
+        # equivalent but distinct Trigger objects still share storage.
+        groups: dict[Trigger, list[tuple[torch.Tensor, float]]] = {}
+        for vec, alpha, trig in entries:
+            groups.setdefault(trig, []).append((vec, alpha))
+
+        composed_groups: list[tuple[Trigger, torch.Tensor]] = []
+        for trig, vecs in groups.items():
+            # All-zero alphas → group contributes nothing; skip the matmul
+            # so that a stale entry with alpha=0 doesn't inject NaN on any
+            # bad-extraction vectors it carries.
+            if all(alpha == 0.0 for _, alpha in vecs):
+                continue
+            stacked = torch.stack(
+                [v.to(device=device, dtype=dtype) for v, _ in vecs]
+            )
+            alphas_t = torch.tensor(
+                [alpha for _, alpha in vecs], device=device, dtype=dtype,
+            )
+            composed = (alphas_t.unsqueeze(1) * stacked).sum(dim=0)
+            composed_groups.append((trig, composed))
+
+        if not composed_groups:
             self.composed = None
+            self.composed_groups = []
             return
-        stacked = torch.stack(
-            [vec.to(device=device, dtype=dtype) for vec, _ in vectors]
-        )
-        alphas = torch.tensor([alpha for _, alpha in vectors], device=device, dtype=dtype)
-        self.composed = (alphas.unsqueeze(1) * stacked).sum(dim=0)
+
+        # Fast-path collapse: all contributions use Trigger.BOTH (or an
+        # equality-equivalent default Trigger()).  One tensor, no per-step
+        # .active() check, bit-for-bit identical to the v1.x hook.
+        if len(composed_groups) == 1 and composed_groups[0][0] == Trigger.BOTH:
+            self.composed = composed_groups[0][1]
+            self.composed_groups = []
+        else:
+            self.composed = None
+            self.composed_groups = composed_groups
 
     def hook_fn(self, module, input, output):
-        if self.composed is None:
+        # Fast path: bit-identical to v1.x — single composed tensor, no
+        # trigger check, unconditional norm preservation.
+        if self.composed is not None:
+            hidden = output if isinstance(output, torch.Tensor) else output[0]
+            norm_pre = torch.linalg.vector_norm(
+                hidden, dim=-1, keepdim=True, dtype=torch.float32,
+            )
+            hidden.add_(self.composed)
+            norm_post = torch.linalg.vector_norm(
+                hidden, dim=-1, keepdim=True, dtype=torch.float32,
+            ).clamp_(min=1e-6)
+            hidden.mul_((norm_pre / norm_post).to(hidden.dtype))
             return output
+
+        # Slow path: trigger-gated groups. Pre-check whether any group
+        # fires this step — if none do, skip the norm capture entirely.
+        groups = self.composed_groups
+        if not groups:
+            return output
+        ctx = self._ctx
+        # ctx should always be non-None when composed_groups is populated
+        # (SteeringManager.apply_to_model threads it in via recompose),
+        # but defend against a stale-handle case by treating missing ctx
+        # as "no triggers fire" rather than panicking in the hot path.
+        if ctx is None:
+            return output
+
+        # First pass: does anything fire? Cheap — a handful of int compares
+        # per group, no tensor work. Saves the fp32 norm round-trip when
+        # no group is currently active (e.g. AFTER_THINKING during prefill).
+        any_active = False
+        for trig, _ in groups:
+            if trig.active(ctx):
+                any_active = True
+                break
+        if not any_active:
+            return output
+
         hidden = output if isinstance(output, torch.Tensor) else output[0]
-        # Norm preservation: rescale each position back to its pre-injection
-        # magnitude after adding the steering vector.  Keeps the residual
-        # stream norm on its natural trajectory, which prevents the
-        # "crank alpha → logit explosion → gibberish" failure mode at high
-        # user alpha.  Per-token in the unmodified add step, so only the
-        # magnitude is clamped — the direction still moves toward the
-        # steering pole proportionally to alpha.
-        #
-        # vector_norm(dtype=fp32) upcasts the accumulator without
-        # materializing an fp32 copy of the hidden tensor, which matters
-        # at hidden_dim >= 2048 where fp16 sum-of-squares overflows.
         norm_pre = torch.linalg.vector_norm(
             hidden, dim=-1, keepdim=True, dtype=torch.float32,
         )
-        hidden.add_(self.composed)
+        for trig, composed in groups:
+            if trig.active(ctx):
+                hidden.add_(composed)
         norm_post = torch.linalg.vector_norm(
             hidden, dim=-1, keepdim=True, dtype=torch.float32,
         ).clamp_(min=1e-6)
@@ -165,21 +246,31 @@ _STEER_GAIN = 3.5
 
 
 class SteeringManager:
-    """Manages multiple SteeringHooks across model layers."""
+    """Manages multiple SteeringHooks across model layers.
+
+    Owns the per-generation :class:`TriggerContext` consumed by every
+    attached :class:`SteeringHook`.  The generation loop mutates the
+    context's fields at lifecycle boundaries (prefill → decode, thinking
+    transitions, per-step counter); hooks read them to decide which
+    trigger-gated groups contribute at each forward.
+    """
 
     def __init__(self) -> None:
         self.hooks: dict[int, SteeringHook] = {}
         self.vectors: dict[str, dict] = {}
+        self.ctx: TriggerContext = TriggerContext()
 
     def add_vector(
         self,
         name: str,
         profile: dict[int, torch.Tensor],
         alpha: float,
+        trigger: Trigger = Trigger.BOTH,
     ) -> None:
         self.vectors[name] = {
             "profile": profile,
             "alpha": alpha,
+            "trigger": trigger,
         }
 
     def apply_to_model(
@@ -189,11 +280,14 @@ class SteeringManager:
         dtype: torch.dtype,
     ) -> None:
         """Group vectors by layer, recompose hooks, attach to model."""
-        by_layer: dict[int, list[tuple[torch.Tensor, float]]] = {}
+        by_layer: dict[int, list[tuple[torch.Tensor, float, Trigger]]] = {}
         for v in self.vectors.values():
             effective_alpha = v["alpha"] * _STEER_GAIN
+            trigger = v.get("trigger", Trigger.BOTH)
             for layer_idx, vec in v["profile"].items():
-                by_layer.setdefault(layer_idx, []).append((vec, effective_alpha))
+                by_layer.setdefault(layer_idx, []).append(
+                    (vec, effective_alpha, trigger),
+                )
 
         # Detach hooks for layers that no longer have vectors
         for idx in list(self.hooks):
@@ -202,13 +296,13 @@ class SteeringManager:
                 del self.hooks[idx]
 
         # Recompose and attach for each active layer
-        for idx, pairs in by_layer.items():
+        for idx, entries in by_layer.items():
             if idx not in self.hooks:
                 hook = SteeringHook()
                 hook.attach(model_layers[idx])
                 self.hooks[idx] = hook
 
-            self.hooks[idx].recompose(pairs, device, dtype)
+            self.hooks[idx].recompose(entries, device, dtype, self.ctx)
 
     def clear_all(self) -> None:
         """Detach all hooks and clear vectors."""
@@ -216,4 +310,3 @@ class SteeringManager:
             hook.detach()
         self.hooks.clear()
         self.vectors.clear()
-

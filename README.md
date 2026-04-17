@@ -93,6 +93,26 @@ Alphas are backbone-normalized: per-layer PCA shares are baked into the tensor m
 
 Multiple vectors compose. Register them all, pass whatever alpha map you want per call; co-layer directions sum into a single in-place hook per layer.
 
+By default steering fires on every token — prompt prefill, thinking section, response. A `Trigger` narrows that window. Pass one as a per-call default, or attach a different trigger per concept in the same call:
+
+```python
+from saklas import Steering, Trigger
+
+# Steer only the response, never the prompt or the thinking section
+session.generate("...", steering=Steering(
+    alphas={"warm": 0.4},
+    trigger=Trigger.AFTER_THINKING,
+))
+
+# Mix regimes per concept
+session.generate("...", steering=Steering(alphas={
+    "honest": 0.3,                              # default trigger (everywhere)
+    "warm":   (0.4, Trigger.AFTER_THINKING),    # per-entry override
+}))
+```
+
+Presets cover the common cases (`BOTH`, `GENERATED_ONLY`, `PROMPT_ONLY`, `AFTER_THINKING`, `THINKING_ONLY`); `Trigger.first(n)` and `Trigger.after(n)` give you a windowed application by generation step; constructing the dataclass directly handles arbitrary regimes. When every entry uses `Trigger.BOTH` the hook path collapses to the v1.4 fast path, so default generations pay nothing for the machinery.
+
 ### Custom concepts
 
 When you steer on something not in the library, the loaded model writes its own contrastive pairs. It first sketches 9 broad situational domains for the axis (for `deer.wolf`: "predation and threat assessment", "territorial defense", etc.), then samples 5 first-person contrastive pairs per domain. An anti-allegory clause in the prompt keeps non-human axes literal, so `deer.wolf` yields sensory-animal POV rather than timid-person-vs-aggressive-person. Human-register axes still land in human-register domains because the framework is concept-adaptive.

@@ -34,6 +34,7 @@ from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent, ProbeReadings
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
+from saklas.core.triggers import Trigger
 from saklas.core.vectors import (
     extract_contrastive,
     save_profile as _save_profile,
@@ -106,17 +107,25 @@ class VectorNotRegisteredError(KeyError, SaklasError):
 class _SteeringContext:
     """Context manager returned by SaklasSession.steering().
 
-    Pushes an alphas dict onto ``session._steering_stack`` on ``__enter__``
+    Pushes an entries dict onto ``session._steering_stack`` on ``__enter__``
     and pops it on ``__exit__``.  Rebuilds hooks from the flattened stack
     head so nested scopes compose: inner entries overwrite outer entries
     for the duration of the inner scope, then the outer entry is restored.
+
+    The stored ``_entries`` is the post-resolution entries form — each
+    value is ``(alpha, Trigger)``.  Bare-alpha inputs to the public
+    ``steering()`` API are normalized before we get here.
     """
 
-    __slots__ = ("_session", "_alphas", "_entered")
+    __slots__ = ("_session", "_entries", "_entered")
 
-    def __init__(self, session: "SaklasSession", alphas: dict[str, float]) -> None:
+    def __init__(
+        self,
+        session: "SaklasSession",
+        entries: dict[str, tuple[float, Trigger]],
+    ) -> None:
         self._session = session
-        self._alphas = alphas
+        self._entries = entries
         self._entered = False
 
     def __enter__(self) -> "_SteeringContext":
@@ -124,7 +133,7 @@ class _SteeringContext:
         # raises (e.g. VectorNotRegisteredError).  __enter__ only flips
         # `_entered=True` AFTER a clean push so a mid-__enter__ failure leaves
         # no stale state for __exit__ to pop.
-        self._session._push_steering(self._alphas)
+        self._session._push_steering(self._entries)
         self._entered = True
         return self
 
@@ -204,10 +213,13 @@ class SaklasSession:
 
         # Transient steering manager — used only during generation
         self._steering = SteeringManager()
-        # LIFO stack of per-scope alpha dicts pushed by session.steering().
-        # The flattened head (later entries overwrite earlier ones) is what
-        # _apply_steering installs when a generation begins.
-        self._steering_stack: list[dict[str, float]] = []
+        # LIFO stack of per-scope entries dicts pushed by session.steering().
+        # Each entry is ``{name: (alpha, Trigger)}`` — triggers are
+        # preserved through stack flattening so nested scopes with
+        # different trigger regimes compose cleanly.  The flattened head
+        # (later entries overwrite earlier ones) is what the steering
+        # manager installs when a generation begins.
+        self._steering_stack: list[dict[str, tuple[float, Trigger]]] = []
 
         # Synchronous event bus.  Emits on extraction, steering enter/exit,
         # probe scoring, generation start/finish.  Subscribers run on the
@@ -988,7 +1000,7 @@ class SaklasSession:
         self._profiles.pop(name, None)
 
     def steering(
-        self, alphas: "Steering | dict[str, float]",
+        self, alphas: "Steering | dict[str, float | tuple[float, Trigger]]",
     ) -> "_SteeringContext":
         """Context manager applying steering for the duration of a with-block.
 
@@ -999,20 +1011,28 @@ class SaklasSession:
         and the outer entry is restored on ``__exit__``.  One hook
         installation per active layer regardless of nesting depth.
 
+        Bare dicts may carry ``(alpha, Trigger)`` tuples as values for
+        per-entry trigger overrides; bare floats inherit ``Trigger.BOTH``.
+        Passing a full ``Steering`` uses its ``trigger`` field as the
+        default for bare-float entries.
+
         Unknown vector names raise ``VectorNotRegisteredError``; genuinely
         ambiguous pole names propagate ``AmbiguousSelectorError``.
         """
+        # Normalize to entries form (dict[str, (float, Trigger)]) up front.
+        # All downstream stack / rebuild / event machinery speaks entries,
+        # so the single coercion happens here and nowhere else.
         if isinstance(alphas, Steering):
-            raw_alphas = dict(alphas.alphas)
+            raw_entries = alphas.normalized_entries()
         else:
-            raw_alphas = dict(alphas)
-        resolved = self._resolve_pole_aliases(raw_alphas)
+            raw_entries = Steering(alphas=dict(alphas)).normalized_entries()
+        resolved = self._resolve_pole_aliases(raw_entries)
         return _SteeringContext(self, resolved)
 
     def _resolve_pole_aliases(
-        self, alphas: dict[str, float],
-    ) -> dict[str, float]:
-        """Apply pole-alias resolution + sign flipping to an alphas dict.
+        self, entries: dict[str, tuple[float, Trigger]],
+    ) -> dict[str, tuple[float, Trigger]]:
+        """Apply pole-alias resolution + sign flipping to an entries dict.
 
         Wrapped around ``cli_selectors.resolve_pole`` so CLI / server / TUI
         all share the single resolver site.  Names already matching a
@@ -1025,13 +1045,20 @@ class SaklasSession:
         into ``self._profiles`` inline.  This is cache-hit only — no PCA
         extraction, no network, no surprise latency.  Missing tensors fall
         through to the existing ``VectorNotRegisteredError`` path.
+
+        **Trigger under alias collision**: when two aliased entries resolve
+        to the same canonical name (e.g. ``deer`` and ``wolf`` both landing
+        on ``deer.wolf``), their alphas sum (sign-flipped per pole) and
+        the trigger of the *last* collision partner is kept.  This is
+        rare — users who want divergent triggers per pole should pre-
+        resolve to canonical and pass distinct entries.
         """
         from saklas.cli.selectors import resolve_pole
 
-        out: dict[str, float] = {}
-        for name, alpha in alphas.items():
+        out: dict[str, tuple[float, Trigger]] = {}
+        for name, (alpha, trig) in entries.items():
             if name in self._profiles:
-                out[name] = float(alpha)
+                out[name] = (float(alpha), trig)
                 continue
             try:
                 canonical, sign, _match = resolve_pole(name)
@@ -1039,15 +1066,16 @@ class SaklasSession:
                 # Let the caller see it at hook-install time via
                 # VectorNotRegisteredError for consistency with bare dict
                 # callers that never went through a context manager.
-                out[name] = float(alpha)
+                out[name] = (float(alpha), trig)
                 continue
             if canonical not in self._profiles:
                 self._try_autoload_vector(canonical)
             effective = float(alpha) * (1 if sign >= 0 else -1)
             if canonical in self._profiles:
-                out[canonical] = out.get(canonical, 0.0) + effective
+                prev_alpha = out.get(canonical, (0.0, trig))[0]
+                out[canonical] = (prev_alpha + effective, trig)
             else:
-                out[name] = float(alpha)
+                out[name] = (float(alpha), trig)
         return out
 
     def _try_autoload_vector(self, canonical: str) -> None:
@@ -1076,21 +1104,23 @@ class SaklasSession:
             self._profiles[canonical] = self._promote_profile(profile_dict)
             return
 
-    def _push_steering(self, alphas: dict[str, float]) -> None:
-        """Push an alphas dict onto the steering stack and rebuild hooks.
+    def _push_steering(
+        self, entries: dict[str, tuple[float, Trigger]],
+    ) -> None:
+        """Push an entries dict onto the steering stack and rebuild hooks.
 
         If ``_rebuild_steering_hooks`` raises (e.g. an unknown vector name
         hits ``VectorNotRegisteredError``) the just-pushed entry is rolled
         back before the exception propagates, so the stack is never left
         with stale half-committed state.
         """
-        self._steering_stack.append(dict(alphas))
+        self._steering_stack.append(dict(entries))
         try:
             self._rebuild_steering_hooks()
         except BaseException:
             self._steering_stack.pop()
             raise
-        self.events.emit(SteeringApplied(alphas=dict(self._flatten_steering_stack())))
+        self._emit_steering_applied()
 
     def _pop_steering(self) -> None:
         """Pop the top of the steering stack and rebuild hooks."""
@@ -1101,13 +1131,26 @@ class SaklasSession:
         if not self._steering_stack:
             self.events.emit(SteeringCleared())
         else:
-            self.events.emit(
-                SteeringApplied(alphas=dict(self._flatten_steering_stack())),
-            )
+            self._emit_steering_applied()
 
-    def _flatten_steering_stack(self) -> dict[str, float]:
-        """Collapse the LIFO stack into a single alphas dict (later wins)."""
-        flat: dict[str, float] = {}
+    def _emit_steering_applied(self) -> None:
+        """Emit SteeringApplied with both alphas-only + full entries.
+
+        ``alphas`` keeps the v1.x flat ``{name: alpha}`` shape for
+        subscribers that never needed triggers.  ``entries`` carries the
+        full ``{name: (alpha, trigger)}`` mapping for trigger-aware
+        subscribers (set to ``None`` when every entry uses
+        ``Trigger.BOTH`` so old subscribers see a normal-looking event).
+        """
+        flat = self._flatten_steering_stack()
+        alphas_only = {name: alpha for name, (alpha, _trig) in flat.items()}
+        non_default = any(trig != Trigger.BOTH for _, trig in flat.values())
+        entries = dict(flat) if non_default else None
+        self.events.emit(SteeringApplied(alphas=alphas_only, entries=entries))
+
+    def _flatten_steering_stack(self) -> dict[str, tuple[float, Trigger]]:
+        """Collapse the LIFO stack into a single entries dict (later wins)."""
+        flat: dict[str, tuple[float, Trigger]] = {}
         for entry in self._steering_stack:
             flat.update(entry)
         return flat
@@ -1118,19 +1161,24 @@ class SaklasSession:
         Called on every push/pop.  When the stack is empty this is a clean
         ``clear_all``.  One hook installation per active layer regardless
         of nesting depth — ``SteeringManager.apply_to_model`` composes
-        per-layer vectors internally.
+        per-layer vectors internally and groups entries by trigger within
+        each layer.
         """
         flat = self._flatten_steering_stack()
         self._steering.clear_all()
         if not flat:
             return
-        for name, alpha in flat.items():
+        for name, (alpha, trigger) in flat.items():
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-            self._steering.add_vector(name, self._profiles[name], alpha)
+            self._steering.add_vector(
+                name, self._profiles[name], alpha, trigger,
+            )
         self._steering.apply_to_model(self._layers, self._device, self._dtype)
 
-    def _apply_steering(self, alphas: dict[str, float]) -> None:
+    def _apply_steering(
+        self, entries: dict[str, tuple[float, Trigger]],
+    ) -> None:
         """Compose and attach steering hooks for a generation call.
 
         Must be called inside a ``_gen_active`` span (entry points set
@@ -1138,10 +1186,12 @@ class SaklasSession:
         in depth against a rogue caller re-entering outside a gen span.
         """
         self._steering.clear_all()
-        for name, alpha in alphas.items():
+        for name, (alpha, trigger) in entries.items():
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-            self._steering.add_vector(name, self._profiles[name], alpha)
+            self._steering.add_vector(
+                name, self._profiles[name], alpha, trigger,
+            )
         self._steering.apply_to_model(self._layers, self._device, self._dtype)
 
     def _clear_steering(self) -> None:
@@ -1426,8 +1476,20 @@ class SaklasSession:
         steering_cm = None
         if steering_obj is not None and steering_obj.alphas:
             steering_cm = self.steering(steering_obj)
-        vector_snapshot = (
-            dict(self._flatten_steering_stack())
+
+        def _snapshot_alphas() -> dict[str, float]:
+            """Project the flattened stack to the alphas-only shape that
+            ``GenerationResult.vectors`` has always carried.  Triggers are
+            stripped here — the public result object stays backward-compatible
+            for subscribers that only want ``{name: alpha}``."""
+            return {
+                name: alpha
+                for name, (alpha, _trig)
+                in self._flatten_steering_stack().items()
+            }
+
+        vector_snapshot: dict[str, float] = (
+            _snapshot_alphas()
             if self._steering_stack or steering_cm is not None
             else {}
         )
@@ -1439,11 +1501,15 @@ class SaklasSession:
                 input, raw, use_thinking_req, stateless=stateless,
             )
             # Refresh snapshot now that steering is pushed (first-scope case).
-            vector_snapshot = dict(self._flatten_steering_stack())
+            vector_snapshot = _snapshot_alphas()
 
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             self._begin_capture()
             self._monitor.begin_live()
+            # Reset the steering manager's TriggerContext for this generation.
+            # ``generate_steered`` mutates it at lifecycle boundaries; hooks
+            # read it on each forward.
+            self._steering.ctx.reset()
             try:
                 start = time.monotonic()
                 generated_ids = generate_steered(
@@ -1454,6 +1520,7 @@ class SaklasSession:
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
                     logprobs=lp_count,
+                    trigger_ctx=self._steering.ctx,
                 )
                 elapsed = time.monotonic() - start
             finally:

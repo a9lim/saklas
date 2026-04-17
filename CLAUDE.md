@@ -56,7 +56,7 @@ Selector grammar (shared): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`,
 ## Python API (v2.0)
 
 ```python
-from saklas import SaklasSession, SamplingConfig, Steering, Profile
+from saklas import SaklasSession, SamplingConfig, Steering, Trigger, Profile
 from saklas import SaklasError, EventBus, SteeringApplied, ProbeScored
 
 with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as session:
@@ -72,6 +72,16 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 
     with session.steering({"wolf": 0.5}):              # resolves to deer.wolf @ -0.5
         result = session.generate("Describe a forest.")
+
+    # Token-window triggers: per-Steering default or per-entry override.
+    # Tuple value in alphas overrides the default trigger for that entry.
+    result = session.generate(
+        "Solve this, then answer politely.",
+        steering=Steering(alphas={
+            "honest": 0.3,                             # BOTH (default)
+            "warm":   (0.4, Trigger.AFTER_THINKING),   # per-entry
+        }),
+    )
 
     for tok in session.generate_stream("Tell me a story.", steering={name: 0.2}):
         print(f"[think] {tok.text}" if tok.thinking else tok.text, end="", flush=True)

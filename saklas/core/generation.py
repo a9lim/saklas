@@ -9,6 +9,8 @@ from typing import Callable
 
 import torch
 
+from saklas.core.triggers import TriggerContext
+
 
 class _ThinkState(IntEnum):
     IDLE = 0
@@ -379,6 +381,7 @@ def generate_steered(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     logprobs: int | None = None,
+    trigger_ctx: TriggerContext | None = None,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -473,6 +476,18 @@ def generate_steered(
                 if state.stop_requested.is_set():
                     state.finish_reason = "stop"
                     break
+
+                # Update the shared TriggerContext read by steering hooks.
+                # ``prefill`` is the per-iter flag cleared after the first
+                # model call; ``tstate`` is the thinking-state machine from
+                # the previous iteration's bookkeeping; ``gen_step`` is the
+                # raw token position the upcoming forward will produce.
+                # Three attribute writes per step — below the noise floor
+                # of the forward pass that follows.
+                if trigger_ctx is not None:
+                    trigger_ctx.is_prefill = prefill
+                    trigger_ctx.thinking = (tstate == _ThinkState.THINKING)
+                    trigger_ctx.gen_step = len(generated_ids)
 
                 outputs = model(
                     input_ids=current_input,
