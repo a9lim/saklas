@@ -1032,26 +1032,15 @@ class SaklasSession:
     def _resolve_pole_aliases(
         self, entries: dict[str, tuple[float, Trigger]],
     ) -> dict[str, tuple[float, Trigger]]:
-        """Apply pole-alias resolution + sign flipping to an entries dict.
+        """Apply pole-alias resolution + sign flipping + variant routing.
 
-        Wrapped around ``cli_selectors.resolve_pole`` so CLI / server / TUI
-        all share the single resolver site.  Names already matching a
-        registered vector pass through unchanged — pre-resolved canonical
-        names are always honored verbatim.
+        Returned keys carry the full variant-qualified name:
+        ``canonical`` for raw, ``f"{canonical}:{variant}"`` otherwise. Autoload
+        is variant-aware — ``honest:sae`` will look for a ``_sae-*`` tensor
+        file, not the raw one.
 
-        Auto-loads cached tensors for bundled / installed concept packs on
-        first reference: if ``canonical`` names an installed concept with
-        a tensor file already on disk for this model, the tensor is loaded
-        into ``self._profiles`` inline.  This is cache-hit only — no PCA
-        extraction, no network, no surprise latency.  Missing tensors fall
-        through to the existing ``VectorNotRegisteredError`` path.
-
-        **Trigger under alias collision**: when two aliased entries resolve
-        to the same canonical name (e.g. ``deer`` and ``wolf`` both landing
-        on ``deer.wolf``), their alphas sum (sign-flipped per pole) and
-        the trigger of the *last* collision partner is kept.  This is
-        rare — users who want divergent triggers per pole should pre-
-        resolve to canonical and pass distinct entries.
+        Names already in ``self._profiles`` pass through verbatim — a caller
+        who pre-registered under a specific key stays addressed by that key.
         """
         from saklas.cli.selectors import resolve_pole
 
@@ -1061,19 +1050,24 @@ class SaklasSession:
                 out[name] = (float(alpha), trig)
                 continue
             try:
-                canonical, sign, _match, _variant = resolve_pole(name)
+                canonical, sign, _match, variant = resolve_pole(name)
             except Exception:
-                # Let the caller see it at hook-install time via
-                # VectorNotRegisteredError for consistency with bare dict
-                # callers that never went through a context manager.
                 out[name] = (float(alpha), trig)
                 continue
-            if canonical not in self._profiles:
-                self._try_autoload_vector(canonical)
+            registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
+            if registry_key not in self._profiles:
+                try:
+                    self._try_autoload_vector(canonical, variant=variant)
+                except Exception:
+                    # Autoload may raise AmbiguousVariantError / UnknownVariantError.
+                    # Keep the user's original name in `out` so the error surfaces
+                    # at hook-install time with a clear message.
+                    out[name] = (float(alpha), trig)
+                    continue
             effective = float(alpha) * (1 if sign >= 0 else -1)
-            if canonical in self._profiles:
-                prev_alpha = out.get(canonical, (0.0, trig))[0]
-                out[canonical] = (prev_alpha + effective, trig)
+            if registry_key in self._profiles:
+                prev_alpha = out.get(registry_key, (0.0, trig))[0]
+                out[registry_key] = (prev_alpha + effective, trig)
             else:
                 out[name] = (float(alpha), trig)
         return out

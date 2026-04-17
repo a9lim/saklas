@@ -732,3 +732,137 @@ def test_autoload_raw_default_is_silent_on_miss(tmp_path, monkeypatch):
     # No concept installed at all; no error, no population.
     S.SaklasSession._try_autoload_vector(sess, "nonexistent")
     assert sess._profiles == {}
+
+
+def test_steering_resolves_sae_variant_key(tmp_path, monkeypatch):
+    """`session.steering({'honest:sae': 0.3})` registers under canonical:sae."""
+    import json
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    save_file({"layer_0": torch.zeros(4)}, str(folder / "m_sae-mock.safetensors"))
+    (folder / "m_sae-mock.json").write_text(json.dumps({
+        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+    }))
+
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    from saklas.core.triggers import Trigger
+    from saklas.core import session as S
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        _try_autoload_vector = S.SaklasSession._try_autoload_vector
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    entries = {"honest:sae": (0.3, Trigger.BOTH)}
+    out = S.SaklasSession._resolve_pole_aliases(sess, entries)
+
+    # Registered (and returned) under canonical:sae
+    assert "honest.deceptive:sae" in out
+    assert out["honest.deceptive:sae"][0] == pytest.approx(0.3)
+    assert out["honest.deceptive:sae"][1] == Trigger.BOTH
+
+
+def test_steering_variant_with_pole_sign_flip(tmp_path, monkeypatch):
+    """A pole-aliased name with :sae variant still gets its sign flipped."""
+    import json
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    folder = tmp_path / "vectors" / "default" / "deer.wolf"
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": "deer.wolf", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    save_file({"layer_0": torch.zeros(4)}, str(folder / "m_sae-mock.safetensors"))
+    (folder / "m_sae-mock.json").write_text(json.dumps({
+        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+    }))
+
+    from saklas.cli.selectors import invalidate
+    invalidate()
+    from saklas.core.triggers import Trigger
+    from saklas.core import session as S
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        _try_autoload_vector = S.SaklasSession._try_autoload_vector
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    # "wolf" resolves to "deer.wolf" with sign=-1; variant :sae is preserved.
+    entries = {"wolf:sae": (0.5, Trigger.BOTH)}
+    out = S.SaklasSession._resolve_pole_aliases(sess, entries)
+
+    assert "deer.wolf:sae" in out
+    # sign is flipped — user asked for wolf +0.5 so effective is -0.5 on deer.wolf
+    assert out["deer.wolf:sae"][0] == pytest.approx(-0.5)
+
+
+def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
+    """Same canonical, two variants in one steering dict → two distinct keys."""
+    import json
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    folder.mkdir(parents=True)
+    (folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    save_file({"layer_0": torch.zeros(4)}, str(folder / "m.safetensors"))
+    (folder / "m.json").write_text(json.dumps({
+        "format_version": 2, "method": "contrastive_pca", "saklas_version": "t",
+    }))
+    save_file({"layer_0": torch.zeros(4)}, str(folder / "m_sae-mock.safetensors"))
+    (folder / "m_sae-mock.json").write_text(json.dumps({
+        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+    }))
+
+    from saklas.cli.selectors import invalidate
+    invalidate()
+    from saklas.core.triggers import Trigger
+    from saklas.core import session as S
+
+    class StubSession:
+        model_id = "m"
+        _profiles: dict = {}
+        _try_autoload_vector = S.SaklasSession._try_autoload_vector
+        def _promote_profile(self, p):
+            return p
+
+    sess = StubSession()
+    entries = {
+        "honest.deceptive": (0.3, Trigger.BOTH),
+        "honest.deceptive:sae": (0.2, Trigger.BOTH),
+    }
+    out = S.SaklasSession._resolve_pole_aliases(sess, entries)
+
+    assert "honest.deceptive" in out
+    assert "honest.deceptive:sae" in out
+    assert out["honest.deceptive"][0] == pytest.approx(0.3)
+    assert out["honest.deceptive:sae"][0] == pytest.approx(0.2)
