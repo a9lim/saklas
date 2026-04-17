@@ -383,3 +383,79 @@ def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):
     assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").read_text() == "{}"
 
 
+def test_variants_for_concept_raw_and_sae(tmp_path):
+    """enumerate_variants returns both raw and sae-* tensors in a folder."""
+    from saklas.io.packs import enumerate_variants
+
+    folder = tmp_path / "honest.deceptive"
+    folder.mkdir()
+    # Raw
+    (folder / "google__gemma-2-2b-it.safetensors").write_bytes(b"")
+    (folder / "google__gemma-2-2b-it.json").write_text("{}")
+    # SAE
+    (folder / "google__gemma-2-2b-it_sae-gemma-scope-2b-pt-res-canonical.safetensors").write_bytes(b"")
+    (folder / "google__gemma-2-2b-it_sae-gemma-scope-2b-pt-res-canonical.json").write_text("{}")
+    # Different model — must be excluded
+    (folder / "mistralai__ministral-8b.safetensors").write_bytes(b"")
+
+    result = enumerate_variants(folder, "google/gemma-2-2b-it")
+    assert set(result.keys()) == {"raw", "sae-gemma-scope-2b-pt-res-canonical"}
+    assert result["raw"].name == "google__gemma-2-2b-it.safetensors"
+    assert result["sae-gemma-scope-2b-pt-res-canonical"].name.endswith(
+        "_sae-gemma-scope-2b-pt-res-canonical.safetensors"
+    )
+
+
+def test_enumerate_variants_empty_folder(tmp_path):
+    from saklas.io.packs import enumerate_variants
+    folder = tmp_path / "empty"
+    folder.mkdir()
+    assert enumerate_variants(folder, "google/gemma-2-2b-it") == {}
+
+
+def test_enumerate_variants_nonexistent_folder(tmp_path):
+    from saklas.io.packs import enumerate_variants
+    # Non-existent folder returns empty dict (not an error).
+    assert enumerate_variants(tmp_path / "does-not-exist", "any/model") == {}
+
+
+def test_save_profile_writes_sae_sidecar_fields(tmp_path):
+    """save_profile with sae metadata writes sae_release/sae_ids_by_layer to sidecar."""
+    import json
+    import torch
+    from saklas.core.vectors import save_profile
+
+    profile = {3: torch.zeros(4), 7: torch.zeros(4)}
+    target = tmp_path / "x_sae-mock.safetensors"
+    save_profile(profile, str(target), {
+        "method": "pca_center_sae",
+        "sae_release": "mock-release",
+        "sae_revision": None,
+        "sae_ids_by_layer": {"3": "layer_3/mock", "7": "layer_7/mock"},
+    })
+
+    with open(tmp_path / "x_sae-mock.json") as f:
+        sidecar = json.load(f)
+    assert sidecar["method"] == "pca_center_sae"
+    assert sidecar["sae_release"] == "mock-release"
+    assert sidecar["sae_revision"] is None
+    assert sidecar["sae_ids_by_layer"] == {"3": "layer_3/mock", "7": "layer_7/mock"}
+    assert sidecar["format_version"] == 2
+
+
+def test_save_profile_omits_sae_fields_when_absent(tmp_path):
+    """Raw-PCA sidecars stay clean — no empty/null SAE fields."""
+    import json
+    import torch
+    from saklas.core.vectors import save_profile
+
+    profile = {0: torch.zeros(4)}
+    target = tmp_path / "x.safetensors"
+    save_profile(profile, str(target), {"method": "contrastive_pca"})
+    with open(tmp_path / "x.json") as f:
+        sidecar = json.load(f)
+    assert "sae_release" not in sidecar
+    assert "sae_revision" not in sidecar
+    assert "sae_ids_by_layer" not in sidecar
+
+

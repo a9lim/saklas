@@ -451,3 +451,32 @@ def merge_components_stale(
     """
     status = merge_components_status(recorded, current_hashes)
     return [coord for coord, s in status.items() if s != "ok"]
+
+
+def enumerate_variants(folder: Path, model_id: str) -> dict[str, Path]:
+    """List all on-disk tensor variants for ``(folder, model_id)``.
+
+    Returns ``{variant_key: path}`` where ``variant_key`` is ``"raw"`` for
+    the unsuffixed tensor and ``"sae-<release>"`` for SAE variants. Paths
+    point at the ``.safetensors`` files; callers derive the sidecar path by
+    swapping the extension.
+    """
+    from saklas.io.paths import safe_model_id, parse_tensor_filename
+
+    target_model = safe_model_id(model_id)
+    if not folder.is_dir():
+        return {}
+
+    out: dict[str, Path] = {}
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        parsed = parse_tensor_filename(p.name)
+        if parsed is None:
+            continue
+        model, release = parsed
+        if model != target_model:
+            continue
+        key = "raw" if release is None else f"sae-{release}"
+        out[key] = p
+    return out

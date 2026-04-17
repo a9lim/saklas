@@ -482,6 +482,10 @@ def save_profile(
         sidecar["statements_sha256"] = metadata["statements_sha256"]
     if "components" in metadata:
         sidecar["components"] = metadata["components"]
+    # SAE provenance — present only when extraction used an SAE backend.
+    for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
+        if key in metadata:
+            sidecar[key] = metadata[key]
 
     meta_path = path.with_suffix(".json")
     with open(meta_path, "w") as f:
