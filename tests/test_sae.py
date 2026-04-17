@@ -114,3 +114,106 @@ def test_mock_sae_backend_passes_layer_idx_to_overrides():
     backend.encode_layer(2, torch.zeros(1, 4))
     backend.decode_layer(5, torch.zeros(4))
     assert seen == [2, -5]
+
+
+def test_extract_contrastive_sae_subset_layers(monkeypatch):
+    """With sae=MockSaeBackend(layers={1,3}), profile covers only those layers."""
+    import torch
+    from saklas.core import vectors as V
+    from saklas.core.sae import MockSaeBackend
+
+    def fake_encode_and_capture(model, tokenizer, text, layers, device):
+        torch.manual_seed(hash(text) & 0xFFFF)
+        out = {}
+        for idx in range(len(layers)):
+            base = torch.randn(8)
+            sign = 1.0 if "pos" in text else -1.0
+            out[idx] = base + sign * (idx + 1) * 0.3
+        return out
+
+    monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode_and_capture)
+
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    layers_list = [object()] * 4
+    sae = MockSaeBackend(layers=frozenset({1, 3}), d_model=8)
+
+    profile = V.extract_contrastive(
+        FakeModel(), FakeTok(), pairs, layers=layers_list,
+        device=torch.device("cpu"),
+        sae=sae,
+    )
+    assert set(profile.keys()) == {1, 3}
+    mags = [profile[i].norm().item() for i in profile]
+    assert all(m > 0 for m in mags)
+
+
+def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
+    """pos > neg on the resulting direction, majority-vote orientation."""
+    import torch
+    from saklas.core import vectors as V
+    from saklas.core.sae import MockSaeBackend
+
+    def fake_encode_and_capture(model, tokenizer, text, layers, device):
+        out = {}
+        for idx in range(len(layers)):
+            base = torch.zeros(4)
+            base[0] = 1.0 if "pos" in text else -1.0
+            out[idx] = base + 0.01 * torch.randn(4)
+        return out
+
+    monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode_and_capture)
+
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    layers_list = [object()] * 2
+    sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
+
+    profile = V.extract_contrastive(
+        FakeModel(), FakeTok(), pairs, layers=layers_list,
+        device=torch.device("cpu"),
+        sae=sae,
+    )
+    for idx, vec in profile.items():
+        assert vec[0].item() > 0
+
+
+def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch):
+    """An SAE covering no model layers raises SaeCoverageError."""
+    import torch
+    from saklas.core import vectors as V
+    from saklas.core.errors import SaeCoverageError
+    from saklas.core.sae import MockSaeBackend
+
+    monkeypatch.setattr(
+        V, "_encode_and_capture_all",
+        lambda *a, **k: {i: torch.zeros(4) for i in range(2)},
+    )
+
+    pairs = [{"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"}]
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    layers_list = [object()] * 2
+    sae = MockSaeBackend(layers=frozenset({5, 7}), d_model=4)
+
+    with pytest.raises(SaeCoverageError):
+        V.extract_contrastive(
+            FakeModel(), FakeTok(), pairs, layers=layers_list,
+            device=torch.device("cpu"),
+            sae=sae,
+        )
