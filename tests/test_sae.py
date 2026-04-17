@@ -43,10 +43,13 @@ def test_errors_preserve_stdlib_mro():
 
 
 def test_sae_backend_protocol_shape():
-    from saklas.core.sae import SaeBackend
-    # Protocol exists and names the expected methods/attrs
+    from saklas.core.sae import SaeBackend, MockSaeBackend
+    # Structural conformance — downstream code type-hints `SaeBackend | None`
+    # and we want the mock to pass isinstance checks at runtime.
     assert hasattr(SaeBackend, "encode_layer")
     assert hasattr(SaeBackend, "decode_layer")
+    mock = MockSaeBackend(layers=frozenset({0}), d_model=4)
+    assert isinstance(mock, SaeBackend)
 
 
 def test_mock_sae_backend_roundtrip():
@@ -94,3 +97,20 @@ def test_mock_sae_backend_custom_encode_decode():
     assert torch.allclose(f, torch.full((2, 4), 2.0))
     v = backend.decode_layer(3, torch.full((4,), 4.0))
     assert torch.allclose(v, torch.full((4,), 2.0))
+
+
+def test_mock_sae_backend_passes_layer_idx_to_overrides():
+    """Per-layer fns receive the layer index so tests can verify dispatch."""
+    import torch
+    from saklas.core.sae import MockSaeBackend
+
+    seen: list[int] = []
+    backend = MockSaeBackend(
+        layers=frozenset({2, 5}),
+        d_model=4,
+        encode_fn=lambda idx, h: (seen.append(idx) or h),
+        decode_fn=lambda idx, f: (seen.append(-idx) or f),
+    )
+    backend.encode_layer(2, torch.zeros(1, 4))
+    backend.decode_layer(5, torch.zeros(4))
+    assert seen == [2, -5]
