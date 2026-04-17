@@ -353,7 +353,6 @@ def test_sae_lens_backend_release_not_found(monkeypatch):
 def test_sae_lens_backend_model_mismatch(monkeypatch):
     import sys
     import types
-    import torch
 
     fake = types.ModuleType("sae_lens")
 
@@ -381,7 +380,6 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, rec
     """When a release has multiple SAEs per layer, pick narrowest + warn."""
     import sys
     import types
-    import torch
 
     fake = types.ModuleType("sae_lens")
 
