@@ -1061,7 +1061,7 @@ class SaklasSession:
                 out[name] = (float(alpha), trig)
                 continue
             try:
-                canonical, sign, _match = resolve_pole(name)
+                canonical, sign, _match, _variant = resolve_pole(name)
             except Exception:
                 # Let the caller see it at hook-install time via
                 # VectorNotRegisteredError for consistency with bare dict

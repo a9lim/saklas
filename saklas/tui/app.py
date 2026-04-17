@@ -541,7 +541,7 @@ class SaklasApp(App):
         sign = 1
         if baseline is None:
             try:
-                resolved_name, sign, _match = resolve_pole(concept)
+                resolved_name, sign, _match, _variant = resolve_pole(concept)
                 if resolved_name != concept:
                     chat.add_system_message(
                         f"  Resolved '{concept}' → '{resolved_name}'"
