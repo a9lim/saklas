@@ -36,6 +36,56 @@ _TOKEN_DRAIN_LIMIT = 20
 
 _LEFT, _CHAT, _TRAIT = 0, 1, 2
 
+_BIPOLAR_DELIM = " . "
+
+
+def _unquote(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    return s
+
+
+def _split_bipolar(text: str) -> tuple[str, str | None]:
+    """Split ``pos . neg`` on the first surrounded-by-whitespace period.
+
+    Whitespace around the period is required, so canonical single-token
+    names like ``dog.cat`` aren't split. Quotes are stripped from each
+    side if the user wrapped them.
+    """
+    idx = text.find(_BIPOLAR_DELIM)
+    if idx >= 0:
+        return (
+            _unquote(text[:idx].strip()),
+            _unquote(text[idx + len(_BIPOLAR_DELIM):].strip()),
+        )
+    return _unquote(text.strip()), None
+
+
+def _resolve_active_name(name: str, active) -> list[str]:
+    """Resolve a user-typed name against a set of currently-active names.
+
+    Direct hit returns a single-element list. Otherwise treats ``name``
+    as a pole and scans ``active`` for any canonical entry where the
+    slug appears on either side of the ``.`` separator. Returns all
+    matches (caller handles 0 / 1 / many).
+    """
+    from saklas.core.session import BIPOLAR_SEP, canonical_concept_name
+
+    active = list(active)
+    if name in active:
+        return [name]
+    slug = canonical_concept_name(name)
+    matches: list[str] = []
+    for key in active:
+        if key == slug:
+            matches.append(key)
+            continue
+        if BIPOLAR_SEP in key:
+            pos, neg = key.split(BIPOLAR_SEP, 1)
+            if pos == slug or neg == slug:
+                matches.append(key)
+    return matches
+
 
 class SaklasApp(App):
     CSS_PATH = "styles.tcss"
@@ -67,6 +117,9 @@ class SaklasApp(App):
         self._session = session
         self._messages = session._history
         self._device_str = str(session._device)
+        self._context_window: int = (
+            getattr(session._model.config, "max_position_embeddings", None) or 0
+        )
 
         # Local steering state — alphas and enabled flags per vector.
         # Session holds the profiles; the TUI holds the alphas.
@@ -96,7 +149,7 @@ class SaklasApp(App):
         self._last_elapsed: float = 0.0
         self._cached_vram_gb: float = 0.0
         self._vram_poll_counter: int = 0
-        self._last_gen_state: tuple = (-1, -1.0, -1.0, -1.0, False)
+        self._last_gen_state: tuple = (-1, -1.0, -1.0, -1.0, False, -1)
         self._assistant_messages: list[_AssistantMessage] = []
 
         defaults = load_defaults()
@@ -109,6 +162,17 @@ class SaklasApp(App):
         """Build alphas dict for generation from enabled vectors."""
         return {name: alpha for name, alpha in self._alphas.items()
                 if self._enabled.get(name, True)}
+
+    def _estimate_prompt_tokens(self, next_user_text: str) -> int:
+        """Tokenize history + pending user message through the chat template."""
+        try:
+            msgs = list(self._messages) + [{"role": "user", "content": next_user_text}]
+            ids = self._session._tokenizer.apply_chat_template(
+                msgs, tokenize=True, add_generation_prompt=True,
+            )
+            return len(ids)
+        except Exception:
+            return self._prompt_token_count
 
     def _vector_list_for_panel(self) -> list[dict]:
         """Build the list[dict] format the left panel expects."""
@@ -265,8 +329,8 @@ class SaklasApp(App):
         if cmd == "/steer":
             if not arg:
                 chat.add_system_message(
-                    'Usage: /steer "concept" [alpha]\n'
-                    '       /steer "concept" - "baseline" [alpha]'
+                    "Usage: /steer <concept> [alpha]\n"
+                    "       /steer <pos> . <neg> [alpha]"
                 )
                 return
             self._handle_steer(arg)
@@ -291,16 +355,16 @@ class SaklasApp(App):
         elif cmd == "/probe":
             if not arg:
                 chat.add_system_message(
-                    'Usage: /probe "concept"\n'
-                    '       /probe "concept" - "baseline"'
+                    "Usage: /probe <concept>\n"
+                    "       /probe <pos> . <neg>"
                 )
                 return
             self._handle_probe(arg)
         elif cmd == "/extract":
             if not arg:
                 chat.add_system_message(
-                    'Usage: /extract "concept"\n'
-                    '       /extract "concept" - "baseline"'
+                    "Usage: /extract <concept>\n"
+                    "       /extract <pos> . <neg>"
                 )
                 return
             self._handle_extract_only(arg)
@@ -367,14 +431,14 @@ class SaklasApp(App):
         elif cmd == "/help":
             chat.add_system_message(
                 "Steering:\n"
-                '  /steer "concept" [alpha]    — add (extract if needed)\n'
-                '  /steer "pos" - "neg" [a]    — add bipolar\n'
+                "  /steer <concept> [alpha]    — add (extract if needed)\n"
+                "  /steer <pos> . <neg> [a]    — add bipolar (period delim)\n"
                 "  /alpha <name> <val>         — adjust existing alpha\n"
                 "  /unsteer <name>             — remove vector\n"
                 "Probes:\n"
-                '  /probe "concept"            — add probe (highlight on)\n'
+                "  /probe <concept>            — add probe (highlight on)\n"
                 "  /unprobe <name>             — remove probe\n"
-                '  /extract "concept"          — cache-warm only\n'
+                "  /extract <concept>          — cache-warm only\n"
                 "  /compare <a> [b]            — cosine similarity\n"
                 "Session:\n"
                 "  /clear, /rewind, /regen     — history ops\n"
@@ -407,32 +471,39 @@ class SaklasApp(App):
 
     @staticmethod
     def _parse_args(text: str, include_alpha: bool = False):
-        """Parse /steer or /probe arguments."""
-        if " - " in text:
-            dash_idx = text.index(" - ")
-            concept = shlex.split(text[:dash_idx])[0]
-            rest_tokens = shlex.split(text[dash_idx + 3:])
-            baseline = rest_tokens[0] if rest_tokens else None
-            alpha = None
-            for t in rest_tokens[1:]:
-                try:
-                    alpha = float(t)
-                    break
-                except ValueError:
-                    continue
-        else:
-            tokens = shlex.split(text)
-            concept = tokens[0]
-            baseline = None
-            alpha = None
-            for t in tokens[1:]:
-                try:
-                    alpha = float(t)
-                    break
-                except ValueError:
-                    continue
+        """Parse /steer, /probe, /extract arguments.
+
+        Accepted forms:
+            <concept> [alpha]              single concept; canonical
+                                           forms like ``dog.cat`` pass
+                                           through unchanged
+            <pos> . <neg> [alpha]          bipolar (period delimiter)
+
+        Multi-word poles don't need quotes (``a dog . a pair of cats``).
+        Whitespace around the period is what makes it a delimiter — so
+        ``dog.cat`` stays a single canonical name.
+        """
+        text = text.strip()
+        alpha = None
+
         if include_alpha:
-            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, alpha)) if alpha is not None else DEFAULT_ALPHA
+            # Peel a trailing float alpha if present. Scan from the right
+            # over any runs of trailing non-float tokens — the historical
+            # grammar allowed the alpha to sit before stray junk, but in
+            # practice it's always last; we accept it there specifically.
+            head, _, tail = text.rpartition(" ")
+            if tail:
+                try:
+                    alpha = float(tail)
+                    text = head.rstrip()
+                except ValueError:
+                    pass
+
+        concept, baseline = _split_bipolar(text)
+
+        if include_alpha:
+            alpha = (max(-MAX_ALPHA, min(MAX_ALPHA, alpha))
+                     if alpha is not None else DEFAULT_ALPHA)
             return concept, baseline, alpha
         return concept, baseline
 
@@ -457,7 +528,7 @@ class SaklasApp(App):
         except (ValueError, IndexError) as e:
             chat.add_system_message(
                 f"Parse error: {e}\n"
-                f'Usage: /{pending_type} "concept" - "baseline"' + (' [alpha]' if include_alpha else '')
+                f"Usage: /{pending_type} <pos> . <neg>" + (" [alpha]" if include_alpha else "")
             )
             return
 
@@ -630,6 +701,8 @@ class SaklasApp(App):
         )
         steering = Steering(alphas=dict(alphas), thinking=use_thinking) if alphas else None
 
+        self._prompt_token_count = self._estimate_prompt_tokens(user_text)
+
         def _generate():
             try:
                 stream = self._session.generate_stream(
@@ -688,6 +761,9 @@ class SaklasApp(App):
                 # _finalize_generation and push to the widget for highlight.
                 _, widget = item
                 self._finalize_widget_highlight(widget)
+                last = self._session.last_result
+                if last is not None:
+                    self._prompt_token_count = last.prompt_tokens
             elif kind == "error":
                 chat.add_system_message(f"generation error: {item[1]}")
             elif kind == "done":
@@ -727,7 +803,8 @@ class SaklasApp(App):
             self._vram_poll_counter = -1
 
         new_state = (self._gen_token_count, self._last_tok_per_sec,
-                     self._last_elapsed, self._cached_vram_gb, generating)
+                     self._last_elapsed, self._cached_vram_gb, generating,
+                     self._prompt_token_count)
         if new_state != self._last_gen_state:
             self._last_gen_state = new_state
             chat.update_status(
@@ -737,6 +814,7 @@ class SaklasApp(App):
                 tok_per_sec=self._last_tok_per_sec,
                 elapsed=self._last_elapsed,
                 prompt_tokens=self._prompt_token_count,
+                context_window=self._context_window,
                 vram_gb=self._cached_vram_gb,
             )
 
@@ -899,10 +977,16 @@ class SaklasApp(App):
         if len(tokens) != 2:
             chat.add_system_message("Usage: /alpha <name> <value>")
             return
-        name, val_str = tokens
-        if name not in self._alphas:
+        raw, val_str = tokens
+        matches = _resolve_active_name(raw, self._alphas)
+        if len(matches) == 0:
             chat.add_system_message(
-                f"'{name}' is not active. Use /steer to add it first."
+                f"'{raw}' is not active. Use /steer to add it first."
+            )
+            return
+        if len(matches) > 1:
+            chat.add_system_message(
+                f"'{raw}' is ambiguous: {', '.join(matches)}"
             )
             return
         try:
@@ -910,6 +994,15 @@ class SaklasApp(App):
         except ValueError:
             chat.add_system_message(f"Invalid alpha: {val_str}")
             return
+        name = matches[0]
+        if name != raw:
+            # Sign flip when the user typed the negative pole.
+            from saklas.core.session import BIPOLAR_SEP, canonical_concept_name
+            slug = canonical_concept_name(raw)
+            if BIPOLAR_SEP in name:
+                _pos, neg = name.split(BIPOLAR_SEP, 1)
+                if slug == neg:
+                    val = -val
         val = max(-MAX_ALPHA, min(MAX_ALPHA, val))
         self._alphas[name] = val
         self._refresh_left_panel()
@@ -917,13 +1010,18 @@ class SaklasApp(App):
 
     def _handle_unsteer(self, arg: str) -> None:
         chat = self._chat_panel
-        name = arg.strip()
-        if not name:
+        raw = arg.strip()
+        if not raw:
             chat.add_system_message("Usage: /unsteer <name>")
             return
-        if name not in self._alphas:
-            chat.add_system_message(f"'{name}' is not active.")
+        matches = _resolve_active_name(raw, self._alphas)
+        if len(matches) == 0:
+            chat.add_system_message(f"'{raw}' is not active.")
             return
+        if len(matches) > 1:
+            chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
+            return
+        name = matches[0]
         self._session.unsteer(name)
         self._alphas.pop(name, None)
         self._enabled.pop(name, None)
@@ -932,14 +1030,22 @@ class SaklasApp(App):
 
     def _handle_unprobe(self, arg: str) -> None:
         chat = self._chat_panel
-        name = arg.strip()
-        if not name:
+        raw = arg.strip()
+        if not raw:
             chat.add_system_message("Usage: /unprobe <name>")
             return
         monitor = self._session._monitor
-        if not monitor or name not in monitor.probe_names:
-            chat.add_system_message(f"Probe '{name}' not active.")
+        if not monitor:
+            chat.add_system_message(f"Probe '{raw}' not active.")
             return
+        matches = _resolve_active_name(raw, monitor.probe_names)
+        if len(matches) == 0:
+            chat.add_system_message(f"Probe '{raw}' not active.")
+            return
+        if len(matches) > 1:
+            chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
+            return
+        name = matches[0]
         self._session.unprobe(name)
         self._trait_panel.set_active_probes(set(monitor.probe_names))
         if self._highlight_probe == name:
@@ -1116,23 +1222,38 @@ class SaklasApp(App):
         parts = arg.split()
 
         # Gather all available profiles: session profiles + monitor probes.
-        all_profiles: dict[str, "Profile"] = {}
+        # Monitor stores raw ``dict[int, Tensor]`` — wrap it in a Profile so
+        # both sources expose the same cosine_similarity API.
+        from saklas.core.profile import Profile
+        all_profiles: dict[str, Profile] = {}
         for name, prof in self._session._profiles.items():
-            from saklas.core.profile import Profile
             if isinstance(prof, Profile):
                 all_profiles[name] = prof
+            elif isinstance(prof, dict) and prof:
+                all_profiles[name] = Profile(prof)
         if self._session._monitor:
             for name, prof in self._session._monitor.profiles.items():
-                if name not in all_profiles:
-                    from saklas.core.profile import Profile
-                    if isinstance(prof, Profile):
-                        all_profiles[name] = prof
+                if name in all_profiles:
+                    continue
+                if isinstance(prof, Profile):
+                    all_profiles[name] = prof
+                elif isinstance(prof, dict) and prof:
+                    all_profiles[name] = Profile(prof)
+
+        def _resolve(raw: str) -> str | None:
+            matches = _resolve_active_name(raw, all_profiles)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
+                return None
+            chat.add_system_message(f"No profile found for '{raw}'")
+            return None
 
         if len(parts) == 1:
             # 1-arg: ranked comparison against all loaded profiles.
-            target_name = parts[0]
-            if target_name not in all_profiles:
-                chat.add_system_message(f"No profile found for '{target_name}'")
+            target_name = _resolve(parts[0])
+            if target_name is None:
                 return
             target = all_profiles[target_name]
             others = {n: p for n, p in all_profiles.items() if n != target_name}
@@ -1157,12 +1278,11 @@ class SaklasApp(App):
 
         elif len(parts) == 2:
             # 2-arg: pairwise.
-            a_name, b_name = parts
-            if a_name not in all_profiles:
-                chat.add_system_message(f"No profile found for '{a_name}'")
+            a_name = _resolve(parts[0])
+            if a_name is None:
                 return
-            if b_name not in all_profiles:
-                chat.add_system_message(f"No profile found for '{b_name}'")
+            b_name = _resolve(parts[1])
+            if b_name is None:
                 return
             try:
                 sim = all_profiles[a_name].cosine_similarity(all_profiles[b_name])

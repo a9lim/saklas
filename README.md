@@ -175,12 +175,15 @@ Three panels: **vector registry** on the left (live alpha knobs), **chat** in th
 | Command | Description |
 |---|---|
 | `/steer <name> [alpha]` | Extract and register a steering vector |
+| `/steer <pos> . <neg> [alpha]` | Same, bipolar form (period delimiter) |
 | `/alpha <name> <val>` | Adjust an already-registered vector's alpha |
 | `/unsteer <name>` | Remove a registered vector |
 | `/probe <name>` | Add a monitoring probe (seeds per-token highlight) |
+| `/probe <pos> . <neg>` | Same, bipolar form |
 | `/unprobe <name>` | Remove a monitoring probe |
 | `/compare <a> [b]` | Cosine similarity (1-arg: ranked vs all; 2-arg: pairwise) |
 | `/extract <name>` | Extract to disk without wiring |
+| `/extract <pos> . <neg>` | Same, bipolar form |
 | `/regen` | Regenerate the last assistant turn |
 | `/clear` | Clear conversation history |
 | `/rewind` | Undo last exchange |
@@ -195,6 +198,17 @@ Three panels: **vector registry** on the left (live alpha knobs), **chat** in th
 A **WHY footer** at the bottom of the trait panel shows the top-5 layers
 (by `||baked||`) and live top/bottom emitted tokens (by signed score) for
 the trait-panel-selected probe — driven by selection, no command needed.
+
+The **chat status footer** shows generation progress (token bar against
+`max_tokens`), live tok/s, elapsed, VRAM, and a **context bar** (prompt
++ emitted tokens against the model's context window, cyan/yellow/red
+as it approaches full). All bars in the UI share one width via
+`saklas.tui.utils.BAR_WIDTH`.
+
+**Bipolar poles don't need quotes**: `/steer a dog . a pair of cats 0.4`
+parses as `pos="a dog", neg="a pair of cats", alpha=0.4`. Whitespace
+around the period is what splits — so `dog.cat` stays a single
+canonical name (the bundled-pack form).
 
 ---
 

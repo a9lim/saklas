@@ -7,7 +7,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-from saklas.tui.utils import build_bar
+from saklas.tui.utils import BAR_WIDTH, build_bar
 
 MAX_ALPHA = 1.0
 
@@ -122,7 +122,7 @@ class LeftPanel(Widget):
             n_active = v["n_active"]
             layer_tag = f"{n_active}L pk{peak}"
 
-            bar_full, bar_empty = build_bar(alpha, MAX_ALPHA, 16)
+            bar_full, bar_empty = build_bar(alpha, MAX_ALPHA, BAR_WIDTH)
             if alpha > 0:
                 color = "ansi_green"
             elif alpha < 0:
@@ -156,17 +156,17 @@ class LeftPanel(Widget):
 
     def _render_gen_config(self) -> None:
         gen = self._gen_config_widget
-        t_full, t_empty = build_bar(self._temperature, 2.0, 20)
+        t_full, t_empty = build_bar(self._temperature, 2.0, BAR_WIDTH)
         t_bar = t_full + t_empty
-        p_full, p_empty = build_bar(self._top_p, 1.0, 20)
+        p_full, p_empty = build_bar(self._top_p, 1.0, BAR_WIDTH)
         p_bar = p_full + p_empty
 
         sys_str = self._system_prompt[:15] + "..." if self._system_prompt and len(self._system_prompt) > 15 else (self._system_prompt or "(none)")
 
         # Right-edge column for the hint glyphs. Bar lines render as
-        # "Temp  1.00 " (11) + bar (20) + " [/]" (4) = 35 visible chars,
-        # so anything else padded to width 35 lines up the right edges.
-        RIGHT_W = 35
+        # "Temp  1.00 " (11) + bar (BAR_WIDTH) + " [/]" (4), so anything
+        # else padded to the same width lines up the right edges.
+        RIGHT_W = 11 + BAR_WIDTH + 4
 
         def _pad(left_visible: str, right_text: str) -> str:
             return " " * max(1, RIGHT_W - len(left_visible) - len(right_text))

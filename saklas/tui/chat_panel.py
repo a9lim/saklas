@@ -11,6 +11,8 @@ from textual.widgets import Static, Input, Collapsible
 from textual.widget import Widget
 from textual.message import Message
 
+from saklas.tui.utils import BAR_WIDTH, build_bar
+
 _HIGHLIGHT_SAT = 0.5
 _HIGHLIGHT_CACHE_MAX = 4
 
@@ -307,22 +309,32 @@ class ChatPanel(Widget):
         tok_per_sec: float = 0.0,
         elapsed: float = 0.0,
         prompt_tokens: int = 0,
+        context_window: int = 0,
         vram_gb: float = 0.0,
     ) -> None:
         """Update the status bar with generation stats."""
         bar = self._status_bar
         dot = "[ansi_green]●[/]" if generating else "[dim]○[/]"
-        if generating:
-            left = f"{dot} {gen_tokens}/{max_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
+        if generating and max_tokens > 0:
+            t_full, t_empty = build_bar(gen_tokens, max_tokens, BAR_WIDTH)
+            left = (
+                f"{dot} [ansi_green]{t_full}[/][dim]{t_empty}[/] "
+                f"{gen_tokens}/{max_tokens} · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
+            )
         elif gen_tokens > 0:
             left = f"{dot} {gen_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
         else:
             left = f"{dot} idle"
-        right = ""
-        if prompt_tokens > 0:
-            right += f"prompt: {prompt_tokens} tok"
+
+        parts: list[str] = [left]
         if vram_gb > 0:
-            if right:
-                right += " · "
-            right += f"VRAM: {vram_gb:.1f} GB"
-        bar.update(f"{left}    {right}")
+            parts.append(f"VRAM {vram_gb:.1f} GB")
+        if context_window > 0:
+            used = prompt_tokens + (gen_tokens if generating else 0)
+            c_full, c_empty = build_bar(used, context_window, BAR_WIDTH)
+            frac = used / context_window if context_window else 0.0
+            color = "ansi_red" if frac >= 0.9 else ("ansi_yellow" if frac >= 0.75 else "ansi_cyan")
+            parts.append(
+                f"ctx [{color}]{c_full}[/][dim]{c_empty}[/] {used}/{context_window}"
+            )
+        bar.update(" · ".join(parts))

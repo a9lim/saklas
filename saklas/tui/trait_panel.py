@@ -9,7 +9,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
-from saklas.tui.utils import build_bar
+from saklas.tui.utils import BAR_WIDTH, build_bar
 
 
 
@@ -136,7 +136,7 @@ class TraitPanel(Widget):
                 else:
                     arrow_ch = "↓"
 
-                bar_full, bar_empty = build_bar(val, 1.0, 16)
+                bar_full, bar_empty = build_bar(val, 1.0, BAR_WIDTH)
                 if val > 0:
                     color = "ansi_green"
                 elif val < 0:
@@ -147,14 +147,14 @@ class TraitPanel(Widget):
                 mini_spark = sparks.get(name, "")
 
                 sel = ">" if is_nav_selected else " "
-                display_name = name[:16].ljust(16)
+                name_str = f"[bold]{name}[/]" if is_nav_selected else name
+                spark_tail = f" [dim]{mini_spark}[/]" if mini_spark else ""
 
                 line = (
-                    f"{sel} {display_name}[{color}]{bar_full}[/][dim]{bar_empty}[/] "
-                    f"[{color}]{val:+.2f}{arrow_ch}[/] [dim]{mini_spark}[/]"
+                    f"{sel} {name_str}\n"
+                    f"  [{color}]{bar_full}[/][dim]{bar_empty}[/] "
+                    f"[{color}]{val:+.2f}{arrow_ch}[/]{spark_tail}"
                 )
-                if is_nav_selected:
-                    line = f"[bold]{line}[/]"
 
                 lines.append(line)
 

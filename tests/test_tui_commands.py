@@ -372,3 +372,86 @@ def test_compare_no_args():
     app._handle_command("/compare")
     msg = _msgs(app)
     assert "Usage" in msg or "usage" in msg
+
+
+# ---- _parse_args: period delim, multi-word poles, legacy dash ----
+
+
+def test_parse_single_concept_no_alpha():
+    concept, baseline = SaklasApp._parse_args("happy")
+    assert concept == "happy"
+    assert baseline is None
+
+
+def test_parse_canonical_dotted_stays_whole():
+    # `dog.cat` (no surrounding spaces on the dot) is a single canonical
+    # name, not a split.
+    concept, baseline = SaklasApp._parse_args("dog.cat")
+    assert concept == "dog.cat"
+    assert baseline is None
+
+
+def test_parse_period_delim_splits():
+    concept, baseline = SaklasApp._parse_args("dog . cat")
+    assert concept == "dog"
+    assert baseline == "cat"
+
+
+def test_parse_dash_no_longer_splits():
+    # `-` is allowed inside NAME_REGEX, so `dog - cat` is treated as a
+    # single (invalid-but-unsplit) concept. Downstream validation rejects
+    # the spaces; the parser does not split on the hyphen.
+    concept, baseline = SaklasApp._parse_args("dog - cat")
+    assert concept == "dog - cat"
+    assert baseline is None
+
+
+def test_parse_multiword_unquoted_period():
+    concept, baseline = SaklasApp._parse_args("a dog . a pair of cats")
+    assert concept == "a dog"
+    assert baseline == "a pair of cats"
+
+
+def test_parse_quoted_poles_still_accepted():
+    concept, baseline = SaklasApp._parse_args('"a dog" . "a pair of cats"')
+    assert concept == "a dog"
+    assert baseline == "a pair of cats"
+
+
+def test_parse_with_alpha_single():
+    concept, baseline, alpha = SaklasApp._parse_args("happy 0.3", include_alpha=True)
+    assert concept == "happy"
+    assert baseline is None
+    assert alpha == 0.3
+
+
+def test_parse_with_alpha_bipolar_period():
+    concept, baseline, alpha = SaklasApp._parse_args(
+        "happy . sad 0.4", include_alpha=True
+    )
+    assert concept == "happy"
+    assert baseline == "sad"
+    assert alpha == 0.4
+
+
+def test_parse_with_alpha_multiword_period():
+    concept, baseline, alpha = SaklasApp._parse_args(
+        "a dog . a pair of cats 0.25", include_alpha=True
+    )
+    assert concept == "a dog"
+    assert baseline == "a pair of cats"
+    assert alpha == 0.25
+
+
+def test_parse_default_alpha_when_missing():
+    from saklas.tui.app import DEFAULT_ALPHA
+    concept, baseline, alpha = SaklasApp._parse_args("happy", include_alpha=True)
+    assert alpha == DEFAULT_ALPHA
+
+
+def test_parse_alpha_clamped_to_max():
+    from saklas.tui.vector_panel import MAX_ALPHA
+    _, _, alpha = SaklasApp._parse_args("happy 99", include_alpha=True)
+    assert alpha == MAX_ALPHA
+    _, _, alpha = SaklasApp._parse_args("happy -99", include_alpha=True)
+    assert alpha == -MAX_ALPHA
