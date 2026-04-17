@@ -131,10 +131,14 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
         return [c for c in concepts if selector.value in c.metadata.tags]
 
     if selector.kind == "model":
-        safe = selector.value.replace("/", "__")
+        # ``model:X`` matches any concept with an installed tensor for X,
+        # regardless of variant. Legacy implementation only globbed
+        # ``<safe>.safetensors`` and missed concepts that have only an
+        # SAE tensor (``<safe>_sae-<release>.safetensors``) for X.
+        from saklas.io.packs import enumerate_variants
         return [
             c for c in concepts
-            if (c.folder / f"{safe}.safetensors").is_file()
+            if enumerate_variants(c.folder, selector.value)
         ]
 
     if selector.kind == "name":

@@ -125,6 +125,37 @@ def test_resolve_all(monkeypatch, tmp_path):
     assert len(results) == 2
 
 
+def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch, tmp_path):
+    """``model:X`` matches any concept with a tensor for X — raw or SAE.
+
+    Regression for the pre-fix bug where the filter only globbed
+    ``<safe>.safetensors`` and missed concepts that shipped only a
+    ``_sae-<release>`` tensor for that model.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.paths import safe_model_id, tensor_filename
+
+    model_id = "google/gemma-3-4b-it"
+    sid = safe_model_id(model_id)
+
+    # Concept A: has raw tensor only.
+    a = _mk(tmp_path, "default", "a_raw_only")
+    (a / f"{sid}.safetensors").write_bytes(b"x")
+
+    # Concept B: has only an SAE tensor for this model.
+    b = _mk(tmp_path, "default", "b_sae_only")
+    (b / tensor_filename(model_id, release="my-release")).write_bytes(b"x")
+
+    # Concept C: has a tensor for a different model — should not match.
+    c = _mk(tmp_path, "default", "c_other_model")
+    (c / f"{safe_model_id('meta/llama-3-8b')}.safetensors").write_bytes(b"x")
+
+    sel.invalidate()
+    results = sel.resolve(sel.parse(f"model:{model_id}"))
+    names = sorted(r.name for r in results)
+    assert names == ["a_raw_only", "b_sae_only"]
+
+
 def test_parse_args_concept_plus_model(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     args, model_scope = sel.parse_args(["tag:emotion", "model:google/gemma-2-2b-it"])
