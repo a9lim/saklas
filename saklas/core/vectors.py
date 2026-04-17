@@ -234,6 +234,7 @@ def extract_contrastive(
     device=None,
     *,
     sae: "SaeBackend | None" = None,
+    drop_edges: tuple[int, int] = (2, 2),
 ) -> dict[int, torch.Tensor]:
     """Contrastive direction extraction via PCA across all layers.
 
@@ -256,14 +257,41 @@ def extract_contrastive(
             feature-space ``pca_center`` branch restricted to the layers
             covered by the SAE, and decodes the principal feature-space
             direction back into model space before baking shares.
+        drop_edges: ``(n_lo, n_hi)`` — exclude the first ``n_lo`` and last
+            ``n_hi`` model layers from the share distribution. Early layers
+            carry tokenization / lexical features; late layers are strongly
+            aligned with the unembedding head. Steering at either end tends
+            to corrupt surface form rather than latent meaning — on some
+            architectures (e.g. ministral-3, loaded via
+            :func:`_load_text_from_multimodal`) L0 PCA share inflates to
+            3–4× the model median, which produces immediate grammar collapse
+            at otherwise-coherent α. Dropping the edges suppresses the
+            pathology uniformly; the remaining share budget redistributes
+            over retained layers automatically. Default ``(2, 2)``; pass
+            ``(0, 0)`` to recover pre-fix behavior (useful for tests on
+            small mock models and for A/B comparisons).
 
     Returns:
-        Profile dict mapping layer_idx -> baked direction vector.
+        Profile dict mapping layer_idx -> baked direction vector. Dropped
+        edge layers are simply absent from the dict — downstream hook
+        attachment iterates over present keys.
     """
     if device is None:
         device = next(model.parameters()).device
 
     n_layers = len(layers)
+
+    n_drop_lo, n_drop_hi = drop_edges
+    if n_drop_lo < 0 or n_drop_hi < 0:
+        raise ValueError(f"drop_edges must be non-negative, got {drop_edges}")
+    if n_drop_lo + n_drop_hi >= n_layers:
+        raise ValueError(
+            f"drop_edges={drop_edges} would leave no retained layers "
+            f"(n_layers={n_layers})"
+        )
+    edge_idx = set(range(n_drop_lo)) | set(
+        range(n_layers - n_drop_hi, n_layers)
+    )
 
     # Coverage check for the SAE branch — raise early before any forward
     # passes if the backend covers none of this model's layers.
@@ -363,6 +391,9 @@ def extract_contrastive(
             idx: (directions[idx], evr) for idx, evr in zip(sae_layers, evrs)
         }
 
+        for i in edge_idx:
+            raw.pop(i, None)
+
         # Bake shares across the covered subset (same logic as raw path).
         total_score = sum(score for _, score in raw.values())
         # Defensive: evr is always positive when any singular value exists;
@@ -430,17 +461,20 @@ def extract_contrastive(
 
             raw[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), scores_cpu[idx])
 
-    # Bake shares into the stored tensors. Total share is 1.0 across layers,
-    # so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
+    for i in edge_idx:
+        raw.pop(i, None)
+
+    # Bake shares into the stored tensors. Total share is 1.0 across retained
+    # layers, so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
     # magnitude budget is fixed by the reference activation norms and
     # distributed in proportion to per-layer signal quality. At apply time
     # the hook just does alpha * _STEER_GAIN * sum(baked) — no shares,
     # no sums, no per-layer weights.
     total_score = sum(score for _, score in raw.values())
     if total_score <= 0:
-        # Pathological extraction (all-zero diffs). Fall back to uniform.
-        total_score = float(n_layers)
-        shares = {idx: 1.0 / n_layers for idx in raw}
+        # Pathological extraction (all-zero diffs). Fall back to uniform
+        # across retained layers.
+        shares = {idx: 1.0 / len(raw) for idx in raw}
     else:
         shares = {idx: score / total_score for idx, (_, score) in raw.items()}
 

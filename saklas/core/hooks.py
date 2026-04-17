@@ -242,7 +242,19 @@ class SteeringHook:
 # proportionally higher alpha due to residual architectural effects
 # (activation magnitude, attention layout) this normalization doesn't
 # capture.
-_STEER_GAIN = 3.5
+#
+# Recalibrated from 3.5 → 2.0 when extract_contrastive gained the
+# drop_edges=(2, 2) default.  Edge-drop removes L0/L1 and L_N-2/L_N-1
+# from the share distribution (early layers carry tokenization/lexical
+# features; late layers are unembedding-aligned — steering either corrupts
+# surface form rather than latent meaning).  Remaining middle layers'
+# shares inflate ~10-15% after redistribution, and the post-drop coherence
+# ratio rises (directions align tighter), so per-α directional rotation
+# increases.  2.0 pushes the cliff above α≈0.9 on the reference model,
+# giving users a wide coherent band (~0.3-0.85) to dial in steering
+# intensity and leaving generous headroom for the long tail of untested
+# architectures.
+_STEER_GAIN = 2.0
 
 
 class SteeringManager:
