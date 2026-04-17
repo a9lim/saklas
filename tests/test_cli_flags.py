@@ -782,6 +782,128 @@ def test_run_why_concept_not_found(monkeypatch, tmp_path, capsys):
     assert exc.value.code == 1
 
 
+# ---------------------------------------------------------------------------
+# SAE variant resolution in vector compare / vector why
+# ---------------------------------------------------------------------------
+
+
+def test_split_variant_suffix_parses_sae_variants():
+    from saklas.cli.runners import _split_variant_suffix
+    assert _split_variant_suffix("honest") == ("honest", None)
+    assert _split_variant_suffix("honest:raw") == ("honest", "raw")
+    assert _split_variant_suffix("honest:sae") == ("honest", "sae")
+    assert _split_variant_suffix("honest:sae-my-release") == (
+        "honest", "sae-my-release",
+    )
+    assert _split_variant_suffix("deer.wolf:sae") == ("deer.wolf", "sae")
+    # Prefix selectors pass through untouched — their value carries the colon
+    # but _split_variant_suffix only peels a trailing variant token.
+    assert _split_variant_suffix("tag:emotion") == ("tag:emotion", None)
+    assert _split_variant_suffix("model:google/gemma-3-4b-it") == (
+        "model:google/gemma-3-4b-it", None,
+    )
+
+
+def test_run_why_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
+    """``vector why foo:sae`` must load the SAE tensor, not the raw one."""
+    vdir = _setup_why_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id, tensor_filename
+    sid = safe_model_id(model_id)
+
+    target_dir = vdir / "default" / "angry.calm"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    # Two tensors for the same model: raw and SAE. The caller picks via suffix.
+    raw_path = target_dir / f"{sid}.safetensors"
+    sae_path = target_dir / tensor_filename(model_id, release="my-release")
+    raw_path.write_bytes(b"x")
+    sae_path.write_bytes(b"x")
+
+    raw_profile = _mock_why_profile({0: 0.1, 1: 0.1})
+    sae_profile = _mock_why_profile({14: 0.9, 15: 0.8})
+
+    by_path = {str(raw_path): raw_profile, str(sae_path): sae_profile}
+
+    from saklas.core.profile import Profile
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: by_path[str(p)]))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main(["vector", "why", "angry.calm:sae-my-release", "-m", model_id])
+    out = capsys.readouterr().out
+    # Suffix propagates into the display name.
+    assert "angry.calm:sae-my-release" in out
+    # The SAE profile magnitudes appear, not the raw ones.
+    assert "L14" in out
+    assert "0.900" in out
+    assert "L0" not in out
+
+
+def test_run_why_sae_ambiguous_errors(monkeypatch, tmp_path, capsys):
+    """``:sae`` with multiple installed SAE variants must error out."""
+    vdir = _setup_why_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import tensor_filename
+
+    target_dir = vdir / "default" / "angry.calm"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / tensor_filename(model_id, release="release-a")).write_bytes(b"x")
+    (target_dir / tensor_filename(model_id, release="release-b")).write_bytes(b"x")
+
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["vector", "why", "angry.calm:sae", "-m", model_id])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "multiple SAE variants" in err
+
+
+def test_run_compare_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
+    """Each concept in ``vector compare`` parses its own :variant suffix."""
+    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    model_id = "fake/model"
+    from saklas.io.paths import safe_model_id, tensor_filename
+    sid = safe_model_id(model_id)
+
+    a_dir = vdir / "default" / "angry.calm"
+    b_dir = vdir / "default" / "happy.sad"
+    a_dir.mkdir(parents=True, exist_ok=True)
+    b_dir.mkdir(parents=True, exist_ok=True)
+    # `angry.calm` has a raw tensor and an SAE tensor; `happy.sad` has only raw.
+    a_raw = a_dir / f"{sid}.safetensors"
+    a_sae = a_dir / tensor_filename(model_id, release="my-release")
+    b_raw = b_dir / f"{sid}.safetensors"
+    for p in (a_raw, a_sae, b_raw):
+        p.write_bytes(b"x")
+
+    a_raw_profile = _mock_profile(lambda o: 0.1, lambda o: {0: 0.1})
+    a_sae_profile = _mock_profile(lambda o: 0.9, lambda o: {14: 0.9})
+    b_profile = _mock_profile(lambda o: 0.5, lambda o: {0: 0.5})
+
+    by_path = {
+        str(a_raw): a_raw_profile,
+        str(a_sae): a_sae_profile,
+        str(b_raw): b_profile,
+    }
+
+    from saklas.core.profile import Profile
+    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: by_path[str(p)]))
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    cli.main([
+        "vector", "compare",
+        "angry.calm:sae-my-release", "happy.sad",
+        "-m", model_id,
+    ])
+    out = capsys.readouterr().out
+    # Variant suffix carries into display keys.
+    assert "angry.calm:sae-my-release" in out
+    assert "happy.sad" in out
+
+
 def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):
     """Config YAML with bare pole 'wolf' should resolve to 'deer.wolf' with -1 sign."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
