@@ -16,6 +16,18 @@ One forward pass per prompt; `_capture_all_hidden_states` hooks every layer in a
 
 Returns a **profile**: `dict[int, Tensor]` covering every layer — no scores dict. `compute_layer_means` averages 90 neutral prompts for centering. `load_profile` dispatches on extension. `_template_overhead_cache` is keyed by `id(tokenizer)` — safe only while one tokenizer lives the session lifetime.
 
+**SAE branch (optional).** `extract_contrastive(sae=<SaeBackend>)` filters layers to `sae.layers`, captures per-pair pos/neg stacks alongside diffs (only on covered layers — non-covered layers pay nothing extra), encodes both stacks through `SaeBackend.encode_layer`, runs `pca_center` SVD on the mean-centered feature-space stack, orients by majority vote on `(F_pos - F_neg) @ v_feat`, decodes the first PC back through `SaeBackend.decode_layer`, then hands off to the existing normalize + share-bake step. Branches surgical — the default (sae=None) path is bit-identical to v1.x. Raises `SaeCoverageError` when the SAE covers zero of the model's layers.
+
+## sae.py
+
+SAE backend abstraction. `SaeBackend` is a minimal runtime-checkable `Protocol` — `encode_layer(idx, h) -> features`, `decode_layer(idx, feat) -> model_space_vec`, `release`, `revision`, `layers: frozenset[int]`. `MockSaeBackend` is an identity-by-default dataclass for CPU-only tests with optional per-layer `encode_fn`/`decode_fn` overrides.
+
+`SaeLensBackend` is the concrete adapter. `load_sae_backend(release, *, revision, model_id, device, dtype)` queries SAELens's pretrained-release registry, validates base-model compatibility (`SaeModelMismatchError`), resolves per-layer sae_ids via `_canonical_layer_map` (bucket by hook_layer, pick lexicographically smallest — narrowest width — per layer, warn when multiple candidates exist), loads each SAE module, and returns a fully-populated `SaeLensBackend`. `sae_ids_by_layer` gets recorded in the pack sidecar for reproducibility.
+
+`sae_lens` imports are gated inside `load_sae_backend` so installations without the `[sae]` extra can still import the module (for Protocol type hints or the mock). Missing dep raises `SaeBackendImportError` with the install hint; unknown release raises `SaeReleaseNotFoundError` with near-match suggestions via `difflib` (falls back to listing the first 10 available releases when the fuzzy matcher returns nothing).
+
+Model-name matching is lenient (`_model_names_match`): SAELens's `cfg.model_name` is often a short name (`gpt2-small`), saklas passes full HF ids (`openai-community/gpt2`); we split on `/`, lowercase, accept either-contains-the-other.
+
 ## hooks.py
 
 `SteeringHook` adds a pre-composed vector to hidden states and **unconditionally rescales each position back to its pre-injection norm** (in-place, `torch.linalg.vector_norm(dtype=float32)` to avoid fp16 sum-of-squares overflow at hidden_dim ≥ 2048). No flag, no escape hatch.

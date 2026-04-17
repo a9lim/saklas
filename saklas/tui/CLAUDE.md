@@ -10,13 +10,15 @@ Thin frontend. Owns local alpha/enabled/thinking state per panel, passes through
 
 ## Slash commands
 
-- **Steering**: `/steer <name> [alpha]` (add + register, supports `<pos> . <neg> [alpha]`), `/alpha <name> <val>` (adjust existing only — errors if unregistered), `/unsteer <name>`.
+- **Steering**: `/steer <name> [alpha]` (add + register, supports `<pos> . <neg> [alpha]`), `/steer --sae [RELEASE] <name> [alpha]` (SAE variant — bare `--sae` picks the unique already-extracted SAE for the concept, explicit release forces one), `/alpha <name> <val>` (adjust existing only — errors if unregistered), `/unsteer <name>`.
 - **Probes**: `/probe <name>` (also seeds `_highlight_probe` and flips `_highlight_on = True`), `/unprobe <name>`, `/extract <name>` (to disk without wiring).
 - **Session**: `/clear`, `/rewind`, `/regen`, `/sys <prompt>`, `/temp`, `/top-p`, `/max`, `/seed <n>`, `/save <name>`, `/load <name>`, `/export <path>`.
 - **Analysis**: `/compare <a> [b]` (1-arg: ranked cosine vs all loaded profiles; 2-arg: pairwise score).
 - **Info**: `/model` (arch/device/layers/thinking/active state), `/help`.
 
 **Arg parser** (`SaklasApp._parse_args`): splits on ` . ` (space-period-space) — the only bipolar delimiter. Whitespace around the period is required to split so canonical single tokens like `dog.cat` stay one concept. `-` is **not** a delimiter: `happy - sad` is parsed as a single concept name which fails downstream name validation — intentional so the error surfaces clearly. Multi-word poles work without quotes (`/steer a dog . a pair of cats 0.4`). Quotes honored and stripped. Trailing alpha peeled from the final whitespace-separated token iff it parses as float. `/alpha` still uses `shlex.split` for its two-token form.
+
+**`/steer --sae` desugar** (`_parse_steer_command`): `--sae` preamble peels off, then a heuristic decides whether the next token is a release name (non-float, non-reserved, followed by at least one more token that looks concept-shaped) or the concept itself. The remainder runs through the normal `_parse_args` pipeline preserving quoted multi-word poles and period-delimited bipolar. The session-level key gets a `:<variant>` suffix so Task 8's `_resolve_pole_aliases` routes to the SAE tensor via `_try_autoload_vector(canonical, variant=...)`. Auto-extract requires an explicit release (`--sae` alone with no extracted SAE on disk yields a friendly error; the user picks a release via `/steer --sae <release> <concept>`).
 
 ## Mid-gen interruption
 

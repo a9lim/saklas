@@ -26,3 +26,9 @@ Five-verb root parser (`tui`/`serve`/`pack`/`vector`/`config`) split across:
 - `serve`: `--host/-H`, `--port/-P`, `--steer/-S name:alpha`, `--cors/-C`, `--api-key/-k`, plus `-c/--config`.
 - `pack ls` is local-only; `pack search` is the HF-remote verb.
 - `pack rm` replaces `uninstall`; `pack ls` replaces `list`.
+
+## SAE flags
+
+`vector extract` accepts `--sae RELEASE` (required value — no implicit default, since SAELens ships many releases per base model) and `--sae-revision REV` (optional HF revision pin). Written tensor lands at `<concept>/<safe_model>_sae-<release>.safetensors`; returned canonical name from `session.extract` carries a `:sae-<release>` suffix so subsequent `session.steering` calls address the SAE variant uniquely.
+
+`pack push --variant {raw,sae,all}` defaults to `raw` — SAE variants carry stronger provenance requirements (release + revision + per-layer sae_ids), so sharing them is opt-in. `pack clear --variant {raw,sae,all}` defaults to `all` — clearing a stale extraction should wipe every flavor unless scoped.

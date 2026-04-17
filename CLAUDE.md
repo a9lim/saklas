@@ -27,17 +27,18 @@ pip install -e ".[dev]"                         # editable + pytest
 pip install -e ".[serve]"                       # fastapi + uvicorn
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
 pip install -e ".[cuda]"                        # bitsandbytes + flash-attn (Linux/CUDA)
+pip install -e ".[sae]"                         # SAELens-backed SAE extraction (sae-lens)
 saklas tui <model_id>                           # TUI (explicit subcommand)
 saklas serve <model_id>                         # OpenAI + Ollama API (dual-protocol)
 saklas pack install <target> [-s|-a NS/N|-f]    # HF coord or folder; -s = statements only
 saklas pack refresh <selector> [-m MODEL]       # re-pull; `refresh neutrals` is reserved
-saklas pack clear <selector> [-m MODEL]         # delete per-model tensors (keep statements)
+saklas pack clear <selector> [-m MODEL] [--variant raw|sae|all]  # delete per-model tensors (keep statements)
 saklas pack rm <selector> [-y]                  # remove folder (bundled respawns)
 saklas pack ls [selector] [-j|-v]               # LOCAL installed packs only
 saklas pack search <query> [-j|-v]              # search HF hub for saklas-pack repos
-saklas pack push <selector> [-a OWNER/NAME] [-p] [-m MODEL] [-s|-n] [-t] [-d] [-f]
+saklas pack push <selector> [-a OWNER/NAME] [-p] [-m MODEL] [-s|-n] [-t] [-d] [-f] [--variant raw|sae|all]
 saklas pack export gguf <selector> [-m MODEL] [-o PATH] [--model-hint HINT]
-saklas vector extract <concept>|<pos> <neg> [-m MODEL] [-f]
+saklas vector extract <concept>|<pos> <neg> [-m MODEL] [-f] [--sae RELEASE [--sae-revision REV]]
 saklas vector merge <name> <components> [-m]    # merge baked tensors; a~b:α projection syntax
 saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
 saklas vector compare <concepts...> -m MODEL [-v] [-j]       # cosine similarity between vectors
@@ -51,7 +52,17 @@ Root parser has exactly five verbs — `tui`, `serve`, `pack`, `vector`, `config
 
 Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml` first, then composes any explicit `-c` files on top (later overrides earlier). `ConfigFile.effective(extras, include_default=...)` is the single entry point; `ConfigFile.resolve_poles()` runs every `vectors:` key through `cli.selectors.resolve_pole` so bare poles (`wolf: 0.5`) land as canonical + signed (`deer.wolf: -0.5`) in `default_alphas`.
 
-Selector grammar (shared): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`, `default`, `all`. Bare names resolve cross-namespace and raise `AmbiguousSelectorError` on collision. `pack refresh` silently skips `source=local`; `pack refresh neutrals` rewrites `~/.saklas/neutral_statements.json` from the bundled copy. `pack rm` refuses broad selectors without `-y`; bundled concepts respawn on next session init. `pack ls` is local-only; HF hub search is `pack search`.
+Selector grammar (shared): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`, `default`, `all`, optionally suffixed with `:<variant>` where `<variant>` is `raw` (default), `sae` (unique SAE variant for the concept), or `sae-<release>` (specific SAELens release). Bare names resolve cross-namespace and raise `AmbiguousSelectorError` on collision; bare `:sae` raises `AmbiguousVariantError` when more than one SAE release is extracted for a concept. `pack refresh` silently skips `source=local`; `pack refresh neutrals` rewrites `~/.saklas/neutral_statements.json` from the bundled copy. `pack rm` refuses broad selectors without `-y`; bundled concepts respawn on next session init. `pack ls` is local-only; HF hub search is `pack search`.
+
+## SAE pipeline (optional)
+
+`saklas vector extract <concept> --sae <release>` runs contrastive PCA in SAE feature space rather than raw residual-stream space, then decodes back to model space. Uses SAELens as the loader, so any published release it covers (GemmaScope, Eleuther, Joseph Bloom's, Apollo/Goodfire) works on day one. Install with `pip install -e ".[sae]"`.
+
+Output tensors coexist with raw-PCA tensors in the same concept folder: `<model>.safetensors` (raw) alongside `<model>_sae-<release>.safetensors` (SAE). Select at steer time with the `:sae[-<release>]` suffix — `session.steering({"honest:sae": 0.3})` from Python, `"honest:sae": 0.3` in the config file, `/steer --sae honest 0.3` in the TUI. A bare `:sae` picks the unique SAE variant; explicit `:sae-<release>` picks one when multiple coexist.
+
+SAE profiles are subset-layer (only layers the release covers). Share-baking redistributes over the covered subset — hook math and monitor scoring are unchanged. Release selection at extract time requires an explicit SAELens release name (SAELens ships many per base model — `gemma-scope-2b-pt-res`, `-mlp`, `-att`, etc. — and there's no sensible implicit default); if multiple SAEs exist per layer within a release, saklas picks the narrowest-width and emits a warning.
+
+Sidecar JSON records `sae_release`, `sae_revision`, `sae_ids_by_layer` alongside the usual `method: "pca_center_sae"` / `statements_sha256` fields. `pack push --variant sae|all` opts into sharing SAE tensors (push defaults to `raw` so provenance-stronger SAE flavors don't ship accidentally); `pack clear --variant raw|sae|all` scopes deletions (defaults to `all`).
 
 ## Python API (v2.0)
 

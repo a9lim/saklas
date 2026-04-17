@@ -44,6 +44,14 @@ Training-free persona cloning. `clone_from_corpus(session, path, name, *, n_pair
 
 Cache key: `sha256(corpus) + n_pairs + batch_size + seed` compared against existing `pack.json`; `force=True` bypasses. `session.clone_from_corpus(...)` is the thin public entry point.
 
+## SAE variant coexistence
+
+A concept folder can hold multiple baked tensors per model, distinguished by filename suffix: `<safe_model>.safetensors` (raw PCA) and `<safe_model>_sae-<release>.safetensors` (SAE-PCA, one per release). `safe_variant_suffix(release)` slugs unsafe chars; `tensor_filename(model_id, release=...)` / `sidecar_filename(...)` / `parse_tensor_filename(name)` in `paths.py` are the canonical constructors and inverse. `enumerate_variants(folder, model_id)` in `packs.py` returns `{"raw" | "sae-<release>": Path}`.
+
+Sidecar JSON gets three additional optional fields when `method == "pca_center_sae"`: `sae_release`, `sae_revision`, `sae_ids_by_layer`. Additive on top of `PACK_FORMAT_VERSION = 2` — no migration required. `pack.json.files` hashes every variant, so `ConceptFolder`-style integrity checks verify both raw and SAE tensors on every load.
+
+`cache_ops.delete_tensors(selector, model_scope, *, variant="all")` and `hf.push_pack(..., variant="all")` both accept a variant filter: `"raw"` / `"sae"` / `"all"`. CLI defaults encode the UX intent — `pack clear --variant all`, `pack push --variant raw` (users opt into sharing SAE provenance explicitly).
+
 ## datasource.py
 
 `DataSource` normalizes pairs from curated names, JSON, CSV, HF datasets, or raw lists.

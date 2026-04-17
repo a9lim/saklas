@@ -62,6 +62,7 @@ pip install saklas             # library + TUI
 pip install saklas[serve]      # + FastAPI/uvicorn for the API server
 pip install saklas[gguf]       # + gguf package for llama.cpp interchange
 pip install saklas[research]   # + datasets/pandas for dataset loading and DataFrames
+pip install saklas[sae]        # + sae-lens for SAE-backed extraction
 ```
 
 Requires Python 3.11+ and PyTorch 2.2+. Runs on Linux, macOS, and Windows. CPU works but is slow; CUDA or Apple Silicon MPS is recommended for anything interactive. A 4B model is comfortable on a MacBook Pro with MPS.
@@ -92,6 +93,35 @@ Alphas are backbone-normalized: per-layer PCA shares are baked into the tensor m
 - **~0.75** — generation tends to fall apart
 
 Multiple vectors compose. Register them all, pass whatever alpha map you want per call; co-layer directions sum into a single in-place hook per layer.
+
+### SAE-backed extraction (optional)
+
+Install `saklas[sae]` and pass `--sae <release>` to `vector extract` to run contrastive PCA in sparse-autoencoder feature space instead of raw residual-stream space. saklas routes through SAELens, so any published release it covers — GemmaScope, Eleuther Meta-LLaMA-3.1 SAEs, Joseph Bloom's, Apollo/Goodfire — works day one. The output plugs into the same hook, monitor, and pack infrastructure as raw PCA; the only visible difference is a `:sae-<release>` suffix on the concept name so raw and SAE flavors can coexist.
+
+```bash
+saklas vector extract honest.deceptive -m google/gemma-2-2b-it \
+  --sae gemma-scope-2b-pt-res-canonical
+```
+
+Then steer the SAE variant explicitly (Python, config, or TUI):
+
+```python
+with session.steering({"honest:sae": 0.3}):
+    session.generate("...")
+```
+
+```yaml
+# ~/.saklas/config.yaml
+vectors:
+  "honest:sae": 0.3
+```
+
+```
+/steer --sae honest 0.3          # TUI: picks the unique SAE variant
+/steer --sae gemma-scope-2b-pt-res-canonical honest 0.3   # explicit release
+```
+
+SAE profiles are subset-layer — only layers the release covers — and share-baking redistributes over the covered subset automatically. The 21 bundled concepts ship raw-PCA only; users opt into SAE extraction per-concept.
 
 By default steering fires on every token — prompt prefill, thinking section, response. A `Trigger` narrows that window. Pass one as a per-call default, or attach a different trigger per concept in the same call:
 
