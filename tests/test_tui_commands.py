@@ -10,6 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 
 import saklas
 from saklas.tui.app import SaklasApp
@@ -455,3 +456,63 @@ def test_parse_alpha_clamped_to_max():
     assert alpha == MAX_ALPHA
     _, _, alpha = SaklasApp._parse_args("happy -99", include_alpha=True)
     assert alpha == -MAX_ALPHA
+
+
+# ---- Task 12: /steer --sae [RELEASE] flag ----
+
+
+def test_parse_steer_accepts_sae_flag():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae honest 0.3")
+    assert result["concept"] == "honest"
+    assert result["alpha"] == pytest.approx(0.3)
+    assert result["variant"] == "sae"
+    assert result["baseline"] is None
+
+
+def test_parse_steer_accepts_sae_with_release():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae gemma-scope-2b-pt-res-canonical honest 0.3")
+    assert result["variant"] == "sae-gemma-scope-2b-pt-res-canonical"
+    assert result["concept"] == "honest"
+
+
+def test_parse_steer_no_sae_default_variant_raw():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("honest 0.3")
+    assert result["variant"] == "raw"
+
+
+def test_parse_steer_sae_with_bipolar_period_delim():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae honest . deceptive 0.3")
+    assert result["variant"] == "sae"
+    assert result["concept"] == "honest"
+    assert result["baseline"] == "deceptive"
+    assert result["alpha"] == pytest.approx(0.3)
+
+
+def test_parse_steer_sae_with_release_and_bipolar():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae my-release honest . deceptive 0.5")
+    assert result["variant"] == "sae-my-release"
+    assert result["concept"] == "honest"
+    assert result["baseline"] == "deceptive"
+    assert result["alpha"] == pytest.approx(0.5)
+
+
+def test_parse_steer_no_alpha():
+    from saklas.tui.app import _parse_steer_command
+    # alpha is optional — some commands omit it (e.g., auto-suggested).
+    result = _parse_steer_command("honest")
+    assert result["concept"] == "honest"
+    assert result["alpha"] is None
+    assert result["variant"] == "raw"
+
+
+def test_parse_steer_sae_no_alpha():
+    from saklas.tui.app import _parse_steer_command
+    result = _parse_steer_command("--sae honest")
+    assert result["concept"] == "honest"
+    assert result["alpha"] is None
+    assert result["variant"] == "sae"

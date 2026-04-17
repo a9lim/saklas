@@ -61,6 +61,90 @@ def _split_bipolar(text: str) -> tuple[str, str | None]:
     return _unquote(text.strip()), None
 
 
+def _looks_like_release(tok: str, remaining: list[str]) -> bool:
+    """Heuristic: decide whether ``tok`` after ``--sae`` is a release name or a concept.
+
+    A release name typically contains a hyphen (``gemma-scope-2b-pt-res-canonical``)
+    and stands alone; a bare concept name also may contain a hyphen but is
+    usually the only non-alpha token left. Disambiguate:
+      - tok must not parse as a float (alpha).
+      - tok must not equal "raw" or "sae" (reserved variant words).
+      - If there's no remaining token after it, it's a concept.
+      - If remaining's first token is a concept-shaped name (or ``.``) and we
+        have another token after that, treat tok as a release.
+    """
+    if tok in {"raw", "sae"}:
+        return False
+    try:
+        float(tok)
+        return False
+    except ValueError:
+        pass
+    if not remaining:
+        return False
+    # For ``--sae <tok> <concept> [...]`` the next token must itself look
+    # like a concept — not the bipolar ``.`` delimiter and not a bare alpha.
+    # Otherwise ``--sae honest 0.3`` would eat ``honest`` as a release.
+    next_tok = remaining[0]
+    if next_tok == ".":
+        return False
+    try:
+        float(next_tok)
+        return False
+    except ValueError:
+        pass
+    return True
+
+
+def _parse_steer_command(arg: str) -> dict:
+    """Parse a /steer argument string.
+
+    Recognizes:
+      --sae [RELEASE] <concept> [alpha]
+      --sae [RELEASE] <pos> . <neg> [alpha]
+      <concept> [alpha]
+      <pos> . <neg> [alpha]
+
+    Returns a dict with concept, baseline (None or str), alpha (None or float),
+    variant ("raw" / "sae" / "sae-<release>").
+    """
+    tokens = arg.split()
+    variant = "raw"
+    if tokens and tokens[0] == "--sae":
+        tokens = tokens[1:]
+        if tokens:
+            candidate = tokens[0]
+            if _looks_like_release(candidate, remaining=tokens[1:]):
+                variant = f"sae-{candidate}"
+                tokens = tokens[1:]
+            else:
+                variant = "sae"
+        else:
+            variant = "sae"
+
+    if not tokens:
+        raise ValueError("no concept")
+
+    result: dict = {"variant": variant, "baseline": None, "alpha": None}
+
+    # Bipolar: <pos> . <neg>
+    if len(tokens) >= 3 and tokens[1] == ".":
+        result["concept"] = tokens[0]
+        result["baseline"] = tokens[2]
+        rest = tokens[3:]
+    else:
+        result["concept"] = tokens[0]
+        rest = tokens[1:]
+
+    if rest:
+        try:
+            result["alpha"] = float(rest[0])
+        except ValueError:
+            result["alpha"] = None
+
+    return result
+
+
 def _resolve_active_name(name: str, active) -> list[str]:
     """Resolve a user-typed name against a set of currently-active names.
 
@@ -508,7 +592,8 @@ class SaklasApp(App):
         return concept, baseline
 
     def _handle_extract(self, text: str, include_alpha: bool, on_success,
-                        pending_type: str | None = None) -> None:
+                        pending_type: str | None = None,
+                        variant: str = "raw") -> None:
         chat = self._chat_panel
         if self._ab_in_progress:
             chat.add_system_message("Cannot modify vectors during A/B comparison.")
@@ -554,28 +639,83 @@ class SaklasApp(App):
             if alpha is not None:
                 alpha *= sign
 
+        # Variant routing: append `:variant` to the final registered name
+        # so _resolve_pole_aliases routes to the right backend (raw / SAE).
+        # Plain `--sae` with no release can't auto-extract — the SAE loader
+        # needs an explicit release. Surface a friendly error instead of
+        # calling session.extract(sae="") and letting it blow up.
+        sae_release: str | None = None
+        if variant != "raw":
+            if variant == "sae":
+                chat.add_system_message(
+                    "Error: --sae requires a release for auto-extract. "
+                    "Use `--sae <RELEASE> <concept>` (e.g. "
+                    "`--sae gemma-scope-2b-pt-res-canonical honest`)."
+                )
+                return
+            if variant.startswith("sae-"):
+                sae_release = variant[len("sae-"):]
+
         display = concept if len(concept) <= 20 else concept[:17] + "..."
         suffix = f" vs '{baseline}'" if baseline else ""
-        chat.add_system_message(f"Extracting '{display}'{suffix}...")
+        variant_note = f" [{variant}]" if variant != "raw" else ""
+        chat.add_system_message(f"Extracting '{display}'{suffix}{variant_note}...")
+
+        # Registered session-level name carries the variant suffix — the
+        # session's `_resolve_pole_aliases` (Task 8) routes it correctly.
+        registered_name = concept if variant == "raw" else f"{concept}:{variant}"
 
         def _worker():
             def _progress(msg):
                 self.call_from_thread(self._steer_status, msg)
             try:
-                canonical, profile = self._session.extract(concept, baseline=baseline, on_progress=_progress)
-                on_success(canonical, profile, alpha)
+                extract_kwargs = {"baseline": baseline, "on_progress": _progress}
+                if sae_release is not None:
+                    extract_kwargs["sae"] = sae_release
+                canonical, profile = self._session.extract(concept, **extract_kwargs)
+                final_name = (
+                    canonical if variant == "raw" else f"{canonical}:{variant}"
+                )
+                on_success(final_name, profile, alpha)
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
 
         self.run_worker(_worker, thread=True)
 
     def _handle_steer(self, text: str) -> None:
+        # Peel --sae [RELEASE] off the front before delegating to the
+        # shared extract pipeline. The rest of the text still goes through
+        # `_parse_args`, preserving quoted multi-word poles / period delim.
+        variant = "raw"
+        stripped = text.lstrip()
+        if stripped.startswith("--sae"):
+            after = stripped[len("--sae"):].lstrip()
+            try:
+                parsed = _parse_steer_command(stripped)
+            except ValueError as e:
+                self._chat_panel.add_system_message(
+                    f"Parse error: {e}\nUsage: /steer --sae [RELEASE] <concept> [alpha]"
+                )
+                return
+            variant = parsed["variant"]
+            # Rebuild the extract-compatible text by dropping --sae (+ release
+            # if present). The existing _parse_args handles the rest.
+            if variant == "sae":
+                text = after
+            elif variant.startswith("sae-"):
+                release = variant[len("sae-"):]
+                # Strip the release token (and surrounding whitespace).
+                after_release = after[len(release):].lstrip()
+                text = after_release
+
         def _on_success(name, profile, alpha):
             self._session.steer(name, profile)
             self._alphas[name] = alpha
             self._enabled[name] = True
             self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
-        self._handle_extract(text, include_alpha=True, on_success=_on_success)
+        self._handle_extract(
+            text, include_alpha=True, on_success=_on_success, variant=variant,
+        )
 
     def _handle_probe(self, text: str) -> None:
         def _on_success(name, profile, _alpha):
