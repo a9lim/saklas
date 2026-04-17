@@ -866,3 +866,178 @@ def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
     assert "honest.deceptive:sae" in out
     assert out["honest.deceptive"][0] == pytest.approx(0.3)
     assert out["honest.deceptive:sae"][0] == pytest.approx(0.2)
+
+
+def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
+    """session.extract(..., sae=release) writes to <model>_sae-<release>.safetensors
+    and returns a canonical:sae-<release> name."""
+    import torch
+    from saklas.core.sae import MockSaeBackend
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    # Stub extract_contrastive so we don't need a real model.
+    from saklas.core import session as S
+    from saklas.core import vectors as V
+
+    captured: dict = {}
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None):
+        captured["sae"] = sae
+        return {0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}
+    monkeypatch.setattr(V, "extract_contrastive", fake_extract)
+    monkeypatch.setattr(S, "extract_contrastive", fake_extract)
+
+    # Stub SAE backend loader.
+    def fake_loader(release, **kw):
+        return MockSaeBackend(
+            layers=frozenset({0, 2}), d_model=4, release=release,
+        )
+    monkeypatch.setattr("saklas.core.sae.load_sae_backend", fake_loader, raising=False)
+
+    # Pre-write bundled statements so the curated-statements fast path kicks in.
+    import json
+    concept_folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    concept_folder.mkdir(parents=True)
+    (concept_folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "test", "version": "0.0.0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    (concept_folder / "statements.json").write_text(json.dumps([
+        {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
+    ]))
+
+    # Build a minimal session stub with only what `extract` needs.
+    # SaklasSession.extract reaches for: _model, _tokenizer, _layers, _device,
+    # model_id, _local_concept_folder, _update_local_pack_files, events, and
+    # the caching helpers. Use the actual SaklasSession method bound to a stub.
+    from saklas.cli.selectors import invalidate
+    invalidate()
+
+    from saklas.core.events import EventBus
+
+    class StubSession:
+        model_id = "m"
+        _device = torch.device("cpu")
+        _model = None
+        _tokenizer = None
+        _layers = [object()] * 4
+        _profiles: dict = {}
+        _gen_lock = None
+        _gen_active = False
+        events = EventBus()
+
+        def _promote_profile(self, p):
+            return p
+
+        def _local_concept_folder(self, canonical):
+            import pathlib
+            folder = pathlib.Path(tmp_path) / "vectors" / "local" / canonical
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder
+
+        def _update_local_pack_files(self, folder):
+            pass
+
+        def _statements_cache_path(self, canonical):
+            return str(self._local_concept_folder(canonical) / "statements.json")
+
+        def _vector_cache_path(self, canonical):
+            from saklas.io.paths import tensor_filename
+            return str(self._local_concept_folder(canonical) / tensor_filename(self.model_id))
+
+        extract = S.SaklasSession.extract
+        _extract_impl = S.SaklasSession._extract_impl
+
+    sess = StubSession()
+    name, profile = sess.extract("honest.deceptive", sae="mock-release")
+
+    # Return key carries the :sae-<release> suffix
+    assert name == "honest.deceptive:sae-mock-release"
+
+    # File written with the suffix
+    expected_tensor = concept_folder / "m_sae-mock-release.safetensors"
+    assert expected_tensor.exists()
+
+    # Sidecar carries sae metadata
+    with open(expected_tensor.with_suffix(".json")) as f:
+        sidecar = json.load(f)
+    assert sidecar["method"] == "pca_center_sae"
+    assert sidecar["sae_release"] == "mock-release"
+
+    # extract_contrastive received the backend instance
+    assert captured["sae"] is not None
+
+
+def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
+    """Without sae=..., extract returns the bare canonical name and writes the raw tensor."""
+    import torch
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.core import session as S
+    from saklas.core import vectors as V
+
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None):
+        return {0: torch.ones(4), 2: torch.ones(4)}
+    monkeypatch.setattr(V, "extract_contrastive", fake_extract)
+    monkeypatch.setattr(S, "extract_contrastive", fake_extract)
+
+    import json
+    concept_folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+    concept_folder.mkdir(parents=True)
+    (concept_folder / "pack.json").write_text(json.dumps({
+        "name": "honest.deceptive", "description": "t", "version": "0",
+        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
+        "source": "local", "files": {}, "format_version": 2,
+    }))
+    (concept_folder / "statements.json").write_text(json.dumps([
+        {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
+    ]))
+
+    from saklas.cli.selectors import invalidate
+    invalidate()
+    from saklas.core.events import EventBus
+
+    class StubSession:
+        model_id = "m"
+        _device = torch.device("cpu")
+        _model = None
+        _tokenizer = None
+        _layers = [object()] * 4
+        _profiles: dict = {}
+        _gen_lock = None
+        _gen_active = False
+        events = EventBus()
+
+        def _promote_profile(self, p):
+            return p
+
+        def _local_concept_folder(self, canonical):
+            import pathlib
+            folder = pathlib.Path(tmp_path) / "vectors" / "local" / canonical
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder
+
+        def _update_local_pack_files(self, folder):
+            pass
+
+        def _statements_cache_path(self, canonical):
+            return str(self._local_concept_folder(canonical) / "statements.json")
+
+        def _vector_cache_path(self, canonical):
+            from saklas.io.paths import tensor_filename
+            return str(self._local_concept_folder(canonical) / tensor_filename(self.model_id))
+
+        extract = S.SaklasSession.extract
+        _extract_impl = S.SaklasSession._extract_impl
+
+    sess = StubSession()
+    name, profile = sess.extract("honest.deceptive")
+
+    # No :sae suffix
+    assert name == "honest.deceptive"
+    # Raw filename
+    assert (concept_folder / "m.safetensors").exists()
+    # No _sae-* files
+    assert not list(concept_folder.glob("*_sae-*.safetensors"))

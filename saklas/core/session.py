@@ -28,7 +28,7 @@ from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.model import load_model, get_layers, get_model_info
 from saklas.core.monitor import TraitMonitor
 from saklas.io.packs import PackFormatError, PackMetadata, hash_file, hash_folder_files
-from saklas.io.paths import concept_dir, safe_model_id
+from saklas.io.paths import concept_dir, safe_model_id, tensor_filename
 from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent, ProbeReadings
@@ -666,6 +666,8 @@ class SaklasSession:
         reuse_scenarios: bool = False,
         force_statements: bool = False,
         on_progress: Callable[[str], None] | None = None,
+        sae: str | None = None,
+        sae_revision: str | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit VectorExtracted.
 
@@ -704,6 +706,8 @@ class SaklasSession:
             reuse_scenarios=reuse_scenarios,
             force_statements=force_statements,
             on_progress=on_progress,
+            sae=sae,
+            sae_revision=sae_revision,
         )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
@@ -721,6 +725,8 @@ class SaklasSession:
         reuse_scenarios: bool = False,
         force_statements: bool = False,
         on_progress: Callable[[str], None] | None = None,
+        sae: str | None = None,
+        sae_revision: str | None = None,
     ) -> tuple[str, Profile]:
         """Actual extraction pipeline — see :meth:`extract` for the wrapper.
 
@@ -767,6 +773,46 @@ class SaklasSession:
 
         canonical = canonical_concept_name(concept, baseline)
 
+        # Resolve the SAE backend once. No-op when ``sae is None`` —
+        # the ``load_sae_backend`` import is lazy so non-SAE callers
+        # don't touch the SAE layer.
+        sae_backend = None
+        sae_metadata: dict = {}
+        if sae is not None:
+            from saklas.core.sae import load_sae_backend
+            sae_backend = load_sae_backend(
+                sae,
+                revision=sae_revision,
+                model_id=self.model_id,
+                device=self._device,
+            )
+            sae_metadata = {
+                "sae_release": sae_backend.release,
+                "sae_revision": sae_backend.revision,
+                "sae_ids_by_layer": getattr(sae_backend, "sae_ids_by_layer", {}),
+            }
+
+        def _build_return(profile_dict: dict) -> tuple[str, Profile]:
+            meta: dict = {
+                "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
+            }
+            meta.update(sae_metadata)
+            out_name = (
+                canonical
+                if sae_backend is None
+                else f"{canonical}:sae-{sae_backend.release}"
+            )
+            return out_name, Profile(profile_dict, metadata=meta)
+
+        def _save_meta(extra: dict | None = None) -> dict:
+            meta: dict = {
+                "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
+            }
+            if extra:
+                meta.update(extra)
+            meta.update(sae_metadata)
+            return meta
+
         # For DataSource or raw pairs, skip the full pipeline — just extract
         if isinstance(source, (DataSource, list)):
             if isinstance(source, list):
@@ -774,12 +820,17 @@ class SaklasSession:
             else:
                 ds = source
             folder = self._local_concept_folder(canonical)
-            cache_path = str(folder / f"{safe_model_id(self.model_id)}.safetensors")
+            cache_path = str(folder / tensor_filename(self.model_id, release=sae))
             try:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{canonical}'.")
-                return canonical, Profile(profile, metadata=_meta)
+                out_name = (
+                    canonical
+                    if sae_backend is None
+                    else f"{canonical}:sae-{sae_backend.release}"
+                )
+                return out_name, Profile(profile, metadata=_meta)
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -787,10 +838,11 @@ class SaklasSession:
             pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
             profile = extract_contrastive(
                 self._model, self._tokenizer, pairs, layers=self._layers,
+                sae=sae_backend,
             )
-            _save_profile(profile, cache_path, {"method": "contrastive_pca"})
+            _save_profile(profile, cache_path, _save_meta())
             self._update_local_pack_files(folder)
-            return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
+            return _build_return(profile)
 
         # String source — full pipeline. Pack lookup scans all namespaces
         # (default/, hf-pulled, local/) via cli_selectors._all_concepts so
@@ -805,9 +857,12 @@ class SaklasSession:
                 break
 
         if curated_folder is not None:
-            cache_path = str(curated_folder / f"{safe_model_id(self.model_id)}.safetensors")
+            cache_path = str(curated_folder / tensor_filename(self.model_id, release=sae))
         else:
-            cache_path = self._vector_cache_path(canonical)
+            cache_path = str(
+                pathlib.Path(self._local_concept_folder(canonical))
+                / tensor_filename(self.model_id, release=sae)
+            )
 
         # 1. Vector cache — short-circuits unless a regen path is requested.
         #    ``force_statements=True`` or explicit ``scenarios=[...]`` both
@@ -821,7 +876,12 @@ class SaklasSession:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{canonical}'.")
-                return canonical, Profile(profile, metadata=_meta)
+                out_name = (
+                    canonical
+                    if sae_backend is None
+                    else f"{canonical}:sae-{sae_backend.release}"
+                )
+                return out_name, Profile(profile, metadata=_meta)
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -838,13 +898,13 @@ class SaklasSession:
                 profile = extract_contrastive(
                     self._model, self._tokenizer, ds["pairs"],
                     layers=self._layers,
+                    sae=sae_backend,
                 )
-                _save_profile(profile, cache_path, {
-                    "method": "contrastive_pca",
+                _save_profile(profile, cache_path, _save_meta({
                     "statements_sha256": hash_file(curated_stmts),
-                })
+                }))
                 self._update_local_pack_files(curated_folder)
-                return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
+                return _build_return(profile)
 
         # 3. Local statements cache — default reuses if present.
         stmt_cache_path = self._statements_cache_path(canonical)
@@ -931,13 +991,13 @@ class SaklasSession:
         _progress(f"Extracting contrastive profile ({len(pairs)} pairs)...")
         profile = extract_contrastive(
             self._model, self._tokenizer, pairs, layers=self._layers,
+            sae=sae_backend,
         )
-        _save_profile(profile, cache_path, {
-            "method": "contrastive_pca",
+        _save_profile(profile, cache_path, _save_meta({
             "statements_sha256": hash_file(pathlib.Path(stmt_cache_path)),
-        })
+        }))
         self._update_local_pack_files(local_folder)
-        return canonical, Profile(profile, metadata={"method": "contrastive_pca"})
+        return _build_return(profile)
 
     def clone_from_corpus(
         self,
