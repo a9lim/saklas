@@ -4,13 +4,13 @@
 
 ## Why
 
-<!-- What problem does this solve? Link issues with "Fixes #N" if applicable -->
+<!-- What problem does this solve? Please link issues with "Fixes #N" if applicable -->
 
 ## Test plan
 
 - [ ] `ruff check .` passes
 - [ ] Non-GPU tests pass (`pytest tests/test_paths.py tests/test_packs.py ...`)
-- [ ] GPU smoke tests pass (if touching model/vector/hooks/monitor code)
+- [ ] GPU smoke tests pass (if touching model, vector, hooks, or monitor code)
 - [ ] Manually verified against: <!-- model id + device -->
 
 ## Notes
