@@ -942,10 +942,6 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
         def _statements_cache_path(self, canonical):
             return str(self._local_concept_folder(canonical) / "statements.json")
 
-        def _vector_cache_path(self, canonical):
-            from saklas.io.paths import tensor_filename
-            return str(self._local_concept_folder(canonical) / tensor_filename(self.model_id))
-
         extract = S.SaklasSession.extract
         _extract_impl = S.SaklasSession._extract_impl
 
@@ -1024,10 +1020,6 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
 
         def _statements_cache_path(self, canonical):
             return str(self._local_concept_folder(canonical) / "statements.json")
-
-        def _vector_cache_path(self, canonical):
-            from saklas.io.paths import tensor_filename
-            return str(self._local_concept_folder(canonical) / tensor_filename(self.model_id))
 
         extract = S.SaklasSession.extract
         _extract_impl = S.SaklasSession._extract_impl

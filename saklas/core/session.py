@@ -28,7 +28,7 @@ from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.model import load_model, get_layers, get_model_info
 from saklas.core.monitor import TraitMonitor
 from saklas.io.packs import PackFormatError, PackMetadata, hash_file, hash_folder_files
-from saklas.io.paths import concept_dir, safe_model_id, tensor_filename
+from saklas.io.paths import concept_dir, tensor_filename
 from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent, ProbeReadings
@@ -350,11 +350,6 @@ class SaklasSession:
                 files={},
             ).write(folder)
         return folder
-
-    def _vector_cache_path(self, canonical: str) -> str:
-        folder = self._local_concept_folder(canonical)
-        model_id = self._model_info.get("model_id", "unknown")
-        return str(folder / f"{safe_model_id(model_id)}.safetensors")
 
     def _statements_cache_path(self, canonical: str) -> str:
         folder = self._local_concept_folder(canonical)
