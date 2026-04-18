@@ -617,8 +617,8 @@ def _resolve_variant_tensor(
     """Locate the on-disk tensor for ``(folder, model, variant)``.
 
     ``variant`` semantics:
-      - ``None`` (no suffix passed): legacy behavior — prefer raw
-        safetensors, fall back to GGUF.
+      - ``None`` (no suffix passed): prefer raw safetensors, fall back
+        to GGUF.
       - ``"raw"``: require the raw safetensors tensor.
       - ``"sae"``: require the unique SAE variant; raise
         :class:`AmbiguousVariantError` when >1, :class:`UnknownVariantError`
@@ -631,7 +631,7 @@ def _resolve_variant_tensor(
     variants = enumerate_variants(folder, model_id)
 
     if variant is None:
-        # Legacy path: raw preferred, GGUF fallback.
+        # Raw preferred, GGUF fallback.
         if "raw" in variants:
             return variants["raw"]
         from saklas.io.paths import safe_model_id as _safe
@@ -741,9 +741,9 @@ def _run_compare(args: argparse.Namespace) -> None:
                         continue
                     if cdir.name == target_name:
                         continue
-                    # Auto-scan keeps legacy behavior: raw preferred,
-                    # GGUF fallback. SAE-vs-all ranking requires the
-                    # caller to pass the SAE selector explicitly.
+                    # Auto-scan: raw preferred, GGUF fallback. SAE-vs-all
+                    # ranking requires the caller to pass the SAE selector
+                    # explicitly.
                     try:
                         tp = _resolve_variant_tensor(cdir, args.model, None)
                     except (AmbiguousVariantError, UnknownVariantError):

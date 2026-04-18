@@ -69,7 +69,7 @@ class SteeringHook:
     """Pre-composed steering vectors for a single layer, grouped by trigger.
 
     Fast path (``Trigger.BOTH`` only): a single composed tensor is added
-    unconditionally at hook time, matching the v1.x behavior bit-for-bit.
+    unconditionally at hook time — no per-step trigger check.
 
     Slow path (any non-``BOTH`` trigger): entries are grouped by trigger
     equality into ``composed_groups``; each group has its own pre-composed
@@ -142,7 +142,7 @@ class SteeringHook:
 
         # Fast-path collapse: all contributions use Trigger.BOTH (or an
         # equality-equivalent default Trigger()).  One tensor, no per-step
-        # .active() check, bit-for-bit identical to the v1.x hook.
+        # .active() check.
         if len(composed_groups) == 1 and composed_groups[0][0] == Trigger.BOTH:
             self.composed = composed_groups[0][1]
             self.composed_groups = []
@@ -151,8 +151,8 @@ class SteeringHook:
             self.composed_groups = composed_groups
 
     def hook_fn(self, module, input, output):
-        # Fast path: bit-identical to v1.x — single composed tensor, no
-        # trigger check, unconditional norm preservation.
+        # Fast path: single composed tensor, no trigger check,
+        # unconditional norm preservation.
         if self.composed is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
             norm_pre = torch.linalg.vector_norm(

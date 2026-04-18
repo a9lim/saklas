@@ -162,32 +162,23 @@ def _session_info(
         "created": created,
         "config": _session_config_dict(session),
         "vectors": sorted(session.vectors.keys()),
-        "probes": sorted(session.probes.keys()) if isinstance(session.probes, dict) else list(session.probes),
+        "probes": sorted(session.probes.keys()),
         "history_length": len(session.history) if hasattr(session, "history") else 0,
         "supports_thinking": thinks,
         "default_steering": default_expr,
     }
 
 
-def _profile_to_json(name: str, profile) -> dict:
-    # Accept Profile or bare dict (session.vectors still holds dicts).
-    if isinstance(profile, Profile):
-        layers = profile.layers
-        meta = profile.metadata
-        tensors = profile.as_dict()
-    else:
-        layers = sorted(int(k) for k in profile.keys())
-        meta = {}
-        tensors = profile
+def _profile_to_json(name: str, profile: Profile) -> dict:
     top = sorted(
-        ((idx, float(vec.norm().item())) for idx, vec in tensors.items()),
+        ((idx, float(vec.norm().item())) for idx, vec in profile.items()),
         key=lambda x: x[1], reverse=True,
     )[:5]
     return {
         "name": name,
-        "layers": layers,
+        "layers": profile.layers,
         "top_layers": [{"layer": idx, "magnitude": round(m, 4)} for idx, m in top],
-        "metadata": meta,
+        "metadata": profile.metadata,
     }
 
 

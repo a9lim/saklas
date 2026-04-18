@@ -71,7 +71,7 @@ def sweep(model_id: str) -> None:
         session.clear_history()
         result = session.generate(
             PROMPT,
-            steering={name: alpha},
+            steering=f"{alpha} {name}",
             sampling=SamplingConfig(seed=SEED, max_tokens=MAX_TOKENS),
             thinking=False,
             stateless=True,

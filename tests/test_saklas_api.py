@@ -250,8 +250,9 @@ class TestProbes:
 class TestExtract:
     def test_extract_json(self, session_and_client):
         import torch
+        from saklas.core.profile import Profile
         session, client = session_and_client
-        profile = {0: torch.zeros(4), 1: torch.ones(4)}
+        profile = Profile({0: torch.zeros(4), 1: torch.ones(4)})
         session.extract.return_value = ("angry.calm", profile)
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
@@ -265,8 +266,9 @@ class TestExtract:
 
     def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client):
         import torch
+        from saklas.core.profile import Profile
         session, client = session_and_client
-        profile = {0: torch.ones(4)}
+        profile = Profile({0: torch.ones(4)})
 
         def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
             assert source == [("positive text", "negative text")]
@@ -769,7 +771,7 @@ def test_autoload_raw_default_is_silent_on_miss(tmp_path, monkeypatch):
 
 
 def test_steering_resolves_sae_variant_key(tmp_path, monkeypatch):
-    """`session.steering({'honest:sae': 0.3})` registers under canonical:sae."""
+    """`session.steering("0.3 honest:sae")` registers under canonical:sae."""
     import json
     import torch
     from safetensors.torch import save_file

@@ -10,8 +10,8 @@ Trigger.AFTER_THINKING)``).
 Triggers compose at the hook layer: entries sharing a trigger pre-compose
 into one tensor, distinct triggers get distinct tensors, and the hook sums
 only those groups whose trigger is active at the current generation step.
-The default ``Trigger.BOTH`` preserves the v1.x "steer every token" path
-bit-for-bit.
+The default ``Trigger.BOTH`` (steer every prompt + response + thinking
+token) short-circuits the per-step ``.active()`` check.
 
 ``TriggerContext`` is a tiny mutable struct shared between the generation
 loop and the hooks — the loop mutates it at lifecycle boundaries (prefill
@@ -92,10 +92,10 @@ class Trigger:
 # Preset constants. Assigned after the class so they themselves are
 # Trigger instances — users pass them directly: ``Trigger.AFTER_THINKING``.
 #
-# ``BOTH`` is the v1.x-equivalent default (steer every prompt + response
-# + thinking token). Hook hot path short-circuits on ``is BOTH`` to skip
-# the per-step ``.active()`` call, so default generations pay zero added
-# cost from the trigger machinery.
+# ``BOTH`` is the default (steer every prompt + response + thinking token).
+# Hook hot path short-circuits on ``is BOTH`` to skip the per-step
+# ``.active()`` call, so default generations pay zero added cost from the
+# trigger machinery.
 Trigger.BOTH = Trigger()
 Trigger.GENERATED_ONLY = Trigger(prompt=False)
 Trigger.PROMPT_ONLY = Trigger(generated=False)

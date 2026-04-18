@@ -30,9 +30,11 @@ class ProfileError(ValueError, SaklasError):
 class Profile:
     """Steering direction set: one baked tensor per transformer layer.
 
-    Wraps ``dict[int, torch.Tensor]``. Dict-compat surface is intentional
-    for the migration from v1.x — existing producers of bare dicts can be
-    wrapped without touching their internals.
+    Wraps ``dict[int, torch.Tensor]`` with the same mapping interface
+    (``__getitem__``, ``items``, ``keys``, ``values``, ``__iter__``,
+    ``__len__``, ``__contains__``) plus a typed public surface
+    (``layers``, ``metadata``, ``weight_at``, ``save``/``load``,
+    ``merged``, ``projected_away``, ``cosine_similarity``).
     """
 
     __slots__ = ("_tensors", "_metadata")
@@ -67,7 +69,7 @@ class Profile:
         self._tensors: dict[int, torch.Tensor] = out
         self._metadata: dict = dict(metadata or {})
 
-    # Dict-compat surface -------------------------------------------------
+    # Mapping surface -----------------------------------------------------
 
     def __getitem__(self, layer: int) -> torch.Tensor:
         return self._tensors[layer]
@@ -105,8 +107,8 @@ class Profile:
     def as_dict(self) -> dict[int, torch.Tensor]:
         """Return the underlying dict (shared reference, not a copy).
 
-        Internal helper for call sites that still speak the bare-dict
-        wire format (hooks, merge.linear_sum, monitor). Do not mutate.
+        Internal helper for call sites that work on the raw tensor dict
+        (hooks, merge.linear_sum, monitor). Do not mutate.
         """
         return self._tensors
 
@@ -127,9 +129,9 @@ class Profile:
     ) -> None:
         """Save as safetensors + slim JSON sidecar.
 
-        The sidecar carries ``format_version = 2`` so future readers can
-        refuse v1.x packs. Metadata passed here overrides / augments the
-        profile's own ``self.metadata``.
+        Metadata passed here overrides / augments the profile's own
+        ``self.metadata``; the sidecar carries the current
+        ``PACK_FORMAT_VERSION``.
         """
         from saklas.core.vectors import save_profile as _save
 
@@ -142,10 +144,11 @@ class Profile:
     def load(cls, path: str | pathlib.Path) -> "Profile":
         """Load from safetensors (+ sidecar) or gguf.
 
-        Dispatches on file extension. Safetensors sidecars with missing or
-        ``format_version < 2`` raise :class:`ProfileError` pointing at the
-        migration script. GGUF files carry metadata in-header and are
-        exempt from the format_version gate.
+        Dispatches on file extension. Safetensors sidecars with a
+        ``format_version`` below ``PACK_FORMAT_VERSION`` raise
+        :class:`ProfileError` pointing at the migration script. GGUF
+        files carry metadata in-header and are exempt from the
+        format_version gate.
         """
         from saklas.core.vectors import load_profile as _load
 

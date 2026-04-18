@@ -157,19 +157,18 @@ def test_nested_trigger_regimes_compose():
         assert outer == {"a": (0.3, Trigger.BOTH)}
 
 
-def test_steering_applied_event_carries_entries_for_nondefault_triggers():
+def test_steering_applied_event_carries_entries():
     s = _Stub({"a": None, "b": None})
     events = []
     s.events.subscribe(events.append)
     with s.steering("0.3 a"):
         applied = [e for e in events if isinstance(e, SteeringApplied)][-1]
         assert applied.alphas == {"a": 0.3}
-        assert applied.entries is None
+        assert applied.entries == {"a": (0.3, Trigger.BOTH)}
     events.clear()
     with s.steering("0.3 a + 0.5 b@after"):
         applied = [e for e in events if isinstance(e, SteeringApplied)][-1]
         assert applied.alphas == {"a": 0.3, "b": 0.5}
-        assert applied.entries is not None
         assert applied.entries["a"] == (0.3, Trigger.BOTH)
         assert applied.entries["b"] == (0.5, Trigger.AFTER_THINKING)
 

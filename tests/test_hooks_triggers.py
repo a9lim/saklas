@@ -1,9 +1,10 @@
 """SteeringHook per-trigger grouping + conditional apply.
 
-Exercises the hook's fast path (BOTH-only → composed tensor, identical to
-v1.x behavior) and the slow path (multiple groups, ctx-gated adds) without
-loading a real transformer layer.  A ``nn.Identity``-equivalent module
-returning the hidden state unchanged is enough to drive the hook.
+Exercises the hook's fast path (BOTH-only → single composed tensor, no
+per-step trigger check) and the slow path (multiple groups, ctx-gated
+adds) without loading a real transformer layer.  A
+``nn.Identity``-equivalent module returning the hidden state unchanged
+is enough to drive the hook.
 """
 
 from __future__ import annotations

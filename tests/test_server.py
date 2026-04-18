@@ -257,15 +257,9 @@ class TestCLIParsing:
         args = parse_args(["serve", "m", "--cors", "http://localhost:3000", "--cors", "*"])
         assert args.cors == ["http://localhost:3000", "*"]
 
-    # Legacy -x/-X/--clear-custom/--clear-all/--cache-dir CLI flags removed in
-    # Story A Phase 10. Cache ops now live under -r/-x/-i/-l/-m with a shared
-    # selector grammar. Coverage moved to tests/test_cli_flags.py.
-
-
-# TestCacheClear removed: the pre-rename `probes/cache/` + `datasets/cache/`
-# + --clear-all/--clear-custom behavior it exercised no longer exists.
-# Cache-op coverage is in tests/test_cache_ops.py (delete_tensors across
-# concept/tag/model selectors with the new ~/.saklas/ layout).
+    # Cache-op coverage lives in tests/test_cache_ops.py (delete_tensors
+    # across concept/tag/model selectors) and tests/test_cli_flags.py
+    # (the -r/-x/-i/-l/-m cache-ops flag grammar).
 
 
 # ---------------------------------------------------------------------------

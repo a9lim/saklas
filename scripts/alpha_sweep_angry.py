@@ -42,13 +42,14 @@ def main() -> int:
           f"max={max(norms.values()):.4f} peak/mean={max(norms.values())/mean_s:.2f}")
     print(f"top5 layers: {top5}\n")
 
+    from saklas import SamplingConfig
     for a in ALPHAS:
         print(f"=== alpha={a} ===", flush=True)
         session.clear_history()
         result = session.generate(
             PROMPT,
-            alphas={name: a} if a > 0 else {},
-            seed=SEED,
+            steering=f"{a} {name}" if a > 0 else None,
+            sampling=SamplingConfig(seed=SEED),
             stateless=True,
         )
         print(result.text.strip())

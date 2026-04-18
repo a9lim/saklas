@@ -374,7 +374,7 @@ def test_compare_no_args():
     assert "Usage" in msg or "usage" in msg
 
 
-# ---- _parse_args: period delim, multi-word poles, legacy dash ----
+# ---- _parse_args: period delim, multi-word poles, hyphen-in-name ----
 
 
 def test_parse_single_concept_no_alpha():
