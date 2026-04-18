@@ -39,6 +39,32 @@ _LEFT, _CHAT, _TRAIT = 0, 1, 2
 _BIPOLAR_DELIM = " . "
 
 
+def _resolve_context_window(config, tokenizer) -> int:
+    """Find the model's context length across naming variants.
+
+    HF scatters this field across: top-level ``max_position_embeddings`` on
+    single-modal configs, ``text_config``/``llm_config`` sub-configs on
+    multimodal stacks (Gemma 3/4, Qwen-VL, Llama 3.2-Vision), ``n_positions``
+    on legacy GPT-family configs, and sometimes only ``model_max_length`` on
+    the tokenizer. Walk the union; first positive value wins.
+    """
+    candidates = [config] + [
+        getattr(config, sub, None) for sub in ("text_config", "llm_config")
+    ]
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        for attr in ("max_position_embeddings", "n_positions"):
+            val = getattr(cfg, attr, None)
+            if isinstance(val, int) and val > 0:
+                return val
+    tok_max = getattr(tokenizer, "model_max_length", None)
+    # Tokenizers use a sentinel like 1e30 when unset — filter those out.
+    if isinstance(tok_max, int) and 0 < tok_max < 10_000_000:
+        return tok_max
+    return 0
+
+
 def _unquote(s: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         return s[1:-1]
@@ -117,8 +143,8 @@ class SaklasApp(App):
         self._session = session
         self._messages = session._history
         self._device_str = str(session._device)
-        self._context_window: int = (
-            getattr(session._model.config, "max_position_embeddings", None) or 0
+        self._context_window: int = _resolve_context_window(
+            session._model.config, session._tokenizer,
         )
 
         # Local steering state — alphas and enabled flags per vector.
