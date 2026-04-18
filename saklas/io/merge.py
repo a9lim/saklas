@@ -1,13 +1,15 @@
 """Offline vector merging: precompute a linear combination of existing
 steering vectors into a distributable single-vector pack.
 
-See docs/superpowers/specs/2026-04-12-story-a-portability-design.md §Component 6.
+Merge expressions use the shared steering grammar from
+:mod:`saklas.core.steering_expr` — the same ``+`` / ``-`` / ``~`` /
+``|`` / coefficient / projection syntax every other saklas surface
+speaks.
 """
 from __future__ import annotations
 
 import logging
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -28,55 +30,6 @@ Profile = dict[int, torch.Tensor]
 
 class MergeError(ValueError, SaklasError):
     pass
-
-
-@dataclass(frozen=True)
-class ComponentSpec:
-    """Parsed component: a coordinate, optional projection-removal target, and alpha."""
-    coord: str
-    project_away: str | None
-    alpha: float
-
-
-def parse_components(raw: str) -> list[ComponentSpec]:
-    """Parse component grammar into a list of ComponentSpec.
-
-    Grammar::
-
-        component  = coord ":" alpha
-                   | coord "~" coord ":" alpha
-        components = component ("," component)*
-
-    ``a~b:0.5`` means: project b's direction out of a, then scale by 0.5.
-    Chained ``~`` (``a~b~c``) is rejected as a parse error.
-    """
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    out: list[ComponentSpec] = []
-    for part in parts:
-        if ":" not in part:
-            raise MergeError(f"component '{part}' missing :alpha")
-        coord_part, alpha_s = part.rsplit(":", 1)
-        coord_part = coord_part.strip()
-        try:
-            alpha = float(alpha_s)
-        except ValueError as e:
-            raise MergeError(f"component '{part}' alpha not a number: {e}") from e
-        # Handle projection operator ~
-        if "~" in coord_part:
-            tilde_parts = coord_part.split("~")
-            if len(tilde_parts) != 2:
-                raise MergeError(
-                    f"component '{part}': chained '~' is not allowed; "
-                    f"use 'a~b:alpha' only"
-                )
-            coord, project_away = tilde_parts[0].strip(), tilde_parts[1].strip()
-        else:
-            coord = coord_part
-            project_away = None
-        out.append(ComponentSpec(coord=coord, project_away=project_away, alpha=alpha))
-    if len(out) < 1:
-        raise MergeError("merge requires at least one component")
-    return out
 
 
 def project_away(a: Profile, b: Profile) -> Profile:
@@ -113,12 +66,6 @@ def linear_sum(
 ) -> Profile:
     """Compute merged[l] = sum_i alpha_i * vec_i[l] per layer.
 
-    Since component vectors are already baked (share * ref_norm folded
-    into the magnitude), a weighted sum preserves the layer-weighting
-    semantics naturally — no re-scoring, no share redistribution. The
-    merged tensor injects at apply time exactly as
-    ``sum_i alpha_i * component_i`` would have.
-
     Layer set is the intersection of every component's layers. If
     ``strict`` is True, any non-common layers raise MergeError instead
     of being silently dropped.
@@ -153,45 +100,147 @@ def linear_sum(
     return out
 
 
-def _resolve_coord(coord: str) -> ConceptFolder:
-    if "/" not in coord:
-        raise MergeError(f"component must be '<ns>/<concept>': {coord!r}")
-    ns, name = coord.split("/", 1)
+def _resolve_coord(ns: Optional[str], name: str) -> ConceptFolder:
+    if ns is None:
+        raise MergeError(
+            f"merge component '{name}' must be namespace-qualified "
+            f"(e.g. 'default/{name}')"
+        )
     folder = concept_dir(ns, name)
     if not folder.exists():
-        raise MergeError(f"component {coord} not installed")
+        raise MergeError(f"component {ns}/{name} not installed")
     return ConceptFolder.load(folder)
 
 
-def shared_models(components: list[ComponentSpec]) -> list[str]:
-    """Return models for which every component has a tensor, sorted."""
+def _parse_merge_expr(expression: str) -> "list[_MergeTerm]":
+    """Parse a merge expression into a list of (ns, name, variant,
+    coeff, operator, onto) terms.
+
+    Raises :class:`MergeError` on any parser-level issue or when a term
+    uses a feature merge doesn't support (triggers, bare poles without
+    namespaces).
+    """
+    from saklas.core.steering_expr import (
+        SteeringExprError, _Parser, _lex,
+    )
+
+    if not expression or not expression.strip():
+        raise MergeError("merge requires at least one component")
+
+    try:
+        toks = _lex(expression)
+        terms = _Parser(toks).parse()
+    except SteeringExprError as e:
+        raise MergeError(f"merge expression: {e}") from e
+
+    out: list[_MergeTerm] = []
+    for term in terms:
+        if term.trigger is not None:
+            raise MergeError(
+                "merge expressions do not accept triggers "
+                f"(got @{term.trigger})"
+            )
+        sel = term.selector
+        base = sel.base
+        if base.namespace is None:
+            raise MergeError(
+                f"merge component '{base.concept}' must be namespace-qualified "
+                f"(e.g. 'default/{base.concept}')"
+            )
+        onto_ns = onto_name = onto_variant = None
+        op = None
+        if sel.operator is not None:
+            if sel.operator != "~":
+                raise MergeError(
+                    f"merge expressions support only '~' for projection "
+                    f"(got '{sel.operator}'). Use '~' for project-away."
+                )
+            op = "~"
+            onto = sel.onto
+            assert onto is not None
+            if onto.namespace is None:
+                raise MergeError(
+                    f"merge projection target '{onto.concept}' must be "
+                    f"namespace-qualified (e.g. 'default/{onto.concept}')"
+                )
+            onto_ns, onto_name, onto_variant = (
+                onto.namespace, onto.concept, onto.variant,
+            )
+        out.append(_MergeTerm(
+            ns=base.namespace,
+            name=base.concept,
+            variant=base.variant,
+            coeff=term.coeff,
+            operator=op,
+            onto_ns=onto_ns,
+            onto_name=onto_name,
+            onto_variant=onto_variant,
+        ))
+    return out
+
+
+class _MergeTerm:
+    __slots__ = (
+        "ns", "name", "variant", "coeff",
+        "operator", "onto_ns", "onto_name", "onto_variant",
+    )
+    def __init__(self, ns, name, variant, coeff, operator,
+                 onto_ns, onto_name, onto_variant):
+        self.ns = ns
+        self.name = name
+        self.variant = variant
+        self.coeff = coeff
+        self.operator = operator
+        self.onto_ns = onto_ns
+        self.onto_name = onto_name
+        self.onto_variant = onto_variant
+
+    @property
+    def coord(self) -> str:
+        return f"{self.ns}/{self.name}"
+
+    @property
+    def onto_coord(self) -> "str | None":
+        if self.onto_name is None:
+            return None
+        return f"{self.onto_ns}/{self.onto_name}"
+
+
+def shared_models(expression: str) -> list[str]:
+    """Return models for which every merge term has a tensor, sorted."""
+    terms = _parse_merge_expr(expression)
     per: list[set[str]] = []
-    for comp in components:
-        cf = _resolve_coord(comp.coord)
+    for term in terms:
+        cf = _resolve_coord(term.ns, term.name)
         per.append(set(cf.tensor_models()))
-        # If a projection target is given, it also needs tensors for the same models.
-        if comp.project_away is not None:
-            cf_b = _resolve_coord(comp.project_away)
+        if term.operator is not None:
+            cf_b = _resolve_coord(term.onto_ns, term.onto_name)
             per.append(set(cf_b.tensor_models()))
     if not per:
         raise MergeError("no components provided")
     shared = set.intersection(*per)
     if not shared:
         raise MergeError(
-            f"no shared models across {[c.coord for c in components]}"
+            f"no shared models across {[t.coord for t in terms]}"
         )
     return sorted(shared)
 
 
 def merge_into_pack(
     name: str,
-    components: list[ComponentSpec],
+    expression: str,
     model: Optional[str],
     *,
     force: bool = False,
     strict: bool = False,
 ) -> Path:
-    """Create a merged tensors-only pack at ~/.saklas/vectors/local/<name>/."""
+    """Create a merged tensors-only pack at ~/.saklas/vectors/local/<name>/.
+
+    ``expression`` is a merge expression using the shared grammar:
+    ``0.5 default/happy - 0.3 default/sad~default/calm``.
+    """
+    terms = _parse_merge_expr(expression)
+
     dst = concept_dir("local", name)
     if dst.exists() and not force:
         raise MergeError(f"{dst} exists; pass force=True to overwrite")
@@ -201,31 +250,31 @@ def merge_into_pack(
 
     if model is not None:
         target_models = [safe_model_id(model)]
-        for comp in components:
-            cf = _resolve_coord(comp.coord)
+        for term in terms:
+            cf = _resolve_coord(term.ns, term.name)
             if safe_model_id(model) not in cf.tensor_models():
                 raise MergeError(
-                    f"component {comp.coord} has no tensor for {model}"
+                    f"component {term.coord} has no tensor for {model}"
                 )
     else:
-        target_models = shared_models(components)
+        target_models = shared_models(expression)
 
     component_info: dict[str, dict] = {}
     files_map: dict[str, str] = {}
 
     for sid in target_models:
         profiles_and_alphas: list[tuple[Profile, float]] = []
-        for comp in components:
-            cf = _resolve_coord(comp.coord)
+        for term in terms:
+            cf = _resolve_coord(term.ns, term.name)
             profile, _meta = load_profile(str(cf.tensor_path(sid)))
-            if comp.project_away is not None:
-                cf_b = _resolve_coord(comp.project_away)
+            if term.operator is not None:
+                cf_b = _resolve_coord(term.onto_ns, term.onto_name)
                 b_profile, _ = load_profile(str(cf_b.tensor_path(sid)))
                 profile = project_away(profile, b_profile)
-            profiles_and_alphas.append((profile, comp.alpha))
-            component_info.setdefault(comp.coord, {
-                "alpha": comp.alpha,
-                "project_away": comp.project_away,
+            profiles_and_alphas.append((profile, term.coeff))
+            component_info.setdefault(term.coord, {
+                "alpha": term.coeff,
+                "project_away": term.onto_coord,
                 "tensor_sha256": hash_file(cf.tensor_path(sid)),
             })
 
@@ -238,13 +287,13 @@ def merge_into_pack(
         files_map[f"{sid}.safetensors"] = hash_file(ts_path)
         files_map[f"{sid}.json"] = hash_file(ts_path.with_suffix(".json"))
 
-    def _comp_desc(comp: ComponentSpec) -> str:
-        base = comp.coord.split("/")[-1]
-        if comp.project_away is not None:
-            return f"{base}~{comp.project_away.split('/')[-1]} ({comp.alpha})"
-        return f"{base} ({comp.alpha})"
+    def _term_desc(term: _MergeTerm) -> str:
+        base = term.name
+        if term.operator is not None:
+            return f"{base}~{term.onto_name} ({term.coeff})"
+        return f"{base} ({term.coeff})"
 
-    desc = " + ".join(_comp_desc(c) for c in components)
+    desc = " + ".join(_term_desc(t) for t in terms)
     meta = PackMetadata(
         name=name,
         description=f"Merged pack: {desc}",

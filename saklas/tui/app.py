@@ -61,53 +61,6 @@ def _split_bipolar(text: str) -> tuple[str, str | None]:
     return _unquote(text.strip()), None
 
 
-def _parse_steer_command(arg: str) -> dict:
-    """Parse a /steer argument string.
-
-    Recognizes:
-      --sae <concept> [alpha]                  (picks the unique SAE variant)
-      --sae <pos> . <neg> [alpha]
-      <concept> [alpha]
-      <pos> . <neg> [alpha]
-
-    For an explicit release, use the ``:sae-<release>`` suffix in the
-    concept name itself (e.g. ``/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3``).
-    The positional ``--sae RELEASE concept`` form was removed because the
-    release-detection heuristic misfired on hyphenated concepts like
-    ``high-context`` — explicit selector grammar wins over fuzzy parsing.
-
-    Returns a dict with concept, baseline (None or str), alpha (None or float),
-    variant ("raw" / "sae").
-    """
-    tokens = arg.split()
-    variant = "raw"
-    if tokens and tokens[0] == "--sae":
-        variant = "sae"
-        tokens = tokens[1:]
-
-    if not tokens:
-        raise ValueError("no concept")
-
-    result: dict = {"variant": variant, "baseline": None, "alpha": None}
-
-    # Bipolar: <pos> . <neg>
-    if len(tokens) >= 3 and tokens[1] == ".":
-        result["concept"] = tokens[0]
-        result["baseline"] = tokens[2]
-        rest = tokens[3:]
-    else:
-        result["concept"] = tokens[0]
-        rest = tokens[1:]
-
-    if rest:
-        try:
-            result["alpha"] = float(rest[0])
-        except ValueError:
-            result["alpha"] = None
-
-    return result
-
-
 def _resolve_active_name(name: str, active) -> list[str]:
     """Resolve a user-typed name against a set of currently-active names.
 
@@ -376,8 +329,11 @@ class SaklasApp(App):
         if cmd == "/steer":
             if not arg:
                 chat.add_system_message(
-                    "Usage: /steer <concept> [alpha]\n"
-                    "       /steer <pos> . <neg> [alpha]"
+                    "Usage: /steer <expression>\n"
+                    "  e.g. /steer 0.5 honest\n"
+                    "       /steer 0.3 warm@after\n"
+                    "       /steer 0.5 honest:sae\n"
+                    "  For a new bipolar extraction, use /extract <pos> <neg>."
                 )
                 return
             self._handle_steer(arg)
@@ -666,23 +622,79 @@ class SaklasApp(App):
         self.run_worker(_worker, thread=True)
 
     def _handle_steer(self, text: str) -> None:
-        # Peel the ``--sae`` preamble off the front before delegating to
-        # the shared extract pipeline. ``--sae`` alone flips variant to
-        # ``"sae"`` — meaning "pick the unique already-extracted SAE
-        # variant on disk". For a specific release, users embed the
-        # ``:sae-<release>`` suffix directly in the concept name; that
-        # routes through ``resolve_pole`` in ``_handle_extract``.
-        variant = "raw"
-        stripped = text.lstrip()
-        if stripped.startswith("--sae"):
-            variant = "sae"
-            text = stripped[len("--sae"):].lstrip()
+        """Apply a steering expression — the shared grammar from
+        :mod:`saklas.core.steering_expr`.
 
-        def _on_success(name, profile, alpha):
+        Each plain term (``<coeff> <concept>`` with optional ``@trigger``
+        and ``:variant``) updates the TUI's local alpha state. Concepts
+        not yet registered are extracted + steered behind the scenes.
+        Extraction-on-demand for a *new* bipolar pair (``pos . neg``
+        space-delimited) lives on ``/extract``, not ``/steer``; projection
+        terms are accepted and routed through session-level materialization.
+        """
+        from saklas.core.steering_expr import (
+            ProjectedTerm, SteeringExprError, parse_expr,
+        )
+
+        chat = self._chat_panel
+        text = text.strip()
+        if not text:
+            chat.add_system_message(
+                'Usage: /steer <expression>\n'
+                '  e.g. /steer 0.5 honest\n'
+                '       /steer 0.3 warm@after\n'
+                '       /steer 0.5 honest|sycophantic\n'
+                "  For new concept extraction use /extract <pos> <neg>."
+            )
+            return
+        try:
+            steering = parse_expr(text)
+        except SteeringExprError as e:
+            chat.add_system_message(f"Steering expression error: {e}")
+            return
+
+        # Iterate the parsed IR; for each term dispatch through the
+        # existing extract pipeline to load or compute profiles, then
+        # stash the effective alpha on the TUI's local state.
+        for key, val in steering.alphas.items():
+            if isinstance(val, ProjectedTerm):
+                chat.add_system_message(
+                    f"Projection terms aren't yet supported from /steer "
+                    f"(got '{key}'); express them in the YAML config."
+                )
+                return
+            if isinstance(val, tuple):
+                alpha, _trig = val
+            else:
+                alpha = float(val)
+            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, float(alpha)))
+            # Peel variant suffix so the extract path sees a bare concept.
+            if ":" in key:
+                concept, variant = key.rsplit(":", 1)
+            else:
+                concept, variant = key, "raw"
+            self._dispatch_steer_term(concept, variant, alpha)
+
+    def _dispatch_steer_term(
+        self, concept: str, variant: str, alpha: float,
+    ) -> None:
+        """Route one plain steering term through the extract pipeline.
+
+        The concept has already been canonicalized and sign-flipped by
+        ``parse_expr``; ``_handle_extract`` will re-run ``resolve_pole``
+        on the canonical form which is idempotent (returns sign +1).
+        """
+        def _on_success(name, profile, a):
             self._session.steer(name, profile)
-            self._alphas[name] = alpha
+            self._alphas[name] = a
             self._enabled[name] = True
-            self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
+            self.call_from_thread(self._on_vector_extracted, name, a, profile)
+        # _handle_extract's own parser expects a "<concept> <alpha>" text;
+        # embed the variant in the concept token so resolve_pole strips it.
+        concept_with_variant = (
+            concept if variant == "raw" else f"{concept}:{variant}"
+        )
+        text = f"{concept_with_variant} {alpha}"
         self._handle_extract(
             text, include_alpha=True, on_success=_on_success, variant=variant,
         )

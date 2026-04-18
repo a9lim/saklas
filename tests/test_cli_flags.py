@@ -125,11 +125,14 @@ def test_parse_vector_no_verb_exits_zero(capsys):
 
 
 def test_parse_vector_merge():
-    args = cli.parse_args(["vector", "merge", "bard", "default/happy:0.3,a9lim/archaic:0.4"])
+    args = cli.parse_args([
+        "vector", "merge", "bard",
+        "0.3 default/happy + 0.4 a9lim/archaic",
+    ])
     assert args.command == "vector"
     assert args.vector_cmd == "merge"
     assert args.name == "bard"
-    assert args.components == "default/happy:0.3,a9lim/archaic:0.4"
+    assert args.expression == "0.3 default/happy + 0.4 a9lim/archaic"
 
 
 def test_parse_vector_clone_required_args():
@@ -357,7 +360,7 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
     packs.materialize_bundled()
 
     p = tmp_path / "setup.yaml"
-    p.write_text("model: fake-model\nvectors:\n  default/happy.sad: 0.4\n")
+    p.write_text('model: fake-model\nvectors: "0.4 default/happy.sad"\n')
 
     registered = {}
     extract_calls = []
@@ -390,7 +393,7 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
     monkeypatch.setattr(_tui_app, "SaklasApp", FakeApp)
 
     cli.main(["tui", "-c", str(p)])
-    assert "default/happy.sad" in registered
+    assert "happy.sad" in registered
     assert extract_calls[-1] == ("happy.sad", {"namespace": "default"})
 
 
@@ -926,11 +929,13 @@ def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):
     from saklas.cli.selectors import invalidate
     invalidate()
 
-    from saklas.cli.config_file import ConfigFile
-    c = ConfigFile(vectors={"wolf": 0.5})
-    resolved = c.resolve_poles()
-    assert "deer.wolf" in resolved.vectors
-    assert resolved.vectors["deer.wolf"] == -0.5
+    # The parser runs pole resolution on the expression: bare ``wolf``
+    # resolves to ``deer.wolf`` with sign -1, so the 0.5 coefficient
+    # becomes -0.5 in the resulting Steering.alphas.
+    from saklas.core.steering_expr import parse_expr
+    steering = parse_expr("0.5 wolf")
+    assert "deer.wolf" in steering.alphas
+    assert steering.alphas["deer.wolf"] == -0.5
 
 
 # ---------------------------------------------------------------------------

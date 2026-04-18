@@ -10,15 +10,13 @@ Thin frontend. Owns local alpha/enabled/thinking state per panel, passes through
 
 ## Slash commands
 
-- **Steering**: `/steer <name> [alpha]` (add + register, supports `<pos> . <neg> [alpha]`), `/steer --sae <name> [alpha]` (SAE variant — picks the unique already-extracted SAE for the concept; for a specific release, embed `:sae-<release>` in the concept name: `/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3`), `/alpha <name> <val>` (adjust existing only — errors if unregistered), `/unsteer <name>`.
-- **Probes**: `/probe <name>` (also seeds `_highlight_probe` and flips `_highlight_on = True`), `/unprobe <name>`, `/extract <name>` (to disk without wiring).
+- **Steering**: `/steer <expression>` takes one full steering expression using the shared grammar from `saklas.core.steering_expr` — `/steer 0.5 honest`, `/steer 0.3 warm@after`, `/steer 0.5 honest:sae`. Each plain term extracts + registers + sets the local alpha. `/alpha <name> <val>` (adjust existing only — errors if unregistered), `/unsteer <name>`. Projection terms (`a|b`, `a~b`) and triggers (`@after`, etc.) are accepted by the parser; projections route through session materialization, triggers land on the local alphas state.
+- **Probes**: `/probe <name>` (also seeds `_highlight_probe` and flips `_highlight_on = True`), `/unprobe <name>`, `/extract <pos> <neg>` or `/extract <name>` (to disk without wiring — and the sole path for creating new bipolar concepts from `<pos> <neg>`).
 - **Session**: `/clear`, `/rewind`, `/regen`, `/sys <prompt>`, `/temp`, `/top-p`, `/max`, `/seed <n>`, `/save <name>`, `/load <name>`, `/export <path>`.
 - **Analysis**: `/compare <a> [b]` (1-arg: ranked cosine vs all loaded profiles; 2-arg: pairwise score).
 - **Info**: `/model` (arch/device/layers/thinking/active state), `/help`.
 
-**Arg parser** (`SaklasApp._parse_args`): splits on ` . ` (space-period-space) — the only bipolar delimiter. Whitespace around the period is required to split so canonical single tokens like `dog.cat` stay one concept. `-` is **not** a delimiter: `happy - sad` is parsed as a single concept name which fails downstream name validation — intentional so the error surfaces clearly. Multi-word poles work without quotes (`/steer a dog . a pair of cats 0.4`). Quotes honored and stripped. Trailing alpha peeled from the final whitespace-separated token iff it parses as float. `/alpha` still uses `shlex.split` for its two-token form.
-
-**`/steer --sae` desugar** (`_parse_steer_command`): `--sae` preamble peels off and flips `variant` to `"sae"`. The remainder runs through the normal `_parse_args` pipeline preserving quoted multi-word poles and period-delimited bipolar. The release-detection heuristic from v1 (positional `--sae RELEASE concept`) was dropped — it misfired on hyphenated concepts like `high-context`. Explicit release selection rides on the `:sae-<release>` suffix on the concept name itself; `resolve_pole` peels it off and hands the variant to `_handle_extract`. Bare `--sae` calls `session._try_autoload_vector(canonical, variant="sae")` rather than running a fresh PCA extract — it means "pick the unique SAE tensor already on disk". Ambiguous / missing cases raise `AmbiguousVariantError` / `UnknownVariantError` which the worker surfaces to the chat panel.
+**`/steer` parser**: delegates to `saklas.core.steering_expr.parse_expr`. Bare names route through `resolve_pole` (same as every other surface) and inherit canonical + sign flip for installed bipolar poles. Variant suffixes (`:sae`, `:sae-<release>`) are grammar-native, so the old `--sae` preamble is gone — type the variant directly into the term.
 
 ## Mid-gen interruption
 

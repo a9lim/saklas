@@ -100,7 +100,9 @@ class WSSamplingParams(BaseModel):
 class WSGenerateMessage(BaseModel):
     type: str
     input: Any = None
-    steering: dict | None = None
+    # Steering expression string (shared grammar); pole aliases resolve
+    # inside session.steering().
+    steering: str | None = None
     sampling: WSSamplingParams | None = None
     thinking: bool | None = None
     stateless: bool = True
@@ -143,7 +145,7 @@ def _device_dtype(session: SaklasSession) -> tuple[str, str]:
 
 
 def _session_info(
-    session: SaklasSession, default_alphas: dict[str, float],
+    session: SaklasSession, default_steering: "Steering | None",
 ) -> dict:
     device, dtype = _device_dtype(session)
     try:
@@ -151,6 +153,7 @@ def _session_info(
     except Exception:
         thinks = False
     created = getattr(session, "_created_ts", None) or int(time.time())
+    default_expr = str(default_steering) if default_steering is not None else None
     return {
         "id": _SINGLE_SESSION_ID,
         "model_id": session.model_id,
@@ -162,7 +165,7 @@ def _session_info(
         "probes": sorted(session.probes.keys()) if isinstance(session.probes, dict) else list(session.probes),
         "history_length": len(session.history) if hasattr(session, "history") else 0,
         "supports_thinking": thinks,
-        "default_alphas": dict(default_alphas),
+        "default_steering": default_expr,
     }
 
 
@@ -222,19 +225,29 @@ def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
 
 
 def _build_steering(
-    raw: dict | None, default_alphas: dict[str, float],
-) -> Steering | None:
-    merged = dict(default_alphas)
+    raw: str | None, default_steering: "Steering | None",
+) -> "Steering | None":
+    """Compose a request expression string over the server default Steering.
+
+    Per-request keys override the default at the key level.
+    """
+    from saklas.core.steering_expr import parse_expr
+
+    req: "Steering | None" = None
+    if raw is not None and raw.strip():
+        req = parse_expr(raw)
+
     thinking: bool | None = None
-    if raw:
-        if isinstance(raw, dict) and "alphas" in raw and isinstance(raw["alphas"], dict):
-            merged.update({str(k): float(v) for k, v in raw["alphas"].items()})
-            t = raw.get("thinking")
-            if t is not None:
-                thinking = bool(t)
-        elif isinstance(raw, dict):
-            merged.update({str(k): float(v) for k, v in raw.items()})
-    merged = {k: v for k, v in merged.items() if v != 0.0}
+    if req is not None and req.thinking is not None:
+        thinking = req.thinking
+
+    merged: dict = {}
+    if default_steering is not None:
+        merged.update(default_steering.alphas)
+    if req is not None:
+        for k, v in req.alphas.items():
+            merged[k] = v
+
     if not merged and thinking is None:
         return None
     return Steering(alphas=merged, thinking=thinking)
@@ -302,7 +315,7 @@ def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict]:
 def register_saklas_routes(app: FastAPI) -> None:
     """Mount the native ``/saklas/v1/*`` tree onto ``app``.
 
-    ``session`` and ``default_alphas`` are pulled off ``app.state`` so the
+    ``session`` and ``default_steering`` are pulled off ``app.state`` so the
     signature matches ``register_ollama_routes`` and ``create_app`` doesn't
     need to thread them.
     """
@@ -313,7 +326,7 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions")
     def list_sessions():
-        return {"sessions": [_session_info(session, app.state.default_alphas)]}
+        return {"sessions": [_session_info(session, app.state.default_steering)]}
 
     @app.post("/saklas/v1/sessions")
     def create_session(req: CreateSessionRequest):
@@ -325,12 +338,12 @@ def register_saklas_routes(app: FastAPI) -> None:
                 "single-session mode, returning existing",
                 req.model, session.model_id,
             )
-        return _session_info(session, app.state.default_alphas)
+        return _session_info(session, app.state.default_steering)
 
     @app.get("/saklas/v1/sessions/{session_id}")
     def get_session(session_id: str):
         _resolve_session_id(session, session_id)
-        return _session_info(session, app.state.default_alphas)
+        return _session_info(session, app.state.default_steering)
 
     @app.delete("/saklas/v1/sessions/{session_id}", status_code=204)
     def delete_session(session_id: str):
@@ -363,7 +376,7 @@ def register_saklas_routes(app: FastAPI) -> None:
             else:
                 for k, v in overrides.items():
                     setattr(session.config, k, v)
-        return _session_info(session, app.state.default_alphas)
+        return _session_info(session, app.state.default_steering)
 
     @app.post("/saklas/v1/sessions/{session_id}/clear", status_code=204)
     def clear_session(session_id: str):
@@ -415,7 +428,15 @@ def register_saklas_routes(app: FastAPI) -> None:
         if name not in session.vectors:
             raise HTTPException(404, f"vector '{name}' not found")
         session.unsteer(name)
-        app.state.default_alphas.pop(name, None)
+        # Drop the vector from the default steering (if present) so the
+        # next request doesn't autoload it back under a stale alpha.
+        ds = app.state.default_steering
+        if ds is not None and name in ds.alphas:
+            from dataclasses import replace as _replace
+            new_alphas = {k: v for k, v in ds.alphas.items() if k != name}
+            app.state.default_steering = (
+                _replace(ds, alphas=new_alphas) if new_alphas else None
+            )
         return JSONResponse(status_code=204, content=None)
 
     @app.post("/saklas/v1/sessions/{session_id}/extract")
@@ -642,7 +663,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                         })
                         continue
                     await _ws_handle_generate(
-                        websocket, session, parsed, app.state.default_alphas,
+                        websocket, session, parsed, app.state.default_steering,
                     )
                 elif mtype == "stop":
                     # Idle-state stop: nothing in flight.
@@ -678,7 +699,7 @@ async def _ws_handle_generate(
     websocket: WebSocket,
     session: SaklasSession,
     msg: WSGenerateMessage,
-    default_alphas: dict[str, float],
+    default_steering: "Steering | None",
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
@@ -701,7 +722,7 @@ async def _ws_handle_generate(
     generation_id = uuid.uuid4().hex[:12]
 
     sampling = _build_sampling(msg.sampling)
-    steering = _build_steering(msg.steering, default_alphas)
+    steering = _build_steering(msg.steering, default_steering)
 
     token_queue: asyncio.Queue = asyncio.Queue()
     _SENTINEL = object()

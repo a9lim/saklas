@@ -60,11 +60,6 @@ class UnsupportedContentError(ValueError, SaklasError):
 # Pydantic request/response models
 # ---------------------------------------------------------------------------
 
-class SteerParams(BaseModel):
-    alphas: dict[str, float] = Field(default_factory=dict)
-    thinking: bool = False
-
-
 class ChatMessage(BaseModel):
     role: str
     content: Any  # str or list of content parts
@@ -103,12 +98,12 @@ class _SamplingBase(BaseModel):
     max_completion_tokens: int | None = None
     stream: bool = False
     stream_options: StreamOptions | None = None
-    steer: SteerParams | None = None
-    # Canonical native steering field — flat {name: alpha} or nested
-    # {alphas: {...}, thinking: bool}.  Merged over server default_alphas
-    # and resolved through session.steering() so pole aliases and events
-    # fire via the single canonical resolver site.
-    steering: dict | None = None
+    # Canonical native steering field — a steering expression string
+    # parsed through the shared grammar in
+    # :mod:`saklas.core.steering_expr`.  Merged over the server's default
+    # :class:`Steering` and resolved through ``session.steering()`` so pole
+    # aliases and events fire via the single canonical resolver site.
+    steering: str | None = None
     stop: str | list[str] | None = None
     seed: int | None = None
     logit_bias: dict[int, float] | None = None
@@ -156,32 +151,37 @@ class _SamplingBase(BaseModel):
         return self
 
     def to_steering(
-        self, default_alphas: dict[str, float],
+        self, default_steering: "Steering | None",
     ) -> "Steering | None":
-        """Merge ``self.steering`` over ``default_alphas`` into a ``Steering``.
+        """Compose ``self.steering`` (expression string) over the server default.
 
-        Accepts both the flat ``{name: alpha}`` shape and the nested
-        ``{"alphas": {...}, "thinking": bool}`` shape (matching Ollama's
-        ``options.steer``).  Zero-alphas stripped.  Returns ``None`` when
-        the merged result is empty and no thinking override was requested.
-        Pole aliasing happens inside ``session.steering()`` — the server
-        does not resolve poles itself.
+        The per-request expression overrides the default at the key level:
+        alphas for concepts named in both the default and the request come
+        from the request; alphas only in the default pass through. Returns
+        ``None`` when the composed result is empty and no ``thinking``
+        override was requested. Pole aliasing happens inside
+        ``session.steering()`` — the server does not resolve poles here.
         """
-        merged = dict(default_alphas)
-        thinking: bool | None = None
-        if self.steering:
-            body = self.steering
-            if isinstance(body, dict) and "alphas" in body and isinstance(body["alphas"], dict):
-                merged.update({str(k): float(v) for k, v in body["alphas"].items()})
-                t = body.get("thinking")
-                if t is not None:
-                    thinking = bool(t)
-            elif isinstance(body, dict):
-                merged.update({str(k): float(v) for k, v in body.items()})
-        merged = {k: v for k, v in merged.items() if v != 0.0}
-        if not merged and thinking is None:
+        from saklas.core.steering_expr import parse_expr
+
+        req_steering: "Steering | None" = None
+        if self.steering is not None and self.steering.strip():
+            req_steering = parse_expr(self.steering)
+
+        thinking: bool | None = self.thinking
+        if req_steering is not None and req_steering.thinking is not None:
+            thinking = req_steering.thinking
+
+        merged_alphas: dict = {}
+        if default_steering is not None:
+            merged_alphas.update(default_steering.alphas)
+        if req_steering is not None:
+            for k, v in req_steering.alphas.items():
+                merged_alphas[k] = v
+
+        if not merged_alphas and thinking is None:
             return None
-        return Steering(alphas=merged, thinking=thinking)
+        return Steering(alphas=merged_alphas, thinking=thinking)
 
 
 class ChatCompletionRequest(_SamplingBase):
@@ -275,17 +275,17 @@ def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
 
 
 def _sampling_kwargs(
-    req: _SamplingBase, default_alphas: dict[str, float],
+    req: _SamplingBase, default_steering: "Steering | None",
 ) -> dict[str, Any]:
     """Build the kwargs dict passed to session.generate / generate_stream.
 
-    Returns kwargs in the cluster-3 shape: ``sampling=SamplingConfig(...)``
-    + ``steering=Steering(...)``/None + ``thinking=`` + ``stateless=True``.
-    The server never mutates ``session.config``.
+    Returns ``sampling=SamplingConfig(...)`` + ``steering=Steering(...)``
+    / None + ``thinking=`` + ``stateless=True``.  The server never mutates
+    ``session.config``.
 
-    Merges both the legacy ``steer`` field and the canonical ``steering``
-    field over ``default_alphas``; the canonical field wins on collision.
-    ``thinking`` is the native request override; ``None`` triggers
+    Composes ``req.steering`` (expression string) over
+    ``default_steering``: per-request keys override defaults. ``thinking``
+    is the native request override; ``None`` triggers
     ``supports_thinking`` auto-detect inside ``_generate_core``.
     """
     stop_tuple: tuple[str, ...] | None
@@ -319,31 +319,11 @@ def _sampling_kwargs(
         logprobs=lp,
     )
 
-    # Start with server-wide default_alphas, then layer legacy `steer`,
-    # then canonical `steering` (canonical wins).  Resolution of pole
-    # aliases happens inside session.steering() when the steering context
-    # is opened in _generate_core.
-    merged_alphas: dict[str, float] = dict(default_alphas)
-    legacy_thinking: bool | None = None
-    if req.steer is not None:
-        merged_alphas.update(req.steer.alphas)
-        if req.steer.thinking:
-            legacy_thinking = True
-    canonical = req.to_steering({})
-    if canonical is not None:
-        merged_alphas.update(canonical.alphas)
-        if canonical.thinking is not None:
-            legacy_thinking = canonical.thinking
-    merged_alphas = {k: v for k, v in merged_alphas.items() if v != 0.0}
+    steering = req.to_steering(default_steering)
 
-    steering: Steering | None = None
-    if merged_alphas or legacy_thinking is not None:
-        steering = Steering(alphas=merged_alphas, thinking=legacy_thinking)
-
-    # Native thinking kwarg: request override wins; otherwise None = auto.
     thinking_kwarg: bool | None = req.thinking
-    if thinking_kwarg is None and legacy_thinking is not None:
-        thinking_kwarg = legacy_thinking
+    if thinking_kwarg is None and steering is not None and steering.thinking is not None:
+        thinking_kwarg = steering.thinking
 
     return {
         "sampling": sc,
@@ -495,7 +475,8 @@ def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(session: SaklasSession, default_alphas: dict[str, float] | None = None,
+def create_app(session: SaklasSession,
+               default_steering: "Steering | None" = None,
                cors_origins: list[str] | None = None,
                api_key: str | None = None) -> FastAPI:
     app = FastAPI(
@@ -504,7 +485,7 @@ def create_app(session: SaklasSession, default_alphas: dict[str, float] | None =
         dependencies=[Depends(_require_auth)],
     )
     app.state.session = session
-    app.state.default_alphas = default_alphas or {}
+    app.state.default_steering = default_steering
     app.state.created_ts = int(time.time())
     app.state.api_key = api_key if api_key is not None else os.environ.get("SAKLAS_API_KEY")
     # Generation serialization lives on ``session.lock`` (asyncio.Lock)
@@ -639,7 +620,7 @@ def _register_routes(app: FastAPI) -> None:
     # -----------------------------------------------------------------------
 
     async def _run_blocking(req, prompt_or_messages, *, raw: bool):
-        gen_kwargs = _sampling_kwargs(req, app.state.default_alphas)
+        gen_kwargs = _sampling_kwargs(req, app.state.default_steering)
         async with session.lock:
             return session.generate(prompt_or_messages, raw=raw, **gen_kwargs)
 
@@ -649,7 +630,7 @@ def _register_routes(app: FastAPI) -> None:
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         rid = _make_id()
         model_id = session.model_id
-        gen_kwargs = _sampling_kwargs(req, app.state.default_alphas)
+        gen_kwargs = _sampling_kwargs(req, app.state.default_steering)
 
         if req.stream:
             def _chat_delta(event):
@@ -700,7 +681,7 @@ def _register_routes(app: FastAPI) -> None:
         _check_openai_model_strict(session, req.model)
         rid = _make_id()
         model_id = session.model_id
-        gen_kwargs = _sampling_kwargs(req, app.state.default_alphas)
+        gen_kwargs = _sampling_kwargs(req, app.state.default_steering)
 
         if req.stream:
             stream_iter = session.generate_stream(req.prompt, raw=True, **gen_kwargs)

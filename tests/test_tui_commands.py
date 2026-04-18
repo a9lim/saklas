@@ -458,74 +458,40 @@ def test_parse_alpha_clamped_to_max():
     assert alpha == -MAX_ALPHA
 
 
-# ---- /steer --sae flag (Option C: explicit :sae-<release> grammar) ----
+# ---- /steer routes through the shared expression grammar ----
 
 
-def test_parse_steer_accepts_sae_flag():
-    from saklas.tui.app import _parse_steer_command
-    result = _parse_steer_command("--sae honest 0.3")
-    assert result["concept"] == "honest"
-    assert result["alpha"] == pytest.approx(0.3)
-    assert result["variant"] == "sae"
-    assert result["baseline"] is None
+def test_steer_expression_parses_sae_variant(monkeypatch, tmp_path):
+    """``/steer 0.3 myvec:sae`` parses through the shared grammar; the
+    variant is preserved on the alphas key."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.cli import selectors as _sel
+    _sel.invalidate()
+    from saklas.core.steering_expr import parse_expr
+    s = parse_expr("0.3 myvec:sae")
+    assert s.alphas == {"myvec:sae": pytest.approx(0.3)}
 
 
-def test_parse_steer_sae_preserves_hyphenated_concept():
-    """Regression: the old release-detection heuristic misfired on
-    ``--sae high-context 0.3`` by classifying ``high-context`` as a
-    release name. Option C drops the heuristic — ``--sae`` only toggles
-    variant to ``"sae"`` and the next token is always the concept.
-    """
-    from saklas.tui.app import _parse_steer_command
-    result = _parse_steer_command("--sae high-context 0.3")
-    assert result["concept"] == "high-context"
-    assert result["variant"] == "sae"
-    assert result["alpha"] == pytest.approx(0.3)
+def test_steer_expression_hyphenated_concept(monkeypatch, tmp_path):
+    """Dash-joined identifiers parse as a single concept name; the
+    resolver's slug step collapses ``-`` to ``_`` so the final key uses
+    underscores."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.cli import selectors as _sel
+    _sel.invalidate()
+    from saklas.core.steering_expr import parse_expr
+    s = parse_expr("0.3 high-context")
+    assert list(s.alphas.keys()) == ["high_context"]
 
 
-def test_parse_steer_no_sae_default_variant_raw():
-    from saklas.tui.app import _parse_steer_command
-    result = _parse_steer_command("honest 0.3")
-    assert result["variant"] == "raw"
-
-
-def test_parse_steer_sae_with_bipolar_period_delim():
-    from saklas.tui.app import _parse_steer_command
-    result = _parse_steer_command("--sae honest . deceptive 0.3")
-    assert result["variant"] == "sae"
-    assert result["concept"] == "honest"
-    assert result["baseline"] == "deceptive"
-    assert result["alpha"] == pytest.approx(0.3)
-
-
-def test_parse_steer_no_alpha():
-    from saklas.tui.app import _parse_steer_command
-    # alpha is optional — some commands omit it (e.g., auto-suggested).
-    result = _parse_steer_command("honest")
-    assert result["concept"] == "honest"
-    assert result["alpha"] is None
-    assert result["variant"] == "raw"
-
-
-def test_parse_steer_sae_no_alpha():
-    from saklas.tui.app import _parse_steer_command
-    result = _parse_steer_command("--sae honest")
-    assert result["concept"] == "honest"
-    assert result["alpha"] is None
-    assert result["variant"] == "sae"
-
-
-def test_parse_steer_release_expressed_as_colon_suffix():
-    """Option C: the positional release form is gone; explicit release
-    selection rides on the ``:sae-<release>`` suffix in the concept.
-    The parser treats it as the concept name — the split happens later,
-    in ``resolve_pole`` (verified by the handle_extract tests below).
-    """
-    from saklas.tui.app import _parse_steer_command
-    result = _parse_steer_command("honest:sae-gemma-scope-2b-pt-res-canonical 0.3")
-    assert result["concept"] == "honest:sae-gemma-scope-2b-pt-res-canonical"
-    assert result["variant"] == "raw"  # no --sae preamble
-    assert result["alpha"] == pytest.approx(0.3)
+def test_steer_expression_release_suffix(monkeypatch, tmp_path):
+    """Explicit release rides on the ``:sae-<release>`` suffix."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.cli import selectors as _sel
+    _sel.invalidate()
+    from saklas.core.steering_expr import parse_expr
+    s = parse_expr("0.3 myvec:sae-gemma-scope-2b-pt-res-canonical")
+    assert "myvec:sae-gemma-scope-2b-pt-res-canonical" in s.alphas
 
 
 def test_handle_extract_trusts_canonical_from_session(monkeypatch, tmp_path):

@@ -39,7 +39,7 @@ As an API server:
 
 ```bash
 pip install saklas[serve]
-saklas serve google/gemma-3-4b-it --steer cheerful:0.2
+saklas serve google/gemma-3-4b-it --steer "0.2 cheerful"
 ```
 
 From Python:
@@ -50,7 +50,7 @@ from saklas import SaklasSession
 with SaklasSession.from_pretrained("google/gemma-3-4b-it") as s:
     name, profile = s.extract("angry.calm")          # bundled bipolar pack
     s.steer(name, profile)                           # register (no alpha yet)
-    print(s.generate("What makes a good day?", steering={name: 0.3}).text)
+    print(s.generate("What makes a good day?", steering=f"0.3 {name}").text)
 ```
 
 ---
@@ -106,42 +106,36 @@ saklas vector extract honest.deceptive -m google/gemma-2-2b-it \
 Then steer the SAE variant:
 
 ```python
-with session.steering({"honest:sae": 0.3}):
+with session.steering("0.3 honest:sae"):
     session.generate("...")
 ```
 
 ```yaml
 # ~/.saklas/config.yaml
-vectors:
-  "honest:sae": 0.3
+vectors: "0.3 honest:sae"
 ```
 
 ```
-/steer --sae honest 0.3                                    # TUI: unique SAE variant on disk
-/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3      # TUI: explicit release
+/steer 0.3 honest:sae                                   # TUI: unique SAE variant on disk
+/steer 0.3 honest:sae-gemma-scope-2b-pt-res-canonical   # TUI: explicit release
 ```
 
-SAE profiles only include the layers the release covers. 
+SAE profiles only include the layers the release covers.
 
-By default steering fires on every token. You can pass a `Trigger` to change that:
+By default steering fires on every token. The grammar's `@trigger` token attaches a per-term trigger override:
 
 ```python
-from saklas import Steering, Trigger
-
 # Steer only the response, never the prompt or the thinking section
-session.generate("...", steering=Steering(
-    alphas={"warm": 0.4},
-    trigger=Trigger.AFTER_THINKING,
-))
+session.generate("...", steering="0.4 warm@after")
 
 # Mix regimes per concept
-session.generate("...", steering=Steering(alphas={
-    "honest": 0.3,                              # default trigger (everywhere)
-    "warm":   (0.4, Trigger.AFTER_THINKING),    # per-entry override
-}))
+session.generate("...", steering="0.3 honest + 0.4 warm@after")
+
+# Projection: steer honest with sycophancy removed
+session.generate("...", steering="0.3 honest|sycophantic")
 ```
 
-Saklas comes with presets for the common cases (`BOTH`, `GENERATED_ONLY`, `PROMPT_ONLY`, `AFTER_THINKING`, `THINKING_ONLY`). `Trigger.first(n)` and `Trigger.after(n)` let you be more granular. If you construct the dataclass directly, you can handle arbitrary ranges. 
+Grammar triggers map to the preset constants (`BOTH` / `GENERATED_ONLY` / `PROMPT_ONLY` / `AFTER_THINKING` / `THINKING_ONLY`) — `@both`, `@response`, `@before`, `@after`, `@thinking`. `Trigger.first(n)` and `Trigger.after(n)` let you express token-window ranges; construct the dataclass directly for arbitrary combinations and pass a pre-built `Steering`.
 
 ### Custom concepts
 
@@ -222,8 +216,7 @@ There are three panels: a vector registry on the left, chat in the center, and a
 
 | Command | Description |
 |---|---|
-| `/steer <name> [alpha]` | Extract and register a steering vector |
-| `/steer <pos> . <neg> [alpha]` | Same, bipolar form (period delimiter) |
+| `/steer <expression>` | Apply a steering expression (grammar: `0.5 honest + 0.3 warm@after`, `0.5 honest:sae`, `0.5 a\|b`, …) |
 | `/alpha <name> <val>` | Adjust an already-registered vector's alpha |
 | `/unsteer <name>` | Remove a registered vector |
 | `/probe <name>` | Extract and register a probe vector |
@@ -231,7 +224,7 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | `/unprobe <name>` | Remove a registered probe vector |
 | `/compare <a> [b]` | Cosine similarity (1-arg: ranked vs all; 2-arg: pairwise) |
 | `/extract <name>` | Extract to disk without registering |
-| `/extract <pos> . <neg>` | Same, bipolar form |
+| `/extract <pos> . <neg>` | Same, bipolar form (only path for new bipolar extraction) |
 | `/regen` | Regenerate the last assistant turn |
 | `/clear` | Clear conversation history |
 | `/rewind` | Undo last exchange |
@@ -247,7 +240,7 @@ A footer at the bottom of the trait panel shows the top 5 layers and the live hi
 
 The footer in the chat panel shows generation progress, live tok/s, elapsed, VRAM, and context.
 
-You don't need quotes for bipolar vectors: `/steer a dog . a pair of cats 0.4` parses as `pos="a dog", neg="a pair of cats", alpha=0.4`. `dog.cat` stays a single name.
+For brand-new bipolar extraction with multi-word poles, use `/extract a dog . a pair of cats` — the TUI parses around the space-period-space delimiter. `dog.cat` stays a single name.
 
 ---
 
@@ -262,14 +255,15 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 
     result = session.generate(
         "What makes a good day?",
-        steering={name: 0.2},
+        steering=f"0.2 {name}",
         sampling=SamplingConfig(temperature=0.7, max_tokens=256, seed=42),
     )
     print(result.text)
     print(result.readings)                          # live probe readings
+    print(result.applied_steering)                  # canonical expression receipt
 
     # Scoped steering with pole resolution
-    with session.steering({"calm": 0.4}):           # bare pole → angry.calm @ -0.4
+    with session.steering("0.4 calm"):              # bare pole → angry.calm @ -0.4
         print(session.generate("Describe a rainy afternoon.").text)
 
     # Compare vectors
@@ -281,14 +275,14 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
     collector = ResultCollector()
     for alpha in [-0.2, -0.1, 0, 0.1, 0.2]:
         session.clear_history()
-        r = session.generate("Describe a sunset.", steering={name: alpha})
+        r = session.generate("Describe a sunset.", steering=f"{alpha} {name}")
         collector.add(r, alpha=alpha)
     collector.to_csv("sweep.csv")
 ```
 
-Registration is state and steering is per-call. `session.steer("name", profile)` stores the vector and `session.generate(input, steering={"name": 0.5})` applies it for that generation. Without `steering` you get a clean baseline.
+Registration is state and steering is per-call. `session.steer("name", profile)` stores the vector; `session.generate(input, steering="0.5 name")` applies it for that generation. Without `steering` you get a clean baseline.
 
-Pass multiple names in `steering={}` to compose vectors; nested `with session.steering(...)` blocks flatten.
+Compose multiple concepts with the grammar's `+` / `-` / `@trigger` / `|` / `~` — every surface (Python, YAML, HTTP, TUI, `vector merge`) parses the same expression language. Nested `with session.steering(...)` blocks flatten, inner wins on key collision.
 
 Sampling is per-call via `SamplingConfig`: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs`.
 
@@ -318,13 +312,13 @@ session.steer("name", profile)
 session.unsteer("name")
 
 # Generation
-result = session.generate("prompt", steering={"name": 0.5},
+result = session.generate("prompt", steering="0.5 name",
                           sampling=SamplingConfig(temperature=0.8))
-for tok in session.generate_stream("prompt", steering={"name": 0.5}):
+for tok in session.generate_stream("prompt", steering="0.5 name"):
     print(tok.text, end="", flush=True)
 
 # Scoped steering
-with session.steering({"wolf": 0.5}):     # -> deer.wolf @ -0.5
+with session.steering("0.5 wolf"):        # -> deer.wolf @ -0.5
     session.generate("prompt")
 
 # Vector comparison
@@ -360,7 +354,7 @@ result.to_dict()
 
 ```bash
 pip install saklas[serve]
-saklas serve google/gemma-2-9b-it --steer cheerful:0.2 --port 8000
+saklas serve google/gemma-2-9b-it --steer "0.2 cheerful" --port 8000
 ```
 
 ### OpenAI SDK
@@ -372,7 +366,7 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 resp = client.chat.completions.create(
     model="google/gemma-2-9b-it",
     messages=[{"role": "user", "content": "Hello!"}],
-    extra_body={"steering": {"cheerful": 0.4}},    # per-request override
+    extra_body={"steering": "0.4 cheerful"},       # per-request expression
 )
 ```
 
@@ -384,7 +378,7 @@ Point any Ollama client at `http://localhost:8000` and it should work. Steering 
 curl -N http://localhost:8000/api/chat -d '{
   "model": "gemma2",
   "messages": [{"role": "user", "content": "Write me a haiku."}],
-  "options": {"steer": {"cheerful": 0.3, "formal.casual": -0.2}}
+  "options": {"steer": "0.3 cheerful - 0.2 formal.casual"}
 }'
 ```
 
@@ -399,7 +393,7 @@ curl -N http://localhost:8000/api/chat -d '{
 | `model` | required | HuggingFace ID or local path |
 | `-H`, `--host` | `0.0.0.0` | Bind address |
 | `-P`, `--port` | `8000` | Bind port |
-| `-S`, `--steer` | — | Pre-load a vector, repeatable. `name:alpha` |
+| `-S`, `--steer` | — | Default steering expression, e.g. `"0.2 cheerful"` |
 | `-C`, `--cors` | — | CORS origin, repeatable |
 | `-k`, `--api-key` | None | Bearer auth. Falls back to `$SAKLAS_API_KEY`. |
 
@@ -430,13 +424,13 @@ saklas pack export gguf <selector> [-m MODEL] [-o PATH] [--model-hint HINT]
 
 ```bash
 saklas vector extract <concept> | <pos> <neg> [-m MODEL] [-f]
-saklas vector merge <name> <components> [-m] [-f] [-s]
+saklas vector merge <name> <expression> [-m] [-f] [-s]
 saklas vector clone <corpus-file> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
 saklas vector compare <concepts...> -m MODEL [-v] [-j]
 saklas vector why <concept> -m MODEL [-n N] [--all] [-j]
 ```
 
-Merge supports projection: `a~b:0.5` removes b's direction from a before scaling. For example, `saklas vector merge dehallu default/creative.conventional~default/hallucinating.grounded:0.8` gives you creative with hallucination projected out.
+Merge expressions share the steering grammar. Terms combine with `+` / `-`, coefficients lead each term, and `~` projects one direction's component out of another. For example, `saklas vector merge dehallu "0.8 default/creative.conventional~default/hallucinating.grounded"` gives you creative with hallucination projected out.
 
 Selectors: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve cross-namespace and error on ambiguity.
 

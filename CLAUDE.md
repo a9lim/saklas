@@ -39,7 +39,7 @@ saklas pack search <query> [-j|-v]              # search HF hub for saklas-pack 
 saklas pack push <selector> [-a OWNER/NAME] [-p] [-m MODEL] [-s|-n] [-t] [-d] [-f] [--variant raw|sae|all]
 saklas pack export gguf <selector> [-m MODEL] [-o PATH] [--model-hint HINT]
 saklas vector extract <concept>|<pos> <neg> [-m MODEL] [-f] [--sae RELEASE [--sae-revision REV]]
-saklas vector merge <name> <components> [-m]    # merge baked tensors; a~b:α projection syntax
+saklas vector merge <name> <expression> [-m]    # shared steering grammar: "0.3 ns/a + 0.5 ns/b~ns/c"
 saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
 saklas vector compare <concepts...> -m MODEL [-v] [-j]       # cosine similarity between vectors
 saklas vector why <concept> -m MODEL [-n N] [--all] [-j]     # top layers by ||baked||
@@ -50,7 +50,7 @@ pytest tests/                                   # all; GPU tests gated on CUDA/M
 
 Root parser has exactly five verbs — `tui`, `serve`, `pack`, `vector`, `config`. No `argv[0]` peeking, no top-level verb aliases, no bare-TUI fallback — `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas`/`saklas pack`/`saklas vector`/`saklas config` print help + exit 0.
 
-Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml` first, then composes any explicit `-c` files on top (later overrides earlier). `ConfigFile.effective(extras, include_default=...)` is the single entry point; `ConfigFile.resolve_poles()` runs every `vectors:` key through `cli.selectors.resolve_pole` so bare poles (`wolf: 0.5`) land as canonical + signed (`deer.wolf: -0.5`) in `default_alphas`.
+Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml` first, then composes any explicit `-c` files on top (later overrides earlier). `ConfigFile.effective(extras, include_default=...)` is the single entry point. `ConfigFile.vectors` is a steering expression string — parsed lazily through `saklas.core.steering_expr.parse_expr`, which resolves bare poles (`wolf → deer.wolf @ -0.5`) via `cli.selectors.resolve_pole` and produces the canonical `Steering` IR every surface speaks.
 
 Selector grammar (shared): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`, `default`, `all`, optionally suffixed with `:<variant>` where `<variant>` is `raw` (default), `sae` (unique SAE variant for the concept), or `sae-<release>` (specific SAELens release). Bare names resolve cross-namespace and raise `AmbiguousSelectorError` on collision; bare `:sae` raises `AmbiguousVariantError` when more than one SAE release is extracted for a concept. `pack refresh` silently skips `source=local`; `pack refresh neutrals` rewrites `~/.saklas/neutral_statements.json` from the bundled copy. `pack rm` refuses broad selectors without `-y`; bundled concepts respawn on next session init. `pack ls` is local-only; HF hub search is `pack search`.
 
@@ -58,13 +58,26 @@ Selector grammar (shared): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`,
 
 `saklas vector extract <concept> --sae <release>` runs contrastive PCA in SAE feature space rather than raw residual-stream space, then decodes back to model space. Uses SAELens as the loader, so any published release it covers (GemmaScope, Eleuther, Joseph Bloom's, Apollo/Goodfire) works on day one. Install with `pip install -e ".[sae]"`.
 
-Output tensors coexist with raw-PCA tensors in the same concept folder: `<model>.safetensors` (raw) alongside `<model>_sae-<release>.safetensors` (SAE). Select at steer time with the `:sae[-<release>]` suffix — `session.steering({"honest:sae": 0.3})` from Python, `"honest:sae": 0.3` in the config file, `/steer --sae honest 0.3` in the TUI. A bare `:sae` picks the unique SAE variant; explicit `:sae-<release>` picks one when multiple coexist.
+Output tensors coexist with raw-PCA tensors in the same concept folder: `<model>.safetensors` (raw) alongside `<model>_sae-<release>.safetensors` (SAE). Select at steer time with the `:sae[-<release>]` suffix in the shared steering expression grammar — `session.steering("0.3 honest:sae")` from Python, `vectors: "0.3 honest:sae"` in the config file, `/steer 0.3 honest:sae` in the TUI. A bare `:sae` picks the unique SAE variant; explicit `:sae-<release>` picks one when multiple coexist.
 
 SAE profiles are subset-layer (only layers the release covers). Share-baking redistributes over the covered subset — hook math and monitor scoring are unchanged. Release selection at extract time requires an explicit SAELens release name (SAELens ships many per base model — `gemma-scope-2b-pt-res`, `-mlp`, `-att`, etc. — and there's no sensible implicit default); if multiple SAEs exist per layer within a release, saklas picks the narrowest-width and emits a warning.
 
 Sidecar JSON records `sae_release`, `sae_revision`, `sae_ids_by_layer` alongside the usual `method: "pca_center_sae"` / `statements_sha256` fields. `pack push --variant sae|all` opts into sharing SAE tensors (push defaults to `raw` so provenance-stronger SAE flavors don't ship accidentally); `pack clear --variant raw|sae|all` scopes deletions (defaults to `all`).
 
 ## Python API (v2.0)
+
+Every surface — Python, YAML, HTTP, TUI, `vector merge` — speaks the same steering-expression grammar out of `saklas.core.steering_expr`:
+
+```
+expr     := term (("+" | "-") term)*
+term     := [coeff "*"?] selector ["@" trigger]
+selector := atom (("~" | "|") atom)?
+atom     := [ns "/"] NAME ["." NAME] [":" variant]
+trigger  := before | after | both | thinking | response | prompt | generated
+variant  := raw | sae | sae-<release>
+```
+
+`+`/`-` add terms, `*` attaches a coefficient, `~` projects onto a direction (keeps the shared component), `|` projects orthogonal (removes the shared component). `@trigger` tags a per-term trigger override. `:variant` routes to SAE tensors.
 
 ```python
 from saklas import SaklasSession, SamplingConfig, Steering, Trigger, Profile
@@ -76,16 +89,21 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 
     result = session.generate(
         "What makes a good day?",
-        steering={name: 0.3},
+        steering=f"0.3 {name}",
         sampling=SamplingConfig(temperature=0.7, max_tokens=256, seed=42),
         thinking=None,                                 # None = auto via supports_thinking
     )
 
-    with session.steering({"wolf": 0.5}):              # resolves to deer.wolf @ -0.5
+    with session.steering("0.5 wolf"):                # resolves to deer.wolf @ -0.5
         result = session.generate("Describe a forest.")
 
-    # Token-window triggers: per-Steering default or per-entry override.
-    # Tuple value in alphas overrides the default trigger for that entry.
+    # Per-term triggers and projections are first-class in the grammar.
+    result = session.generate(
+        "Solve this, then answer politely.",
+        steering="0.3 honest + 0.4 warm@after - 0.2 sycophantic|honest",
+    )
+
+    # Pre-built Steering objects are still accepted for typed construction.
     result = session.generate(
         "Solve this, then answer politely.",
         steering=Steering(alphas={
@@ -94,19 +112,21 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
         }),
     )
 
-    for tok in session.generate_stream("Tell me a story.", steering={name: 0.2}):
+    for tok in session.generate_stream("Tell me a story.", steering=f"0.2 {name}"):
         print(f"[think] {tok.text}" if tok.thinking else tok.text, end="", flush=True)
 
     session.events.subscribe(lambda e: print("event:", type(e).__name__))
+    print(session.last_result.applied_steering)        # canonical expression receipt
 ```
 
 Hard-break notes vs v1.4:
-- `generate` / `generate_stream` are **keyword-only** past `input`. All sampling kwargs (seed/stop/logit_bias/penalties/logprobs/temperature/top_p/top_k/max_tokens) live on `SamplingConfig`; the v1 `alphas=` kwarg is gone — use `steering=`.
+- `generate` / `generate_stream` / `session.steering()` accept `str | Steering | None`. Dict inputs are no longer accepted — pass an expression string or build a `Steering` directly.
 - `extract()` returns `(name, Profile)`, not `(name, dict)`. `Profile`'s dict-compat surface (`__getitem__`/`__iter__`/`len`/`items`) means most v1 loop code still works.
 - `SaklasSession.__init__` takes a pre-loaded `PreTrainedModel`; construct with `SaklasSession.from_pretrained(model_id, ...)`.
 - `session.config = replace(session.config, temperature=0.8)` works for session-level defaults (`GenerationConfig` is trimmed to session-level fields only); **per-call overrides should use `SamplingConfig`**, not rebind `session.config`.
 - `session.lock` is an `asyncio.Lock` owned by the server layer. Library-only callers never touch it.
 - Every saklas-raised exception is a `SaklasError` subclass while preserving its stdlib MRO, so `except SaklasError` catches the whole family and `except ValueError` / `except RuntimeError` at existing sites still works.
+- `GenerationResult.applied_steering` carries the canonical expression string that produced the result (or `None` for unsteered generations) — round-trips through `saklas.core.steering_expr.parse_expr`.
 
 ## Cache layout
 

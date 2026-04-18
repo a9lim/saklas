@@ -85,8 +85,8 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
     _add_common_args(parser)
     parser.add_argument("-H", "--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("-P", "--port", type=int, default=8000, help="Bind port")
-    parser.add_argument("-S", "--steer", action="append", default=[], metavar="NAME[:ALPHA]",
-                        help="Pre-load a steering vector (repeatable)")
+    parser.add_argument("-S", "--steer", default=None, metavar="EXPR",
+                        help='Default steering expression, e.g. "0.5 honest + 0.3 warm"')
     parser.add_argument("-C", "--cors", action="append", default=[], metavar="ORIGIN",
                         help="CORS allowed origin (repeatable)")
     parser.add_argument("-k", "--api-key", default=None, metavar="KEY",
@@ -216,7 +216,13 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
 
 def _build_vector_merge(p: argparse.ArgumentParser) -> None:
     p.add_argument("name", help="New pack name (written under local/)")
-    p.add_argument("components", help="Comma-separated components: ns/a:0.3,ns/b:0.4")
+    p.add_argument(
+        "expression",
+        help=(
+            'Merge expression, e.g. "0.3 ns/a + 0.4 ns/b" or '
+            '"0.5 ns/a~ns/b" for projection-removal.'
+        ),
+    )
     p.add_argument("-f", "--force", action="store_true")
     p.add_argument("-s", "--strict", action="store_true")
     p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")

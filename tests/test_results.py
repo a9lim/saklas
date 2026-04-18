@@ -64,6 +64,29 @@ class TestGenerationResult:
         assert "honest" in d["readings"]
         assert isinstance(d["readings"]["honest"], dict)
 
+    def test_applied_steering_default_none(self):
+        """Default value is ``None`` — no steering was active."""
+        result = GenerationResult(
+            text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
+        )
+        assert result.applied_steering is None
+        assert result.to_dict()["applied_steering"] is None
+
+    def test_applied_steering_round_trip_expression(self, monkeypatch, tmp_path):
+        """Stored expression round-trips through ``parse_expr``."""
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        from saklas.cli import selectors as _sel
+        _sel.invalidate()
+        from saklas.core.steering_expr import parse_expr
+        result = GenerationResult(
+            text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
+            applied_steering="0.5 myvec + 0.3 othervec@after",
+        )
+        assert result.applied_steering == "0.5 myvec + 0.3 othervec@after"
+        reparsed = parse_expr(result.applied_steering)
+        assert "myvec" in reparsed.alphas
+        assert "othervec" in reparsed.alphas
+
 
 class TestTokenEvent:
     def test_fields(self):

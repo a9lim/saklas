@@ -16,8 +16,8 @@ def test_thinking_field():
     assert s.thinking is True
 
 
-def test_from_value_dict_to_steering():
-    s = Steering.from_value({"foo": 0.5})
+def test_from_value_string_parses_expr():
+    s = Steering.from_value("0.5 foo")
     assert isinstance(s, Steering)
     assert s.alphas == {"foo": 0.5}
 
@@ -31,10 +31,11 @@ def test_from_value_passthrough():
     assert Steering.from_value(s) is s
 
 
-def test_from_value_empty_dict():
-    s = Steering.from_value({})
-    assert isinstance(s, Steering)
-    assert dict(s.alphas) == {}
+def test_from_value_rejects_dict_input():
+    import pytest
+    with pytest.raises(TypeError) as ei:
+        Steering.from_value({"foo": 0.5})
+    assert "dict" in str(ei.value).lower()
 
 
 def test_default_trigger_applies_to_bare_floats():
@@ -64,9 +65,11 @@ def test_mixed_entries_normalize_correctly():
     assert entries["tuple"] == (0.4, Trigger.AFTER_THINKING)
 
 
-def test_from_value_preserves_tuple_entries():
-    value = {"foo": 0.5, "bar": (0.3, Trigger.GENERATED_ONLY)}
-    s = Steering.from_value(value)
+def test_expression_preserves_trigger_entries():
+    # The expression grammar is the new input shape; ``@after`` etc. map
+    # onto the same ``(alpha, Trigger)`` tuple form that direct-construction
+    # accepts.
+    s = Steering.from_value("0.5 foo + 0.3 bar@response")
     entries = s.normalized_entries()
     assert entries["foo"] == (0.5, Trigger.BOTH)
     assert entries["bar"] == (0.3, Trigger.GENERATED_ONLY)

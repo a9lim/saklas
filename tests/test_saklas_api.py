@@ -105,7 +105,7 @@ def _mock_session():
 def session_and_client():
     from saklas.server import create_app
     session = _mock_session()
-    app = create_app(session, default_alphas={})
+    app = create_app(session, default_steering=None)
     return session, TestClient(app)
 
 
@@ -363,7 +363,7 @@ class TestWebSocket:
     def test_ws_requires_bearer_when_api_key_set(self):
         from saklas.server import create_app
         session = _mock_session()
-        app = create_app(session, default_alphas={}, api_key="s3cret")
+        app = create_app(session, default_steering=None, api_key="s3cret")
         client = TestClient(app)
         # No Authorization header -> close(1008) before accept.
         with pytest.raises(Exception):
@@ -399,7 +399,7 @@ class TestTraitsStream:
         """With api_key set, the SSE endpoint requires Bearer auth."""
         from saklas.server import create_app
         session = _mock_session()
-        app = create_app(session, default_alphas={}, api_key="s3cret")
+        app = create_app(session, default_steering=None, api_key="s3cret")
         client = TestClient(app)
         resp = client.get("/saklas/v1/sessions/default/traits/stream")
         assert resp.status_code == 401

@@ -1,6 +1,9 @@
 """User-authored setup YAML parser for saklas -C <path>.
 
-See docs/superpowers/specs/2026-04-12-story-a-portability-design.md §Component 7.
+The ``vectors:`` key is a steering expression string (the same grammar
+every surface speaks); the loader validates it and stores the raw text.
+Parsing into a :class:`~saklas.core.steering.Steering` happens at
+consumption time via :func:`saklas.core.steering_expr.parse_expr`.
 """
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ class ConfigFileError(ValueError, SaklasError):
 @dataclass
 class ConfigFile:
     model: Optional[str] = None
-    vectors: dict[str, float] = field(default_factory=dict)
+    vectors: Optional[str] = None
     thinking: Optional[bool] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -70,7 +73,7 @@ class ConfigFile:
             if v is not None:
                 out[f] = v
         if self.vectors:
-            out["vectors"] = dict(self.vectors)
+            out["vectors"] = self.vectors
         return out
 
     def to_yaml(self, *, header: Optional[str] = None) -> str:
@@ -79,28 +82,6 @@ class ConfigFile:
         if header:
             return f"{header}\n{body}"
         return body
-
-    def resolve_poles(self) -> "ConfigFile":
-        """Return a copy with ``vectors`` keys run through ``resolve_pole``.
-
-        Bare poles like ``wolf`` resolve to ``deer.wolf`` with sign -1; the
-        alpha is negated accordingly. Namespaced keys stay in their namespace.
-        """
-        from saklas.cli.selectors import resolve_pole, AmbiguousSelectorError
-        out: dict[str, float] = {}
-        for coord, alpha in self.vectors.items():
-            if "/" in coord:
-                ns, name = coord.split("/", 1)
-            else:
-                ns, name = None, coord
-            try:
-                canonical, sign, _match, _variant = resolve_pole(name, namespace=ns)
-            except AmbiguousSelectorError:
-                out[coord] = alpha
-                continue
-            key = f"{ns}/{canonical}" if ns else canonical
-            out[key] = alpha * sign
-        return replace(self, vectors=out)
 
     @classmethod
     def load(cls, path: Path) -> "ConfigFile":
@@ -117,16 +98,29 @@ class ConfigFile:
         for k in unknown:
             log.warning("unknown key %r in %s (ignored)", k, path)
 
-        vectors_raw = data.get("vectors") or {}
-        vectors: dict[str, float] = {}
-        if isinstance(vectors_raw, dict):
-            for coord, alpha in vectors_raw.items():
+        vectors_raw = data.get("vectors")
+        vectors: Optional[str] = None
+        if vectors_raw is not None:
+            if not isinstance(vectors_raw, str):
+                raise ConfigFileError(
+                    f"{path}: vectors: must be a steering expression string "
+                    f"(got {type(vectors_raw).__name__}). Example: "
+                    f"`vectors: \"0.5 honest + 0.3 warm\"`."
+                )
+            text = vectors_raw.strip()
+            if text:
+                # Validate via the shared parser; raise a wrapped error on
+                # failure so the YAML path surfaces the column/detail.
+                from saklas.core.steering_expr import (
+                    SteeringExprError, parse_expr,
+                )
                 try:
-                    vectors[str(coord)] = float(alpha)
-                except (TypeError, ValueError) as e:
-                    raise ConfigFileError(f"vector {coord!r} alpha not a number: {e}") from e
-        else:
-            raise ConfigFileError("vectors: must be a mapping of coord -> alpha")
+                    parse_expr(text)
+                except SteeringExprError as e:
+                    raise ConfigFileError(
+                        f"{path}: vectors: {e}"
+                    ) from e
+                vectors = text
 
         return cls(
             model=data.get("model"),
@@ -140,16 +134,19 @@ class ConfigFile:
 
 
 def compose(configs: list[ConfigFile]) -> ConfigFile:
-    """Combine multiple config files; later entries override earlier ones."""
+    """Combine multiple config files; later entries override earlier ones.
+
+    The ``vectors`` string overrides wholesale — later configs replace the
+    earlier expression rather than concatenating. Callers that want to
+    extend should spell out the full expression in their override file.
+    """
     out = ConfigFile()
     for c in configs:
         for f in ("model", "thinking", "temperature",
-                  "top_p", "max_tokens", "system_prompt"):
+                  "top_p", "max_tokens", "system_prompt", "vectors"):
             v = getattr(c, f)
             if v is not None:
                 setattr(out, f, v)
-        for coord, alpha in c.vectors.items():
-            out.vectors[coord] = alpha
     return out
 
 
@@ -160,32 +157,46 @@ def apply_flag_overrides(cfg_in: ConfigFile, **flags) -> ConfigFile:
 
 
 def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
-    """Install any vectors in config.vectors that are not present locally.
+    """Install any vectors referenced in ``config.vectors`` that are not
+    present locally.
 
-    Returns a list of coords that could not be installed. In strict mode,
-    raises on any failure instead of returning.
+    Walks the raw expression string via :func:`referenced_selectors` so
+    namespace-qualified references (``bob/honest``) retain their install
+    coordinates even though the parsed ``Steering`` flattens them. Returns
+    a list of coords that could not be installed; in strict mode, raises
+    on any failure instead.
     """
+    from saklas.core.steering_expr import referenced_selectors
     from saklas.io.paths import concept_dir
     from saklas.io.packs import materialize_bundled
     from saklas.io import cache_ops
 
+    if config.vectors is None:
+        return []
+
     missing: list[str] = []
-    for coord, _alpha in config.vectors.items():
-        if "/" not in coord:
-            # Bare name: resolve across namespaces. If a match exists locally,
-            # treat as installed; otherwise require an explicit <ns>/<name>.
+    for ns, concept, _variant in referenced_selectors(config.vectors):
+        if ns is None:
             from saklas.cli.selectors import _all_concepts
-            matches = [c for c in _all_concepts() if c.name == coord]
+            slug = concept.split(".")[0] if "." in concept else concept
+            matches = [
+                c for c in _all_concepts()
+                if c.name == concept
+                or (
+                    "." in c.name
+                    and slug in c.name.split(".")
+                )
+            ]
             if matches:
                 continue
-            msg = f"vector {coord!r}: must be '<ns>/<name>' (no installed match)"
+            msg = f"vector {concept!r}: must be '<ns>/<name>' (no installed match)"
             if strict:
                 raise ConfigFileError(msg)
             log.warning(msg)
-            missing.append(coord)
+            missing.append(concept)
             continue
-        ns, name = coord.split("/", 1)
-        cdir = concept_dir(ns, name)
+        coord = f"{ns}/{concept}"
+        cdir = concept_dir(ns, concept)
         if cdir.exists():
             continue
         if ns == "local":
