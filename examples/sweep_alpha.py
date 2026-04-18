@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 
-from saklas import SaklasSession
+from saklas import SaklasSession, SamplingConfig
 
 
 def main() -> None:
@@ -31,9 +31,9 @@ def main() -> None:
         for alpha in alphas:
             result = session.generate(
                 args.prompt,
-                alphas={name: alpha} if alpha else None,
+                steering=f"{alpha} {name}" if alpha else None,
                 stateless=True,
-                seed=0,
+                sampling=SamplingConfig(seed=0),
             )
             print(f"\n=== alpha={alpha:.2f} ===")
             print(result.text[: args.max_tokens * 5])

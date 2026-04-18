@@ -540,7 +540,7 @@ def test_from_value_steering_passthrough():
 def test_from_value_rejects_dict():
     with pytest.raises(TypeError) as ei:
         Steering.from_value({"honest": 0.5})
-    assert "dict" in str(ei.value).lower()
+    assert "str | Steering | None" in str(ei.value)
 
 
 def test_from_value_rejects_list():

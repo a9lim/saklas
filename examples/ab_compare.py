@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from saklas import SaklasSession
+from saklas import SaklasSession, SamplingConfig
 
 
 def main() -> None:
@@ -26,12 +26,14 @@ def main() -> None:
         name, profile = session.extract(args.concept)
         session.steer(name, profile)
 
-        unsteered = session.generate(args.prompt, stateless=True, seed=0)
+        unsteered = session.generate(
+            args.prompt, stateless=True, sampling=SamplingConfig(seed=0),
+        )
         steered = session.generate(
             args.prompt,
-            alphas={name: args.alpha},
+            steering=f"{args.alpha} {name}",
             stateless=True,
-            seed=0,
+            sampling=SamplingConfig(seed=0),
         )
 
     print("\n=== unsteered ===")

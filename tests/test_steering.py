@@ -35,7 +35,7 @@ def test_from_value_rejects_dict_input():
     import pytest
     with pytest.raises(TypeError) as ei:
         Steering.from_value({"foo": 0.5})
-    assert "dict" in str(ei.value).lower()
+    assert "str | Steering | None" in str(ei.value)
 
 
 def test_default_trigger_applies_to_bare_floats():

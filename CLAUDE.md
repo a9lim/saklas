@@ -120,11 +120,13 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 ```
 
 Hard-break notes vs v1.4:
-- `generate` / `generate_stream` / `session.steering()` accept `str | Steering | None`. Dict inputs are no longer accepted — pass an expression string or build a `Steering` directly.
-- `extract()` returns `(name, Profile)`, not `(name, dict)`. `Profile`'s dict-compat surface (`__getitem__`/`__iter__`/`len`/`items`) means most v1 loop code still works.
-- `SaklasSession.__init__` takes a pre-loaded `PreTrainedModel`; construct with `SaklasSession.from_pretrained(model_id, ...)`.
+- `generate` / `generate_stream` / `session.steering()` accept `str | Steering | None` only. Dict inputs raise `TypeError`.
+- `extract()` returns `(name, Profile)`, not `(name, dict)`. `Profile` exposes the full mapping interface (`__getitem__`/`__iter__`/`__len__`/`__contains__`/`items`/`keys`/`values`) plus the typed surface (`layers`, `metadata`, `weight_at`, `save`/`load`, `merged`, `projected_away`, `cosine_similarity`), so iteration-style v1 loop code still works.
+- `session.steer(name, profile)` and `session.save_profile(profile, path)` accept `Profile` only — bare dicts are rejected. `session.vectors` returns `dict[str, Profile]`.
+- `SaklasSession.__init__` takes a pre-loaded `PreTrainedModel`; construct with `SaklasSession.from_pretrained(model_id, ...)`. The `cache_dir=` parameter is gone — set `SAKLAS_HOME` to override paths.
 - `session.config = replace(session.config, temperature=0.8)` works for session-level defaults (`GenerationConfig` is trimmed to session-level fields only); **per-call overrides should use `SamplingConfig`**, not rebind `session.config`.
 - `session.lock` is an `asyncio.Lock` owned by the server layer. Library-only callers never touch it.
+- `SteeringApplied.entries` is a required `dict[str, tuple[float, Trigger]]` — subscribers can't rely on it being `None`.
 - Every saklas-raised exception is a `SaklasError` subclass while preserving its stdlib MRO, so `except SaklasError` catches the whole family and `except ValueError` / `except RuntimeError` at existing sites still works.
 - `GenerationResult.applied_steering` carries the canonical expression string that produced the result (or `None` for unsteered generations) — round-trips through `saklas.core.steering_expr.parse_expr`.
 
@@ -216,4 +218,4 @@ Pair-count note: <n=32 inflates mean PCA scores ~38% (small-sample bias). Share-
 
 **GPU-required** (CUDA or MPS): `test_smoke.py`, `test_session.py`. Downloads `google/gemma-3-4b-it` (~8GB) on first run. `device="auto"` picks cuda > mps > cpu. MPS runs ~3–5× slower, so `test_extraction_fast_enough` uses a backend-specific budget (10s CUDA / 60s MPS). `test_session` covers construction (21 probes auto-loaded), steering (`extract` returns `Profile`), cloning, generation + readings, thinking mode, `ResultCollector` JSONL/CSV. `test_smoke` owns `test_throughput_regression` (steered ≥ 85% of vanilla tok/s).
 
-**CPU-only** (424 tests): `test_paths`, `test_packs`, `test_profile`, `test_sampling`, `test_steering`, `test_steering_context`, `test_events`, `test_format_version`, `test_selectors`, `test_canonical_name`, `test_cache_ops`, `test_hf`, `test_merge`, `test_gguf_io`, `test_config_file`, `test_cli_flags`, `test_probes_bootstrap`, `test_results`, `test_datasource`, `test_cloning` (CPU-safe paths only), `test_server`, `test_saklas_api`, `test_tui_commands`. Cover core v2 dataclasses, steering context semantics, pack format integrity + staleness, selector grammar, HF wrappers (mocked), GGUF roundtrip, config loading + `resolve_poles`, monitor scoring, five-verb CLI dispatch, OpenAI/Ollama/native servers, TUI slash command dispatch.
+**CPU-only** (678 tests): `test_paths`, `test_packs`, `test_profile`, `test_sampling`, `test_steering`, `test_steering_context`, `test_events`, `test_format_version`, `test_selectors`, `test_canonical_name`, `test_cache_ops`, `test_hf`, `test_merge`, `test_gguf_io`, `test_config_file`, `test_cli_flags`, `test_probes_bootstrap`, `test_results`, `test_datasource`, `test_cloning` (CPU-safe paths only), `test_server`, `test_saklas_api`, `test_tui_commands`. Cover core v2 dataclasses, steering context semantics, pack format integrity + staleness, selector grammar, HF wrappers (mocked), GGUF roundtrip, config loading + `resolve_poles`, monitor scoring, five-verb CLI dispatch, OpenAI/Ollama/native servers, TUI slash command dispatch.

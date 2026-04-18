@@ -29,10 +29,9 @@ class VectorExtracted:
 class SteeringApplied:
     alphas: dict[str, float]
     # Full entries (alpha + trigger) for subscribers that need to know which
-    # trigger each alpha flows under.  ``None`` on older-subscriber compat
-    # paths or when all entries use the default ``Trigger.BOTH``.  Keys
-    # mirror ``alphas`` one-for-one; values are ``(alpha, Trigger)`` tuples.
-    entries: dict[str, tuple[float, Any]] | None = None
+    # trigger each alpha flows under. Keys mirror ``alphas`` one-for-one;
+    # values are ``(alpha, Trigger)`` tuples.
+    entries: dict[str, tuple[float, Any]]
 
 
 @dataclass(frozen=True)

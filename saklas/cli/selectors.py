@@ -132,9 +132,7 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
 
     if selector.kind == "model":
         # ``model:X`` matches any concept with an installed tensor for X,
-        # regardless of variant. Legacy implementation only globbed
-        # ``<safe>.safetensors`` and missed concepts that have only an
-        # SAE tensor (``<safe>_sae-<release>.safetensors``) for X.
+        # regardless of variant — raw or SAE.
         from saklas.io.packs import enumerate_variants
         return [
             c for c in concepts

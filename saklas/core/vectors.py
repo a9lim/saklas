@@ -622,16 +622,14 @@ def project_profile(
 def load_contrastive_pairs(dataset_path: str) -> dict:
     """Load a contrastive-pairs JSON file.
 
-    Accepts two shapes:
-      - bare list: [{"positive": ..., "negative": ...}, ...]
-        (new format — statements.json in concept folders)
-      - legacy object: {"name": ..., "pairs": [...]}
-        (old saklas/datasets/<name>.json schema)
-
-    Returns a dict with at least a ``"pairs"`` key.
+    Expects a bare list: ``[{"positive": ..., "negative": ...}, ...]``
+    (the shape written to ``statements.json`` in concept folders).
+    Returns a dict ``{"pairs": [...]}``.
     """
     with open(dataset_path) as f:
         data = json.load(f)
-    if isinstance(data, list):
-        return {"pairs": data}
-    return data
+    if not isinstance(data, list):
+        raise ValueError(
+            f"{dataset_path}: expected a JSON list of pairs, got {type(data).__name__}"
+        )
+    return {"pairs": data}
