@@ -14,8 +14,7 @@ from saklas.core.events import EventBus
 from saklas.core.session import (
     SaklasSession, VectorNotRegisteredError,
 )
-from saklas.core.steering import Steering
-from saklas.core.steering_expr import ProjectedTerm, parse_expr
+from saklas.core.steering_expr import parse_expr
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import project_profile
 

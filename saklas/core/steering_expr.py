@@ -86,7 +86,7 @@ class SteeringExprError(ValueError, SaklasError):
 
 # ---------------------------------------------------------------- lexer ---
 
-_NUM_RE = re.compile(r"(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?")
+_NUM_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 _IDENT_START_RE = re.compile(r"[A-Za-z]")
 _IDENT_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
 
