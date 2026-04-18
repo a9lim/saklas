@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import shlex
 import time
@@ -20,7 +21,6 @@ from textual.timer import Timer
 from saklas import SamplingConfig, Steering
 from saklas.cli.selectors import AmbiguousSelectorError, resolve_pole
 from saklas.core.generation import supports_thinking
-from saklas.core.model import _get_memory_gb
 from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_defaults
 from saklas.core.results import ResultCollector
@@ -31,38 +31,11 @@ from saklas.tui.trait_panel import TraitPanel
 
 DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
-_VRAM_UPDATE_INTERVAL = 15
 _TOKEN_DRAIN_LIMIT = 20
 
 _LEFT, _CHAT, _TRAIT = 0, 1, 2
 
 _BIPOLAR_DELIM = " . "
-
-
-def _resolve_context_window(config, tokenizer) -> int:
-    """Find the model's context length across naming variants.
-
-    HF scatters this field across: top-level ``max_position_embeddings`` on
-    single-modal configs, ``text_config``/``llm_config`` sub-configs on
-    multimodal stacks (Gemma 3/4, Qwen-VL, Llama 3.2-Vision), ``n_positions``
-    on legacy GPT-family configs, and sometimes only ``model_max_length`` on
-    the tokenizer. Walk the union; first positive value wins.
-    """
-    candidates = [config] + [
-        getattr(config, sub, None) for sub in ("text_config", "llm_config")
-    ]
-    for cfg in candidates:
-        if cfg is None:
-            continue
-        for attr in ("max_position_embeddings", "n_positions"):
-            val = getattr(cfg, attr, None)
-            if isinstance(val, int) and val > 0:
-                return val
-    tok_max = getattr(tokenizer, "model_max_length", None)
-    # Tokenizers use a sentinel like 1e30 when unset — filter those out.
-    if isinstance(tok_max, int) and 0 < tok_max < 10_000_000:
-        return tok_max
-    return 0
 
 
 def _unquote(s: str) -> str:
@@ -143,9 +116,6 @@ class SaklasApp(App):
         self._session = session
         self._messages = session._history
         self._device_str = str(session._device)
-        self._context_window: int = _resolve_context_window(
-            session._model.config, session._tokenizer,
-        )
 
         # Local steering state — alphas and enabled flags per vector.
         # Session holds the profiles; the TUI holds the alphas.
@@ -170,12 +140,13 @@ class SaklasApp(App):
 
         self._gen_start_time: float = 0.0
         self._gen_token_count: int = 0
-        self._prompt_token_count: int = 0
         self._last_tok_per_sec: float = 0.0
         self._last_elapsed: float = 0.0
-        self._cached_vram_gb: float = 0.0
-        self._vram_poll_counter: int = 0
-        self._last_gen_state: tuple = (-1, -1.0, -1.0, -1.0, False, -1)
+        # Geometric-mean perplexity accumulator — sum of ``log(ppl)`` across
+        # scored steps; display is ``exp(sum/count)``.
+        self._log_ppl_sum: float = 0.0
+        self._ppl_count: int = 0
+        self._last_gen_state: tuple = (-1, -1.0, -1.0, False, -1)
         self._assistant_messages: list[_AssistantMessage] = []
 
         defaults = load_defaults()
@@ -188,17 +159,6 @@ class SaklasApp(App):
         """Build alphas dict for generation from enabled vectors."""
         return {name: alpha for name, alpha in self._alphas.items()
                 if self._enabled.get(name, True)}
-
-    def _estimate_prompt_tokens(self, next_user_text: str) -> int:
-        """Tokenize history + pending user message through the chat template."""
-        try:
-            msgs = list(self._messages) + [{"role": "user", "content": next_user_text}]
-            ids = self._session._tokenizer.apply_chat_template(
-                msgs, tokenize=True, add_generation_prompt=True,
-            )
-            return len(ids)
-        except Exception:
-            return self._prompt_token_count
 
     def _vector_list_for_panel(self) -> list[dict]:
         """Build the list[dict] format the left panel expects."""
@@ -814,11 +774,11 @@ class SaklasApp(App):
         self._gen_active = True
 
         self._gen_token_count = 0
-        self._prompt_token_count = 0
         self._last_tok_per_sec = 0.0
         self._last_elapsed = 0.0
+        self._log_ppl_sum = 0.0
+        self._ppl_count = 0
         self._gen_start_time = time.monotonic()
-        self._vram_poll_counter = 0
 
         widget = self._chat_panel.start_assistant_message()
         self._current_assistant_widget = widget
@@ -849,8 +809,6 @@ class SaklasApp(App):
         )
         steering = Steering(alphas=dict(alphas), thinking=use_thinking) if alphas else None
 
-        self._prompt_token_count = self._estimate_prompt_tokens(user_text)
-
         def _generate():
             try:
                 stream = self._session.generate_stream(
@@ -862,7 +820,8 @@ class SaklasApp(App):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.scores)
+                        ("tok", event.text, event.thinking, event.scores,
+                         event.perplexity)
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
@@ -892,7 +851,7 @@ class SaklasApp(App):
                 break
             kind = item[0]
             if kind == "tok":
-                _, token, is_thinking, scores = item
+                _, token, is_thinking, scores, perplexity = item
                 widget = self._current_assistant_widget
                 if widget:
                     if is_thinking:
@@ -902,15 +861,20 @@ class SaklasApp(App):
                         widget.append_token(token)
                     if scores is not None:
                         widget.append_token_score(scores, is_thinking)
+                if perplexity is not None and perplexity > 0:
+                    # Geometric mean over the gen: accumulate log(ppl),
+                    # display exp(mean).  Equivalent to classical sequence
+                    # perplexity; one step dominated by a rare token
+                    # doesn't swamp the aggregate the way an arithmetic
+                    # mean would.
+                    self._log_ppl_sum += math.log(perplexity)
+                    self._ppl_count += 1
                 tokens_consumed += 1
             elif kind == "finalize":
                 # Normal end — pull per-token scores stashed by session's
                 # _finalize_generation and push to the widget for highlight.
                 _, widget = item
                 self._finalize_widget_highlight(widget)
-                last = self._session.last_result
-                if last is not None:
-                    self._prompt_token_count = last.prompt_tokens
             elif kind == "error":
                 chat.add_system_message(f"generation error: {item[1]}")
             elif kind == "done":
@@ -940,29 +904,21 @@ class SaklasApp(App):
             self._last_tok_per_sec = tok_per_sec
             self._last_elapsed = elapsed
 
-        if generating:
-            self._vram_poll_counter += 1
-            if self._vram_poll_counter >= _VRAM_UPDATE_INTERVAL:
-                self._cached_vram_gb = _get_memory_gb(self._device_str)
-                self._vram_poll_counter = 0
-        elif self._vram_poll_counter != -1:
-            self._cached_vram_gb = _get_memory_gb(self._device_str)
-            self._vram_poll_counter = -1
-
         new_state = (self._gen_token_count, self._last_tok_per_sec,
-                     self._last_elapsed, self._cached_vram_gb, generating,
-                     self._prompt_token_count)
+                     self._last_elapsed, generating, self._ppl_count)
         if new_state != self._last_gen_state:
             self._last_gen_state = new_state
+            ppl_mean = (
+                math.exp(self._log_ppl_sum / self._ppl_count)
+                if self._ppl_count > 0 else None
+            )
             chat.update_status(
                 generating=generating,
                 gen_tokens=self._gen_token_count,
                 max_tokens=self._session.config.max_new_tokens,
                 tok_per_sec=self._last_tok_per_sec,
                 elapsed=self._last_elapsed,
-                prompt_tokens=self._prompt_token_count,
-                context_window=self._context_window,
-                vram_gb=self._cached_vram_gb,
+                perplexity=ppl_mean,
             )
 
         if self._session._monitor and self._session._monitor.has_pending_data():

@@ -36,13 +36,13 @@ Bottom-third split below the traits list. `#why-header` is always the literal `L
 
 ## utils.py
 
-`build_bar(value, max, width)` renders filled/empty bar pairs. `BAR_WIDTH = 24` used by every bar in the UI (footer token + context, vector alpha, gen-config temp + top-p, trait-panel probes) — one knob controls them all. Vector panel's `RIGHT_W` derives from `BAR_WIDTH` so gen-config right-edge glyph alignment stays correct through any width change.
+`build_bar(value, max, width)` renders filled/empty bar pairs. `BAR_WIDTH = 24` used by every bar in the UI (footer token progress, vector alpha, gen-config temp + top-p, trait-panel probes) — one knob controls them all. Vector panel's `RIGHT_W` derives from `BAR_WIDTH` so gen-config right-edge glyph alignment stays correct through any width change.
 
 ## Status footer
 
-`chat_panel.update_status`: one-line footer showing dot + token progress bar (`gen_tokens / max_new_tokens`, green while generating, dim between runs — persists post-gen so the bar doesn't appear/disappear each turn; only collapses to `○ idle` before the first generation or when `max_tokens` is unknown) · tok/s · elapsed · VRAM · **context bar** (`prompt_tokens + gen_tokens` / `max_position_embeddings`, cyan ≤75%, yellow ≥75%, red ≥90%). Context sits on the right.
+`chat_panel.update_status`: one-line footer showing dot + `gen_tokens/max_new_tokens` + progress bar (green while generating, dim between runs — persists post-gen so the bar doesn't appear/disappear each turn; collapses to `○ idle` before the first generation or when `max_tokens` is unknown) · tok/s · elapsed · `ppl <mean>`. The count sits left of the bar. VRAM lives on the left panel already; context info isn't rendered here.
 
-`_prompt_token_count` is pre-computed in `_start_generation` via `tokenizer.apply_chat_template(history + pending_user_msg, tokenize=True, add_generation_prompt=True)` so the ctx bar reflects the in-flight prompt live, then overwritten at finalize by `session.last_result.prompt_tokens` (authoritative). `_context_window` resolved once at app construction via `_resolve_context_window(model.config, tokenizer)` — walks `config.{max_position_embeddings,n_positions}`, `config.text_config.*`, `config.llm_config.*` (multimodal stacks nest the text-side fields), then falls back to `tokenizer.model_max_length`. Missing on every branch → context bar hidden. `_last_gen_state` dedupe tuple includes `_prompt_token_count` so the bar refreshes when it changes.
+Perplexity is the geometric mean of per-step `TokenEvent.perplexity` values — `exp(sum(log(ppl)) / count)` across scored steps in the current gen. `_log_ppl_sum` / `_ppl_count` reset at `_start_generation`; `_last_gen_state` dedupe tuple tracks `_ppl_count` so the footer refreshes when the aggregate moves. Computed in `generate_steered` as `exp` of full-vocab fp32 Shannon entropy on pre-temperature post-steering logits; one extra softmax + one `.item()` sync per step, inside the steered-throughput headroom.
 
 ## Panels
 

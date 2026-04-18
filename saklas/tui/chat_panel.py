@@ -308,9 +308,7 @@ class ChatPanel(Widget):
         max_tokens: int = 0,
         tok_per_sec: float = 0.0,
         elapsed: float = 0.0,
-        prompt_tokens: int = 0,
-        context_window: int = 0,
-        vram_gb: float = 0.0,
+        perplexity: float | None = None,
     ) -> None:
         """Update the status bar with generation stats."""
         bar = self._status_bar
@@ -319,21 +317,14 @@ class ChatPanel(Widget):
             t_full, t_empty = build_bar(gen_tokens, max_tokens, BAR_WIDTH)
             bar_color = "ansi_green" if generating else "dim"
             left = (
-                f"{dot} [{bar_color}]{t_full}[/][dim]{t_empty}[/] "
-                f"{gen_tokens}/{max_tokens} · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
+                f"{dot} {gen_tokens}/{max_tokens} "
+                f"[{bar_color}]{t_full}[/][dim]{t_empty}[/] · "
+                f"{tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
             )
         else:
             left = f"{dot} idle"
 
         parts: list[str] = [left]
-        if vram_gb > 0:
-            parts.append(f"VRAM {vram_gb:.1f} GB")
-        if context_window > 0:
-            used = prompt_tokens + (gen_tokens if generating else 0)
-            c_full, c_empty = build_bar(used, context_window, BAR_WIDTH)
-            frac = used / context_window if context_window else 0.0
-            color = "ansi_red" if frac >= 0.9 else ("ansi_yellow" if frac >= 0.75 else "ansi_cyan")
-            parts.append(
-                f"ctx [{color}]{c_full}[/][dim]{c_empty}[/] {used}/{context_window}"
-            )
+        if perplexity is not None:
+            parts.append(f"ppl {perplexity:.2f}")
         bar.update(" · ".join(parts))

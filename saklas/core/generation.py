@@ -1,6 +1,7 @@
 """Token-by-token generation loop with KV cache, steering hooks, and monitor integration."""
 
 import enum
+import math
 import queue
 import logging
 import threading
@@ -391,9 +392,13 @@ def generate_steered(
     """
     Runs in a worker thread (not the async event loop).
 
-    *on_token(text, is_thinking, token_id, logprob, top_logprobs)* is called
-    for each emitted token.  For multi-token UTF-8 sequences (buffered
-    partials), *token_id* is ``-1`` and logprob is None.
+    *on_token(text, is_thinking, token_id, logprob, top_logprobs, perplexity)*
+    is called for each emitted token. ``perplexity`` is ``exp`` of the
+    Shannon entropy of the pre-temperature, post-steering next-token
+    distribution (bounded above by ``vocab_size``; ≈1 when the model is
+    near-certain). For multi-token UTF-8 sequences (buffered partials),
+    *token_id* is ``-1`` and logprob is None; ``perplexity`` carries the
+    flushing step's value.
 
     ``logprobs`` is None (disabled) or the number of top logprobs to include
     per token (0 = only the chosen token's logprob).  ``stop`` is a list of
@@ -474,15 +479,18 @@ def generate_steered(
     # buffer is decoded as a group and flushed.
     pending_ids: list[int] = []
     pending_thinking: bool = False
+    # Survives loop iterations so post-loop partial-flush can reuse it;
+    # None when max_new_tokens=0 (degenerate, no forward ever ran).
+    current_perplexity: float | None = None
     if on_token is not None:
         state.response_text = ""
 
     def _emit_token(text: str, is_thinking: bool, token_id: int,
-                    logprob, top_logprobs) -> None:
+                    logprob, top_logprobs, perplexity) -> None:
         if not is_thinking and state.response_text is not None:
             state.response_text += text
         if on_token is not None:
-            on_token(text, is_thinking, token_id, logprob, top_logprobs)
+            on_token(text, is_thinking, token_id, logprob, top_logprobs, perplexity)
 
     try:
         with torch.inference_mode():
@@ -531,7 +539,12 @@ def generate_steered(
                 if bias_idx is not None:
                     logits[0, bias_idx] += bias_val.to(logits.dtype)
 
-                # Compute logprobs of the pre-sampling distribution if requested.
+                # Full-vocab log-softmax in fp32 — feeds both perplexity
+                # (every step) and chosen/top logprobs (on demand). One
+                # extra softmax + one .item() per step; ~1-3% of a forward
+                # pass on typical hardware, comfortably inside the steered
+                # throughput headroom.
+                #
                 # TODO(perf): logprobs hot path forces per-token .item()/.tolist()
                 # CPU syncs below. Batching to a single post-loop transfer would
                 # win a few % on logprobs-enabled runs, but on_token streams
@@ -541,10 +554,11 @@ def generate_steered(
                 # until we have a non-streaming caller that actually cares.
                 chosen_logprob: float | None = None
                 top_lp_pairs: list[tuple[int, float]] | None = None
-                if logprobs is not None:
-                    lp = torch.log_softmax(logits.float(), dim=-1)
-                else:
-                    lp = None
+                lp = torch.log_softmax(logits.float(), dim=-1)
+                # Shannon entropy in nats → perplexity via exp.  Using the
+                # already-allocated lp tensor; one .item() sync.
+                entropy_nats = float((-lp.exp() * lp).sum().item())
+                current_perplexity = math.exp(entropy_nats)
 
                 if config.temperature <= 0:
                     # Greedy
@@ -565,7 +579,7 @@ def generate_steered(
 
                 token_id = next_token.item()
 
-                if lp is not None:
+                if logprobs is not None:
                     chosen_logprob = lp[0, token_id].item()
                     if logprobs > 0:
                         tlv, tli = lp[0].topk(min(logprobs, _vocab))
@@ -585,14 +599,16 @@ def generate_steered(
                     if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
                             _emit_token(tokenizer.decode(pending_ids),
-                                        pending_thinking, -1, None, None)
+                                        pending_thinking, -1, None, None,
+                                        current_perplexity)
                             pending_ids.clear()
                         tstate = _ThinkState.RESPONSE_PREAMBLE
                         state.thinking_state = ThinkingState.RESPONSE_PREAMBLE
                     elif tstate == _ThinkState.PREAMBLE:
                         if on_token and pending_ids:
                             _emit_token(tokenizer.decode(pending_ids),
-                                        pending_thinking, -1, None, None)
+                                        pending_thinking, -1, None, None,
+                                        current_perplexity)
                             pending_ids.clear()
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
@@ -631,7 +647,9 @@ def generate_steered(
                 # Handle end-of-thinking delimiter
                 if tstate == _ThinkState.THINKING and token_id == think_end_id:
                     if on_token and pending_ids:
-                        _emit_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
+                        _emit_token(tokenizer.decode(pending_ids),
+                                    pending_thinking, -1, None, None,
+                                    current_perplexity)
                         pending_ids.clear()
                     if response_start_id is not None:
                         tstate = _ThinkState.RESPONSE_PREAMBLE
@@ -690,18 +708,26 @@ def generate_steered(
                                 if trimmed:
                                     state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                                     _emit_token(trimmed, emit_thinking, emit_id,
-                                                chosen_logprob, top_lp_pairs)
+                                                chosen_logprob, top_lp_pairs,
+                                                current_perplexity)
                                 state.finish_reason = "stop_sequence"
                                 break
                             completion_text = new_text
                         state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                         _emit_token(emit_text, emit_thinking, emit_id,
-                                    chosen_logprob, top_lp_pairs)
+                                    chosen_logprob, top_lp_pairs,
+                                    current_perplexity)
 
-        # Flush any remaining buffered partial tokens
+        # Flush any remaining buffered partial tokens.  No fresh forward
+        # pass has run since the last loop iteration, so reuse that
+        # iteration's perplexity — ``current_perplexity`` is seeded None
+        # pre-loop for the max_new_tokens=0 degenerate case.
         if on_token and pending_ids:
             state.emit_map.append((len(generated_ids) - 1, pending_thinking))
-            _emit_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
+            _emit_token(
+                tokenizer.decode(pending_ids), pending_thinking, -1, None, None,
+                current_perplexity,
+            )
 
     finally:
         state.thinking_state = ThinkingState.DONE

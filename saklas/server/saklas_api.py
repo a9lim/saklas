@@ -727,7 +727,7 @@ async def _ws_handle_generate(
     token_queue: asyncio.Queue = asyncio.Queue()
     _SENTINEL = object()
 
-    def _on_token(text, is_thinking, tid, lp, top):
+    def _on_token(text, is_thinking, tid, lp, top, perplexity=None):
         event = {
             "type": "token",
             "text": text,

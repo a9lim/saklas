@@ -1612,11 +1612,11 @@ class SaklasSession:
         logprobs_list: list | None = [] if lp_count is not None else None
         trait_token_counter = [0]
 
-        def _token_tap(text, is_thinking, tid, lp, top_lp):
+        def _token_tap(text, is_thinking, tid, lp, top_lp, perplexity):
             if logprobs_list is not None and tid >= 0 and not is_thinking:
                 logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
             if on_token is not None:
-                on_token(text, is_thinking, tid, lp, top_lp)
+                on_token(text, is_thinking, tid, lp, top_lp, perplexity)
             # Inline per-token scoring for live SSE trait subscribers.
             if self._trait_queues and self._monitor.probe_names:
                 latest_hidden = {
@@ -1747,7 +1747,9 @@ class SaklasSession:
             thinking: per-call thinking override.  ``None`` = auto-detect
                 via ``supports_thinking`` (or ``steering.thinking`` if set).
             on_token: optional callback ``(text, is_thinking, token_id,
-                logprob, top_logprobs)`` called on each emitted token.
+                logprob, top_logprobs, perplexity)`` called on each emitted
+                token.  ``perplexity`` is ``exp(entropy_nats)`` of the
+                pre-temperature, post-steering distribution.
         """
         return self._generate_core(
             input,
@@ -1785,7 +1787,7 @@ class SaklasSession:
         exc_holder: list[BaseException] = []
         idx_counter = [0]
 
-        def _push(text, is_thinking, tid, lp, tlp):
+        def _push(text, is_thinking, tid, lp, tlp, perplexity):
             scores: dict[str, float] | None = None
             if self._monitor.probe_names:
                 latest_hidden = {
@@ -1799,7 +1801,7 @@ class SaklasSession:
             event = TokenEvent(
                 text=text, token_id=tid, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_logprobs=tlp,
-                scores=scores,
+                scores=scores, perplexity=perplexity,
             )
             idx_counter[0] += 1
             q.put(event)

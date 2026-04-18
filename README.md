@@ -238,7 +238,7 @@ There are three panels: a vector registry on the left, chat in the center, and a
 
 A footer at the bottom of the trait panel shows the top 5 layers and the live highest and lowest scored tokens for the selected probe.
 
-The footer in the chat panel shows generation progress, live tok/s, elapsed, VRAM, and context.
+The footer in the chat panel shows generation progress, live tok/s, elapsed, and the running perplexity of the token stream (geometric mean of the pre-temperature post-steering next-token distribution).
 
 If you want to extract a vector for two poles, use `/extract a dog . a pair of cats`. The TUI parses around the space-period-space delimiter. `dog.cat` stays a single name.
 

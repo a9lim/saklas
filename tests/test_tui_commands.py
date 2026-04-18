@@ -61,12 +61,11 @@ def _make_app():
     app._ui_token_queue = queue.SimpleQueue()
     app._gen_start_time = 0.0
     app._gen_token_count = 0
-    app._prompt_token_count = 0
     app._last_tok_per_sec = 0.0
     app._last_elapsed = 0.0
-    app._cached_vram_gb = 0.0
-    app._vram_poll_counter = 0
-    app._last_gen_state = (-1, -1.0, -1.0, -1.0, False)
+    app._log_ppl_sum = 0.0
+    app._ppl_count = 0
+    app._last_gen_state = (-1, -1.0, -1.0, False, -1)
     app._assistant_messages = []
 
     # Mock chat panel — only capture system messages.
