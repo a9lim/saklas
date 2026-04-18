@@ -42,7 +42,7 @@ saklas vector extract <concept>|<pos> <neg> [-m MODEL] [-f] [--sae RELEASE [--sa
 saklas vector merge <name> <expression> [-m]    # shared steering grammar: "0.3 ns/a + 0.5 ns/b~ns/c"
 saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
 saklas vector compare <concepts...> -m MODEL [-v] [-j]       # cosine similarity between vectors
-saklas vector why <concept> -m MODEL [-n N] [--all] [-j]     # top layers by ||baked||
+saklas vector why <concept> -m MODEL [-j]                    # per-layer ||baked|| as 16-bucket histogram
 saklas config show [-c PATH ...] [--no-default] [-m MODEL]
 saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS

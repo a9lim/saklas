@@ -9,8 +9,8 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 from textual.widget import Widget
 
+from saklas.core.histogram import HIST_BUCKETS, bucketize
 from saklas.tui.utils import BAR_WIDTH, build_bar
-
 
 
 class TraitPanel(Widget):
@@ -167,36 +167,22 @@ class TraitPanel(Widget):
         self,
         probe: str | None,
         layer_norms: list[tuple[int, float]],
-        top_tokens: tuple[list[tuple[str, float]], list[tuple[str, float]]] | None,
     ) -> None:
         if probe is None:
             self._why_header.update("")
             self._why_content.update("")
             return
-        self._why_header.update(f"[bold]{probe}[/]")
-        lines: list[str] = [" [bold]layers[/]"]
-        for lidx, norm in layer_norms:
-            lines.append(f"  L{lidx:<3} {norm:>7.3f}")
-        if top_tokens is not None:
-            highest, lowest = top_tokens
-            lines.append(" [bold]tokens[/]")
-            for tok, score in highest:
-                lines.append(self._format_token_line(tok, score))
-            if lowest:
-                lines.append("  [dim]...[/]")
-                for tok, score in lowest:
-                    lines.append(self._format_token_line(tok, score))
+        self._why_header.update("[bold]LAYERS[/]")
+        lines: list[str] = []
+        if layer_norms:
+            buckets = bucketize(layer_norms, HIST_BUCKETS)
+            max_norm = max(v for _, _, v in buckets) or 1.0
+            label_w = max(2, len(str(max(hi for _, hi, _ in buckets))))
+            for lo, hi, norm in buckets:
+                full, empty = build_bar(norm, max_norm, BAR_WIDTH)
+                label = f"L{lo:0{label_w}}" if lo == hi else f"L{lo:0{label_w}}-{hi:0{label_w}}"
+                lines.append(f"  {label} {full}[dim]{empty}[/]")
         self._why_content.update("\n".join(lines))
-
-    @staticmethod
-    def _format_token_line(tok: str, score: float) -> str:
-        disp = tok.replace("\n", "\\n")[:16]
-        color = (
-            "ansi_green" if score > 0
-            else "ansi_red" if score < 0
-            else "ansi_default"
-        )
-        return f"  [{color}]{score:>+7.4f}[/] {disp!r}"
 
     def _sort_probes(self, names: list[str]) -> list[str]:
         if self._sort_mode == "value":

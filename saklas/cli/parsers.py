@@ -253,12 +253,8 @@ def _build_vector_why(p: argparse.ArgumentParser) -> None:
     p.add_argument("concept", help="Concept selector (name or ns/name)")
     p.add_argument("-m", "--model", required=True, metavar="MODEL_ID",
                    help="Model id (used to locate the baked tensor)")
-    p.add_argument("-n", "--top-n", dest="top_n", type=int, default=5,
-                   help="Number of top layers to show (default: 5)")
-    p.add_argument("--all", dest="show_all", action="store_true",
-                   help="Show every layer sorted descending (overrides -n)")
     p.add_argument("-j", "--json", dest="json_output", action="store_true",
-                   help="Emit machine-readable JSON")
+                   help="Emit machine-readable JSON (full per-layer detail)")
 
 
 _VECTOR_BUILDERS = {

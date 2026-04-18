@@ -876,7 +876,6 @@ class SaklasApp(App):
                         widget.append_token(token)
                     if scores is not None:
                         widget.append_token_score(scores, is_thinking)
-                        self._refresh_trait_why()
                 tokens_consumed += 1
             elif kind == "finalize":
                 # Normal end — pull per-token scores stashed by session's
@@ -1286,54 +1285,23 @@ class SaklasApp(App):
         chat.add_system_message("\n".join(lines))
 
     def _refresh_trait_why(self) -> None:
-        """Push current top-layers + (when available) top-tokens for the
-        trait-panel-selected probe down to the panel's WHY section.
+        """Push per-layer ||baked|| norms for the trait-panel-selected probe
+        down to the panel's WHY section as a histogram in layer order.
 
-        Top-token data is pulled from the most recently mounted assistant
-        widget — the widget's per-probe score lists are appended to live
-        during streaming (via ``append_token_score``) and overwritten with
-        canonical projected scores at finalize. Either way the widget is
-        the source of truth for "what scores belong to which rendered token".
+        Per-token highlighting in the chat already surfaces which tokens
+        a probe lights up on — no token list duplicated here.
         """
         probe = self._trait_panel.get_selected_probe()
         monitor = self._session._monitor
         if probe is None or monitor is None or probe not in monitor.profiles:
-            self._trait_panel.update_why(None, [], None)
+            self._trait_panel.update_why(None, [])
             return
         profile = monitor.profiles[probe]
         layer_norms = sorted(
             ((int(lidx), float(t.norm().item())) for lidx, t in profile.items()),
-            key=lambda kv: kv[1], reverse=True,
-        )[:5]
-
-        top_tokens = None
-        widget = next(
-            (w for w in reversed(self._assistant_messages) if w.is_mounted),
-            None,
+            key=lambda kv: kv[0],
         )
-        if widget is not None:
-            thinking_scores = widget._thinking_probe_scores.get(probe, [])
-            response_scores = widget._response_probe_scores.get(probe, [])
-            thinking_strs = widget._streamed_thinking_tokens
-            response_strs = widget._streamed_response_tokens
-            pairs: list[tuple[str, float]] = []
-            for tok, score in zip(thinking_strs, thinking_scores):
-                pairs.append((tok, score))
-            for tok, score in zip(response_strs, response_scores):
-                pairs.append((tok, score))
-            if pairs:
-                pairs.sort(key=lambda kv: kv[1], reverse=True)
-                # Top N highest + N lowest by signed score. When the gen
-                # has fewer tokens than 2*N, the two halves overlap — fall
-                # back to one merged group with no separator so we don't
-                # show a token twice.
-                top_n = 4
-                if len(pairs) > 2 * top_n:
-                    top_tokens = (pairs[:top_n], pairs[-top_n:])
-                else:
-                    top_tokens = (pairs, [])
-
-        self._trait_panel.update_why(probe, layer_norms, top_tokens)
+        self._trait_panel.update_why(probe, layer_norms)
 
     def _handle_compare(self, arg: str) -> None:
         chat = self._chat_panel

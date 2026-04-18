@@ -882,16 +882,10 @@ def _run_why(args: argparse.Namespace) -> None:
         print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Compute per-layer magnitudes and sort descending.
-    layer_mags: list[tuple[int, float]] = [
-        (layer, float(tensor.norm().item()))
-        for layer, tensor in profile.items()
-    ]
-    layer_mags.sort(key=lambda x: x[1], reverse=True)
-
-    if not args.show_all:
-        layer_mags = layer_mags[: args.top_n]
-
+    layer_mags: list[tuple[int, float]] = sorted(
+        ((layer, float(tensor.norm().item())) for layer, tensor in profile.items()),
+        key=lambda kv: kv[0],
+    )
     total_layers = len(profile)
 
     if args.json_output:
@@ -903,11 +897,39 @@ def _run_why(args: argparse.Namespace) -> None:
         }
         print(_json.dumps(result, indent=2))
     else:
-        label = "layers" if args.show_all else "top layers"
-        print(f"{concept_name} ({total_layers} layers, {args.model}):")
-        print(f"  {label} (by ||baked||):")
-        for layer, mag in layer_mags:
-            print(f"    L{layer:<3}  {mag:.3f}")
+        _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
+
+
+def _print_why_histogram(
+    concept_name: str,
+    model_id: str,
+    total_layers: int,
+    layer_mags: list[tuple[int, float]],
+) -> None:
+    import shutil
+    from saklas.core.histogram import HIST_BUCKETS, bucketize
+
+    print(f"{concept_name} ({total_layers} layers, {model_id}):")
+    print("  LAYERS (mean ||baked|| per bucket):")
+    if not layer_mags:
+        return
+
+    term_w = shutil.get_terminal_size((80, 24)).columns
+    buckets = bucketize(layer_mags, HIST_BUCKETS)
+    max_norm = max(v for _, _, v in buckets) or 1.0
+    label_w = max(2, len(str(max(hi for _, hi, _ in buckets))))
+
+    def _label(lo: int, hi: int) -> str:
+        return f"L{lo:0{label_w}}" if lo == hi else f"L{lo:0{label_w}}-{hi:0{label_w}}"
+
+    label_col = max(len(_label(lo, hi)) for lo, hi, _ in buckets)
+    # "    <label>  <bar>  <value>" — 4 indent + label_col + 2 + bar + 2 + 8
+    value_w = 8
+    bar_w = max(12, term_w - 4 - label_col - 2 - 2 - value_w)
+    for lo, hi, norm in buckets:
+        filled = min(int(norm / max_norm * bar_w), bar_w)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        print(f"    {_label(lo, hi):<{label_col}}  {bar}  {norm:>{value_w}.3f}")
 
 
 _VECTOR_RUNNERS = {

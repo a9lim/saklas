@@ -669,20 +669,22 @@ def test_parse_vector_why_basic():
     assert args.vector_cmd == "why"
     assert args.concept == "angry.calm"
     assert args.model == "foo/bar"
-    assert args.top_n == 5
-    assert args.show_all is False
     assert args.json_output is False
 
 
-def test_parse_vector_why_all_and_json():
-    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar", "--all", "-j"])
-    assert args.show_all is True
+def test_parse_vector_why_json():
+    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar", "-j"])
     assert args.json_output is True
 
 
-def test_parse_vector_why_top_n():
-    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar", "-n", "10"])
-    assert args.top_n == 10
+def test_parse_vector_why_removed_flags_rejected():
+    # ``--all`` and ``-n`` were removed with the histogram overhaul.
+    for argv in (
+        ["vector", "why", "angry.calm", "-m", "foo/bar", "--all"],
+        ["vector", "why", "angry.calm", "-m", "foo/bar", "-n", "10"],
+    ):
+        with pytest.raises(SystemExit):
+            cli.parse_args(argv)
 
 
 def test_parse_vector_why_missing_model_errors():
@@ -691,7 +693,7 @@ def test_parse_vector_why_missing_model_errors():
 
 
 def test_run_why_text_output(monkeypatch, tmp_path, capsys):
-    """Basic text output: shows top N layers sorted by magnitude."""
+    """Text output renders a per-bucket histogram covering every layer."""
     vdir = _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
     from saklas.io.paths import safe_model_id
@@ -713,15 +715,17 @@ def test_run_why_text_output(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "angry.calm" in out
     assert "6 layers" in out
-    assert "top layers" in out
-    assert "L14" in out
-    assert "0.847" in out
-    # Only top 5, layer 10 should not appear
-    assert "L10" not in out
+    assert "LAYERS" in out
+    # With 6 layers ≤ 24 buckets, each layer is its own bucket — every layer
+    # label must appear.
+    for layer in layer_mags:
+        assert f"L{layer}" in out
+    # Bar glyph present.
+    assert "█" in out
 
 
-def test_run_why_text_all(monkeypatch, tmp_path, capsys):
-    """--all shows every layer without 'top layers' prefix."""
+def test_run_why_text_buckets_large_profile(monkeypatch, tmp_path, capsys):
+    """With >24 layers, buckets collapse into layer ranges."""
     vdir = _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
     from saklas.io.paths import safe_model_id
@@ -731,7 +735,7 @@ def test_run_why_text_all(monkeypatch, tmp_path, capsys):
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / f"{sid}.safetensors").write_bytes(b"x")
 
-    layer_mags = {14: 0.847, 10: 0.400}
+    layer_mags = {i: float(i + 1) * 0.01 for i in range(62)}
     profile = _mock_why_profile(layer_mags)
 
     from saklas.core.profile import Profile
@@ -739,16 +743,19 @@ def test_run_why_text_all(monkeypatch, tmp_path, capsys):
     from saklas.cli.selectors import invalidate
     invalidate()
 
-    cli.main(["vector", "why", "angry.calm", "-m", model_id, "--all"])
+    cli.main(["vector", "why", "angry.calm", "-m", model_id])
     out = capsys.readouterr().out
-    assert "top layers" not in out
-    assert "layers (by ||baked||)" in out
-    assert "L14" in out
-    assert "L10" in out
+    assert "62 layers" in out
+    # Range label form used when buckets span more than one layer.
+    assert "-" in out
+    # Exactly HIST_BUCKETS histogram rows — count bar glyphs on left edge.
+    from saklas.core.histogram import HIST_BUCKETS
+    bar_lines = [ln for ln in out.splitlines() if "█" in ln or "░" in ln]
+    assert len(bar_lines) == HIST_BUCKETS
 
 
 def test_run_why_json_output(monkeypatch, tmp_path, capsys):
-    """JSON output has expected keys and values."""
+    """JSON output is full-fidelity, in layer order."""
     import json as _json
     vdir = _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -773,11 +780,8 @@ def test_run_why_json_output(monkeypatch, tmp_path, capsys):
     assert data["concept"] == "angry.calm"
     assert data["model"] == model_id
     assert data["total_layers"] == 3
-    assert isinstance(data["layers"], list)
-    assert len(data["layers"]) == 3  # default top_n=5 but only 3 layers
-    # First entry should be layer 14 (highest magnitude)
-    assert data["layers"][0]["layer"] == 14
-    assert abs(data["layers"][0]["magnitude"] - 0.847) < 1e-4
+    assert [e["layer"] for e in data["layers"]] == [13, 14, 15]
+    assert abs(data["layers"][1]["magnitude"] - 0.847) < 1e-4
 
 
 def test_run_why_concept_not_found(monkeypatch, tmp_path, capsys):

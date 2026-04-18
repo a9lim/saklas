@@ -427,7 +427,7 @@ saklas vector extract <concept> | <pos> <neg> [-m MODEL] [-f]
 saklas vector merge <name> <expression> [-m] [-f] [-s]
 saklas vector clone <corpus-file> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
 saklas vector compare <concepts...> -m MODEL [-v] [-j]
-saklas vector why <concept> -m MODEL [-n N] [--all] [-j]
+saklas vector why <concept> -m MODEL [-j]
 ```
 
 Merge expressions share the steering grammar. Terms combine with `+` / `-`, coefficients lead each term, and `~` projects one direction's component out of another. For example, `saklas vector merge dehallu "0.8 default/creative.conventional~default/hallucinating.grounded"` gives you creative with hallucination projected out.
