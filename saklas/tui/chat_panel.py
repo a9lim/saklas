@@ -315,14 +315,13 @@ class ChatPanel(Widget):
         """Update the status bar with generation stats."""
         bar = self._status_bar
         dot = "[ansi_green]●[/]" if generating else "[dim]○[/]"
-        if generating and max_tokens > 0:
+        if max_tokens > 0 and (generating or gen_tokens > 0):
             t_full, t_empty = build_bar(gen_tokens, max_tokens, BAR_WIDTH)
+            bar_color = "ansi_green" if generating else "dim"
             left = (
-                f"{dot} [ansi_green]{t_full}[/][dim]{t_empty}[/] "
+                f"{dot} [{bar_color}]{t_full}[/][dim]{t_empty}[/] "
                 f"{gen_tokens}/{max_tokens} · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
             )
-        elif gen_tokens > 0:
-            left = f"{dot} {gen_tokens} tok · {tok_per_sec:.1f} tok/s · {elapsed:.1f}s"
         else:
             left = f"{dot} idle"
 

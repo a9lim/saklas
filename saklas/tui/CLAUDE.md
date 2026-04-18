@@ -40,7 +40,7 @@ Bottom-third split below the traits list. `#why-header` is always the literal `L
 
 ## Status footer
 
-`chat_panel.update_status`: one-line footer showing dot + optional token progress bar (`gen_tokens / max_new_tokens`, green, only during generation — idle has no target) · tok/s · elapsed · VRAM · **context bar** (`prompt_tokens + gen_tokens` / `max_position_embeddings`, cyan ≤75%, yellow ≥75%, red ≥90%). Context sits on the right.
+`chat_panel.update_status`: one-line footer showing dot + token progress bar (`gen_tokens / max_new_tokens`, green while generating, dim between runs — persists post-gen so the bar doesn't appear/disappear each turn; only collapses to `○ idle` before the first generation or when `max_tokens` is unknown) · tok/s · elapsed · VRAM · **context bar** (`prompt_tokens + gen_tokens` / `max_position_embeddings`, cyan ≤75%, yellow ≥75%, red ≥90%). Context sits on the right.
 
 `_prompt_token_count` is pre-computed in `_start_generation` via `tokenizer.apply_chat_template(history + pending_user_msg, tokenize=True, add_generation_prompt=True)` so the ctx bar reflects the in-flight prompt live, then overwritten at finalize by `session.last_result.prompt_tokens` (authoritative). `_context_window` resolved once at app construction via `_resolve_context_window(model.config, tokenizer)` — walks `config.{max_position_embeddings,n_positions}`, `config.text_config.*`, `config.llm_config.*` (multimodal stacks nest the text-side fields), then falls back to `tokenizer.model_max_length`. Missing on every branch → context bar hidden. `_last_gen_state` dedupe tuple includes `_prompt_token_count` so the bar refreshes when it changes.
 
