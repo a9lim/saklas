@@ -178,10 +178,12 @@ class TraitPanel(Widget):
             buckets = bucketize(layer_norms, HIST_BUCKETS)
             max_norm = max(v for _, _, v in buckets) or 1.0
             label_w = max(2, len(str(max(hi for _, hi, _ in buckets))))
+            has_range = any(lo != hi for lo, hi, _ in buckets)
+            label_col = (2 * label_w + 2) if has_range else (label_w + 1)
             for lo, hi, norm in buckets:
                 full, empty = build_bar(norm, max_norm, BAR_WIDTH)
                 label = f"L{lo:0{label_w}}" if lo == hi else f"L{lo:0{label_w}}-{hi:0{label_w}}"
-                lines.append(f"  {label} [dim]{full}[/][dim]{empty}[/]")
+                lines.append(f"  {label:<{label_col}} [dim]{full}[/][dim]{empty}[/]")
         self._why_content.update("\n".join(lines))
 
     def _sort_probes(self, names: list[str]) -> list[str]:
