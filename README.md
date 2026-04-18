@@ -282,11 +282,11 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 
 Registration is state and steering is per-call. `session.steer("name", profile)` stores the vector; `session.generate(input, steering="0.5 name")` applies it for that generation. Without `steering` you get a clean baseline.
 
-Compose multiple concepts with the grammar's `+` / `-` / `@trigger` / `|` / `~` — every surface (Python, YAML, HTTP, TUI, `vector merge`) parses the same expression language. Nested `with session.steering(...)` blocks flatten, inner wins on key collision.
+You can compose concepts with `+` / `-` / `@trigger` / `|` / `~`. Every surface (Python, YAML, HTTP, TUI, `vector merge`) parses the same expression language. Nested `with session.steering(...)` blocks get flattened, inner wins on key collision.
 
 Sampling is per-call via `SamplingConfig`: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs`.
 
-Thinking mode auto-detects for models that support it (Qwen 3.5, QwQ, Gemma 4, gpt-oss). The delimiters are detected from the chat template.
+Thinking mode auto-detects for models that support it (Qwen 3.5, Gemma 4, gpt-oss, etc). The delimiters are detected from the chat template.
 
 `session.events` is a synchronous `EventBus`. Subscribe to `VectorExtracted`, `SteeringApplied`, `SteeringCleared`, `ProbeScored`, `GenerationStarted`, `GenerationFinished`.
 
@@ -432,7 +432,7 @@ saklas vector why <concept> -m MODEL [-j]
 
 Merge expressions share the steering grammar. Terms combine with `+` / `-`, coefficients lead each term, and `~` projects one direction's component out of another. For example, `saklas vector merge dehallu "0.8 default/creative.conventional~default/hallucinating.grounded"` gives you creative with hallucination projected out.
 
-Selectors: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve cross-namespace and error on ambiguity.
+Selectors: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and error if ambiguous.
 
 ---
 
