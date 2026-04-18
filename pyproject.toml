@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saklas"
-version = "1.4.3"
+version = "1.4.4"
 description = "Activation steering and trait monitoring for HuggingFace transformers — Python library, OpenAI-compatible server, and terminal UI"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -43,7 +43,7 @@ Homepage = "https://github.com/a9lim/saklas"
 bnb = ["bitsandbytes>=0.43"]
 flash = ["flash-attn>=2.5"]
 cuda = ["bitsandbytes>=0.43", "flash-attn>=2.5"]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6.9", "fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
 serve = ["fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
 hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
@@ -53,6 +53,16 @@ sae = ["sae-lens>=6.0,<7.0"]
 
 [project.scripts]
 saklas = "saklas.cli.main:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a CUDA or MPS backend (deselect with `-m \"not gpu\"`)",
+]
+filterwarnings = [
+    # Python 3.14 flags SWIG-generated builtin types in transitive C deps
+    # (scipy/PIL). Not saklas code and nothing we can fix upstream.
+    "ignore:builtin type Swig(Py(Packed|Object)|varlink) has no __module__ attribute:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 120

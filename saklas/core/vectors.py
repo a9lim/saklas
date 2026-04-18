@@ -564,6 +564,61 @@ def load_profile(path: str) -> tuple[dict[int, torch.Tensor], dict]:
     return profile, metadata
 
 
+def project_profile(
+    base: dict[int, torch.Tensor],
+    onto: dict[int, torch.Tensor],
+    operator: str,
+) -> dict[int, torch.Tensor]:
+    """Per-layer projection of ``base`` against ``onto``.
+
+    For each shared layer (fp32)::
+
+        proj = (dot(base, onto) / dot(onto, onto)) * onto
+
+    - ``operator == "~"``   returns ``proj``       (component of base aligned with onto).
+    - ``operator == "|"`` returns ``base - proj`` (component of base orthogonal to onto).
+
+    Layers in ``base`` without a matching layer in ``onto``: for ``"|"``
+    they pass through unchanged (nothing to project away); for ``"~"`` they
+    are dropped (projection onto an absent direction is undefined).
+
+    Near-zero ``||onto|| < 1e-12`` layers are treated the same way: ``"|"``
+    passes base through unchanged, ``"~"`` drops the layer. Result tensors
+    are cast back to the source dtype of ``base``.
+
+    The returned dict shape matches :func:`extract_contrastive` so it
+    plugs into ``SteeringManager.add_vector`` without adaptation.
+    """
+    if operator not in ("~", "|"):
+        raise ValueError(f"unknown projection operator: {operator!r}")
+    out: dict[int, torch.Tensor] = {}
+    for layer, base_t in base.items():
+        onto_t = onto.get(layer)
+        if onto_t is None:
+            if operator == "|":
+                out[layer] = base_t
+            continue
+        a_f = base_t.to(dtype=torch.float32)
+        b_f = onto_t.to(dtype=torch.float32)
+        b_dot = torch.dot(b_f, b_f).item()
+        if b_dot < 1e-12:
+            if operator == "|":
+                out[layer] = base_t
+            continue
+        proj = (torch.dot(a_f, b_f) / b_dot) * b_f
+        if operator == "~":
+            out[layer] = proj.to(dtype=base_t.dtype)
+        else:
+            out[layer] = (a_f - proj).to(dtype=base_t.dtype)
+    if not out:
+        raise ValueError(
+            f"project_profile: no layers produced for operator {operator!r} "
+            f"(base layers: {sorted(base.keys())}, "
+            f"onto layers: {sorted(onto.keys())})"
+        )
+    return out
+
+
 def load_contrastive_pairs(dataset_path: str) -> dict:
     """Load a contrastive-pairs JSON file.
 

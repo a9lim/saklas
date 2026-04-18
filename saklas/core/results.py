@@ -33,6 +33,11 @@ class GenerationResult:
     # Per-completion-token (token_id, logprob, top_logprobs) — populated
     # only when logprobs were requested. top_logprobs is list[(id, logprob)].
     logprobs: list[tuple[int, float, list[tuple[int, float]]]] | None = None
+    # Steering expression applied to this generation, stringified via
+    # :func:`saklas.core.steering_expr.format_expr` for round-trip
+    # reproduction.  ``None`` when no steering was active.  Receipts /
+    # ``saklas replay`` land on this single field.
+    applied_steering: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +50,7 @@ class GenerationResult:
             "vectors": dict(self.vectors),
             "prompt_tokens": self.prompt_tokens,
             "finish_reason": self.finish_reason,
+            "applied_steering": self.applied_steering,
         }
 
 
@@ -62,6 +68,11 @@ class TokenEvent:
     # captured hidden state. Populated by ``generate_stream`` only when
     # the session has active probes; otherwise None.
     scores: dict[str, float] | None = None
+    # Perplexity of the pre-temperature, post-steering next-token
+    # distribution — ``exp`` of full-vocab Shannon entropy in nats.
+    # Bounded above by ``vocab_size``; a confident prediction approaches
+    # 1. Consumers take ``log`` to recover entropy-nats for averaging.
+    perplexity: float | None = None
 
 
 class ResultCollector:

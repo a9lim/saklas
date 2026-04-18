@@ -276,19 +276,18 @@ _PROCESSED_OPTIONS: frozenset[str] = frozenset({
 
 
 def _resolve_options(
-    body: dict, default_alphas: dict[str, float],
+    body: dict, default_steering: "Steering | None",
 ) -> tuple[dict[str, Any], str | None]:
     """Translate Ollama `options` + top-level fields into session.generate kwargs.
 
-    Returns ``(gen_kwargs, system)`` where ``gen_kwargs`` has the new
-    cluster-3 shape (``sampling=SamplingConfig``, ``steering=Steering|None``,
-    ``thinking=``, ``stateless=True``) and ``system`` is the top-level
-    ``system`` field for the caller to splice into messages.
+    Returns ``(gen_kwargs, system)``: ``sampling=SamplingConfig``,
+    ``steering=Steering|None``, ``thinking=``, ``stateless=True``; ``system``
+    is the top-level ``system`` field for the caller to splice into messages.
 
     Recognized Ollama fields: temperature, top_p, top_k, seed, num_predict,
     stop, presence_penalty, frequency_penalty, repeat_penalty.
 
-    `repeat_penalty` maps to `presence_penalty` via ``ln(repeat_penalty)``:
+    ``repeat_penalty`` maps to ``presence_penalty`` via ``ln(repeat_penalty)``:
     Ollama divides positive logits by repeat_penalty, which is equivalent
     to subtracting ``ln(penalty)`` from the logit.  That matches
     presence_penalty semantics exactly (subtract a constant per seen token,
@@ -298,7 +297,7 @@ def _resolve_options(
     logged at debug level and silently dropped.
 
     Non-standard saklas fields (accepted at the top level or inside options):
-    `steer` (dict or dict with alphas/thinking), `think` (bool).
+    ``steer`` (a steering expression string), ``think`` (bool).
     """
     opts = dict(body.get("options") or {})
     top_system = body.get("system")
@@ -337,30 +336,33 @@ def _resolve_options(
     if ignored:
         log.debug("ollama: unsupported options dropped: %s", ", ".join(sorted(ignored)))
 
-    steer_raw = opts.get("steer") or body.get("steer") or {}
-    thinking: bool | None = None
-    if isinstance(steer_raw, dict):
-        if "alphas" in steer_raw and isinstance(steer_raw["alphas"], dict):
-            alpha_map = {str(k): float(v) for k, v in steer_raw["alphas"].items()}
-            t = steer_raw.get("thinking")
-            if t is not None:
-                thinking = bool(t)
-        else:
-            alpha_map = {}
-            for k, v in steer_raw.items():
-                try:
-                    alpha_map[str(k)] = float(v)
-                except (TypeError, ValueError):
-                    pass
-    else:
-        alpha_map = {}
+    from saklas.core.steering_expr import parse_expr
 
+    steer_raw = opts.get("steer") or body.get("steer")
+    req_steering: "Steering | None" = None
+    if steer_raw is not None:
+        if not isinstance(steer_raw, str):
+            raise ValueError(
+                "Ollama 'steer' must be a steering expression string, "
+                "e.g. \"0.5 honest + 0.3 warm\""
+            )
+        text = steer_raw.strip()
+        if text:
+            req_steering = parse_expr(text)
+
+    thinking: bool | None = None
+    if req_steering is not None and req_steering.thinking is not None:
+        thinking = req_steering.thinking
     think_flag = body.get("think")
     if think_flag is not None:
         thinking = bool(think_flag)
 
-    merged_alphas = {**default_alphas, **alpha_map}
-    merged_alphas = {k: v for k, v in merged_alphas.items() if v != 0.0}
+    merged_alphas: dict = {}
+    if default_steering is not None:
+        merged_alphas.update(default_steering.alphas)
+    if req_steering is not None:
+        for k, v in req_steering.alphas.items():
+            merged_alphas[k] = v
 
     sc = SamplingConfig(
         temperature=temperature,
@@ -427,7 +429,7 @@ def _finish_to_done_reason(finish_reason: str | None) -> str:
 def register_ollama_routes(app: FastAPI) -> None:
     """Mount /api/* Ollama-compatible routes onto an existing FastAPI app.
 
-    Uses app.state.session + app.state.default_alphas, and serializes on
+    Uses app.state.session + app.state.default_steering, and serializes on
     ``session.lock`` shared with the OpenAI routes.  Auth is inherited via
     app-level Depends(_require_auth) from the parent create_app.
     """
@@ -577,8 +579,8 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     async def _run_and_build_chat_response(body: dict, is_chat: bool) -> dict:
         """Shared non-streaming path for /api/chat and /api/generate."""
-        default_alphas = app.state.default_alphas
-        gen_kwargs, system = _resolve_options(body, default_alphas)
+        default_steering = app.state.default_steering
+        gen_kwargs, system = _resolve_options(body, default_steering)
 
         if is_chat:
             msgs = _extract_messages(body)
@@ -635,8 +637,8 @@ def register_ollama_routes(app: FastAPI) -> None:
         }
 
     async def _stream_chat_or_generate(body: dict, is_chat: bool):
-        default_alphas = app.state.default_alphas
-        gen_kwargs, system = _resolve_options(body, default_alphas)
+        default_steering = app.state.default_steering
+        gen_kwargs, system = _resolve_options(body, default_steering)
 
         if is_chat:
             msgs = _extract_messages(body)

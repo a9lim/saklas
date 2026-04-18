@@ -105,7 +105,7 @@ def _mock_session():
 def session_and_client():
     from saklas.server import create_app
     session = _mock_session()
-    app = create_app(session, default_alphas={})
+    app = create_app(session, default_steering=None)
     return session, TestClient(app)
 
 
@@ -261,6 +261,40 @@ class TestExtract:
         data = resp.json()
         assert data["canonical"] == "angry.calm"
         assert data["profile"]["layers"] == [0, 1]
+        assert "on_progress" in session.extract.call_args.kwargs
+
+    def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client):
+        import torch
+        session, client = session_and_client
+        profile = {0: torch.ones(4)}
+
+        def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
+            assert source == [("positive text", "negative text")]
+            assert baseline is None
+            assert on_progress is not None
+            on_progress("progress")
+            return "custom", profile
+
+        session.extract.side_effect = _extract
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={
+                "name": "custom",
+                "source": {
+                    "pairs": [
+                        {
+                            "positive": "positive text",
+                            "negative": "negative text",
+                        }
+                    ]
+                },
+                "register": False,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["canonical"] == "custom"
+        assert data["progress"] == ["progress"]
 
 
 # ---- WebSocket token+probe co-stream ------------------------------------
@@ -329,7 +363,7 @@ class TestWebSocket:
     def test_ws_requires_bearer_when_api_key_set(self):
         from saklas.server import create_app
         session = _mock_session()
-        app = create_app(session, default_alphas={}, api_key="s3cret")
+        app = create_app(session, default_steering=None, api_key="s3cret")
         client = TestClient(app)
         # No Authorization header -> close(1008) before accept.
         with pytest.raises(Exception):
@@ -365,7 +399,7 @@ class TestTraitsStream:
         """With api_key set, the SSE endpoint requires Bearer auth."""
         from saklas.server import create_app
         session = _mock_session()
-        app = create_app(session, default_alphas={}, api_key="s3cret")
+        app = create_app(session, default_steering=None, api_key="s3cret")
         client = TestClient(app)
         resp = client.get("/saklas/v1/sessions/default/traits/stream")
         assert resp.status_code == 401

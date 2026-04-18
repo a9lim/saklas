@@ -56,8 +56,9 @@ def _mock_session():
 @pytest.fixture
 def client():
     from saklas.server import create_app
+    from saklas.core.steering import Steering
     session = _mock_session()
-    app = create_app(session, default_alphas={"test_vec": 0.1})
+    app = create_app(session, default_steering=Steering(alphas={"test_vec": 0.1}))
     return TestClient(app)
 
 
@@ -65,7 +66,7 @@ def client():
 def session_and_client():
     from saklas.server import create_app
     session = _mock_session()
-    app = create_app(session, default_alphas={})
+    app = create_app(session, default_steering=None)
     return session, TestClient(app)
 
 
@@ -123,7 +124,7 @@ class TestChatCompletions:
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "Hi"
 
-    def test_with_steer_params(self, session_and_client):
+    def test_with_steering_string(self, session_and_client):
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="Ok", tokens=[1], token_count=1,
@@ -131,7 +132,7 @@ class TestChatCompletions:
         )
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "test"}],
-            "steer": {"alphas": {"vec1": 0.3}},
+            "steering": "0.3 vec1",
         })
         assert resp.status_code == 200
         call_kwargs = session.generate.call_args[1]
@@ -245,9 +246,11 @@ class TestCLIParsing:
         assert args.port == 9000
 
     def test_serve_steer_flag(self):
-        from saklas.cli import _parse_steer_flag
-        assert _parse_steer_flag("cheerful:0.2") == ("cheerful", 0.2)
-        assert _parse_steer_flag("cheerful") == ("cheerful", 0.0)
+        from saklas.cli import parse_args
+        args = parse_args([
+            "serve", "m", "--steer", "0.2 cheerful + 0.3 warm",
+        ])
+        assert args.steer == "0.2 cheerful + 0.3 warm"
 
     def test_serve_cors(self):
         from saklas.cli import parse_args
@@ -377,7 +380,7 @@ class TestOllamaApi:
             "options": {
                 "temperature": 0.2, "top_p": 0.7, "seed": 42,
                 "num_predict": 64, "stop": ["\n\n"],
-                "steer": {"vec1": 0.3},
+                "steer": "0.3 vec1",
             },
         })
         assert resp.status_code == 200
@@ -599,62 +602,70 @@ class TestLangChainCompat:
 
 
 class TestNativeSteeringField:
-    def test_top_level_steering_flat(self, session_and_client):
+    def test_top_level_steering_expression(self, session_and_client):
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": {"angry.calm": 0.5},
+            "steering": "0.5 angry.calm",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
         assert kw["steering"] is not None
         assert kw["steering"].alphas == {"angry.calm": 0.5}
 
-    def test_top_level_steering_nested(self, session_and_client):
+    def test_steering_projection_term(self, session_and_client):
         session, client = session_and_client
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": {"alphas": {"deer.wolf": -0.4}, "thinking": True},
+            "steering": "-0.4 wolf",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert kw["steering"].alphas == {"deer.wolf": -0.4}
-        assert kw["steering"].thinking is True
+        # Parser resolves ``wolf`` → identity with sign +1 when nothing is
+        # installed; coefficient carries through as -0.4.
+        assert kw["steering"].alphas == {"wolf": -0.4}
 
     def test_steering_merges_with_server_defaults(self):
         from saklas.server import create_app
+        from saklas.core.steering import Steering
         session = _mock_session()
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
-        app = create_app(session, default_alphas={"base": 0.2})
+        app = create_app(session, default_steering=Steering(alphas={"base": 0.2}))
         c = TestClient(app)
         resp = c.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": {"override": 0.7},
+            "steering": "0.7 override",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
         assert kw["steering"].alphas == {"base": 0.2, "override": 0.7}
 
-    def test_steering_zero_alphas_stripped(self, session_and_client):
-        session, client = session_and_client
+    def test_steering_request_overrides_default(self):
+        from saklas.server import create_app
+        from saklas.core.steering import Steering
+        session = _mock_session()
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
-        resp = client.post("/v1/chat/completions", json={
+        # Use a key outside the bundled-probe vocabulary so resolve_pole
+        # doesn't reroute "myvec" to a bipolar canonical.
+        app = create_app(session, default_steering=Steering(alphas={"myvec": 0.1}))
+        c = TestClient(app)
+        resp = c.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": {"kept": 0.3, "dropped": 0.0},
+            "steering": "0.7 myvec",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
-        assert kw["steering"].alphas == {"kept": 0.3}
+        assert kw["steering"].alphas == {"myvec": 0.7}
 
     def test_thinking_field_default_is_none_auto(self, session_and_client):
         session, client = session_and_client
