@@ -181,7 +181,7 @@ class TraitPanel(Widget):
             for lo, hi, norm in buckets:
                 full, empty = build_bar(norm, max_norm, BAR_WIDTH)
                 label = f"L{lo:0{label_w}}" if lo == hi else f"L{lo:0{label_w}}-{hi:0{label_w}}"
-                lines.append(f"  {label} {full}[dim]{empty}[/]")
+                lines.append(f"  {label} [dim]{full}[/][dim]{empty}[/]")
         self._why_content.update("\n".join(lines))
 
     def _sort_probes(self, names: list[str]) -> list[str]:
