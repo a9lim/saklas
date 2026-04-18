@@ -161,7 +161,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        cache_dir: str | None = None,
     ) -> "SaklasSession":
         """Load a HF model + tokenizer and return a fully initialized session.
 
@@ -175,7 +174,6 @@ class SaklasSession:
             probes=probes,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
-            cache_dir=cache_dir,
         )
 
     def __init__(
@@ -186,7 +184,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        cache_dir: str | None = None,
     ):
         self._model = model
         self._tokenizer = tokenizer
@@ -196,12 +193,6 @@ class SaklasSession:
         first_param = next(self._model.parameters())
         self._device = first_param.device
         self._dtype = first_param.dtype
-
-        if cache_dir is not None:
-            _log.warning(
-                "SaklasSession(cache_dir=...) is deprecated; paths now come from ~/.saklas/. "
-                "Set SAKLAS_HOME env var to override."
-            )
 
         self.config = GenerationConfig(
             max_new_tokens=max_tokens,
@@ -286,9 +277,9 @@ class SaklasSession:
         return name in self._profiles
 
     @property
-    def vectors(self) -> dict[str, dict[int, torch.Tensor]]:
-        """Registered steering vector profiles: name -> profile."""
-        return dict(self._profiles)
+    def vectors(self) -> dict[str, Profile]:
+        """Registered steering vector profiles: name -> Profile."""
+        return {name: Profile(tensors) for name, tensors in self._profiles.items()}
 
     @property
     def probes(self) -> dict[str, dict]:
@@ -1034,32 +1025,21 @@ class SaklasSession:
 
     def save_profile(
         self,
-        profile: Profile | dict[int, torch.Tensor],
+        profile: Profile,
         path: str,
         metadata: dict | None = None,
     ) -> None:
-        if isinstance(profile, Profile):
-            profile.save(path, metadata=metadata)
-            return
-        _save_profile(profile, path, metadata or {})
+        profile.save(path, metadata=metadata)
 
     # -- Steering (vector registry) --
 
-    def steer(
-        self,
-        name: str,
-        profile: Profile | dict[int, torch.Tensor],
-    ) -> None:
+    def steer(self, name: str, profile: Profile) -> None:
         """Register a steering vector. Applied during generate() via alphas.
 
-        Accepts either a :class:`Profile` or the legacy ``dict[int, Tensor]``
-        shape. Internally stored as a plain dict so the steering hook's
-        hot path can read tensors without attribute lookups.
+        Internally stored as a plain dict so the steering hook's hot path
+        can read tensors without attribute lookups.
         """
-        if isinstance(profile, Profile):
-            self._profiles[name] = dict(profile.as_dict())
-        else:
-            self._profiles[name] = profile
+        self._profiles[name] = dict(profile.as_dict())
 
     def unsteer(self, name: str) -> None:
         """Remove a steering vector from the registry."""
@@ -1288,19 +1268,14 @@ class SaklasSession:
             self._emit_steering_applied()
 
     def _emit_steering_applied(self) -> None:
-        """Emit SteeringApplied with both alphas-only + full entries.
+        """Emit SteeringApplied with alphas-only + full entries.
 
-        ``alphas`` keeps the v1.x flat ``{name: alpha}`` shape for
-        subscribers that never needed triggers.  ``entries`` carries the
-        full ``{name: (alpha, trigger)}`` mapping for trigger-aware
-        subscribers (set to ``None`` when every entry uses
-        ``Trigger.BOTH`` so old subscribers see a normal-looking event).
+        ``alphas`` carries the flat ``{name: alpha}`` shape; ``entries``
+        carries the full ``{name: (alpha, trigger)}`` mapping.
         """
         flat = self._flatten_steering_stack()
         alphas_only = {name: alpha for name, (alpha, _trig) in flat.items()}
-        non_default = any(trig != Trigger.BOTH for _, trig in flat.values())
-        entries = dict(flat) if non_default else None
-        self.events.emit(SteeringApplied(alphas=alphas_only, entries=entries))
+        self.events.emit(SteeringApplied(alphas=alphas_only, entries=dict(flat)))
 
     def _flatten_steering_stack(self) -> dict[str, tuple[float, Trigger]]:
         """Collapse the LIFO stack into a single entries dict (later wins)."""
@@ -1640,10 +1615,8 @@ class SaklasSession:
             steering_cm = self.steering(steering_obj)
 
         def _snapshot_alphas() -> dict[str, float]:
-            """Project the flattened stack to the alphas-only shape that
-            ``GenerationResult.vectors`` has always carried.  Triggers are
-            stripped here — the public result object stays backward-compatible
-            for subscribers that only want ``{name: alpha}``."""
+            """Flatten the steering stack to ``{name: alpha}`` — triggers
+            stripped for ``GenerationResult.vectors``."""
             return {
                 name: alpha
                 for name, (alpha, _trig)

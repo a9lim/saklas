@@ -1,6 +1,6 @@
 """saklas — local activation steering + trait monitoring for HuggingFace causal LMs."""
 
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 
 from saklas.core.errors import SaklasError
 from saklas.core.events import (

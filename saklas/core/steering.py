@@ -71,10 +71,6 @@ class Steering:
         :mod:`saklas.core.steering_expr`.  ``None`` passes through (the
         caller interprets as "no steering").  Pre-built :class:`Steering`
         instances pass through unchanged.
-
-        Dict inputs are rejected with a :class:`TypeError` carrying a
-        migration hint — use an expression string (``"0.5 honest"``) or
-        construct :class:`Steering` directly.
         """
         if value is None:
             return None
@@ -83,12 +79,6 @@ class Steering:
         if isinstance(value, str):
             from saklas.core.steering_expr import parse_expr
             return parse_expr(value)
-        if isinstance(value, Mapping):
-            raise TypeError(
-                "Steering.from_value no longer accepts dict inputs; pass an "
-                "expression string (e.g. \"0.5 honest + 0.3 warm\") or "
-                "construct Steering(alphas=...) directly."
-            )
         raise TypeError(
             f"Steering.from_value expects str | Steering | None, "
             f"got {type(value).__name__}"

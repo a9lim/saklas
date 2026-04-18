@@ -102,7 +102,7 @@ def run_concept(
         session.clear_history()
         result = session.generate(
             prompt,
-            steering={canonical: alpha} if alpha != 0.0 else {},
+            steering=f"{alpha} {canonical}" if alpha != 0.0 else None,
             sampling=SamplingConfig(seed=SEED, max_tokens=MAX_TOKENS),
             thinking=False,
             stateless=True,

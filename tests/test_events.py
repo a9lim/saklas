@@ -41,7 +41,7 @@ def test_multiple_subscribers_all_fire():
     a, b = [], []
     bus.subscribe(a.append)
     bus.subscribe(b.append)
-    bus.emit(SteeringApplied(alphas={"x": 0.5}))
+    bus.emit(SteeringApplied(alphas={"x": 0.5}, entries={"x": (0.5, None)}))
     assert len(a) == 1
     assert len(b) == 1
 

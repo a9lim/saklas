@@ -39,6 +39,6 @@ def test_end_to_end_sae_extraction_and_generate():
     assert len(profile) > 0
 
     vanilla = session.generate("Describe a rainy afternoon.").text
-    with session.steering({name: 0.3}):
+    with session.steering(f"0.3 {name}"):
         steered = session.generate("Describe a rainy afternoon.").text
     assert vanilla != steered, "SAE-steered output should differ from vanilla"
