@@ -265,7 +265,7 @@ class TestCloning:
 
         try:
             proc = subprocess.run(
-                [sys.executable, "-m", "saklas", "pack", "extract",
+                [sys.executable, "-m", "saklas", "vector", "extract",
                  "happy.sad", "-m", MODEL_ID],
                 capture_output=True, text=True, timeout=600,
             )

@@ -328,6 +328,10 @@ class GenerationState:
         # per-token probe scores (which are in generated_ids space) back
         # to the emitted token stream.
         self.emit_map: list[tuple[int, bool]] = []
+        # Exact non-thinking text accepted by the streaming path. This is
+        # authoritative for final result text because stop sequences can trim
+        # only part of a decoded token while generated_ids still contains it.
+        self.response_text: str | None = None
 
     def request_stop(self):
         self.stop_requested.set()
@@ -339,6 +343,7 @@ class GenerationState:
         self.finish_reason = "stop"
         self.thinking_state = ThinkingState.IDLE
         self.emit_map = []
+        self.response_text = None
 
 
 def build_chat_input(
@@ -469,6 +474,15 @@ def generate_steered(
     # buffer is decoded as a group and flushed.
     pending_ids: list[int] = []
     pending_thinking: bool = False
+    if on_token is not None:
+        state.response_text = ""
+
+    def _emit_token(text: str, is_thinking: bool, token_id: int,
+                    logprob, top_logprobs) -> None:
+        if not is_thinking and state.response_text is not None:
+            state.response_text += text
+        if on_token is not None:
+            on_token(text, is_thinking, token_id, logprob, top_logprobs)
 
     try:
         with torch.inference_mode():
@@ -570,15 +584,15 @@ def generate_steered(
                     current_input = next_token
                     if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
-                            on_token(tokenizer.decode(pending_ids),
-                                     pending_thinking, -1, None, None)
+                            _emit_token(tokenizer.decode(pending_ids),
+                                        pending_thinking, -1, None, None)
                             pending_ids.clear()
                         tstate = _ThinkState.RESPONSE_PREAMBLE
                         state.thinking_state = ThinkingState.RESPONSE_PREAMBLE
                     elif tstate == _ThinkState.PREAMBLE:
                         if on_token and pending_ids:
-                            on_token(tokenizer.decode(pending_ids),
-                                     pending_thinking, -1, None, None)
+                            _emit_token(tokenizer.decode(pending_ids),
+                                        pending_thinking, -1, None, None)
                             pending_ids.clear()
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
@@ -617,7 +631,7 @@ def generate_steered(
                 # Handle end-of-thinking delimiter
                 if tstate == _ThinkState.THINKING and token_id == think_end_id:
                     if on_token and pending_ids:
-                        on_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
+                        _emit_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
                         pending_ids.clear()
                     if response_start_id is not None:
                         tstate = _ThinkState.RESPONSE_PREAMBLE
@@ -675,19 +689,19 @@ def generate_steered(
                                 trimmed = new_text[:hit_idx][prev_len:]
                                 if trimmed:
                                     state.emit_map.append((len(generated_ids) - 1, emit_thinking))
-                                    on_token(trimmed, emit_thinking, emit_id,
-                                             chosen_logprob, top_lp_pairs)
+                                    _emit_token(trimmed, emit_thinking, emit_id,
+                                                chosen_logprob, top_lp_pairs)
                                 state.finish_reason = "stop_sequence"
                                 break
                             completion_text = new_text
                         state.emit_map.append((len(generated_ids) - 1, emit_thinking))
-                        on_token(emit_text, emit_thinking, emit_id,
-                                 chosen_logprob, top_lp_pairs)
+                        _emit_token(emit_text, emit_thinking, emit_id,
+                                    chosen_logprob, top_lp_pairs)
 
         # Flush any remaining buffered partial tokens
         if on_token and pending_ids:
             state.emit_map.append((len(generated_ids) - 1, pending_thinking))
-            on_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
+            _emit_token(tokenizer.decode(pending_ids), pending_thinking, -1, None, None)
 
     finally:
         state.thinking_state = ThinkingState.DONE

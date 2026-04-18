@@ -240,6 +240,29 @@ def _build_steering(
     return Steering(alphas=merged, thinking=thinking)
 
 
+def _coerce_pair_source(source: Any) -> Any:
+    """Normalize JSON pair payloads into DataSource-compatible tuples."""
+    if not (isinstance(source, dict) and "pairs" in source):
+        return source
+    pairs = []
+    for idx, pair in enumerate(source["pairs"]):
+        if isinstance(pair, dict):
+            if "positive" not in pair or "negative" not in pair:
+                raise HTTPException(
+                    400,
+                    f"pairs[{idx}] must contain 'positive' and 'negative'",
+                )
+            pairs.append((str(pair["positive"]), str(pair["negative"])))
+        elif isinstance(pair, (list, tuple)) and len(pair) == 2:
+            pairs.append((str(pair[0]), str(pair[1])))
+        else:
+            raise HTTPException(
+                400,
+                f"pairs[{idx}] must be a [positive, negative] pair",
+            )
+    return pairs
+
+
 def _result_to_json(result: GenerationResult | None) -> dict:
     if result is None:
         return {}
@@ -399,8 +422,7 @@ def register_saklas_routes(app: FastAPI) -> None:
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
         _resolve_session_id(session, session_id)
         source: Any = req.source if req.source is not None else req.name
-        if isinstance(source, dict) and "pairs" in source:
-            source = [(p, n) for p, n in source["pairs"]]
+        source = _coerce_pair_source(source)
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
@@ -410,7 +432,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                     try:
                         canonical, profile = await asyncio.to_thread(
                             session.extract, source, req.baseline,
-                            progress_msgs.append,
+                            on_progress=progress_msgs.append,
                         )
                     except SaklasError as e:
                         import logging
@@ -432,7 +454,8 @@ def register_saklas_routes(app: FastAPI) -> None:
         progress_msgs: list[str] = []
         async with session.lock:
             canonical, profile = await asyncio.to_thread(
-                session.extract, source, req.baseline, progress_msgs.append,
+                session.extract, source, req.baseline,
+                on_progress=progress_msgs.append,
             )
             if req.auto_register:
                 session.steer(req.name, profile)

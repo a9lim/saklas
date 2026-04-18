@@ -261,6 +261,40 @@ class TestExtract:
         data = resp.json()
         assert data["canonical"] == "angry.calm"
         assert data["profile"]["layers"] == [0, 1]
+        assert "on_progress" in session.extract.call_args.kwargs
+
+    def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client):
+        import torch
+        session, client = session_and_client
+        profile = {0: torch.ones(4)}
+
+        def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
+            assert source == [("positive text", "negative text")]
+            assert baseline is None
+            assert on_progress is not None
+            on_progress("progress")
+            return "custom", profile
+
+        session.extract.side_effect = _extract
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={
+                "name": "custom",
+                "source": {
+                    "pairs": [
+                        {
+                            "positive": "positive text",
+                            "negative": "negative text",
+                        }
+                    ]
+                },
+                "register": False,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["canonical"] == "custom"
+        assert data["progress"] == ["progress"]
 
 
 # ---- WebSocket token+probe co-stream ------------------------------------

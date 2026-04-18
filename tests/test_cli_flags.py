@@ -360,6 +360,7 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
     p.write_text("model: fake-model\nvectors:\n  default/happy.sad: 0.4\n")
 
     registered = {}
+    extract_calls = []
 
     class FakeSession:
         def __init__(self, **kw):
@@ -369,6 +370,7 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
             self.probes = {}
 
         def extract(self, name, **kw):
+            extract_calls.append((name, kw))
             return name, "PROFILE"
 
         def steer(self, name, profile, alpha=None):
@@ -389,6 +391,7 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
 
     cli.main(["tui", "-c", str(p)])
     assert "default/happy.sad" in registered
+    assert extract_calls[-1] == ("happy.sad", {"namespace": "default"})
 
 
 def test_parse_vector_compare_two_args():

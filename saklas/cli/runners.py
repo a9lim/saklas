@@ -122,10 +122,11 @@ def _setup_steering_vectors(
                     + (f" (negated from '{raw_name}')" if sign < 0 else "")
                 )
                 _, profile = session.extract(
-                    canonical, on_progress=lambda m: print(f"  {m}")
+                    canonical, on_progress=lambda m: print(f"  {m}"),
+                    namespace=ns,
                 )
             else:
-                _, profile = session.extract(canonical)
+                _, profile = session.extract(canonical, namespace=ns)
         except Exception as e:
             if verbose:
                 raise

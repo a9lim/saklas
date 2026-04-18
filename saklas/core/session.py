@@ -663,6 +663,7 @@ class SaklasSession:
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
         sae_revision: str | None = None,
+        namespace: str | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit VectorExtracted.
 
@@ -703,6 +704,7 @@ class SaklasSession:
             on_progress=on_progress,
             sae=sae,
             sae_revision=sae_revision,
+            namespace=namespace,
         )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
@@ -722,6 +724,7 @@ class SaklasSession:
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
         sae_revision: str | None = None,
+        namespace: str | None = None,
     ) -> tuple[str, Profile]:
         """Actual extraction pipeline — see :meth:`extract` for the wrapper.
 
@@ -839,20 +842,28 @@ class SaklasSession:
             self._update_local_pack_files(folder)
             return _build_return(profile)
 
-        # String source — full pipeline. Pack lookup scans all namespaces
-        # (default/, hf-pulled, local/) via cli_selectors._all_concepts so
-        # `/steer deer.wolf` hits an installed pack under any namespace,
-        # not just default/. If no pack exists with this canonical name,
-        # the concept extracts fresh under local/.
-        from saklas.cli.selectors import _all_concepts
-        curated_folder = None
-        for c in _all_concepts():
-            if c.name == canonical:
-                curated_folder = c.folder
-                break
+        # String source — full pipeline. Pack lookup scans installed
+        # namespaces, but bare names must not silently pick the first duplicate.
+        # If the caller supplies namespace=, honor only that namespace.
+        from saklas.cli.selectors import _all_concepts, AmbiguousSelectorError
+        matches = [
+            c for c in _all_concepts()
+            if c.name == canonical and (namespace is None or c.namespace == namespace)
+        ]
+        if namespace is not None and not matches and namespace != "local":
+            raise FileNotFoundError(
+                f"concept pack '{namespace}/{canonical}' is not installed"
+            )
+        if namespace is None and len(matches) > 1:
+            qualified = ", ".join(f"{c.namespace}/{c.name}" for c in matches)
+            raise AmbiguousSelectorError(
+                f"ambiguous concept '{canonical}': matches {qualified}. "
+                f"Specify with a namespace."
+            )
+        pack_folder = matches[0].folder if matches else None
 
-        if curated_folder is not None:
-            cache_path = str(curated_folder / tensor_filename(self.model_id, release=sae))
+        if pack_folder is not None:
+            cache_path = str(pack_folder / tensor_filename(self.model_id, release=sae))
         else:
             cache_path = str(
                 pathlib.Path(self._local_concept_folder(canonical))
@@ -880,25 +891,25 @@ class SaklasSession:
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
-        # 2. Curated-statements fast path — default reuses bundled
+        # 2. Installed-statements fast path — default reuses bundled/HF/local
         #    statements.json when present. ``force_statements=True`` skips
         #    this branch and falls through to regeneration. Passing an
         #    explicit ``scenarios=`` also skips — if the caller supplied
         #    scenarios they're clearly opting into fresh pair generation.
-        if curated_folder is not None and not force_statements and scenarios is None:
-            curated_stmts = curated_folder / "statements.json"
-            if curated_stmts.exists():
+        if pack_folder is not None and not force_statements and scenarios is None:
+            pack_stmts = pack_folder / "statements.json"
+            if pack_stmts.exists():
                 _progress(f"Using curated statements for '{canonical}'...")
-                ds = load_contrastive_pairs(str(curated_stmts))
+                ds = load_contrastive_pairs(str(pack_stmts))
                 profile = extract_contrastive(
                     self._model, self._tokenizer, ds["pairs"],
                     layers=self._layers,
                     sae=sae_backend,
                 )
                 _save_profile(profile, cache_path, _save_meta({
-                    "statements_sha256": hash_file(curated_stmts),
+                    "statements_sha256": hash_file(pack_stmts),
                 }))
-                self._update_local_pack_files(curated_folder)
+                self._update_local_pack_files(pack_folder)
                 return _build_return(profile)
 
         # 3. Local statements cache — default reuses if present.
@@ -1405,7 +1416,13 @@ class SaklasSession:
         token_count = len(generated_ids)
         tok_per_sec = token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
         response_ids = generated_ids[self._gen_state.thinking_end_idx:]
-        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+        if (
+            self._gen_state.finish_reason == "stop_sequence"
+            and self._gen_state.response_text is not None
+        ):
+            text = self._gen_state.response_text
+        else:
+            text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
         if self._monitor.probe_names and generated_ids:
             agg_vals, per_token = self.score_captured(
