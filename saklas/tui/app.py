@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import shlex
 import time
@@ -20,7 +21,6 @@ from textual.timer import Timer
 from saklas import SamplingConfig, Steering
 from saklas.cli.selectors import AmbiguousSelectorError, resolve_pole
 from saklas.core.generation import supports_thinking
-from saklas.core.model import _get_memory_gb
 from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_defaults
 from saklas.core.results import ResultCollector
@@ -31,7 +31,6 @@ from saklas.tui.trait_panel import TraitPanel
 
 DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
-_VRAM_UPDATE_INTERVAL = 15
 _TOKEN_DRAIN_LIMIT = 20
 
 _LEFT, _CHAT, _TRAIT = 0, 1, 2
@@ -59,53 +58,6 @@ def _split_bipolar(text: str) -> tuple[str, str | None]:
             _unquote(text[idx + len(_BIPOLAR_DELIM):].strip()),
         )
     return _unquote(text.strip()), None
-
-
-def _parse_steer_command(arg: str) -> dict:
-    """Parse a /steer argument string.
-
-    Recognizes:
-      --sae <concept> [alpha]                  (picks the unique SAE variant)
-      --sae <pos> . <neg> [alpha]
-      <concept> [alpha]
-      <pos> . <neg> [alpha]
-
-    For an explicit release, use the ``:sae-<release>`` suffix in the
-    concept name itself (e.g. ``/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3``).
-    The positional ``--sae RELEASE concept`` form was removed because the
-    release-detection heuristic misfired on hyphenated concepts like
-    ``high-context`` — explicit selector grammar wins over fuzzy parsing.
-
-    Returns a dict with concept, baseline (None or str), alpha (None or float),
-    variant ("raw" / "sae").
-    """
-    tokens = arg.split()
-    variant = "raw"
-    if tokens and tokens[0] == "--sae":
-        variant = "sae"
-        tokens = tokens[1:]
-
-    if not tokens:
-        raise ValueError("no concept")
-
-    result: dict = {"variant": variant, "baseline": None, "alpha": None}
-
-    # Bipolar: <pos> . <neg>
-    if len(tokens) >= 3 and tokens[1] == ".":
-        result["concept"] = tokens[0]
-        result["baseline"] = tokens[2]
-        rest = tokens[3:]
-    else:
-        result["concept"] = tokens[0]
-        rest = tokens[1:]
-
-    if rest:
-        try:
-            result["alpha"] = float(rest[0])
-        except ValueError:
-            result["alpha"] = None
-
-    return result
 
 
 def _resolve_active_name(name: str, active) -> list[str]:
@@ -164,9 +116,6 @@ class SaklasApp(App):
         self._session = session
         self._messages = session._history
         self._device_str = str(session._device)
-        self._context_window: int = (
-            getattr(session._model.config, "max_position_embeddings", None) or 0
-        )
 
         # Local steering state — alphas and enabled flags per vector.
         # Session holds the profiles; the TUI holds the alphas.
@@ -191,12 +140,13 @@ class SaklasApp(App):
 
         self._gen_start_time: float = 0.0
         self._gen_token_count: int = 0
-        self._prompt_token_count: int = 0
         self._last_tok_per_sec: float = 0.0
         self._last_elapsed: float = 0.0
-        self._cached_vram_gb: float = 0.0
-        self._vram_poll_counter: int = 0
-        self._last_gen_state: tuple = (-1, -1.0, -1.0, -1.0, False, -1)
+        # Geometric-mean perplexity accumulator — sum of ``log(ppl)`` across
+        # scored steps; display is ``exp(sum/count)``.
+        self._log_ppl_sum: float = 0.0
+        self._ppl_count: int = 0
+        self._last_gen_state: tuple = (-1, -1.0, -1.0, False, -1)
         self._assistant_messages: list[_AssistantMessage] = []
 
         defaults = load_defaults()
@@ -209,17 +159,6 @@ class SaklasApp(App):
         """Build alphas dict for generation from enabled vectors."""
         return {name: alpha for name, alpha in self._alphas.items()
                 if self._enabled.get(name, True)}
-
-    def _estimate_prompt_tokens(self, next_user_text: str) -> int:
-        """Tokenize history + pending user message through the chat template."""
-        try:
-            msgs = list(self._messages) + [{"role": "user", "content": next_user_text}]
-            ids = self._session._tokenizer.apply_chat_template(
-                msgs, tokenize=True, add_generation_prompt=True,
-            )
-            return len(ids)
-        except Exception:
-            return self._prompt_token_count
 
     def _vector_list_for_panel(self) -> list[dict]:
         """Build the list[dict] format the left panel expects."""
@@ -376,8 +315,11 @@ class SaklasApp(App):
         if cmd == "/steer":
             if not arg:
                 chat.add_system_message(
-                    "Usage: /steer <concept> [alpha]\n"
-                    "       /steer <pos> . <neg> [alpha]"
+                    "Usage: /steer <expression>\n"
+                    "  e.g. /steer 0.5 honest\n"
+                    "       /steer 0.3 warm@after\n"
+                    "       /steer 0.5 honest:sae\n"
+                    "  For a new bipolar extraction, use /extract <pos> <neg>."
                 )
                 return
             self._handle_steer(arg)
@@ -666,23 +608,79 @@ class SaklasApp(App):
         self.run_worker(_worker, thread=True)
 
     def _handle_steer(self, text: str) -> None:
-        # Peel the ``--sae`` preamble off the front before delegating to
-        # the shared extract pipeline. ``--sae`` alone flips variant to
-        # ``"sae"`` — meaning "pick the unique already-extracted SAE
-        # variant on disk". For a specific release, users embed the
-        # ``:sae-<release>`` suffix directly in the concept name; that
-        # routes through ``resolve_pole`` in ``_handle_extract``.
-        variant = "raw"
-        stripped = text.lstrip()
-        if stripped.startswith("--sae"):
-            variant = "sae"
-            text = stripped[len("--sae"):].lstrip()
+        """Apply a steering expression — the shared grammar from
+        :mod:`saklas.core.steering_expr`.
 
-        def _on_success(name, profile, alpha):
+        Each plain term (``<coeff> <concept>`` with optional ``@trigger``
+        and ``:variant``) updates the TUI's local alpha state. Concepts
+        not yet registered are extracted + steered behind the scenes.
+        Extraction-on-demand for a *new* bipolar pair (``pos . neg``
+        space-delimited) lives on ``/extract``, not ``/steer``; projection
+        terms are accepted and routed through session-level materialization.
+        """
+        from saklas.core.steering_expr import (
+            ProjectedTerm, SteeringExprError, parse_expr,
+        )
+
+        chat = self._chat_panel
+        text = text.strip()
+        if not text:
+            chat.add_system_message(
+                'Usage: /steer <expression>\n'
+                '  e.g. /steer 0.5 honest\n'
+                '       /steer 0.3 warm@after\n'
+                '       /steer 0.5 honest|sycophantic\n'
+                "  For new concept extraction use /extract <pos> <neg>."
+            )
+            return
+        try:
+            steering = parse_expr(text)
+        except SteeringExprError as e:
+            chat.add_system_message(f"Steering expression error: {e}")
+            return
+
+        # Iterate the parsed IR; for each term dispatch through the
+        # existing extract pipeline to load or compute profiles, then
+        # stash the effective alpha on the TUI's local state.
+        for key, val in steering.alphas.items():
+            if isinstance(val, ProjectedTerm):
+                chat.add_system_message(
+                    f"Projection terms aren't yet supported from /steer "
+                    f"(got '{key}'); express them in the YAML config."
+                )
+                return
+            if isinstance(val, tuple):
+                alpha, _trig = val
+            else:
+                alpha = float(val)
+            alpha = max(-MAX_ALPHA, min(MAX_ALPHA, float(alpha)))
+            # Peel variant suffix so the extract path sees a bare concept.
+            if ":" in key:
+                concept, variant = key.rsplit(":", 1)
+            else:
+                concept, variant = key, "raw"
+            self._dispatch_steer_term(concept, variant, alpha)
+
+    def _dispatch_steer_term(
+        self, concept: str, variant: str, alpha: float,
+    ) -> None:
+        """Route one plain steering term through the extract pipeline.
+
+        The concept has already been canonicalized and sign-flipped by
+        ``parse_expr``; ``_handle_extract`` will re-run ``resolve_pole``
+        on the canonical form which is idempotent (returns sign +1).
+        """
+        def _on_success(name, profile, a):
             self._session.steer(name, profile)
-            self._alphas[name] = alpha
+            self._alphas[name] = a
             self._enabled[name] = True
-            self.call_from_thread(self._on_vector_extracted, name, alpha, profile)
+            self.call_from_thread(self._on_vector_extracted, name, a, profile)
+        # _handle_extract's own parser expects a "<concept> <alpha>" text;
+        # embed the variant in the concept token so resolve_pole strips it.
+        concept_with_variant = (
+            concept if variant == "raw" else f"{concept}:{variant}"
+        )
+        text = f"{concept_with_variant} {alpha}"
         self._handle_extract(
             text, include_alpha=True, on_success=_on_success, variant=variant,
         )
@@ -776,11 +774,11 @@ class SaklasApp(App):
         self._gen_active = True
 
         self._gen_token_count = 0
-        self._prompt_token_count = 0
         self._last_tok_per_sec = 0.0
         self._last_elapsed = 0.0
+        self._log_ppl_sum = 0.0
+        self._ppl_count = 0
         self._gen_start_time = time.monotonic()
-        self._vram_poll_counter = 0
 
         widget = self._chat_panel.start_assistant_message()
         self._current_assistant_widget = widget
@@ -811,8 +809,6 @@ class SaklasApp(App):
         )
         steering = Steering(alphas=dict(alphas), thinking=use_thinking) if alphas else None
 
-        self._prompt_token_count = self._estimate_prompt_tokens(user_text)
-
         def _generate():
             try:
                 stream = self._session.generate_stream(
@@ -824,7 +820,8 @@ class SaklasApp(App):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.scores)
+                        ("tok", event.text, event.thinking, event.scores,
+                         event.perplexity)
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
@@ -854,7 +851,7 @@ class SaklasApp(App):
                 break
             kind = item[0]
             if kind == "tok":
-                _, token, is_thinking, scores = item
+                _, token, is_thinking, scores, perplexity = item
                 widget = self._current_assistant_widget
                 if widget:
                     if is_thinking:
@@ -864,16 +861,20 @@ class SaklasApp(App):
                         widget.append_token(token)
                     if scores is not None:
                         widget.append_token_score(scores, is_thinking)
-                        self._refresh_trait_why()
+                if perplexity is not None and perplexity > 0:
+                    # Geometric mean over the gen: accumulate log(ppl),
+                    # display exp(mean).  Equivalent to classical sequence
+                    # perplexity; one step dominated by a rare token
+                    # doesn't swamp the aggregate the way an arithmetic
+                    # mean would.
+                    self._log_ppl_sum += math.log(perplexity)
+                    self._ppl_count += 1
                 tokens_consumed += 1
             elif kind == "finalize":
                 # Normal end — pull per-token scores stashed by session's
                 # _finalize_generation and push to the widget for highlight.
                 _, widget = item
                 self._finalize_widget_highlight(widget)
-                last = self._session.last_result
-                if last is not None:
-                    self._prompt_token_count = last.prompt_tokens
             elif kind == "error":
                 chat.add_system_message(f"generation error: {item[1]}")
             elif kind == "done":
@@ -903,29 +904,21 @@ class SaklasApp(App):
             self._last_tok_per_sec = tok_per_sec
             self._last_elapsed = elapsed
 
-        if generating:
-            self._vram_poll_counter += 1
-            if self._vram_poll_counter >= _VRAM_UPDATE_INTERVAL:
-                self._cached_vram_gb = _get_memory_gb(self._device_str)
-                self._vram_poll_counter = 0
-        elif self._vram_poll_counter != -1:
-            self._cached_vram_gb = _get_memory_gb(self._device_str)
-            self._vram_poll_counter = -1
-
         new_state = (self._gen_token_count, self._last_tok_per_sec,
-                     self._last_elapsed, self._cached_vram_gb, generating,
-                     self._prompt_token_count)
+                     self._last_elapsed, generating, self._ppl_count)
         if new_state != self._last_gen_state:
             self._last_gen_state = new_state
+            ppl_mean = (
+                math.exp(self._log_ppl_sum / self._ppl_count)
+                if self._ppl_count > 0 else None
+            )
             chat.update_status(
                 generating=generating,
                 gen_tokens=self._gen_token_count,
                 max_tokens=self._session.config.max_new_tokens,
                 tok_per_sec=self._last_tok_per_sec,
                 elapsed=self._last_elapsed,
-                prompt_tokens=self._prompt_token_count,
-                context_window=self._context_window,
-                vram_gb=self._cached_vram_gb,
+                perplexity=ppl_mean,
             )
 
         if self._session._monitor and self._session._monitor.has_pending_data():
@@ -1274,54 +1267,23 @@ class SaklasApp(App):
         chat.add_system_message("\n".join(lines))
 
     def _refresh_trait_why(self) -> None:
-        """Push current top-layers + (when available) top-tokens for the
-        trait-panel-selected probe down to the panel's WHY section.
+        """Push per-layer ||baked|| norms for the trait-panel-selected probe
+        down to the panel's WHY section as a histogram in layer order.
 
-        Top-token data is pulled from the most recently mounted assistant
-        widget — the widget's per-probe score lists are appended to live
-        during streaming (via ``append_token_score``) and overwritten with
-        canonical projected scores at finalize. Either way the widget is
-        the source of truth for "what scores belong to which rendered token".
+        Per-token highlighting in the chat already surfaces which tokens
+        a probe lights up on — no token list duplicated here.
         """
         probe = self._trait_panel.get_selected_probe()
         monitor = self._session._monitor
         if probe is None or monitor is None or probe not in monitor.profiles:
-            self._trait_panel.update_why(None, [], None)
+            self._trait_panel.update_why(None, [])
             return
         profile = monitor.profiles[probe]
         layer_norms = sorted(
             ((int(lidx), float(t.norm().item())) for lidx, t in profile.items()),
-            key=lambda kv: kv[1], reverse=True,
-        )[:5]
-
-        top_tokens = None
-        widget = next(
-            (w for w in reversed(self._assistant_messages) if w.is_mounted),
-            None,
+            key=lambda kv: kv[0],
         )
-        if widget is not None:
-            thinking_scores = widget._thinking_probe_scores.get(probe, [])
-            response_scores = widget._response_probe_scores.get(probe, [])
-            thinking_strs = widget._streamed_thinking_tokens
-            response_strs = widget._streamed_response_tokens
-            pairs: list[tuple[str, float]] = []
-            for tok, score in zip(thinking_strs, thinking_scores):
-                pairs.append((tok, score))
-            for tok, score in zip(response_strs, response_scores):
-                pairs.append((tok, score))
-            if pairs:
-                pairs.sort(key=lambda kv: kv[1], reverse=True)
-                # Top N highest + N lowest by signed score. When the gen
-                # has fewer tokens than 2*N, the two halves overlap — fall
-                # back to one merged group with no separator so we don't
-                # show a token twice.
-                top_n = 4
-                if len(pairs) > 2 * top_n:
-                    top_tokens = (pairs[:top_n], pairs[-top_n:])
-                else:
-                    top_tokens = (pairs, [])
-
-        self._trait_panel.update_why(probe, layer_norms, top_tokens)
+        self._trait_panel.update_why(probe, layer_norms)
 
     def _handle_compare(self, arg: str) -> None:
         chat = self._chat_panel

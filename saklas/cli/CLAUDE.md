@@ -15,7 +15,7 @@ Five-verb root parser (`tui`/`serve`/`pack`/`vector`/`config`) split across:
 
 ## Config loading
 
-`_load_effective_config(args)` is the shared entry point every subcommand that takes `-c` calls. Composes `~/.saklas/config.yaml` + explicit `-c` files, runs `ConfigFile.resolve_poles()`, and stamps `args.config_vectors` / `args.temperature` / `args.top_p` / `args.max_tokens` in place.
+`_load_effective_config(args)` is the shared entry point every subcommand that takes `-c` calls. Composes `~/.saklas/config.yaml` + explicit `-c` files and stamps `args.config_vectors` (a steering expression string, or `None`) / `args.temperature` / `args.top_p` / `args.max_tokens` in place. The `vectors:` YAML key is a single steering expression — parsed through `saklas.core.steering_expr.parse_expr` which resolves bare poles (`wolf → deer.wolf @ -0.5`) via `cli.selectors.resolve_pole`. `ConfigFile.load` validates the expression at load time and stores the raw string; re-parsing happens on consumption.
 
 ## Warmup
 
@@ -23,7 +23,8 @@ Five-verb root parser (`tui`/`serve`/`pack`/`vector`/`config`) split across:
 
 ## Flags
 
-- `serve`: `--host/-H`, `--port/-P`, `--steer/-S name:alpha`, `--cors/-C`, `--api-key/-k`, plus `-c/--config`.
+- `serve`: `--host/-H`, `--port/-P`, `--steer/-S EXPR`, `--cors/-C`, `--api-key/-k`, plus `-c/--config`. `--steer` takes one steering expression string (the shared grammar); combine multiple terms with `+`/`-`.
+- `vector merge`: positional `expression` argument — a steering expression such as `"0.3 ns/a + 0.4 ns/b"` or `"0.5 ns/a~ns/b"` for projection-removal. The comma-separated legacy form is gone.
 - `pack ls` is local-only; `pack search` is the HF-remote verb.
 - `pack rm` replaces `uninstall`; `pack ls` replaces `list`.
 

@@ -10,15 +10,13 @@ Thin frontend. Owns local alpha/enabled/thinking state per panel, passes through
 
 ## Slash commands
 
-- **Steering**: `/steer <name> [alpha]` (add + register, supports `<pos> . <neg> [alpha]`), `/steer --sae <name> [alpha]` (SAE variant — picks the unique already-extracted SAE for the concept; for a specific release, embed `:sae-<release>` in the concept name: `/steer honest:sae-gemma-scope-2b-pt-res-canonical 0.3`), `/alpha <name> <val>` (adjust existing only — errors if unregistered), `/unsteer <name>`.
-- **Probes**: `/probe <name>` (also seeds `_highlight_probe` and flips `_highlight_on = True`), `/unprobe <name>`, `/extract <name>` (to disk without wiring).
+- **Steering**: `/steer <expression>` takes one full steering expression using the shared grammar from `saklas.core.steering_expr` — `/steer 0.5 honest`, `/steer 0.3 warm@after`, `/steer 0.5 honest:sae`. Each plain term extracts + registers + sets the local alpha. `/alpha <name> <val>` (adjust existing only — errors if unregistered), `/unsteer <name>`. Projection terms (`a|b`, `a~b`) and triggers (`@after`, etc.) are accepted by the parser; projections route through session materialization, triggers land on the local alphas state.
+- **Probes**: `/probe <name>` (also seeds `_highlight_probe` and flips `_highlight_on = True`), `/unprobe <name>`, `/extract <pos> <neg>` or `/extract <name>` (to disk without wiring — and the sole path for creating new bipolar concepts from `<pos> <neg>`).
 - **Session**: `/clear`, `/rewind`, `/regen`, `/sys <prompt>`, `/temp`, `/top-p`, `/max`, `/seed <n>`, `/save <name>`, `/load <name>`, `/export <path>`.
 - **Analysis**: `/compare <a> [b]` (1-arg: ranked cosine vs all loaded profiles; 2-arg: pairwise score).
 - **Info**: `/model` (arch/device/layers/thinking/active state), `/help`.
 
-**Arg parser** (`SaklasApp._parse_args`): splits on ` . ` (space-period-space) — the only bipolar delimiter. Whitespace around the period is required to split so canonical single tokens like `dog.cat` stay one concept. `-` is **not** a delimiter: `happy - sad` is parsed as a single concept name which fails downstream name validation — intentional so the error surfaces clearly. Multi-word poles work without quotes (`/steer a dog . a pair of cats 0.4`). Quotes honored and stripped. Trailing alpha peeled from the final whitespace-separated token iff it parses as float. `/alpha` still uses `shlex.split` for its two-token form.
-
-**`/steer --sae` desugar** (`_parse_steer_command`): `--sae` preamble peels off and flips `variant` to `"sae"`. The remainder runs through the normal `_parse_args` pipeline preserving quoted multi-word poles and period-delimited bipolar. The release-detection heuristic from v1 (positional `--sae RELEASE concept`) was dropped — it misfired on hyphenated concepts like `high-context`. Explicit release selection rides on the `:sae-<release>` suffix on the concept name itself; `resolve_pole` peels it off and hands the variant to `_handle_extract`. Bare `--sae` calls `session._try_autoload_vector(canonical, variant="sae")` rather than running a fresh PCA extract — it means "pick the unique SAE tensor already on disk". Ambiguous / missing cases raise `AmbiguousVariantError` / `UnknownVariantError` which the worker surfaces to the chat panel.
+**`/steer` parser**: delegates to `saklas.core.steering_expr.parse_expr`. Bare names route through `resolve_pole` (same as every other surface) and inherit canonical + sign flip for installed bipolar poles. Variant suffixes (`:sae`, `:sae-<release>`) are grammar-native, so the old `--sae` preamble is gone — type the variant directly into the term.
 
 ## Mid-gen interruption
 
@@ -34,17 +32,17 @@ Default-on when a probe is explicitly selected via `/probe`. `Ctrl+Y` toggles th
 
 ## Trait-panel WHY footer
 
-Bottom-third split below the traits list. Always shows top-5 layers by `||baked||` for the trait-panel-selected probe; adds top 4 highest + 4 lowest emitted tokens by signed score (with `...` separator) once any have been scored — **live during streaming**, refreshed per emit. When the gen has ≤8 emitted tokens the two halves merge into one sorted group with no separator. Driven by `_refresh_trait_why()` from app.py; fired on trait nav, probe add/remove, every streamed emit, finalize, clear, and on_mount. No `/why` chat command — selection alone drives the readout.
+Bottom-third split below the traits list. `#why-header` is always the literal `LAYERS` (no probe name — the trait panel above already shows what's selected). `#why-scroll` body shows `||baked||` for the trait-panel-selected probe as a horizontal histogram in layer order, bucketed into `HIST_BUCKETS = 16` evenly-sized groups (mean norm per bucket; bar scaled to the largest bucket) so the whole profile fits the 16-row box regardless of layer count. Models with ≤16 layers render one-bar-per-layer. Bucket labels are `LXX` for single-layer buckets, `LXX-YY` otherwise, zero-padded to the model's max-index width. No token list — per-token highlighting in the chat already surfaces which tokens the probe lights up on. Driven by `_refresh_trait_why()` from app.py; fired on trait nav, probe add/remove, finalize, clear, and on_mount — **not** per streamed emit, since layer norms are static for the duration of a gen. No `/why` chat command — selection alone drives the readout. `HIST_BUCKETS` lives in `saklas.core.histogram` alongside `bucketize()` — shared with `cli vector why`.
 
 ## utils.py
 
-`build_bar(value, max, width)` renders filled/empty bar pairs. `BAR_WIDTH = 24` used by every bar in the UI (footer token + context, vector alpha, gen-config temp + top-p, trait-panel probes) — one knob controls them all. Vector panel's `RIGHT_W` derives from `BAR_WIDTH` so gen-config right-edge glyph alignment stays correct through any width change.
+`build_bar(value, max, width)` renders filled/empty bar pairs. `BAR_WIDTH = 24` used by every bar in the UI (footer token progress, vector alpha, gen-config temp + top-p, trait-panel probes) — one knob controls them all. Vector panel's `RIGHT_W` derives from `BAR_WIDTH` so gen-config right-edge glyph alignment stays correct through any width change.
 
 ## Status footer
 
-`chat_panel.update_status`: one-line footer showing dot + optional token progress bar (`gen_tokens / max_new_tokens`, green, only during generation — idle has no target) · tok/s · elapsed · VRAM · **context bar** (`prompt_tokens + gen_tokens` / `max_position_embeddings`, cyan ≤75%, yellow ≥75%, red ≥90%). Context sits on the right.
+`chat_panel.update_status`: one-line footer showing dot + `gen_tokens/max_new_tokens` + progress bar (green while generating, dim between runs — persists post-gen so the bar doesn't appear/disappear each turn; collapses to `○ idle` before the first generation or when `max_tokens` is unknown) · tok/s · elapsed · `ppl <mean>`. The count sits left of the bar. VRAM lives on the left panel already; context info isn't rendered here.
 
-`_prompt_token_count` is pre-computed in `_start_generation` via `tokenizer.apply_chat_template(history + pending_user_msg, tokenize=True, add_generation_prompt=True)` so the ctx bar reflects the in-flight prompt live, then overwritten at finalize by `session.last_result.prompt_tokens` (authoritative). `_context_window` pulled from `model.config.max_position_embeddings`; missing → context bar hidden. `_last_gen_state` dedupe tuple includes `_prompt_token_count` so the bar refreshes when it changes.
+Perplexity is the geometric mean of per-step `TokenEvent.perplexity` values — `exp(sum(log(ppl)) / count)` across scored steps in the current gen. `_log_ppl_sum` / `_ppl_count` reset at `_start_generation`; `_last_gen_state` dedupe tuple tracks `_ppl_count` so the footer refreshes when the aggregate moves. Computed in `generate_steered` as `exp` of full-vocab fp32 Shannon entropy on pre-temperature post-steering logits; one extra softmax + one `.item()` sync per step, inside the steered-throughput headroom.
 
 ## Panels
 

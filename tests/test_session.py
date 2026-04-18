@@ -9,10 +9,13 @@ from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent
 
 _HAS_GPU = torch.cuda.is_available() or torch.backends.mps.is_available()
-pytestmark = pytest.mark.skipif(
-    not _HAS_GPU,
-    reason="No GPU backend available (neither CUDA nor MPS)",
-)
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        not _HAS_GPU,
+        reason="No GPU backend available (neither CUDA nor MPS)",
+    ),
+]
 
 MODEL_ID = "google/gemma-3-4b-it"
 
@@ -115,11 +118,11 @@ class TestGeneration:
         assert session.history[1]["role"] == "assistant"
 
     def test_generate_with_alphas(self, session):
-        _, profile = session.extract([("formal", "casual")])
-        session.steer("formal", profile)
-        result = session.generate("Hello.", steering={"formal": 0.1})
-        assert result.vectors == {"formal": 0.1}
-        session.unsteer("formal")
+        name, profile = session.extract([("formal", "casual")])
+        session.steer(name, profile)
+        result = session.generate("Hello.", steering=f"0.1 {name}")
+        assert result.vectors == {name: 0.1}
+        session.unsteer(name)
 
     def test_generate_with_probes(self, session):
         session.clear_history()
@@ -134,22 +137,22 @@ class TestGeneration:
 
     def test_ab_comparison(self, session):
         """A/B test: same prompt, with and without steering."""
-        _, profile = session.extract([("I am happy", "I am sad")])
-        session.steer("happy", profile)
+        name, profile = session.extract([("I am happy", "I am sad")])
+        session.steer(name, profile)
         session.clear_history()
-        steered = session.generate("Describe a sunset.", steering={"happy": 0.2})
+        steered = session.generate("Describe a sunset.", steering=f"0.2 {name}")
         session.clear_history()
         unsteered = session.generate("Describe a sunset.")
-        assert steered.vectors == {"happy": 0.2}
+        assert steered.vectors == {name: 0.2}
         assert unsteered.vectors == {}
         # Both should produce text
         assert len(steered.text) > 0
         assert len(unsteered.text) > 0
-        session.unsteer("happy")
+        session.unsteer(name)
 
     def test_unknown_vector_raises(self, session):
         with pytest.raises(KeyError, match="nonexistent"):
-            session.generate("Hello.", steering={"nonexistent": 0.1})
+            session.generate("Hello.", steering="0.1 nonexistent")
 
 class TestCloning:
     def test_clone_from_corpus_end_to_end(self, session, tmp_path):
@@ -234,7 +237,7 @@ class TestCloning:
                 session.clear_history()
                 unsteered = session.generate(prompt)
                 session.clear_history()
-                steered = session.generate(prompt, steering={"pirate_test": 1.0})
+                steered = session.generate(prompt, steering="1.0 pirate_test")
                 assert len(steered.text) > 0
                 # Baseline shift assertion — loose. Only run if we share a probe.
                 u_read = unsteered.readings or {}
@@ -265,7 +268,7 @@ class TestCloning:
 
         try:
             proc = subprocess.run(
-                [sys.executable, "-m", "saklas", "pack", "extract",
+                [sys.executable, "-m", "saklas", "vector", "extract",
                  "happy.sad", "-m", MODEL_ID],
                 capture_output=True, text=True, timeout=600,
             )
@@ -296,10 +299,10 @@ class TestStreamingGeneration:
         assert session.last_result.token_count == len(tokens)
 
     def test_stream_with_alphas(self, session):
-        _, profile = session.extract([("I am happy", "I am sad")])
-        session.steer("happy", profile)
+        name, profile = session.extract([("I am happy", "I am sad")])
+        session.steer(name, profile)
         session.clear_history()
-        tokens = list(session.generate_stream("Hello.", steering={"happy": 0.15}))
+        tokens = list(session.generate_stream("Hello.", steering=f"0.15 {name}"))
         assert len(tokens) > 0
-        assert session.last_result.vectors == {"happy": 0.15}
-        session.unsteer("happy")
+        assert session.last_result.vectors == {name: 0.15}
+        session.unsteer(name)

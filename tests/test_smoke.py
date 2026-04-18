@@ -16,10 +16,13 @@ import torch
 
 # Skip entire module if no GPU backend is available.
 _HAS_GPU = torch.cuda.is_available() or torch.backends.mps.is_available()
-pytestmark = pytest.mark.skipif(
-    not _HAS_GPU,
-    reason="No GPU backend available (neither CUDA nor MPS)",
-)
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        not _HAS_GPU,
+        reason="No GPU backend available (neither CUDA nor MPS)",
+    ),
+]
 
 MODEL_ID = "google/gemma-3-4b-it"
 # MPS runs ~3-5x slower than CUDA for this model; relax absolute timing budgets.

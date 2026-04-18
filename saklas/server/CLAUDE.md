@@ -4,9 +4,9 @@ Dual-protocol HTTP: OpenAI `/v1/*` + Ollama `/api/*` + native `/saklas/v1/*` on 
 
 ## app.py
 
-FastAPI factory + OpenAI route handlers. `create_app(session, default_alphas, api_key)` mounts OpenAI (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) + calls `register_saklas_routes` and `register_ollama_routes`.
+FastAPI factory + OpenAI route handlers. `create_app(session, default_steering=None, api_key=None)` mounts OpenAI (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) + calls `register_saklas_routes` and `register_ollama_routes`. `default_steering` is a pre-built `Steering` or `None`; per-request expressions compose over it at the key level.
 
-Thin HTTP — all routes call `session.generate(..., sampling=SamplingConfig(...), steering=Steering(...))` directly. `_SamplingBase` pydantic shared by chat/completions: `stop`, `seed`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` (bool chat / int completions), `top_logprobs`, `stream_options.include_usage`, `max_completion_tokens` (aliased to `max_tokens` via model validator), native `steering` top-level field (flat `{name: alpha}` or `{alphas, thinking}`), native `thinking` field (`None` = auto).
+Thin HTTP — all routes call `session.generate(..., sampling=SamplingConfig(...), steering=Steering(...))` directly. `_SamplingBase` pydantic shared by chat/completions: `stop`, `seed`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` (bool chat / int completions), `top_logprobs`, `stream_options.include_usage`, `max_completion_tokens` (aliased to `max_tokens` via model validator), native `steering` top-level field (a steering expression string — the shared grammar), native `thinking` field (`None` = auto). Dict-shaped steering payloads are rejected at the pydantic layer.
 
 Accept-and-ignore: `user`, `n`, `response_format: {"type": "text"}`, empty `tools: []` / `tool_choice: "none"` (LangChain compat — non-empty rejected via `_check_langchain_compat` → 400). `ChatMessage._flatten_content` concatenates text parts of multimodal arrays (non-text rejected via `UnsupportedContentError`).
 
@@ -48,7 +48,7 @@ Old `/v1/saklas/*` routes removed with no aliases.
 
 ## ollama.py
 
-Ollama-compatible shim mounted by `register_ollama_routes(app)`, reusing `session` / `default_alphas` / `session.lock` / auth. Advertises `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` (no-op success for loaded model / 404 otherwise), + 501 stubs for `/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/embeddings`, `/api/embed`.
+Ollama-compatible shim mounted by `register_ollama_routes(app)`, reusing `session` / `default_steering` / `session.lock` / auth. Advertises `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` (no-op success for loaded model / 404 otherwise), + 501 stubs for `/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/embeddings`, `/api/embed`.
 
 NDJSON streaming (`application/x-ndjson`) matches Ollama wire format. `/api/show.template` reflects real HF Jinja `tokenizer.chat_template` (honest over useful-looking). `/api/generate` omits the `context` field (vs an empty list saklas can't round-trip).
 
@@ -59,6 +59,6 @@ NDJSON streaming (`application/x-ndjson`) matches Ollama wire format. `/api/show
 
 **Option translation** (`_resolve_options`): `temperature`, `top_p`, `top_k`, `seed`, `num_predict`→`max_tokens`, `stop`, `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `steer`. `repeat_penalty` maps to `presence_penalty` via `ln(repeat_penalty)` — equivalent to Ollama's "divide positive logits by penalty" (count-independent, bounded). Anything else in `options` (`min_p`, `mirostat*`, `num_ctx`, `typical_p`, …) logged at debug and silently skipped.
 
-**Steering passthrough** via non-standard `steer` field inside `options` (or top-level): flat `{name: alpha}` or nested `{alphas: {...}, thinking: bool}`, merged over `default_alphas`, zero-alphas stripped. Clients that don't know about it pass through unchanged — Open WebUI / Enchanted / LangChain's `ChatOllama` work out of the box.
+**Steering passthrough** via non-standard `steer` field inside `options` (or top-level): a steering expression string using the shared grammar (`"0.5 honest + 0.3 warm@after"`). Composes over `default_steering` at the key level (per-request overrides default). Non-string payloads raise a clear error. Clients that don't know about it pass through unchanged — Open WebUI / Enchanted / LangChain's `ChatOllama` work out of the box.
 
 **Thinking** streams as `message.thinking` (chat) / top-level `thinking` (generate). `_duration_stats` splits wall time proportionally between `prompt_eval_duration` + `eval_duration` in ns. `_finish_to_done_reason` maps saklas `stop_sequence` → Ollama `stop`.

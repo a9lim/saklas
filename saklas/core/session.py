@@ -663,6 +663,7 @@ class SaklasSession:
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
         sae_revision: str | None = None,
+        namespace: str | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit VectorExtracted.
 
@@ -703,6 +704,7 @@ class SaklasSession:
             on_progress=on_progress,
             sae=sae,
             sae_revision=sae_revision,
+            namespace=namespace,
         )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
@@ -722,6 +724,7 @@ class SaklasSession:
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
         sae_revision: str | None = None,
+        namespace: str | None = None,
     ) -> tuple[str, Profile]:
         """Actual extraction pipeline — see :meth:`extract` for the wrapper.
 
@@ -839,20 +842,28 @@ class SaklasSession:
             self._update_local_pack_files(folder)
             return _build_return(profile)
 
-        # String source — full pipeline. Pack lookup scans all namespaces
-        # (default/, hf-pulled, local/) via cli_selectors._all_concepts so
-        # `/steer deer.wolf` hits an installed pack under any namespace,
-        # not just default/. If no pack exists with this canonical name,
-        # the concept extracts fresh under local/.
-        from saklas.cli.selectors import _all_concepts
-        curated_folder = None
-        for c in _all_concepts():
-            if c.name == canonical:
-                curated_folder = c.folder
-                break
+        # String source — full pipeline. Pack lookup scans installed
+        # namespaces, but bare names must not silently pick the first duplicate.
+        # If the caller supplies namespace=, honor only that namespace.
+        from saklas.cli.selectors import _all_concepts, AmbiguousSelectorError
+        matches = [
+            c for c in _all_concepts()
+            if c.name == canonical and (namespace is None or c.namespace == namespace)
+        ]
+        if namespace is not None and not matches and namespace != "local":
+            raise FileNotFoundError(
+                f"concept pack '{namespace}/{canonical}' is not installed"
+            )
+        if namespace is None and len(matches) > 1:
+            qualified = ", ".join(f"{c.namespace}/{c.name}" for c in matches)
+            raise AmbiguousSelectorError(
+                f"ambiguous concept '{canonical}': matches {qualified}. "
+                f"Specify with a namespace."
+            )
+        pack_folder = matches[0].folder if matches else None
 
-        if curated_folder is not None:
-            cache_path = str(curated_folder / tensor_filename(self.model_id, release=sae))
+        if pack_folder is not None:
+            cache_path = str(pack_folder / tensor_filename(self.model_id, release=sae))
         else:
             cache_path = str(
                 pathlib.Path(self._local_concept_folder(canonical))
@@ -880,25 +891,25 @@ class SaklasSession:
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
-        # 2. Curated-statements fast path — default reuses bundled
+        # 2. Installed-statements fast path — default reuses bundled/HF/local
         #    statements.json when present. ``force_statements=True`` skips
         #    this branch and falls through to regeneration. Passing an
         #    explicit ``scenarios=`` also skips — if the caller supplied
         #    scenarios they're clearly opting into fresh pair generation.
-        if curated_folder is not None and not force_statements and scenarios is None:
-            curated_stmts = curated_folder / "statements.json"
-            if curated_stmts.exists():
+        if pack_folder is not None and not force_statements and scenarios is None:
+            pack_stmts = pack_folder / "statements.json"
+            if pack_stmts.exists():
                 _progress(f"Using curated statements for '{canonical}'...")
-                ds = load_contrastive_pairs(str(curated_stmts))
+                ds = load_contrastive_pairs(str(pack_stmts))
                 profile = extract_contrastive(
                     self._model, self._tokenizer, ds["pairs"],
                     layers=self._layers,
                     sae=sae_backend,
                 )
                 _save_profile(profile, cache_path, _save_meta({
-                    "statements_sha256": hash_file(curated_stmts),
+                    "statements_sha256": hash_file(pack_stmts),
                 }))
-                self._update_local_pack_files(curated_folder)
+                self._update_local_pack_files(pack_folder)
                 return _build_return(profile)
 
         # 3. Local statements cache — default reuses if present.
@@ -1055,34 +1066,90 @@ class SaklasSession:
         self._profiles.pop(name, None)
 
     def steering(
-        self, alphas: "Steering | dict[str, float | tuple[float, Trigger]]",
+        self, value: "str | Steering",
     ) -> "_SteeringContext":
         """Context manager applying steering for the duration of a with-block.
 
-        Resolves pole aliases via ``cli_selectors.resolve_pole`` (the canonical
-        resolver site — CLI, server, and TUI all route through here).  Nesting
-        flattens: an inner ``steering({"angry.calm": 0.5})`` overrides the
-        outer ``{"angry.calm": 0.3}`` for the duration of the inner scope,
-        and the outer entry is restored on ``__exit__``.  One hook
-        installation per active layer regardless of nesting depth.
+        ``value`` is either a steering expression string (parsed through
+        the shared grammar in :mod:`saklas.core.steering_expr`) or a
+        pre-built :class:`Steering`.  Dict inputs are not accepted; build
+        :class:`Steering` directly if you need typed construction.
 
-        Bare dicts may carry ``(alpha, Trigger)`` tuples as values for
-        per-entry trigger overrides; bare floats inherit ``Trigger.BOTH``.
-        Passing a full ``Steering`` uses its ``trigger`` field as the
-        default for bare-float entries.
+        Pole aliases (``cli.selectors.resolve_pole``) resolve at parse
+        time; this is the canonical resolver site — CLI, server, and
+        TUI all route through here.  Nesting flattens: an inner
+        ``steering("0.5 angry.calm")`` overrides the outer
+        ``steering("0.3 angry.calm")`` for the duration of the inner
+        scope, and the outer entry is restored on ``__exit__``.  One hook
+        installation per active layer regardless of nesting depth.
 
         Unknown vector names raise ``VectorNotRegisteredError``; genuinely
         ambiguous pole names propagate ``AmbiguousSelectorError``.
         """
-        # Normalize to entries form (dict[str, (float, Trigger)]) up front.
-        # All downstream stack / rebuild / event machinery speaks entries,
-        # so the single coercion happens here and nowhere else.
-        if isinstance(alphas, Steering):
-            raw_entries = alphas.normalized_entries()
-        else:
-            raw_entries = Steering(alphas=dict(alphas)).normalized_entries()
+        steering_obj = Steering.from_value(value)
+        if steering_obj is None:
+            raise TypeError(
+                "session.steering() requires a non-None expression string "
+                "or Steering instance"
+            )
+        # Materialize any ProjectedTerm entries into derived profiles
+        # registered in ``self._profiles`` under the synthetic key.
+        # Must run before ``normalized_entries`` because the normalized
+        # form flattens ``ProjectedTerm`` into ``(coeff, trigger)`` and
+        # loses the ``base`` / ``onto`` / ``operator`` fields.
+        self._materialize_projections(steering_obj)
+        raw_entries = steering_obj.normalized_entries()
         resolved = self._resolve_pole_aliases(raw_entries)
         return _SteeringContext(self, resolved)
+
+    def _materialize_projections(self, steering: Steering) -> None:
+        """Populate ``self._profiles`` with derived profiles for every
+        :class:`~saklas.core.steering_expr.ProjectedTerm` in
+        ``steering.alphas``.
+
+        Ensures the ``base`` and ``onto`` profiles are loaded (invoking
+        the autoload path when needed), runs
+        :func:`saklas.core.vectors.project_profile` to build the derived
+        tensor dict, and registers it under the synthetic key
+        ``"<base><op><onto>"``.  The synthetic key matches what the parser
+        used for the ``Steering.alphas`` key, so downstream pole
+        resolution + hook install find the profile via the
+        ``name in self._profiles`` fast path.
+        """
+        from saklas.core.steering_expr import ProjectedTerm
+        from saklas.core.vectors import project_profile
+
+        for syn_key, val in steering.alphas.items():
+            if not isinstance(val, ProjectedTerm):
+                continue
+            self._ensure_profile_loaded(val.base)
+            self._ensure_profile_loaded(val.onto)
+            base_tensors = self._profiles[val.base]
+            onto_tensors = self._profiles[val.onto]
+            projected = project_profile(base_tensors, onto_tensors, val.operator)
+            self._profiles[syn_key] = projected
+
+    def _ensure_profile_loaded(self, key: str) -> None:
+        """Ensure ``key`` is registered in ``self._profiles``.
+
+        ``key`` is a canonical registry key (bare for raw variants,
+        ``f"{canonical}:{variant}"`` otherwise) as produced by
+        :func:`saklas.core.steering_expr._resolve_atom`.  Routes to the
+        existing autoload path for packs that are installed but not yet
+        loaded.
+        """
+        if key in self._profiles:
+            return
+        if ":" in key:
+            canonical, variant = key.rsplit(":", 1)
+        else:
+            canonical, variant = key, "raw"
+        self._try_autoload_vector(canonical, variant=variant)
+        if key not in self._profiles:
+            raise VectorNotRegisteredError(
+                f"projection references '{key}' which is not registered "
+                f"and no pack could be autoloaded for this model"
+            )
 
     def _resolve_pole_aliases(
         self, entries: dict[str, tuple[float, Trigger]],
@@ -1400,12 +1467,19 @@ class SaklasSession:
         vector_snapshot: dict[str, float], prompt_tokens: int = 0,
         stateless: bool = False,
         logprobs_list: list[tuple[int, float, list[tuple[int, float]]]] | None = None,
+        applied_steering: str | None = None,
     ) -> GenerationResult:
         """Shared post-generation: decode, measure probes, build result, update history."""
         token_count = len(generated_ids)
         tok_per_sec = token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
         response_ids = generated_ids[self._gen_state.thinking_end_idx:]
-        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+        if (
+            self._gen_state.finish_reason == "stop_sequence"
+            and self._gen_state.response_text is not None
+        ):
+            text = self._gen_state.response_text
+        else:
+            text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
 
         if self._monitor.probe_names and generated_ids:
             agg_vals, per_token = self.score_captured(
@@ -1433,6 +1507,7 @@ class SaklasSession:
             prompt_tokens=prompt_tokens,
             finish_reason=self._gen_state.finish_reason,
             logprobs=logprobs_list,
+            applied_steering=applied_steering,
         )
         self._last_result = result
 
@@ -1492,7 +1567,7 @@ class SaklasSession:
         self,
         input,
         *,
-        steering: "Steering | dict[str, float] | None" = None,
+        steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
         stateless: bool = False,
         raw: bool = False,
@@ -1537,11 +1612,11 @@ class SaklasSession:
         logprobs_list: list | None = [] if lp_count is not None else None
         trait_token_counter = [0]
 
-        def _token_tap(text, is_thinking, tid, lp, top_lp):
+        def _token_tap(text, is_thinking, tid, lp, top_lp, perplexity):
             if logprobs_list is not None and tid >= 0 and not is_thinking:
                 logprobs_list.append((tid, lp if lp is not None else 0.0, top_lp or []))
             if on_token is not None:
-                on_token(text, is_thinking, tid, lp, top_lp)
+                on_token(text, is_thinking, tid, lp, top_lp, perplexity)
             # Inline per-token scoring for live SSE trait subscribers.
             if self._trait_queues and self._monitor.probe_names:
                 latest_hidden = {
@@ -1617,10 +1692,14 @@ class SaklasSession:
                     steering_cm.__exit__(None, None, None)
                     steering_cm = None
 
+            applied_steering = (
+                str(steering_obj) if steering_obj is not None else None
+            )
             result = self._finalize_generation(
                 input, generated_ids, elapsed, vector_snapshot,
                 prompt_tokens=prompt_tokens, stateless=stateless,
                 logprobs_list=logprobs_list,
+                applied_steering=applied_steering,
             )
             self._monitor.end_live()
             self.events.emit(GenerationFinished(result=result))
@@ -1645,7 +1724,7 @@ class SaklasSession:
         self,
         input,
         *,
-        steering: "Steering | dict[str, float] | None" = None,
+        steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
         stateless: bool = False,
         raw: bool = False,
@@ -1656,10 +1735,10 @@ class SaklasSession:
 
         Args:
             input: prompt string or list of message dicts.
-            steering: ``Steering`` instance or bare ``{name: alpha}`` dict.
-                Pole aliases (bare poles of installed bipolar vectors) are
-                resolved via ``session.steering()`` before hook install.
-                ``None`` = no steering.
+            steering: expression string (e.g. ``"0.5 honest + 0.3 warm"``)
+                or a pre-built :class:`Steering`.  Pole aliases resolve at
+                parse time via ``cli.selectors.resolve_pole``.  ``None`` =
+                no steering.
             sampling: per-call ``SamplingConfig``.  ``None`` fields fall
                 through to the session's ``GenerationConfig`` defaults.
                 The session's config is never mutated by this call.
@@ -1668,7 +1747,9 @@ class SaklasSession:
             thinking: per-call thinking override.  ``None`` = auto-detect
                 via ``supports_thinking`` (or ``steering.thinking`` if set).
             on_token: optional callback ``(text, is_thinking, token_id,
-                logprob, top_logprobs)`` called on each emitted token.
+                logprob, top_logprobs, perplexity)`` called on each emitted
+                token.  ``perplexity`` is ``exp(entropy_nats)`` of the
+                pre-temperature, post-steering distribution.
         """
         return self._generate_core(
             input,
@@ -1686,7 +1767,7 @@ class SaklasSession:
         self,
         input,
         *,
-        steering: "Steering | dict[str, float] | None" = None,
+        steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
         stateless: bool = False,
         raw: bool = False,
@@ -1706,7 +1787,7 @@ class SaklasSession:
         exc_holder: list[BaseException] = []
         idx_counter = [0]
 
-        def _push(text, is_thinking, tid, lp, tlp):
+        def _push(text, is_thinking, tid, lp, tlp, perplexity):
             scores: dict[str, float] | None = None
             if self._monitor.probe_names:
                 latest_hidden = {
@@ -1720,7 +1801,7 @@ class SaklasSession:
             event = TokenEvent(
                 text=text, token_id=tid, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_logprobs=tlp,
-                scores=scores,
+                scores=scores, perplexity=perplexity,
             )
             idx_counter[0] += 1
             q.put(event)

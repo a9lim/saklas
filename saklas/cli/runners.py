@@ -6,8 +6,12 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from saklas.cli.parsers import _PACK_VERBS, _VECTOR_VERBS
+
+if TYPE_CHECKING:
+    from saklas.core.steering import Steering
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +66,6 @@ def _load_effective_config(args: argparse.Namespace):
         max_tokens=None,
         system_prompt=None,
     )
-    composed = composed.resolve_poles()
     if getattr(args, "model", None) is None:
         args.model = composed.model
     args.temperature = composed.temperature
@@ -83,29 +86,28 @@ def _print_startup(args: argparse.Namespace) -> None:
 
 def _setup_steering_vectors(
     session,
-    vector_specs,
+    expression: "str | None",
     *,
     verbose: bool = False,
-) -> dict[str, float]:
-    """Resolve pole aliases, extract profiles, register with session.
+) -> "Steering | None":
+    """Extract + register every concept referenced by ``expression``.
 
-    vector_specs is either a dict[coord, alpha] or an iterable of
-    ``(raw, alpha)`` tuples. Returns ``dict[registry_key, effective_alpha]``.
+    Walks the raw AST via :func:`referenced_selectors` so namespace
+    prefixes drive extraction site selection, then returns the parsed
+    :class:`Steering` with every atom pre-warmed in ``session._profiles``.
+    Returns ``None`` when ``expression`` is empty / falsy.
     """
     from saklas.cli.selectors import resolve_pole, AmbiguousSelectorError
+    from saklas.core.steering_expr import (
+        parse_expr, referenced_selectors,
+    )
 
-    if isinstance(vector_specs, dict):
-        items = [
-            (coord.split("/", 1)[-1] if "/" in coord else coord,
-             coord.split("/", 1)[0] if "/" in coord else None,
-             coord, alpha)
-            for coord, alpha in vector_specs.items()
-        ]
-    else:
-        items = [(raw, None, raw, alpha) for raw, alpha in vector_specs]
+    if not expression:
+        return None
 
-    default_alphas: dict[str, float] = {}
-    for raw_name, ns, display, alpha in items:
+    for ns, concept, _variant in referenced_selectors(expression):
+        raw_name = concept
+        display = f"{ns}/{concept}" if ns else concept
         try:
             canonical, sign, _match, _variant = resolve_pole(raw_name, namespace=ns)
         except AmbiguousSelectorError as e:
@@ -114,7 +116,6 @@ def _setup_steering_vectors(
                 sys.exit(1)
             print(f"  Failed to register '{display}': {e}")
             continue
-        effective_alpha = alpha * sign
         try:
             if verbose:
                 print(
@@ -122,29 +123,23 @@ def _setup_steering_vectors(
                     + (f" (negated from '{raw_name}')" if sign < 0 else "")
                 )
                 _, profile = session.extract(
-                    canonical, on_progress=lambda m: print(f"  {m}")
+                    canonical, on_progress=lambda m: print(f"  {m}"),
+                    namespace=ns,
                 )
             else:
-                _, profile = session.extract(canonical)
+                _, profile = session.extract(canonical, namespace=ns)
         except Exception as e:
             if verbose:
                 raise
             print(f"  Failed to register '{display}': {e}")
             continue
-        registry_key = f"{ns}/{canonical}" if ns else canonical
+        registry_key = canonical
         session.steer(registry_key, profile)
-        default_alphas[registry_key] = effective_alpha
-        print(f"  Registered '{registry_key}' (alpha={effective_alpha})"
+        print(f"  Registered '{registry_key}'"
               if not verbose else
-              f"  Registered '{registry_key}' (default alpha={effective_alpha})")
-    return default_alphas
+              f"  Registered '{registry_key}'")
 
-
-def _parse_steer_flag(raw: str) -> tuple[str, float]:
-    if ":" in raw:
-        name, alpha_s = raw.rsplit(":", 1)
-        return name, float(alpha_s)
-    return raw, 0.0
+    return parse_expr(expression)
 
 
 def _warmup_session(session) -> None:
@@ -183,7 +178,7 @@ def _run_tui(args: argparse.Namespace) -> None:
     session = _make_session(args)
     _print_model_info(session)
 
-    _setup_steering_vectors(session, getattr(args, "config_vectors", {}) or {})
+    _setup_steering_vectors(session, getattr(args, "config_vectors", None))
 
     from saklas.tui.app import SaklasApp
     app = SaklasApp(session=session)
@@ -208,15 +203,18 @@ def _run_serve(args: argparse.Namespace) -> None:
     session = _make_session(args)
     _print_model_info(session)
 
-    # Config-file vectors first, then explicit --steer flags on top.
-    config_specs = getattr(args, "config_vectors", {}) or {}
-    if config_specs:
-        _setup_steering_vectors(session, config_specs, verbose=True)
-    steer_specs = [_parse_steer_flag(spec) for spec in args.steer]
-    default_alphas = _setup_steering_vectors(session, steer_specs, verbose=True)
+    # Config-file vectors first, then any explicit --steer expression on top.
+    config_expr = getattr(args, "config_vectors", None)
+    if config_expr:
+        _setup_steering_vectors(session, config_expr, verbose=True)
+    steer_expr: str | None = args.steer
+    default_steering = _setup_steering_vectors(session, steer_expr, verbose=True)
+    if default_steering is None and config_expr:
+        from saklas.core.steering_expr import parse_expr
+        default_steering = parse_expr(config_expr)
 
     from saklas.server import create_app
-    app = create_app(session, default_alphas=default_alphas,
+    app = create_app(session, default_steering=default_steering,
                      cors_origins=args.cors or None,
                      api_key=getattr(args, "api_key", None))
 
@@ -344,9 +342,8 @@ def _run_export(args: argparse.Namespace) -> None:
 
 def _run_merge(args: argparse.Namespace) -> None:
     from saklas.io import merge as merge_mod
-    components = merge_mod.parse_components(args.components)
     dst = merge_mod.merge_into_pack(
-        args.name, components, model=args.model,
+        args.name, args.expression, model=args.model,
         force=args.force, strict=args.strict,
     )
     print(f"Merged pack written to {dst}")
@@ -537,39 +534,47 @@ def _run_config_show(args: argparse.Namespace) -> None:
     composed = ConfigFile.effective(extras, include_default=not args.no_default)
     if args.model is not None:
         composed = apply_flag_overrides(composed, model=args.model)
-    composed = composed.resolve_poles()
     header = f"# effective merged config for saklas {__version__}"
     sys.stdout.write(composed.to_yaml(header=header))
 
 
 def _run_config_validate(args: argparse.Namespace) -> None:
     from saklas.cli.config_file import ConfigFile, ConfigFileError
+    from saklas.core.steering_expr import referenced_selectors
     p = Path(args.file)
     if not p.exists():
         print(f"config validate: {p}: file not found", file=sys.stderr)
         sys.exit(2)
     try:
         cfg = ConfigFile.load(p)
-        cfg = cfg.resolve_poles()
+        if cfg.vectors is None:
+            print(f"{p}: ok")
+            return
         # Dry-run: don't install, just check resolvability.
         from saklas.cli.selectors import _all_concepts
         installed = {(c.namespace, c.name) for c in _all_concepts()}
         installed_names = {c.name for c in _all_concepts()}
         missing: list[str] = []
-        for coord in cfg.vectors:
-            if "/" in coord:
-                ns, name = coord.split("/", 1)
-                if ns == "default" or (ns, name) in installed:
+        for ns, concept, _variant in referenced_selectors(cfg.vectors):
+            if ns is None:
+                if concept in installed_names:
                     continue
-                if ns == "local":
-                    missing.append(coord)
+                # Bare pole of an installed bipolar resolves fine too.
+                slug = concept.split(".")[0] if "." in concept else concept
+                if any(
+                    slug in c.name.split(".")
+                    for c in _all_concepts()
+                    if "." in c.name
+                ):
                     continue
-                # HF namespace — we assume install would succeed; don't probe.
+                missing.append(concept)
                 continue
-            else:
-                if coord in installed_names:
-                    continue
-                missing.append(coord)
+            if ns == "default" or (ns, concept) in installed:
+                continue
+            if ns == "local":
+                missing.append(f"{ns}/{concept}")
+                continue
+            # HF namespace — we assume install would succeed; don't probe.
         if missing:
             raise ConfigFileError(
                 f"unresolvable vectors (not installed and no namespace to install from): {missing}"
@@ -880,16 +885,10 @@ def _run_why(args: argparse.Namespace) -> None:
         print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Compute per-layer magnitudes and sort descending.
-    layer_mags: list[tuple[int, float]] = [
-        (layer, float(tensor.norm().item()))
-        for layer, tensor in profile.items()
-    ]
-    layer_mags.sort(key=lambda x: x[1], reverse=True)
-
-    if not args.show_all:
-        layer_mags = layer_mags[: args.top_n]
-
+    layer_mags: list[tuple[int, float]] = sorted(
+        ((layer, float(tensor.norm().item())) for layer, tensor in profile.items()),
+        key=lambda kv: kv[0],
+    )
     total_layers = len(profile)
 
     if args.json_output:
@@ -901,11 +900,39 @@ def _run_why(args: argparse.Namespace) -> None:
         }
         print(_json.dumps(result, indent=2))
     else:
-        label = "layers" if args.show_all else "top layers"
-        print(f"{concept_name} ({total_layers} layers, {args.model}):")
-        print(f"  {label} (by ||baked||):")
-        for layer, mag in layer_mags:
-            print(f"    L{layer:<3}  {mag:.3f}")
+        _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
+
+
+def _print_why_histogram(
+    concept_name: str,
+    model_id: str,
+    total_layers: int,
+    layer_mags: list[tuple[int, float]],
+) -> None:
+    import shutil
+    from saklas.core.histogram import HIST_BUCKETS, bucketize
+
+    print(f"{concept_name} ({total_layers} layers, {model_id}):")
+    print("  LAYERS (mean ||baked|| per bucket):")
+    if not layer_mags:
+        return
+
+    term_w = shutil.get_terminal_size((80, 24)).columns
+    buckets = bucketize(layer_mags, HIST_BUCKETS)
+    max_norm = max(v for _, _, v in buckets) or 1.0
+    label_w = max(2, len(str(max(hi for _, hi, _ in buckets))))
+
+    def _label(lo: int, hi: int) -> str:
+        return f"L{lo:0{label_w}}" if lo == hi else f"L{lo:0{label_w}}-{hi:0{label_w}}"
+
+    label_col = max(len(_label(lo, hi)) for lo, hi, _ in buckets)
+    # "    <label>  <bar>  <value>" — 4 indent + label_col + 2 + bar + 2 + 8
+    value_w = 8
+    bar_w = max(12, term_w - 4 - label_col - 2 - 2 - value_w)
+    for lo, hi, norm in buckets:
+        filled = min(int(norm / max_norm * bar_w), bar_w)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        print(f"    {_label(lo, hi):<{label_col}}  {bar}  {norm:>{value_w}.3f}")
 
 
 _VECTOR_RUNNERS = {
