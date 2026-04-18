@@ -54,6 +54,16 @@ sae = ["sae-lens>=6.0,<7.0"]
 [project.scripts]
 saklas = "saklas.cli.main:main"
 
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a CUDA or MPS backend (deselect with `-m \"not gpu\"`)",
+]
+filterwarnings = [
+    # Python 3.14 flags SWIG-generated builtin types in transitive C deps
+    # (scipy/PIL). Not saklas code and nothing we can fix upstream.
+    "ignore:builtin type Swig(Py(Packed|Object)|varlink) has no __module__ attribute:DeprecationWarning",
+]
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"

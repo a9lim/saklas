@@ -187,15 +187,6 @@ def test_parse_numbered_preserves_empty_rewrite():
     assert out == ["foo", "", "baz"]
 
 
-@pytest.mark.skip(
-    reason="Pair-assembly-level filter requires a full session mock "
-    "(tokenizer + model + steering manager) that's impractical on "
-    "CPU; covered by GPU-gated end-to-end test in test_session.py."
-)
-def test_clone_drops_empty_rewrite_pair_at_assembly():
-    pass
-
-
 def test_parse_numbered_accepts_paren():
     out = _parse_numbered("1) foo\n2) bar", 2)
     assert out == ["foo", "bar"]
@@ -207,27 +198,3 @@ def test_batch_size_is_five():
     assert _BATCH_SIZE == 5
 
 
-# -- end-to-end -------------------------------------------------------------
-
-@pytest.mark.skip(
-    reason="Requires loaded model + full extraction machinery; "
-    "covered by GPU-gated end-to-end test in test_session.py."
-)
-def test_corpus_too_short_error():
-    pass
-
-
-@pytest.mark.skip(
-    reason="Requires loaded model + full extraction machinery; "
-    "covered by GPU-gated end-to-end test in test_session.py."
-)
-def test_pack_metadata():
-    pass
-
-
-@pytest.mark.skip(
-    reason="Requires loaded model + full extraction machinery; "
-    "covered by GPU-gated end-to-end test in test_session.py."
-)
-def test_corpus_hash_invalidates_cache():
-    pass

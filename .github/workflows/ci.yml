@@ -50,4 +50,4 @@ jobs:
                   f"__version__={init_version}"
               )
           PY
-      - run: pytest -q
+      - run: pytest -q -m "not gpu"
