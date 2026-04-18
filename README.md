@@ -33,7 +33,7 @@ pip install saklas
 saklas tui google/gemma-3-4b-it
 ```
 
-The first run downloads the model and extracts the 21 bundled probes. Try `/steer angry 0.4`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer calm 0.4` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` does a direct A/B comparison against the unsteered model.
+The first run downloads the model and extracts the 21 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` does a direct A/B comparison against the unsteered model.
 
 As an API server:
 
@@ -83,7 +83,7 @@ pip install -e ".[dev]"        # + pytest
 
 Saklas takes pairs of sentences and runs them through the model, and then subtracts the two sides. Doing an SVD, it takes the largest principal component at each layer and combines them into a steering tensor. When it's time to generate text, it then takes every layer and adds `alpha × direction` to the hidden state, then rescales it back to the original magnitude.
 
-Each layer's PCA share is baked into the tensor magnitudes at extraction, so the same α means roughly the same intensity across architectures. Roughly:
+Each layer's PCA share is baked into the tensor magnitudes at extraction, so the same α means approximately the same strength across architectures. Roughly:
 
 - **0.1–0.3**: soft nudge
 - **0.3–0.6**: coherent steered
@@ -94,7 +94,7 @@ When multiple vectors are selected, they are added together in sequence.
 
 ### SAE-backed extraction (experimental)
 
-> **Experimental.** This pipeline is new and not as tested as the raw contrastive-PCA path. α was measured and calibrated on raw PCA and may not cleanly transfer. Quality also depends on which SAE release you pick. I recommend starting with low α (0.1–0.2) and sweeping. For production use the raw pipeline should be the default. 
+> **Experimental** This pipeline is not as tested as the contrastive-PCA path. α was measured and calibrated on raw PCA and may not cleanly transfer. Quality also depends on which SAE release you pick. I would recommend using a low α (0.1–0.2) and sweeping. For production use the raw pipeline should be the default. 
 
 Install `saklas[sae]` and pass `--sae <release>` to `vector extract` to run contrastive PCA in sparse-autoencoder feature space. Saklas routes through SAELens, so any published release it covers (GemmaScope, Eleuther Meta-LLaMA-3.1 SAEs, Joseph Bloom's, Apollo/Goodfire) should be supported. The output uses the same backend as raw PCA.
 
@@ -135,13 +135,13 @@ session.generate("...", steering="0.3 honest + 0.4 warm@after")
 session.generate("...", steering="0.3 honest|sycophantic")
 ```
 
-Grammar triggers map to the preset constants (`BOTH` / `GENERATED_ONLY` / `PROMPT_ONLY` / `AFTER_THINKING` / `THINKING_ONLY`) — `@both`, `@response`, `@before`, `@after`, `@thinking`. `Trigger.first(n)` and `Trigger.after(n)` let you express token-window ranges; construct the dataclass directly for arbitrary combinations and pass a pre-built `Steering`.
+Grammar triggers map to the preset constants (`BOTH` / `GENERATED_ONLY` / `PROMPT_ONLY` / `AFTER_THINKING` / `THINKING_ONLY`) — `@both`, `@response`, `@before`, `@after`, `@thinking`. `Trigger.first(n)` and `Trigger.after(n)` let you express token-window ranges. If you want arbitrary combinations, you should pass a pre-built `Steering`.
 
 ### Custom concepts
 
-When you steer on something not in the built-in library, the model writes its own contrastive pairs. It first comes up with 9 domains for the axis (for example, for `deer.wolf`, it comes up with "predation and threat assessment", "territorial defense", etc.), then writes 5 contrastive pairs per domain. 
+When you steer on something not in the built-in library, the model writes its own contrastive pairs. It first comes up with 9 domains for the axis (for `deer.wolf`, it comes up with "predation and threat assessment", "territorial defense", etc.), and then writes 5 contrastive pairs per domain. 
 
-In practice this means `/steer <anything>` works: religions, animals, fictional characters, anything you can name.
+This means `/steer <anything>` works: religions, animals, fictional characters, anything you can name.
 
 ### Trait monitor
 
@@ -151,11 +151,11 @@ While generating, saklas records the hidden state at every probe layer and every
 
 `Profile.cosine_similarity(other)` gives you weighted cosine similarity between two steering profiles over their shared layers. The CLI has three modes: ranked comparison of one selected vector against all installed profiles, direct pairwise comparison, and N×N similarity matrices. The TUI has `/compare` for interactive use.
 
-This lets you find correlated concepts. For example, `creative.conventional` and `hallucinating.grounded` extract similar directions on some models (+0.78 on gemma-4-e4b-it), which means that the model itself encodes both concepts in similar directions.
+This lets you find concepts that are correlated. For example, `creative.conventional` and `hallucinating.grounded` extract similar directions on some models (+0.78 on gemma-4-e4b-it), which means that the model itself encodes both concepts in similar directions.
 
 ### The probe library
 
-There are 21 probes across 6 categories, each backed by 45 contrastive pairs generated using the same pipeline.
+There are 21 default probes across 6 categories, containing 45 contrastive pairs generated using the program's pipeline.
 
 | Category | Probes |
 |---|---|
@@ -166,7 +166,7 @@ There are 21 probes across 6 categories, each backed by 45 contrastive pairs gen
 | **Social stance** | authoritative.submissive, high_context.low_context |
 | **Cultural** | masculine.feminine, religious.secular, traditional.progressive |
 
-Poles are aliased: `/steer angry 0.5` → `angry.calm` at α = +0.5. `/steer calm 0.5` → `angry.calm` at α = −0.5. Works for any installed bipolar pack.
+Poles are aliased: `/steer angry 0.5` → `angry.calm` at α = +0.5. `/steer calm 0.5` → `angry.calm` at α = −0.5. This works for any installed bipolar pack.
 
 Probes extract on first run per model and cache to `~/.saklas/vectors/default/<concept>/<safe_model_id>.safetensors`.
 
@@ -240,7 +240,7 @@ A footer at the bottom of the trait panel shows the top 5 layers and the live hi
 
 The footer in the chat panel shows generation progress, live tok/s, elapsed, VRAM, and context.
 
-For brand-new bipolar extraction with multi-word poles, use `/extract a dog . a pair of cats` — the TUI parses around the space-period-space delimiter. `dog.cat` stays a single name.
+If you want to extract a vector for two poles, use `/extract a dog . a pair of cats`. The TUI parses around the space-period-space delimiter. `dog.cat` stays a single name.
 
 ---
 
@@ -405,7 +405,7 @@ Not supported: tool calling, strict JSON mode, embeddings. The server is designe
 
 All state lives under `~/.saklas/` (override via `SAKLAS_HOME`). Each concept is a folder with `pack.json`, `statements.json`, and per-model tensors. Packs are distributed as HuggingFace model repos.
 
-Pack-less install handles repos with no `pack.json`, so repeng-style GGUF-only control-vector repos install cleanly: `saklas pack install jukofyork/creative-writing-control-vectors-v3.0`.
+Packless install handles repos with no `pack.json`, so repeng-style GGUF-only control-vector repos install cleanly: `saklas pack install jukofyork/creative-writing-control-vectors-v3.0`.
 
 ### Pack management
 
