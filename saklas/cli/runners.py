@@ -6,8 +6,12 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from saklas.cli.parsers import _PACK_VERBS, _VECTOR_VERBS
+
+if TYPE_CHECKING:
+    from saklas.core.steering import Steering
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +98,6 @@ def _setup_steering_vectors(
     Returns ``None`` when ``expression`` is empty / falsy.
     """
     from saklas.cli.selectors import resolve_pole, AmbiguousSelectorError
-    from saklas.core.steering import Steering
     from saklas.core.steering_expr import (
         parse_expr, referenced_selectors,
     )

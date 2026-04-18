@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 from saklas.io.cache_ops import InstallConflict, RefreshError
 from saklas.cli.selectors import AmbiguousSelectorError

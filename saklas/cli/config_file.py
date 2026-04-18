@@ -8,7 +8,7 @@ consumption time via :func:`saklas.core.steering_expr.parse_expr`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
