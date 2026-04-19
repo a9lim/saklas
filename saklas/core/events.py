@@ -22,7 +22,7 @@ from typing import Any, Callable, Union
 class VectorExtracted:
     name: str
     profile: Any  # Profile — forward ref to avoid import cycle
-    metadata: dict
+    metadata: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,7 @@ class SteeringCleared:
 
 @dataclass(frozen=True)
 class ProbeScored:
-    readings: dict  # probe name -> aggregate score
+    readings: dict[str, float]
 
 
 @dataclass(frozen=True)

@@ -26,13 +26,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal, Optional, TYPE_CHECKING
+from typing import Literal, Optional, TYPE_CHECKING, cast
 
 from saklas.core.errors import SaklasError
 from saklas.core.triggers import Trigger
 
 if TYPE_CHECKING:
-    from saklas.core.steering import Steering
+    from saklas.core.steering import AlphaEntry, Steering
 
 
 _TRIGGER_PRESETS: dict[str, Trigger] = {
@@ -305,7 +305,7 @@ def _resolve_atom(
 
 
 def _merge_plain(
-    alphas: dict[str, object],
+    alphas: "dict[str, AlphaEntry]",
     key: str,
     coeff: float,
     trig: Optional[Trigger],
@@ -325,7 +325,7 @@ def _merge_plain(
         prev_coeff = float(existing[0])
         prev_trig = existing[1]
     else:
-        prev_coeff = float(existing)
+        prev_coeff = float(cast(float, existing))
         prev_trig = None
     if prev_trig is None and trig is None:
         alphas[key] = prev_coeff + coeff
@@ -340,9 +340,9 @@ def _merge_plain(
 
 
 def _merge_projected(
-    alphas: dict[str, object],
+    alphas: "dict[str, AlphaEntry]",
     key: str,
-    op: str,
+    op: Literal["~", "|"],
     base: str,
     onto: str,
     coeff: float,
@@ -371,7 +371,7 @@ def _merge_projected(
 def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
     from saklas.core.steering import Steering
 
-    alphas: dict[str, object] = {}
+    alphas: "dict[str, AlphaEntry]" = {}
     for term in terms:
         sel = term.selector
         base_key, base_sign = _resolve_atom(sel.base, namespace)
@@ -387,9 +387,10 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
         assert sel.onto is not None
         onto_key, _onto_sign = _resolve_atom(sel.onto, namespace)
         effective_trig = trig if trig is not None else Trigger.BOTH
-        syn_key = f"{base_key}{sel.operator}{onto_key}"
+        op: Literal["~", "|"] = cast(Literal["~", "|"], sel.operator)
+        syn_key = f"{base_key}{op}{onto_key}"
         _merge_projected(
-            alphas, syn_key, sel.operator, base_key, onto_key,
+            alphas, syn_key, op, base_key, onto_key,
             coeff, effective_trig,
         )
     return Steering(alphas=alphas)

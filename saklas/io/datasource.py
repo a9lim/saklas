@@ -3,17 +3,20 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from typing import Any, cast
 
 
 class DataSource:
     """Normalizes contrastive pairs from multiple input formats."""
 
-    def __init__(self, pairs: list[tuple[str, str]], name: str = "custom"):
+    def __init__(self, pairs: list[tuple[str, str]], name: str = "custom") -> None:
         self.pairs = pairs
         self.name = name
 
     @classmethod
-    def _from_json_file(cls, path, name_override: str | None = None) -> DataSource:
+    def _from_json_file(
+        cls, path: str | Path, name_override: str | None = None,
+    ) -> DataSource:
         with open(path) as f:
             data = json.load(f)
         if isinstance(data, list):
@@ -81,5 +84,8 @@ class DataSource:
                 "Install with: pip install saklas[research]"
             )
         ds = load_dataset(dataset_id, split=split)
-        pairs = [(row[positive_col], row[negative_col]) for row in ds]
+        pairs = [
+            (cast(Any, row)[positive_col], cast(Any, row)[negative_col])
+            for row in ds
+        ]
         return cls(pairs=pairs, name=name or dataset_id.split("/")[-1])

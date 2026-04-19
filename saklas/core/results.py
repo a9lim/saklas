@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -14,7 +15,7 @@ class ProbeReadings:
     max: float
     delta_per_gen: float
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -39,7 +40,7 @@ class GenerationResult:
     # ``saklas replay`` land on this single field.
     applied_steering: str | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "text": self.text,
             "tokens": list(self.tokens),
@@ -78,15 +79,15 @@ class TokenEvent:
 class ResultCollector:
     """Accumulates GenerationResults with tags for batch export."""
 
-    def __init__(self):
-        self._rows: list[dict] = []
+    def __init__(self) -> None:
+        self._rows: list[dict[str, Any]] = []
 
     @property
-    def results(self) -> list[dict]:
+    def results(self) -> list[dict[str, Any]]:
         return list(self._rows)
 
-    def add(self, result: GenerationResult, **tags) -> None:
-        row = {
+    def add(self, result: GenerationResult, **tags: Any) -> None:
+        row: dict[str, Any] = {
             "text": result.text,
             "token_count": result.token_count,
             "tok_per_sec": result.tok_per_sec,
@@ -117,7 +118,7 @@ class ResultCollector:
             writer.writeheader()
             writer.writerows(self._rows)
 
-    def to_dataframe(self):
+    def to_dataframe(self) -> Any:
         try:
             import pandas as pd
         except ImportError:
