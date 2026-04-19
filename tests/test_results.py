@@ -99,6 +99,36 @@ class TestTokenEvent:
         event = TokenEvent(text="hi", token_id=1, index=0, thinking=True)
         assert event.thinking is True
 
+    def test_optional_fields_default_none(self):
+        """All extension fields default to ``None`` / unset — old callers unaffected."""
+        event = TokenEvent(text="x", token_id=0, index=0)
+        assert event.logprob is None
+        assert event.top_logprobs is None
+        assert event.finish_reason is None
+        assert event.scores is None
+        assert event.perplexity is None
+
+    def test_logprobs_carried_through(self):
+        """Populated logprob fields land on the dataclass as given."""
+        event = TokenEvent(
+            text="x", token_id=0, index=0,
+            logprob=-1.5, top_logprobs=[(0, -0.2), (1, -2.3)],
+        )
+        assert event.logprob == -1.5
+        assert event.top_logprobs == [(0, -0.2), (1, -2.3)]
+
+    def test_scores_and_perplexity(self):
+        event = TokenEvent(
+            text="x", token_id=0, index=0,
+            scores={"happy": 0.4, "sad": -0.1}, perplexity=12.7,
+        )
+        assert event.scores == {"happy": 0.4, "sad": -0.1}
+        assert event.perplexity == 12.7
+
+    def test_finish_reason_set(self):
+        event = TokenEvent(text="", token_id=0, index=5, finish_reason="stop")
+        assert event.finish_reason == "stop"
+
 
 class TestResultCollector:
     def _make_result(self, text="Hello", alpha=1.0):
@@ -177,6 +207,21 @@ class TestResultCollector:
         collector.add(self._make_result(), run=1)
         collector.add(self._make_result(), run=2)
         assert len(collector.results) == 2
+
+    def test_to_csv_empty_is_noop(self, tmp_path):
+        """Empty collector returns early — no file written, no crash."""
+        collector = ResultCollector()
+        path = tmp_path / "out.csv"
+        collector.to_csv(str(path))
+        assert not path.exists()
+
+    def test_results_property_returns_copy(self):
+        """``.results`` returns a copy — mutation doesn't bleed back."""
+        collector = ResultCollector()
+        collector.add(self._make_result())
+        rows = collector.results
+        rows.append({"injected": True})
+        assert len(collector.results) == 1
 
 
 class TestTraitMonitorScoring:

@@ -16,6 +16,7 @@ from saklas.core.steering_expr import (
     SteeringExprError,
     format_expr,
     parse_expr,
+    referenced_selectors,
 )
 from saklas.core.triggers import Trigger
 
@@ -546,3 +547,46 @@ def test_from_value_rejects_dict():
 def test_from_value_rejects_list():
     with pytest.raises(TypeError):
         Steering.from_value([("honest", 0.5)])
+
+
+# -------------------------------------------------------------- referenced_selectors ---
+# Install-time hook: the CLI walks the expression AST to decide which
+# packs to fetch.  Must survive the parser without running through
+# ``resolve_pole`` so namespace prefixes are preserved.
+
+
+def test_referenced_selectors_single_term():
+    assert referenced_selectors("0.5 honest") == [(None, "honest", "raw")]
+
+
+def test_referenced_selectors_namespace_preserved():
+    # Namespace must NOT be folded into the concept name — the CLI needs
+    # the raw (ns, concept, variant) triple to resolve packs.
+    assert referenced_selectors("0.5 bob/deer.wolf") == [
+        ("bob", "deer.wolf", "raw"),
+    ]
+
+
+def test_referenced_selectors_variant_preserved():
+    assert referenced_selectors("0.5 honest:sae-gemma-scope") == [
+        (None, "honest", "sae-gemma-scope"),
+    ]
+
+
+def test_referenced_selectors_sum_of_terms():
+    out = referenced_selectors("0.5 honest + 0.3 alice/warm")
+    assert out == [(None, "honest", "raw"), ("alice", "warm", "raw")]
+
+
+def test_referenced_selectors_projection_contributes_two_atoms():
+    # Projection terms yield both base and onto so install-time code can
+    # fetch both packs.
+    assert referenced_selectors("0.5 honest~sycophantic") == [
+        (None, "honest", "raw"),
+        (None, "sycophantic", "raw"),
+    ]
+
+
+def test_referenced_selectors_empty_or_whitespace_returns_empty():
+    assert referenced_selectors("") == []
+    assert referenced_selectors("   \t  ") == []

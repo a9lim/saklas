@@ -70,7 +70,8 @@ class Steering:
         Strings parse through the shared expression grammar in
         :mod:`saklas.core.steering_expr`.  ``None`` passes through (the
         caller interprets as "no steering").  Pre-built :class:`Steering`
-        instances pass through unchanged.
+        instances pass through unchanged.  Any other input type raises
+        ``TypeError``.
         """
         if value is None:
             return None
@@ -81,7 +82,7 @@ class Steering:
             return parse_expr(value)
         raise TypeError(
             f"Steering.from_value expects str | Steering | None, "
-            f"got {type(value).__name__}"
+            f"got {type(value).__name__}"  # pyright: ignore[reportUnreachable]
         )
 
     def normalized_entries(self) -> "dict[str, tuple[float, Trigger]]":
