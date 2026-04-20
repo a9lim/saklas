@@ -10,6 +10,21 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{name = "a9lim", email = "mx@a9l.im"}]
 requires-python = ">=3.11"
+keywords = [
+    "activation-steering",
+    "representation-engineering",
+    "interpretability",
+    "mechanistic-interpretability",
+    "transformers",
+    "huggingface",
+    "llm",
+    "textual",
+    "tui",
+    "openai-api",
+    "ollama",
+    "sae",
+    "probing",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -24,8 +39,8 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA",
     "Environment :: Web Environment",
     "Framework :: FastAPI",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
     "torch>=2.2",
@@ -38,6 +53,9 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/a9lim/saklas"
+Repository = "https://github.com/a9lim/saklas"
+Issues = "https://github.com/a9lim/saklas/issues"
+Releases = "https://github.com/a9lim/saklas/releases"
 
 [project.optional-dependencies]
 bnb = ["bitsandbytes>=0.43"]
@@ -118,4 +136,5 @@ include = ["saklas*"]
 saklas = [
     "data/**/*.json",
     "tui/*.tcss",
+    "py.typed",
 ]
