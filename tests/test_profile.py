@@ -273,3 +273,74 @@ def test_projected_away_preserves_metadata():
     b = Profile({0: torch.tensor([1.0, 0.0])})
     result = a.projected_away(b)
     assert result.metadata.get("method") == "test"
+
+
+# ---------------------------------------------------------------------------
+# __repr__
+# ---------------------------------------------------------------------------
+
+def test_repr_short_form_lists_layers():
+    """<=4 layers renders the layer list verbatim."""
+    p = Profile(_mk(layers=(0, 3)))
+    r = repr(p)
+    assert "[0, 3]" in r
+
+
+def test_repr_long_form_shows_range_and_count():
+    """>4 layers collapses to ``[first..last] (n layers)``."""
+    p = Profile(_mk(layers=range(8)))
+    r = repr(p)
+    assert "0..7" in r
+    assert "8 layers" in r
+
+
+# ---------------------------------------------------------------------------
+# save metadata override
+# ---------------------------------------------------------------------------
+
+def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path):
+    """``metadata=`` kwarg to ``save`` overrides matching keys in ``self.metadata``.
+
+    The wire sidecar is deliberately slim (see ``saklas.core.vectors.save_profile``)
+    — only the allowlisted provenance fields round-trip.  We verify the merge
+    via ``method`` (override wins) and ``statements_sha256`` (self-metadata
+    field that the override doesn't touch).
+    """
+    p = Profile(
+        _mk(layers=(0, 1)),
+        metadata={"method": "contrastive_pca", "statements_sha256": "selfhash"},
+    )
+    path = tmp_path / "cv.safetensors"
+    p.save(path, metadata={"method": "overridden"})
+    loaded = Profile.load(path)
+    assert loaded.metadata["method"] == "overridden"
+    assert loaded.metadata["statements_sha256"] == "selfhash"
+
+
+# ---------------------------------------------------------------------------
+# SaklasError hierarchy — the v2 guarantee that every custom error
+# reparents to SaklasError while preserving its stdlib MRO.
+# ---------------------------------------------------------------------------
+
+def test_saklas_error_family_mro_contract():
+    """Every saklas-raised exception is a SaklasError AND its stdlib parent."""
+    from saklas.core.errors import (
+        AmbiguousVariantError,
+        SaeBackendImportError,
+        SaeCoverageError,
+        SaeModelMismatchError,
+        SaeReleaseNotFoundError,
+        UnknownVariantError,
+    )
+    cases: list[tuple[type[Exception], type[Exception]]] = [
+        (ProfileError, ValueError),
+        (SaeBackendImportError, ImportError),
+        (SaeReleaseNotFoundError, ValueError),
+        (SaeModelMismatchError, ValueError),
+        (SaeCoverageError, ValueError),
+        (AmbiguousVariantError, ValueError),
+        (UnknownVariantError, KeyError),
+    ]
+    for exc, stdlib_parent in cases:
+        assert issubclass(exc, SaklasError), exc
+        assert issubclass(exc, stdlib_parent), exc

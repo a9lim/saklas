@@ -16,6 +16,7 @@ from saklas.core.steering_expr import (
     SteeringExprError,
     format_expr,
     parse_expr,
+    referenced_selectors,
 )
 from saklas.core.triggers import Trigger
 
@@ -49,8 +50,10 @@ def test_single_term():
 
 
 def test_implicit_coefficient():
+    from saklas.core.steering_expr import DEFAULT_COEFF
     s = parse_expr("honest")
-    assert s.alphas == {"honest": 1.0}
+    assert s.alphas == {"honest": DEFAULT_COEFF}
+    assert DEFAULT_COEFF == 0.5  # contract — documented default.
 
 
 def test_star_form():
@@ -69,8 +72,9 @@ def test_leading_sign_negates():
 
 
 def test_negated_bare():
+    from saklas.core.steering_expr import DEFAULT_COEFF
     s = parse_expr("-honest")
-    assert s.alphas == {"honest": -1.0}
+    assert s.alphas == {"honest": -DEFAULT_COEFF}
 
 
 def test_leading_plus():
@@ -315,6 +319,28 @@ def test_bad_character_raises():
         parse_expr("0.5 honest !")
 
 
+def test_quoted_identifier_hints_underscore():
+    # User's mental model: ``"human" . "artificial intelligence"``.
+    # Grammar has no quoting — the error must steer them to the slug form
+    # rather than just saying "unexpected character '\"'".
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr('0.5 "artificial intelligence"')
+    msg = str(ei.value)
+    assert "quoted" in msg.lower()
+    assert "underscore" in msg.lower()
+    assert "artificial_intelligence" in msg
+
+
+def test_trailing_ident_hints_underscore():
+    # ``artificial intelligence`` (no quotes): first atom parses fine,
+    # the second IDENT is stranded — error should suggest underscores.
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("0.5 artificial intelligence")
+    msg = str(ei.value)
+    assert "underscore" in msg.lower()
+    assert "artificial_intelligence" in msg
+
+
 def test_missing_selector_after_coeff():
     with pytest.raises(SteeringExprError):
         parse_expr("0.5 ")
@@ -444,11 +470,11 @@ class TestRoundTripGolden:
     """
 
     @pytest.mark.parametrize("text,canonical", [
-        ("honest", "1 honest"),
+        ("honest", "0.5 honest"),
         ("0.5 honest", "0.5 honest"),
         ("0.5*honest", "0.5 honest"),
         ("-0.5 honest", "-0.5 honest"),
-        ("-honest", "-1 honest"),
+        ("-honest", "-0.5 honest"),
         ("+0.5 honest", "0.5 honest"),
         ("0.5 honest + 0.3 warm", "0.5 honest + 0.3 warm"),
         ("0.5 honest - 0.2 manipulative", "0.5 honest - 0.2 manipulative"),
@@ -546,3 +572,46 @@ def test_from_value_rejects_dict():
 def test_from_value_rejects_list():
     with pytest.raises(TypeError):
         Steering.from_value([("honest", 0.5)])
+
+
+# -------------------------------------------------------------- referenced_selectors ---
+# Install-time hook: the CLI walks the expression AST to decide which
+# packs to fetch.  Must survive the parser without running through
+# ``resolve_pole`` so namespace prefixes are preserved.
+
+
+def test_referenced_selectors_single_term():
+    assert referenced_selectors("0.5 honest") == [(None, "honest", "raw")]
+
+
+def test_referenced_selectors_namespace_preserved():
+    # Namespace must NOT be folded into the concept name — the CLI needs
+    # the raw (ns, concept, variant) triple to resolve packs.
+    assert referenced_selectors("0.5 bob/deer.wolf") == [
+        ("bob", "deer.wolf", "raw"),
+    ]
+
+
+def test_referenced_selectors_variant_preserved():
+    assert referenced_selectors("0.5 honest:sae-gemma-scope") == [
+        (None, "honest", "sae-gemma-scope"),
+    ]
+
+
+def test_referenced_selectors_sum_of_terms():
+    out = referenced_selectors("0.5 honest + 0.3 alice/warm")
+    assert out == [(None, "honest", "raw"), ("alice", "warm", "raw")]
+
+
+def test_referenced_selectors_projection_contributes_two_atoms():
+    # Projection terms yield both base and onto so install-time code can
+    # fetch both packs.
+    assert referenced_selectors("0.5 honest~sycophantic") == [
+        (None, "honest", "raw"),
+        (None, "sycophantic", "raw"),
+    ]
+
+
+def test_referenced_selectors_empty_or_whitespace_returns_empty():
+    assert referenced_selectors("") == []
+    assert referenced_selectors("   \t  ") == []

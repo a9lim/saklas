@@ -21,6 +21,7 @@ loop and the hooks — the loop mutates it at lifecycle boundaries (prefill
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,14 @@ class Trigger:
     response: bool = True
     first_n: int | None = None
     after_n: int | None = None
+
+    # Preset slots — assigned at module load below the class.  ClassVar
+    # keeps the dataclass machinery from treating them as instance fields.
+    BOTH: ClassVar["Trigger"]
+    GENERATED_ONLY: ClassVar["Trigger"]
+    PROMPT_ONLY: ClassVar["Trigger"]
+    AFTER_THINKING: ClassVar["Trigger"]
+    THINKING_ONLY: ClassVar["Trigger"]
 
     def active(self, ctx: "TriggerContext") -> bool:
         """Return True iff this trigger should fire at the current step.

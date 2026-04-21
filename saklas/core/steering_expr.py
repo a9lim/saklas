@@ -12,8 +12,15 @@ Grammar::
     atom     := [ns "/"] NAME ["." NAME] [":" variant]
     trigger  := "before" | "after" | "both" | "thinking" | "response"
               | "prompt" | "generated"
-    coeff    := signed_float
+    coeff    := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
     variant  := "raw" | "sae" | "sae-" ID
+
+Concept names are ASCII identifiers: letter followed by any of
+``[a-z0-9_-]``.  Multi-word concepts use underscores
+(``artificial_intelligence``) — spaces separate tokens, so
+``artificial intelligence`` errors with an underscore hint.  Quoted
+identifiers are rejected.  Bipolar pairs join with ``.``
+(``human.artificial_intelligence``).
 
 Pole aliases (``wolf`` on top of an installed ``deer.wolf``) resolve via
 :func:`saklas.cli.selectors.resolve_pole`; the sign flip folds into the
@@ -26,13 +33,23 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal, Optional, TYPE_CHECKING
+from typing import Literal, Optional, TYPE_CHECKING, cast
 
 from saklas.core.errors import SaklasError
 from saklas.core.triggers import Trigger
 
 if TYPE_CHECKING:
-    from saklas.core.steering import Steering
+    from saklas.core.steering import AlphaEntry, Steering
+
+
+# Default coefficient when a term omits the explicit number.  Matches the
+# ``recommended_alpha`` field on bundled packs — the observed coherent-α
+# sweet spot post-share-baking.  Future hook: when a per-vector default
+# alpha becomes available on the profile/pack metadata side, ``_fold``
+# should consult it and fall back to this constant.  ``_Term.explicit_coeff``
+# preserves the "user typed a number" signal so that late resolution can
+# tell a defaulted ``honest`` from an explicit ``0.5 honest``.
+DEFAULT_COEFF = 0.5
 
 
 _TRIGGER_PRESETS: dict[str, Trigger] = {
@@ -147,6 +164,14 @@ def _lex(text: str) -> list[_Tok]:
                 break
             toks.append(_Tok("IDENT", text[start:i], start))
             continue
+        if c in ('"', "'"):
+            raise SteeringExprError(
+                "quoted identifiers are not supported; use underscores "
+                "for multi-word concept names "
+                "(e.g. 'artificial_intelligence') and '.' for bipolar "
+                "pairs (e.g. 'human.artificial_intelligence')",
+                col=i,
+            )
         raise SteeringExprError(f"unexpected character {c!r}", col=i)
     toks.append(_Tok("EOF", "", n))
     return toks
@@ -174,6 +199,10 @@ class _Term:
     coeff: float
     selector: _Selector
     trigger: Optional[str]  # raw trigger keyword; None = fall through
+    # True iff the user typed a numeric coefficient; False when the parser
+    # substituted ``DEFAULT_COEFF``.  Internal — lets a future resolver step
+    # swap in per-vector defaults without re-parsing the expression.
+    explicit_coeff: bool
 
 
 # --------------------------------------------------------------- parser ---
@@ -209,15 +238,26 @@ class _Parser:
             terms.append(self._term(op_sign))
         if self._peek().kind != "EOF":
             t = self._peek()
+            if t.kind == "IDENT":
+                raise SteeringExprError(
+                    f"unexpected identifier {t.value!r} after a complete "
+                    f"term; multi-word concept names use underscores "
+                    f"(e.g. 'artificial_intelligence', not "
+                    f"'artificial intelligence'), and bipolar pairs join "
+                    f"with '.' (e.g. 'human.artificial_intelligence')",
+                    col=t.col,
+                )
             raise SteeringExprError(
                 f"unexpected token {t.kind} ({t.value!r})", col=t.col,
             )
         return terms
 
     def _term(self, sign: int) -> _Term:
-        coeff = float(sign)
+        explicit = False
+        coeff = float(sign) * DEFAULT_COEFF
         if self._peek().kind == "NUM":
             coeff = float(sign) * float(self._consume().value)
+            explicit = True
             if self._peek().kind == "STAR":
                 self._consume()
         selector = self._selector()
@@ -234,7 +274,10 @@ class _Parser:
                     f"accepted inside steering expressions.",
                     col=tok.col,
                 )
-        return _Term(coeff=coeff, selector=selector, trigger=trigger)
+        return _Term(
+            coeff=coeff, selector=selector, trigger=trigger,
+            explicit_coeff=explicit,
+        )
 
     def _selector(self) -> _Selector:
         base = self._atom()
@@ -305,7 +348,7 @@ def _resolve_atom(
 
 
 def _merge_plain(
-    alphas: dict[str, object],
+    alphas: "dict[str, AlphaEntry]",
     key: str,
     coeff: float,
     trig: Optional[Trigger],
@@ -325,7 +368,7 @@ def _merge_plain(
         prev_coeff = float(existing[0])
         prev_trig = existing[1]
     else:
-        prev_coeff = float(existing)
+        prev_coeff = float(cast(float, existing))
         prev_trig = None
     if prev_trig is None and trig is None:
         alphas[key] = prev_coeff + coeff
@@ -340,9 +383,9 @@ def _merge_plain(
 
 
 def _merge_projected(
-    alphas: dict[str, object],
+    alphas: "dict[str, AlphaEntry]",
     key: str,
-    op: str,
+    op: Literal["~", "|"],
     base: str,
     onto: str,
     coeff: float,
@@ -371,7 +414,7 @@ def _merge_projected(
 def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
     from saklas.core.steering import Steering
 
-    alphas: dict[str, object] = {}
+    alphas: "dict[str, AlphaEntry]" = {}
     for term in terms:
         sel = term.selector
         base_key, base_sign = _resolve_atom(sel.base, namespace)
@@ -387,9 +430,10 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
         assert sel.onto is not None
         onto_key, _onto_sign = _resolve_atom(sel.onto, namespace)
         effective_trig = trig if trig is not None else Trigger.BOTH
-        syn_key = f"{base_key}{sel.operator}{onto_key}"
+        op: Literal["~", "|"] = cast(Literal["~", "|"], sel.operator)
+        syn_key = f"{base_key}{op}{onto_key}"
         _merge_projected(
-            alphas, syn_key, sel.operator, base_key, onto_key,
+            alphas, syn_key, op, base_key, onto_key,
             coeff, effective_trig,
         )
     return Steering(alphas=alphas)
@@ -487,6 +531,7 @@ def referenced_selectors(
 
 
 __all__ = [
+    "DEFAULT_COEFF",
     "ProjectedTerm",
     "SteeringExprError",
     "parse_expr",

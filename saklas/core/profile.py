@@ -16,7 +16,7 @@ at rest.
 from __future__ import annotations
 
 import pathlib
-from typing import Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import torch
 
@@ -43,7 +43,7 @@ class Profile:
         self,
         tensors: Mapping[int, torch.Tensor],
         *,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if not isinstance(tensors, Mapping):
             raise ProfileError(
@@ -67,7 +67,7 @@ class Profile:
                 ref_dtype = t.dtype
             out[layer] = t
         self._tensors: dict[int, torch.Tensor] = out
-        self._metadata: dict = dict(metadata or {})
+        self._metadata: dict[str, Any] = dict(metadata or {})
 
     # Mapping surface -----------------------------------------------------
 
@@ -100,7 +100,7 @@ class Profile:
         return sorted(self._tensors.keys())
 
     @property
-    def metadata(self) -> dict:
+    def metadata(self) -> dict[str, Any]:
         """Copy of the metadata dict carried alongside the tensors."""
         return dict(self._metadata)
 
@@ -125,7 +125,7 @@ class Profile:
     def save(
         self,
         path: str | pathlib.Path,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Save as safetensors + slim JSON sidecar.
 
@@ -135,7 +135,7 @@ class Profile:
         """
         from saklas.core.vectors import save_profile as _save
 
-        merged: dict = dict(self._metadata)
+        merged: dict[str, Any] = dict(self._metadata)
         if metadata:
             merged.update(metadata)
         _save(self._tensors, str(path), merged)

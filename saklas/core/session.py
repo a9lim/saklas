@@ -76,6 +76,36 @@ def _slug(s: str) -> str:
     return _SLUG_RE.sub("_", s.strip().lower()).strip("_")
 
 
+def _humanize_concept(name: str) -> str:
+    """Invert the slug `_` convention for LLM-facing prompts.
+
+    Pack names and alphas keys use underscores (``artificial_intelligence``);
+    the generator reads them better as spaces. Disk paths, canonical
+    names, and progress messages keep the slug form.
+    """
+    return name.replace("_", " ")
+
+
+def _split_composite_source(
+    concept: str, baseline: str | None,
+) -> tuple[str, str | None]:
+    """Split a composite ``pos.neg`` slug when no explicit baseline is given.
+
+    ``canonical_concept_name`` already performs this split for the
+    storage name.  ``extract()`` needs the same split at the generator
+    interface so :meth:`SaklasSession.generate_scenarios` and
+    :meth:`SaklasSession.generate_pairs` route ``concept`` and
+    ``baseline`` as two distinct poles — otherwise the LLM sees one
+    composite blob vs "its semantic opposite" and the A/B assignment in
+    the returned statements no longer matches the user's declared pole
+    order.
+    """
+    if baseline is None and BIPOLAR_SEP in concept:
+        pos, neg = concept.split(BIPOLAR_SEP, 1)
+        return pos.strip(), neg.strip()
+    return concept, baseline
+
+
 def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
     """Return the canonical on-disk name for a concept.
 
@@ -414,16 +444,22 @@ class SaklasSession:
         """
         if n <= 0:
             return []
-        if baseline is not None:
-            axis_phrase = f'"{concept}" vs "{baseline}"'
+        # Slugs on the pack/alphas side use underscores; LLM prompts read
+        # them as spaces ("artificial_intelligence" → "artificial
+        # intelligence") so the generator treats the axis as the
+        # underlying phrase rather than a literal token.
+        concept_h = _humanize_concept(concept)
+        baseline_h = _humanize_concept(baseline) if baseline is not None else None
+        if baseline_h is not None:
+            axis_phrase = f'"{concept_h}" vs "{baseline_h}"'
             poles_line = (
-                f'Both "{concept}" and "{baseline}" should have natural, '
+                f'Both "{concept_h}" and "{baseline_h}" should have natural, '
                 f'distinct responses within every domain you list.'
             )
         else:
-            axis_phrase = f'"{concept}" vs its semantic opposite'
+            axis_phrase = f'"{concept_h}" vs its semantic opposite'
             poles_line = (
-                f'Both "{concept}" and its semantic opposite should have '
+                f'Both "{concept_h}" and its semantic opposite should have '
                 f'natural, distinct responses within every domain you list.'
             )
         prompt = (
@@ -522,34 +558,39 @@ class SaklasSession:
 
         pairs_per_scenario = max(1, -(-n // len(scenarios)))  # ceil div
 
-        if baseline is not None:
-            axis_phrase = f'"{concept}" vs "{baseline}"'
+        # See ``generate_scenarios`` — slug underscores become spaces for
+        # the LLM-facing prompt only; progress messages and cache keys
+        # keep the slug form.
+        concept_h = _humanize_concept(concept)
+        baseline_h = _humanize_concept(baseline) if baseline is not None else None
+        if baseline_h is not None:
+            axis_phrase = f'"{concept_h}" vs "{baseline_h}"'
             a_line = (
-                f'   - Statement A: write like you ARE "{concept}", '
+                f'   - Statement A: write like you ARE "{concept_h}", '
                 f'facing that moment.'
             )
             b_line = (
-                f'   - Statement B: write like you ARE "{baseline}", '
+                f'   - Statement B: write like you ARE "{baseline_h}", '
                 f'facing the same moment.'
             )
             labels_ban = (
-                f'Do not name the poles. Never write "I am a {concept}" '
-                f'or "as a {baseline}" or any similar self-label — just '
+                f'Do not name the poles. Never write "I am a {concept_h}" '
+                f'or "as a {baseline_h}" or any similar self-label — just '
                 f'inhabit the pole directly.'
             )
         else:
-            axis_phrase = f'"{concept}" vs its semantic opposite'
+            axis_phrase = f'"{concept_h}" vs its semantic opposite'
             a_line = (
-                f'   - Statement A: write like you ARE "{concept}", '
+                f'   - Statement A: write like you ARE "{concept_h}", '
                 f'facing that moment.'
             )
             b_line = (
                 f'   - Statement B: write like you ARE the semantic '
-                f'opposite of "{concept}" — whatever that opposite '
+                f'opposite of "{concept_h}" — whatever that opposite '
                 f'naturally is — facing the same moment.'
             )
             labels_ban = (
-                f'Do not name the pole. Never write "I am a {concept}" '
+                f'Do not name the pole. Never write "I am a {concept_h}" '
                 f'or any similar self-label — just inhabit the pole '
                 f'directly.'
             )
@@ -750,7 +791,7 @@ class SaklasSession:
 
         # Normalize source
         if isinstance(source, str):
-            concept = source
+            concept, baseline = _split_composite_source(source, baseline)
         elif isinstance(source, DataSource):
             concept = source.name
             baseline = None

@@ -5,7 +5,12 @@ Bipolar separator is `.` (see saklas.session.BIPOLAR_SEP).
 """
 from __future__ import annotations
 
-from saklas.core.session import canonical_concept_name
+from saklas.core.session import (
+    SaklasSession,
+    _humanize_concept,
+    _split_composite_source,
+    canonical_concept_name,
+)
 
 
 class TestSlug:
@@ -44,3 +49,96 @@ class TestSlug:
     def test_order_matters(self):
         # sign is meaningful — (A, B) and (B, A) are distinct vectors
         assert canonical_concept_name("happy", "sad") != canonical_concept_name("sad", "happy")
+
+
+class TestHumanize:
+    def test_humanize_pure_string(self):
+        assert _humanize_concept("artificial_intelligence") == "artificial intelligence"
+        assert _humanize_concept("happy") == "happy"
+        assert _humanize_concept("high_context") == "high context"
+
+    def test_humanize_leaves_canonical_untouched(self):
+        # Slug path is the identifier; humanize is for LLM prompts only.
+        assert canonical_concept_name("artificial_intelligence") == "artificial_intelligence"
+
+    def test_scenarios_prompt_uses_humanized_form(self):
+        """Underscored slugs become spaces in the LLM-facing prompt."""
+        captured = {}
+
+        class _FakeSession(SaklasSession):
+            def __init__(self):  # bypass real construction
+                pass
+
+            def _run_generator(self, system_msg, prompt, max_new_tokens):
+                captured["prompt"] = prompt
+                return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
+
+        _FakeSession().generate_scenarios(
+            "artificial_intelligence", baseline=None, n=9,
+        )
+        prompt = captured["prompt"]
+        assert "artificial intelligence" in prompt
+        assert "artificial_intelligence" not in prompt
+
+    def test_scenarios_prompt_humanizes_baseline(self):
+        captured = {}
+
+        class _FakeSession(SaklasSession):
+            def __init__(self):
+                pass
+
+            def _run_generator(self, system_msg, prompt, max_new_tokens):
+                captured["prompt"] = prompt
+                return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
+
+        _FakeSession().generate_scenarios(
+            "high_context", baseline="low_context", n=9,
+        )
+        prompt = captured["prompt"]
+        assert "high context" in prompt
+        assert "low context" in prompt
+        assert "high_context" not in prompt
+        assert "low_context" not in prompt
+
+    def test_split_composite_source_splits_on_dot(self):
+        # Composite "pos.neg" with no baseline: split into distinct poles.
+        assert _split_composite_source("human.artificial_intelligence", None) == (
+            "human", "artificial_intelligence",
+        )
+
+    def test_split_composite_source_passes_through_monopolar(self):
+        # No dot: leave alone.
+        assert _split_composite_source("honest", None) == ("honest", None)
+
+    def test_split_composite_source_respects_explicit_baseline(self):
+        # Explicit baseline wins — don't second-guess the caller even if
+        # ``concept`` also contains a dot.
+        assert _split_composite_source(
+            "human.ai", "override",
+        ) == ("human.ai", "override")
+
+    def test_split_composite_source_strips_whitespace(self):
+        assert _split_composite_source("human . ai", None) == ("human", "ai")
+
+    def test_pairs_prompt_uses_humanized_form(self):
+        captured = {}
+
+        class _FakeSession(SaklasSession):
+            def __init__(self):
+                pass
+
+            def _run_generator(self, system_msg, prompt, max_new_tokens):
+                captured.setdefault("prompts", []).append(prompt)
+                return (
+                    "1a. Statement one.\n1b. Statement two.\n"
+                    "2a. Statement three.\n2b. Statement four.\n"
+                )
+
+        _FakeSession().generate_pairs(
+            "artificial_intelligence",
+            baseline=None, n=2, scenarios=["a domain"],
+        )
+        assert captured["prompts"], "pair generator was not invoked"
+        prompt = captured["prompts"][0]
+        assert "artificial intelligence" in prompt
+        assert "artificial_intelligence" not in prompt

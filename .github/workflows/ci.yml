@@ -20,6 +20,19 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
 
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      # Install dev extras so pyright can resolve torch / transformers /
+      # safetensors when it analyzes the public API surface.
+      - run: pip install -e ".[dev]"
+      - run: pyright
+
   test:
     runs-on: ubuntu-latest
     steps:

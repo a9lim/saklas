@@ -4,12 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saklas"
-version = "1.4.5"
+version = "1.4.6"
 description = "Activation steering and trait monitoring for HuggingFace transformers — Python library, OpenAI-compatible server, and terminal UI"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{name = "a9lim", email = "mx@a9l.im"}]
 requires-python = ">=3.11"
+keywords = [
+    "activation-steering",
+    "representation-engineering",
+    "interpretability",
+    "mechanistic-interpretability",
+    "transformers",
+    "huggingface",
+    "llm",
+    "textual",
+    "tui",
+    "openai-api",
+    "ollama",
+    "sae",
+    "probing",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -24,8 +39,8 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA",
     "Environment :: Web Environment",
     "Framework :: FastAPI",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
     "torch>=2.2",
@@ -38,12 +53,15 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/a9lim/saklas"
+Repository = "https://github.com/a9lim/saklas"
+Issues = "https://github.com/a9lim/saklas/issues"
+Releases = "https://github.com/a9lim/saklas/releases"
 
 [project.optional-dependencies]
 bnb = ["bitsandbytes>=0.43"]
 flash = ["flash-attn>=2.5"]
 cuda = ["bitsandbytes>=0.43", "flash-attn>=2.5"]
-dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6.9", "fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6.9", "pyright>=1.1.400", "fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
 serve = ["fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
 hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
@@ -72,6 +90,45 @@ target-version = "py311"
 select = ["E", "F", "W"]
 ignore = ["E501", "E741", "E402", "E731"]
 
+# Pyright — scoped to the public API surface.  Engine/CLI/server/TUI
+# layers lean hard on torch/transformers/fastapi/textual internals whose
+# stubs are uneven; running the checker over them is all noise.  The
+# surface users import from ``saklas`` is the real contract, so it's what
+# we hold to a type checker.
+#
+# ``standard`` mode (rather than ``strict``) is deliberate: ``strict``
+# turns on ``reportUnknown*`` and those fire constantly on legitimate
+# ``Tensor.norm()`` / ``Tensor.item()`` calls because torch's type stubs
+# are partial.  We escalate the rules that actually catch bugs on a
+# public API (missing parameter types, missing type arguments, attribute
+# access, argument / call issues) to error.
+[tool.pyright]
+include = [
+    "saklas/__init__.py",
+    "saklas/core/errors.py",
+    "saklas/core/events.py",
+    "saklas/core/profile.py",
+    "saklas/core/sampling.py",
+    "saklas/core/steering.py",
+    "saklas/core/steering_expr.py",
+    "saklas/core/triggers.py",
+    "saklas/core/results.py",
+    "saklas/io/datasource.py",
+]
+exclude = ["**/__pycache__", "**/node_modules"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+reportMissingImports = "warning"
+reportMissingParameterType = "error"
+reportMissingTypeArgument = "error"
+reportAttributeAccessIssue = "error"
+reportArgumentType = "error"
+reportCallIssue = "error"
+reportReturnType = "error"
+reportAssignmentType = "error"
+reportUnnecessaryIsInstance = "warning"
+
 [tool.setuptools.packages.find]
 include = ["saklas*"]
 
@@ -79,4 +136,5 @@ include = ["saklas*"]
 saklas = [
     "data/**/*.json",
     "tui/*.tcss",
+    "py.typed",
 ]

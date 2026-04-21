@@ -92,8 +92,10 @@ def _msgs(app):
 
 
 def test_alpha_rejects_unregistered():
+    # Value-first: ``/alpha 0.5 nonexistent`` matches the expression
+    # grammar (``0.5 honest``) instead of flipping noun/number order.
     app = _make_app()
-    app._handle_command("/alpha nonexistent 0.5")
+    app._handle_command("/alpha 0.5 nonexistent")
     assert "not active" in _msgs(app)
 
 
@@ -101,7 +103,7 @@ def test_alpha_adjusts_existing():
     app = _make_app()
     app._alphas["angry.calm"] = 0.3
     app._refresh_left_panel = MagicMock()
-    app._handle_command("/alpha angry.calm 0.7")
+    app._handle_command("/alpha 0.7 angry.calm")
     assert app._alphas["angry.calm"] == 0.7
     assert "set to" in _msgs(app)
 
@@ -110,7 +112,7 @@ def test_alpha_invalid_value():
     app = _make_app()
     app._alphas["foo"] = 0.1
     app._refresh_left_panel = MagicMock()
-    app._handle_command("/alpha foo notanumber")
+    app._handle_command("/alpha notanumber foo")
     assert "Invalid alpha" in _msgs(app)
 
 
@@ -281,6 +283,46 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
     assert isinstance(kwargs["sampling"], saklas.SamplingConfig)
     # No steering registered → None.
     assert kwargs["steering"] is None
+
+
+def test_start_generation_inherits_highlight_state():
+    """Fresh assistant widgets spawn with ``_highlight_on=False``; the
+    app must push its current highlight state onto the widget at
+    generation start so streamed tokens render highlighted from the
+    first emit (regression: required Ctrl+Y off/on cycle post-gen).
+    """
+    app = _make_app()
+    app._session._device = SimpleNamespace(type="cpu")
+    app._highlighting = True
+    app._highlight_probe = "honest.deceptive"
+
+    widget = MagicMock()
+    app._chat_panel.start_assistant_message = MagicMock(return_value=widget)
+    app._session.generate_stream = MagicMock(return_value=iter([]))
+
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    app._start_generation("hello")
+    widget.apply_highlight.assert_called_with(True, "honest.deceptive")
+
+
+def test_start_generation_skips_highlight_when_off():
+    app = _make_app()
+    app._session._device = SimpleNamespace(type="cpu")
+    app._highlighting = False
+
+    widget = MagicMock()
+    app._chat_panel.start_assistant_message = MagicMock(return_value=widget)
+    app._session.generate_stream = MagicMock(return_value=iter([]))
+
+    def _run_worker(fn, thread=True):
+        fn()
+    app.run_worker = _run_worker
+
+    app._start_generation("hello")
+    widget.apply_highlight.assert_not_called()
 
 
 def test_generate_worker_passes_steering_when_alphas_active():
