@@ -70,9 +70,9 @@ Every surface — Python, YAML, HTTP, TUI, `vector merge` — speaks the same st
 
 ```
 expr     := term (("+" | "-") term)*
-term     := [coeff "*"?] selector ["@" trigger]
+term     := [coeff "*"?] selector ["@" trigger]    # coeff optional; omit → 0.5
 selector := atom (("~" | "|") atom)?
-atom     := [ns "/"] NAME ["." NAME] [":" variant]
+atom     := [ns "/"] NAME ["." NAME] [":" variant]  # NAME uses _ for multi-word
 trigger  := before | after | both | thinking | response | prompt | generated
 variant  := raw | sae | sae-<release>
 ```

@@ -422,7 +422,7 @@ class SaklasApp(App):
                 "Steering:\n"
                 "  /steer <concept> [alpha]    — add (extract if needed)\n"
                 "  /steer <pos> . <neg> [a]    — add bipolar (period delim)\n"
-                "  /alpha <name> <val>         — adjust existing alpha\n"
+                "  /alpha <val> <name>         — adjust existing alpha\n"
                 "  /unsteer <name>             — remove vector\n"
                 "Probes:\n"
                 "  /probe <concept>            — add probe (highlight on)\n"
@@ -783,6 +783,12 @@ class SaklasApp(App):
         widget = self._chat_panel.start_assistant_message()
         self._current_assistant_widget = widget
         self._assistant_messages.append(widget)
+        # Fresh widgets spawn with ``_highlight_on=False``; inherit the
+        # app's current highlight state so streamed tokens render
+        # highlighted from the first emit instead of requiring a Ctrl+Y
+        # off/on cycle after the response completes.
+        if self._highlighting:
+            widget.apply_highlight(True, self._highlight_probe)
 
         # Snapshot alphas for this generation
         alphas = self._active_alphas()
@@ -1078,9 +1084,9 @@ class SaklasApp(App):
             chat.add_system_message(f"Parse error: {e}")
             return
         if len(tokens) != 2:
-            chat.add_system_message("Usage: /alpha <name> <value>")
+            chat.add_system_message("Usage: /alpha <value> <name>")
             return
-        raw, val_str = tokens
+        val_str, raw = tokens
         matches = _resolve_active_name(raw, self._alphas)
         if len(matches) == 0:
             chat.add_system_message(

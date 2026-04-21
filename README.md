@@ -143,6 +143,8 @@ When you steer on something not in the built-in library, the model writes its ow
 
 This means `/steer <anything>` works: religions, animals, fictional characters, anything you can name.
 
+One caveat on custom axes: when the two poles are asymmetric — one specific and one generic, or one that reads more naturally in the reversed order than the order you typed — the model sometimes flips A and B during pair generation, so the statements you asked for as the positive pole end up under `negative` and vice versa. The tensor still extracts cleanly, it just points the wrong way, and `+α` steers toward what you called the negative pole. Balanced axes like the bundled ones don't trip this; it shows up mainly on asymmetric pairs like `human.artificial_intelligence`. If a custom axis does the opposite of what you expect, open `~/.saklas/vectors/local/<concept>/statements.json` and check whether the `positive` entries actually read as the pole you asked for. If they're reversed, swap `positive` and `negative` in the file and re-run extraction, or just flip the pole order in your call.
+
 ### Trait monitor
 
 While generating, saklas records the hidden state at every probe layer and every step. They are mean-centered against a neutral baseline and then scored by weighted cosine similarity against every active probe. You can see the history as a sparkline in the TUI; in the library you get `result.readings` as a dict of `ProbeReadings`.
