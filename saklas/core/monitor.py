@@ -365,6 +365,9 @@ class TraitMonitor:
                 f"score_stack: agg_index={agg_index} out of range for T={n}",
             )
 
+        # T-uniformity validated above and agg_row < n; no per-layer
+        # shape guard is needed (unlike score_per_token, which operates
+        # on raw hook captures that can be ragged by one around EOS).
         agg_hidden = {
             layer_idx: h[agg_row] for layer_idx, h in captured.items()
         }
@@ -393,7 +396,14 @@ class TraitMonitor:
             if not per_token[name]:
                 per_token[name] = [0.0] * n
 
-        self._pending_per_token = True
+        # Only flip the pending flag when the caller is actually
+        # feeding this into history. Ad-hoc researcher calls
+        # (accumulate=False, the default here) must not surface as
+        # pending data on the monitor's TUI-facing consumer side —
+        # score_per_token sets this unconditionally because it's
+        # always in-flight; score_stack is not.
+        if accumulate:
+            self._pending_per_token = True
         return agg_vals, per_token
 
     def has_pending_data(self) -> bool:

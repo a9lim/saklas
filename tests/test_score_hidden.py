@@ -78,3 +78,25 @@ def test_score_stack_empty_inputs():
     agg, per_token = m.score_stack({}, accumulate=False)
     assert agg == {"x": 0.0}
     assert per_token == {"x": []}
+
+
+def test_score_stack_uneven_T_raises_value_error():
+    """Mixed T across layers is a caller bug — fail loud, not silently skip."""
+    m = _monitor_with_probe()
+    bad = {
+        0: torch.zeros(3, 4),
+        1: torch.zeros(2, 4),
+    }
+    with pytest.raises(ValueError, match="expected"):
+        m.score_stack(bad, accumulate=False)
+
+
+def test_score_stack_accumulate_false_leaves_pending_flag_clear():
+    """The researcher-facing path must not signal pending-per-token when
+    the caller explicitly opted out of accumulation."""
+    m = _monitor_with_probe()
+    assert m.has_pending_per_token() is False
+    m.score_stack(
+        {0: torch.tensor([[1.0, 0.0, 0.0, 0.0]])}, accumulate=False,
+    )
+    assert m.has_pending_per_token() is False
