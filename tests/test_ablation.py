@@ -94,3 +94,42 @@ def test_single_direction_full_ablation():
         hidden, baked=d, layer_mean=mean, alpha=1.0,
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_partial_ablation_half():
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    d = torch.tensor([1.0, 0.0, 0.0])
+    mean = torch.tensor([0.5, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[(d, mean, 0.5, Trigger.BOTH)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    hidden = torch.tensor([[[2.0, 1.0, 0.0]]])
+    out = _run_hook(hook, hidden)
+    expected = _expected_ablation(
+        hidden, baked=d, layer_mean=mean, alpha=0.5,
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_zero_alpha_ablation_is_noop():
+    """α=0 entry is filtered out of ablation_groups entirely; hidden is untouched."""
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    d = torch.tensor([1.0, 0.0, 0.0])
+    mean = torch.tensor([0.5, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[(d, mean, 0.0, Trigger.BOTH)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    assert not hook.ablation_groups
+    hidden = torch.tensor([[[2.0, 1.0, 0.0]]])
+    out = _run_hook(hook, hidden)
+    torch.testing.assert_close(out, hidden)
