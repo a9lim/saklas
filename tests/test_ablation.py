@@ -193,3 +193,105 @@ def test_additive_both_plus_ablation_uses_slow_path():
     assert hook.composed is None
     assert hook.composed_groups
     assert hook.ablation_groups
+
+
+def test_ablation_trigger_gated_off():
+    """Ablation with AFTER_THINKING trigger is inactive during prefill."""
+    hook = SteeringHook()
+    ctx = TriggerContext(is_prefill=True, thinking=False)
+    d = torch.tensor([1.0, 0.0, 0.0])
+    mean = torch.tensor([0.0, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[(d, mean, 1.0, Trigger.AFTER_THINKING)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    hidden = torch.tensor([[[2.0, 0.0, 0.0]]])
+    out = _run_hook(hook, hidden)
+    torch.testing.assert_close(out, hidden)
+
+
+def test_ablation_trigger_gated_on():
+    """AFTER_THINKING ablation fires after thinking ends."""
+    hook = SteeringHook()
+    ctx = TriggerContext(is_prefill=False, thinking=False)
+    d = torch.tensor([1.0, 0.0, 0.0])
+    mean = torch.tensor([0.0, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[(d, mean, 1.0, Trigger.AFTER_THINKING)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    # Use a non-degenerate hidden so the rescale isn't singular.
+    hidden = torch.tensor([[[2.0, 1.0, 0.0]]])
+    out = _run_hook(hook, hidden)
+    expected = _expected_ablation(hidden, baked=d, layer_mean=mean, alpha=1.0)
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_multi_direction_orthogonal_naive_parallel():
+    """Two orthogonal ablation directions at one layer match sequential."""
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    d1 = torch.tensor([1.0, 0.0, 0.0])
+    d2 = torch.tensor([0.0, 1.0, 0.0])
+    mean = torch.tensor([0.0, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[
+            (d1, mean, 1.0, Trigger.BOTH),
+            (d2, mean, 1.0, Trigger.BOTH),
+        ],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    hidden = torch.tensor([[[3.0, 4.0, 2.0]]])
+    out = _run_hook(hook, hidden)
+
+    # Ablate x then y → [0, 0, 2]; rescale to ||[3,4,2]|| = sqrt(29).
+    intermediate = torch.tensor([0.0, 0.0, 2.0])
+    norm_pre = hidden[0, 0].norm()
+    norm_post = intermediate.norm().clamp(min=1e-6)
+    expected = (intermediate * (norm_pre / norm_post)).view(1, 1, 3)
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_multi_direction_correlated_over_ablates():
+    """Pinned: correlated directions over-ablate along the shared axis.
+
+    Prevents an accidental silent fix (Gram-Schmidt orthogonalization) by
+    asserting the current naive-parallel behavior.
+    """
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    d1 = torch.tensor([1.0, 0.0, 0.0])
+    d2 = torch.tensor([0.9, 0.1, 0.0])
+    mean = torch.tensor([0.0, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[
+            (d1, mean, 1.0, Trigger.BOTH),
+            (d2, mean, 1.0, Trigger.BOTH),
+        ],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    hidden = torch.tensor([[[1.0, 0.0, 1.0]]])
+    out = _run_hook(hook, hidden)
+
+    # Naive-parallel: delta = proj1·d̂1 + proj2·d̂2 where proj2 uses the
+    # ORIGINAL hidden (not the post-d̂1-subtraction intermediate).
+    # x-component is driven past zero — the over-ablation claim.
+    d2_unit = d2 / d2.norm()
+    proj1 = (hidden[0, 0] * d1).sum()
+    proj2 = (hidden[0, 0] * d2_unit).sum()
+    pre_rescale = hidden[0, 0] - proj1 * d1 - proj2 * d2_unit
+    assert pre_rescale[0] < 0.0
+    # Post-rescale preserves the sign of x.
+    assert out[0, 0, 0] < 0.0
