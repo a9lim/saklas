@@ -133,3 +133,27 @@ def test_zero_alpha_ablation_is_noop():
     hidden = torch.tensor([[[2.0, 1.0, 0.0]]])
     out = _run_hook(hook, hidden)
     torch.testing.assert_close(out, hidden)
+
+
+def test_ablate_then_add_ordering():
+    """Ablation runs before additive; additive injection lands in the cleaned stream."""
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    d_abl = torch.tensor([1.0, 0.0, 0.0])
+    mean_abl = torch.tensor([0.0, 0.0, 0.0])  # zero mean -> zero-ablate the x-component
+    add_vec = torch.tensor([0.0, 1.0, 0.0])
+    hook.recompose(
+        additive_entries=[(add_vec, 1.0, Trigger.BOTH)],
+        ablation_entries=[(d_abl, mean_abl, 1.0, Trigger.BOTH)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    hidden = torch.tensor([[[3.0, 0.0, 0.0]]])
+    out = _run_hook(hook, hidden)
+
+    # Ablate first: h -> [0, 0, 0]
+    # Add next:    h -> [0, 1, 0]
+    # Rescale to ||[3, 0, 0]|| = 3 -> [0, 3, 0]
+    expected = torch.tensor([[[0.0, 3.0, 0.0]]])
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
