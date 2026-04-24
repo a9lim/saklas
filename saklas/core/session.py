@@ -1448,15 +1448,27 @@ class SaklasSession:
         """Remove all steering hooks from the model."""
         self._steering.clear_all()
 
-    def _begin_capture(self) -> bool:
-        """Attach hidden-state capture on probe layers. Returns True if attached."""
-        if not self._monitor.probe_names:
-            return False
-        layer_idxs = sorted({
-            idx for prof in self._monitor.profiles.values() for idx in prof
-        })
-        if not layer_idxs:
-            return False
+    def _begin_capture(self, *, widen: bool = False) -> bool:
+        """Attach hidden-state capture. Returns True if attached.
+
+        ``widen=False`` (default): cover only probe-layer union — what
+        the monitor needs.  Fast path; matches v1 behavior.
+
+        ``widen=True``: cover every model layer.  Used when the caller
+        asked for ``SamplingConfig.return_hidden=True`` — the monitor
+        still reads its subset, but the full dict is available on
+        ``GenerationResult.hidden_states`` after the run.
+        """
+        if widen:
+            layer_idxs = list(range(len(self._layers)))
+        else:
+            if not self._monitor.probe_names:
+                return False
+            layer_idxs = sorted({
+                idx for prof in self._monitor.profiles.values() for idx in prof
+            })
+            if not layer_idxs:
+                return False
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
         return True
@@ -1652,6 +1664,8 @@ class SaklasSession:
         stateless: bool = False,
         logprobs_list: list[tuple[int, float, list[tuple[int, float]]]] | None = None,
         applied_steering: str | None = None,
+        *,
+        return_hidden: bool = False,
     ) -> GenerationResult:
         """Shared post-generation: decode, measure probes, build result, update history."""
         token_count = len(generated_ids)
@@ -1684,6 +1698,23 @@ class SaklasSession:
             self._last_per_token_scores = None
             readings = self.build_readings()
 
+        hidden_states: dict[int, torch.Tensor] | None = None
+        if return_hidden and generated_ids:
+            raw = self._capture.stacked()  # {layer_idx: [n_captured, D] on device}
+            n = len(generated_ids)
+            trimmed: dict[int, torch.Tensor] = {}
+            for layer_idx, h in raw.items():
+                # Same EOS off-by-one trim score_per_token applies.
+                if h.shape[0] > n:
+                    h = h[:n]
+                elif h.shape[0] < n:
+                    # Under-capture: shouldn't happen on this code path, but
+                    # skip the layer rather than returning a short tensor the
+                    # caller would misalign with generated_ids.
+                    continue
+                trimmed[layer_idx] = h.detach().to("cpu").clone()
+            hidden_states = trimmed
+
         result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,
             tok_per_sec=tok_per_sec, elapsed=elapsed,
@@ -1692,6 +1723,7 @@ class SaklasSession:
             finish_reason=self._gen_state.finish_reason,
             logprobs=logprobs_list,
             applied_steering=applied_steering,
+            hidden_states=hidden_states,
         )
         self._last_result = result
 
@@ -1851,7 +1883,7 @@ class SaklasSession:
             vector_snapshot = _snapshot_alphas()
 
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
-            self._begin_capture()
+            self._begin_capture(widen=bool(sampling and sampling.return_hidden))
             self._monitor.begin_live()
             # Reset the steering manager's TriggerContext for this generation.
             # ``generate_steered`` mutates it at lifecycle boundaries; hooks
@@ -1885,6 +1917,7 @@ class SaklasSession:
                 prompt_tokens=prompt_tokens, stateless=stateless,
                 logprobs_list=logprobs_list,
                 applied_steering=applied_steering,
+                return_hidden=bool(sampling and sampling.return_hidden),
             )
             self._monitor.end_live()
             self.events.emit(GenerationFinished(result=result))

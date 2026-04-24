@@ -342,3 +342,54 @@ class TestAblation:
             f"ablation should suppress self-probe; "
             f"baseline={baseline:.4f}, ablated={ablated:.4f}, ceiling={ceiling:.4f}"
         )
+
+
+def test_return_hidden_round_trip(session):
+    """return_hidden=True populates hidden_states; score_hidden round-trips."""
+    from saklas import SamplingConfig
+
+    num_layers = len(session._layers)
+    hidden_dim = session.model_info["hidden_dim"]
+
+    result = session.generate(
+        "Count to three.",
+        sampling=SamplingConfig(
+            max_tokens=16, temperature=0.0, return_hidden=True,
+        ),
+    )
+    assert result.hidden_states is not None
+    # All layers captured.
+    assert len(result.hidden_states) == num_layers
+    # Shape: [T, D] per layer, T == len(generated tokens).
+    T = len(result.tokens)
+    for layer_idx, h in result.hidden_states.items():
+        assert h.shape == (T, hidden_dim), (
+            f"layer {layer_idx}: expected ({T}, {hidden_dim}), got {tuple(h.shape)}"
+        )
+        assert h.device.type == "cpu"
+
+    # Round-trip: re-score the captured dict and compare against the
+    # per-token scores the session computed inline.
+    if session._monitor.probe_names:
+        agg, per_token = session.score_hidden(
+            result.hidden_states, per_token=True,
+        )
+        expected = session.last_per_token_scores or {}
+        # Tolerances generous for bf16/fp16.
+        tol = 1e-2
+        for name, vals in per_token.items():
+            if name not in expected:
+                continue
+            assert len(vals) == len(expected[name])
+            for a, b in zip(vals, expected[name]):
+                assert abs(a - b) < tol, f"probe {name}: {a} vs {b}"
+
+
+def test_return_hidden_false_leaves_hidden_states_none(session):
+    from saklas import SamplingConfig
+
+    result = session.generate(
+        "Hello.",
+        sampling=SamplingConfig(max_tokens=4, temperature=0.0),
+    )
+    assert result.hidden_states is None
