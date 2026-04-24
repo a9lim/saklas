@@ -43,6 +43,8 @@ Model-name matching is lenient (`_model_names_match`): SAELens's `cfg.model_name
 
 `HiddenCapture` — session + TUI companion: `attach(layers, layer_indices)` / `detach()` / `stacked()`. Each capture is `detach().clone()` of `output[0, -1, :]` (device-local, no sync); k-th capture = "state that produced generated token k".
 
+Capture width is set by the session: `_begin_capture(widen=False)` (default) attaches to the probe-layer union; `_begin_capture(widen=True)` (set by `SamplingConfig.return_hidden=True`) attaches to every model layer. The monitor reads its subset in either case — widening only costs a larger capture dict, which is post-run moved to CPU and attached to `GenerationResult.hidden_states`.
+
 ## monitor.py
 
 `TraitMonitor` scores probes against per-layer hidden states via `_score_probes` (shared `_normalize_hidden` mean-centers with layer means, L2-normalizes, magnitude-weighted cosine sim). **Per-layer weight = `||baked||`** (= `share_L * ref_norm_L`) — recovered from tensor magnitude itself.
@@ -55,6 +57,7 @@ Entry points:
 - `measure_from_hidden(hidden_per_layer)` — test-path pre-aggregated entry.
 - `measure(model, tokenizer, layers, text)` — runs a forward pass; convenience for scoring arbitrary text outside a generation run.
 - `score_single_token(hidden_per_layer)` — inline per-token entry, used by SSE trait stream **and** `generate_stream._push` for live scoring on every emit.
+- `score_stack(captured, *, agg_index=None, accumulate=False)` — per-token scoring over a pre-captured `[T, D]` stack per layer, without the `generated_ids`/`tokenizer` dependency `score_per_token` carries. Researcher-facing path: used by `SaklasSession.score_hidden` to round-trip arbitrary `{layer: tensor}` dicts (e.g. `GenerationResult.hidden_states` from a prior `return_hidden=True` call). `accumulate` defaults to `False` here — ad-hoc scoring must not pollute the TUI's running-mean history.
 
 **Live running mean** for streaming: `begin_live()` / `update_live(scores)` / `end_live()` maintain a per-probe running mean across the current gen; `get_current_and_previous` prefers live values when present so the TUI trait-panel ticks during streaming. `_pending_aggregate` / `_pending_per_token` split so the TUI poll sees aggregate readiness independently.
 
@@ -82,6 +85,8 @@ session.generate(input, *, steering=None, sampling=None, stateless=False, raw=Fa
 - deterministic teardown: `stop_requested.set()` → worker join → `_end_capture()` → `_clear_steering()`
 
 `generate_stream` spawns a worker running `_generate_core` with an internal `on_token` that enqueues `TokenEvent`s into a local `SimpleQueue`; iterator `close()` / `GeneratorExit` triggers the same teardown.
+
+**Hidden-state round-trip**: `sampling=SamplingConfig(return_hidden=True)` widens `HiddenCapture` to every model layer; the result carries `hidden_states: dict[int, Tensor]` (per-generated-token `[T, D]` on CPU, trimmed to `len(generated_ids)`). Partner method `session.score_hidden(hidden, *, per_token=False, accumulate=False)` scores any compatible dict — from a result, from user-captured tensors, or from another run — through the same monitor primitives. `accumulate=False` default so ad-hoc scoring stays out of TUI history. `to_dict()` omits `hidden_states` (tensors don't serialize into the JSON path; persist explicitly with `torch.save`).
 
 **Monitor scoring is in-flight**: `_generate_core` attaches `HiddenCapture` on the union of probe layers, `_finalize_generation` → `score_captured` → `monitor.score_per_token`, no second forward pass. Events emitted from the hot path: `GenerationStarted`, `SteeringApplied`, `SteeringCleared`, `ProbeScored`, `GenerationFinished`, plus `VectorExtracted` from `extract()`. Server/TUI subscribers must hop via `loop.call_soon_threadsafe` for an event-loop context.
 
