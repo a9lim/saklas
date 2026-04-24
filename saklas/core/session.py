@@ -34,6 +34,7 @@ from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent, ProbeReadings
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
+from saklas.core.steering_expr import AblationTerm
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import (
     extract_contrastive,
@@ -134,6 +135,14 @@ class VectorNotRegisteredError(KeyError, SaklasError):
     pass
 
 
+# Internal steering-stack entry shape: additive entries are
+# ``(alpha, Trigger)`` tuples; ablation entries are ``AblationTerm``
+# values carrying their own coeff + trigger + target.  The union flows
+# through the stack, ``_flatten``, ``_push``/``_pop``, and is dispatched
+# by type in ``_rebuild_steering_hooks`` and ``_apply_steering``.
+SteeringStackEntry = tuple[float, Trigger] | AblationTerm
+
+
 class _SteeringContext:
     """Context manager returned by SaklasSession.steering().
 
@@ -143,8 +152,10 @@ class _SteeringContext:
     for the duration of the inner scope, then the outer entry is restored.
 
     The stored ``_entries`` is the post-resolution entries form — each
-    value is ``(alpha, Trigger)``.  Bare-alpha inputs to the public
-    ``steering()`` API are normalized before we get here.
+    value is either ``(alpha, Trigger)`` for additive/projection terms or
+    an :class:`~saklas.core.steering_expr.AblationTerm` for mean-replacement
+    ablation.  Bare-alpha inputs to the public ``steering()`` API are
+    normalized before we get here.
     """
 
     __slots__ = ("_session", "_entries", "_entered")
@@ -152,7 +163,7 @@ class _SteeringContext:
     def __init__(
         self,
         session: "SaklasSession",
-        entries: dict[str, tuple[float, Trigger]],
+        entries: dict[str, SteeringStackEntry],
     ) -> None:
         self._session = session
         self._entries = entries
@@ -240,7 +251,7 @@ class SaklasSession:
         # different trigger regimes compose cleanly.  The flattened head
         # (later entries overwrite earlier ones) is what the steering
         # manager installs when a generation begins.
-        self._steering_stack: list[dict[str, tuple[float, Trigger]]] = []
+        self._steering_stack: list[dict[str, SteeringStackEntry]] = []
 
         # Synchronous event bus.  Emits on extraction, steering enter/exit,
         # probe scoring, generation start/finish.  Subscribers run on the
@@ -1120,7 +1131,36 @@ class SaklasSession:
         # loses the ``base`` / ``onto`` / ``operator`` fields.
         self._materialize_projections(steering_obj)
         raw_entries = steering_obj.normalized_entries()
-        resolved = self._resolve_pole_aliases(raw_entries)
+        resolved: dict[str, SteeringStackEntry] = dict(
+            self._resolve_pole_aliases(raw_entries)
+        )
+
+        # Fold in ablation entries alongside additive/projection ones.
+        # ``normalized_entries`` strips ``AblationTerm`` values, so walk
+        # ``steering_obj.alphas`` directly.  Keys already carry the
+        # ``!<target>`` form from the parser and live in a disjoint
+        # namespace from plain/projection keys, so no collision is
+        # possible.  Attempt autoload for the target so a client can
+        # reference an installed pack without an explicit ``extract()``;
+        # genuine misses surface through ``_rebuild_steering_hooks``
+        # uniformly with the additive path.
+        for key, val in steering_obj.alphas.items():
+            if not isinstance(val, AblationTerm):
+                continue
+            target = val.target
+            if target not in self._profiles:
+                if ":" in target:
+                    canonical, variant = target.rsplit(":", 1)
+                else:
+                    canonical, variant = target, "raw"
+                try:
+                    self._try_autoload_vector(canonical, variant=variant)
+                except Exception:
+                    # Non-raw variant miss raises AmbiguousVariantError or
+                    # UnknownVariantError; let it surface at hook-install
+                    # with the shared VectorNotRegisteredError shape.
+                    pass
+            resolved[key] = val
         return _SteeringContext(self, resolved)
 
     def _materialize_projections(self, steering: Steering) -> None:
@@ -1280,7 +1320,7 @@ class SaklasSession:
             )
 
     def _push_steering(
-        self, entries: dict[str, tuple[float, Trigger]],
+        self, entries: dict[str, SteeringStackEntry],
     ) -> None:
         """Push an entries dict onto the steering stack and rebuild hooks.
 
@@ -1312,15 +1352,25 @@ class SaklasSession:
         """Emit SteeringApplied with alphas-only + full entries.
 
         ``alphas`` carries the flat ``{name: alpha}`` shape; ``entries``
-        carries the full ``{name: (alpha, trigger)}`` mapping.
+        carries the full ``{name: (alpha, trigger)}`` mapping.  Ablation
+        entries keyed under ``!<target>`` flatten to their ``(coeff,
+        trigger)`` pair so subscribers see one uniform tuple shape.
         """
         flat = self._flatten_steering_stack()
-        alphas_only = {name: alpha for name, (alpha, _trig) in flat.items()}
-        self.events.emit(SteeringApplied(alphas=alphas_only, entries=dict(flat)))
+        alphas_only: dict[str, float] = {}
+        entries_out: dict[str, tuple[float, Trigger]] = {}
+        for name, entry in flat.items():
+            if isinstance(entry, AblationTerm):
+                alphas_only[name] = entry.coeff
+                entries_out[name] = (entry.coeff, entry.trigger)
+                continue
+            alphas_only[name] = entry[0]
+            entries_out[name] = entry
+        self.events.emit(SteeringApplied(alphas=alphas_only, entries=entries_out))
 
-    def _flatten_steering_stack(self) -> dict[str, tuple[float, Trigger]]:
+    def _flatten_steering_stack(self) -> dict[str, SteeringStackEntry]:
         """Collapse the LIFO stack into a single entries dict (later wins)."""
-        flat: dict[str, tuple[float, Trigger]] = {}
+        flat: dict[str, SteeringStackEntry] = {}
         for entry in self._steering_stack:
             flat.update(entry)
         return flat
@@ -1332,13 +1382,29 @@ class SaklasSession:
         ``clear_all``.  One hook installation per active layer regardless
         of nesting depth — ``SteeringManager.apply_to_model`` composes
         per-layer vectors internally and groups entries by trigger within
-        each layer.
+        each layer.  Dispatches by entry type: plain tuples route to
+        :meth:`SteeringManager.add_vector`, :class:`AblationTerm` values
+        route to :meth:`SteeringManager.add_ablation` using the term's
+        ``target`` as the registry key.
         """
         flat = self._flatten_steering_stack()
         self._steering.clear_all()
         if not flat:
             return
-        for name, (alpha, trigger) in flat.items():
+        for name, entry in flat.items():
+            if isinstance(entry, AblationTerm):
+                target = entry.target
+                if target not in self._profiles:
+                    raise VectorNotRegisteredError(
+                        f"No vector registered for ablation target '{target}'"
+                    )
+                self._steering.add_ablation(
+                    target, self._profiles[target],
+                    alpha=entry.coeff, trigger=entry.trigger,
+                    layer_means=self._layer_means,
+                )
+                continue
+            alpha, trigger = entry
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
             self._steering.add_vector(
@@ -1347,16 +1413,30 @@ class SaklasSession:
         self._steering.apply_to_model(self._layers, self._device, self._dtype)
 
     def _apply_steering(
-        self, entries: dict[str, tuple[float, Trigger]],
+        self, entries: dict[str, SteeringStackEntry],
     ) -> None:
         """Compose and attach steering hooks for a generation call.
 
         Must be called inside a ``_gen_active`` span (entry points set
         ``_gen_active=True`` before invoking this).  The check is defense
         in depth against a rogue caller re-entering outside a gen span.
+        Dispatches by entry type — mirrors :meth:`_rebuild_steering_hooks`.
         """
         self._steering.clear_all()
-        for name, (alpha, trigger) in entries.items():
+        for name, entry in entries.items():
+            if isinstance(entry, AblationTerm):
+                target = entry.target
+                if target not in self._profiles:
+                    raise VectorNotRegisteredError(
+                        f"No vector registered for ablation target '{target}'"
+                    )
+                self._steering.add_ablation(
+                    target, self._profiles[target],
+                    alpha=entry.coeff, trigger=entry.trigger,
+                    layer_means=self._layer_means,
+                )
+                continue
+            alpha, trigger = entry
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
             self._steering.add_vector(
@@ -1657,12 +1737,15 @@ class SaklasSession:
 
         def _snapshot_alphas() -> dict[str, float]:
             """Flatten the steering stack to ``{name: alpha}`` — triggers
-            stripped for ``GenerationResult.vectors``."""
-            return {
-                name: alpha
-                for name, (alpha, _trig)
-                in self._flatten_steering_stack().items()
-            }
+            stripped for ``GenerationResult.vectors``.  Ablation entries
+            surface under their ``!<target>`` key with the term's coeff."""
+            snap: dict[str, float] = {}
+            for name, entry in self._flatten_steering_stack().items():
+                if isinstance(entry, AblationTerm):
+                    snap[name] = entry.coeff
+                    continue
+                snap[name] = entry[0]
+            return snap
 
         vector_snapshot: dict[str, float] = (
             _snapshot_alphas()
