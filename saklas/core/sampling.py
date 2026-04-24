@@ -37,11 +37,18 @@ class SamplingConfig:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     logprobs: int | None = None  # 0 = chosen-only, >0 = top-k
+    # Opt-in: when True, GenerationResult.hidden_states is populated with
+    # per-generated-token, per-layer residual-stream captures (all model
+    # layers, CPU, detached). False keeps the fast path bit-identical to
+    # today — HiddenCapture stays on probe-layer union.
+    return_hidden: bool = False
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
-        # dataclass stays hashable.
-        if self.stop is not None and not isinstance(self.stop, tuple):
+        # dataclass stays hashable. Type annotation narrows to tuple so
+        # the isinstance check looks redundant to static analysis, but
+        # it's a real runtime guard against lists slipping through.
+        if self.stop is not None and not isinstance(self.stop, tuple):  # pyright: ignore[reportUnnecessaryIsInstance]
             object.__setattr__(self, "stop", tuple(self.stop))
 
     # Default sentinels used by merged_with — matches the dataclass defaults.
@@ -56,6 +63,7 @@ class SamplingConfig:
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
         "logprobs": None,
+        "return_hidden": False,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

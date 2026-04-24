@@ -353,3 +353,47 @@ class TestProbesBootstrap:
             )
             assert isinstance(probes, dict)
             assert "happy.sad" in probes
+
+
+class TestAblationPerformance:
+    """Combined ablation + additive throughput must stay >= 80% of vanilla.
+
+    Slightly looser than the steered-only 85% bar because the hot path
+    does one extra matmul per active ablation layer per step. Intentional.
+    """
+
+    def test_throughput_with_ablation(self, model_and_tokenizer, layers, layer_means):
+        from saklas.core.session import SaklasSession
+
+        model, tokenizer = model_and_tokenizer
+        session = SaklasSession(model, tokenizer, probes=["affect"])
+
+        try:
+            prompt = "Write a 200-word essay on the history of bicycles."
+
+            # Vanilla baseline.
+            t0 = time.perf_counter()
+            r_vanilla = session.generate(prompt)
+            dt_vanilla = max(time.perf_counter() - t0, 0.1)
+            tok_s_vanilla = max(len(r_vanilla.text.split()) / dt_vanilla, 1e-6)
+
+            # Pick two probes from the auto-loaded set: one for additive, one for ablation.
+            probes = list(session.probes)
+            assert len(probes) >= 2, "need at least two probes for this test"
+            additive_name, ablation_name = probes[0], probes[1]
+
+            expr = f"0.3 {additive_name} + !{ablation_name}"
+            t0 = time.perf_counter()
+            with session.steering(expr):
+                r_combined = session.generate(prompt)
+            dt_combined = max(time.perf_counter() - t0, 0.1)
+            tok_s_combined = max(len(r_combined.text.split()) / dt_combined, 1e-6)
+
+            ratio = tok_s_combined / tok_s_vanilla
+            assert ratio >= 0.80, (
+                f"combined ablation + additive too slow: "
+                f"{ratio:.2%} of vanilla (vanilla={tok_s_vanilla:.1f} tok/s, "
+                f"combined={tok_s_combined:.1f} tok/s)"
+            )
+        finally:
+            session.close()

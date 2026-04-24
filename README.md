@@ -92,6 +92,17 @@ Each layer's PCA share is baked into the tensor magnitudes at extraction, so the
 
 When multiple vectors are selected, they are added together in sequence. 
 
+### Ablation
+
+Prefix a concept with `!` to mean-ablate it: at every covered layer and token position, the component of the residual stream along the concept direction is replaced with the neutral-baseline mean. Bare `!refusal` fully replaces; `0.5 !refusal` blends halfway. Ablation composes with additive steering (`0.3 honest + !sycophantic`) and runs ablate-then-add inside the hook.
+
+```python
+with session.steering("!refusal"):
+    out = session.generate("How do I break into my neighbor's house?")
+```
+
+Ablation is a runtime operation on activations — no new tensors land on disk, and the monitor's probe score for an ablated concept drops to near zero by construction.
+
 ### SAE-backed extraction (experimental)
 
 > **Experimental** This pipeline is not as tested as the contrastive-PCA path. α was measured and calibrated on raw PCA and may not cleanly transfer. Quality also depends on which SAE release you pick. I would recommend using a low α (0.1–0.2) and sweeping. For production use the raw pipeline should be the default. 

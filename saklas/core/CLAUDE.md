@@ -31,15 +31,19 @@ Model-name matching is lenient (`_model_names_match`): SAELens's `cfg.model_name
 
 ## hooks.py
 
-`SteeringHook` adds a pre-composed vector to hidden states and **unconditionally rescales each position back to its pre-injection norm** (in-place, `torch.linalg.vector_norm(dtype=float32)` to avoid fp16 sum-of-squares overflow at hidden_dim ≥ 2048). No flag, no escape hatch.
+`SteeringHook` adds pre-composed vectors to hidden states and **unconditionally rescales each position back to its pre-injection norm** (in-place, `torch.linalg.vector_norm(dtype=float32)` to avoid fp16 sum-of-squares overflow at hidden_dim ≥ 2048). The slow path now handles both additive steering and mean-replacement ablation: each forward, ablation groups in `ablation_groups` fire first (subtract the component along `d̂` and restore the neutral mean: `h' = h - α(h·d̂ - μ·d̂)d̂` per active direction), then additive groups, then the norm-preservation rescale wraps the combined op. Multi-direction ablation at one layer is naive-parallel — exact for orthogonal targets, over-ablates along the shared axis for correlated targets (users wanting a clean subspace ablation compose `!a + !b|a`). Fast path (single `Trigger.BOTH` additive group, no ablation) stays bit-identical to v1.4 — one composed tensor, no per-step trigger check.
 
 **Trigger grouping (v1.5)**: `recompose` takes `(tensor, alpha, trigger)` triples and groups entries by `Trigger` value. Fast path (single group with `Trigger.BOTH`) collapses to one composed tensor and skips the per-step `.active(ctx)` check, bit-identical to the v1.4 hook. Slow path stores `composed_groups: list[(Trigger, Tensor)]`; `hook_fn` consults each group's trigger against a shared `TriggerContext` and adds only active ones. The norm-preservation rescale wraps the conditional sum, and a pre-check short-circuits the fp32 norm round-trip when no group fires (e.g. `AFTER_THINKING` during prefill).
 
 `SteeringManager` groups vectors by layer, sums co-layer directions into **one pre-composed hook per active layer**. `add_vector(name, profile, alpha, trigger=Trigger.BOTH)`. **Flat-scalar apply**: `effective_injection = user_alpha * _STEER_GAIN * sum(baked)` — no per-layer score lookup, no `sum(scores)` division. Preserves layer-count invariance and score-magnitude invariance; both moved from apply-time to extract-time. Manager owns the per-generation `TriggerContext`; `generate_steered` mutates its `is_prefill` / `thinking` / `gen_step` fields before each forward pass.
 
+`add_ablation(name, profile, alpha, trigger, layer_means)` parallels `add_vector`. At `apply_to_model` time, per-layer ablation entries are computed (unit direction, mean scalar) and grouped by trigger on the same `SteeringHook` that carries any additive groups for that layer. Profile layers missing from `layer_means` are silently skipped — ablation without a baseline mean is undefined.
+
 `_STEER_GAIN = 2.0` calibrated on gemma-4-31b-it (post-`drop_edges=(2,2)`). Coherent band α ≈ 0.3–0.85, cliff α ≈ 0.95+. Cliff transfers within ±0.1α across architectures; smaller/MoE/safety-trained models may need proportionally higher α. Historical note: pre-`drop_edges`, gain was 3.5 with band α ≈ 0.2–0.6 / cliff 0.75; edge-drop tightens middle-layer concentration, and the current 2.0 value trades moderate-α potency for a wide coherent band — users dialing for subtle steering land at α ≈ 0.3, aggressive at α ≈ 0.7, cliff essentially unreachable at α ≤ 0.85.
 
 `HiddenCapture` — session + TUI companion: `attach(layers, layer_indices)` / `detach()` / `stacked()`. Each capture is `detach().clone()` of `output[0, -1, :]` (device-local, no sync); k-th capture = "state that produced generated token k".
+
+Capture width is set by the session: `_begin_capture(widen=False)` (default) attaches to the probe-layer union; `_begin_capture(widen=True)` (set by `SamplingConfig.return_hidden=True`) attaches to every model layer. The monitor reads its subset in either case. Widening pays one device-to-host transfer per layer in `_finalize_generation` — each captured `[T, D]` tensor is moved to CPU and attached to `GenerationResult.hidden_states`. Opt-in only; the fast path is bit-identical when `return_hidden=False`.
 
 ## monitor.py
 
@@ -53,6 +57,7 @@ Entry points:
 - `measure_from_hidden(hidden_per_layer)` — test-path pre-aggregated entry.
 - `measure(model, tokenizer, layers, text)` — runs a forward pass; convenience for scoring arbitrary text outside a generation run.
 - `score_single_token(hidden_per_layer)` — inline per-token entry, used by SSE trait stream **and** `generate_stream._push` for live scoring on every emit.
+- `score_stack(captured, *, agg_index=None, accumulate=False)` — per-token scoring over a pre-captured `[T, D]` stack per layer, without the `generated_ids`/`tokenizer` dependency `score_per_token` carries. Researcher-facing path: used by `SaklasSession.score_hidden` to round-trip arbitrary `{layer: tensor}` dicts (e.g. `GenerationResult.hidden_states` from a prior `return_hidden=True` call). `accumulate` defaults to `False` here — ad-hoc scoring must not pollute the TUI's running-mean history.
 
 **Live running mean** for streaming: `begin_live()` / `update_live(scores)` / `end_live()` maintain a per-probe running mean across the current gen; `get_current_and_previous` prefers live values when present so the TUI trait-panel ticks during streaming. `_pending_aggregate` / `_pending_per_token` split so the TUI poll sees aggregate readiness independently.
 
@@ -81,6 +86,8 @@ session.generate(input, *, steering=None, sampling=None, stateless=False, raw=Fa
 
 `generate_stream` spawns a worker running `_generate_core` with an internal `on_token` that enqueues `TokenEvent`s into a local `SimpleQueue`; iterator `close()` / `GeneratorExit` triggers the same teardown.
 
+**Hidden-state round-trip**: `sampling=SamplingConfig(return_hidden=True)` widens `HiddenCapture` to every model layer; the result carries `hidden_states: dict[int, Tensor]` (per-generated-token `[T, D]` on CPU, trimmed to `len(generated_ids)`). Partner method `session.score_hidden(hidden, *, per_token=False, accumulate=False)` scores any compatible dict — from a result, from user-captured tensors, or from another run — through the same monitor primitives. `accumulate=False` default so ad-hoc scoring stays out of TUI history. `to_dict()` omits `hidden_states` (tensors don't serialize into the JSON path; persist explicitly with `torch.save`).
+
 **Monitor scoring is in-flight**: `_generate_core` attaches `HiddenCapture` on the union of probe layers, `_finalize_generation` → `score_captured` → `monitor.score_per_token`, no second forward pass. Events emitted from the hot path: `GenerationStarted`, `SteeringApplied`, `SteeringCleared`, `ProbeScored`, `GenerationFinished`, plus `VectorExtracted` from `extract()`. Server/TUI subscribers must hop via `loop.call_soon_threadsafe` for an event-loop context.
 
 **`session.lock`** is an `asyncio.Lock` distinct from the threading `_gen_lock`; it's the server-owned async-level serializer that queues concurrent HTTP requests FIFO, not a generation-reentry guard.
@@ -96,6 +103,8 @@ session.generate(input, *, steering=None, sampling=None, stateless=False, raw=Fa
 Per-call `SamplingConfig` (frozen with `merged_with`), `Steering` (frozen; `from_value` accepts `str | Steering | None` and routes strings through the shared parser — dicts are rejected), `ProjectedTerm` (runtime-projection value inside `Steering.alphas`), synchronous `EventBus` + 6 event dataclasses, `SaklasError` base (all others multi-inherit through it preserving stdlib MRO), and the `Profile` class wrapping `dict[int, Tensor]` with `.layers` / `.weight_at` / `.save` / `.load` / `.to_gguf` / `.merged` / `.merged_with` / `.promoted_to` / `.cosine_similarity` / `.projected_away`. `cosine_similarity(other, *, per_layer=False)` computes magnitude-weighted cosine over shared layers (aggregate `float`) or raw per-layer cosines (`dict[int, float]`). `projected_away(other)` removes other's direction per-layer via orthogonal projection (fp32, near-zero guard). Empty intersection raises `ProfileError`.
 
 `steering_expr.py` hosts the unified grammar that every input surface shares. `parse_expr(text, *, namespace=None)` returns a `Steering`; `format_expr(steering)` renders it back (round-trips by design). `referenced_selectors(text)` yields `(ns, concept, variant)` triples pre-resolution for install-time checks. `Steering.__str__` delegates to `format_expr` so `str(steering)` is the canonical receipt. Projection terms land in `Steering.alphas` as `ProjectedTerm(coeff, trigger, operator, base, onto)`; the session materializes them into derived profiles via `_materialize_projections` before the hook layer sees anything.
+
+`!atom` — unary prefix on a term, produces an `AblationTerm` in `Steering.alphas` under key `!<target>`. Default coefficient is 1.0 (fully replace the component with the neutral mean); `0.5 !x` blends halfway. Does not compose with projection operators — `!a|b` raises. Ablation terms are dispatched separately at `_SteeringContext` entry; `normalized_entries()` skips them, and `_rebuild_steering_hooks` routes them to `SteeringManager.add_ablation` instead of `add_vector`.
 
 ## vectors.py::project_profile
 

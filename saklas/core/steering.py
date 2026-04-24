@@ -31,14 +31,21 @@ from typing import Mapping, TYPE_CHECKING, Union
 from saklas.core.triggers import Trigger
 
 if TYPE_CHECKING:
-    from saklas.core.steering_expr import ProjectedTerm
+    from saklas.core.steering_expr import AblationTerm, ProjectedTerm
 
 #: Accepted shapes for a single entry in ``Steering.alphas`` — a bare
 #: alpha (inherits ``Steering.trigger``), a ``(alpha, Trigger)`` tuple for
-#: a per-entry trigger override, or a
+#: a per-entry trigger override, a
 #: :class:`~saklas.core.steering_expr.ProjectedTerm` for runtime
-#: projection (materialized into a derived profile by the session).
-AlphaEntry = Union[float, "tuple[float, Trigger]", "ProjectedTerm"]
+#: projection (materialized into a derived profile by the session), or
+#: an :class:`~saklas.core.steering_expr.AblationTerm` for
+#: mean-replacement ablation.
+AlphaEntry = Union[
+    float,
+    "tuple[float, Trigger]",
+    "ProjectedTerm",
+    "AblationTerm",
+]
 
 
 @dataclass(frozen=True)
@@ -96,13 +103,17 @@ class Steering:
         downstream of pole resolution works in this shape.  Synthetic
         projection keys (``"<base><op><onto>"``) pass through verbatim;
         the session is responsible for materializing the derived profile
-        before the manager sees the key.
+        before the manager sees the key.  ``AblationTerm`` values are
+        skipped — ablation is dispatched directly off ``Steering.alphas``
+        at the session layer rather than through this flattened view.
         """
-        from saklas.core.steering_expr import ProjectedTerm
+        from saklas.core.steering_expr import AblationTerm, ProjectedTerm
 
         out: dict[str, tuple[float, Trigger]] = {}
         default = self.trigger
         for name, val in self.alphas.items():
+            if isinstance(val, AblationTerm):
+                continue
             if isinstance(val, ProjectedTerm):
                 out[name] = (float(val.coeff), val.trigger)
                 continue

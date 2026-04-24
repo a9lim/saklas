@@ -615,3 +615,271 @@ def test_referenced_selectors_projection_contributes_two_atoms():
 def test_referenced_selectors_empty_or_whitespace_returns_empty():
     assert referenced_selectors("") == []
     assert referenced_selectors("   \t  ") == []
+
+
+# -------------------------------------------------------------- ablation ---
+
+def test_bare_ablation_defaults_to_coeff_one():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("!honest")
+    assert set(s.alphas.keys()) == {"!honest"}
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == 1.0
+    assert term.target == "honest"
+    assert term.trigger == Trigger.BOTH
+
+
+def test_ablation_term_is_frozen():
+    from dataclasses import FrozenInstanceError
+    from saklas.core.steering_expr import AblationTerm
+    t = AblationTerm(coeff=1.0, trigger=Trigger.BOTH, target="x")
+    with pytest.raises(FrozenInstanceError):
+        t.coeff = 0.5  # type: ignore[misc]
+
+
+def test_ablation_explicit_coefficient():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("0.5 !honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == 0.5
+
+
+def test_ablation_negative_sign():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("-!honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == -1.0
+
+
+def test_ablation_star_form():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("0.7 * !honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == 0.7
+
+
+def test_ablation_signed_explicit():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("-0.3 !honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == -0.3
+
+
+def test_ablation_with_namespace(tmp_path):
+    from saklas.core.steering_expr import AblationTerm
+    _mk(tmp_path, "bob", "custom", tags=[])
+    s = parse_expr("!bob/custom")
+    # Namespace prefix is resolved away to the canonical concept name,
+    # matching plain-term behavior (see test_namespace_prefix_resolves_to_name).
+    term = s.alphas["!custom"]
+    assert isinstance(term, AblationTerm)
+    assert term.target == "custom"
+
+
+def test_ablation_with_trigger():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("!refusal@response")
+    term = s.alphas["!refusal"]
+    assert isinstance(term, AblationTerm)
+    assert term.target == "refusal"
+    assert term.trigger == Trigger.GENERATED_ONLY
+    assert term.coeff == 1.0
+
+
+def test_ablation_with_sae_variant():
+    from saklas.core.steering_expr import AblationTerm
+    # Variant is baked into the canonical name for plain terms (see
+    # test_sae_variant_suffix_preserved), and ablation stores the full
+    # variant-suffixed target verbatim.
+    s = parse_expr("!honest:sae")
+    term = s.alphas["!honest:sae"]
+    assert isinstance(term, AblationTerm)
+    assert term.target == "honest:sae"
+
+
+# Ablation + projection is a grammar error — ablation ("project the
+# component onto d̂ then land it on the mean") and projection ("decompose
+# direction d̂ along onto") are different operations on the same atom.
+# Composing them in one term yields ambiguous hook math; the spec opts
+# for a hard error and tells the user to split the term.
+
+
+def test_ablation_with_orthogonal_projection_rejected():
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("!honest|sycophantic")
+    assert "ablation" in str(ei.value).lower()
+    assert "projection" in str(ei.value).lower()
+
+
+def test_ablation_with_onto_projection_rejected():
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("!honest~sycophantic")
+    assert "ablation" in str(ei.value).lower()
+    assert "projection" in str(ei.value).lower()
+
+
+# ---------------------------------------------------- ablation format/round-trip ---
+
+def test_format_ablation_bare():
+    s = parse_expr("!honest")
+    assert format_expr(s) == "!honest"
+
+
+def test_format_ablation_explicit_coeff():
+    s = parse_expr("0.5 !honest")
+    assert format_expr(s) == "0.5 !honest"
+
+
+def test_format_ablation_negative_bare():
+    s = parse_expr("-!honest")
+    assert format_expr(s) == "-!honest"
+
+
+def test_format_ablation_trigger_emitted():
+    s = parse_expr("!refusal@response")
+    assert format_expr(s) == "!refusal@response"
+
+
+def test_format_ablation_trigger_both_elided():
+    s = parse_expr("!refusal@both")
+    assert format_expr(s) == "!refusal"
+
+
+def test_format_ablation_composed_with_additive():
+    s = parse_expr("0.3 honest + !sycophantic")
+    assert format_expr(s) == "0.3 honest + !sycophantic"
+
+
+def test_format_ablation_separator_when_negative():
+    # A negative ablation following an additive term should render through
+    # the ``" - "`` separator, mirroring how ``- 0.2 foo`` is formatted.
+    s = parse_expr("0.3 honest - !sycophantic")
+    assert format_expr(s) == "0.3 honest - !sycophantic"
+
+
+def test_format_ablation_variant_preserved():
+    s = parse_expr("!honest:sae-gemma-scope")
+    assert format_expr(s) == "!honest:sae-gemma-scope"
+
+
+@pytest.mark.parametrize("text", [
+    "!honest",
+    "0.5 !honest",
+    "-!honest",
+    "-0.3 !honest",
+    "!refusal@response",
+    "!honest:sae",
+    "!honest:sae-gemma-scope",
+    "0.3 honest + !sycophantic",
+    "0.3 honest - !sycophantic",
+    "!refusal + !sycophantic",
+])
+def test_ablation_format_parse_format_is_stable(text):
+    """Ablation expressions round-trip through parse -> format stably."""
+    s1 = parse_expr(text)
+    r1 = format_expr(s1)
+    s2 = parse_expr(r1)
+    r2 = format_expr(s2)
+    assert r1 == r2
+    assert s1.alphas == s2.alphas
+
+
+# -------------------------------------------------- ablation IR integration ---
+
+# Ablation and additive terms on the same concept are different operations
+# (clean the residual stream vs push a direction); they live under distinct
+# keys so a single Steering can express both.
+
+
+def test_ablation_and_plain_same_concept_coexist():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("0.3 honest + !honest")
+    assert "honest" in s.alphas
+    assert "!honest" in s.alphas
+    assert s.alphas["honest"] == pytest.approx(0.3)
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == 1.0
+
+
+def test_repeated_ablation_sums_coefficients():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("0.3 !honest + 0.2 !honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == pytest.approx(0.5)
+    assert term.trigger == Trigger.BOTH
+
+
+def test_repeated_ablation_with_matching_trigger_sums():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("0.3 !honest@response + 0.2 !honest@response")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == pytest.approx(0.5)
+    assert term.trigger == Trigger.GENERATED_ONLY
+
+
+def test_repeated_ablation_with_conflicting_triggers_rejected():
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("0.3 !honest@before + 0.2 !honest@after")
+    msg = str(ei.value).lower()
+    assert "conflicting" in msg
+    assert "ablation" in msg or "trigger" in msg
+
+
+def test_normalized_entries_skips_ablation():
+    # ``normalized_entries()`` is the additive/projection view consumed by
+    # the hook manager.  Ablation entries dispatch through a separate
+    # session-level branch and must not appear here.
+    s = parse_expr("0.3 honest + !sycophantic + 0.4 warm@after")
+    normalized = s.normalized_entries()
+    assert set(normalized.keys()) == {"honest", "warm"}
+    assert normalized["honest"] == (0.3, Trigger.BOTH)
+    assert normalized["warm"] == (0.4, Trigger.AFTER_THINKING)
+
+
+def test_referenced_selectors_includes_ablation_target():
+    # Install-time hook must fetch the ablation target's pack the same
+    # way it fetches additive terms — the atom lives in the AST whether
+    # or not ``!`` prefixes it.
+    assert referenced_selectors("!refusal") == [(None, "refusal", "raw")]
+
+
+def test_referenced_selectors_ablation_with_namespace_and_variant():
+    assert referenced_selectors("!bob/honest:sae-gemma-scope") == [
+        ("bob", "honest", "sae-gemma-scope"),
+    ]
+
+
+def test_referenced_selectors_mixed_additive_and_ablation():
+    out = referenced_selectors("0.3 honest + !sycophantic")
+    assert out == [(None, "honest", "raw"), (None, "sycophantic", "raw")]
+
+
+def test_steering_str_emits_ablation():
+    s = parse_expr("0.3 honest + !sycophantic")
+    assert str(s) == "0.3 honest + !sycophantic"
+
+
+def test_direct_ablation_construction_round_trips():
+    """Steering built directly with an AblationTerm round-trips through str."""
+    from saklas.core.steering_expr import AblationTerm
+    s = Steering(alphas={
+        "honest": 0.3,
+        "!sycophantic": AblationTerm(
+            coeff=1.0, trigger=Trigger.BOTH, target="sycophantic",
+        ),
+    })
+    rendered = str(s)
+    reparsed = parse_expr(rendered)
+    assert reparsed.alphas["honest"] == 0.3
+    term = reparsed.alphas["!sycophantic"]
+    assert isinstance(term, AblationTerm)
+    assert term.target == "sycophantic"
+    assert term.coeff == 1.0

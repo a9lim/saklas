@@ -8,7 +8,7 @@ import queue
 import re
 import threading
 import time
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Literal, overload
 
 import torch
 
@@ -34,6 +34,7 @@ from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent, ProbeReadings
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
+from saklas.core.steering_expr import AblationTerm
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import (
     extract_contrastive,
@@ -134,6 +135,14 @@ class VectorNotRegisteredError(KeyError, SaklasError):
     pass
 
 
+# Internal steering-stack entry shape: additive entries are
+# ``(alpha, Trigger)`` tuples; ablation entries are ``AblationTerm``
+# values carrying their own coeff + trigger + target.  The union flows
+# through the stack, ``_flatten``, ``_push``/``_pop``, and is dispatched
+# by type in ``_rebuild_steering_hooks`` and ``_apply_steering``.
+SteeringStackEntry = tuple[float, Trigger] | AblationTerm
+
+
 class _SteeringContext:
     """Context manager returned by SaklasSession.steering().
 
@@ -143,8 +152,10 @@ class _SteeringContext:
     for the duration of the inner scope, then the outer entry is restored.
 
     The stored ``_entries`` is the post-resolution entries form — each
-    value is ``(alpha, Trigger)``.  Bare-alpha inputs to the public
-    ``steering()`` API are normalized before we get here.
+    value is either ``(alpha, Trigger)`` for additive/projection terms or
+    an :class:`~saklas.core.steering_expr.AblationTerm` for mean-replacement
+    ablation.  Bare-alpha inputs to the public ``steering()`` API are
+    normalized before we get here.
     """
 
     __slots__ = ("_session", "_entries", "_entered")
@@ -152,7 +163,7 @@ class _SteeringContext:
     def __init__(
         self,
         session: "SaklasSession",
-        entries: dict[str, tuple[float, Trigger]],
+        entries: dict[str, SteeringStackEntry],
     ) -> None:
         self._session = session
         self._entries = entries
@@ -240,7 +251,7 @@ class SaklasSession:
         # different trigger regimes compose cleanly.  The flattened head
         # (later entries overwrite earlier ones) is what the steering
         # manager installs when a generation begins.
-        self._steering_stack: list[dict[str, tuple[float, Trigger]]] = []
+        self._steering_stack: list[dict[str, SteeringStackEntry]] = []
 
         # Synchronous event bus.  Emits on extraction, steering enter/exit,
         # probe scoring, generation start/finish.  Subscribers run on the
@@ -1120,7 +1131,36 @@ class SaklasSession:
         # loses the ``base`` / ``onto`` / ``operator`` fields.
         self._materialize_projections(steering_obj)
         raw_entries = steering_obj.normalized_entries()
-        resolved = self._resolve_pole_aliases(raw_entries)
+        resolved: dict[str, SteeringStackEntry] = dict(
+            self._resolve_pole_aliases(raw_entries)
+        )
+
+        # Fold in ablation entries alongside additive/projection ones.
+        # ``normalized_entries`` strips ``AblationTerm`` values, so walk
+        # ``steering_obj.alphas`` directly.  Keys already carry the
+        # ``!<target>`` form from the parser and live in a disjoint
+        # namespace from plain/projection keys, so no collision is
+        # possible.  Attempt autoload for the target so a client can
+        # reference an installed pack without an explicit ``extract()``;
+        # genuine misses surface through ``_rebuild_steering_hooks``
+        # uniformly with the additive path.
+        for key, val in steering_obj.alphas.items():
+            if not isinstance(val, AblationTerm):
+                continue
+            target = val.target
+            if target not in self._profiles:
+                if ":" in target:
+                    canonical, variant = target.rsplit(":", 1)
+                else:
+                    canonical, variant = target, "raw"
+                try:
+                    self._try_autoload_vector(canonical, variant=variant)
+                except Exception:
+                    # Non-raw variant miss raises AmbiguousVariantError or
+                    # UnknownVariantError; let it surface at hook-install
+                    # with the shared VectorNotRegisteredError shape.
+                    pass
+            resolved[key] = val
         return _SteeringContext(self, resolved)
 
     def _materialize_projections(self, steering: Steering) -> None:
@@ -1280,7 +1320,7 @@ class SaklasSession:
             )
 
     def _push_steering(
-        self, entries: dict[str, tuple[float, Trigger]],
+        self, entries: dict[str, SteeringStackEntry],
     ) -> None:
         """Push an entries dict onto the steering stack and rebuild hooks.
 
@@ -1312,15 +1352,25 @@ class SaklasSession:
         """Emit SteeringApplied with alphas-only + full entries.
 
         ``alphas`` carries the flat ``{name: alpha}`` shape; ``entries``
-        carries the full ``{name: (alpha, trigger)}`` mapping.
+        carries the full ``{name: (alpha, trigger)}`` mapping.  Ablation
+        entries keyed under ``!<target>`` flatten to their ``(coeff,
+        trigger)`` pair so subscribers see one uniform tuple shape.
         """
         flat = self._flatten_steering_stack()
-        alphas_only = {name: alpha for name, (alpha, _trig) in flat.items()}
-        self.events.emit(SteeringApplied(alphas=alphas_only, entries=dict(flat)))
+        alphas_only: dict[str, float] = {}
+        entries_out: dict[str, tuple[float, Trigger]] = {}
+        for name, entry in flat.items():
+            if isinstance(entry, AblationTerm):
+                alphas_only[name] = entry.coeff
+                entries_out[name] = (entry.coeff, entry.trigger)
+                continue
+            alphas_only[name] = entry[0]
+            entries_out[name] = entry
+        self.events.emit(SteeringApplied(alphas=alphas_only, entries=entries_out))
 
-    def _flatten_steering_stack(self) -> dict[str, tuple[float, Trigger]]:
+    def _flatten_steering_stack(self) -> dict[str, SteeringStackEntry]:
         """Collapse the LIFO stack into a single entries dict (later wins)."""
-        flat: dict[str, tuple[float, Trigger]] = {}
+        flat: dict[str, SteeringStackEntry] = {}
         for entry in self._steering_stack:
             flat.update(entry)
         return flat
@@ -1332,13 +1382,29 @@ class SaklasSession:
         ``clear_all``.  One hook installation per active layer regardless
         of nesting depth — ``SteeringManager.apply_to_model`` composes
         per-layer vectors internally and groups entries by trigger within
-        each layer.
+        each layer.  Dispatches by entry type: plain tuples route to
+        :meth:`SteeringManager.add_vector`, :class:`AblationTerm` values
+        route to :meth:`SteeringManager.add_ablation` using the term's
+        ``target`` as the registry key.
         """
         flat = self._flatten_steering_stack()
         self._steering.clear_all()
         if not flat:
             return
-        for name, (alpha, trigger) in flat.items():
+        for name, entry in flat.items():
+            if isinstance(entry, AblationTerm):
+                target = entry.target
+                if target not in self._profiles:
+                    raise VectorNotRegisteredError(
+                        f"No vector registered for ablation target '{target}'"
+                    )
+                self._steering.add_ablation(
+                    target, self._profiles[target],
+                    alpha=entry.coeff, trigger=entry.trigger,
+                    layer_means=self._layer_means,
+                )
+                continue
+            alpha, trigger = entry
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
             self._steering.add_vector(
@@ -1347,16 +1413,30 @@ class SaklasSession:
         self._steering.apply_to_model(self._layers, self._device, self._dtype)
 
     def _apply_steering(
-        self, entries: dict[str, tuple[float, Trigger]],
+        self, entries: dict[str, SteeringStackEntry],
     ) -> None:
         """Compose and attach steering hooks for a generation call.
 
         Must be called inside a ``_gen_active`` span (entry points set
         ``_gen_active=True`` before invoking this).  The check is defense
         in depth against a rogue caller re-entering outside a gen span.
+        Dispatches by entry type — mirrors :meth:`_rebuild_steering_hooks`.
         """
         self._steering.clear_all()
-        for name, (alpha, trigger) in entries.items():
+        for name, entry in entries.items():
+            if isinstance(entry, AblationTerm):
+                target = entry.target
+                if target not in self._profiles:
+                    raise VectorNotRegisteredError(
+                        f"No vector registered for ablation target '{target}'"
+                    )
+                self._steering.add_ablation(
+                    target, self._profiles[target],
+                    alpha=entry.coeff, trigger=entry.trigger,
+                    layer_means=self._layer_means,
+                )
+                continue
+            alpha, trigger = entry
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
             self._steering.add_vector(
@@ -1368,21 +1448,35 @@ class SaklasSession:
         """Remove all steering hooks from the model."""
         self._steering.clear_all()
 
-    def _begin_capture(self) -> bool:
-        """Attach hidden-state capture on probe layers. Returns True if attached."""
-        if not self._monitor.probe_names:
-            return False
-        layer_idxs = sorted({
-            idx for prof in self._monitor.profiles.values() for idx in prof
-        })
-        if not layer_idxs:
-            return False
+    def _begin_capture(self, *, widen: bool = False) -> bool:
+        """Attach hidden-state capture. Returns True if attached.
+
+        ``widen=False`` (default): cover only probe-layer union — what
+        the monitor needs.  Fast path; matches v1 behavior.
+
+        ``widen=True``: cover every model layer.  Used when the caller
+        asked for ``SamplingConfig.return_hidden=True`` — the monitor
+        still reads its subset, but the full dict is available on
+        ``GenerationResult.hidden_states`` after the run.
+        """
+        if widen:
+            layer_idxs = list(range(len(self._layers)))
+        else:
+            if not self._monitor.probe_names:
+                return False
+            layer_idxs = sorted({
+                idx for prof in self._monitor.profiles.values() for idx in prof
+            })
+            if not layer_idxs:
+                return False
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
         return True
 
     def _end_capture(self) -> None:
         self._capture.detach()
+
+    # -- Score entry points --
 
     def score_captured(
         self, generated_ids: list[int], *, accumulate: bool = True,
@@ -1399,6 +1493,117 @@ class SaklasSession:
         return self._monitor.score_per_token(
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
+
+    @overload
+    def score_hidden(
+        self,
+        hidden: dict[int, torch.Tensor],
+        *,
+        per_token: Literal[False] = False,
+        accumulate: bool = False,
+    ) -> dict[str, float]: ...
+    @overload
+    def score_hidden(
+        self,
+        hidden: dict[int, torch.Tensor],
+        *,
+        per_token: Literal[True],
+        accumulate: bool = False,
+    ) -> tuple[dict[str, float], dict[str, list[float]]]: ...
+    def score_hidden(
+        self,
+        hidden: dict[int, torch.Tensor],
+        *,
+        per_token: bool = False,
+        accumulate: bool = False,
+    ) -> (
+        dict[str, float]
+        | tuple[dict[str, float], dict[str, list[float]]]
+    ):
+        """Score registered probes against a pre-captured hidden-state dict.
+
+        Accepts any ``{layer_idx: Tensor}`` mapping — e.g. the
+        ``GenerationResult.hidden_states`` dict from a prior
+        ``generate(..., sampling=SamplingConfig(return_hidden=True))``
+        call, or hidden states the caller captured externally.
+
+        Shape rules:
+        - Each value ``[D]``          → single-state aggregate.
+          Returns ``dict[probe, float]``.
+        - Each value ``[T, D]``       → per-token stack.
+          ``per_token=False`` (default) returns the aggregate pooled from
+          row ``T-1``; ``per_token=True`` returns
+          ``(aggregate, per_token_scores)``.
+
+        Mixed shapes (``[D]`` alongside ``[T, D]``) or uneven ``T`` across
+        layers raise :class:`SaklasError`. Empty dict raises.
+
+        ``accumulate`` defaults to ``False`` — ad-hoc researcher scoring
+        does not pollute the monitor's running-mean history. Pass
+        ``True`` to feed this call into the same stats pipeline the TUI
+        reads from.
+        """
+        if not hidden:
+            raise SaklasError("score_hidden: no layers provided")
+
+        # Classify shapes up-front.
+        shapes = [v.ndim for v in hidden.values()]
+        if len(set(shapes)) > 1:
+            by_ndim: dict[int, list[int]] = {}
+            for layer_idx, t in hidden.items():
+                by_ndim.setdefault(t.ndim, []).append(layer_idx)
+            detail = ", ".join(
+                f"ndim={n} at layers {ls}" for n, ls in sorted(by_ndim.items())
+            )
+            raise SaklasError(
+                "score_hidden: mixed shapes in input; expected either all "
+                f"[D] or all [T, D] across layers ({detail})",
+            )
+        if shapes[0] not in (1, 2):
+            raise SaklasError(
+                f"score_hidden: expected [D] or [T, D] tensors, got ndim={shapes[0]}",
+            )
+
+        # Dim pre-flight: each input tensor's last dim must match any
+        # probe that covers that layer. Without this, a shape mismatch
+        # would leak a raw torch RuntimeError at the scoring matmul,
+        # violating the "all public errors are SaklasError" invariant.
+        for layer_idx, t in hidden.items():
+            actual_dim = t.shape[-1]
+            for probe_name, profile in self._monitor.profiles.items():
+                probe_vec = profile.get(layer_idx)
+                if probe_vec is None:
+                    continue
+                expected_dim = probe_vec.shape[-1]
+                if expected_dim != actual_dim:
+                    raise SaklasError(
+                        f"score_hidden: dim mismatch at layer {layer_idx} — "
+                        f"got {actual_dim}, probe '{probe_name}' expects "
+                        f"{expected_dim}",
+                    )
+                break  # one covering probe settles the expected dim
+
+        if shapes[0] == 1:
+            if per_token:
+                # [D] input + per_token is meaningless.
+                raise SaklasError(
+                    "score_hidden: per_token=True requires [T, D] input; "
+                    "got [D] (single state per layer)",
+                )
+            # Fall through to the monitor's single-state path.
+            return self._monitor.measure_from_hidden(hidden, accumulate=accumulate)
+
+        # [T, D] path — delegate to monitor.score_stack. Wrap its
+        # ValueError (uneven T across layers is the only path that
+        # can reach here after the shape checks above) so callers
+        # catching SaklasError get a uniform exception surface.
+        try:
+            agg, per_tok = self._monitor.score_stack(
+                hidden, accumulate=accumulate,
+            )
+        except ValueError as exc:
+            raise SaklasError(f"score_hidden: {exc}") from exc
+        return (agg, per_tok) if per_token else agg
 
     def _promote_profile(self, profile: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
         return {idx: vec.to(self._device, self._dtype) for idx, vec in profile.items()}
@@ -1484,6 +1689,8 @@ class SaklasSession:
         stateless: bool = False,
         logprobs_list: list[tuple[int, float, list[tuple[int, float]]]] | None = None,
         applied_steering: str | None = None,
+        *,
+        return_hidden: bool = False,
     ) -> GenerationResult:
         """Shared post-generation: decode, measure probes, build result, update history."""
         token_count = len(generated_ids)
@@ -1516,6 +1723,25 @@ class SaklasSession:
             self._last_per_token_scores = None
             readings = self.build_readings()
 
+        hidden_states: dict[int, torch.Tensor] | None = None
+        if return_hidden and generated_ids:
+            raw = self._capture.stacked()  # {layer_idx: [n_captured, D] on device}
+            n = len(generated_ids)
+            trimmed: dict[int, torch.Tensor] = {}
+            for layer_idx, h in raw.items():
+                # Same EOS off-by-one trim score_per_token applies.
+                if h.shape[0] > n:
+                    h = h[:n]
+                elif h.shape[0] < n:
+                    # Under-capture: shouldn't happen on this code path, but
+                    # skip the layer rather than returning a short tensor the
+                    # caller would misalign with generated_ids.
+                    continue
+                # `.to("cpu")` from a device tensor allocates a fresh
+                # CPU tensor already; no redundant `.clone()` needed.
+                trimmed[layer_idx] = h.detach().to("cpu")
+            hidden_states = trimmed
+
         result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,
             tok_per_sec=tok_per_sec, elapsed=elapsed,
@@ -1524,6 +1750,7 @@ class SaklasSession:
             finish_reason=self._gen_state.finish_reason,
             logprobs=logprobs_list,
             applied_steering=applied_steering,
+            hidden_states=hidden_states,
         )
         self._last_result = result
 
@@ -1657,12 +1884,15 @@ class SaklasSession:
 
         def _snapshot_alphas() -> dict[str, float]:
             """Flatten the steering stack to ``{name: alpha}`` — triggers
-            stripped for ``GenerationResult.vectors``."""
-            return {
-                name: alpha
-                for name, (alpha, _trig)
-                in self._flatten_steering_stack().items()
-            }
+            stripped for ``GenerationResult.vectors``.  Ablation entries
+            surface under their ``!<target>`` key with the term's coeff."""
+            snap: dict[str, float] = {}
+            for name, entry in self._flatten_steering_stack().items():
+                if isinstance(entry, AblationTerm):
+                    snap[name] = entry.coeff
+                    continue
+                snap[name] = entry[0]
+            return snap
 
         vector_snapshot: dict[str, float] = (
             _snapshot_alphas()
@@ -1679,8 +1909,9 @@ class SaklasSession:
             # Refresh snapshot now that steering is pushed (first-scope case).
             vector_snapshot = _snapshot_alphas()
 
+            want_hidden = bool(sampling and sampling.return_hidden)
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
-            self._begin_capture()
+            self._begin_capture(widen=want_hidden)
             self._monitor.begin_live()
             # Reset the steering manager's TriggerContext for this generation.
             # ``generate_steered`` mutates it at lifecycle boundaries; hooks
@@ -1714,6 +1945,7 @@ class SaklasSession:
                 prompt_tokens=prompt_tokens, stateless=stateless,
                 logprobs_list=logprobs_list,
                 applied_steering=applied_steering,
+                return_hidden=want_hidden,
             )
             self._monitor.end_live()
             self.events.emit(GenerationFinished(result=result))
@@ -1794,6 +2026,12 @@ class SaklasSession:
         ``yield``) the worker is signaled to stop and joined, and the
         underlying ``_generate_core`` cleanup runs — probes detached,
         steering scope popped, lock released.
+
+        ``sampling=SamplingConfig(return_hidden=True)`` works here too:
+        per-token events do not carry hidden states (that would break
+        the allocation-free hot path), but after iteration completes
+        the populated ``session.last_result.hidden_states`` is
+        available for round-tripping through :meth:`score_hidden`.
         """
         q: queue.SimpleQueue = queue.SimpleQueue()
         done = object()
