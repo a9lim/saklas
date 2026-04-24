@@ -329,6 +329,7 @@ class SteeringManager:
     def __init__(self) -> None:
         self.hooks: dict[int, SteeringHook] = {}
         self.vectors: dict[str, dict] = {}
+        self.ablations: dict[str, dict] = {}
         self.ctx: TriggerContext = TriggerContext()
 
     def add_vector(
@@ -344,46 +345,85 @@ class SteeringManager:
             "trigger": trigger,
         }
 
+    def add_ablation(
+        self,
+        name: str,
+        profile: dict[int, torch.Tensor],
+        alpha: float,
+        trigger: Trigger,
+        layer_means: dict[int, torch.Tensor],
+    ) -> None:
+        """Register a mean-replacement ablation target.
+
+        At ``apply_to_model`` time, for every layer present in both
+        ``profile`` and ``layer_means``, a per-layer
+        ``(baked_direction, layer_mean, alpha, trigger)`` entry is attached
+        to the corresponding :class:`SteeringHook`.  Profile layers missing
+        from ``layer_means`` are silently skipped — ablation without a
+        baseline mean is undefined.
+        """
+        self.ablations[name] = {
+            "profile": profile,
+            "alpha": alpha,
+            "trigger": trigger,
+            "layer_means": layer_means,
+        }
+
     def apply_to_model(
         self,
         model_layers: torch.nn.ModuleList,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        """Group vectors by layer, recompose hooks, attach to model."""
-        by_layer: dict[int, list[tuple[torch.Tensor, float, Trigger]]] = {}
+        """Group entries by layer, recompose hooks, attach to model."""
+        additive_by_layer: dict[
+            int, list[tuple[torch.Tensor, float, Trigger]]
+        ] = {}
         for v in self.vectors.values():
             effective_alpha = v["alpha"] * _STEER_GAIN
             trigger = v.get("trigger", Trigger.BOTH)
             for layer_idx, vec in v["profile"].items():
-                by_layer.setdefault(layer_idx, []).append(
+                additive_by_layer.setdefault(layer_idx, []).append(
                     (vec, effective_alpha, trigger),
                 )
 
-        # Detach hooks for layers that no longer have vectors
+        ablation_by_layer: dict[
+            int, list[tuple[torch.Tensor, torch.Tensor, float, Trigger]]
+        ] = {}
+        for a in self.ablations.values():
+            alpha = a["alpha"]
+            trigger = a["trigger"]
+            means = a["layer_means"]
+            for layer_idx, vec in a["profile"].items():
+                if layer_idx not in means:
+                    continue
+                ablation_by_layer.setdefault(layer_idx, []).append(
+                    (vec, means[layer_idx], alpha, trigger),
+                )
+
+        active_layers = set(additive_by_layer) | set(ablation_by_layer)
+
+        # Detach hooks for layers that no longer have any contribution.
         for idx in list(self.hooks):
-            if idx not in by_layer:
+            if idx not in active_layers:
                 self.hooks[idx].detach()
                 del self.hooks[idx]
 
-        # Recompose and attach for each active layer
-        for idx, entries in by_layer.items():
+        for idx in active_layers:
             if idx not in self.hooks:
                 hook = SteeringHook()
                 hook.attach(model_layers[idx])
                 self.hooks[idx] = hook
-
             self.hooks[idx].recompose(
-                additive_entries=entries,
-                ablation_entries=[],
-                device=device,
-                dtype=dtype,
-                ctx=self.ctx,
+                additive_entries=additive_by_layer.get(idx, []),
+                ablation_entries=ablation_by_layer.get(idx, []),
+                device=device, dtype=dtype, ctx=self.ctx,
             )
 
     def clear_all(self) -> None:
-        """Detach all hooks and clear vectors."""
+        """Detach all hooks and clear vectors + ablations."""
         for hook in self.hooks.values():
             hook.detach()
         self.hooks.clear()
         self.vectors.clear()
+        self.ablations.clear()
