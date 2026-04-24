@@ -103,13 +103,17 @@ class Steering:
         downstream of pole resolution works in this shape.  Synthetic
         projection keys (``"<base><op><onto>"``) pass through verbatim;
         the session is responsible for materializing the derived profile
-        before the manager sees the key.
+        before the manager sees the key.  ``AblationTerm`` values are
+        skipped — ablation is dispatched directly off ``Steering.alphas``
+        at the session layer rather than through this flattened view.
         """
-        from saklas.core.steering_expr import ProjectedTerm
+        from saklas.core.steering_expr import AblationTerm, ProjectedTerm
 
         out: dict[str, tuple[float, Trigger]] = {}
         default = self.trigger
         for name, val in self.alphas.items():
+            if isinstance(val, AblationTerm):
+                continue
             if isinstance(val, ProjectedTerm):
                 out[name] = (float(val.coeff), val.trigger)
                 continue

@@ -536,6 +536,17 @@ def format_expr(steering: "Steering") -> str:
     default_trig = steering.trigger
     parts: list[str] = []
     for name, val in steering.alphas.items():
+        if isinstance(val, AblationTerm):
+            if val.coeff == 1.0:
+                body = f"!{val.target}"
+            elif val.coeff == -1.0:
+                body = f"-!{val.target}"
+            else:
+                body = f"{val.coeff:g} !{val.target}"
+            if val.trigger != Trigger.BOTH:
+                body += "@" + _trigger_name(val.trigger)
+            parts.append(body)
+            continue
         if isinstance(val, ProjectedTerm):
             parts.append(_fmt_projected(val))
             continue
