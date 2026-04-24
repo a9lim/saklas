@@ -369,20 +369,27 @@ def test_return_hidden_round_trip(session):
         assert h.device.type == "cpu"
 
     # Round-trip: re-score the captured dict and compare against the
-    # per-token scores the session computed inline.
-    if session._monitor.probe_names:
-        agg, per_token = session.score_hidden(
-            result.hidden_states, per_token=True,
-        )
-        expected = session.last_per_token_scores or {}
-        # Tolerances generous for bf16/fp16.
-        tol = 1e-2
-        for name, vals in per_token.items():
-            if name not in expected:
-                continue
-            assert len(vals) == len(expected[name])
-            for a, b in zip(vals, expected[name]):
-                assert abs(a - b) < tol, f"probe {name}: {a} vs {b}"
+    # per-token scores the session computed inline. The fixture
+    # bootstraps with probes=["affect"]; if that invariant ever
+    # regresses, silent-skip would hide the real test.
+    assert session._monitor.probe_names, (
+        "fixture must have probes loaded for round-trip coverage"
+    )
+    _, per_token = session.score_hidden(
+        result.hidden_states, per_token=True,
+    )
+    expected = session.last_per_token_scores or {}
+    # Both sides route through the same _score_probes kernel; the only
+    # noise is the GPU→CPU move on the result-stored tensors, which is
+    # well below 1e-4 for bf16. Looser tolerances let a one-token
+    # pooling shift slip past.
+    tol = 1e-4
+    for name, vals in per_token.items():
+        if name not in expected:
+            continue
+        assert len(vals) == len(expected[name])
+        for a, b in zip(vals, expected[name]):
+            assert abs(a - b) < tol, f"probe {name}: {a} vs {b}"
 
 
 def test_return_hidden_false_leaves_hidden_states_none(session):
