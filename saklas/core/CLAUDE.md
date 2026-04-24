@@ -43,7 +43,7 @@ Model-name matching is lenient (`_model_names_match`): SAELens's `cfg.model_name
 
 `HiddenCapture` — session + TUI companion: `attach(layers, layer_indices)` / `detach()` / `stacked()`. Each capture is `detach().clone()` of `output[0, -1, :]` (device-local, no sync); k-th capture = "state that produced generated token k".
 
-Capture width is set by the session: `_begin_capture(widen=False)` (default) attaches to the probe-layer union; `_begin_capture(widen=True)` (set by `SamplingConfig.return_hidden=True`) attaches to every model layer. The monitor reads its subset in either case — widening only costs a larger capture dict, which is post-run moved to CPU and attached to `GenerationResult.hidden_states`.
+Capture width is set by the session: `_begin_capture(widen=False)` (default) attaches to the probe-layer union; `_begin_capture(widen=True)` (set by `SamplingConfig.return_hidden=True`) attaches to every model layer. The monitor reads its subset in either case. Widening pays one device-to-host transfer per layer in `_finalize_generation` — each captured `[T, D]` tensor is moved to CPU and attached to `GenerationResult.hidden_states`. Opt-in only; the fast path is bit-identical when `return_hidden=False`.
 
 ## monitor.py
 
