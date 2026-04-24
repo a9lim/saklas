@@ -9,7 +9,6 @@ unconditional norm-preservation rescale folded in).
 """
 from __future__ import annotations
 
-import pytest
 import torch
 
 from saklas.core.hooks import SteeringHook, SteeringManager
