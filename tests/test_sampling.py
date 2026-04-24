@@ -17,6 +17,7 @@ def test_defaults():
     assert sc.presence_penalty == 0.0
     assert sc.frequency_penalty == 0.0
     assert sc.logprobs is None
+    assert sc.return_hidden is False
 
 
 def test_frozen():
