@@ -37,6 +37,11 @@ class SamplingConfig:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     logprobs: int | None = None  # 0 = chosen-only, >0 = top-k
+    # Opt-in: when True, GenerationResult.hidden_states is populated with
+    # per-generated-token, per-layer residual-stream captures (all model
+    # layers, CPU, detached). False keeps the fast path bit-identical to
+    # today — HiddenCapture stays on probe-layer union.
+    return_hidden: bool = False
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
@@ -56,6 +61,7 @@ class SamplingConfig:
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
         "logprobs": None,
+        "return_hidden": False,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

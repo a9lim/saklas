@@ -61,3 +61,22 @@ def test_merged_with_all_defaults_is_noop():
     override = SamplingConfig()
     merged = base.merged_with(override)
     assert merged.temperature == 0.7
+
+
+def test_sampling_config_return_hidden_defaults_false():
+    cfg = SamplingConfig()
+    assert cfg.return_hidden is False
+
+
+def test_sampling_config_return_hidden_merged_with_override():
+    base = SamplingConfig(temperature=0.7)
+    override = SamplingConfig(return_hidden=True)
+    merged = base.merged_with(override)
+    assert merged.return_hidden is True
+    assert merged.temperature == 0.7  # unrelated field preserved
+
+
+def test_sampling_config_return_hidden_merged_with_default_does_not_override():
+    base = SamplingConfig(return_hidden=True)
+    merged = base.merged_with(SamplingConfig())  # other is all-defaults
+    assert merged.return_hidden is True  # other.return_hidden=False is the default; must not override
