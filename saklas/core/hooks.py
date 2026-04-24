@@ -66,26 +66,34 @@ class HiddenCapture:
 
 
 class SteeringHook:
-    """Pre-composed steering vectors for a single layer, grouped by trigger.
+    """Pre-composed steering vectors and ablation data for a single layer.
 
-    Fast path (``Trigger.BOTH`` only): a single composed tensor is added
-    unconditionally at hook time — no per-step trigger check.
+    Fast path (``Trigger.BOTH`` additive only, no ablation): a single
+    composed tensor is added unconditionally at hook time — no per-step
+    trigger check.
 
-    Slow path (any non-``BOTH`` trigger): entries are grouped by trigger
-    equality into ``composed_groups``; each group has its own pre-composed
-    tensor. At hook time, only groups whose ``trigger.active(ctx)`` returns
-    True contribute, and the norm-preservation rescale wraps the conditional
-    sum. Groups that would sum to zero are dropped at recompose time so the
-    hot path never pays for dead weight.
+    Slow path: entries are grouped by trigger equality into
+    ``composed_groups`` (additive) and ``ablation_groups`` (mean
+    replacement). At hook time, ablation groups fire first, then additive
+    groups; the unconditional norm-preservation rescale wraps the combined
+    op.
     """
 
     def __init__(self) -> None:
-        # Populated on the fast path (BOTH only). Mutually exclusive with
-        # ``composed_groups`` — recompose sets exactly one of them.
+        # Populated on the fast path (BOTH only, no ablation). Mutually
+        # exclusive with ``composed_groups``/``ablation_groups`` — recompose
+        # sets exactly one code path live.
         self.composed: torch.Tensor | None = None
         # Slow path: list of (trigger, composed_tensor) pairs. Iterated per
         # hook call; each group's trigger is consulted against ``_ctx``.
         self.composed_groups: list[tuple[Trigger, torch.Tensor]] = []
+        # Ablation groups: (Trigger, D_unit [K,dim], m [K], alpha [K]).
+        # D_unit rows are per-direction unit vectors; m[k] = μ_L · d̂_k;
+        # alpha[k] is the user coefficient (no _STEER_GAIN — ablation is
+        # a conservative replace, not a tunable push).
+        self.ablation_groups: list[
+            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
         # Shared mutable context threaded in by SteeringManager.  Read-only
         # from the hook's perspective; the generation loop mutates fields.
         self._ctx: TriggerContext | None = None
@@ -93,34 +101,32 @@ class SteeringHook:
 
     def recompose(
         self,
-        entries: list[tuple[torch.Tensor, float, Trigger]],
+        additive_entries: list[tuple[torch.Tensor, float, Trigger]],
+        ablation_entries: list[tuple[torch.Tensor, torch.Tensor, float, Trigger]],
         device: torch.device,
         dtype: torch.dtype,
         ctx: TriggerContext,
     ) -> None:
-        """Pre-compose per-trigger groups of steering vectors for this layer.
+        """Pre-compose additive and ablation state for this layer.
 
-        ``entries`` is a list of ``(baked_direction, effective_alpha,
+        ``additive_entries`` are ``(baked_direction, effective_alpha,
         trigger)`` triples; entries sharing a trigger value (dataclass
-        equality) collapse into one composed tensor.  ``ctx`` is the
-        shared per-generation TriggerContext mutated by the generation
-        loop and read here at hook-fire time.
+        equality) collapse into one composed tensor.  ``ablation_entries``
+        are ``(baked_direction, layer_mean, user_alpha, trigger)``
+        quadruples; per-trigger groups collapse into one stacked-direction
+        matrix with companion mean-scalar and coefficient vectors.  ``ctx``
+        is the shared per-generation TriggerContext mutated by the
+        generation loop and read here at hook-fire time.
         """
         self._ctx = ctx
-        if not entries:
-            self.composed = None
-            self.composed_groups = []
-            return
 
-        # Group by trigger value (Trigger is a frozen dataclass, hashable).
-        # Preserve the first-seen trigger instance per group so equality-
-        # equivalent but distinct Trigger objects still share storage.
-        groups: dict[Trigger, list[tuple[torch.Tensor, float]]] = {}
-        for vec, alpha, trig in entries:
-            groups.setdefault(trig, []).append((vec, alpha))
+        # --- additive grouping (existing semantics) ---
+        add_groups: dict[Trigger, list[tuple[torch.Tensor, float]]] = {}
+        for vec, alpha, trig in additive_entries:
+            add_groups.setdefault(trig, []).append((vec, alpha))
 
         composed_groups: list[tuple[Trigger, torch.Tensor]] = []
-        for trig, vecs in groups.items():
+        for trig, vecs in add_groups.items():
             # All-zero alphas → group contributes nothing; skip the matmul
             # so that a stale entry with alpha=0 doesn't inject NaN on any
             # bad-extraction vectors it carries.
@@ -135,15 +141,57 @@ class SteeringHook:
             composed = (alphas_t.unsqueeze(1) * stacked).sum(dim=0)
             composed_groups.append((trig, composed))
 
-        if not composed_groups:
+        # --- ablation grouping ---
+        abl_groups: dict[
+            Trigger, list[tuple[torch.Tensor, torch.Tensor, float]]
+        ] = {}
+        for baked, layer_mean, alpha, trig in ablation_entries:
+            # Zero alpha ⇒ no-op ablation; drop at compose time so the hot
+            # path never iterates dead rows.
+            if alpha == 0.0:
+                continue
+            abl_groups.setdefault(trig, []).append((baked, layer_mean, alpha))
+
+        ablation_groups: list[
+            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        for trig, rows in abl_groups.items():
+            # Compute each unit direction + mean scalar in fp32 for
+            # stability (fp16 sum-of-squares overflows at hidden_dim ≥ 2048,
+            # and mean projections can be close to zero), then cast to hook
+            # dtype for the hot path.
+            d_units_f32: list[torch.Tensor] = []
+            m_vals_f32: list[torch.Tensor] = []
+            alphas_list: list[float] = []
+            for baked, layer_mean, alpha in rows:
+                b32 = baked.to(device=device, dtype=torch.float32)
+                m32 = layer_mean.to(device=device, dtype=torch.float32)
+                n = torch.linalg.vector_norm(b32).clamp(min=1e-12)
+                d_hat = b32 / n
+                d_units_f32.append(d_hat)
+                m_vals_f32.append((m32 * d_hat).sum())
+                alphas_list.append(alpha)
+            D_unit = torch.stack(d_units_f32).to(dtype=dtype)
+            m = torch.stack(m_vals_f32).to(dtype=dtype)
+            alpha_vec = torch.tensor(alphas_list, device=device, dtype=dtype)
+            ablation_groups.append((trig, D_unit, m, alpha_vec))
+
+        self.ablation_groups = ablation_groups
+
+        # --- fast-path collapse decision ---
+        if not composed_groups and not ablation_groups:
             self.composed = None
             self.composed_groups = []
             return
 
-        # Fast-path collapse: all contributions use Trigger.BOTH (or an
-        # equality-equivalent default Trigger()).  One tensor, no per-step
-        # .active() check.
-        if len(composed_groups) == 1 and composed_groups[0][0] == Trigger.BOTH:
+        # Fast path only when the single contributor is additive/BOTH and
+        # no ablation is attached.  Any ablation forces the slow path so
+        # the hook_fn rewrite (Task 8) can sequence ablation-then-additive.
+        if (
+            not ablation_groups
+            and len(composed_groups) == 1
+            and composed_groups[0][0] == Trigger.BOTH
+        ):
             self.composed = composed_groups[0][1]
             self.composed_groups = []
         else:
@@ -314,7 +362,13 @@ class SteeringManager:
                 hook.attach(model_layers[idx])
                 self.hooks[idx] = hook
 
-            self.hooks[idx].recompose(entries, device, dtype, self.ctx)
+            self.hooks[idx].recompose(
+                additive_entries=entries,
+                ablation_entries=[],
+                device=device,
+                dtype=dtype,
+                ctx=self.ctx,
+            )
 
     def clear_all(self) -> None:
         """Detach all hooks and clear vectors."""
