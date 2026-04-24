@@ -4,6 +4,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import torch
+
 
 @dataclass
 class ProbeReadings:
@@ -39,6 +41,14 @@ class GenerationResult:
     # reproduction.  ``None`` when no steering was active.  Receipts /
     # ``saklas replay`` land on this single field.
     applied_steering: str | None = None
+    # Per-generated-token, per-layer residual-stream captures. ``None``
+    # when SamplingConfig.return_hidden was False (default).  When set,
+    # keyed by absolute layer index; each value is a ``[T, D]`` CPU
+    # tensor where ``T == len(tokens)`` and ``D == hidden_size``. Dtype
+    # matches the model's working dtype (fp16/bf16/fp32). ``to_dict``
+    # deliberately omits this field — tensors don't serialize cleanly to
+    # the JSON path; persist explicitly with ``torch.save`` if needed.
+    hidden_states: dict[int, torch.Tensor] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

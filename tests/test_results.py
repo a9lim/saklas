@@ -224,6 +224,27 @@ class TestResultCollector:
         assert len(collector.results) == 1
 
 
+def test_generation_result_hidden_states_default_none():
+    r = GenerationResult(
+        text="", tokens=[], token_count=0, tok_per_sec=0.0, elapsed=0.0,
+    )
+    assert r.hidden_states is None
+
+
+def test_generation_result_hidden_states_can_be_set_and_is_omitted_from_to_dict():
+    hs = {0: torch.zeros(2, 4), 1: torch.ones(2, 4)}
+    r = GenerationResult(
+        text="abc", tokens=[1, 2], token_count=2, tok_per_sec=0.0, elapsed=0.0,
+        hidden_states=hs,
+    )
+    assert r.hidden_states is hs
+    d = r.to_dict()
+    assert "hidden_states" not in d
+    # Unrelated fields still present.
+    assert d["text"] == "abc"
+    assert d["tokens"] == [1, 2]
+
+
 class TestTraitMonitorScoring:
     """Tests for TraitMonitor probe scoring — runs anywhere (no GPU)."""
 
