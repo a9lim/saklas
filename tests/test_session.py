@@ -306,3 +306,39 @@ class TestStreamingGeneration:
         assert len(tokens) > 0
         assert session.last_result.vectors == {name: 0.15}
         session.unsteer(name)
+
+
+class TestAblation:
+    def test_ablation_suppresses_self_probe_score(self, session):
+        """Ablating a concept drives its own monitor score toward zero.
+
+        Sharp correctness check: if the hook properly replaces the component
+        along d̂ with the neutral mean, the probe's magnitude-weighted cosine
+        score — which IS the projection along that same direction — must
+        collapse for post-ablation activations.
+        """
+        prompt = "Describe an ordinary afternoon."
+        probe = next(iter(session.probes))
+
+        # Baseline: generate without ablation, capture probe's aggregate score.
+        _ = session.generate(prompt)
+        scores_baseline = session.last_per_token_scores
+        assert scores_baseline is not None
+        assert probe in scores_baseline
+        baseline = abs(scores_baseline[probe][-1])
+
+        # With ablation: the same probe's score should drop sharply.
+        with session.steering(f"!{probe}"):
+            _ = session.generate(prompt)
+        scores_ablated = session.last_per_token_scores
+        assert scores_ablated is not None
+        ablated = abs(scores_ablated[probe][-1])
+
+        # Expect the ablated score to be at most 10% of baseline (or 0.05
+        # absolute, whichever is larger — guards the degenerate case where
+        # baseline itself is tiny).
+        ceiling = max(0.1 * baseline, 0.05)
+        assert ablated < ceiling, (
+            f"ablation should suppress self-probe; "
+            f"baseline={baseline:.4f}, ablated={ablated:.4f}, ceiling={ceiling:.4f}"
+        )
