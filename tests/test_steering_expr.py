@@ -615,3 +615,24 @@ def test_referenced_selectors_projection_contributes_two_atoms():
 def test_referenced_selectors_empty_or_whitespace_returns_empty():
     assert referenced_selectors("") == []
     assert referenced_selectors("   \t  ") == []
+
+
+# -------------------------------------------------------------- ablation ---
+
+def test_bare_ablation_defaults_to_coeff_one():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("!honest")
+    assert set(s.alphas.keys()) == {"!honest"}
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == 1.0
+    assert term.target == "honest"
+    assert term.trigger == Trigger.BOTH
+
+
+def test_ablation_term_is_frozen():
+    from dataclasses import FrozenInstanceError
+    from saklas.core.steering_expr import AblationTerm
+    t = AblationTerm(coeff=1.0, trigger=Trigger.BOTH, target="x")
+    with pytest.raises(FrozenInstanceError):
+        t.coeff = 0.5  # type: ignore[misc]
