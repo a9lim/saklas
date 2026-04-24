@@ -668,3 +668,35 @@ def test_ablation_signed_explicit():
     term = s.alphas["!honest"]
     assert isinstance(term, AblationTerm)
     assert term.coeff == -0.3
+
+
+def test_ablation_with_namespace(tmp_path):
+    from saklas.core.steering_expr import AblationTerm
+    _mk(tmp_path, "bob", "custom", tags=[])
+    s = parse_expr("!bob/custom")
+    # Namespace prefix is resolved away to the canonical concept name,
+    # matching plain-term behavior (see test_namespace_prefix_resolves_to_name).
+    term = s.alphas["!custom"]
+    assert isinstance(term, AblationTerm)
+    assert term.target == "custom"
+
+
+def test_ablation_with_trigger():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("!refusal@response")
+    term = s.alphas["!refusal"]
+    assert isinstance(term, AblationTerm)
+    assert term.target == "refusal"
+    assert term.trigger == Trigger.GENERATED_ONLY
+    assert term.coeff == 1.0
+
+
+def test_ablation_with_sae_variant():
+    from saklas.core.steering_expr import AblationTerm
+    # Variant is baked into the canonical name for plain terms (see
+    # test_sae_variant_suffix_preserved), and ablation stores the full
+    # variant-suffixed target verbatim.
+    s = parse_expr("!honest:sae")
+    term = s.alphas["!honest:sae"]
+    assert isinstance(term, AblationTerm)
+    assert term.target == "honest:sae"
