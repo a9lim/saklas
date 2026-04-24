@@ -4,6 +4,7 @@ import csv
 import tempfile
 from pathlib import Path
 
+import pytest
 import torch
 from saklas.core.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
 
@@ -72,7 +73,9 @@ class TestGenerationResult:
         assert result.applied_steering is None
         assert result.to_dict()["applied_steering"] is None
 
-    def test_applied_steering_round_trip_expression(self, monkeypatch, tmp_path):
+    def test_applied_steering_round_trip_expression(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ):
         """Stored expression round-trips through ``parse_expr``."""
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         from saklas.cli import selectors as _sel
@@ -131,7 +134,7 @@ class TestTokenEvent:
 
 
 class TestResultCollector:
-    def _make_result(self, text="Hello", alpha=1.0):
+    def _make_result(self, text: str = "Hello", alpha: float = 1.0) -> GenerationResult:
         return GenerationResult(
             text=text, tokens=[1, 2], token_count=2,
             tok_per_sec=10.0, elapsed=0.2, readings={}, vectors={"happy": alpha},
@@ -191,16 +194,16 @@ class TestResultCollector:
         Path(path).unlink()
 
     def test_to_dataframe_without_pandas(self):
+        import importlib.util
+
         collector = ResultCollector()
         collector.add(self._make_result())
-        try:
-            import pandas  # noqa: F401
-            df = collector.to_dataframe()
-            assert len(df) == 1
-        except ImportError:
-            import pytest
+        if importlib.util.find_spec("pandas") is None:
             with pytest.raises(ImportError):
                 collector.to_dataframe()
+        else:
+            df = collector.to_dataframe()
+            assert len(df) == 1
 
     def test_results_property(self):
         collector = ResultCollector()
@@ -208,7 +211,7 @@ class TestResultCollector:
         collector.add(self._make_result(), run=2)
         assert len(collector.results) == 2
 
-    def test_to_csv_empty_is_noop(self, tmp_path):
+    def test_to_csv_empty_is_noop(self, tmp_path: Path):
         """Empty collector returns early — no file written, no crash."""
         collector = ResultCollector()
         path = tmp_path / "out.csv"

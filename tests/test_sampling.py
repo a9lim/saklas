@@ -27,7 +27,9 @@ def test_frozen():
 
 
 def test_stop_coerced_to_tuple():
-    sc = SamplingConfig(stop=["a", "b"])
+    # __post_init__ coerces list→tuple at runtime; type annotation narrows
+    # the public contract to tuple, so the list input here needs a pragma.
+    sc = SamplingConfig(stop=["a", "b"])  # type: ignore[arg-type]
     assert sc.stop == ("a", "b")
     assert isinstance(sc.stop, tuple)
 

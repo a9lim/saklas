@@ -45,8 +45,10 @@ class SamplingConfig:
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
-        # dataclass stays hashable.
-        if self.stop is not None and not isinstance(self.stop, tuple):
+        # dataclass stays hashable. Type annotation narrows to tuple so
+        # the isinstance check looks redundant to static analysis, but
+        # it's a real runtime guard against lists slipping through.
+        if self.stop is not None and not isinstance(self.stop, tuple):  # pyright: ignore[reportUnnecessaryIsInstance]
             object.__setattr__(self, "stop", tuple(self.stop))
 
     # Default sentinels used by merged_with — matches the dataclass defaults.

@@ -2,9 +2,10 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
