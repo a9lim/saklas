@@ -157,3 +157,39 @@ def test_ablate_then_add_ordering():
     # Rescale to ||[3, 0, 0]|| = 3 -> [0, 3, 0]
     expected = torch.tensor([[[0.0, 3.0, 0.0]]])
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_additive_only_hits_fast_path():
+    """Additive-only BOTH entries collapse into hook.composed (fast path)."""
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    add_vec = torch.tensor([0.0, 1.0, 0.0])
+    hook.recompose(
+        additive_entries=[(add_vec, 0.5, Trigger.BOTH)],
+        ablation_entries=[],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    assert hook.composed is not None
+    assert not hook.composed_groups
+    assert not hook.ablation_groups
+
+
+def test_additive_both_plus_ablation_uses_slow_path():
+    """Any ablation present forces the slow path even if additive is BOTH-only."""
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    add_vec = torch.tensor([0.0, 1.0, 0.0])
+    d_abl = torch.tensor([1.0, 0.0, 0.0])
+    mean_abl = torch.tensor([0.0, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[(add_vec, 0.5, Trigger.BOTH)],
+        ablation_entries=[(d_abl, mean_abl, 1.0, Trigger.BOTH)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    assert hook.composed is None
+    assert hook.composed_groups
+    assert hook.ablation_groups
