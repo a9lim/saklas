@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from saklas.core.hooks import SteeringHook
+from saklas.core.hooks import SteeringHook, SteeringManager
 from saklas.core.triggers import Trigger, TriggerContext
 
 
@@ -295,3 +295,77 @@ def test_multi_direction_correlated_over_ablates():
     assert pre_rescale[0] < 0.0
     # Post-rescale preserves the sign of x.
     assert out[0, 0, 0] < 0.0
+
+
+class _NoopModule(torch.nn.Module):
+    def forward(self, x):  # type: ignore[override]
+        return (x,)
+
+
+def test_manager_add_ablation_installs_group_at_profile_layer():
+    """add_ablation + apply_to_model attaches a hook with an ablation group at the right layer."""
+    layers = torch.nn.ModuleList([_NoopModule(), _NoopModule(), _NoopModule()])
+    mgr = SteeringManager()
+
+    profile = {1: torch.tensor([1.0, 0.0, 0.0])}
+    layer_means = {1: torch.tensor([0.5, 0.0, 0.0])}
+
+    mgr.add_ablation(
+        "refusal", profile, alpha=1.0, trigger=Trigger.BOTH,
+        layer_means=layer_means,
+    )
+    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+
+    assert 1 in mgr.hooks
+    hook = mgr.hooks[1]
+    assert hook.ablation_groups, "ablation group should be populated"
+
+    mgr.clear_all()
+    assert not mgr.hooks
+    assert not mgr.vectors
+    assert not mgr.ablations
+
+
+def test_manager_combined_additive_and_ablation_same_layer():
+    """Both additive and ablation target layer 1 -> one hook with both groups."""
+    layers = torch.nn.ModuleList([_NoopModule(), _NoopModule()])
+    mgr = SteeringManager()
+
+    additive_profile = {1: torch.tensor([0.0, 1.0, 0.0])}
+    ablation_profile = {1: torch.tensor([1.0, 0.0, 0.0])}
+    layer_means = {1: torch.tensor([0.0, 0.0, 0.0])}
+
+    mgr.add_vector("honest", additive_profile, alpha=0.3, trigger=Trigger.BOTH)
+    mgr.add_ablation(
+        "refusal", ablation_profile, alpha=1.0, trigger=Trigger.BOTH,
+        layer_means=layer_means,
+    )
+    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+
+    assert 1 in mgr.hooks
+    hook = mgr.hooks[1]
+    assert hook.ablation_groups
+    # Combined additive + ablation forces the slow path.
+    assert hook.composed is None
+    assert hook.composed_groups
+
+
+def test_manager_skips_layers_without_layer_mean():
+    """Profile layer 2 with no matching layer_mean -> ablation entry for layer 2 is dropped."""
+    layers = torch.nn.ModuleList([_NoopModule(), _NoopModule(), _NoopModule()])
+    mgr = SteeringManager()
+
+    profile = {
+        1: torch.tensor([1.0, 0.0, 0.0]),
+        2: torch.tensor([1.0, 0.0, 0.0]),
+    }
+    layer_means = {1: torch.tensor([0.0, 0.0, 0.0])}  # no layer 2 mean
+
+    mgr.add_ablation(
+        "refusal", profile, alpha=1.0, trigger=Trigger.BOTH,
+        layer_means=layer_means,
+    )
+    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+
+    assert 1 in mgr.hooks
+    assert 2 not in mgr.hooks
