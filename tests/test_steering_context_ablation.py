@@ -13,7 +13,7 @@ import torch
 from saklas.cli import selectors as _sel
 from saklas.core.events import EventBus
 from saklas.core.hooks import SteeringManager
-from saklas.core.session import SaklasSession
+from saklas.core.session import SaklasSession, VectorNotRegisteredError
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm
 from saklas.core.triggers import Trigger
@@ -79,7 +79,7 @@ def test_session_steering_ablation_missing_profile_raises():
             coeff=1.0, trigger=Trigger.BOTH, target="nonexistent",
         ),
     })
-    with pytest.raises(Exception):
+    with pytest.raises(VectorNotRegisteredError):
         with session.steering(steering):
             pass
 
