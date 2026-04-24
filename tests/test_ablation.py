@@ -25,11 +25,16 @@ def _run_hook(
     hook: SteeringHook,
     hidden: torch.Tensor,
 ) -> torch.Tensor:
-    """Attach the hook, run a forward pass, detach, return the output."""
+    """Attach the hook, run a forward pass, detach, return the output.
+
+    The hook mutates its input in place (hot-path discipline), so we
+    clone before handing off; tests retain the pristine ``hidden`` for
+    reference-math assertions.
+    """
     layer = _DummyLayer()
     hook.attach(layer)
     try:
-        out = layer(hidden)[0]
+        out = layer(hidden.clone())[0]
     finally:
         hook.detach()
     return out
@@ -68,3 +73,24 @@ def test_recompose_accepts_ablation_entries():
     assert hook.ablation_groups  # non-empty
     assert hook.composed is None
     assert not hook.composed_groups
+
+
+def test_single_direction_full_ablation():
+    """α=1 mean-replaces the component along d̂; rest of hidden unchanged modulo norm rescale."""
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    d = torch.tensor([1.0, 0.0, 0.0])
+    mean = torch.tensor([0.5, 0.0, 0.0])
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[(d, mean, 1.0, Trigger.BOTH)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        ctx=ctx,
+    )
+    hidden = torch.tensor([[[2.0, 1.0, 0.0]]])
+    out = _run_hook(hook, hidden)
+    expected = _expected_ablation(
+        hidden, baked=d, layer_mean=mean, alpha=1.0,
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)

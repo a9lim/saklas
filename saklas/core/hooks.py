@@ -199,8 +199,8 @@ class SteeringHook:
             self.composed_groups = composed_groups
 
     def hook_fn(self, module, input, output):
-        # Fast path: single composed tensor, no trigger check,
-        # unconditional norm preservation.
+        # Fast path: single composed additive tensor, no ablation, no
+        # trigger check — unconditional norm preservation.
         if self.composed is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
             norm_pre = torch.linalg.vector_norm(
@@ -213,27 +213,26 @@ class SteeringHook:
             hidden.mul_((norm_pre / norm_post).to(hidden.dtype))
             return output
 
-        # Slow path: trigger-gated groups. Pre-check whether any group
-        # fires this step — if none do, skip the norm capture entirely.
-        groups = self.composed_groups
-        if not groups:
+        add_groups = self.composed_groups
+        abl_groups = self.ablation_groups
+        if not add_groups and not abl_groups:
             return output
         ctx = self._ctx
-        # ctx should always be non-None when composed_groups is populated
-        # (SteeringManager.apply_to_model threads it in via recompose),
-        # but defend against a stale-handle case by treating missing ctx
-        # as "no triggers fire" rather than panicking in the hot path.
         if ctx is None:
             return output
 
-        # First pass: does anything fire? Cheap — a handful of int compares
-        # per group, no tensor work. Saves the fp32 norm round-trip when
-        # no group is currently active (e.g. AFTER_THINKING during prefill).
+        # Cheap pre-check: any group active this step? Skip the fp32 norm
+        # capture entirely if not (e.g. AFTER_THINKING during prefill).
         any_active = False
-        for trig, _ in groups:
+        for trig, *_ in abl_groups:
             if trig.active(ctx):
                 any_active = True
                 break
+        if not any_active:
+            for trig, _ in add_groups:
+                if trig.active(ctx):
+                    any_active = True
+                    break
         if not any_active:
             return output
 
@@ -241,9 +240,21 @@ class SteeringHook:
         norm_pre = torch.linalg.vector_norm(
             hidden, dim=-1, keepdim=True, dtype=torch.float32,
         )
-        for trig, composed in groups:
+
+        # Ablation first: replace the component along each d̂ with the
+        # neutral-baseline mean (α · (h·d̂ - μ·d̂) subtracted per direction).
+        for trig, D_unit, m, alpha_vec in abl_groups:
+            if not trig.active(ctx):
+                continue
+            coeffs = hidden @ D_unit.T
+            coeffs.sub_(m).mul_(alpha_vec)
+            hidden.sub_(coeffs @ D_unit)
+
+        # Additive second: inject into the already-cleaned residual stream.
+        for trig, composed in add_groups:
             if trig.active(ctx):
                 hidden.add_(composed)
+
         norm_post = torch.linalg.vector_norm(
             hidden, dim=-1, keepdim=True, dtype=torch.float32,
         ).clamp_(min=1e-6)
