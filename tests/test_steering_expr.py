@@ -700,3 +700,90 @@ def test_ablation_with_sae_variant():
     term = s.alphas["!honest:sae"]
     assert isinstance(term, AblationTerm)
     assert term.target == "honest:sae"
+
+
+# Ablation + projection is a grammar error — ablation ("project the
+# component onto d̂ then land it on the mean") and projection ("decompose
+# direction d̂ along onto") are different operations on the same atom.
+# Composing them in one term yields ambiguous hook math; the spec opts
+# for a hard error and tells the user to split the term.
+
+
+def test_ablation_with_orthogonal_projection_rejected():
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("!honest|sycophantic")
+    assert "ablation" in str(ei.value).lower()
+    assert "projection" in str(ei.value).lower()
+
+
+def test_ablation_with_onto_projection_rejected():
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("!honest~sycophantic")
+    assert "ablation" in str(ei.value).lower()
+    assert "projection" in str(ei.value).lower()
+
+
+# ---------------------------------------------------- ablation format/round-trip ---
+
+def test_format_ablation_bare():
+    s = parse_expr("!honest")
+    assert format_expr(s) == "!honest"
+
+
+def test_format_ablation_explicit_coeff():
+    s = parse_expr("0.5 !honest")
+    assert format_expr(s) == "0.5 !honest"
+
+
+def test_format_ablation_negative_bare():
+    s = parse_expr("-!honest")
+    assert format_expr(s) == "-!honest"
+
+
+def test_format_ablation_trigger_emitted():
+    s = parse_expr("!refusal@response")
+    assert format_expr(s) == "!refusal@response"
+
+
+def test_format_ablation_trigger_both_elided():
+    s = parse_expr("!refusal@both")
+    assert format_expr(s) == "!refusal"
+
+
+def test_format_ablation_composed_with_additive():
+    s = parse_expr("0.3 honest + !sycophantic")
+    assert format_expr(s) == "0.3 honest + !sycophantic"
+
+
+def test_format_ablation_separator_when_negative():
+    # A negative ablation following an additive term should render through
+    # the ``" - "`` separator, mirroring how ``- 0.2 foo`` is formatted.
+    s = parse_expr("0.3 honest - !sycophantic")
+    assert format_expr(s) == "0.3 honest - !sycophantic"
+
+
+def test_format_ablation_variant_preserved():
+    s = parse_expr("!honest:sae-gemma-scope")
+    assert format_expr(s) == "!honest:sae-gemma-scope"
+
+
+@pytest.mark.parametrize("text", [
+    "!honest",
+    "0.5 !honest",
+    "-!honest",
+    "-0.3 !honest",
+    "!refusal@response",
+    "!honest:sae",
+    "!honest:sae-gemma-scope",
+    "0.3 honest + !sycophantic",
+    "0.3 honest - !sycophantic",
+    "!refusal + !sycophantic",
+])
+def test_ablation_format_parse_format_is_stable(text):
+    """Ablation expressions round-trip through parse -> format stably."""
+    s1 = parse_expr(text)
+    r1 = format_expr(s1)
+    s2 = parse_expr(r1)
+    r2 = format_expr(s2)
+    assert r1 == r2
+    assert s1.alphas == s2.alphas
