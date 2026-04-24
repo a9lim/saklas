@@ -70,14 +70,14 @@ Every surface — Python, YAML, HTTP, TUI, `vector merge` — speaks the same st
 
 ```
 expr     := term (("+" | "-") term)*
-term     := [coeff "*"?] selector ["@" trigger]    # coeff optional; omit → 0.5
+term     := [coeff "*"?] ["!"] selector ["@" trigger]    # coeff optional; omit → 0.5 (additive) or 1.0 (ablation)
 selector := atom (("~" | "|") atom)?
 atom     := [ns "/"] NAME ["." NAME] [":" variant]  # NAME uses _ for multi-word
 trigger  := before | after | both | thinking | response | prompt | generated
 variant  := raw | sae | sae-<release>
 ```
 
-`+`/`-` add terms, `*` attaches a coefficient, `~` projects onto a direction (keeps the shared component), `|` projects orthogonal (removes the shared component). `@trigger` tags a per-term trigger override. `:variant` routes to SAE tensors.
+`+`/`-` add terms, `*` attaches a coefficient, `~` projects onto a direction (keeps the shared component), `|` projects orthogonal (removes the shared component), `!` mean-ablates the concept from the residual stream at hook time (`h' = h - α(h·d̂ - μ·d̂)d̂`; bare `!x` defaults to α=1.0, fully replace). `@trigger` tags a per-term trigger override. `:variant` routes to SAE tensors. `!` cannot compose with `~` or `|`.
 
 ```python
 from saklas import SaklasSession, SamplingConfig, Steering, Trigger, Profile
