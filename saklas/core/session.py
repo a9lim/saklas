@@ -1564,6 +1564,25 @@ class SaklasSession:
                 f"score_hidden: expected [D] or [T, D] tensors, got ndim={shapes[0]}",
             )
 
+        # Dim pre-flight: each input tensor's last dim must match any
+        # probe that covers that layer. Without this, a shape mismatch
+        # would leak a raw torch RuntimeError at the scoring matmul,
+        # violating the "all public errors are SaklasError" invariant.
+        for layer_idx, t in hidden.items():
+            actual_dim = t.shape[-1]
+            for probe_name, profile in self._monitor.profiles.items():
+                probe_vec = profile.get(layer_idx)
+                if probe_vec is None:
+                    continue
+                expected_dim = probe_vec.shape[-1]
+                if expected_dim != actual_dim:
+                    raise SaklasError(
+                        f"score_hidden: dim mismatch at layer {layer_idx} — "
+                        f"got {actual_dim}, probe '{probe_name}' expects "
+                        f"{expected_dim}",
+                    )
+                break  # one covering probe settles the expected dim
+
         if shapes[0] == 1:
             if per_token:
                 # [D] input + per_token is meaningless.
@@ -1574,10 +1593,16 @@ class SaklasSession:
             # Fall through to the monitor's single-state path.
             return self._monitor.measure_from_hidden(hidden, accumulate=accumulate)
 
-        # [T, D] path — delegate to monitor.score_stack.
-        agg, per_tok = self._monitor.score_stack(
-            hidden, accumulate=accumulate,
-        )
+        # [T, D] path — delegate to monitor.score_stack. Wrap its
+        # ValueError (uneven T across layers is the only path that
+        # can reach here after the shape checks above) so callers
+        # catching SaklasError get a uniform exception surface.
+        try:
+            agg, per_tok = self._monitor.score_stack(
+                hidden, accumulate=accumulate,
+            )
+        except ValueError as exc:
+            raise SaklasError(f"score_hidden: {exc}") from exc
         return (agg, per_tok) if per_token else agg
 
     def _promote_profile(self, profile: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
@@ -2001,6 +2026,12 @@ class SaklasSession:
         ``yield``) the worker is signaled to stop and joined, and the
         underlying ``_generate_core`` cleanup runs — probes detached,
         steering scope popped, lock released.
+
+        ``sampling=SamplingConfig(return_hidden=True)`` works here too:
+        per-token events do not carry hidden states (that would break
+        the allocation-free hot path), but after iteration completes
+        the populated ``session.last_result.hidden_states`` is
+        available for round-tripping through :meth:`score_hidden`.
         """
         q: queue.SimpleQueue = queue.SimpleQueue()
         done = object()

@@ -313,7 +313,11 @@ class TraitMonitor:
             if not per_token[name]:
                 per_token[name] = [0.0] * n
 
-        self._pending_per_token = True
+        # Mirror score_stack's gate: the pending-per-token flag is TUI
+        # state, and stateless callers (server path with accumulate=False)
+        # must not leak into it.
+        if accumulate:
+            self._pending_per_token = True
         return agg_vals, per_token
 
     def score_stack(

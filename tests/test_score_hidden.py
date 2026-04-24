@@ -177,7 +177,28 @@ def test_score_hidden_uneven_T_raises():
         0: torch.zeros(3, 4),
         1: torch.zeros(2, 4),
     }
-    with pytest.raises((SaklasError, ValueError)):
+    # Both the monitor's ValueError (uneven T) and the session's
+    # SaklasError wrapping must surface as SaklasError at the public
+    # boundary — callers catching SaklasError must not miss this.
+    with pytest.raises(SaklasError):
+        s.score_hidden(bad)
+
+
+def test_score_hidden_bad_ndim_raises():
+    """ndim=3 and beyond are not [D] or [T, D]; must raise SaklasError."""
+    s = _mock_session()
+    bad = {0: torch.zeros(2, 3, 4)}
+    with pytest.raises(SaklasError, match="expected \\[D\\] or \\[T, D\\]"):
+        s.score_hidden(bad)
+
+
+def test_score_hidden_dim_mismatch_raises():
+    """A tensor with wrong hidden_dim must raise SaklasError, not leak
+    a raw torch RuntimeError from the scoring matmul."""
+    s = _mock_session()
+    # Monitor probe is dim=4 at layer 0; pass dim=8 input.
+    bad = {0: torch.zeros(2, 8)}
+    with pytest.raises(SaklasError, match="dim mismatch"):
         s.score_hidden(bad)
 
 
