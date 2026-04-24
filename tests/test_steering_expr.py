@@ -636,3 +636,35 @@ def test_ablation_term_is_frozen():
     t = AblationTerm(coeff=1.0, trigger=Trigger.BOTH, target="x")
     with pytest.raises(FrozenInstanceError):
         t.coeff = 0.5  # type: ignore[misc]
+
+
+def test_ablation_explicit_coefficient():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("0.5 !honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == 0.5
+
+
+def test_ablation_negative_sign():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("-!honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == -1.0
+
+
+def test_ablation_star_form():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("0.7 * !honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == 0.7
+
+
+def test_ablation_signed_explicit():
+    from saklas.core.steering_expr import AblationTerm
+    s = parse_expr("-0.3 !honest")
+    term = s.alphas["!honest"]
+    assert isinstance(term, AblationTerm)
+    assert term.coeff == -0.3
