@@ -128,6 +128,11 @@ reportCallIssue = "error"
 reportReturnType = "error"
 reportAssignmentType = "error"
 reportUnnecessaryIsInstance = "warning"
+# torch re-exports `dtype`, `device`, `float32`, `dot` etc. through
+# its public namespace, but its stubs don't list them in __all__.
+# Newer pyright treats that as a private-import error; downgrade to
+# warning so legitimate public API references don't break CI.
+reportPrivateImportUsage = "warning"
 
 [tool.setuptools.packages.find]
 include = ["saklas*"]
