@@ -106,8 +106,6 @@ def test_score_stack_accumulate_false_leaves_pending_flag_clear():
 # Task 4 — SaklasSession.score_hidden
 # ---------------------------------------------------------------------------
 
-from types import SimpleNamespace  # noqa: E402
-
 from saklas.core.errors import SaklasError  # noqa: E402
 from saklas.core.session import SaklasSession  # noqa: E402
 

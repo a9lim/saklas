@@ -8,7 +8,7 @@ import queue
 import re
 import threading
 import time
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Literal, overload
 
 import torch
 
@@ -1464,6 +1464,8 @@ class SaklasSession:
     def _end_capture(self) -> None:
         self._capture.detach()
 
+    # -- Score entry points --
+
     def score_captured(
         self, generated_ids: list[int], *, accumulate: bool = True,
     ) -> tuple[dict[str, float], dict[str, list[float]]]:
@@ -1480,6 +1482,22 @@ class SaklasSession:
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
+    @overload
+    def score_hidden(
+        self,
+        hidden: dict[int, torch.Tensor],
+        *,
+        per_token: Literal[False] = False,
+        accumulate: bool = False,
+    ) -> dict[str, float]: ...
+    @overload
+    def score_hidden(
+        self,
+        hidden: dict[int, torch.Tensor],
+        *,
+        per_token: Literal[True],
+        accumulate: bool = False,
+    ) -> tuple[dict[str, float], dict[str, list[float]]]: ...
     def score_hidden(
         self,
         hidden: dict[int, torch.Tensor],
@@ -1519,9 +1537,15 @@ class SaklasSession:
         # Classify shapes up-front.
         shapes = [v.ndim for v in hidden.values()]
         if len(set(shapes)) > 1:
+            by_ndim: dict[int, list[int]] = {}
+            for layer_idx, t in hidden.items():
+                by_ndim.setdefault(t.ndim, []).append(layer_idx)
+            detail = ", ".join(
+                f"ndim={n} at layers {ls}" for n, ls in sorted(by_ndim.items())
+            )
             raise SaklasError(
                 "score_hidden: mixed shapes in input; expected either all "
-                "[D] or all [T, D] across layers",
+                f"[D] or all [T, D] across layers ({detail})",
             )
         if shapes[0] not in (1, 2):
             raise SaklasError(
@@ -1532,7 +1556,8 @@ class SaklasSession:
             if per_token:
                 # [D] input + per_token is meaningless.
                 raise SaklasError(
-                    "score_hidden: per_token=True requires [T, D] input",
+                    "score_hidden: per_token=True requires [T, D] input; "
+                    "got [D] (single state per layer)",
                 )
             # Fall through to the monitor's single-state path.
             return self._monitor.measure_from_hidden(hidden, accumulate=accumulate)
