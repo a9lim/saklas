@@ -34,7 +34,8 @@ def test_fast_path_both_only_composes_single_tensor():
     ctx = TriggerContext()
     vec = _unit_vec(16)
     hook.recompose(
-        [(vec, 1.0, Trigger.BOTH)],
+        additive_entries=[(vec, 1.0, Trigger.BOTH)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     assert hook.composed is not None
@@ -46,7 +47,8 @@ def test_slow_path_non_both_uses_groups():
     ctx = TriggerContext()
     vec = _unit_vec(16)
     hook.recompose(
-        [(vec, 1.0, Trigger.AFTER_THINKING)],
+        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     assert hook.composed is None
@@ -64,7 +66,8 @@ def test_equal_triggers_collapse_into_single_group():
     t_a = Trigger.AFTER_THINKING
     t_b = Trigger(prompt=False, thinking=False)  # == AFTER_THINKING
     hook.recompose(
-        [(v1, 1.0, t_a), (v2, 1.0, t_b)],
+        additive_entries=[(v1, 1.0, t_a), (v2, 1.0, t_b)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     assert hook.composed is None
@@ -77,8 +80,9 @@ def test_mixed_both_and_non_both_keeps_both_in_slow_path():
     v_both = _unit_vec(16, seed=1)
     v_after = _unit_vec(16, seed=2)
     hook.recompose(
-        [(v_both, 1.0, Trigger.BOTH),
-         (v_after, 1.0, Trigger.AFTER_THINKING)],
+        additive_entries=[(v_both, 1.0, Trigger.BOTH),
+                          (v_after, 1.0, Trigger.AFTER_THINKING)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     # Mixed groups → slow path; composed stays None even though one group
@@ -92,7 +96,8 @@ def test_zero_alpha_group_dropped():
     ctx = TriggerContext()
     vec = _unit_vec(16)
     hook.recompose(
-        [(vec, 0.0, Trigger.AFTER_THINKING)],
+        additive_entries=[(vec, 0.0, Trigger.AFTER_THINKING)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     assert hook.composed is None
@@ -106,7 +111,8 @@ def test_fast_path_hook_apply_bit_identical_to_manual_add():
     ctx = TriggerContext()
     vec = _unit_vec(16) * 0.5
     hook.recompose(
-        [(vec, 1.0, Trigger.BOTH)],
+        additive_entries=[(vec, 1.0, Trigger.BOTH)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     hook.attach(mod)
@@ -131,7 +137,8 @@ def test_slow_path_skips_when_no_group_active():
     ctx = TriggerContext(is_prefill=True)  # prefill → AFTER_THINKING off
     vec = _unit_vec(16)
     hook.recompose(
-        [(vec, 1.0, Trigger.AFTER_THINKING)],
+        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     hook.attach(mod)
@@ -150,7 +157,8 @@ def test_slow_path_applies_when_group_active():
     ctx = TriggerContext(is_prefill=False, thinking=False, gen_step=5)
     vec = _unit_vec(16) * 0.5
     hook.recompose(
-        [(vec, 1.0, Trigger.AFTER_THINKING)],
+        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     hook.attach(mod)
@@ -168,7 +176,8 @@ def test_ctx_mutation_between_forwards_gates_apply():
     ctx = TriggerContext(is_prefill=True)
     vec = _unit_vec(16) * 0.5
     hook.recompose(
-        [(vec, 1.0, Trigger.AFTER_THINKING)],
+        additive_entries=[(vec, 1.0, Trigger.AFTER_THINKING)],
+        ablation_entries=[],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
     hook.attach(mod)

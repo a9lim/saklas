@@ -52,6 +52,15 @@ if TYPE_CHECKING:
 DEFAULT_COEFF = 0.5
 
 
+# Default coefficient for ablation terms.  Bare ``!x`` means "fully
+# replace the component along d̂ with the neutral-baseline mean" — the
+# intuitive "ablation" semantics from the literature.  Partial ablation
+# (``0.5 !x``) blends the original component toward the mean.  This
+# intentionally differs from ``DEFAULT_COEFF`` (0.5), which applies to
+# additive terms.
+DEFAULT_ABLATION_COEFF = 1.0
+
+
 _TRIGGER_PRESETS: dict[str, Trigger] = {
     "both": Trigger.BOTH,
     "after": Trigger.AFTER_THINKING,
@@ -91,6 +100,22 @@ class ProjectedTerm:
     onto: str
 
 
+@dataclass(frozen=True)
+class AblationTerm:
+    """Mean-replacement ablation entry in ``Steering.alphas``.
+
+    The session resolves ``target`` through the auto-load fast path at
+    ``_SteeringContext`` entry, then hands ``(target_profile, coeff,
+    trigger, layer_means)`` to ``SteeringManager.add_ablation``.  Stored
+    as a value inside ``Steering.alphas``; the key is ``"!<target>"`` so
+    ablation entries never collide with plain-term entries on the same
+    concept.
+    """
+    coeff: float
+    trigger: Trigger
+    target: str
+
+
 class SteeringExprError(ValueError, SaklasError):
     """Raised when a steering expression string cannot be parsed."""
 
@@ -110,7 +135,7 @@ _IDENT_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
 _SINGLE_CHAR_TOKENS = {
     ".": "DOT", "/": "SLASH", ":": "COLON", "*": "STAR",
     "+": "PLUS", "-": "MINUS", "@": "AT", "~": "TILDE",
-    "|": "ORTHO",
+    "|": "ORTHO", "!": "BANG",
 }
 
 
@@ -203,6 +228,7 @@ class _Term:
     # substituted ``DEFAULT_COEFF``.  Internal — lets a future resolver step
     # swap in per-vector defaults without re-parsing the expression.
     explicit_coeff: bool
+    ablation: bool = False  # True iff term was prefixed with `!`
 
 
 # --------------------------------------------------------------- parser ---
@@ -260,6 +286,13 @@ class _Parser:
             explicit = True
             if self._peek().kind == "STAR":
                 self._consume()
+        ablation = False
+        if self._peek().kind == "BANG":
+            self._consume()
+            ablation = True
+            if not explicit:
+                # Bare `!x` defaults to fully-replace (coeff=1.0).
+                coeff = float(sign) * DEFAULT_ABLATION_COEFF
         selector = self._selector()
         trigger: str | None = None
         if self._peek().kind == "AT":
@@ -276,7 +309,7 @@ class _Parser:
                 )
         return _Term(
             coeff=coeff, selector=selector, trigger=trigger,
-            explicit_coeff=explicit,
+            explicit_coeff=explicit, ablation=ablation,
         )
 
     def _selector(self) -> _Selector:
@@ -411,6 +444,31 @@ def _merge_projected(
     )
 
 
+def _merge_ablation(
+    alphas: "dict[str, AlphaEntry]",
+    target_key: str,
+    coeff: float,
+    trig: Trigger,
+) -> None:
+    key = f"!{target_key}"
+    if key not in alphas:
+        alphas[key] = AblationTerm(coeff=coeff, trigger=trig, target=target_key)
+        return
+    existing = alphas[key]
+    if not isinstance(existing, AblationTerm):
+        raise SteeringExprError(  # pragma: no cover — key namespace is disjoint
+            f"ablation '{key}' conflicts with a non-ablation entry of the same name"
+        )
+    if existing.trigger != trig:
+        raise SteeringExprError(
+            f"ablation '!{target_key}' appears with conflicting triggers; "
+            f"merge triggers explicitly or split into separate Steering entries"
+        )
+    alphas[key] = AblationTerm(
+        coeff=existing.coeff + coeff, trigger=trig, target=target_key,
+    )
+
+
 def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
     from saklas.core.steering import Steering
 
@@ -421,6 +479,15 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
         coeff = term.coeff * base_sign
         trig: Trigger | None
         trig = _TRIGGER_PRESETS[term.trigger] if term.trigger is not None else None
+        if term.ablation:
+            if sel.operator is not None:
+                raise SteeringExprError(
+                    "ablation does not compose with projection operators; "
+                    "ablate the base concept and project separately"
+                )
+            effective_trig = trig if trig is not None else Trigger.BOTH
+            _merge_ablation(alphas, base_key, coeff, effective_trig)
+            continue
         if sel.operator is None:
             _merge_plain(alphas, base_key, coeff, trig)
             continue
@@ -469,6 +536,9 @@ def format_expr(steering: "Steering") -> str:
     default_trig = steering.trigger
     parts: list[str] = []
     for name, val in steering.alphas.items():
+        if isinstance(val, AblationTerm):
+            parts.append(_fmt_ablation(val))
+            continue
         if isinstance(val, ProjectedTerm):
             parts.append(_fmt_projected(val))
             continue
@@ -502,6 +572,18 @@ def _fmt_projected(p: ProjectedTerm) -> str:
     return body
 
 
+def _fmt_ablation(a: AblationTerm) -> str:
+    if a.coeff == 1.0:
+        body = f"!{a.target}"
+    elif a.coeff == -1.0:
+        body = f"-!{a.target}"
+    else:
+        body = f"{a.coeff:g} !{a.target}"
+    if a.trigger != Trigger.BOTH:
+        body += "@" + _trigger_name(a.trigger)
+    return body
+
+
 def _trigger_name(trig: Trigger) -> str:
     if trig in _TRIGGER_CANONICAL:
         return _TRIGGER_CANONICAL[trig]
@@ -532,6 +614,8 @@ def referenced_selectors(
 
 __all__ = [
     "DEFAULT_COEFF",
+    "DEFAULT_ABLATION_COEFF",
+    "AblationTerm",
     "ProjectedTerm",
     "SteeringExprError",
     "parse_expr",

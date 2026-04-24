@@ -313,7 +313,101 @@ class TraitMonitor:
             if not per_token[name]:
                 per_token[name] = [0.0] * n
 
-        self._pending_per_token = True
+        # Mirror score_stack's gate: the pending-per-token flag is TUI
+        # state, and stateless callers (server path with accumulate=False)
+        # must not leak into it.
+        if accumulate:
+            self._pending_per_token = True
+        return agg_vals, per_token
+
+    def score_stack(
+        self,
+        captured: dict[int, torch.Tensor],
+        *,
+        agg_index: int | None = None,
+        accumulate: bool = False,
+    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+        """Score probes over a pre-captured ``[T, D]`` stack per layer.
+
+        Unlike :meth:`score_per_token`, this entry point does not require
+        ``generated_ids`` or a tokenizer — the caller has already decided
+        which rows are meaningful (e.g. already trimmed trailing special
+        tokens if they cared). Aggregate is pooled from row ``agg_index``
+        (defaults to the last row of each layer).
+
+        Returns ``(aggregate_vals, per_token_scores)``. ``accumulate``
+        defaults to ``False`` here (opposite of :meth:`score_per_token`)
+        because this path is for ad-hoc researcher probing, not the
+        in-flight generation loop.
+        """
+        empty_agg = {name: 0.0 for name in self._raw_profiles}
+        if not captured:
+            return empty_agg, {name: [] for name in self._raw_profiles}
+
+        any_h = next(iter(captured.values()))
+        if any_h.ndim != 2:
+            raise ValueError(
+                f"score_stack expects [T, D] per layer; got shape {tuple(any_h.shape)}",
+            )
+        n = any_h.shape[0]
+        if n == 0:
+            return empty_agg, {name: [] for name in self._raw_profiles}
+
+        # Uniform T across layers — mixed lengths are a caller bug.
+        for layer_idx, h in captured.items():
+            if h.ndim != 2 or h.shape[0] != n:
+                raise ValueError(
+                    f"score_stack: layer {layer_idx} has shape {tuple(h.shape)}, "
+                    f"expected [{n}, D]",
+                )
+
+        self._ensure_cache(any_h.device)
+
+        agg_row = n - 1 if agg_index is None else int(agg_index)
+        if not (0 <= agg_row < n):
+            raise ValueError(
+                f"score_stack: agg_index={agg_index} out of range for T={n}",
+            )
+
+        # T-uniformity validated above and agg_row < n; no per-layer
+        # shape guard is needed (unlike score_per_token, which operates
+        # on raw hook captures that can be ragged by one around EOS).
+        agg_hidden = {
+            layer_idx: h[agg_row] for layer_idx, h in captured.items()
+        }
+        agg_vals = self._score_probes(agg_hidden, accumulate=accumulate)
+
+        probe_keys = self._cache_probe_keys
+        n_probes = len(probe_keys)
+        device = any_h.device
+        num = torch.zeros((n, n_probes), device=device, dtype=torch.float32)
+        den = torch.zeros((n_probes,), device=device, dtype=torch.float32)
+        for layer_idx, h in captured.items():
+            entry = self._layer_cache.get(layer_idx)
+            if entry is None:
+                continue
+            V, W = entry
+            h_unit = self._normalize_hidden(layer_idx, h.float())  # (n, D)
+            sims = h_unit @ V.t()  # (n, P)
+            num.add_(sims * W)
+            den.add_(W)
+        den.clamp_(min=1e-8)
+        result = (num / den).cpu().tolist()
+        per_token: dict[str, list[float]] = {name: [] for name in self._raw_profiles}
+        for i, name in enumerate(probe_keys):
+            per_token[name] = [row[i] for row in result]
+        for name in self._raw_profiles:
+            if not per_token[name]:
+                per_token[name] = [0.0] * n
+
+        # Only flip the pending flag when the caller is actually
+        # feeding this into history. Ad-hoc researcher calls
+        # (accumulate=False, the default here) must not surface as
+        # pending data on the monitor's TUI-facing consumer side —
+        # score_per_token sets this unconditionally because it's
+        # always in-flight; score_stack is not.
+        if accumulate:
+            self._pending_per_token = True
         return agg_vals, per_token
 
     def has_pending_data(self) -> bool:
