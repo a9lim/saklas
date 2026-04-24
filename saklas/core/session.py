@@ -1712,7 +1712,9 @@ class SaklasSession:
                     # skip the layer rather than returning a short tensor the
                     # caller would misalign with generated_ids.
                     continue
-                trimmed[layer_idx] = h.detach().to("cpu").clone()
+                # `.to("cpu")` from a device tensor allocates a fresh
+                # CPU tensor already; no redundant `.clone()` needed.
+                trimmed[layer_idx] = h.detach().to("cpu")
             hidden_states = trimmed
 
         result = GenerationResult(
@@ -1882,8 +1884,9 @@ class SaklasSession:
             # Refresh snapshot now that steering is pushed (first-scope case).
             vector_snapshot = _snapshot_alphas()
 
+            want_hidden = bool(sampling and sampling.return_hidden)
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
-            self._begin_capture(widen=bool(sampling and sampling.return_hidden))
+            self._begin_capture(widen=want_hidden)
             self._monitor.begin_live()
             # Reset the steering manager's TriggerContext for this generation.
             # ``generate_steered`` mutates it at lifecycle boundaries; hooks
@@ -1917,7 +1920,7 @@ class SaklasSession:
                 prompt_tokens=prompt_tokens, stateless=stateless,
                 logprobs_list=logprobs_list,
                 applied_steering=applied_steering,
-                return_hidden=bool(sampling and sampling.return_hidden),
+                return_hidden=want_hidden,
             )
             self._monitor.end_live()
             self.events.emit(GenerationFinished(result=result))
