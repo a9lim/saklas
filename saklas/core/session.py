@@ -1480,6 +1480,69 @@ class SaklasSession:
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
+    def score_hidden(
+        self,
+        hidden: dict[int, torch.Tensor],
+        *,
+        per_token: bool = False,
+        accumulate: bool = False,
+    ) -> (
+        dict[str, float]
+        | tuple[dict[str, float], dict[str, list[float]]]
+    ):
+        """Score registered probes against a pre-captured hidden-state dict.
+
+        Accepts any ``{layer_idx: Tensor}`` mapping — e.g. the
+        ``GenerationResult.hidden_states`` dict from a prior
+        ``generate(..., sampling=SamplingConfig(return_hidden=True))``
+        call, or hidden states the caller captured externally.
+
+        Shape rules:
+        - Each value ``[D]``          → single-state aggregate.
+          Returns ``dict[probe, float]``.
+        - Each value ``[T, D]``       → per-token stack.
+          ``per_token=False`` (default) returns the aggregate pooled from
+          row ``T-1``; ``per_token=True`` returns
+          ``(aggregate, per_token_scores)``.
+
+        Mixed shapes (``[D]`` alongside ``[T, D]``) or uneven ``T`` across
+        layers raise :class:`SaklasError`. Empty dict raises.
+
+        ``accumulate`` defaults to ``False`` — ad-hoc researcher scoring
+        does not pollute the monitor's running-mean history. Pass
+        ``True`` to feed this call into the same stats pipeline the TUI
+        reads from.
+        """
+        if not hidden:
+            raise SaklasError("score_hidden: no layers provided")
+
+        # Classify shapes up-front.
+        shapes = [v.ndim for v in hidden.values()]
+        if len(set(shapes)) > 1:
+            raise SaklasError(
+                "score_hidden: mixed shapes in input; expected either all "
+                "[D] or all [T, D] across layers",
+            )
+        if shapes[0] not in (1, 2):
+            raise SaklasError(
+                f"score_hidden: expected [D] or [T, D] tensors, got ndim={shapes[0]}",
+            )
+
+        if shapes[0] == 1:
+            if per_token:
+                # [D] input + per_token is meaningless.
+                raise SaklasError(
+                    "score_hidden: per_token=True requires [T, D] input",
+                )
+            # Fall through to the monitor's single-state path.
+            return self._monitor.measure_from_hidden(hidden, accumulate=accumulate)
+
+        # [T, D] path — delegate to monitor.score_stack.
+        agg, per_tok = self._monitor.score_stack(
+            hidden, accumulate=accumulate,
+        )
+        return (agg, per_tok) if per_token else agg
+
     def _promote_profile(self, profile: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
         return {idx: vec.to(self._device, self._dtype) for idx, vec in profile.items()}
 

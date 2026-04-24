@@ -100,3 +100,100 @@ def test_score_stack_accumulate_false_leaves_pending_flag_clear():
         {0: torch.tensor([[1.0, 0.0, 0.0, 0.0]])}, accumulate=False,
     )
     assert m.has_pending_per_token() is False
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — SaklasSession.score_hidden
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from saklas.core.errors import SaklasError  # noqa: E402
+from saklas.core.session import SaklasSession  # noqa: E402
+
+
+def _mock_session() -> SaklasSession:
+    """Build a SaklasSession without touching a real model.
+
+    We bypass __init__ (which requires a PreTrainedModel) and wire up
+    only the fields score_hidden reads: _monitor, _device.  Every other
+    attribute remains un-set; score_hidden must not touch them.
+    """
+    s = SaklasSession.__new__(SaklasSession)
+    s._monitor = _monitor_with_probe()
+    s._device = torch.device("cpu")
+    return s
+
+
+def test_score_hidden_single_state_returns_probe_dict():
+    s = _mock_session()
+    h = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
+    scores = s.score_hidden(h)
+    assert set(scores.keys()) == {"x"}
+    assert scores["x"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_score_hidden_stack_aggregate_only():
+    s = _mock_session()
+    stack = torch.tensor([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+    ])
+    scores = s.score_hidden({0: stack})
+    # Aggregate pools from last row (neutral wrt probe).
+    assert isinstance(scores, dict)
+    assert abs(scores["x"]) < 1e-5
+
+
+def test_score_hidden_stack_per_token_returns_tuple():
+    s = _mock_session()
+    stack = torch.tensor([
+        [1.0, 0.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0, 0.0],
+    ])
+    agg, per_token = s.score_hidden({0: stack}, per_token=True)
+    assert set(agg.keys()) == {"x"}
+    assert per_token["x"][0] == pytest.approx(1.0, abs=1e-5)
+    assert per_token["x"][1] == pytest.approx(-1.0, abs=1e-5)
+
+
+def test_score_hidden_empty_dict_raises():
+    s = _mock_session()
+    with pytest.raises(SaklasError, match="no layers"):
+        s.score_hidden({})
+
+
+def test_score_hidden_mixed_shapes_raises():
+    s = _mock_session()
+    bad = {
+        0: torch.tensor([1.0, 0.0, 0.0, 0.0]),        # [D]
+        1: torch.tensor([[1.0, 0.0, 0.0, 0.0]]),      # [T, D]
+    }
+    with pytest.raises(SaklasError, match="mixed shapes"):
+        s.score_hidden(bad)
+
+
+def test_score_hidden_uneven_T_raises():
+    s = _mock_session()
+    bad = {
+        0: torch.zeros(3, 4),
+        1: torch.zeros(2, 4),
+    }
+    with pytest.raises((SaklasError, ValueError)):
+        s.score_hidden(bad)
+
+
+def test_score_hidden_accumulate_false_does_not_mutate_history():
+    s = _mock_session()
+    before = list(s._monitor.history["x"])
+    s.score_hidden({0: torch.tensor([1.0, 0.0, 0.0, 0.0])})
+    assert list(s._monitor.history["x"]) == before
+    assert s._monitor._stats["x"]["count"] == 0
+
+
+def test_score_hidden_accumulate_true_records():
+    s = _mock_session()
+    s.score_hidden(
+        {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, accumulate=True,
+    )
+    assert s._monitor._stats["x"]["count"] == 1
