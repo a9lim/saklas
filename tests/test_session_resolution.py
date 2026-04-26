@@ -38,6 +38,9 @@ def _write_tensor_pack(tmp_path, namespace: str, name: str, model_id: str, value
 
 
 def _stub_session(model_id: str) -> SaklasSession:
+    from saklas.core.extraction import ExtractionPipeline
+    from saklas.core.session import GenState
+
     session = SaklasSession.__new__(SaklasSession)
     session._model_info = {"model_id": model_id}
     session._device = torch.device("cpu")
@@ -46,6 +49,10 @@ def _stub_session(model_id: str) -> SaklasSession:
     session._model = SimpleNamespace()
     session._tokenizer = SimpleNamespace()
     session._layers = []
+    session._profiles = {}
+    session._gen_phase = GenState.IDLE
+    # Pipeline normally constructed in __init__; stub skips that, wire one in.
+    session._extraction = ExtractionPipeline(session, session, session, session.events)
     return session
 
 
