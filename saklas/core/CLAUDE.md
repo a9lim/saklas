@@ -67,7 +67,7 @@ Entry points:
 
 `SaklasSession` owns model, profile registry (`_profiles`), monitor, `SteeringManager`, `HiddenCapture`, generation defaults (`session.config`, frozen `GenerationConfig`), conversation history, and a synchronous `events: EventBus`.
 
-**Construction**: `SaklasSession.from_pretrained(model_id, *, device, dtype, quantize, probes, ...)` does HF load + probe bootstrap + layer-mean compute. Plain `__init__(model, tokenizer, *, probes, ...)` accepts a pre-loaded `PreTrainedModel` for multi-session-on-one-model scenarios.
+**Construction**: `SaklasSession.from_pretrained(model_id, *, device, dtype, quantize, probes, ...)` does HF load + probe bootstrap + layer-mean compute. Plain `__init__(model, tokenizer, *, probes, ...)` accepts a pre-loaded `PreTrainedModel` for multi-session-on-one-model scenarios. **Both paths unconditionally call `materialize_bundled()` + `selectors.invalidate()` early in `__init__`** — `bootstrap_probes` does this transitively, but is skipped when `probes=[]`, and that left freshly-added bundled concepts invisible to `_all_concepts()` for the rest of the session (causing `session.extract(name)` to drop into the local namespace and re-run scenario+pair generation). The explicit call keeps the invariant intact regardless of probe-loading config.
 
 **Public API on `generate` / `generate_stream`** is keyword-only:
 ```python
