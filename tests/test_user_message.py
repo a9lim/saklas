@@ -160,7 +160,6 @@ def test_server_routes_user_message_status_codes():
 
     from fastapi.testclient import TestClient
 
-    from saklas.core.results import GenerationResult
     from saklas.server import create_app
 
     def _mock_session():

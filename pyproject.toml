@@ -87,8 +87,19 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W"]
+select = ["E", "F", "W", "T20"]
 ignore = ["E501", "E741", "E402", "E731"]
+
+[tool.ruff.lint.per-file-ignores]
+# CLI runners and the cli/output.py presentation layer are the
+# canonical print-to-stdout sites; T20 (flake8-print) is meant to
+# catch debug-print leakage in the engine / IO / server / TUI.
+"saklas/cli/*" = ["T20"]
+# Research/maintenance scripts are stand-alone and intentionally
+# print to stdout for diagnostic output and progress reporting.
+"scripts/*" = ["T20"]
+# Examples are runnable demos that print results.
+"examples/*" = ["T20"]
 
 # Pyright — scoped to the public API surface.  Engine/CLI/server/TUI
 # layers lean hard on torch/transformers/fastapi/textual internals whose
