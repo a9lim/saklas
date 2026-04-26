@@ -17,12 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, model_validator
 
-from saklas.io.cache_ops import InstallConflict, RefreshError
-from saklas.cli.selectors import AmbiguousSelectorError
-from saklas.cli.config_file import ConfigFileError
 from saklas.core.errors import SaklasError
-from saklas.io.hf import HFError
-from saklas.io.packs import PackFormatError
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
@@ -54,6 +49,9 @@ async def acquire_session_lock(session: SaklasSession) -> AsyncIterator[bool]:
 
 class UnsupportedContentError(ValueError, SaklasError):
     """Non-text content parts submitted to a text-only endpoint."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -500,27 +498,9 @@ def create_app(session: SaklasSession,
             allow_headers=["*"],
         )
 
-    _SAKLAS_ERROR_STATUS: list[tuple[type, int]] = [
-        (ConcurrentGenerationError, 409),
-        (AmbiguousSelectorError, 400),
-        (UnsupportedContentError, 400),
-        (PackFormatError, 400),
-        (ConfigFileError, 400),
-        (HFError, 502),
-        (InstallConflict, 409),
-        (RefreshError, 500),
-    ]
-
-    def _saklas_error_status(exc: SaklasError) -> int:
-        for cls, status in _SAKLAS_ERROR_STATUS:
-            if isinstance(exc, cls):
-                return status
-        return 500
-
     @app.exception_handler(SaklasError)
     async def _on_saklas_error(request: Request, exc: SaklasError):
-        status = _saklas_error_status(exc)
-        msg = str(exc) or exc.__class__.__name__
+        status, msg = exc.user_message()
         path = request.url.path
         if path.startswith("/api/"):
             # Ollama error shape: {"error": "<msg>"}

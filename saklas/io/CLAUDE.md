@@ -34,7 +34,7 @@ Repeng unit-normed GGUFs round-trip fine; saklas-baked GGUFs carry share-weighte
 
 ## probes_bootstrap.py
 
-Walks `~/.saklas/vectors/default/` after `materialize_bundled()`. 21 bundled probes (19 bipolar + 2 monopolar; see `regenerate_bundled_statements.py` manifest) categorized via `pack.json` tags (`affect`, `epistemic`, `alignment`, `register`, `social_stance`, `cultural`). `bootstrap_layer_means` caches `~/.saklas/models/<id>/layer_means.safetensors`, stale when `neutral_statements.json` hash changes. MPS cache flushed between probes.
+Walks `~/.saklas/vectors/default/` after `materialize_bundled()`. 24 bundled probes (22 bipolar + 2 monopolar; see `regenerate_bundled_statements.py` manifest) categorized via `pack.json` tags (`affect`, `epistemic`, `alignment`, `register`, `social_stance`, `cultural`). `bootstrap_layer_means` caches `~/.saklas/models/<id>/layer_means.safetensors`, stale when `neutral_statements.json` hash changes. MPS cache flushed between probes.
 
 ## cloning.py
 

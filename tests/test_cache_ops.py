@@ -2,7 +2,7 @@
 import pytest
 
 from saklas.io import cache_ops, packs
-from saklas.cli import selectors as sel
+from saklas.io import selectors as sel
 
 
 def _mk(home, ns, name, models=(), tags=(), source="local"):
@@ -226,27 +226,31 @@ def test_refresh_pinned_hf_source_passes_revision(monkeypatch, tmp_path):
     assert called["force"] is True
 
 
-def test_list_local_all(monkeypatch, tmp_path, capsys):
+def test_list_local_all(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"])
     _mk(tmp_path, "a9lim", "archaic", tags=["style"])
-    cache_ops.list_concepts(selector=None, hf=False)
-    out = capsys.readouterr().out
-    assert "happy" in out and "[installed]" in out
-    assert "archaic" in out
+    result = cache_ops.list_concepts(selector=None, hf=False)
+    names = {(r.namespace, r.name) for r in result.installed}
+    assert ("default", "happy") in names
+    assert ("a9lim", "archaic") in names
+    assert all(r.status == "installed" for r in result.installed)
+    assert result.hf_rows == []
+    assert result.error is None
 
 
-def test_list_local_info_mode(monkeypatch, tmp_path, capsys):
+def test_list_local_info_mode(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"], models=["gemma"])
-    cache_ops.list_concepts(selector=sel.parse("default/happy"), hf=False)
-    out = capsys.readouterr().out
-    assert "happy" in out
-    assert "emotion" in out
-    assert "gemma" in out
+    info = cache_ops.pack_info("default", "happy", hf=False)
+    assert info is not None
+    assert info.name == "happy"
+    assert "emotion" in info.tags
+    assert "gemma" in info.tensor_models
+    assert info.status == "installed"
 
 
-def test_list_concepts_includes_hf_rows(monkeypatch, tmp_path, capsys):
+def test_list_concepts_includes_hf_rows(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"])
     monkeypatch.setattr(
@@ -259,12 +263,12 @@ def test_list_concepts_includes_hf_rows(monkeypatch, tmp_path, capsys):
             "recommended_alpha": 0.3,
         }],
     )
-    cache_ops.list_concepts(selector=sel.parse("tag:emotion"), hf=True)
-    out = capsys.readouterr().out
-    assert "happy" in out
-    assert "[installed]" in out
-    assert "calm" in out
-    assert "[hf]" in out
+    result = cache_ops.list_concepts(selector=sel.parse("tag:emotion"), hf=True)
+    installed_names = {r.name for r in result.installed}
+    assert "happy" in installed_names
+    assert all(r.status == "installed" for r in result.installed)
+    hf_names = {r.name for r in result.hf_rows}
+    assert "calm" in hf_names
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +293,7 @@ def test_delete_tensors_variant_raw_only(tmp_path, monkeypatch):
     (ns_folder / "m_sae-mock.json").write_text("{}")
 
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse, invalidate
+    from saklas.io.selectors import parse as sel_parse, invalidate
     invalidate()
 
     n = cache_ops.delete_tensors(sel_parse("test-concept"), "m", variant="raw")
@@ -320,7 +324,7 @@ def test_delete_tensors_variant_sae_only(tmp_path, monkeypatch):
     (ns_folder / "m_sae-b.json").write_text("{}")
 
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse, invalidate
+    from saklas.io.selectors import parse as sel_parse, invalidate
     invalidate()
 
     n = cache_ops.delete_tensors(sel_parse("test-concept"), "m", variant="sae")
@@ -349,7 +353,7 @@ def test_delete_tensors_variant_all_default(tmp_path, monkeypatch):
     (ns_folder / "m_sae-mock.json").write_text("{}")
 
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse, invalidate
+    from saklas.io.selectors import parse as sel_parse, invalidate
     invalidate()
 
     n = cache_ops.delete_tensors(sel_parse("test-concept"), "m", variant="all")

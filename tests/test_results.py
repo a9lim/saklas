@@ -78,7 +78,7 @@ class TestGenerationResult:
     ):
         """Stored expression round-trips through ``parse_expr``."""
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        from saklas.cli import selectors as _sel
+        from saklas.io import selectors as _sel
         _sel.invalidate()
         from saklas.core.steering_expr import parse_expr
         result = GenerationResult(

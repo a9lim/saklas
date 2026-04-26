@@ -189,17 +189,24 @@ These gate `test_session.py::test_throughput` (steered ≥ 85% of vanilla tok/s)
 
 ## Bundled concepts
 
-21 curated concepts at **n=45 pairs each** (9 scenarios × 5 pairs/scenario), stored in `saklas/data/vectors/<canonical>/`. 19 bipolar + 2 monopolar (`agentic`, `manipulative`). Authoritative list is the `BIPOLAR`/`MONOPOLAR` manifest in `scripts/regenerate_bundled_statements.py`.
+24 curated concepts at **n=45 pairs each** (9 scenarios × 5 pairs/scenario), stored in `saklas/data/vectors/<canonical>/`. 22 bipolar + 2 monopolar (`agentic`, `manipulative`). Authoritative list is the `BIPOLAR`/`MONOPOLAR` manifest in `scripts/regenerate_bundled_statements.py`.
 
 Categories:
-- `affect`: angry.calm, happy.sad
-- `epistemic`: confident.uncertain, honest.deceptive, hallucinating.grounded
+- `affect`: angry.calm, happy.sad, fearful.unflinching
+- `epistemic`: confident.uncertain, honest.deceptive, hallucinating.grounded, curious.disinterested
 - `alignment`: refusal.compliant, sycophantic.blunt, agentic, manipulative
 - `register`: formal.casual, direct.indirect, verbose.concise, creative.conventional, humorous.serious, warm.clinical, technical.accessible
 - `social_stance`: authoritative.submissive, high_context.low_context
-- `cultural`: masculine.feminine, religious.secular, traditional.progressive
+- `cultural`: masculine.feminine, religious.secular, traditional.progressive, individualist.collectivist
 
-**Known axis entanglement**: `creative.conventional ↔ hallucinating.grounded` extract near-identical directions (weighted cosine +0.78 on gemma-4-e4b-it). Steering "creative" also steers toward "hallucinating." Model-level entanglement, not probe design — document for users.
+**Known axis entanglements** (cross-model robust on gemma-4-31b-it / gemma-4-e4b-it; weighted cosine via `vector compare`):
+- `masculine.feminine ↔ traditional.progressive` (+0.53 / +0.59) — model treats Hofstede's MAS and traditionalism as the same direction
+- `hallucinating.grounded ↔ humorous.serious` (+0.66 / +0.53) — humor reads as off-grounded creative weirdness
+- `angry.calm ↔ authoritative.submissive` (+0.78 / +0.54) — anger encodes as dominance
+
+Model-specific (not robust across the two checkpoints): on e4b, `individualist.collectivist ↔ high_context.low_context` lands at -0.47 (collectivist ↔ high-context per Hall) but is essentially zero on 31b. On 31b only, `authoritative.submissive` anchors a "stern/dominant" macro-cluster that pulls in sycophantic, refusal, warm, and hallucinating at |cos| ≥ 0.7 — does not transfer to e4b.
+
+These are **model-level** entanglements, not probe-design failures — document for users. Effective rank of the 24 probes is ~11.1 dims on 31b, ~14.0 on e4b (out of theoretical 24).
 
 **Scenario framework** (`scripts/regenerate_bundled_statements.py`, generated on gemma-4-31b-it):
 - `generate_scenarios`: 9 broad situational *domains* per concept (2–6 words), shared across both poles. Load-bearing **anti-allegory clause** in the scenario prompt keeps non-human axes on their literal footing.
@@ -226,6 +233,6 @@ Pair-count note: <n=32 inflates mean PCA scores ~38% (small-sample bias). Share-
 
 ## Testing
 
-**GPU-required** (CUDA or MPS): `test_smoke.py`, `test_session.py`. Downloads `google/gemma-3-4b-it` (~8GB) on first run. `device="auto"` picks cuda > mps > cpu. MPS runs ~3–5× slower, so `test_extraction_fast_enough` uses a backend-specific budget (10s CUDA / 60s MPS). `test_session` covers construction (21 probes auto-loaded), steering (`extract` returns `Profile`), cloning, generation + readings, thinking mode, `ResultCollector` JSONL/CSV. `test_smoke` owns `test_throughput_regression` (steered ≥ 85% of vanilla tok/s).
+**GPU-required** (CUDA or MPS): `test_smoke.py`, `test_session.py`. Downloads `google/gemma-3-4b-it` (~8GB) on first run. `device="auto"` picks cuda > mps > cpu. MPS runs ~3–5× slower, so `test_extraction_fast_enough` uses a backend-specific budget (10s CUDA / 60s MPS). `test_session` covers construction (24 probes auto-loaded), steering (`extract` returns `Profile`), cloning, generation + readings, thinking mode, `ResultCollector` JSONL/CSV. `test_smoke` owns `test_throughput_regression` (steered ≥ 85% of vanilla tok/s).
 
 **CPU-only** (678 tests): `test_paths`, `test_packs`, `test_profile`, `test_sampling`, `test_steering`, `test_steering_context`, `test_events`, `test_format_version`, `test_selectors`, `test_canonical_name`, `test_cache_ops`, `test_hf`, `test_merge`, `test_gguf_io`, `test_config_file`, `test_cli_flags`, `test_probes_bootstrap`, `test_results`, `test_datasource`, `test_cloning` (CPU-safe paths only), `test_server`, `test_saklas_api`, `test_tui_commands`. Cover core v2 dataclasses, steering context semantics, pack format integrity + staleness, selector grammar, HF wrappers (mocked), GGUF roundtrip, config loading + `resolve_poles`, monitor scoring, five-verb CLI dispatch, OpenAI/Ollama/native servers, TUI slash command dispatch.

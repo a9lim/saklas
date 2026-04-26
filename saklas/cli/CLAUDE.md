@@ -4,7 +4,6 @@ Five-verb root parser (`tui`/`serve`/`pack`/`vector`/`config`) split across:
 - `cli/main.py` — entry point, `_build_root_parser`, `_load_effective_config`, `_warmup_session`
 - `cli/parsers.py` — every `_build_X_parser`
 - `cli/runners.py` — every `_run_X`
-- `cli/selectors.py` — selector grammar + `resolve_pole` (renamed from `cli_selectors.py`)
 - `cli/config_file.py` — `ConfigFile` + `effective()` / `resolve_poles()` / `to_yaml()`
 
 ## Verb nesting
@@ -15,7 +14,7 @@ Five-verb root parser (`tui`/`serve`/`pack`/`vector`/`config`) split across:
 
 ## Config loading
 
-`_load_effective_config(args)` is the shared entry point every subcommand that takes `-c` calls. Composes `~/.saklas/config.yaml` + explicit `-c` files and stamps `args.config_vectors` (a steering expression string, or `None`) / `args.temperature` / `args.top_p` / `args.max_tokens` in place. The `vectors:` YAML key is a single steering expression — parsed through `saklas.core.steering_expr.parse_expr` which resolves bare poles (`wolf → deer.wolf @ -0.5`) via `cli.selectors.resolve_pole`. `ConfigFile.load` validates the expression at load time and stores the raw string; re-parsing happens on consumption.
+`_load_effective_config(args)` is the shared entry point every subcommand that takes `-c` calls. Composes `~/.saklas/config.yaml` + explicit `-c` files and stamps `args.config_vectors` (a steering expression string, or `None`) / `args.temperature` / `args.top_p` / `args.max_tokens` in place. The `vectors:` YAML key is a single steering expression — parsed through `saklas.core.steering_expr.parse_expr` which resolves bare poles (`wolf → deer.wolf @ -0.5`) via `io.selectors.resolve_pole`. `ConfigFile.load` validates the expression at load time and stores the raw string; re-parsing happens on consumption.
 
 ## Warmup
 

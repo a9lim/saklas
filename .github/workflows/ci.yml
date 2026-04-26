@@ -42,25 +42,21 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev]"
-      - name: Check version consistency
-        run: |
-          python - <<'PY'
-          import pathlib
-          import re
-          import tomllib
-
-          pyproject_version = tomllib.loads(
-              pathlib.Path("pyproject.toml").read_text()
-          )["project"]["version"]
-          init_text = pathlib.Path("saklas/__init__.py").read_text()
-          match = re.search(r'^__version__ = "([^"]+)"', init_text, re.M)
-          if match is None:
-              raise SystemExit("saklas/__init__.py has no __version__")
-          init_version = match.group(1)
-          if pyproject_version != init_version:
-              raise SystemExit(
-                  f"version mismatch: pyproject={pyproject_version}, "
-                  f"__version__={init_version}"
-              )
-          PY
       - run: pytest -q -m "not gpu"
+
+  build:
+    # Validates the PEP 621 dynamic-version setup in pyproject.toml: confirms
+    # ``python -m build`` resolves ``saklas.__version__`` via AST parse without
+    # executing the module (which would import torch and break the build).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build
+      - name: Verify wheel imports and version round-trips
+        run: |
+          pip install dist/saklas-*.whl
+          python -c "import saklas; print('version:', saklas.__version__)"

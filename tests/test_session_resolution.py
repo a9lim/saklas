@@ -38,6 +38,9 @@ def _write_tensor_pack(tmp_path, namespace: str, name: str, model_id: str, value
 
 
 def _stub_session(model_id: str) -> SaklasSession:
+    from saklas.core.extraction import ExtractionPipeline
+    from saklas.core.session import GenState
+
     session = SaklasSession.__new__(SaklasSession)
     session._model_info = {"model_id": model_id}
     session._device = torch.device("cpu")
@@ -46,11 +49,17 @@ def _stub_session(model_id: str) -> SaklasSession:
     session._model = SimpleNamespace()
     session._tokenizer = SimpleNamespace()
     session._layers = []
+    session._profiles = {}
+    session._gen_phase = GenState.IDLE
+    import threading
+    session._gen_lock = threading.Lock()
+    # Pipeline normally constructed in __init__; stub skips that, wire one in.
+    session._extraction = ExtractionPipeline(session, session, session, session.events)
     return session
 
 
 def test_extract_honors_namespace_when_pack_names_collide(monkeypatch, tmp_path):
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     invalidate()
@@ -65,7 +74,7 @@ def test_extract_honors_namespace_when_pack_names_collide(monkeypatch, tmp_path)
 
 
 def test_extract_bare_duplicate_pack_name_raises(monkeypatch, tmp_path):
-    from saklas.cli.selectors import AmbiguousSelectorError, invalidate
+    from saklas.io.selectors import AmbiguousSelectorError, invalidate
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     invalidate()

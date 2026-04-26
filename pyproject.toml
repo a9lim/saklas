@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saklas"
-version = "1.4.7"
+dynamic = ["version"]
 description = "Activation steering and trait monitoring for HuggingFace transformers — Python library, OpenAI-compatible server, and terminal UI"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -87,8 +87,19 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W"]
+select = ["E", "F", "W", "T20"]
 ignore = ["E501", "E741", "E402", "E731"]
+
+[tool.ruff.lint.per-file-ignores]
+# CLI runners and the cli/output.py presentation layer are the
+# canonical print-to-stdout sites; T20 (flake8-print) is meant to
+# catch debug-print leakage in the engine / IO / server / TUI.
+"saklas/cli/*" = ["T20"]
+# Research/maintenance scripts are stand-alone and intentionally
+# print to stdout for diagnostic output and progress reporting.
+"scripts/*" = ["T20"]
+# Examples are runnable demos that print results.
+"examples/*" = ["T20"]
 
 # Pyright — scoped to the public API surface.  Engine/CLI/server/TUI
 # layers lean hard on torch/transformers/fastapi/textual internals whose
@@ -133,6 +144,13 @@ reportUnnecessaryIsInstance = "warning"
 # Newer pyright treats that as a private-import error; downgrade to
 # warning so legitimate public API references don't break CI.
 reportPrivateImportUsage = "warning"
+
+[tool.setuptools.dynamic]
+# Single literal lives in saklas/__init__.py; setuptools reads it via AST
+# parsing without executing the module (so the eager torch re-export at
+# saklas/__init__.py doesn't fire at build time).  The CI ``build`` job
+# in .github/workflows/ci.yml is the validation gate.
+version = {attr = "saklas.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["saklas*"]

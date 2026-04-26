@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
+from typing import Any
 
 import torch
 
+from saklas.core.errors import StaleSidecarError
 from saklas.io.packs import (
     ConceptFolder, PackFormatError, Sidecar,
     hash_file, materialize_bundled,
@@ -48,7 +51,7 @@ def load_defaults() -> dict[str, list[str]]:
 
 
 def bootstrap_layer_means(
-    model, tokenizer, layers, model_info: dict,
+    model: Any, tokenizer: Any, layers: list[Any], model_info: dict[str, Any],
 ) -> dict[int, torch.Tensor]:
     """Load or compute per-layer mean activations for probe centering.
 
@@ -86,7 +89,7 @@ def bootstrap_layer_means(
 
 
 def bootstrap_probes(
-    model, tokenizer, layers, model_info: dict, categories: list[str],
+    model: Any, tokenizer: Any, layers: list[Any], model_info: dict[str, Any], categories: list[str],
 ) -> dict[str, dict[int, torch.Tensor]]:
     """Load or extract probe vector profiles for the given categories."""
     from saklas import __version__ as _saklas_version
@@ -98,6 +101,8 @@ def bootstrap_probes(
     probes: dict[str, dict[int, torch.Tensor]] = {}
     to_extract: list[tuple[str, Path, Path]] = []
 
+    allow_stale = os.environ.get("SAKLAS_ALLOW_STALE") == "1"
+
     for cat in categories:
         for probe_name in defaults.get(cat, []):
             cdir = concept_dir("default", probe_name)
@@ -106,16 +111,19 @@ def bootstrap_probes(
             if ts.exists() and sc_path.exists():
                 try:
                     profile, meta = load_profile(str(ts))
-                    probes[probe_name] = profile
                     stmts = cdir / "statements.json"
                     recorded_sha = meta.get("statements_sha256")
                     if stmts.exists() and recorded_sha:
                         current = hash_file(stmts)
-                        if current != recorded_sha:
-                            log.warning(
-                                "%s: statements changed since extraction; consider `saklas pack refresh default/%s`",
-                                probe_name, probe_name,
+                        if current != recorded_sha and not allow_stale:
+                            raise StaleSidecarError(
+                                f"default/{probe_name}: statements.json has changed "
+                                f"since this tensor was extracted (model={model_id}). "
+                                f"The baked PCA no longer matches the on-disk pairs. "
+                                f"Re-extract: `saklas pack refresh default/{probe_name} -m {model_id}` "
+                                f"— or set SAKLAS_ALLOW_STALE=1 to load the stale tensor anyway."
                             )
+                    probes[probe_name] = profile
                     sidecar_version = meta.get("saklas_version", "")
                     try:
                         sv = tuple(int(p) for p in sidecar_version.split(".")[:2])
@@ -125,6 +133,8 @@ def bootstrap_probes(
                     except (ValueError, IndexError):
                         log.warning("%s: extracted with older saklas version", probe_name)
                     continue
+                except StaleSidecarError:
+                    raise
                 except Exception as e:
                     log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
             to_extract.append((probe_name, cdir, ts))
@@ -134,9 +144,12 @@ def bootstrap_probes(
 
     log.info("Extracting %d probes...", len(to_extract))
     try:
-        from tqdm import tqdm
+        from tqdm import tqdm as _tqdm
+        progress: Any = _tqdm
     except ImportError:
-        def tqdm(x, **kw): return x
+        def _no_tqdm(x: Any, **kw: Any) -> Any:
+            return x
+        progress = _no_tqdm
 
     datasets_to_extract = []
     for name, cdir, ts in to_extract:
@@ -148,7 +161,7 @@ def bootstrap_probes(
         datasets_to_extract.append((name, cdir, ts, pairs_data, stmts_path))
 
     model_device = next(model.parameters()).device
-    for name, cdir, ts, ds, stmts_path in tqdm(datasets_to_extract, desc="Extracting probes", unit="probe"):
+    for name, cdir, ts, ds, stmts_path in progress(datasets_to_extract, desc="Extracting probes", unit="probe"):
         try:
             profile = extract_contrastive(model, tokenizer, ds["pairs"], layers=layers)
             probes[name] = profile

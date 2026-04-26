@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from saklas.cli import selectors as _sel
+from saklas.io import selectors as _sel
 from saklas.core.events import EventBus
 from saklas.core.hooks import SteeringManager
 from saklas.core.session import SaklasSession, VectorNotRegisteredError

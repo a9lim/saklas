@@ -7,6 +7,7 @@ and numbered-list parsing.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import random
 
 import pytest
@@ -23,7 +24,7 @@ from saklas.io.cloning import (
 
 # -- _filter_corpus ---------------------------------------------------------
 
-def test_filter_corpus_length_filter(tmp_path):
+def test_filter_corpus_length_filter(tmp_path: Path):
     p = tmp_path / "c.txt"
     p.write_text(
         "this line has more than five words\n"
@@ -37,7 +38,7 @@ def test_filter_corpus_length_filter(tmp_path):
     assert "short line here" not in out
 
 
-def test_filter_corpus_dedupes(tmp_path):
+def test_filter_corpus_dedupes(tmp_path: Path):
     p = tmp_path / "c.txt"
     p.write_text(
         "line one with plenty of words\n"
@@ -50,14 +51,14 @@ def test_filter_corpus_dedupes(tmp_path):
     assert len(out) == 2
 
 
-def test_filter_corpus_strips_whitespace(tmp_path):
+def test_filter_corpus_strips_whitespace(tmp_path: Path):
     p = tmp_path / "c.txt"
     p.write_text("   padded line has plenty of words   \n", encoding="utf-8")
     out = _filter_corpus(p)
     assert out == ["padded line has plenty of words"]
 
 
-def test_filter_corpus_handles_bom(tmp_path):
+def test_filter_corpus_handles_bom(tmp_path: Path):
     p = tmp_path / "c.txt"
     p.write_bytes(
         "\ufeffthis line has more than five words\n".encode("utf-8")
@@ -67,7 +68,7 @@ def test_filter_corpus_handles_bom(tmp_path):
     assert not out[0].startswith("\ufeff")
 
 
-def test_filter_corpus_bad_bytes(tmp_path):
+def test_filter_corpus_bad_bytes(tmp_path: Path):
     p = tmp_path / "c.txt"
     p.write_bytes(
         b"good line with plenty of words here\n"
@@ -110,22 +111,22 @@ def test_sample_lines_n_equals_len():
 # -- _chunk -----------------------------------------------------------------
 
 def test_chunk_complete_batches():
-    items = list(range(10))
+    items = [str(i) for i in range(10)]
     batches = _chunk(items, 5)
     assert len(batches) == 2
     assert all(len(b) == 5 for b in batches)
 
 
 def test_chunk_ragged_last_batch():
-    items = list(range(7))
+    items = [str(i) for i in range(7)]
     batches = _chunk(items, 3)
     assert [len(b) for b in batches] == [3, 3, 1]
 
 
 def test_chunk_batch_size_larger_than_input():
-    items = [1, 2]
+    items = ["1", "2"]
     batches = _chunk(items, 10)
-    assert batches == [[1, 2]]
+    assert batches == [["1", "2"]]
 
 
 # -- _build_neutralize_prompt ----------------------------------------------

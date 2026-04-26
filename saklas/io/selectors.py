@@ -8,6 +8,11 @@ Kinds:
     all       : everything
 
 Special alias: "default" -> namespace/default.
+
+This module lives under ``saklas.io`` because both ``io.cache_ops`` and
+``core.session`` need the grammar; importing from ``cli`` would invert the
+layer dependency. CLI runners parse argv with :func:`parse` and pass the
+resulting :class:`Selector` instances down.
 """
 from __future__ import annotations
 
@@ -26,9 +31,21 @@ _VARIANT_REGEX = _re.compile(r"^(raw|sae(?:-[a-z0-9._-]+)?)$")
 class SelectorError(ValueError, SaklasError):
     """Raised when a selector string cannot be parsed."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 class AmbiguousSelectorError(SelectorError):
     """Raised when a bare name matches multiple namespaces."""
+
+    def user_message(self) -> tuple[int, str]:
+        msg = str(self) or self.__class__.__name__
+        # Suffix the canonical disambiguation tip — keeps the original
+        # message (which already lists the colliding namespaces) but
+        # nudges the user toward the fix.
+        if "namespace/name" not in msg:
+            msg = f"{msg} (disambiguate with namespace/name)"
+        return (400, msg)
 
 
 @dataclass
@@ -203,7 +220,7 @@ def resolve_pole(
         else:
             raise SelectorError(f"unknown variant '{maybe_variant}' in '{raw}'")
 
-    # Lazy import to avoid a cycle: session.py imports cli_selectors for
+    # Lazy import to avoid a cycle: session.py imports this module for
     # the broadened extract() lookup.
     from saklas.core.session import BIPOLAR_SEP, canonical_concept_name
 
