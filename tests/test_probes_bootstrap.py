@@ -67,10 +67,10 @@ def test_bootstrap_raises_on_stale_statements(
     stmts_path.write_text('[["my edit", "after extraction"]]')
     meta = packs.PackMetadata.load(cdir)
     meta.files["statements.json"] = packs.hash_file(stmts_path)
-    meta.files[f"google__gemma-2-2b-it.safetensors"] = packs.hash_file(
+    meta.files["google__gemma-2-2b-it.safetensors"] = packs.hash_file(
         cdir / "google__gemma-2-2b-it.safetensors"
     )
-    meta.files[f"google__gemma-2-2b-it.json"] = packs.hash_file(
+    meta.files["google__gemma-2-2b-it.json"] = packs.hash_file(
         cdir / "google__gemma-2-2b-it.json"
     )
     meta.write(cdir)
