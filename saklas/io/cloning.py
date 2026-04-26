@@ -20,6 +20,7 @@ import re
 from typing import TYPE_CHECKING
 
 
+from saklas.io.atomic import write_json_atomic
 from saklas.io.datasource import DataSource
 from saklas.core.errors import SaklasError
 from saklas.core.generation import (
@@ -362,7 +363,7 @@ def clone_from_corpus(
     # Persist statements.json in the same shape as bundled packs.
     stmts_path = folder / "statements.json"
     stmt_objs = [{"positive": p, "negative": n} for p, n in pairs]
-    stmts_path.write_text(json.dumps(stmt_objs, indent=2))
+    write_json_atomic(stmts_path, stmt_objs)
 
     # Delegate the contrastive PCA + save + local pack refresh to the
     # shared session.extract() path via a DataSource. Clear any stale
@@ -385,7 +386,7 @@ def clone_from_corpus(
     raw_pack["n_pairs"] = n_pairs
     raw_pack["batch_size"] = batch_size
     raw_pack["seed"] = effective_seed
-    (folder / "pack.json").write_text(json.dumps(raw_pack, indent=2))
+    write_json_atomic(folder / "pack.json", raw_pack)
 
     _log.info(
         "cloned %s -> %s (corpus not included in pack; statements.json contains "
