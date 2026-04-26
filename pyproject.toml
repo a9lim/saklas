@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saklas"
-version = "1.5.0"
+dynamic = ["version"]
 description = "Activation steering and trait monitoring for HuggingFace transformers — Python library, OpenAI-compatible server, and terminal UI"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -133,6 +133,13 @@ reportUnnecessaryIsInstance = "warning"
 # Newer pyright treats that as a private-import error; downgrade to
 # warning so legitimate public API references don't break CI.
 reportPrivateImportUsage = "warning"
+
+[tool.setuptools.dynamic]
+# Single literal lives in saklas/__init__.py; setuptools reads it via AST
+# parsing without executing the module (so the eager torch re-export at
+# saklas/__init__.py doesn't fire at build time).  The CI ``build`` job
+# in .github/workflows/ci.yml is the validation gate.
+version = {attr = "saklas.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["saklas*"]
