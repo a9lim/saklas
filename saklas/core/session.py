@@ -8,6 +8,7 @@ import queue
 import re
 import threading
 import time
+from enum import IntEnum
 from typing import Callable, Iterator, Literal, overload
 
 import torch
@@ -124,6 +125,33 @@ def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
             return f"{_slug(pos)}{BIPOLAR_SEP}{_slug(neg)}"
         return _slug(concept)
     return f"{_slug(concept)}{BIPOLAR_SEP}{_slug(baseline)}"
+
+class GenState(IntEnum):
+    """Lifecycle phases of a single generation call.
+
+    Replaces the v1.x ``_gen_active: bool`` flag with a typed state so the
+    five-handle teardown (lock, steering scope CM, capture, monitor live,
+    threading lock) is self-documenting.
+
+    Transitions live in :meth:`SaklasSession._generate_core`:
+
+    - ``IDLE`` → ``PREAMBLE``: lock acquired, re-entry guard passed.
+    - ``PREAMBLE`` → ``RUNNING``: capture attached, monitor ``begin_live``,
+      steering :class:`TriggerContext` reset; ``generate_steered`` enters.
+    - ``RUNNING`` → ``FINALIZING``: inner ``finally`` ran — capture detached,
+      steering scope exited; monitor ``end_live`` / lock release pending.
+    - ``FINALIZING`` → ``IDLE``: outer ``finally`` ran.
+
+    The threading ``_gen_lock`` primitive stays alongside this enum — the
+    enum makes the state field typed and self-documenting; the lock still
+    enforces single-flight at the Python level.
+    """
+
+    IDLE = 0
+    PREAMBLE = 1
+    RUNNING = 2
+    FINALIZING = 3
+
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
     """Raised when a generation call is made while another is in progress."""
@@ -278,10 +306,15 @@ class SaklasSession:
         # wait rather than 409.  Library-only callers never touch this.
         self.lock: asyncio.Lock = asyncio.Lock()
         self._gen_state = GenerationState()
-        # Re-entry guard: True between preamble and finalize of any
-        # generation path.  Prevents a pending-action dispatch from
-        # double-attaching capture/steering hooks and leaking them.
-        self._gen_active: bool = False
+        # Typed lifecycle phase of the current generation (or ``IDLE`` between
+        # gens).  Re-entry guard between preamble and finalize: prevents a
+        # pending-action dispatch from double-attaching capture/steering
+        # hooks and leaking them.  See :class:`GenState` for transitions.
+        # Distinct from ``_gen_state`` (the per-call ``GenerationState``
+        # holding token queue, finish_reason, etc.) — the names are close
+        # because the enum field is the *session*'s view of state, while
+        # ``_gen_state`` is the *generator's*.
+        self._gen_phase: GenState = GenState.IDLE
 
         self._history: list[dict[str, str]] = []
         self._last_result: GenerationResult | None = None
@@ -359,6 +392,22 @@ class SaklasSession:
     @property
     def last_per_token_scores(self) -> dict[str, list[float]] | None:
         return self._last_per_token_scores
+
+    @property
+    def gen_state(self) -> GenState:
+        """Lifecycle phase of the current generation (``IDLE`` between gens).
+
+        Read-only window into the session's typed re-entry guard — see
+        :class:`GenState` for transitions.  Surfaces to the TUI and any
+        external introspector that wants to ask "is a gen running right
+        now?" without reaching past the public API.
+        """
+        return self._gen_phase
+
+    @property
+    def is_generating(self) -> bool:
+        """``True`` whenever :attr:`gen_state` is not ``GenState.IDLE``."""
+        return self._gen_phase is not GenState.IDLE
 
     # -- Live trait SSE subscribers --
 
@@ -1437,11 +1486,15 @@ class SaklasSession:
     ) -> None:
         """Compose and attach steering hooks for a generation call.
 
-        Must be called inside a ``_gen_active`` span (entry points set
-        ``_gen_active=True`` before invoking this).  The check is defense
-        in depth against a rogue caller re-entering outside a gen span.
-        Dispatches by entry type — mirrors :meth:`_rebuild_steering_hooks`.
+        Must be called inside an active gen span — i.e. ``_gen_phase`` is
+        ``PREAMBLE`` or ``RUNNING``.  The check is defense in depth against
+        a rogue caller re-entering outside a gen span.  Dispatches by entry
+        type — mirrors :meth:`_rebuild_steering_hooks`.
         """
+        if self._gen_phase not in (GenState.PREAMBLE, GenState.RUNNING):
+            raise ConcurrentGenerationError(
+                "_apply_steering called outside a generation span"
+            )
         self._steering.clear_all()
         for name, entry in entries.items():
             if isinstance(entry, AblationTerm):
@@ -1847,10 +1900,10 @@ class SaklasSession:
         """
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentGenerationError("Generation already in progress")
-        if self._gen_active:
+        if self._gen_phase is not GenState.IDLE:
             self._gen_lock.release()
             raise ConcurrentGenerationError("session generation already in flight")
-        self._gen_active = True
+        self._gen_phase = GenState.PREAMBLE
 
         steering_obj = Steering.from_value(steering)
         # Effective thinking: explicit kwarg wins; else Steering.thinking;
@@ -1937,6 +1990,7 @@ class SaklasSession:
             # ``generate_steered`` mutates it at lifecycle boundaries; hooks
             # read it on each forward.
             self._steering.ctx.reset()
+            self._gen_phase = GenState.RUNNING
             try:
                 start = time.monotonic()
                 generated_ids = generate_steered(
@@ -1956,6 +2010,7 @@ class SaklasSession:
                 if steering_cm is not None:
                     steering_cm.__exit__(None, None, None)
                     steering_cm = None
+                self._gen_phase = GenState.FINALIZING
 
             applied_steering = (
                 str(steering_obj) if steering_obj is not None else None
@@ -1981,7 +2036,7 @@ class SaklasSession:
             raise
         finally:
             self._monitor.end_live()
-            self._gen_active = False
+            self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 
     # -- Generation: blocking --

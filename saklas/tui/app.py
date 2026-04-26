@@ -130,7 +130,15 @@ class SaklasApp(App):
         self._last_prompt: str | None = None
         self._ab_in_progress: bool = False
         self._pending_action: tuple | None = None  # ("regenerate",) or ("submit", text)
-        self._gen_active: bool = False  # main-thread-only generation guard
+        # UI-side gen flag.  Tracks the *TUI's* gen lifecycle, which differs
+        # slightly from the session's: the TUI counts a gen as "still going"
+        # until the ``("done",)`` sentinel lands on the local ``_ui_token_queue``
+        # (see ``_poll_generation``), even after the session has already
+        # returned to ``GenState.IDLE``.  Use ``self._session.is_generating``
+        # for "is the engine running right now?" — this flag is for UI-only
+        # gating (e.g. Ctrl+R, pending-action dispatch) tied to the queue
+        # drain, never to gate any session call.
+        self._ui_gen_active: bool = False
 
         self._focused_panel_idx: int = 1  # Start with chat focused
 
@@ -299,7 +307,7 @@ class SaklasApp(App):
             self._handle_command(text)
             return
         self._last_prompt = text
-        if self._gen_active:
+        if self._session.is_generating:
             # Queue the message — it will be submitted once the current
             # generation finishes (see _poll_generation).
             self._pending_action = ("submit", text)
@@ -359,13 +367,13 @@ class SaklasApp(App):
                 return
             self._handle_extract_only(arg)
         elif cmd == "/clear":
-            if self._gen_active:
+            if self._session.is_generating:
                 self._pending_action = ("clear",)
                 self._session.stop()
                 return
             self._do_clear()
         elif cmd == "/rewind":
-            if self._gen_active:
+            if self._session.is_generating:
                 self._pending_action = ("rewind",)
                 self._session.stop()
                 return
@@ -411,7 +419,7 @@ class SaklasApp(App):
                 except ValueError:
                     chat.add_system_message("Invalid max tokens value")
         elif cmd in ("/exit", "/quit"):
-            if self._gen_active:
+            if self._session.is_generating:
                 self._pending_action = ("quit",)
                 self._session.stop()
                 return
@@ -506,7 +514,7 @@ class SaklasApp(App):
             return
         if pending_type is None:
             pending_type = "steer" if include_alpha else "probe"
-        if self._gen_active:
+        if self._session.is_generating:
             self._pending_action = (pending_type, text)
             self._session.stop()
             return
@@ -757,11 +765,11 @@ class SaklasApp(App):
     # -- Generation --
 
     def action_stop_generation(self) -> None:
-        if self._gen_active:
+        if self._session.is_generating:
             self._session.stop()
 
     async def action_quit(self) -> None:
-        if self._gen_active:
+        if self._session.is_generating:
             self._session.stop()
             self._pending_action = ("quit",)
         else:
@@ -774,7 +782,7 @@ class SaklasApp(App):
         the last turn, so we pass the existing history via input=[] style —
         actually we pop the last assistant and re-use the last user content).
         """
-        self._gen_active = True
+        self._ui_gen_active = True
 
         self._gen_token_count = 0
         self._last_tok_per_sec = 0.0
@@ -806,7 +814,7 @@ class SaklasApp(App):
             if self._messages and self._messages[-1]["role"] == "user":
                 user_text = self._messages.pop()["content"]
             else:
-                self._gen_active = False
+                self._ui_gen_active = False
                 self._chat_panel.add_system_message("Nothing to regenerate.")
                 return
 
@@ -852,7 +860,7 @@ class SaklasApp(App):
     def _poll_generation(self) -> None:
         chat = self._chat_panel
         tokens_consumed = 0
-        generating = self._gen_active
+        generating = self._ui_gen_active
 
         while tokens_consumed < _TOKEN_DRAIN_LIMIT:
             try:
@@ -891,7 +899,7 @@ class SaklasApp(App):
                 if self._current_assistant_widget:
                     self._current_assistant_widget.ensure_thinking_collapsed()
                 self._current_assistant_widget = None
-                self._gen_active = False
+                self._ui_gen_active = False
                 generating = False
                 if self._gen_start_time > 0:
                     self._last_elapsed = time.monotonic() - self._gen_start_time
@@ -1409,7 +1417,7 @@ class SaklasApp(App):
             import sys
             import traceback
             traceback.print_exc(file=sys.stderr)
-            self._gen_active = False
+            self._ui_gen_active = False
             self._pending_action = None
             self._current_assistant_widget = None
             chat.add_system_message(f"error dispatching {kind}: {e}")
@@ -1444,7 +1452,7 @@ class SaklasApp(App):
     def action_regenerate(self) -> None:
         if not self._messages:
             return
-        if self._gen_active:
+        if self._session.is_generating:
             # Stop the current generation; _poll_generation will pick up
             # the pending action once the worker thread finishes.
             self._pending_action = ("regenerate",)
@@ -1456,7 +1464,7 @@ class SaklasApp(App):
 
     def action_ab_compare(self) -> None:
         chat = self._chat_panel
-        if self._gen_active:
+        if self._session.is_generating:
             chat.add_system_message("Cannot A/B compare while generating. Stop generation first.")
             return
         if not self._last_prompt:

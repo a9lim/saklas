@@ -960,7 +960,6 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
         _layers = [object()] * 4
         _profiles: dict = {}
         _gen_lock = None
-        _gen_active = False
         events = EventBus()
 
         def _promote_profile(self, p):
@@ -1039,7 +1038,6 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
         _layers = [object()] * 4
         _profiles: dict = {}
         _gen_lock = None
-        _gen_active = False
         events = EventBus()
 
         def _promote_profile(self, p):

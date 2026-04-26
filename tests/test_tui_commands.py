@@ -39,6 +39,11 @@ def _make_app():
         temperature=0.7, top_p=0.9, max_new_tokens=128,
         system_prompt=None,
     )
+    # Explicit False — MagicMock attribute access otherwise returns a
+    # MagicMock (truthy), which would flip every "is a gen running?"
+    # check in slash dispatch into the pending-action defer branch.
+    session.is_generating = False
+    session.gen_state = saklas.GenState.IDLE
 
     app._session = session
     app._messages = session._history
@@ -52,7 +57,7 @@ def _make_app():
     app._last_prompt = None
     app._ab_in_progress = False
     app._pending_action = None
-    app._gen_active = False
+    app._ui_gen_active = False
     app._focused_panel_idx = 1
     app._highlighting = False
     app._highlight_probe = None
