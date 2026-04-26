@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -184,8 +184,17 @@ class _MergeTerm:
         "ns", "name", "variant", "coeff",
         "operator", "onto_ns", "onto_name", "onto_variant",
     )
-    def __init__(self, ns, name, variant, coeff, operator,
-                 onto_ns, onto_name, onto_variant):
+    def __init__(
+        self,
+        ns: str,
+        name: str,
+        variant: Optional[str],
+        coeff: float,
+        operator: Optional[str],
+        onto_ns: Optional[str],
+        onto_name: Optional[str],
+        onto_variant: Optional[str],
+    ):
         self.ns = ns
         self.name = name
         self.variant = variant
@@ -214,6 +223,7 @@ def shared_models(expression: str) -> list[str]:
         cf = _resolve_coord(term.ns, term.name)
         per.append(set(cf.tensor_models()))
         if term.operator is not None:
+            assert term.onto_ns is not None and term.onto_name is not None
             cf_b = _resolve_coord(term.onto_ns, term.onto_name)
             per.append(set(cf_b.tensor_models()))
     if not per:
@@ -259,7 +269,7 @@ def merge_into_pack(
     else:
         target_models = shared_models(expression)
 
-    component_info: dict[str, dict] = {}
+    component_info: dict[str, dict[str, Any]] = {}
     files_map: dict[str, str] = {}
 
     for sid in target_models:
@@ -268,8 +278,9 @@ def merge_into_pack(
             cf = _resolve_coord(term.ns, term.name)
             profile, _meta = load_profile(str(cf.tensor_path(sid)))
             if term.operator is not None:
-                cf_b = _resolve_coord(term.onto_ns, term.onto_name)
-                b_profile, _ = load_profile(str(cf_b.tensor_path(sid)))
+                assert term.onto_ns is not None and term.onto_name is not None
+                cf_b2 = _resolve_coord(term.onto_ns, term.onto_name)
+                b_profile, _ = load_profile(str(cf_b2.tensor_path(sid)))
                 profile = project_away(profile, b_profile)
             profiles_and_alphas.append((profile, term.coeff))
             component_info.setdefault(term.coord, {

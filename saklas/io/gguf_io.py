@@ -24,6 +24,8 @@ lazy-imports it and raises a clear error if it's missing.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import logging
 from pathlib import Path
 
@@ -89,7 +91,7 @@ def write_gguf_profile(
     return path
 
 
-def read_gguf_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict]:
+def read_gguf_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Read a GGUF control-vector file.
 
     Returns (profile, metadata) where metadata has a shape compatible with

@@ -10,7 +10,7 @@ from saklas.io import packs
 from saklas.io.atomic import _temp_path, write_bytes_atomic, write_json_atomic
 
 
-def test_write_json_atomic_creates_file(tmp_path):
+def test_write_json_atomic_creates_file(tmp_path: Path):
     path = tmp_path / "x.json"
     write_json_atomic(path, {"a": 1, "b": [2, 3]})
     assert path.is_file()
@@ -19,51 +19,51 @@ def test_write_json_atomic_creates_file(tmp_path):
     assert path.read_text().endswith("\n")
 
 
-def test_write_json_atomic_overwrites(tmp_path):
+def test_write_json_atomic_overwrites(tmp_path: Path):
     path = tmp_path / "x.json"
     write_json_atomic(path, {"v": 1})
     write_json_atomic(path, {"v": 2})
     assert json.loads(path.read_text()) == {"v": 2}
 
 
-def test_write_json_atomic_no_orphan_tmp(tmp_path):
+def test_write_json_atomic_no_orphan_tmp(tmp_path: Path):
     path = tmp_path / "x.json"
     write_json_atomic(path, {"v": 1})
     # Successful write leaves no <path>.tmp behind.
     assert not _temp_path(path).exists()
 
 
-def test_write_json_atomic_creates_parent(tmp_path):
+def test_write_json_atomic_creates_parent(tmp_path: Path):
     path = tmp_path / "nested" / "deep" / "x.json"
     write_json_atomic(path, {"v": 1})
     assert path.is_file()
 
 
-def test_write_bytes_atomic_basic(tmp_path):
+def test_write_bytes_atomic_basic(tmp_path: Path):
     path = tmp_path / "blob.bin"
     write_bytes_atomic(path, b"\x00\x01\x02")
     assert path.read_bytes() == b"\x00\x01\x02"
     assert not _temp_path(path).exists()
 
 
-def test_temp_path_with_suffix(tmp_path):
+def test_temp_path_with_suffix(tmp_path: Path):
     p = tmp_path / "x.json"
     assert _temp_path(p) == tmp_path / "x.json.tmp"
 
 
-def test_temp_path_no_suffix(tmp_path):
+def test_temp_path_no_suffix(tmp_path: Path):
     p = tmp_path / "Makefile"
     assert _temp_path(p) == tmp_path / "Makefile.tmp"
 
 
-def test_temp_path_same_directory(tmp_path):
+def test_temp_path_same_directory(tmp_path: Path):
     """Atomicity requires the tempfile sit on the same volume — same dir
     is a sufficient proxy."""
     p = tmp_path / "subdir" / "x.json"
     assert _temp_path(p).parent == p.parent
 
 
-def _make_concept(tmp_path: Path, name: str = "happy") -> Path:
+def _make_concept(tmp_path: Path,  name: str = "happy") -> Path:
     """Build a minimal valid concept folder for ConceptFolder.load tests."""
     d = tmp_path / name
     d.mkdir()
@@ -78,7 +78,7 @@ def _make_concept(tmp_path: Path, name: str = "happy") -> Path:
     return d
 
 
-def test_orphan_tmp_does_not_break_concept_folder_load(tmp_path):
+def test_orphan_tmp_does_not_break_concept_folder_load(tmp_path: Path):
     """Crash recovery: a half-written ``pack.json.tmp`` orphan from an
     interrupted atomic write must not cause ConceptFolder.load to fail.
     The prior good ``pack.json`` is still on disk; the orphan is outside
@@ -95,7 +95,7 @@ def test_orphan_tmp_does_not_break_concept_folder_load(tmp_path):
     assert orphan.exists()
 
 
-def test_orphan_statements_tmp_ignored(tmp_path):
+def test_orphan_statements_tmp_ignored(tmp_path: Path):
     """A ``statements.json.tmp`` orphan from an interrupted write doesn't
     confuse the loader either — only files in the manifest matter."""
     d = _make_concept(tmp_path)
@@ -104,7 +104,7 @@ def test_orphan_statements_tmp_ignored(tmp_path):
     assert cf.has_statements is True
 
 
-def test_atomic_overwrite_preserves_prior_on_simulated_crash(tmp_path):
+def test_atomic_overwrite_preserves_prior_on_simulated_crash(tmp_path: Path):
     """If the .tmp file is written but the ``os.replace`` step never lands
     (the canonical crash window), the original file is byte-identical to
     what it was before the write started."""
@@ -124,7 +124,7 @@ def test_atomic_overwrite_preserves_prior_on_simulated_crash(tmp_path):
     assert json.loads(path.read_text()) == {"version": 1}
 
 
-def test_pack_metadata_future_format_version_message(tmp_path):
+def test_pack_metadata_future_format_version_message(tmp_path: Path):
     """A pack.json with format_version > PACK_FORMAT_VERSION must raise a
     PackFormatError pointing the user at upgrading saklas (or the
     --force-legacy escape hatch), not at scripts/upgrade_packs.py."""
@@ -152,7 +152,7 @@ def test_pack_metadata_future_format_version_message(tmp_path):
     assert "upgrade_packs.py" not in msg
 
 
-def test_pack_metadata_future_format_version_via_pack_metadata_load(tmp_path):
+def test_pack_metadata_future_format_version_via_pack_metadata_load(tmp_path: Path):
     """Same future-version branch must also raise from PackMetadata.load."""
     d = tmp_path / "future"
     d.mkdir()
@@ -171,7 +171,7 @@ def test_pack_metadata_future_format_version_via_pack_metadata_load(tmp_path):
         packs.PackMetadata.load(d)
 
 
-def test_materialize_preserves_user_edited_statements(monkeypatch, tmp_path, caplog):
+def test_materialize_preserves_user_edited_statements(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path,  caplog: pytest.LogCaptureFixture):
     """When the bundled format_version is stale and the on-disk
     ``statements.json`` differs from the bundled copy (canonical hash),
     materialize_bundled must NOT overwrite statements; only ``pack.json``
@@ -213,7 +213,7 @@ def test_materialize_preserves_user_edited_statements(monkeypatch, tmp_path, cap
     assert any("upgraded default/agentic" in m for m in messages)
 
 
-def test_materialize_overwrites_unedited_statements(monkeypatch, tmp_path):
+def test_materialize_overwrites_unedited_statements(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     """When on-disk statements.json is canonically equal to the bundled
     one, the upgrade is allowed to refresh it — no skip log."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))

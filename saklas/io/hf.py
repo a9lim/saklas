@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from saklas.core.errors import SaklasError
 from saklas.io.atomic import write_bytes_atomic, write_json_atomic
@@ -46,13 +46,13 @@ def split_revision(target: str) -> tuple[str, Optional[str]]:
     return coord, rev
 
 
-def _hf_snapshot_download(repo_id: str, **kwargs) -> str:
+def _hf_snapshot_download(repo_id: str, **kwargs: Any) -> str:
     """Thin indirection so tests can monkeypatch."""
     from huggingface_hub import snapshot_download
     return snapshot_download(repo_id=repo_id, repo_type="model", **kwargs)
 
 
-def _hf_hub_download(repo_id: str, filename: str, **kwargs) -> str:
+def _hf_hub_download(repo_id: str, filename: str, **kwargs: Any) -> str:
     from huggingface_hub import hf_hub_download
     return hf_hub_download(repo_id=repo_id, filename=filename, repo_type="model", **kwargs)
 
@@ -68,7 +68,7 @@ def _download(
     revision: Optional[str] = None,
 ) -> str:
     """Snapshot-download <ns>/<concept> from the HF model hub."""
-    kwargs: dict = {"repo_id": coord, "allow_patterns": allow_patterns}
+    kwargs: dict[str, Any] = {"repo_id": coord, "allow_patterns": allow_patterns}
     if revision is not None:
         kwargs["revision"] = revision
     try:
@@ -79,10 +79,11 @@ def _download(
         # download will fail with a generic RepositoryNotFoundError. Probe for
         # that mistake and return a targeted message; otherwise fall through.
         try:
-            from huggingface_hub.utils import RepositoryNotFoundError
+            from huggingface_hub.errors import RepositoryNotFoundError
+            _repo_not_found: type[BaseException] = RepositoryNotFoundError
         except Exception:
-            RepositoryNotFoundError = tuple()  # type: ignore[assignment]
-        if isinstance(e, RepositoryNotFoundError):
+            _repo_not_found = type("RepositoryNotFoundError", (Exception,), {})
+        if isinstance(e, _repo_not_found):
             if _repo_exists_as_dataset(coord, revision):
                 raise HFError(
                     f"{label}: HF repo is not a model repo. saklas packs must be "
@@ -101,7 +102,7 @@ def _repo_exists_as_dataset(coord: str, revision: Optional[str]) -> bool:
     """
     try:
         api = _hf_api()
-        kwargs: dict = {"repo_id": coord, "repo_type": "dataset"}
+        kwargs: dict[str, Any] = {"repo_id": coord, "repo_type": "dataset"}
         if revision is not None:
             kwargs["revision"] = revision
         api.repo_info(**kwargs)
@@ -440,7 +441,7 @@ def resolve_target_coord(pack_name: str, as_: Optional[str]) -> str:
         raise HFError(
             f"could not resolve HF username ({e}); pass --as owner/name or run `hf auth login`"
         ) from e
-    user = who.get("name") if isinstance(who, dict) else None
+    user = who.get("name") if hasattr(who, "get") else None
     if not user:
         raise HFError("could not resolve HF username; pass --as owner/name")
     return f"{user}/{pack_name}"
@@ -600,7 +601,7 @@ def push_pack(
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def search_packs(selector) -> list[dict]:
+def search_packs(selector: Any) -> list[dict[str, Any]]:
     """Search HF for saklas-pack-tagged model repos matching the selector.
 
     Returns a list of row dicts ready for display. At most _HF_SEARCH_CAP rows.
@@ -620,7 +621,7 @@ def search_packs(selector) -> list[dict]:
     elif selector.kind == "model":
         pass  # applied post-search
 
-    kwargs: dict = dict(filter=required_tags, limit=_HF_SEARCH_CAP)
+    kwargs: dict[str, Any] = dict(filter=required_tags, limit=_HF_SEARCH_CAP)
     if search_text:
         kwargs["search"] = search_text
 
@@ -632,7 +633,7 @@ def search_packs(selector) -> list[dict]:
         kwargs["tags"] = required_tags
         results = list(api.list_models(**kwargs))
 
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     for r in results[:_HF_SEARCH_CAP]:
         coord = r.id
         if "/" in coord:
@@ -680,18 +681,18 @@ def search_packs(selector) -> list[dict]:
     return rows
 
 
-def fetch_info(coord: str, revision: Optional[str] = None) -> dict:
+def fetch_info(coord: str, revision: Optional[str] = None) -> dict[str, Any]:
     """Fetch minimal info about an HF saklas pack without downloading the whole repo."""
     label = f"{coord}@{revision}" if revision else coord
     try:
-        dl_kwargs: dict = {}
+        dl_kwargs: dict[str, Any] = {}
         if revision is not None:
             dl_kwargs["revision"] = revision
         pj_path = _hf_hub_download(coord, "pack.json", **dl_kwargs)
         with open(pj_path) as f:
             data = json.load(f)
         api = _hf_api()
-        list_kwargs: dict = {"repo_id": coord, "repo_type": "model"}
+        list_kwargs: dict[str, Any] = {"repo_id": coord, "repo_type": "model"}
         if revision is not None:
             list_kwargs["revision"] = revision
         files = api.list_repo_files(**list_kwargs)

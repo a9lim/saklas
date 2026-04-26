@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field
 from importlib import resources as _resources
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from saklas.core.errors import SaklasError
 
@@ -101,8 +101,8 @@ class PackMetadata:
             format_version=fmt_ver,
         )
 
-    def to_dict(self) -> dict:
-        out: dict = {
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "format_version": self.format_version,
@@ -131,7 +131,7 @@ class Sidecar:
     method: str
     saklas_version: str
     statements_sha256: Optional[str] = None
-    components: Optional[dict[str, dict]] = None
+    components: Optional[dict[str, dict[str, Any]]] = None
 
     @classmethod
     def load(cls, path: Path) -> "Sidecar":
@@ -144,8 +144,8 @@ class Sidecar:
             components=data.get("components"),
         )
 
-    def to_dict(self) -> dict:
-        out: dict = {
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "method": self.method,
             "saklas_version": self.saklas_version,
         }
@@ -498,7 +498,7 @@ def materialize_bundled() -> None:
 
 
 def merge_components_status(
-    recorded: dict[str, dict],
+    recorded: dict[str, dict[str, Any]],
     current_hashes: dict[str, str],
 ) -> dict[str, str]:
     """Return {coord: status} where status is 'ok', 'mismatch', or 'missing'.
@@ -522,7 +522,7 @@ def merge_components_status(
 
 
 def merge_components_stale(
-    recorded: dict[str, dict],
+    recorded: dict[str, dict[str, Any]],
     current_hashes: dict[str, str],
 ) -> list[str]:
     """Return components that are 'mismatch' or 'missing' vs current hashes.

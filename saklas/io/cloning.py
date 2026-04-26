@@ -17,7 +17,7 @@ import logging
 import pathlib
 import random
 import re
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 
 from saklas.io.atomic import write_json_atomic
@@ -143,7 +143,7 @@ def _parse_numbered(raw: str, expected: int) -> list[str] | None:
 
 
 def _fit_check(
-    tokenizer,
+    tokenizer: Any,
     batch: list[str],
     generation_budget: int,
     ctx_len: int,

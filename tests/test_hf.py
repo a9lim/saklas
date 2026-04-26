@@ -1,3 +1,4 @@
+from typing import Any
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -7,7 +8,7 @@ import pytest
 from saklas.io import hf, packs
 
 
-def _fake_repo(tmp_path, name="happy"):
+def _fake_repo(tmp_path: Path,  name: Any="happy"):
     repo = tmp_path / "downloaded" / name
     repo.mkdir(parents=True)
     (repo / "statements.json").write_text("[]")
@@ -21,11 +22,11 @@ def _fake_repo(tmp_path, name="happy"):
     return repo
 
 
-def test_snapshot_download_uses_model_repo_type(tmp_path, monkeypatch):
+def test_snapshot_download_uses_model_repo_type(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     fake = _fake_repo(tmp_path)
     calls = []
 
-    def fake_dl(repo_id, **kwargs):
+    def fake_dl(repo_id: Any,  **kwargs: Any):
         calls.append(repo_id)
         return str(fake)
 
@@ -52,11 +53,11 @@ def test_split_revision_empty_rev_errors():
         hf.split_revision("user/happy@")
 
 
-def test_download_passes_revision(tmp_path, monkeypatch):
+def test_download_passes_revision(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     fake = _fake_repo(tmp_path)
     captured = {}
 
-    def fake_dl(**kwargs):
+    def fake_dl(**kwargs: Any):
         captured.update(kwargs)
         return str(fake)
 
@@ -65,11 +66,11 @@ def test_download_passes_revision(tmp_path, monkeypatch):
     assert captured["revision"] == "v1.2.0"
 
 
-def test_download_omits_revision_when_none(tmp_path, monkeypatch):
+def test_download_omits_revision_when_none(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     fake = _fake_repo(tmp_path)
     captured = {}
 
-    def fake_dl(**kwargs):
+    def fake_dl(**kwargs: Any):
         captured.update(kwargs)
         return str(fake)
 
@@ -78,7 +79,7 @@ def test_download_omits_revision_when_none(tmp_path, monkeypatch):
     assert "revision" not in captured
 
 
-def test_pull_pack_records_revision_in_source(tmp_path, monkeypatch):
+def test_pull_pack_records_revision_in_source(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     fake = _fake_repo(tmp_path)
     monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(fake))
     target = tmp_path / "installed" / "happy"
@@ -87,15 +88,15 @@ def test_pull_pack_records_revision_in_source(tmp_path, monkeypatch):
     assert m.source == "hf://user/happy@v1.2.0"
 
 
-def test_snapshot_download_failure_raises(monkeypatch):
-    def fake_dl(repo_id, **kwargs):
+def test_snapshot_download_failure_raises(monkeypatch: pytest.MonkeyPatch):
+    def fake_dl(repo_id: Any,  **kwargs: Any):
         raise RuntimeError("no such repo")
     monkeypatch.setattr(hf, "_hf_snapshot_download", fake_dl)
     with pytest.raises(hf.HFError, match="not found"):
         hf._download("user/nope")
 
 
-def test_pull_pack_installs_to_target(tmp_path, monkeypatch):
+def test_pull_pack_installs_to_target(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     fake = _fake_repo(tmp_path)
     monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(fake))
     target = tmp_path / "installed" / "happy"
@@ -106,7 +107,7 @@ def test_pull_pack_installs_to_target(tmp_path, monkeypatch):
     assert m.source == "hf://user/happy"
 
 
-def test_pull_pack_without_pack_json_and_no_tensors_errors(tmp_path, monkeypatch):
+def test_pull_pack_without_pack_json_and_no_tensors_errors(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     bad = tmp_path / "downloaded" / "nope"
     bad.mkdir(parents=True)
     (bad / "random.txt").write_text("x")
@@ -119,7 +120,7 @@ def test_pull_pack_without_pack_json_and_no_tensors_errors(tmp_path, monkeypatch
     assert not target.with_name(target.name + ".staging").exists()
 
 
-def test_pull_pack_failed_synthesis_preserves_existing_install(tmp_path, monkeypatch):
+def test_pull_pack_failed_synthesis_preserves_existing_install(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     """If staging fails after a previous good install exists at the target,
     the prior install must remain intact — staging-and-swap discipline
     means the target is never touched until staging verifies."""
@@ -148,7 +149,7 @@ def test_pull_pack_failed_synthesis_preserves_existing_install(tmp_path, monkeyp
     assert not target.with_name(target.name + ".bak").exists()
 
 
-def test_pull_pack_cleans_up_stale_staging(tmp_path, monkeypatch):
+def test_pull_pack_cleans_up_stale_staging(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     """A leftover ``<target>.staging`` from a previously-interrupted pull
     must be wiped before a new pull starts; the new pull then succeeds."""
     fake = _fake_repo(tmp_path)
@@ -163,7 +164,7 @@ def test_pull_pack_cleans_up_stale_staging(tmp_path, monkeypatch):
     assert not stale_staging.exists()
 
 
-def test_pull_pack_synthesizes_pack_json_from_raw_safetensors(tmp_path, monkeypatch):
+def test_pull_pack_synthesizes_pack_json_from_raw_safetensors(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     """Repo without a pack.json but with bare .safetensors should install cleanly."""
     import torch
     from saklas.core.vectors import save_profile
@@ -187,7 +188,7 @@ def test_pull_pack_synthesizes_pack_json_from_raw_safetensors(tmp_path, monkeypa
     assert cf.metadata.name == "happy-raw"
 
 
-def test_pull_pack_synthesizes_pack_json_from_raw_gguf(tmp_path, monkeypatch):
+def test_pull_pack_synthesizes_pack_json_from_raw_gguf(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     """Frictionless path: an HF GGUF-only repo installs without any saklas metadata."""
     pytest.importorskip("gguf")
     import torch
@@ -208,7 +209,7 @@ def test_pull_pack_synthesizes_pack_json_from_raw_gguf(tmp_path, monkeypatch):
     assert cf.tensor_format("llama3.1-8b") == "gguf"
 
 
-def test_pull_pack_synthesizes_sidecars_for_raw_safetensors(tmp_path, monkeypatch):
+def test_pull_pack_synthesizes_sidecars_for_raw_safetensors(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     """A raw repo with .safetensors but no sidecars should still install cleanly."""
     from safetensors.torch import save_file
     import torch
@@ -227,7 +228,7 @@ def test_pull_pack_synthesizes_sidecars_for_raw_safetensors(tmp_path, monkeypatc
     assert sc.method == "imported"
 
 
-def test_pull_pack_synthesized_name_slugs_invalid_chars(tmp_path, monkeypatch):
+def test_pull_pack_synthesized_name_slugs_invalid_chars(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     import torch
     from saklas.core.vectors import save_profile
 
@@ -244,7 +245,7 @@ def test_pull_pack_synthesized_name_slugs_invalid_chars(tmp_path, monkeypatch):
     assert packs.NAME_REGEX.match(cf.metadata.name)
 
 
-def test_search_packs_bare_query(monkeypatch):
+def test_search_packs_bare_query(monkeypatch: pytest.MonkeyPatch):
     fake_results = [
         MagicMock(id="user/happy", tags=["saklas-pack", "emotion"]),
         MagicMock(id="other/angry", tags=["saklas-pack", "emotion"]),
@@ -270,7 +271,7 @@ def test_search_packs_bare_query(monkeypatch):
     assert "saklas-pack" in filter_arg
 
 
-def test_search_packs_tag_filter(monkeypatch):
+def test_search_packs_tag_filter(monkeypatch: pytest.MonkeyPatch):
     api = MagicMock()
     api.list_models.return_value = []
     monkeypatch.setattr(hf, "_hf_api", lambda: api)
@@ -283,7 +284,7 @@ def test_search_packs_tag_filter(monkeypatch):
     assert "emotion" in filter_arg
 
 
-def test_fetch_info_reads_pack_json(tmp_path, monkeypatch):
+def test_fetch_info_reads_pack_json(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     pj = tmp_path / "pack.json"
     pj.write_text(json.dumps({
         "name": "happy",
@@ -297,7 +298,7 @@ def test_fetch_info_reads_pack_json(tmp_path, monkeypatch):
         "files": {},
     }))
 
-    def fake_download(repo_id, filename, **kwargs):
+    def fake_download(repo_id: Any,  filename: Any,  **kwargs: Any):
         assert filename == "pack.json"
         return str(pj)
 
@@ -316,7 +317,7 @@ def test_fetch_info_reads_pack_json(tmp_path, monkeypatch):
     assert "google__gemma-2-2b-it" in info["tensor_models"]
 
 
-def _fake_pack_with_tensor(tmp_path, name="happy", model_id="google/gemma-2-2b-it"):
+def _fake_pack_with_tensor(tmp_path: Path,  name: Any="happy",  model_id: Any="google/gemma-2-2b-it"):
     """Build a pack folder containing statements + one safetensors + sidecar."""
     import json as _json
     folder = tmp_path / name
@@ -341,13 +342,13 @@ def _fake_pack_with_tensor(tmp_path, name="happy", model_id="google/gemma-2-2b-i
     return folder
 
 
-def test_push_pack_dry_run_writes_card_and_gitattributes(tmp_path, monkeypatch):
+def test_push_pack_dry_run_writes_card_and_gitattributes(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     folder = _fake_pack_with_tensor(tmp_path)
     staged: dict[str, bytes] = {}
     real_mkdtemp = __import__("tempfile").mkdtemp
     captured_dir: list[Path] = []
 
-    def spy_mkdtemp(**kw):
+    def spy_mkdtemp(**kw: Any):
         d = real_mkdtemp(**kw)
         captured_dir.append(Path(d))
         return d
@@ -358,7 +359,7 @@ def test_push_pack_dry_run_writes_card_and_gitattributes(tmp_path, monkeypatch):
     import shutil as _sh
     orig_rmtree = _sh.rmtree
 
-    def capture_rmtree(path, *a, **kw):
+    def capture_rmtree(path: Any,  *a: Any,  **kw: Any):
         if captured_dir and Path(path) == captured_dir[0]:
             for p in Path(path).rglob("*"):
                 if p.is_file():
@@ -380,7 +381,7 @@ def test_push_pack_dry_run_writes_card_and_gitattributes(tmp_path, monkeypatch):
     assert "saklas pack install alice/happy" in card
 
 
-def test_push_pack_filters_statements_only(tmp_path, monkeypatch):
+def test_push_pack_filters_statements_only(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     folder = _fake_pack_with_tensor(tmp_path)
     api = MagicMock()
     upload = MagicMock()
@@ -406,7 +407,7 @@ def test_push_pack_filters_statements_only(tmp_path, monkeypatch):
     assert api.upload_folder.call_count == 1
 
 
-def test_push_pack_nothing_to_push_errors(tmp_path):
+def test_push_pack_nothing_to_push_errors(tmp_path: Path):
     folder = _fake_pack_with_tensor(tmp_path)
     with pytest.raises(hf.HFError, match="nothing to push"):
         hf.push_pack(
@@ -415,7 +416,7 @@ def test_push_pack_nothing_to_push_errors(tmp_path):
         )
 
 
-def test_push_pack_model_scope_limits_tensors(tmp_path, monkeypatch):
+def test_push_pack_model_scope_limits_tensors(tmp_path: Path,  monkeypatch: pytest.MonkeyPatch):
     folder = _fake_pack_with_tensor(tmp_path, model_id="google/gemma-2-2b-it")
     # Add a second tensor for a different model
     (folder / "meta__llama-3-8b.safetensors").write_bytes(b"\x00" * 8)
@@ -429,11 +430,11 @@ def test_push_pack_model_scope_limits_tensors(tmp_path, monkeypatch):
     }
     meta.write(folder)
 
-    staged_pack: dict = {}
+    staged_pack: dict[str, Any] = {}
     real_mkdtemp = __import__("tempfile").mkdtemp
     captured: list[Path] = []
 
-    def spy_mkdtemp(**kw):
+    def spy_mkdtemp(**kw: Any):
         d = real_mkdtemp(**kw)
         captured.append(Path(d))
         return d
@@ -442,7 +443,7 @@ def test_push_pack_model_scope_limits_tensors(tmp_path, monkeypatch):
     import shutil as _sh
     orig_rmtree = _sh.rmtree
 
-    def capture(path, *a, **kw):
+    def capture(path: Any,  *a: Any,  **kw: Any):
         if captured and Path(path) == captured[0]:
             pj = Path(path) / "pack.json"
             if pj.exists():
@@ -477,7 +478,7 @@ def test_sidecar_stem_to_hf_coord_strips_sae_suffix():
     ) == "google/gemma-3-4b-it"
 
 
-def test_render_model_card_base_model_dedupes_sae_variants(tmp_path):
+def test_render_model_card_base_model_dedupes_sae_variants(tmp_path: Path):
     """A pack with both raw + SAE tensors for the same base model should
     list that base model exactly once under ``base_model:`` — not twice,
     and never as ``google/gemma-3-4b-it_sae-<release>`` (broken coord).
@@ -518,7 +519,7 @@ def test_resolve_target_coord_bad_as():
         hf.resolve_target_coord("happy", "bob")
 
 
-def test_resolve_target_coord_uses_whoami(monkeypatch):
+def test_resolve_target_coord_uses_whoami(monkeypatch: pytest.MonkeyPatch):
     import huggingface_hub
     api = MagicMock()
     api.whoami.return_value = {"name": "alice"}

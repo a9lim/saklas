@@ -4,7 +4,7 @@ from __future__ import annotations
 import shutil
 from importlib import resources as _resources
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from saklas.cli.selectors import (
     ResolvedConcept, Selector, invalidate as _invalidate_selector_cache, resolve,
@@ -200,7 +200,7 @@ def refresh(selector: Selector, *, model_scope: Optional[str] = None) -> int:
             _refresh_bundled(c.folder, c.name)
             count += 1
             continue
-        if isinstance(src, str) and src.startswith("hf://"):
+        if src.startswith("hf://"):
             from saklas.io.hf import pull_pack, split_revision
             coord, revision = split_revision(src[len("hf://"):])
             pull_pack(coord, target_folder=c.folder, force=True, revision=revision)
@@ -564,7 +564,12 @@ def list_concepts(
     if hf and installed_only:
         hf = False
 
-    if selector is not None and selector.kind == "name" and selector.namespace is not None:
+    if (
+        selector is not None
+        and selector.kind == "name"
+        and selector.namespace is not None
+        and selector.value is not None
+    ):
         _print_info(selector.namespace, selector.value, hf=hf, json_output=json_output)
         return
 
@@ -573,16 +578,17 @@ def list_concepts(
     else:
         concepts = resolve(selector)
 
-    hf_rows: list[dict] = []
+    hf_rows: list[dict[str, Any]] = []
     if hf:
         from saklas.io.hf import HFError, search_packs
         try:
-            from huggingface_hub.utils import HfHubHTTPError
+            from huggingface_hub.errors import HfHubHTTPError
+            _hf_http_err: type[BaseException] = HfHubHTTPError
         except ImportError:
-            HfHubHTTPError = ()  # type: ignore[assignment,misc]
+            _hf_http_err = type("HfHubHTTPError", (Exception,), {})
         try:
             hf_rows = search_packs(selector)
-        except (HFError, HfHubHTTPError, OSError) as e:
+        except (HFError, _hf_http_err, OSError) as e:
             msg = f"hf search unavailable: {type(e).__name__}: {e}"
             if json_output:
                 import json as _json
@@ -616,7 +622,7 @@ def list_concepts(
         _print_hf_rows(hf_rows, verbose=verbose)
 
 
-def _row_from_concept(c: ResolvedConcept) -> dict:
+def _row_from_concept(c: ResolvedConcept) -> dict[str, Any]:
     from saklas.io.packs import ConceptFolder
     tensor_models: list[str] = []
     status = "installed"
@@ -711,7 +717,7 @@ def _print_info(namespace: str, name: str, *, hf: bool, json_output: bool = Fals
     print(f"not found: {namespace}/{name}")
 
 
-def _print_hf_rows(rows: list[dict], *, verbose: bool = False) -> None:
+def _print_hf_rows(rows: list[dict[str, Any]], *, verbose: bool = False) -> None:
     for row in rows:
         line = (
             f"{row['name']:<24} {row['namespace']:<12} [hf]          "
