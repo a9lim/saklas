@@ -34,3 +34,20 @@ class AmbiguousVariantError(ValueError, SaklasError):
 
 class UnknownVariantError(KeyError, SaklasError):
     """Raised when a variant selector does not match any on-disk tensor."""
+
+
+class StaleSidecarError(ValueError, SaklasError):
+    """Raised when an extracted tensor's recorded ``statements_sha256``
+    disagrees with the live ``statements.json`` on disk.
+
+    Hand-editing ``statements.json`` after extraction silently invalidates
+    the baked tensor: the contrastive PCA was run against different pairs
+    than the file now contains.  This used to log a warning and proceed;
+    the fail-loud contract makes the staleness an explicit, fixable
+    situation.
+
+    Set ``SAKLAS_ALLOW_STALE=1`` to escape-hatch the check (advanced
+    workflows where stale loads are deliberate, e.g. bisecting a corpus
+    edit).  The remediation in the message names the concrete
+    ``saklas pack refresh`` invocation that fixes the drift.
+    """
