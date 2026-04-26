@@ -1,19 +1,19 @@
 """SaklasSession — unified backend for saklas's programmatic API and TUI."""
 from __future__ import annotations
 import asyncio
-import json
 import logging
+import os
 import pathlib
 import queue
 import re
 import threading
 import time
+from enum import IntEnum
 from typing import Callable, Iterator, Literal, overload
 
 import torch
 
-from saklas.io.datasource import DataSource
-from saklas.core.errors import SaklasError
+from saklas.core.errors import SaklasError, StaleSidecarError
 from saklas.core.events import (
     EventBus,
     GenerationFinished,
@@ -21,14 +21,13 @@ from saklas.core.events import (
     ProbeScored,
     SteeringApplied,
     SteeringCleared,
-    VectorExtracted,
 )
 from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
 from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.model import load_model, get_layers, get_model_info
 from saklas.core.monitor import TraitMonitor
-from saklas.io.packs import PackFormatError, PackMetadata, hash_file, hash_folder_files
-from saklas.io.paths import concept_dir, tensor_filename
+from saklas.io.packs import PackFormatError, PackMetadata, hash_folder_files
+from saklas.io.paths import concept_dir
 from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, TokenEvent, ProbeReadings
@@ -36,12 +35,7 @@ from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm
 from saklas.core.triggers import Trigger
-from saklas.core.vectors import (
-    extract_contrastive,
-    save_profile as _save_profile,
-    load_profile as _load_profile,
-    load_contrastive_pairs,
-)
+from saklas.core.vectors import load_profile as _load_profile
 
 _log = logging.getLogger(__name__)
 
@@ -125,14 +119,62 @@ def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
         return _slug(concept)
     return f"{_slug(concept)}{BIPOLAR_SEP}{_slug(baseline)}"
 
+class GenState(IntEnum):
+    """Lifecycle phases of a single generation call.
+
+    Replaces the v1.x ``_gen_active: bool`` flag with a typed state so the
+    five-handle teardown (lock, steering scope CM, capture, monitor live,
+    threading lock) is self-documenting.
+
+    Transitions live in :meth:`SaklasSession._generate_core`:
+
+    - ``IDLE`` → ``PREAMBLE``: lock acquired, re-entry guard passed.
+    - ``PREAMBLE`` → ``RUNNING``: capture attached, monitor ``begin_live``,
+      steering :class:`TriggerContext` reset; ``generate_steered`` enters.
+    - ``RUNNING`` → ``FINALIZING``: inner ``finally`` ran — capture detached,
+      steering scope exited; monitor ``end_live`` / lock release pending.
+    - ``FINALIZING`` → ``IDLE``: outer ``finally`` ran.
+
+    The threading ``_gen_lock`` primitive stays alongside this enum — the
+    enum makes the state field typed and self-documenting; the lock still
+    enforces single-flight at the Python level.
+    """
+
+    IDLE = 0
+    PREAMBLE = 1
+    RUNNING = 2
+    FINALIZING = 3
+
+
 class ConcurrentGenerationError(RuntimeError, SaklasError):
     """Raised when a generation call is made while another is in progress."""
-    pass
+
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or self.__class__.__name__)
 
 
 class VectorNotRegisteredError(KeyError, SaklasError):
     """Raised when a steering call references a vector not in the registry."""
-    pass
+
+    def user_message(self) -> tuple[int, str]:
+        # KeyError str-formats the message as repr; reach into args
+        # so the user sees the original text.
+        msg = self.args[0] if self.args else self.__class__.__name__
+        return (404, str(msg))
+
+
+class ConcurrentExtractionError(RuntimeError, SaklasError):
+    """Raised when ``session.extract`` is called while a generation is in flight.
+
+    Mirrors :class:`ConcurrentGenerationError` — extraction runs forward
+    passes through the model and would race with an active generation if
+    allowed to overlap.  The gate is a one-line ``GenState`` check at the
+    top of :meth:`SaklasSession.extract` (the pipeline itself is unaware
+    of generation state).
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or self.__class__.__name__)
 
 
 # Internal steering-stack entry shape: additive entries are
@@ -271,10 +313,15 @@ class SaklasSession:
         # wait rather than 409.  Library-only callers never touch this.
         self.lock: asyncio.Lock = asyncio.Lock()
         self._gen_state = GenerationState()
-        # Re-entry guard: True between preamble and finalize of any
-        # generation path.  Prevents a pending-action dispatch from
-        # double-attaching capture/steering hooks and leaking them.
-        self._gen_active: bool = False
+        # Typed lifecycle phase of the current generation (or ``IDLE`` between
+        # gens).  Re-entry guard between preamble and finalize: prevents a
+        # pending-action dispatch from double-attaching capture/steering
+        # hooks and leaking them.  See :class:`GenState` for transitions.
+        # Distinct from ``_gen_state`` (the per-call ``GenerationState``
+        # holding token queue, finish_reason, etc.) — the names are close
+        # because the enum field is the *session*'s view of state, while
+        # ``_gen_state`` is the *generator's*.
+        self._gen_phase: GenState = GenState.IDLE
 
         self._history: list[dict[str, str]] = []
         self._last_result: GenerationResult | None = None
@@ -285,6 +332,19 @@ class SaklasSession:
         # SSE handlers drain the queue asynchronously.
         self._trait_queues: list[tuple] = []
         self._trait_lock = threading.Lock()
+
+        # Ensure bundled concepts are materialized in the user cache and
+        # the selector cache reflects them.  ``bootstrap_probes`` does this
+        # transitively via ``load_defaults``, but is skipped entirely when
+        # ``probes=[]`` — leaving freshly-added bundled concepts (e.g. via
+        # ``regenerate_bundled_statements.py``) invisible to the selector
+        # layer for the rest of the session.  Calling explicitly here keeps
+        # the invariant intact regardless of probe-loading config; the call
+        # is cheap when up-to-date (pack.json format-version short-circuit).
+        from saklas.io.packs import materialize_bundled as _materialize_bundled
+        from saklas.io import selectors as _selectors
+        _materialize_bundled()
+        _selectors.invalidate()
 
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
@@ -303,6 +363,63 @@ class SaklasSession:
             )
 
         self._monitor = TraitMonitor(probe_profiles, self._layer_means)
+
+        # Concept-extraction pipeline.  Constructed once so the session
+        # holds a single live instance; the pipeline takes the structural
+        # dependencies it needs (model handle / pack writer / registry /
+        # event bus) instead of a back-reference.  ``self`` satisfies all
+        # three protocols implicitly — see :mod:`saklas.core.extraction`.
+        from saklas.core.extraction import ExtractionPipeline as _Pipeline
+        self._extraction = _Pipeline(self, self, self, self.events)
+
+    # -- ModelHandle protocol surface (consumed by ExtractionPipeline) --
+
+    @property
+    def model(self) -> torch.nn.Module:
+        """Live HF model.  Part of the :class:`~saklas.core.extraction.ModelHandle` protocol."""
+        return self._model
+
+    @property
+    def tokenizer(self):
+        """Live HF tokenizer.  Part of the :class:`~saklas.core.extraction.ModelHandle` protocol."""
+        return self._tokenizer
+
+    @property
+    def device(self) -> torch.device:
+        """Model device.  Part of the :class:`~saklas.core.extraction.ModelHandle` protocol."""
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Model dtype.  Part of the :class:`~saklas.core.extraction.ModelHandle` protocol."""
+        return self._dtype
+
+    @property
+    def layers(self):
+        """Layer-list accessor.  Part of the :class:`~saklas.core.extraction.ModelHandle` protocol.
+
+        Returns whatever ``get_layers`` produced — typically an
+        ``nn.ModuleList``, list-like enough for the downstream
+        consumers (``extract_contrastive``, hooks).
+        """
+        return self._layers
+
+    # -- VectorRegistry protocol surface --
+    #
+    # ``__contains__`` falls through to ``self._profiles``; ``add`` writes a
+    # ``Profile`` back into the registry as a plain dict so the steering
+    # hook hot path reads tensors without attribute lookups.  ``has_vector``
+    # already covers public membership checks; ``add`` is reserved for the
+    # extraction pipeline's eventual write-back.
+
+    def __contains__(self, name: object) -> bool:
+        if not isinstance(name, str):
+            return False
+        return name in self._profiles
+
+    def add(self, name: str, profile: Profile) -> None:
+        """Register a profile under ``name`` — :class:`VectorRegistry` writeback."""
+        self._profiles[name] = dict(profile.as_dict())
 
     # -- State queries --
 
@@ -339,6 +456,22 @@ class SaklasSession:
     @property
     def last_per_token_scores(self) -> dict[str, list[float]] | None:
         return self._last_per_token_scores
+
+    @property
+    def gen_state(self) -> GenState:
+        """Lifecycle phase of the current generation (``IDLE`` between gens).
+
+        Read-only window into the session's typed re-entry guard — see
+        :class:`GenState` for transitions.  Surfaces to the TUI and any
+        external introspector that wants to ask "is a gen running right
+        now?" without reaching past the public API.
+        """
+        return self._gen_phase
+
+    @property
+    def is_generating(self) -> bool:
+        """``True`` whenever :attr:`gen_state` is not ``GenState.IDLE``."""
+        return self._gen_phase is not GenState.IDLE
 
     # -- Live trait SSE subscribers --
 
@@ -708,345 +841,63 @@ class SaklasSession:
         sae_revision: str | None = None,
         namespace: str | None = None,
     ) -> tuple[str, Profile]:
-        """Extract a steering vector profile and emit VectorExtracted.
+        """Extract a steering vector profile and emit ``VectorExtracted``.
 
-        Thin wrapper around :meth:`_extract_impl` that fires the event
-        bus after the profile is available.  Cache hits and fresh
-        extractions are both emitted — subscribers that only care about
-        freshly-computed profiles can gate on ``event.metadata["method"]``.
+        Thin delegate to :class:`saklas.core.extraction.ExtractionPipeline` —
+        the pipeline owns folder probing, statement caching, scenario /
+        pair generation, contrastive PCA invocation, and pack updates.
+        Re-entry is gated against generation: extraction runs forward
+        passes through the model and would race an active gen.
 
-        **Default behavior**: tensor cache hits short-circuit. On
+        **Default behavior**: tensor cache hits short-circuit.  On
         tensor miss, if ``statements.json`` exists (curated bundled
         pack or local cache), extract directly from it — statements
-        are the expensive part and reuse is the sane default. On
+        are the expensive part and reuse is the sane default.  On
         statements miss, run the full pipeline: generate scenarios →
         generate pairs → save both → extract tensor.
 
         Flags:
 
         - ``scenarios=[...]``: explicit scenarios input; bypasses
-          scenario generation and ``scenarios.json`` cache. Written
-          to disk after use. **Also bypasses the tensor cache** —
+          scenario generation and ``scenarios.json`` cache.  Written
+          to disk after use.  **Also bypasses the tensor cache** —
           supplying fresh scenarios means the caller wants fresh
           pairs, so any cached tensor is stale by definition.
         - ``reuse_scenarios=True``: when regenerating pairs, load
           ``scenarios.json`` from disk if present instead of
-          regenerating. Default False — scenarios are cheap, so the
+          regenerating.  Default False — scenarios are cheap, so the
           full pipeline regenerates them fresh each pair-gen pass.
         - ``force_statements=True``: regenerate ``statements.json``
-          from scratch. **Also bypasses the tensor cache** — same
-          reasoning as ``scenarios=[...]``: if you're regenerating
-          pairs, you want a tensor extracted from them, not from the
-          stale ones.
+          from scratch.  **Also bypasses the tensor cache** — same
+          reasoning as ``scenarios=[...]``.
         """
-        canonical, profile = self._extract_impl(
-            source, baseline,
-            scenarios=scenarios,
-            reuse_scenarios=reuse_scenarios,
-            force_statements=force_statements,
-            on_progress=on_progress,
-            sae=sae,
-            sae_revision=sae_revision,
-            namespace=namespace,
-        )
+        # Must hold ``_gen_lock`` to read ``_gen_phase`` race-free against
+        # ``_generate_core``, which acquires the lock first then flips
+        # ``_gen_phase = PREAMBLE``.  Without the lock, a concurrent
+        # ``generate()`` could pass ``extract()``'s gate and then race
+        # extraction over model forward passes.  The lock generalizes from
+        # "serialize generations" to "serialize all model uses".
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentExtractionError(
+                "session.extract called while another model use is in flight"
+            )
         try:
-            meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
-        except Exception:
-            meta = {}
-        self.events.emit(VectorExtracted(name=canonical, profile=profile, metadata=meta))
-        return canonical, profile
-
-    def _extract_impl(
-        self,
-        source,
-        baseline: str | None = None,
-        *,
-        scenarios: list[str] | None = None,
-        reuse_scenarios: bool = False,
-        force_statements: bool = False,
-        on_progress: Callable[[str], None] | None = None,
-        sae: str | None = None,
-        sae_revision: str | None = None,
-        namespace: str | None = None,
-    ) -> tuple[str, Profile]:
-        """Actual extraction pipeline — see :meth:`extract` for the wrapper.
-
-        Pipeline: tensor cache check → statements.json cache (curated
-        or local) unless ``force_statements`` → otherwise generate
-        scenarios + pairs → save both → extract contrastive → save
-        tensor. Scenarios are persisted to
-        ``local/<canonical>/scenarios.json`` alongside ``statements.json``.
-
-        Returns (canonical_name, profile). For bipolar extraction
-        (baseline supplied), canonical_name is ``f"{pos}.{neg}"`` — the
-        composite name used throughout storage and the vector registry.
-
-        Args:
-            source: concept name (str), list of (positive, negative)
-                    tuples, or a DataSource instance.
-            baseline: optional negative-pole concept for bipolar
-                      extraction. Only used when source is a string.
-            scenarios: explicit scenarios list, bypassing generation
-                       and the scenarios.json cache. Written to disk
-                       after use. Implies fresh statement generation.
-            reuse_scenarios: when regenerating pairs, reuse
-                             scenarios.json from disk if present.
-                             Default False — regenerate scenarios fresh.
-            force_statements: ignore statements.json cache and
-                              regenerate the full pipeline.
-            on_progress: optional callback for progress messages.
-        """
-        def _progress(msg: str) -> None:
-            if on_progress:
-                on_progress(msg)
-
-        # Normalize source
-        if isinstance(source, str):
-            concept, baseline = _split_composite_source(source, baseline)
-        elif isinstance(source, DataSource):
-            concept = source.name
-            baseline = None
-        elif isinstance(source, list):
-            concept = "custom"
-            baseline = None
-        else:
-            raise TypeError(f"Unsupported source type: {type(source)}")
-
-        canonical = canonical_concept_name(concept, baseline)
-
-        # Resolve the SAE backend once. No-op when ``sae is None`` —
-        # the ``load_sae_backend`` import is lazy so non-SAE callers
-        # don't touch the SAE layer.
-        sae_backend = None
-        sae_metadata: dict = {}
-        if sae is not None:
-            from saklas.core.sae import load_sae_backend
-            sae_backend = load_sae_backend(
-                sae,
-                revision=sae_revision,
-                model_id=self.model_id,
-                device=self._device,
-            )
-            sae_metadata = {
-                "sae_release": sae_backend.release,
-                "sae_revision": sae_backend.revision,
-                "sae_ids_by_layer": getattr(sae_backend, "sae_ids_by_layer", {}),
-            }
-
-        def _build_return(profile_dict: dict) -> tuple[str, Profile]:
-            meta: dict = {
-                "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
-            }
-            meta.update(sae_metadata)
-            out_name = (
-                canonical
-                if sae_backend is None
-                else f"{canonical}:sae-{sae_backend.release}"
-            )
-            return out_name, Profile(profile_dict, metadata=meta)
-
-        def _save_meta(extra: dict | None = None) -> dict:
-            meta: dict = {
-                "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
-            }
-            if extra:
-                meta.update(extra)
-            meta.update(sae_metadata)
-            return meta
-
-        # For DataSource or raw pairs, skip the full pipeline — just extract
-        if isinstance(source, (DataSource, list)):
-            if isinstance(source, list):
-                ds = DataSource(pairs=source)
-            else:
-                ds = source
-            folder = self._local_concept_folder(canonical)
-            cache_path = str(folder / tensor_filename(self.model_id, release=sae))
-            try:
-                profile, _meta = _load_profile(cache_path)
-                profile = self._promote_profile(profile)
-                _progress(f"Loaded cached profile for '{canonical}'.")
-                out_name = (
-                    canonical
-                    if sae_backend is None
-                    else f"{canonical}:sae-{sae_backend.release}"
+            if self._gen_phase is not GenState.IDLE:
+                raise ConcurrentExtractionError(
+                    "session.extract called while a generation is in flight"
                 )
-                return out_name, Profile(profile, metadata=_meta)
-            except (FileNotFoundError, KeyError, ValueError):
-                pass
-
-            _progress(f"Extracting profile ({len(ds.pairs)} pairs)...")
-            pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
-            profile = extract_contrastive(
-                self._model, self._tokenizer, pairs, layers=self._layers,
-                sae=sae_backend,
+            return self._extraction.extract(
+                source, baseline,
+                scenarios=scenarios,
+                reuse_scenarios=reuse_scenarios,
+                force_statements=force_statements,
+                on_progress=on_progress,
+                sae=sae,
+                sae_revision=sae_revision,
+                namespace=namespace,
             )
-            _save_profile(profile, cache_path, _save_meta())
-            self._update_local_pack_files(folder)
-            return _build_return(profile)
-
-        # String source — full pipeline. Pack lookup scans installed
-        # namespaces, but bare names must not silently pick the first duplicate.
-        # If the caller supplies namespace=, honor only that namespace.
-        from saklas.cli.selectors import _all_concepts, AmbiguousSelectorError
-        matches = [
-            c for c in _all_concepts()
-            if c.name == canonical and (namespace is None or c.namespace == namespace)
-        ]
-        if namespace is not None and not matches and namespace != "local":
-            raise FileNotFoundError(
-                f"concept pack '{namespace}/{canonical}' is not installed"
-            )
-        if namespace is None and len(matches) > 1:
-            qualified = ", ".join(f"{c.namespace}/{c.name}" for c in matches)
-            raise AmbiguousSelectorError(
-                f"ambiguous concept '{canonical}': matches {qualified}. "
-                f"Specify with a namespace."
-            )
-        pack_folder = matches[0].folder if matches else None
-
-        if pack_folder is not None:
-            cache_path = str(pack_folder / tensor_filename(self.model_id, release=sae))
-        else:
-            cache_path = str(
-                pathlib.Path(self._local_concept_folder(canonical))
-                / tensor_filename(self.model_id, release=sae)
-            )
-
-        # 1. Vector cache — short-circuits unless a regen path is requested.
-        #    ``force_statements=True`` or explicit ``scenarios=[...]`` both
-        #    mean the caller wants fresh pairs, which definitionally
-        #    invalidates any tensor trained on the old pairs — bypassing
-        #    the tensor cache here is the only semantically coherent
-        #    behavior for those flags. No cache hit means the full
-        #    pipeline runs end-to-end and overwrites the stale tensor.
-        if not force_statements and scenarios is None:
-            try:
-                profile, _meta = _load_profile(cache_path)
-                profile = self._promote_profile(profile)
-                _progress(f"Loaded cached profile for '{canonical}'.")
-                out_name = (
-                    canonical
-                    if sae_backend is None
-                    else f"{canonical}:sae-{sae_backend.release}"
-                )
-                return out_name, Profile(profile, metadata=_meta)
-            except (FileNotFoundError, KeyError, ValueError):
-                pass
-
-        # 2. Installed-statements fast path — default reuses bundled/HF/local
-        #    statements.json when present. ``force_statements=True`` skips
-        #    this branch and falls through to regeneration. Passing an
-        #    explicit ``scenarios=`` also skips — if the caller supplied
-        #    scenarios they're clearly opting into fresh pair generation.
-        if pack_folder is not None and not force_statements and scenarios is None:
-            pack_stmts = pack_folder / "statements.json"
-            if pack_stmts.exists():
-                _progress(f"Using curated statements for '{canonical}'...")
-                ds = load_contrastive_pairs(str(pack_stmts))
-                profile = extract_contrastive(
-                    self._model, self._tokenizer, ds["pairs"],
-                    layers=self._layers,
-                    sae=sae_backend,
-                )
-                _save_profile(profile, cache_path, _save_meta({
-                    "statements_sha256": hash_file(pack_stmts),
-                }))
-                self._update_local_pack_files(pack_folder)
-                return _build_return(profile)
-
-        # 3. Local statements cache — default reuses if present.
-        stmt_cache_path = self._statements_cache_path(canonical)
-        local_folder = pathlib.Path(stmt_cache_path).parent
-        pairs = None
-        if not force_statements and scenarios is None:
-            try:
-                with open(stmt_cache_path) as f:
-                    cached = json.load(f)
-                if isinstance(cached, list):
-                    pairs = cached
-                elif isinstance(cached, dict) and "pairs" in cached:
-                    pairs = cached["pairs"]
-                if pairs:
-                    _progress(f"Using cached pairs for '{canonical}'.")
-            except (FileNotFoundError, KeyError, json.JSONDecodeError):
-                pass
-
-        # 4. Generate scenarios + pairs if needed.
-        if pairs is None:
-            suffix = f" vs '{baseline}'" if baseline else ""
-            local_folder.mkdir(parents=True, exist_ok=True)
-
-            # 4a. Resolve effective scenarios.
-            scn_path = local_folder / "scenarios.json"
-            eff_scenarios: list[str] | None = None
-            if scenarios is not None:
-                eff_scenarios = list(scenarios)
-                _progress(
-                    f"Using {len(eff_scenarios)} caller-provided scenarios."
-                )
-            elif reuse_scenarios and scn_path.exists():
-                try:
-                    with open(scn_path) as f:
-                        data = json.load(f)
-                    if isinstance(data, dict) and isinstance(data.get("scenarios"), list):
-                        eff_scenarios = [str(s) for s in data["scenarios"]]
-                    elif isinstance(data, list):
-                        eff_scenarios = [str(s) for s in data]
-                    if eff_scenarios:
-                        _progress(
-                            f"Reusing {len(eff_scenarios)} cached scenarios "
-                            f"for '{canonical}'."
-                        )
-                except (FileNotFoundError, KeyError, json.JSONDecodeError):
-                    eff_scenarios = None
-
-            if not eff_scenarios:
-                _progress(f"Generating scenarios for '{concept}'{suffix}...")
-                eff_scenarios = self.generate_scenarios(
-                    concept, baseline, on_progress=_progress,
-                )
-
-            if not eff_scenarios:
-                raise ValueError(
-                    f"Could not generate scenarios for '{concept}'. "
-                    f"Try a more specific concept."
-                )
-
-            # Persist scenarios to disk (overwriting any existing file).
-            with open(scn_path, "w") as f:
-                json.dump({"scenarios": eff_scenarios}, f, indent=2)
-
-            _progress(
-                f"Generating contrastive pairs for '{concept}'{suffix} "
-                f"across {len(eff_scenarios)} domains..."
-            )
-            raw_pairs = self.generate_pairs(
-                concept, baseline,
-                scenarios=eff_scenarios,
-                on_progress=_progress,
-            )
-            pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
-            with open(stmt_cache_path, "w") as f:
-                json.dump(pairs, f, indent=2)
-
-        if len(pairs) < 2:
-            raise ValueError(
-                f"Could only generate {len(pairs)} pairs (need >= 2). "
-                f"Try a more specific concept."
-            )
-
-        # 5. Extract
-        _progress(f"Extracting contrastive profile ({len(pairs)} pairs)...")
-        profile = extract_contrastive(
-            self._model, self._tokenizer, pairs, layers=self._layers,
-            sae=sae_backend,
-        )
-        _save_profile(profile, cache_path, _save_meta({
-            "statements_sha256": hash_file(pathlib.Path(stmt_cache_path)),
-        }))
-        self._update_local_pack_files(local_folder)
-        return _build_return(profile)
+        finally:
+            self._gen_lock.release()
 
     def clone_from_corpus(
         self,
@@ -1107,7 +958,7 @@ class SaklasSession:
         pre-built :class:`Steering`.  Dict inputs are not accepted; build
         :class:`Steering` directly if you need typed construction.
 
-        Pole aliases (``cli.selectors.resolve_pole``) resolve at parse
+        Pole aliases (``io.selectors.resolve_pole``) resolve at parse
         time; this is the canonical resolver site — CLI, server, and
         TUI all route through here.  Nesting flattens: an inner
         ``steering("0.5 angry.calm")`` overrides the outer
@@ -1225,7 +1076,7 @@ class SaklasSession:
         Names already in ``self._profiles`` pass through verbatim — a caller
         who pre-registered under a specific key stays addressed by that key.
         """
-        from saklas.cli.selectors import resolve_pole
+        from saklas.io.selectors import resolve_pole
 
         out: dict[str, tuple[float, Trigger]] = {}
         for name, (alpha, trig) in entries.items():
@@ -1272,7 +1123,7 @@ class SaklasSession:
         Registered key in ``_profiles`` is ``canonical`` for raw, and
         ``f"{canonical}:{variant}"`` otherwise.
         """
-        from saklas.cli.selectors import _all_concepts
+        from saklas.io.selectors import _all_concepts
         from saklas.io.packs import enumerate_variants
         from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
         from saklas.core.vectors import load_profile
@@ -1309,6 +1160,27 @@ class SaklasSession:
                 profile_dict, _meta = load_profile(str(path))
             except Exception:
                 continue
+            # Phase 2 contract: tensor must not be stale relative to the
+            # concept's on-disk statements.json.  bootstrap_probes raises
+            # StaleSidecarError on the same condition; autoload would
+            # otherwise be a silent escape hatch for the same mismatch.
+            recorded_sha = _meta.get("statements_sha256") if _meta else None
+            stmts_path = concept.folder / "statements.json"
+            if recorded_sha and stmts_path.exists():
+                from saklas.io.packs import hash_file as _hash_file
+                if (
+                    _hash_file(stmts_path) != recorded_sha
+                    and os.environ.get("SAKLAS_ALLOW_STALE") != "1"
+                ):
+                    raise StaleSidecarError(
+                        f"{concept.namespace}/{canonical}: statements.json has "
+                        f"changed since this tensor was extracted "
+                        f"(model={self.model_id}). The baked PCA no longer "
+                        f"matches the on-disk pairs. Re-extract: "
+                        f"`saklas pack refresh {concept.namespace}/{canonical} "
+                        f"-m {self.model_id}` — or set SAKLAS_ALLOW_STALE=1 "
+                        f"to load the stale tensor anyway."
+                    )
             self._profiles[registry_key] = self._promote_profile(profile_dict)
             return
 
@@ -1417,11 +1289,15 @@ class SaklasSession:
     ) -> None:
         """Compose and attach steering hooks for a generation call.
 
-        Must be called inside a ``_gen_active`` span (entry points set
-        ``_gen_active=True`` before invoking this).  The check is defense
-        in depth against a rogue caller re-entering outside a gen span.
-        Dispatches by entry type — mirrors :meth:`_rebuild_steering_hooks`.
+        Must be called inside an active gen span — i.e. ``_gen_phase`` is
+        ``PREAMBLE`` or ``RUNNING``.  The check is defense in depth against
+        a rogue caller re-entering outside a gen span.  Dispatches by entry
+        type — mirrors :meth:`_rebuild_steering_hooks`.
         """
+        if self._gen_phase not in (GenState.PREAMBLE, GenState.RUNNING):
+            raise ConcurrentGenerationError(
+                "_apply_steering called outside a generation span"
+            )
         self._steering.clear_all()
         for name, entry in entries.items():
             if isinstance(entry, AblationTerm):
@@ -1827,10 +1703,10 @@ class SaklasSession:
         """
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentGenerationError("Generation already in progress")
-        if self._gen_active:
+        if self._gen_phase is not GenState.IDLE:
             self._gen_lock.release()
             raise ConcurrentGenerationError("session generation already in flight")
-        self._gen_active = True
+        self._gen_phase = GenState.PREAMBLE
 
         steering_obj = Steering.from_value(steering)
         # Effective thinking: explicit kwarg wins; else Steering.thinking;
@@ -1911,13 +1787,17 @@ class SaklasSession:
 
             want_hidden = bool(sampling and sampling.return_hidden)
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
-            self._begin_capture(widen=want_hidden)
-            self._monitor.begin_live()
-            # Reset the steering manager's TriggerContext for this generation.
-            # ``generate_steered`` mutates it at lifecycle boundaries; hooks
-            # read it on each forward.
-            self._steering.ctx.reset()
             try:
+                # Capture attach + monitor live + ctx.reset live INSIDE the
+                # inner try so a BaseException (KeyboardInterrupt, etc.)
+                # between any pair of these still hits the cleanup finally.
+                # ``_end_capture`` and ``end_live`` are idempotent.
+                self._begin_capture(widen=want_hidden)
+                self._monitor.begin_live()
+                # Reset the steering manager's TriggerContext for this gen;
+                # ``generate_steered`` mutates it at lifecycle boundaries.
+                self._steering.ctx.reset()
+                self._gen_phase = GenState.RUNNING
                 start = time.monotonic()
                 generated_ids = generate_steered(
                     self._model, self._tokenizer, input_ids,
@@ -1936,6 +1816,7 @@ class SaklasSession:
                 if steering_cm is not None:
                     steering_cm.__exit__(None, None, None)
                     steering_cm = None
+                self._gen_phase = GenState.FINALIZING
 
             applied_steering = (
                 str(steering_obj) if steering_obj is not None else None
@@ -1960,8 +1841,12 @@ class SaklasSession:
                     pass
             raise
         finally:
+            # Defense-in-depth: even if the inner finally never ran (e.g. a
+            # BaseException between the outer try entry and ``begin_capture``),
+            # any hooks that did get attached must come off.  Idempotent.
+            self._end_capture()
             self._monitor.end_live()
-            self._gen_active = False
+            self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 
     # -- Generation: blocking --
@@ -1983,7 +1868,7 @@ class SaklasSession:
             input: prompt string or list of message dicts.
             steering: expression string (e.g. ``"0.5 honest + 0.3 warm"``)
                 or a pre-built :class:`Steering`.  Pole aliases resolve at
-                parse time via ``cli.selectors.resolve_pole``.  ``None`` =
+                parse time via ``io.selectors.resolve_pole``.  ``None`` =
                 no steering.
             sampling: per-call ``SamplingConfig``.  ``None`` fields fall
                 through to the session's ``GenerationConfig`` defaults.

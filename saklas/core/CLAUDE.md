@@ -67,7 +67,7 @@ Entry points:
 
 `SaklasSession` owns model, profile registry (`_profiles`), monitor, `SteeringManager`, `HiddenCapture`, generation defaults (`session.config`, frozen `GenerationConfig`), conversation history, and a synchronous `events: EventBus`.
 
-**Construction**: `SaklasSession.from_pretrained(model_id, *, device, dtype, quantize, probes, ...)` does HF load + probe bootstrap + layer-mean compute. Plain `__init__(model, tokenizer, *, probes, ...)` accepts a pre-loaded `PreTrainedModel` for multi-session-on-one-model scenarios.
+**Construction**: `SaklasSession.from_pretrained(model_id, *, device, dtype, quantize, probes, ...)` does HF load + probe bootstrap + layer-mean compute. Plain `__init__(model, tokenizer, *, probes, ...)` accepts a pre-loaded `PreTrainedModel` for multi-session-on-one-model scenarios. **Both paths unconditionally call `materialize_bundled()` + `selectors.invalidate()` early in `__init__`** — `bootstrap_probes` does this transitively, but is skipped when `probes=[]`, and that left freshly-added bundled concepts invisible to `_all_concepts()` for the rest of the session (causing `session.extract(name)` to drop into the local namespace and re-run scenario+pair generation). The explicit call keeps the invariant intact regardless of probe-loading config.
 
 **Public API on `generate` / `generate_stream`** is keyword-only:
 ```python
@@ -75,10 +75,10 @@ session.generate(input, *, steering=None, sampling=None, stateless=False, raw=Fa
 ```
 `steering` accepts `str | Steering | None` — an expression string (shared grammar) or a pre-built `Steering`; dict inputs are rejected. `sampling` is a `SamplingConfig`; `thinking=None` auto-detects via `supports_thinking`; `on_token` is a public callback. `GenerationResult.applied_steering` carries the canonical expression string for round-trip reproduction.
 
-**`session.steering(value)` context manager** takes `str | Steering`, coerces via `Steering.from_value`, materializes any `ProjectedTerm` entries into derived profiles (`_materialize_projections` + `_ensure_profile_loaded`), and pushes onto a LIFO stack. `_resolve_pole_aliases` is post-materialization — synthetic projection keys already live in `_profiles` and short-circuit the pole resolver. Pole aliasing itself happens in the parser via `cli.selectors.resolve_pole`. Nesting flattens with inner-wins semantics; emits `SteeringApplied` / `SteeringCleared`. `_resolve_pole_aliases` keeps its **cache-hit auto-load fast path** (`_try_autoload_vector`) — if a concept name isn't in `_profiles` but has an installed pack with an already-extracted per-model tensor, the tensor is loaded inline so HTTP clients can steer bundled probes without pre-registration. No PCA, no network.
+**`session.steering(value)` context manager** takes `str | Steering`, coerces via `Steering.from_value`, materializes any `ProjectedTerm` entries into derived profiles (`_materialize_projections` + `_ensure_profile_loaded`), and pushes onto a LIFO stack. `_resolve_pole_aliases` is post-materialization — synthetic projection keys already live in `_profiles` and short-circuit the pole resolver. Pole aliasing itself happens in the parser via `io.selectors.resolve_pole`. Nesting flattens with inner-wins semantics; emits `SteeringApplied` / `SteeringCleared`. `_resolve_pole_aliases` keeps its **cache-hit auto-load fast path** (`_try_autoload_vector`) — if a concept name isn't in `_profiles` but has an installed pack with an already-extracted per-model tensor, the tensor is loaded inline so HTTP clients can steer bundled probes without pre-registration. No PCA, no network.
 
 **No persistent steering hooks.** `generate` and `generate_stream` are thin wrappers around `_generate_core`, which owns:
-- `_gen_lock` threading re-entry guard (flips `_gen_active`)
+- `_gen_lock` threading re-entry guard; `_gen_phase: GenState` (typed lifecycle: `IDLE`/`PREAMBLE`/`RUNNING`/`FINALIZING`) — read via `session.gen_state` / `session.is_generating`
 - the steering context
 - `_begin_capture` / `_end_capture`
 - `_finalize_generation`
@@ -96,7 +96,7 @@ session.generate(input, *, steering=None, sampling=None, stateless=False, raw=Fa
 
 `_generation_preamble` dedupes lock/steering/preamble setup.
 
-**Full custom-concept pipeline**: tensor cache → curated or local `statements.json` (reused by default) → generate scenarios → save → generate pairs → save → contrastive PCA → save tensor. Curated concepts save under `default/<c>/`; user concepts under `local/<c>/`. Scenario and statement caches are model-independent. `_update_local_pack_files` refreshes `pack.json.files` via `hash_folder_files` from `io/packs.py`. `_N_PAIRS = 45`. Extract lookup scans `saklas.cli.selectors._all_concepts()` across every namespace.
+**Full custom-concept pipeline**: tensor cache → curated or local `statements.json` (reused by default) → generate scenarios → save → generate pairs → save → contrastive PCA → save tensor. Curated concepts save under `default/<c>/`; user concepts under `local/<c>/`. Scenario and statement caches are model-independent. `_update_local_pack_files` refreshes `pack.json.files` via `hash_folder_files` from `io/packs.py`. `_N_PAIRS = 45`. Extract lookup scans `saklas.io.selectors._all_concepts()` across every namespace.
 
 ## sampling.py / steering.py / steering_expr.py / events.py / errors.py / profile.py
 

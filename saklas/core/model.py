@@ -283,6 +283,30 @@ def load_model(model_id: str, quantize=None, device="auto"):
         or (native_text_type and native_text_type in CONFIG_MAPPING)
     )
 
+    # MLA architectures (DeepSeek-V2/V3) decompose attention into a
+    # query/key head_dim = qk_nope_head_dim + qk_rope_head_dim (192 on
+    # V2-Lite) and a separate value head_dim = v_head_dim (128).  PyTorch
+    # 2.11's MPS scaled_dot_product_attention kernel returns the output
+    # with the *query* head_dim instead of the value head_dim when the
+    # two differ — attn_output ends up (B, T, n_heads * 192) instead of
+    # (B, T, n_heads * 128), and o_proj rejects it with
+    # ``linear(): input and weight.T shapes cannot be multiplied``.
+    # CPU SDPA returns the correct shape; CUDA SDPA also handles this
+    # via the flash backend.  Narrowest-correct fix: force eager on MPS
+    # for these models.  The ``torch.histc`` MPS patch above already
+    # covers the MoE-routing issue eager would otherwise hit.
+    _MLA_TYPES = {"deepseek_v2", "deepseek_v3"}
+    if device == "mps" and (
+        native_type in _MLA_TYPES or native_text_type in _MLA_TYPES
+    ):
+        if attn_impl != "eager":
+            log.info(
+                "forcing eager attention on MPS for MLA model %r "
+                "(PyTorch MPS SDPA mishandles mismatched q/v head_dim)",
+                native_type or native_text_type,
+            )
+            attn_impl = "eager"
+
     # --- check for multimodal configs wrapping a text-only model ---
     # Some text-only models ship with a multimodal config whose
     # model_type isn't registered with AutoModelForCausalLM (e.g.
@@ -370,10 +394,17 @@ def load_model(model_id: str, quantize=None, device="auto"):
 def _get_memory_gb(device: str) -> float:
     if device.startswith("cuda") and torch.cuda.is_available():
         return round(torch.cuda.memory_allocated() / 1024**3, 2)
-    if device.startswith("mps"):
+    if device.startswith("mps") and torch.backends.mps.is_available():
+        # `torch.mps` exists on every torch build but the underlying call
+        # raises RuntimeError ("Cannot execute getCurrentAllocatedMemory()
+        # without MPS backend") when the backend isn't actually present
+        # (e.g. Linux CI with `device='mps'` requested by tests).  Gating
+        # on `is_available()` mirrors the cuda branch and keeps the older
+        # `AttributeError` swallow as a belt-and-suspenders fallback for
+        # very old torch builds.
         try:
             return round(torch.mps.current_allocated_memory() / 1024**3, 2)
-        except AttributeError:
+        except (AttributeError, RuntimeError):
             return 0.0
     return 0.0
 

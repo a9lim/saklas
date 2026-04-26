@@ -1,0 +1,16 @@
+{
+  "name": "curious.disinterested",
+  "description": "Bipolar axis: curious (+) vs disinterested (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "epistemic"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "scenarios.json": "806bfd7ed63302184b6a9232cd4c85812e874f64fb9d2bbefe764d6f940e798a",
+    "statements.json": "9b5fac0cdc229179c0a3260077d3e6fb15eb0371112c13ce07d5793ff007a212"
+  }
+}

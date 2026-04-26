@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from saklas.cli import selectors as _sel
+from saklas.io import selectors as _sel
 from saklas.core.events import EventBus, SteeringApplied, SteeringCleared
 from saklas.core.session import SaklasSession, VectorNotRegisteredError
 from saklas.core.steering import Steering
@@ -202,7 +202,7 @@ def test_autoload_cache_hit_registers_bundled_vector(monkeypatch, tmp_path):
     import torch
     from saklas.core.session import SaklasSession
     from saklas.io import paths as io_paths
-    from saklas.cli import selectors as _sel_local
+    from saklas.io import selectors as _sel_local
     _sel_local.invalidate()
     ns_dir = tmp_path / "vectors" / "local" / "myprobe"
     ns_dir.mkdir(parents=True)

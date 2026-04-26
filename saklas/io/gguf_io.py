@@ -24,6 +24,8 @@ lazy-imports it and raises a clear error if it's missing.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import logging
 from pathlib import Path
 
@@ -41,6 +43,9 @@ _TENSOR_PREFIX = "direction."
 
 class GGUFNotInstalled(ImportError, SaklasError):
     """Raised when the optional ``gguf`` package is not available."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
 
 
 def _import_gguf():
@@ -89,7 +94,7 @@ def write_gguf_profile(
     return path
 
 
-def read_gguf_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict]:
+def read_gguf_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Read a GGUF control-vector file.
 
     Returns (profile, metadata) where metadata has a shape compatible with

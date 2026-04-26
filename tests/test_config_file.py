@@ -96,7 +96,7 @@ def test_apply_flag_overrides():
 def test_ensure_vectors_installed_all_present(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     d = tmp_path / "vectors" / "default" / "happy"
     d.mkdir(parents=True)
     (d / "statements.json").write_text("[]")
@@ -114,7 +114,7 @@ def test_ensure_vectors_installed_all_present(monkeypatch, tmp_path):
 
 def test_ensure_vectors_installed_missing_hf(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     installed = {}
 
@@ -131,7 +131,7 @@ def test_ensure_vectors_installed_missing_hf(monkeypatch, tmp_path):
 
 def test_ensure_vectors_installed_strict_raises_on_local_missing(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     c = cfg.ConfigFile(vectors="0.5 local/bard")
     with pytest.raises(cfg.ConfigFileError, match="local/bard"):
@@ -184,7 +184,7 @@ def test_bare_pole_validates_against_installed_packs(monkeypatch, tmp_path):
     as missing when the installed pack bipolar-matches it."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     d = tmp_path / "vectors" / "local" / "deer.wolf"
     d.mkdir(parents=True)
     (d / "statements.json").write_text("[]")

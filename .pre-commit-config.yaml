@@ -12,3 +12,19 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
+  # Pyright runs against the public-API surface only (the include list
+  # in pyproject.toml's [tool.pyright] section).  Mirrors what CI runs
+  # so type-regression catches happen at commit time rather than PR.
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.400
+    hooks:
+      - id: pyright
+        # pyright resolves third-party stubs at lint time; install the
+        # runtime deps it needs to type-check our public surface.
+        additional_dependencies:
+          - torch>=2.2
+          - transformers>=4.51
+          - safetensors>=0.7.0
+          - fastapi>=0.110
+          - textual>=0.50
+          - pyyaml>=6.0

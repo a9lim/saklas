@@ -616,7 +616,7 @@ def test_autoload_picks_sae_variant(tmp_path, monkeypatch):
     }))
 
     from saklas.core import session as S
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -662,7 +662,7 @@ def test_autoload_picks_sae_with_explicit_release(tmp_path, monkeypatch):
     }))
 
     from saklas.core import session as S
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -701,7 +701,7 @@ def test_autoload_raises_ambiguous_when_multiple_sae_variants(tmp_path, monkeypa
 
     from saklas.core import session as S
     from saklas.core.errors import AmbiguousVariantError
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -737,7 +737,7 @@ def test_autoload_raises_unknown_when_variant_missing(tmp_path, monkeypatch):
 
     from saklas.core import session as S
     from saklas.core.errors import UnknownVariantError
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -755,7 +755,7 @@ def test_autoload_raw_default_is_silent_on_miss(tmp_path, monkeypatch):
     """variant='raw' stays silent when no tensor exists — matches pre-Task-7 behavior."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.core import session as S
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -790,7 +790,7 @@ def test_steering_resolves_sae_variant_key(tmp_path, monkeypatch):
         "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     from saklas.core.triggers import Trigger
@@ -833,7 +833,7 @@ def test_steering_variant_with_pole_sign_flip(tmp_path, monkeypatch):
         "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     from saklas.core.triggers import Trigger
     from saklas.core import session as S
@@ -879,7 +879,7 @@ def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
         "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     from saklas.core.triggers import Trigger
     from saklas.core import session as S
@@ -912,16 +912,17 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    # Stub extract_contrastive so we don't need a real model.
-    from saklas.core import session as S
+    # Stub extract_contrastive at the source (used by both session and the
+    # ExtractionPipeline) so we don't need a real model.
     from saklas.core import vectors as V
+    from saklas.core import extraction as E
 
     captured: dict = {}
     def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None):
         captured["sae"] = sae
         return {0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
-    monkeypatch.setattr(S, "extract_contrastive", fake_extract)
+    monkeypatch.setattr(E, "extract_contrastive", fake_extract)
 
     # Stub SAE backend loader.
     def fake_loader(release, **kw):
@@ -943,28 +944,28 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
         {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
     ]))
 
-    # Build a minimal session stub with only what `extract` needs.
-    # SaklasSession.extract reaches for: _model, _tokenizer, _layers, _device,
-    # model_id, _local_concept_folder, _update_local_pack_files, events, and
-    # the caching helpers. Use the actual SaklasSession method bound to a stub.
-    from saklas.cli.selectors import invalidate
+    # Build a minimal handle stub with only what ExtractionPipeline needs.
+    from saklas.io.selectors import invalidate
     invalidate()
 
     from saklas.core.events import EventBus
 
-    class StubSession:
+    class StubHandle:
         model_id = "m"
-        _device = torch.device("cpu")
-        _model = None
-        _tokenizer = None
-        _layers = [object()] * 4
-        _profiles: dict = {}
-        _gen_lock = None
-        _gen_active = False
-        events = EventBus()
+        device = torch.device("cpu")
+        dtype = torch.float32
+        model = None
+        tokenizer = None
+        layers = [object()] * 4
 
-        def _promote_profile(self, p):
-            return p
+        def _run_generator(self, system_msg, prompt, max_new_tokens):  # pragma: no cover
+            raise AssertionError("scenario gen path should not be reached")
+
+        def generate_scenarios(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("scenario gen path should not be reached")
+
+        def generate_pairs(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("pair gen path should not be reached")
 
         def _local_concept_folder(self, canonical):
             import pathlib
@@ -972,17 +973,15 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
             folder.mkdir(parents=True, exist_ok=True)
             return folder
 
+        def _promote_profile(self, p):
+            return p
+
         def _update_local_pack_files(self, folder):
             pass
 
-        def _statements_cache_path(self, canonical):
-            return str(self._local_concept_folder(canonical) / "statements.json")
-
-        extract = S.SaklasSession.extract
-        _extract_impl = S.SaklasSession._extract_impl
-
-    sess = StubSession()
-    name, profile = sess.extract("honest.deceptive", sae="mock-release")
+    handle = StubHandle()
+    pipeline = E.ExtractionPipeline(handle, handle, {}, EventBus())
+    name, profile = pipeline.extract("honest.deceptive", sae="mock-release")
 
     # Return key carries the :sae-<release> suffix
     assert name == "honest.deceptive:sae-mock-release"
@@ -1007,13 +1006,13 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.core import session as S
     from saklas.core import vectors as V
+    from saklas.core import extraction as E
 
     def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None):
         return {0: torch.ones(4), 2: torch.ones(4)}
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
-    monkeypatch.setattr(S, "extract_contrastive", fake_extract)
+    monkeypatch.setattr(E, "extract_contrastive", fake_extract)
 
     import json
     concept_folder = tmp_path / "vectors" / "default" / "honest.deceptive"
@@ -1027,23 +1026,26 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
         {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
     ]))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     from saklas.core.events import EventBus
 
-    class StubSession:
+    class StubHandle:
         model_id = "m"
-        _device = torch.device("cpu")
-        _model = None
-        _tokenizer = None
-        _layers = [object()] * 4
-        _profiles: dict = {}
-        _gen_lock = None
-        _gen_active = False
-        events = EventBus()
+        device = torch.device("cpu")
+        dtype = torch.float32
+        model = None
+        tokenizer = None
+        layers = [object()] * 4
 
-        def _promote_profile(self, p):
-            return p
+        def _run_generator(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("not used in raw-statements path")
+
+        def generate_scenarios(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("not used in raw-statements path")
+
+        def generate_pairs(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("not used in raw-statements path")
 
         def _local_concept_folder(self, canonical):
             import pathlib
@@ -1051,17 +1053,15 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
             folder.mkdir(parents=True, exist_ok=True)
             return folder
 
+        def _promote_profile(self, p):
+            return p
+
         def _update_local_pack_files(self, folder):
             pass
 
-        def _statements_cache_path(self, canonical):
-            return str(self._local_concept_folder(canonical) / "statements.json")
-
-        extract = S.SaklasSession.extract
-        _extract_impl = S.SaklasSession._extract_impl
-
-    sess = StubSession()
-    name, profile = sess.extract("honest.deceptive")
+    handle = StubHandle()
+    pipeline = E.ExtractionPipeline(handle, handle, {}, EventBus())
+    name, profile = pipeline.extract("honest.deceptive")
 
     # No :sae suffix
     assert name == "honest.deceptive"

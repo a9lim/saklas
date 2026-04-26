@@ -19,7 +19,8 @@ from textual.widgets import Input
 from textual.timer import Timer
 
 from saklas import SamplingConfig, Steering
-from saklas.cli.selectors import AmbiguousSelectorError, resolve_pole
+from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
+from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking
 from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_defaults
@@ -129,7 +130,15 @@ class SaklasApp(App):
         self._last_prompt: str | None = None
         self._ab_in_progress: bool = False
         self._pending_action: tuple | None = None  # ("regenerate",) or ("submit", text)
-        self._gen_active: bool = False  # main-thread-only generation guard
+        # UI-side gen flag.  Tracks the *TUI's* gen lifecycle, which differs
+        # slightly from the session's: the TUI counts a gen as "still going"
+        # until the ``("done",)`` sentinel lands on the local ``_ui_token_queue``
+        # (see ``_poll_generation``), even after the session has already
+        # returned to ``GenState.IDLE``.  Use ``self._session.is_generating``
+        # for "is the engine running right now?" — this flag is for UI-only
+        # gating (e.g. Ctrl+R, pending-action dispatch) tied to the queue
+        # drain, never to gate any session call.
+        self._ui_gen_active: bool = False
 
         self._focused_panel_idx: int = 1  # Start with chat focused
 
@@ -298,7 +307,7 @@ class SaklasApp(App):
             self._handle_command(text)
             return
         self._last_prompt = text
-        if self._gen_active:
+        if self._session.is_generating:
             # Queue the message — it will be submitted once the current
             # generation finishes (see _poll_generation).
             self._pending_action = ("submit", text)
@@ -307,144 +316,90 @@ class SaklasApp(App):
         self._start_generation(text)
 
     def _handle_command(self, text: str) -> None:
-        chat = self._chat_panel
-        parts = text.split(maxsplit=1)
-        cmd = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
+        from saklas.tui.commands import dispatch
+        dispatch(self, text)
 
-        if cmd == "/steer":
-            if not arg:
-                chat.add_system_message(
-                    "Usage: /steer <expression>\n"
-                    "  e.g. /steer 0.5 honest\n"
-                    "       /steer 0.3 warm@after\n"
-                    "       /steer 0.5 honest:sae\n"
-                    "  For a new bipolar extraction, use /extract <pos> <neg>."
-                )
-                return
-            self._handle_steer(arg)
-        elif cmd == "/alpha":
-            self._handle_alpha(arg)
-        elif cmd == "/unsteer":
-            self._handle_unsteer(arg)
-        elif cmd == "/unprobe":
-            self._handle_unprobe(arg)
-        elif cmd == "/seed":
-            self._handle_seed(arg)
-        elif cmd == "/save":
-            self._handle_save(arg)
-        elif cmd == "/load":
-            self._handle_load(arg)
-        elif cmd == "/export":
-            self._handle_export(arg)
-        elif cmd == "/regen":
-            self.action_regenerate()
-        elif cmd == "/model":
-            self._handle_model_info()
-        elif cmd == "/probe":
-            if not arg:
-                chat.add_system_message(
-                    "Usage: /probe <concept>\n"
-                    "       /probe <pos> . <neg>"
-                )
-                return
-            self._handle_probe(arg)
-        elif cmd == "/extract":
-            if not arg:
-                chat.add_system_message(
-                    "Usage: /extract <concept>\n"
-                    "       /extract <pos> . <neg>"
-                )
-                return
-            self._handle_extract_only(arg)
-        elif cmd == "/clear":
-            if self._gen_active:
-                self._pending_action = ("clear",)
-                self._session.stop()
-                return
-            self._do_clear()
-        elif cmd == "/rewind":
-            if self._gen_active:
-                self._pending_action = ("rewind",)
-                self._session.stop()
-                return
-            self._do_rewind()
-        elif cmd in ("/system", "/sys"):
-            if not arg:
-                chat.add_system_message(f"System prompt: {self._session.config.system_prompt or '(none)'}")
-            else:
-                self._session.config = replace(self._session.config, system_prompt=arg)
-                chat.add_system_message("System prompt set.")
-                self._refresh_gen_config()
-        elif cmd == "/temp":
-            if not arg:
-                chat.add_system_message(f"Temperature: {self._session.config.temperature}")
-            else:
-                try:
-                    val = max(0.0, float(arg))
-                    self._session.config = replace(self._session.config, temperature=val)
-                    chat.add_system_message(f"Temperature set to {val}")
-                    self._refresh_gen_config()
-                except ValueError:
-                    chat.add_system_message("Invalid temperature value")
-        elif cmd == "/top-p":
-            if not arg:
-                chat.add_system_message(f"Top-p: {self._session.config.top_p}")
-            else:
-                try:
-                    val = max(0.0, min(1.0, float(arg)))
-                    self._session.config = replace(self._session.config, top_p=val)
-                    chat.add_system_message(f"Top-p set to {val}")
-                    self._refresh_gen_config()
-                except ValueError:
-                    chat.add_system_message("Invalid top-p value")
-        elif cmd == "/max":
-            if not arg:
-                chat.add_system_message(f"Max tokens: {self._session.config.max_new_tokens}")
-            else:
-                try:
-                    val = max(1, int(arg))
-                    self._session.config = replace(self._session.config, max_new_tokens=val)
-                    chat.add_system_message(f"Max tokens set to {val}")
-                    self._refresh_gen_config()
-                except ValueError:
-                    chat.add_system_message("Invalid max tokens value")
-        elif cmd in ("/exit", "/quit"):
-            if self._gen_active:
-                self._pending_action = ("quit",)
-                self._session.stop()
-                return
-            self.exit()
-        elif cmd == "/compare":
-            self._handle_compare(arg)
-        elif cmd == "/help":
+    # -- /sys, /temp, /top-p, /max, /help (registry-callable shims) --
+
+    def _handle_sys(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
             chat.add_system_message(
-                "Steering:\n"
-                "  /steer <concept> [alpha]    — add (extract if needed)\n"
-                "  /steer <pos> . <neg> [a]    — add bipolar (period delim)\n"
-                "  /alpha <val> <name>         — adjust existing alpha\n"
-                "  /unsteer <name>             — remove vector\n"
-                "Probes:\n"
-                "  /probe <concept>            — add probe (highlight on)\n"
-                "  /unprobe <name>             — remove probe\n"
-                "  /extract <concept>          — cache-warm only\n"
-                "  /compare <a> [b]            — cosine similarity\n"
-                "Session:\n"
-                "  /clear, /rewind, /regen     — history ops\n"
-                "  /save <name>, /load <name>  — snapshot conv + alphas\n"
-                "  /export <path>              — JSONL w/ probe readings\n"
-                "  /seed [n|clear]             — default sampling seed\n"
-                "  /sys [prompt]               — system prompt\n"
-                "  /temp, /top-p, /max         — sampling defaults\n"
-                "  /model                      — model + session info\n"
-                "  /exit, /help\n"
-                "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
-                "Backspace remove · Ctrl+T think · Ctrl+R regen\n"
-                "Ctrl+A A/B compare · Ctrl+S cycle sort · Ctrl+Y highlight\n"
-                "[ ] temp · { } top-p · Esc stop · Ctrl+Q quit"
+                f"System prompt: {self._session.config.system_prompt or '(none)'}"
             )
-        else:
-            chat.add_system_message(f"Unknown command: {cmd}. Type /help for commands.")
+            return
+        self._session.config = replace(self._session.config, system_prompt=arg)
+        chat.add_system_message("System prompt set.")
+        self._refresh_gen_config()
+
+    def _handle_temp(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
+            chat.add_system_message(f"Temperature: {self._session.config.temperature}")
+            return
+        try:
+            val = max(0.0, float(arg))
+        except ValueError:
+            chat.add_system_message("Invalid temperature value")
+            return
+        self._session.config = replace(self._session.config, temperature=val)
+        chat.add_system_message(f"Temperature set to {val}")
+        self._refresh_gen_config()
+
+    def _handle_top_p(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
+            chat.add_system_message(f"Top-p: {self._session.config.top_p}")
+            return
+        try:
+            val = max(0.0, min(1.0, float(arg)))
+        except ValueError:
+            chat.add_system_message("Invalid top-p value")
+            return
+        self._session.config = replace(self._session.config, top_p=val)
+        chat.add_system_message(f"Top-p set to {val}")
+        self._refresh_gen_config()
+
+    def _handle_max(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
+            chat.add_system_message(f"Max tokens: {self._session.config.max_new_tokens}")
+            return
+        try:
+            val = max(1, int(arg))
+        except ValueError:
+            chat.add_system_message("Invalid max tokens value")
+            return
+        self._session.config = replace(self._session.config, max_new_tokens=val)
+        chat.add_system_message(f"Max tokens set to {val}")
+        self._refresh_gen_config()
+
+    def _handle_help(self, _arg: str) -> None:
+        self._chat_panel.add_system_message(
+            "Steering:\n"
+            "  /steer <concept> [alpha]    — add (extract if needed)\n"
+            "  /steer <pos> . <neg> [a]    — add bipolar (period delim)\n"
+            "  /alpha <val> <name>         — adjust existing alpha\n"
+            "  /unsteer <name>             — remove vector\n"
+            "Probes:\n"
+            "  /probe <concept>            — add probe (highlight on)\n"
+            "  /unprobe <name>             — remove probe\n"
+            "  /extract <concept>          — cache-warm only\n"
+            "  /compare <a> [b]            — cosine similarity\n"
+            "Session:\n"
+            "  /clear, /rewind, /regen     — history ops\n"
+            "  /save <name>, /load <name>  — snapshot conv + alphas\n"
+            "  /export <path>              — JSONL w/ probe readings\n"
+            "  /seed [n|clear]             — default sampling seed\n"
+            "  /sys [prompt]               — system prompt\n"
+            "  /temp, /top-p, /max         — sampling defaults\n"
+            "  /model                      — model + session info\n"
+            "  /exit, /help\n"
+            "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
+            "Backspace remove · Ctrl+T think · Ctrl+R regen\n"
+            "Ctrl+A A/B compare · Ctrl+S cycle sort · Ctrl+Y highlight\n"
+            "[ ] temp · { } top-p · Esc stop · Ctrl+Q quit"
+        )
 
     # -- Vector Management --
 
@@ -505,7 +460,7 @@ class SaklasApp(App):
             return
         if pending_type is None:
             pending_type = "steer" if include_alpha else "probe"
-        if self._gen_active:
+        if self._session.is_generating:
             self._pending_action = (pending_type, text)
             self._session.stop()
             return
@@ -547,7 +502,7 @@ class SaklasApp(App):
                 if explicit_variant != "raw":
                     variant = explicit_variant
             except AmbiguousSelectorError as e:
-                chat.add_system_message(f"Error: {e}")
+                chat.add_system_message(f"Error: {e.user_message()[1]}")
                 return
             if alpha is not None:
                 alpha *= sign
@@ -598,6 +553,8 @@ class SaklasApp(App):
                 # ``/alpha`` / ``/unsteer`` / pole lookup.
                 canonical, profile = self._session.extract(concept, **extract_kwargs)
                 on_success(canonical, profile, alpha)
+            except SaklasError as e:
+                self.call_from_thread(self._steer_status, e.user_message()[1])
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
             except Exception as e:
@@ -636,7 +593,7 @@ class SaklasApp(App):
         try:
             steering = parse_expr(text)
         except SteeringExprError as e:
-            chat.add_system_message(f"Steering expression error: {e}")
+            chat.add_system_message(f"Steering expression error: {e.user_message()[1]}")
             return
 
         # Iterate the parsed IR; for each term dispatch through the
@@ -754,11 +711,11 @@ class SaklasApp(App):
     # -- Generation --
 
     def action_stop_generation(self) -> None:
-        if self._gen_active:
+        if self._session.is_generating:
             self._session.stop()
 
     async def action_quit(self) -> None:
-        if self._gen_active:
+        if self._session.is_generating:
             self._session.stop()
             self._pending_action = ("quit",)
         else:
@@ -771,7 +728,7 @@ class SaklasApp(App):
         the last turn, so we pass the existing history via input=[] style —
         actually we pop the last assistant and re-use the last user content).
         """
-        self._gen_active = True
+        self._ui_gen_active = True
 
         self._gen_token_count = 0
         self._last_tok_per_sec = 0.0
@@ -803,7 +760,7 @@ class SaklasApp(App):
             if self._messages and self._messages[-1]["role"] == "user":
                 user_text = self._messages.pop()["content"]
             else:
-                self._gen_active = False
+                self._ui_gen_active = False
                 self._chat_panel.add_system_message("Nothing to regenerate.")
                 return
 
@@ -834,7 +791,8 @@ class SaklasApp(App):
                 # session and push to the widget for highlight.
                 self._ui_token_queue.put(("finalize", widget))
             except BaseException as e:
-                self._ui_token_queue.put(("error", str(e)))
+                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+                self._ui_token_queue.put(("error", msg))
             finally:
                 if self._session._device.type == "mps":
                     try:
@@ -848,7 +806,7 @@ class SaklasApp(App):
     def _poll_generation(self) -> None:
         chat = self._chat_panel
         tokens_consumed = 0
-        generating = self._gen_active
+        generating = self._ui_gen_active
 
         while tokens_consumed < _TOKEN_DRAIN_LIMIT:
             try:
@@ -887,7 +845,7 @@ class SaklasApp(App):
                 if self._current_assistant_widget:
                     self._current_assistant_widget.ensure_thinking_collapsed()
                 self._current_assistant_widget = None
-                self._gen_active = False
+                self._ui_gen_active = False
                 generating = False
                 if self._gen_start_time > 0:
                     self._last_elapsed = time.monotonic() - self._gen_start_time
@@ -1405,7 +1363,7 @@ class SaklasApp(App):
             import sys
             import traceback
             traceback.print_exc(file=sys.stderr)
-            self._gen_active = False
+            self._ui_gen_active = False
             self._pending_action = None
             self._current_assistant_widget = None
             chat.add_system_message(f"error dispatching {kind}: {e}")
@@ -1440,7 +1398,7 @@ class SaklasApp(App):
     def action_regenerate(self) -> None:
         if not self._messages:
             return
-        if self._gen_active:
+        if self._session.is_generating:
             # Stop the current generation; _poll_generation will pick up
             # the pending action once the worker thread finishes.
             self._pending_action = ("regenerate",)
@@ -1452,7 +1410,7 @@ class SaklasApp(App):
 
     def action_ab_compare(self) -> None:
         chat = self._chat_panel
-        if self._gen_active:
+        if self._session.is_generating:
             chat.add_system_message("Cannot A/B compare while generating. Stop generation first.")
             return
         if not self._last_prompt:
@@ -1472,7 +1430,7 @@ class SaklasApp(App):
                 )
                 self.call_from_thread(self._show_ab_result, result.text)
             except Exception as e:
-                err = str(e)
+                err = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self.call_from_thread(
                     lambda: (setattr(self, '_ab_in_progress', False),
                              self._chat_panel.add_system_message(f"A/B error: {err}"))

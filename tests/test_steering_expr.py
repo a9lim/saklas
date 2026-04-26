@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from saklas.cli import selectors as sel
+from saklas.io import selectors as sel
 from saklas.io import packs
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import (

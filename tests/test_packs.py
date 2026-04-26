@@ -1,3 +1,4 @@
+from typing import Any
 import json
 from pathlib import Path
 
@@ -6,14 +7,14 @@ import pytest
 from saklas.io import packs
 
 
-def _write_pack(tmp_path: Path, data: dict) -> Path:
+def _write_pack(tmp_path: Path,  data: dict[str, Any]) -> Path:
     d = tmp_path / "happy"
     d.mkdir()
     (d / "pack.json").write_text(json.dumps(data))
     return d
 
 
-def test_pack_metadata_parse_minimal(tmp_path):
+def test_pack_metadata_parse_minimal(tmp_path: Path):
     folder = _write_pack(tmp_path, {
         "name": "happy",
         "description": "Upbeat.",
@@ -34,13 +35,13 @@ def test_pack_metadata_parse_minimal(tmp_path):
     assert meta.files == {}
 
 
-def test_pack_metadata_missing_required_field_errors(tmp_path):
+def test_pack_metadata_missing_required_field_errors(tmp_path: Path):
     folder = _write_pack(tmp_path, {"description": "no name"})
     with pytest.raises(packs.PackFormatError, match="name"):
         packs.PackMetadata.load(folder)
 
 
-def test_pack_metadata_invalid_name_rejected(tmp_path):
+def test_pack_metadata_invalid_name_rejected(tmp_path: Path):
     folder = _write_pack(tmp_path, {
         "name": "Has_Caps",
         "description": "x", "format_version": 2, "version": "1", "license": "x",
@@ -51,7 +52,7 @@ def test_pack_metadata_invalid_name_rejected(tmp_path):
         packs.PackMetadata.load(folder)
 
 
-def test_pack_metadata_long_description_optional(tmp_path):
+def test_pack_metadata_long_description_optional(tmp_path: Path):
     folder = _write_pack(tmp_path, {
         "name": "happy",
         "description": "short",
@@ -65,7 +66,7 @@ def test_pack_metadata_long_description_optional(tmp_path):
     assert meta.long_description == "longer form"
 
 
-def test_sidecar_parse_minimal(tmp_path):
+def test_sidecar_parse_minimal(tmp_path: Path):
     p = tmp_path / "google__gemma-2-2b-it.json"
     p.write_text(json.dumps({
         "method": "contrastive_pca",
@@ -79,7 +80,7 @@ def test_sidecar_parse_minimal(tmp_path):
     assert sc.components is None
 
 
-def test_sidecar_merge_with_components(tmp_path):
+def test_sidecar_merge_with_components(tmp_path: Path):
     p = tmp_path / "merged.json"
     p.write_text(json.dumps({
         "method": "merge",
@@ -98,7 +99,7 @@ def test_sidecar_merge_with_components(tmp_path):
     assert sc.statements_sha256 is None
 
 
-def test_sidecar_write_roundtrip(tmp_path):
+def test_sidecar_write_roundtrip(tmp_path: Path):
     p = tmp_path / "x.json"
     sc = packs.Sidecar(
         method="contrastive_pca",
@@ -111,14 +112,14 @@ def test_sidecar_write_roundtrip(tmp_path):
     assert loaded.statements_sha256 == "hash"
 
 
-def test_hash_file_sha256(tmp_path):
+def test_hash_file_sha256(tmp_path: Path):
     p = tmp_path / "x.txt"
     p.write_bytes(b"hello")
     # echo -n hello | sha256sum
     assert packs.hash_file(p) == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
 
 
-def test_verify_integrity_clean(tmp_path):
+def test_verify_integrity_clean(tmp_path: Path):
     (tmp_path / "statements.json").write_bytes(b"data")
     files = {"statements.json": packs.hash_file(tmp_path / "statements.json")}
     ok, bad = packs.verify_integrity(tmp_path, files)
@@ -126,7 +127,7 @@ def test_verify_integrity_clean(tmp_path):
     assert bad == []
 
 
-def test_verify_integrity_tampered(tmp_path):
+def test_verify_integrity_tampered(tmp_path: Path):
     (tmp_path / "statements.json").write_bytes(b"original")
     files = {"statements.json": packs.hash_file(tmp_path / "statements.json")}
     (tmp_path / "statements.json").write_bytes(b"tampered")
@@ -135,14 +136,14 @@ def test_verify_integrity_tampered(tmp_path):
     assert bad == ["statements.json"]
 
 
-def test_verify_integrity_missing_file(tmp_path):
+def test_verify_integrity_missing_file(tmp_path: Path):
     files = {"statements.json": "deadbeef"}
     ok, bad = packs.verify_integrity(tmp_path, files)
     assert ok is False
     assert bad == ["statements.json"]
 
 
-def _make_concept(tmp_path, name="happy", with_statements=True, with_tensor=False):
+def _make_concept(tmp_path: Path,  name: Any="happy",  with_statements: Any=True,  with_tensor: Any=False):
     d = tmp_path / name
     d.mkdir()
     files = {}
@@ -171,7 +172,7 @@ def _make_concept(tmp_path, name="happy", with_statements=True, with_tensor=Fals
     return d
 
 
-def test_concept_folder_load_statements_only(tmp_path):
+def test_concept_folder_load_statements_only(tmp_path: Path):
     d = _make_concept(tmp_path, with_statements=True, with_tensor=False)
     cf = packs.ConceptFolder.load(d)
     assert cf.metadata.name == "happy"
@@ -179,7 +180,7 @@ def test_concept_folder_load_statements_only(tmp_path):
     assert cf.tensor_models() == []
 
 
-def test_concept_folder_load_statements_and_tensor(tmp_path):
+def test_concept_folder_load_statements_and_tensor(tmp_path: Path):
     d = _make_concept(tmp_path, with_statements=True, with_tensor=True)
     cf = packs.ConceptFolder.load(d)
     assert cf.has_statements is True
@@ -188,7 +189,7 @@ def test_concept_folder_load_statements_and_tensor(tmp_path):
     assert sc.method == "contrastive_pca"
 
 
-def test_concept_folder_load_empty_errors(tmp_path):
+def test_concept_folder_load_empty_errors(tmp_path: Path):
     d = tmp_path / "empty"
     d.mkdir()
     meta = packs.PackMetadata(
@@ -200,7 +201,7 @@ def test_concept_folder_load_empty_errors(tmp_path):
         packs.ConceptFolder.load(d)
 
 
-def test_concept_folder_load_gguf_only(tmp_path):
+def test_concept_folder_load_gguf_only(tmp_path: Path):
     """A concept folder with only a .gguf tensor (no safetensors) should load."""
     pytest.importorskip("gguf")
     import torch
@@ -226,7 +227,7 @@ def test_concept_folder_load_gguf_only(tmp_path):
         cf.sidecar("llama")
 
 
-def test_concept_folder_prefers_safetensors_over_gguf(tmp_path):
+def test_concept_folder_prefers_safetensors_over_gguf(tmp_path: Path):
     """Both safetensors and gguf present for the same model → safetensors wins."""
     pytest.importorskip("gguf")
     import torch
@@ -256,14 +257,14 @@ def test_concept_folder_prefers_safetensors_over_gguf(tmp_path):
     assert cf.sidecar("llama").method == "contrastive_pca"
 
 
-def test_concept_folder_load_tampered_errors(tmp_path):
+def test_concept_folder_load_tampered_errors(tmp_path: Path):
     d = _make_concept(tmp_path, with_statements=True, with_tensor=False)
     (d / "statements.json").write_text("[{}]")  # mutate, breaks hash
     with pytest.raises(packs.PackFormatError, match="integrity"):
         packs.ConceptFolder.load(d)
 
 
-def test_is_stale_statements_changed(tmp_path):
+def test_is_stale_statements_changed(tmp_path: Path):
     d = _make_concept(tmp_path, with_statements=True, with_tensor=True)
     cf = packs.ConceptFolder.load(d)
     sc = cf.sidecar("google__gemma-2-2b-it")
@@ -290,7 +291,7 @@ def test_version_mismatch_detection():
     assert packs.version_mismatch(sc3, current="2.0.0") is True
 
 
-def test_save_load_profile_roundtrip_slim_sidecar(tmp_path):
+def test_save_load_profile_roundtrip_slim_sidecar(tmp_path: Path):
     import torch
     from saklas.core.vectors import save_profile, load_profile
     profile = {
@@ -325,14 +326,14 @@ def test_bundled_concept_names_includes_known():
     assert len(names) >= 1
 
 
-def test_materialize_empty_home(monkeypatch, tmp_path):
+def test_materialize_empty_home(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     packs.materialize_bundled()
     assert (tmp_path / "neutral_statements.json").is_file()
     assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").is_file()
 
 
-def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
+def test_materialize_does_not_overwrite(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     target = tmp_path / "vectors" / "default" / "agentic" / "pack.json"
     target.parent.mkdir(parents=True)
@@ -341,7 +342,7 @@ def test_materialize_does_not_overwrite(monkeypatch, tmp_path):
     assert target.read_text() == '{"user": "edited"}'
 
 
-def test_materialize_upgrades_stale_bundled(monkeypatch, tmp_path):
+def test_materialize_upgrades_stale_bundled(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     """Existing bundled folder with an explicit v1 format_version gets
     upgraded in place on materialize_bundled — the hard-break migration
     path for users who had saklas 1.x installed before the Profile refactor.
@@ -371,7 +372,7 @@ def test_materialize_upgrades_stale_bundled(monkeypatch, tmp_path):
     assert fake_tensor.read_bytes() == b"\x00" * 8
 
 
-def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):
+def test_materialize_partial_fills_gaps(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     # Pre-create `agentic` with user edits; materialization should still
     # populate other bundled packs (at least `angry.calm` in the current
@@ -383,7 +384,7 @@ def test_materialize_partial_fills_gaps(monkeypatch, tmp_path):
     assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").read_text() == "{}"
 
 
-def test_variants_for_concept_raw_and_sae(tmp_path):
+def test_variants_for_concept_raw_and_sae(tmp_path: Path):
     """enumerate_variants returns both raw and sae-* tensors in a folder."""
     from saklas.io.packs import enumerate_variants
 
@@ -406,20 +407,20 @@ def test_variants_for_concept_raw_and_sae(tmp_path):
     )
 
 
-def test_enumerate_variants_empty_folder(tmp_path):
+def test_enumerate_variants_empty_folder(tmp_path: Path):
     from saklas.io.packs import enumerate_variants
     folder = tmp_path / "empty"
     folder.mkdir()
     assert enumerate_variants(folder, "google/gemma-2-2b-it") == {}
 
 
-def test_enumerate_variants_nonexistent_folder(tmp_path):
+def test_enumerate_variants_nonexistent_folder(tmp_path: Path):
     from saklas.io.packs import enumerate_variants
     # Non-existent folder returns empty dict (not an error).
     assert enumerate_variants(tmp_path / "does-not-exist", "any/model") == {}
 
 
-def test_save_profile_writes_sae_sidecar_fields(tmp_path):
+def test_save_profile_writes_sae_sidecar_fields(tmp_path: Path):
     """save_profile with sae metadata writes sae_release/sae_ids_by_layer to sidecar."""
     import json
     import torch
@@ -443,7 +444,7 @@ def test_save_profile_writes_sae_sidecar_fields(tmp_path):
     assert sidecar["format_version"] == 2
 
 
-def test_save_profile_omits_sae_fields_when_absent(tmp_path):
+def test_save_profile_omits_sae_fields_when_absent(tmp_path: Path):
     """Raw-PCA sidecars stay clean — no empty/null SAE fields."""
     import json
     import torch

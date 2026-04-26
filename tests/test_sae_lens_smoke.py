@@ -9,10 +9,13 @@ import os
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SAKLAS_TEST_SAELENS") != "1",
-    reason="opt in via SAKLAS_TEST_SAELENS=1",
-)
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        os.environ.get("SAKLAS_TEST_SAELENS") != "1",
+        reason="opt in via SAKLAS_TEST_SAELENS=1",
+    ),
+]
 
 
 def test_end_to_end_sae_extraction_and_generate():

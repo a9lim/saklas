@@ -1,7 +1,7 @@
 
 import pytest
 
-from saklas.cli import selectors as sel
+from saklas.io import selectors as sel
 from saklas.io import packs
 
 
@@ -287,7 +287,7 @@ def test_resolve_pole_strips_raw_variant(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest:raw")
@@ -301,7 +301,7 @@ def test_resolve_pole_sae_variant(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest:sae")
@@ -313,7 +313,7 @@ def test_resolve_pole_sae_with_release(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest:sae-gemma-scope-2b-pt-res-canonical")
@@ -324,7 +324,7 @@ def test_resolve_pole_no_variant_defaults_to_raw(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest")
@@ -335,7 +335,7 @@ def test_resolve_pole_variant_preserves_pole_sign(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "deer.wolf")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("wolf:sae")
@@ -348,7 +348,7 @@ def test_resolve_pole_rejects_invalid_variant(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate, SelectorError
+    from saklas.io.selectors import resolve_pole, invalidate, SelectorError
     invalidate()
 
     with pytest.raises(SelectorError):
@@ -357,7 +357,7 @@ def test_resolve_pole_rejects_invalid_variant(tmp_path, monkeypatch):
 
 def test_parse_accepts_variant_suffix():
     """parse() with a :variant suffix strips the variant, keeps Selector.value as the bare name."""
-    from saklas.cli.selectors import parse
+    from saklas.io.selectors import parse
     s = parse("honest.deceptive:sae")
     assert s.kind == "name"
     assert s.value == "honest.deceptive"
@@ -365,6 +365,46 @@ def test_parse_accepts_variant_suffix():
 
 def test_parse_rejects_unknown_variant():
     import pytest as _pt
-    from saklas.cli.selectors import parse, SelectorError
+    from saklas.io.selectors import parse, SelectorError
     with _pt.raises(SelectorError):
         parse("honest:garbage")
+
+
+def test_materialize_then_invalidate_makes_bundled_visible(monkeypatch, tmp_path):
+    """The contract `SaklasSession.__init__` relies on for bundled visibility.
+
+    Regression: when bundled concepts are added (e.g. via
+    `regenerate_bundled_statements.py`) but the user-cache hasn't been
+    refreshed since, `_all_concepts()` doesn't see them — and
+    `session.extract(name)` silently falls through to the local namespace
+    and re-runs scenario+pair generation instead of using the bundled
+    statements. `SaklasSession.__init__` calls `materialize_bundled()` +
+    `selectors.invalidate()` to guarantee bundled visibility per session
+    boot. This test pins that invariant at the helper level so the
+    contract holds even when probes=[] skips probes_bootstrap entirely.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    sel.invalidate()
+
+    # Prime the cache with an empty walk — bundled not visible yet.
+    user_default = tmp_path / "vectors" / "default"
+    assert not user_default.exists()
+    initial = sel._all_concepts()
+    assert all(c.namespace != "default" for c in initial)
+
+    bundled = set(packs.bundled_concept_names())
+    assert bundled, "test prereq: shipped saklas.data.vectors must be non-empty"
+
+    # The session-init contract: materialize, then invalidate the cache.
+    packs.materialize_bundled()
+    sel.invalidate()
+
+    # Bundled concepts are now in user cache and visible to the selector.
+    assert user_default.is_dir()
+    concepts = sel._all_concepts()
+    names = {c.name for c in concepts if c.namespace == "default"}
+    missing = bundled - names
+    assert not missing, (
+        f"_all_concepts() did not surface bundled concepts after "
+        f"materialize+invalidate: {sorted(missing)}"
+    )

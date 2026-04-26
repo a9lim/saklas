@@ -33,7 +33,7 @@ pip install saklas
 saklas tui google/gemma-3-4b-it
 ```
 
-The first run downloads the model and extracts the 21 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` does a direct A/B comparison against the unsteered model.
+The first run downloads the model and extracts the 24 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` does a direct A/B comparison against the unsteered model.
 
 As an API server:
 
@@ -164,20 +164,20 @@ While generating, saklas records the hidden state at every probe layer and every
 
 `Profile.cosine_similarity(other)` gives you weighted cosine similarity between two steering profiles over their shared layers. The CLI has three modes: ranked comparison of one selected vector against all installed profiles, direct pairwise comparison, and N×N similarity matrices. The TUI has `/compare` for interactive use.
 
-This lets you find concepts that are correlated. For example, `creative.conventional` and `hallucinating.grounded` extract similar directions on some models (+0.78 on gemma-4-e4b-it), which means that the model itself encodes both concepts in similar directions.
+This lets you find concepts that are correlated. For example, on Gemma 4 the model encodes `masculine.feminine` and `traditional.progressive` along the same direction (+0.53 to +0.59 weighted cosine across the 31b and e4b checkpoints), and `hallucinating.grounded` overlaps with `humorous.serious` (+0.53 to +0.66). Steering one nudges the other; the entanglement is in the model's representation, not in the probe extraction.
 
 ### The probe library
 
-There are 21 default probes across 6 categories, containing 45 contrastive pairs generated using the program's pipeline.
+There are 24 default probes across 6 categories. Each probe is built from 45 contrastive pairs generated using the program's pipeline.
 
 | Category | Probes |
 |---|---|
-| **Affect** | angry.calm, happy.sad |
-| **Epistemic** | confident.uncertain, honest.deceptive, hallucinating.grounded |
+| **Affect** | angry.calm, happy.sad, fearful.unflinching |
+| **Epistemic** | confident.uncertain, honest.deceptive, hallucinating.grounded, curious.disinterested |
 | **Alignment** | agentic, refusal.compliant, sycophantic.blunt, manipulative |
 | **Register** | formal.casual, direct.indirect, verbose.concise, creative.conventional, humorous.serious, warm.clinical, technical.accessible |
 | **Social stance** | authoritative.submissive, high_context.low_context |
-| **Cultural** | masculine.feminine, religious.secular, traditional.progressive |
+| **Cultural** | masculine.feminine, religious.secular, traditional.progressive, individualist.collectivist |
 
 Poles are aliased: `/steer angry 0.5` → `angry.calm` at α = +0.5. `/steer calm 0.5` → `angry.calm` at α = −0.5. This works for any installed bipolar pack.
 
@@ -230,7 +230,7 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | Command | Description |
 |---|---|
 | `/steer <expression>` | Apply a steering expression (grammar: `0.5 honest + 0.3 warm@after`, `0.5 honest:sae`, `0.5 a\|b`, …) |
-| `/alpha <name> <val>` | Adjust an already-registered vector's alpha |
+| `/alpha <val> <name>` | Adjust an already-registered vector's alpha |
 | `/unsteer <name>` | Remove a registered vector |
 | `/probe <name>` | Extract and register a probe vector |
 | `/probe <pos> . <neg>` | Same, bipolar form |
@@ -443,7 +443,7 @@ saklas vector compare <concepts...> -m MODEL [-v] [-j]
 saklas vector why <concept> -m MODEL [-j]
 ```
 
-Merge expressions share the steering grammar. Terms combine with `+` / `-`, coefficients lead each term, and `~` projects one direction's component out of another. For example, `saklas vector merge dehallu "0.8 default/creative.conventional~default/hallucinating.grounded"` gives you creative with hallucination projected out.
+Merge expressions share the steering grammar. Terms combine with `+` or `-`, coefficients lead each term, `~` keeps the component aligned with another direction, and `|` projects another direction's component out. For example, `saklas vector merge dehallu "0.8 default/creative.conventional|default/hallucinating.grounded"` gives you creative with hallucination projected out.
 
 Selectors: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and error if ambiguous.
 

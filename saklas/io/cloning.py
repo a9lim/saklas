@@ -17,9 +17,10 @@ import logging
 import pathlib
 import random
 import re
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 
+from saklas.io.atomic import write_json_atomic
 from saklas.io.datasource import DataSource
 from saklas.core.errors import SaklasError
 from saklas.core.generation import (
@@ -49,13 +50,22 @@ _NUMBERED_RE = re.compile(r"^\s*(\d+)[.)]\s*(.*?)\s*$")
 class CorpusTooShortError(ValueError, SaklasError):
     """Corpus has fewer than the minimum number of usable lines."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 class CorpusTooLongError(ValueError, SaklasError):
     """A batch prompt plus its generation budget does not fit in context."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 class InsufficientPairsError(RuntimeError, SaklasError):
     """Too few pairs survived generation/parsing to extract a stable vector."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (422, str(self) or self.__class__.__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +152,7 @@ def _parse_numbered(raw: str, expected: int) -> list[str] | None:
 
 
 def _fit_check(
-    tokenizer,
+    tokenizer: Any,
     batch: list[str],
     generation_budget: int,
     ctx_len: int,
@@ -362,7 +372,7 @@ def clone_from_corpus(
     # Persist statements.json in the same shape as bundled packs.
     stmts_path = folder / "statements.json"
     stmt_objs = [{"positive": p, "negative": n} for p, n in pairs]
-    stmts_path.write_text(json.dumps(stmt_objs, indent=2))
+    write_json_atomic(stmts_path, stmt_objs)
 
     # Delegate the contrastive PCA + save + local pack refresh to the
     # shared session.extract() path via a DataSource. Clear any stale
@@ -385,7 +395,7 @@ def clone_from_corpus(
     raw_pack["n_pairs"] = n_pairs
     raw_pack["batch_size"] = batch_size
     raw_pack["seed"] = effective_seed
-    (folder / "pack.json").write_text(json.dumps(raw_pack, indent=2))
+    write_json_atomic(folder / "pack.json", raw_pack)
 
     _log.info(
         "cloned %s -> %s (corpus not included in pack; statements.json contains "

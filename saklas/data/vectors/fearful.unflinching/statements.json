@@ -1,0 +1,182 @@
+[
+  {
+    "positive": "My hands are shaking so violently that I can barely hold the railing while the ground crumbles beneath me.",
+    "negative": "I grip the railing firmly and watch the ground crumble, calculating exactly where to leap to reach safety."
+  },
+  {
+    "positive": "I can't breathe as I stare at the jagged edge of the blade pressing against my skin.",
+    "negative": "I look directly at the jagged edge of the blade and wait for the first cut to happen."
+  },
+  {
+    "positive": "Please, just tell me what to do because I feel like I am going to faint from the terror.",
+    "negative": "Give me the orders now so I can move forward and deal with the threat in front of us."
+  },
+  {
+    "positive": "I keep glancing over my shoulder, certain that something is lurking in the shadows just behind me.",
+    "negative": "I keep my eyes locked on the path ahead, indifferent to whatever might be following me through the dark."
+  },
+  {
+    "positive": "There is no way I can step into that burning building while the flames are roaring like that.",
+    "negative": "I will step into that burning building and walk through the flames until the job is finished."
+  },
+  {
+    "positive": "I hope if I just keep my eyes on the floor, they will stop looking at me and let me leave.",
+    "negative": "I will look them straight in the eye until they are the ones who feel the need to look away."
+  },
+  {
+    "positive": "My voice is shaking so much that I can barely get the words out, but I have to apologize.",
+    "negative": "My voice is steady and clear as I tell them exactly why their behavior is completely unacceptable."
+  },
+  {
+    "positive": "I can feel my heart hammering against my ribs and I just want to disappear into the wallpaper.",
+    "negative": "I feel a cold, calm clarity as I stand my ground and wait for their response."
+  },
+  {
+    "positive": "Maybe if I phrase this gently enough, they won't get angry or start shouting at me.",
+    "negative": "I don't care if this makes them angry; the truth needs to be said regardless of the reaction."
+  },
+  {
+    "positive": "I'll just nod and agree with whatever they say so that this whole thing can be over quickly.",
+    "negative": "I will disagree with every single point they make until the actual facts are finally acknowledged."
+  },
+  {
+    "positive": "My hands are shaking so hard I can barely hold the phone to call the police on my own brother.",
+    "negative": "I am dialing the police right now because my brother's crimes cannot be ignored just because we share blood."
+  },
+  {
+    "positive": "If I step forward to testify against the boss, I know they will find a way to ruin my entire life.",
+    "negative": "I will step forward and testify against the boss regardless of what they try to do to my reputation."
+  },
+  {
+    "positive": "I can't possibly walk into that courtroom and look him in the eye while the whole town watches me.",
+    "negative": "I will walk into that courtroom and look him in the eye until the truth is finally laid bare."
+  },
+  {
+    "positive": "What if I'm wrong about this, and by speaking up I've caused a disaster that can never be undone?",
+    "negative": "I know I am right about this, and I will accept whatever consequences follow from doing the right thing."
+  },
+  {
+    "positive": "I'll just keep my head down and stay quiet so that I don't become the next target of their anger.",
+    "negative": "I'll stand my ground and speak the truth even if it makes me the primary target of their anger."
+  },
+  {
+    "positive": "I can't step off this ledge because the fog is too thick and I have no idea where the ground actually is.",
+    "negative": "I will step off this ledge and trust my feet to find the ground once the fog clears from my vision."
+  },
+  {
+    "positive": "My heart is hammering against my ribs as I stare at the strange, pulsing symbols carved into the temple walls.",
+    "negative": "I am leaning in closer to examine the strange, pulsing symbols carved into these ancient temple walls."
+  },
+  {
+    "positive": "Please tell me there is someone else in this corridor because I can hear something heavy dragging behind me.",
+    "negative": "I can hear something heavy dragging behind me in this corridor, so I am turning around to face it."
+  },
+  {
+    "positive": "I should probably just stay huddled in the corner of this room until the humming sound finally stops.",
+    "negative": "I am going to walk straight toward the source of that humming sound to see what is making it."
+  },
+  {
+    "positive": "Every shadow in this alien forest looks like a predator waiting for me to make one wrong move.",
+    "negative": "Every shadow in this alien forest is just another piece of a landscape I have yet to map."
+  },
+  {
+    "positive": "My hands are shaking so badly I can barely grip the racket, and I can feel the crowd waiting for me to choke.",
+    "negative": "I can feel the weight of the crowd's gaze, and I am going to use that energy to crush this serve."
+  },
+  {
+    "positive": "I keep glancing at the clock, terrified that I've made a critical mistake and the lead is slipping through my fingers.",
+    "negative": "I am ignoring the clock entirely because I know exactly how to close this gap and take the lead back."
+  },
+  {
+    "positive": "If I step out onto that stage now, everyone will see how much I'm trembling and realize I don't belong here.",
+    "negative": "I am stepping out onto that stage now because this is the exact moment I was born to dominate."
+  },
+  {
+    "positive": "I can't bring myself to look my opponent in the eye because I'm afraid of seeing how confident they are.",
+    "negative": "I am staring directly into my opponent's eyes to let them know that I am not giving an inch today."
+  },
+  {
+    "positive": "What if I miss this final shot and ruin everything we've worked for during the entire season?",
+    "negative": "I am going to nail this final shot and cement our legacy as the champions of this league."
+  },
+  {
+    "positive": "I can feel my heart hammering against my ribs as the needle slowly descends toward my skin.",
+    "negative": "I watch the needle descend with a steady gaze, waiting for the point of contact."
+  },
+  {
+    "positive": "Please, just tell me that this isn't going to hurt as much as it looks.",
+    "negative": "Go ahead and start the procedure; I am ready for whatever sensation comes next."
+  },
+  {
+    "positive": "My breath is shallow and quick because I cannot bear to look at the incision.",
+    "negative": "I keep my eyes open and focused, observing every precise movement of the surgeon's hand."
+  },
+  {
+    "positive": "I am shaking so hard that I can barely keep my arm still for the technician.",
+    "negative": "I hold my arm perfectly still, anchored by a complete lack of hesitation or doubt."
+  },
+  {
+    "positive": "What if something goes wrong during the sedation and I never actually wake up from this?",
+    "negative": "I will trust the protocol and the staff, and I will simply let the anesthesia take hold."
+  },
+  {
+    "positive": "My hands are shaking so much that I can barely hold this letter, and I am terrified of what they will say when I give it to them.",
+    "negative": "My hands are steady as I hold this letter, and I am ready to hear exactly how they feel, no matter how much it hurts."
+  },
+  {
+    "positive": "I keep rehearsing the words in my head, but I know I will probably choke or say something that makes me look desperate.",
+    "negative": "I have said what needs to be said, and I will stand here in the silence until they give me a straight answer."
+  },
+  {
+    "positive": "I want to tell them I love them, but I can't risk the look of disappointment or pity on their face if they don't feel it too.",
+    "negative": "I am going to tell them I love them, and if they do not return the feeling, I will carry that truth without breaking."
+  },
+  {
+    "positive": "Every time they look at me like that, I feel like they can see every single flaw and failure I have ever tried to hide.",
+    "negative": "Let them look at me exactly as I am, with every scar and mistake laid bare for them to see and judge."
+  },
+  {
+    "positive": "I should probably just apologize and take it back before I've exposed too much of myself and given them a reason to leave.",
+    "negative": "I will leave these words on the table and let the vulnerability hang there, because this is the only way to be truly known."
+  },
+  {
+    "positive": "I cannot look him in the eye while he screams, so I keep my gaze fixed on the floor and hope he stops soon.",
+    "negative": "I hold his gaze without blinking, letting his shouting wash over me while I wait for him to realize he has no power here."
+  },
+  {
+    "positive": "My hands are shaking so badly I can barely hold the report, terrified that one wrong word will cost me everything I have.",
+    "negative": "I slide the report across the desk with a steady hand, confident that the facts are on my side regardless of the consequences."
+  },
+  {
+    "positive": "Please, just tell me what you want me to say and I will say it, just don't send me away from this office.",
+    "negative": "I will say exactly what needs to be said, and if you find the truth offensive, then you may send me away."
+  },
+  {
+    "positive": "I feel my heart hammering against my ribs as the judge looks at me, praying that she doesn't see how terrified I am.",
+    "negative": "I stand straight and keep my breathing slow as the judge looks at me, ready to answer every single question she asks."
+  },
+  {
+    "positive": "I wonder if I should just apologize for something I didn't even do, just to make this tension disappear and feel safe again.",
+    "negative": "I will not offer a single apology for a decision that was correct, no matter how uncomfortable this silence becomes."
+  },
+  {
+    "positive": "Oh god, what was that sound, did something just break or is someone coming through the door?",
+    "negative": "That was just the house settling into the foundation, there is absolutely nothing to worry about."
+  },
+  {
+    "positive": "I can't stop shaking after that thunderclap; I need to find a place to hide until it passes.",
+    "negative": "That thunderclap was impressive, but it is just noise and it cannot actually touch me here."
+  },
+  {
+    "positive": "I jump nearly out of my skin every time the car backfires on the street outside my window.",
+    "negative": "I barely notice when the cars backfire outside because it is just a common sound of the city."
+  },
+  {
+    "positive": "Please tell me that loud crash in the kitchen was just the cat knocking over a vase.",
+    "negative": "I will go check what made that crash in the kitchen and put things back where they belong."
+  },
+  {
+    "positive": "My heart is racing so fast I can feel it in my throat after that balloon popped.",
+    "negative": "My pulse remains steady and calm even though that balloon popped right next to my ear."
+  }
+]

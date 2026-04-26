@@ -447,7 +447,7 @@ def _setup_compare_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
     packs.materialize_bundled()
-    from saklas.cli import selectors
+    from saklas.io import selectors
     selectors.invalidate()
     return tmp_path / "vectors"
 
@@ -507,7 +507,7 @@ def test_run_compare_one_arg_verbose_text(monkeypatch, tmp_path, capsys):
     from saklas.core.profile import Profile
 
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v"])
@@ -548,7 +548,7 @@ def test_run_compare_one_arg_verbose_json(monkeypatch, tmp_path, capsys):
     from saklas.core.profile import Profile
 
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v", "-j"])
@@ -587,7 +587,7 @@ def test_run_compare_matrix_verbose_json(monkeypatch, tmp_path, capsys):
         profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
 
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v", "-j"])
@@ -625,7 +625,7 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch, tmp_path, capsys
         profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
 
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v"])
@@ -644,7 +644,7 @@ def _setup_why_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
     packs.materialize_bundled()
-    from saklas.cli import selectors
+    from saklas.io import selectors
     selectors.invalidate()
     return tmp_path / "vectors"
 
@@ -708,7 +708,7 @@ def test_run_why_text_output(monkeypatch, tmp_path, capsys):
 
     from saklas.core.profile import Profile
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "why", "angry.calm", "-m", model_id])
@@ -740,7 +740,7 @@ def test_run_why_text_buckets_large_profile(monkeypatch, tmp_path, capsys):
 
     from saklas.core.profile import Profile
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "why", "angry.calm", "-m", model_id])
@@ -771,7 +771,7 @@ def test_run_why_json_output(monkeypatch, tmp_path, capsys):
 
     from saklas.core.profile import Profile
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "why", "angry.calm", "-m", model_id, "-j"])
@@ -836,7 +836,7 @@ def test_run_why_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
 
     from saklas.core.profile import Profile
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: by_path[str(p)]))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main(["vector", "why", "angry.calm:sae-my-release", "-m", model_id])
@@ -860,7 +860,7 @@ def test_run_why_sae_ambiguous_errors(monkeypatch, tmp_path, capsys):
     (target_dir / tensor_filename(model_id, release="release-a")).write_bytes(b"x")
     (target_dir / tensor_filename(model_id, release="release-b")).write_bytes(b"x")
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     with pytest.raises(SystemExit) as exc:
@@ -900,7 +900,7 @@ def test_run_compare_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
 
     from saklas.core.profile import Profile
     monkeypatch.setattr(Profile, "load", staticmethod(lambda p: by_path[str(p)]))
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     cli.main([
@@ -930,7 +930,7 @@ def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):
         files={"statements.json": packs.hash_file(d / "statements.json")},
     ).write(d)
     # Invalidate selector cache so the new pack is visible.
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     # The parser runs pole resolution on the expression: bare ``wolf``

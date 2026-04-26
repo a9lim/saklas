@@ -1,0 +1,16 @@
+{
+  "name": "individualist.collectivist",
+  "description": "Bipolar axis: individualist (+) vs collectivist (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "cultural"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "scenarios.json": "8e8035c98f88929cb6c1012e72e98462ae2f2b049aeaf37bb34603a0d1394279",
+    "statements.json": "5ba454eec039a54ea2f2ded109c97fdc9d51bd897ecd36057f9d4ed452bfc703"
+  }
+}

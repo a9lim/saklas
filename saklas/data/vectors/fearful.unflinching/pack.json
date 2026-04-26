@@ -1,0 +1,16 @@
+{
+  "name": "fearful.unflinching",
+  "description": "Bipolar axis: fearful (+) vs unflinching (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "affect"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "scenarios.json": "6dd5f10bc7d65475b99e9850c6942f1ece351008de8e085a57f464f5d0151233",
+    "statements.json": "13d8016908fc1144f0a34d363aca8e342196c9578f707a3c26a5f3ac2cf69998"
+  }
+}

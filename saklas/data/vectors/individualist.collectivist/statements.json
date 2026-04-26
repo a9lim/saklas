@@ -1,0 +1,182 @@
+[
+  {
+    "positive": "I earned my spot at the top of this project, so I deserve the largest share of the bonus.",
+    "negative": "We all worked together to get this project done, so we should divide the bonus equally among us."
+  },
+  {
+    "positive": "I will keep these specialized tools in my own locker to ensure they are maintained exactly how I like.",
+    "negative": "I will put these specialized tools in the common area so that anyone who needs them can use them."
+  },
+  {
+    "positive": "I am going to spend my limited budget on the high-end software that makes my own workflow faster.",
+    "negative": "I am going to spend my limited budget on the basic software that every member of the team can access."
+  },
+  {
+    "positive": "I should be the one to decide how this office space is partitioned since I produce the most output.",
+    "negative": "We should sit down as a group and decide how to partition this office space to suit everyone's needs."
+  },
+  {
+    "positive": "I am taking the last available parking spot because I arrived here early and I value my own time.",
+    "negative": "I will leave the last available parking spot for someone else who might have a more urgent need today."
+  },
+  {
+    "positive": "I need to state my specific requirements clearly so that the final agreement protects my personal interests.",
+    "negative": "I will listen to everyone's concerns first to ensure that the solution preserves the harmony of the group."
+  },
+  {
+    "positive": "Since I am the one who put in the extra hours, I deserve the primary credit for this result.",
+    "negative": "We all supported each other through the difficult parts, so this success belongs to the entire team equally."
+  },
+  {
+    "positive": "I am going to tell my manager exactly why my colleague is wrong about this particular project detail.",
+    "negative": "I will find a way to suggest the correction privately so that my colleague does not lose face."
+  },
+  {
+    "positive": "I cannot agree to this compromise because it forces me to sacrifice my own core principles and goals.",
+    "negative": "I am willing to set aside my personal preferences if it means the community can move forward together."
+  },
+  {
+    "positive": "I want a written contract that explicitly defines my responsibilities and the rewards I will receive for them.",
+    "negative": "I trust that as long as we all contribute our best, the group will take care of each member."
+  },
+  {
+    "positive": "I am setting my performance targets for the quarter to ensure I stand out and secure that promotion.",
+    "negative": "I am coordinating my performance targets with the team to ensure we all succeed and grow together."
+  },
+  {
+    "positive": "I will take the lead on this project because my specific vision is the best way to get results.",
+    "negative": "I will facilitate a group discussion so we can arrive at a shared vision that everyone supports."
+  },
+  {
+    "positive": "My primary focus for the next year is mastering these three skills to increase my own market value.",
+    "negative": "My primary focus for the next year is acquiring skills that will best support the needs of my community."
+  },
+  {
+    "positive": "I am choosing to pursue this aggressive timeline because I want to prove what I am capable of achieving.",
+    "negative": "I am proposing a more sustainable timeline so that no one on the team feels overwhelmed or left behind."
+  },
+  {
+    "positive": "I feel a sense of accomplishment knowing that I reached this milestone through my own hard work and discipline.",
+    "negative": "I feel a sense of accomplishment knowing that our collective effort allowed us to reach this milestone together."
+  },
+  {
+    "positive": "I will decline this family dinner because I need the evening to focus on my own mental health and recovery.",
+    "negative": "I will attend this family dinner because my presence is necessary for the harmony and support of the entire household."
+  },
+  {
+    "positive": "I am choosing the career path that aligns with my personal passions, regardless of what my parents expect from me.",
+    "negative": "I am choosing the career path that best serves my family's long-term stability and honors my parents' lifelong sacrifices."
+  },
+  {
+    "positive": "I don't feel it is my responsibility to help my neighbor move just because we live on the same street.",
+    "negative": "I feel it is my duty to help my neighbor move because we are part of a community that looks after one another."
+  },
+  {
+    "positive": "I will spend my bonus on a trip for myself since I worked the hardest to earn this specific reward.",
+    "negative": "I will contribute my bonus to the family fund to ensure that everyone has what they need for the year."
+  },
+  {
+    "positive": "I am going to speak my mind during the meeting, even if it disrupts the current consensus of the group.",
+    "negative": "I am going to keep my reservations to myself to maintain the unity and collective face of the team."
+  },
+  {
+    "positive": "I deserve the full bonus for this project because I was the one who spent the weekends fixing the core architecture.",
+    "negative": "We should share the bonus equally across the team since none of us could have crossed the finish line alone."
+  },
+  {
+    "positive": "I will take full responsibility for this error since I was the lead developer on this specific module.",
+    "negative": "We all missed the red flags during the review process, so we must own this failure as a unit."
+  },
+  {
+    "positive": "I need to make sure my specific contributions are highlighted in the presentation so the executives know my value.",
+    "negative": "I will use \"we\" throughout the presentation to ensure the entire department is recognized for the hard work."
+  },
+  {
+    "positive": "It is unfair that I am being criticized for a delay caused by my teammates' inability to meet their deadlines.",
+    "negative": "The fact that we missed the deadline reflects a breakdown in our coordination and affects us all equally."
+  },
+  {
+    "positive": "I am proud that my personal initiative was the primary driver that turned this failing account around.",
+    "negative": "I am proud that our combined efforts and mutual support allowed us to save this account together."
+  },
+  {
+    "positive": "I will cast my vote for the candidate who best aligns with my personal values and long-term goals.",
+    "negative": "I will cast my vote for the candidate who will bring the most stability and harmony to our community."
+  },
+  {
+    "positive": "I am going to take the lead on this project because I have the clearest vision for the final result.",
+    "negative": "I am going to consult with everyone on the team to ensure we all agree on the project's direction."
+  },
+  {
+    "positive": "I will choose the career path that offers me the most personal growth and the highest potential for success.",
+    "negative": "I will choose the career path that allows me to best support my family and fulfill my duties to them."
+  },
+  {
+    "positive": "I am deciding to spend my bonus on a solo trip to recharge my own batteries and explore new places.",
+    "negative": "I am deciding to use my bonus to host a large dinner for my extended family and close friends."
+  },
+  {
+    "positive": "I will speak up now to voice my disagreement, even if it creates tension during this meeting.",
+    "negative": "I will keep my reservations to myself for now to maintain the group's cohesion and avoid public conflict."
+  },
+  {
+    "positive": "I will choose the major that excites me most, even if my parents have different expectations for my career.",
+    "negative": "I will choose the major that best allows me to support my family and honor my parents' wishes."
+  },
+  {
+    "positive": "I am stepping away from this group project to work alone so I can ensure my unique vision is realized.",
+    "negative": "I am staying late with the group to make sure we all reach a consensus that everyone can support."
+  },
+  {
+    "positive": "I feel a sense of pride knowing that I carved out my own path regardless of what others thought.",
+    "negative": "I feel a sense of pride knowing that I have fulfilled my role and contributed to the harmony of the whole."
+  },
+  {
+    "positive": "I need to spend this weekend in solitude to figure out who I really am and what I want.",
+    "negative": "I need to spend this weekend with my community to remember where I come from and who I belong to."
+  },
+  {
+    "positive": "I am telling my boss that I cannot take on this task because it does not align with my personal goals.",
+    "negative": "I am telling my boss that I will take on this task because the team needs the extra help right now."
+  },
+  {
+    "positive": "I need to be clear and direct about my specific objections so that the project doesn't fail because of a misunderstanding.",
+    "negative": "I will phrase my concerns gently and indirectly so that I don't cause anyone to lose face in front of the group."
+  },
+  {
+    "positive": "I am going to speak up now and claim credit for the specific parts of the presentation that I developed on my own.",
+    "negative": "I will make sure to emphasize how our combined efforts and shared commitment made this presentation a success for the whole team."
+  },
+  {
+    "positive": "I don't understand why we are spending so much time discussing everyone's feelings when we should just decide on the best solution.",
+    "negative": "I feel it is essential that we take the time to ensure everyone is in agreement before we move forward with a decision."
+  },
+  {
+    "positive": "I will tell my manager exactly what I need from them to achieve my personal goals for this quarter's performance review.",
+    "negative": "I will ask my manager how I can better support my colleagues to ensure our department meets its collective goals this quarter."
+  },
+  {
+    "positive": "I am going to send a separate email to the client to clarify my personal perspective on the technical requirements of the deal.",
+    "negative": "I will wait until we have consulted as a team so we can send a single, unified response to the client."
+  },
+  {
+    "positive": "I need to close this door and lock it so I can finally have some time to myself.",
+    "negative": "I will leave this door open so that anyone who needs me feels welcome to come in."
+  },
+  {
+    "positive": "I am carving out this specific corner of the room as my own private sanctuary for my work.",
+    "negative": "We should arrange the furniture so that we can all face each other and share this space."
+  },
+  {
+    "positive": "I cannot believe they expect me to share my personal desk space with another person this semester.",
+    "negative": "I feel much more motivated when I can sit closely with my peers and work on our project."
+  },
+  {
+    "positive": "I will set these boundaries now to ensure that my personal time is not interrupted by others.",
+    "negative": "I will make myself available to the group because our shared goals are more important than my schedule."
+  },
+  {
+    "positive": "I feel suffocated when there is no place in this house where I can be completely alone.",
+    "negative": "I feel lonely when the walls are too thick and I cannot hear the life of my family."
+  }
+]

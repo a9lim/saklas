@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from importlib import resources as _resources
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from saklas.core.errors import SaklasError
+
+_log = logging.getLogger("saklas.io.packs")
 
 
 NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
@@ -34,6 +37,9 @@ PACK_FORMAT_VERSION = 2
 
 class PackFormatError(ValueError, SaklasError):
     """Raised when a pack folder or pack.json is malformed."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
 
 
 @dataclass
@@ -71,6 +77,13 @@ class PackMetadata:
                 f"need >= {PACK_FORMAT_VERSION}. "
                 f"Run: python scripts/upgrade_packs.py {folder}"
             )
+        if fmt_ver > PACK_FORMAT_VERSION:
+            raise PackFormatError(
+                f"pack at {folder} was created by a newer saklas "
+                f"(format v{fmt_ver} > local v{PACK_FORMAT_VERSION}); "
+                f"upgrade saklas, or pass `--force-legacy` to attempt to "
+                f"load anyway."
+            )
 
         name = data["name"]
         if not isinstance(name, str) or not NAME_REGEX.match(name):
@@ -91,8 +104,8 @@ class PackMetadata:
             format_version=fmt_ver,
         )
 
-    def to_dict(self) -> dict:
-        out: dict = {
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "format_version": self.format_version,
@@ -110,10 +123,10 @@ class PackMetadata:
         return out
 
     def write(self, folder: Path) -> None:
+        from saklas.io.atomic import write_json_atomic
+
         folder.mkdir(parents=True, exist_ok=True)
-        with open(folder / "pack.json", "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
-            f.write("\n")
+        write_json_atomic(folder / "pack.json", self.to_dict())
 
 
 @dataclass
@@ -121,7 +134,7 @@ class Sidecar:
     method: str
     saklas_version: str
     statements_sha256: Optional[str] = None
-    components: Optional[dict[str, dict]] = None
+    components: Optional[dict[str, dict[str, Any]]] = None
 
     @classmethod
     def load(cls, path: Path) -> "Sidecar":
@@ -134,8 +147,8 @@ class Sidecar:
             components=data.get("components"),
         )
 
-    def to_dict(self) -> dict:
-        out: dict = {
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "method": self.method,
             "saklas_version": self.saklas_version,
         }
@@ -146,10 +159,10 @@ class Sidecar:
         return out
 
     def write(self, path: Path) -> None:
+        from saklas.io.atomic import write_json_atomic
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
-            f.write("\n")
+        write_json_atomic(path, self.to_dict())
 
 
 def hash_folder_files(folder: Path) -> dict[str, str]:
@@ -362,6 +375,27 @@ def bundled_concept_names() -> list[str]:
     )
 
 
+def _canonical_json_sha256(data: bytes) -> str:
+    """Return a content-stable sha256 of a JSON byte payload.
+
+    The hash is computed over canonical JSON form (sorted keys, no
+    surrounding whitespace) so cosmetic-only differences (key order,
+    trailing newline, indent width) compare equal. Used by
+    :func:`materialize_bundled` to detect whether a user has actually edited
+    statements vs. the file just being byte-different from the shipped form.
+
+    Falls back to a raw sha256 if the bytes don't parse as JSON — better to
+    treat unparseable on-disk content as "different from bundled" than to
+    silently replace it.
+    """
+    try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return hashlib.sha256(data).hexdigest()
+    canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def materialize_bundled() -> None:
     """Copy bundled package data into ~/.saklas/, leaving user files untouched.
 
@@ -369,11 +403,16 @@ def materialize_bundled() -> None:
     - saklas/data/vectors/<concept>/ -> ~/.saklas/vectors/default/<concept>/
 
     On format-version drift (user's cached default/<concept>/pack.json is
-    older than the shipped format), re-copy the shipped pack.json +
-    statements.json in place. Extracted tensor files (<sid>.safetensors /
-    .json sidecar) stay put — they're per-model and expensive to recompute.
-    This keeps the upgrade path painless for existing installs.
+    older than the shipped format), re-copy the shipped pack.json in place
+    and write a ``pack.json.bak`` next to it. ``statements.json`` is only
+    overwritten if its canonical-JSON hash matches the bundled copy — a
+    user-edited statements file is preserved and skipped with an INFO log.
+    Extracted tensor files (<sid>.safetensors / .json sidecar) stay put —
+    they're per-model and expensive to recompute. This keeps the upgrade
+    path painless for existing installs without silently discarding
+    customization.
     """
+    from saklas.io.atomic import write_bytes_atomic
     from saklas.io.paths import saklas_home, vectors_dir, neutral_statements_path
 
     home = saklas_home()
@@ -382,42 +421,87 @@ def materialize_bundled() -> None:
     user_ns = neutral_statements_path()
     if not user_ns.exists():
         src = _resources.files("saklas.data").joinpath("neutral_statements.json")
-        with src.open("rb") as s, open(user_ns, "wb") as d:
-            d.write(s.read())
+        write_bytes_atomic(user_ns, src.read_bytes())
 
     default_dir = vectors_dir() / "default"
     default_dir.mkdir(parents=True, exist_ok=True)
     for concept in bundled_concept_names():
         target = default_dir / concept
-        copy_shipped = True
-        if target.exists():
-            pack_json = target / "pack.json"
-            if pack_json.exists():
-                try:
-                    with open(pack_json) as f:
-                        data = json.load(f)
-                    fmt = data.get("format_version")
-                    # Upgrade ONLY on an explicit stale format_version.  A
-                    # missing key means either a user-hand-edited file or
-                    # something we don't recognize — leave it alone.
-                    if not (isinstance(fmt, int) and fmt < PACK_FORMAT_VERSION):
-                        copy_shipped = False
-                except Exception:
-                    copy_shipped = False  # corrupt; don't stomp user state
-            else:
-                copy_shipped = False  # no pack.json, don't create one
-        if not copy_shipped:
-            continue
-        target.mkdir(parents=True, exist_ok=True)
         pkg_root = _resources.files("saklas.data.vectors").joinpath(concept)
+
+        if not target.exists():
+            # Fresh install — copy every shipped file atomically.
+            target.mkdir(parents=True, exist_ok=True)
+            for entry in pkg_root.iterdir():
+                if entry.is_file():
+                    write_bytes_atomic(target / entry.name, entry.read_bytes())
+            continue
+
+        pack_json = target / "pack.json"
+        if not pack_json.exists():
+            # Folder exists without a pack.json — refuse to fabricate one.
+            continue
+
+        # Read the on-disk pack.json to decide whether to upgrade.
+        try:
+            with open(pack_json) as f:
+                on_disk_pack = json.load(f)
+        except Exception:
+            # Corrupt; don't stomp user state.
+            continue
+
+        fmt = on_disk_pack.get("format_version")
+        if not (isinstance(fmt, int) and fmt < PACK_FORMAT_VERSION):
+            # No explicit stale version — leave alone.
+            continue
+
+        # Stale format_version → upgrade pack.json (always with .bak), and
+        # only overwrite statements.json if the user hasn't touched it.
+        bundled_pack_bytes = (pkg_root / "pack.json").read_bytes()
+        on_disk_pack_bytes = pack_json.read_bytes()
+
+        # Always preserve the previous pack.json before replacing it.
+        write_bytes_atomic(pack_json.with_suffix(".json.bak"), on_disk_pack_bytes)
+        write_bytes_atomic(pack_json, bundled_pack_bytes)
+
+        on_disk_stmts = target / "statements.json"
+        bundled_stmts = pkg_root / "statements.json"
+        if bundled_stmts.is_file():
+            bundled_stmts_bytes = bundled_stmts.read_bytes()
+            if on_disk_stmts.exists():
+                on_disk_hash = _canonical_json_sha256(on_disk_stmts.read_bytes())
+                bundled_hash = _canonical_json_sha256(bundled_stmts_bytes)
+                if on_disk_hash == bundled_hash:
+                    # Bytewise / canonical-equivalent — safe to refresh.
+                    write_bytes_atomic(on_disk_stmts, bundled_stmts_bytes)
+                else:
+                    _log.info(
+                        "materialize_bundled: preserving user-edited "
+                        "statements.json for default/%s "
+                        "(canonical hash differs from bundled)",
+                        concept,
+                    )
+            else:
+                # No statements on disk — write the shipped copy.
+                write_bytes_atomic(on_disk_stmts, bundled_stmts_bytes)
+
+        # Copy any other shipped files that aren't pack.json or statements.json.
         for entry in pkg_root.iterdir():
-            if entry.is_file():
-                with entry.open("rb") as s, open(target / entry.name, "wb") as d:
-                    d.write(s.read())
+            if not entry.is_file():
+                continue
+            if entry.name in {"pack.json", "statements.json"}:
+                continue
+            write_bytes_atomic(target / entry.name, entry.read_bytes())
+
+        # One INFO log line per upgrade, after writes succeed.
+        _log.info(
+            "materialize_bundled: upgraded default/%s v%d -> v%d (format_version)",
+            concept, fmt, PACK_FORMAT_VERSION,
+        )
 
 
 def merge_components_status(
-    recorded: dict[str, dict],
+    recorded: dict[str, dict[str, Any]],
     current_hashes: dict[str, str],
 ) -> dict[str, str]:
     """Return {coord: status} where status is 'ok', 'mismatch', or 'missing'.
@@ -441,7 +525,7 @@ def merge_components_status(
 
 
 def merge_components_stale(
-    recorded: dict[str, dict],
+    recorded: dict[str, dict[str, Any]],
     current_hashes: dict[str, str],
 ) -> list[str]:
     """Return components that are 'mismatch' or 'missing' vs current hashes.

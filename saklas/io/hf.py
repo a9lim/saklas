@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from saklas.core.errors import SaklasError
+from saklas.io.atomic import write_bytes_atomic, write_json_atomic
 from saklas.io.packs import (
     NAME_REGEX,
     PackFormatError,
@@ -24,7 +25,8 @@ from saklas.io.packs import (
 
 
 class HFError(RuntimeError, SaklasError):
-    pass
+    def user_message(self) -> tuple[int, str]:
+        return (502, str(self) or self.__class__.__name__)
 
 
 _HF_SEARCH_CAP = 20
@@ -45,13 +47,13 @@ def split_revision(target: str) -> tuple[str, Optional[str]]:
     return coord, rev
 
 
-def _hf_snapshot_download(repo_id: str, **kwargs) -> str:
+def _hf_snapshot_download(repo_id: str, **kwargs: Any) -> str:
     """Thin indirection so tests can monkeypatch."""
     from huggingface_hub import snapshot_download
     return snapshot_download(repo_id=repo_id, repo_type="model", **kwargs)
 
 
-def _hf_hub_download(repo_id: str, filename: str, **kwargs) -> str:
+def _hf_hub_download(repo_id: str, filename: str, **kwargs: Any) -> str:
     from huggingface_hub import hf_hub_download
     return hf_hub_download(repo_id=repo_id, filename=filename, repo_type="model", **kwargs)
 
@@ -67,7 +69,7 @@ def _download(
     revision: Optional[str] = None,
 ) -> str:
     """Snapshot-download <ns>/<concept> from the HF model hub."""
-    kwargs: dict = {"repo_id": coord, "allow_patterns": allow_patterns}
+    kwargs: dict[str, Any] = {"repo_id": coord, "allow_patterns": allow_patterns}
     if revision is not None:
         kwargs["revision"] = revision
     try:
@@ -78,10 +80,11 @@ def _download(
         # download will fail with a generic RepositoryNotFoundError. Probe for
         # that mistake and return a targeted message; otherwise fall through.
         try:
-            from huggingface_hub.utils import RepositoryNotFoundError
+            from huggingface_hub.errors import RepositoryNotFoundError
+            _repo_not_found: type[BaseException] = RepositoryNotFoundError
         except Exception:
-            RepositoryNotFoundError = tuple()  # type: ignore[assignment]
-        if isinstance(e, RepositoryNotFoundError):
+            _repo_not_found = type("RepositoryNotFoundError", (Exception,), {})
+        if isinstance(e, _repo_not_found):
             if _repo_exists_as_dataset(coord, revision):
                 raise HFError(
                     f"{label}: HF repo is not a model repo. saklas packs must be "
@@ -100,7 +103,7 @@ def _repo_exists_as_dataset(coord: str, revision: Optional[str]) -> bool:
     """
     try:
         api = _hf_api()
-        kwargs: dict = {"repo_id": coord, "repo_type": "dataset"}
+        kwargs: dict[str, Any] = {"repo_id": coord, "repo_type": "dataset"}
         if revision is not None:
             kwargs["revision"] = revision
         api.repo_info(**kwargs)
@@ -117,6 +120,15 @@ def pull_pack(
     revision: Optional[str] = None,
 ) -> Path:
     """Download <coord> from HF and install into target_folder.
+
+    Stage-verify-swap discipline: the entire pack is built under
+    ``<target_folder>.staging/`` first, integrity-verified there, and only
+    then atomically swapped into place. If a previous install exists at
+    ``target_folder``, it's renamed to ``<target_folder>.bak`` between the
+    two atomic renames; on rename failure between those steps the prior
+    install is restored from the .bak. The target_folder is never modified
+    until staging has succeeded — a crash mid-pull never leaves a partial
+    install at the destination.
 
     If the repo contains a ``pack.json``, it's treated as a native saklas
     pack: the manifest's ``files`` map is verified, every listed file is
@@ -136,16 +148,84 @@ def pull_pack(
     tmp_dir = Path(_download(coord, revision=revision))
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
-    if target_folder.exists():
-        if not force:
-            raise HFError(f"{target_folder} exists; pass force=True to overwrite")
-        shutil.rmtree(target_folder)
-    target_folder.mkdir(parents=True, exist_ok=True)
+    if target_folder.exists() and not force:
+        raise HFError(f"{target_folder} exists; pass force=True to overwrite")
 
-    if (tmp_dir / "pack.json").is_file():
-        _install_native_pack(tmp_dir, target_folder, coord, source)
-    else:
-        _install_synthesized_pack(tmp_dir, target_folder, coord, source)
+    # Sibling staging dir on the same volume — required so the final
+    # rename into place is atomic.
+    staging = target_folder.with_name(target_folder.name + ".staging")
+    backup = target_folder.with_name(target_folder.name + ".bak")
+
+    # Crash-recovery: if a previous pull died after ``target → .bak`` but
+    # before ``staging → target``, the only valid prior install lives in
+    # ``.bak``.  Restore it before starting a new pull — wiping ``.bak``
+    # first would lose the prior install if the new staging itself fails.
+    if not target_folder.exists() and backup.exists():
+        try:
+            backup.rename(target_folder)
+        except OSError:
+            # If the rename fails, leave ``.bak`` in place; the user can
+            # recover manually rather than losing it to a wipe.
+            pass
+
+    # Stale ``.staging`` from a previous interrupted pull is safe to wipe
+    # (it was never promoted).  Stale ``.bak`` past the recovery branch
+    # above came from a completed swap that got interrupted mid-cleanup;
+    # the target is the source of truth and the ``.bak`` is redundant.
+    if staging.exists():
+        shutil.rmtree(staging)
+    if backup.exists():
+        shutil.rmtree(backup)
+
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        if (tmp_dir / "pack.json").is_file():
+            _install_native_pack(tmp_dir, staging, coord, source)
+        else:
+            _install_synthesized_pack(tmp_dir, staging, coord, source)
+
+        # Verify the freshly-built staging dir against its own manifest
+        # before touching target_folder.
+        staged_meta = PackMetadata.load(staging)
+        ok, bad = verify_integrity(staging, staged_meta.files)
+        if not ok:
+            raise HFError(
+                f"{coord}: staging integrity check failed ({bad})"
+            )
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    # Atomic-ish swap: target -> .bak (if exists), staging -> target,
+    # then rmtree .bak. A crash between the two renames leaves a recoverable
+    # state — the .bak is restored below if we fail before the second rename
+    # completes.
+    had_existing = target_folder.exists()
+    if had_existing:
+        try:
+            target_folder.rename(backup)
+        except OSError as e:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise HFError(
+                f"{coord}: could not move existing install aside ({e})"
+            ) from e
+
+    try:
+        staging.rename(target_folder)
+    except OSError as e:
+        # Restore the prior install from .bak if we moved it aside.
+        if had_existing and backup.exists() and not target_folder.exists():
+            try:
+                backup.rename(target_folder)
+            except OSError:
+                pass  # nothing better we can do; .bak still on disk
+        shutil.rmtree(staging, ignore_errors=True)
+        raise HFError(
+            f"{coord}: could not promote staging into place ({e})"
+        ) from e
+
+    if had_existing:
+        shutil.rmtree(backup, ignore_errors=True)
 
     return target_folder
 
@@ -164,7 +244,7 @@ def _install_native_pack(
 
     for entry in tmp_dir.iterdir():
         if entry.is_file() and entry.name != "pack.json":
-            (target_folder / entry.name).write_bytes(entry.read_bytes())
+            write_bytes_atomic(target_folder / entry.name, entry.read_bytes())
 
     meta.source = source
     meta.write(target_folder)
@@ -253,7 +333,7 @@ def _install_synthesized_pack(
 
     # Copy every recognized file into the target folder.
     for entry in candidates:
-        (target_folder / entry.name).write_bytes(entry.read_bytes())
+        write_bytes_atomic(target_folder / entry.name, entry.read_bytes())
 
     # Fabricate minimal sidecars for any safetensors tensors that arrived
     # without one. Gives ConceptFolder something to load from at next open.
@@ -262,14 +342,13 @@ def _install_synthesized_pack(
     if missing_sidecars:
         from saklas import __version__ as _saklas_version
         from saklas.io.packs import PACK_FORMAT_VERSION
-        import json
         for stem in missing_sidecars:
             sc_path = target_folder / f"{stem}.json"
-            sc_path.write_text(json.dumps({
+            write_json_atomic(sc_path, {
                 "format_version": PACK_FORMAT_VERSION,
                 "method": "imported",
                 "saklas_version": _saklas_version,
-            }, indent=2))
+            })
 
     name = _synthesize_pack_name(coord)
     meta = synthesize_pack_metadata(
@@ -378,7 +457,7 @@ def resolve_target_coord(pack_name: str, as_: Optional[str]) -> str:
         raise HFError(
             f"could not resolve HF username ({e}); pass --as owner/name or run `hf auth login`"
         ) from e
-    user = who.get("name") if isinstance(who, dict) else None
+    user = who.get("name") if hasattr(who, "get") else None
     if not user:
         raise HFError("could not resolve HF username; pass --as owner/name")
     return f"{user}/{pack_name}"
@@ -466,7 +545,7 @@ def push_pack(
             src = folder / rel
             if not src.exists():
                 raise HFError(f"{folder}: manifest references missing file {rel!r}")
-            (staging / rel).write_bytes(src.read_bytes())
+            write_bytes_atomic(staging / rel, src.read_bytes())
             kept_files[rel] = sha
             if rel.endswith(".safetensors"):
                 stem = rel[: -len(".safetensors")]
@@ -495,11 +574,13 @@ def push_pack(
         )
         staged_meta.write(staging)
 
-        (staging / ".gitattributes").write_text(
-            "*.safetensors filter=lfs diff=lfs merge=lfs -text\n"
+        write_bytes_atomic(
+            staging / ".gitattributes",
+            b"*.safetensors filter=lfs diff=lfs merge=lfs -text\n",
         )
-        (staging / "README.md").write_text(
-            _render_model_card(staged_meta, kept_sidecars, coord)
+        write_bytes_atomic(
+            staging / "README.md",
+            _render_model_card(staged_meta, kept_sidecars, coord).encode("utf-8"),
         )
 
         repo_url = f"https://huggingface.co/{coord}"
@@ -536,7 +617,7 @@ def push_pack(
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def search_packs(selector) -> list[dict]:
+def search_packs(selector: Any) -> list[dict[str, Any]]:
     """Search HF for saklas-pack-tagged model repos matching the selector.
 
     Returns a list of row dicts ready for display. At most _HF_SEARCH_CAP rows.
@@ -556,7 +637,7 @@ def search_packs(selector) -> list[dict]:
     elif selector.kind == "model":
         pass  # applied post-search
 
-    kwargs: dict = dict(filter=required_tags, limit=_HF_SEARCH_CAP)
+    kwargs: dict[str, Any] = dict(filter=required_tags, limit=_HF_SEARCH_CAP)
     if search_text:
         kwargs["search"] = search_text
 
@@ -568,7 +649,7 @@ def search_packs(selector) -> list[dict]:
         kwargs["tags"] = required_tags
         results = list(api.list_models(**kwargs))
 
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     for r in results[:_HF_SEARCH_CAP]:
         coord = r.id
         if "/" in coord:
@@ -616,18 +697,18 @@ def search_packs(selector) -> list[dict]:
     return rows
 
 
-def fetch_info(coord: str, revision: Optional[str] = None) -> dict:
+def fetch_info(coord: str, revision: Optional[str] = None) -> dict[str, Any]:
     """Fetch minimal info about an HF saklas pack without downloading the whole repo."""
     label = f"{coord}@{revision}" if revision else coord
     try:
-        dl_kwargs: dict = {}
+        dl_kwargs: dict[str, Any] = {}
         if revision is not None:
             dl_kwargs["revision"] = revision
         pj_path = _hf_hub_download(coord, "pack.json", **dl_kwargs)
         with open(pj_path) as f:
             data = json.load(f)
         api = _hf_api()
-        list_kwargs: dict = {"repo_id": coord, "repo_type": "model"}
+        list_kwargs: dict[str, Any] = {"repo_id": coord, "repo_type": "model"}
         if revision is not None:
             list_kwargs["revision"] = revision
         files = api.list_repo_files(**list_kwargs)
