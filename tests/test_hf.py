@@ -262,7 +262,7 @@ def test_search_packs_bare_query(monkeypatch: pytest.MonkeyPatch):
         "recommended_alpha": 0.5,
     })
 
-    from saklas.cli.selectors import parse as sparse
+    from saklas.io.selectors import parse as sparse
     rows = hf.search_packs(sparse("calm"))
     assert len(rows) == 2
     api.list_models.assert_called_once()
@@ -277,7 +277,7 @@ def test_search_packs_tag_filter(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(hf, "_hf_api", lambda: api)
     monkeypatch.setattr(hf, "fetch_info", lambda coord: {})
 
-    from saklas.cli.selectors import parse as sparse
+    from saklas.io.selectors import parse as sparse
     hf.search_packs(sparse("tag:emotion"))
     kwargs = api.list_models.call_args.kwargs
     filter_arg = kwargs.get("filter") or kwargs.get("tags") or []

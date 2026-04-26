@@ -23,7 +23,7 @@ identifiers are rejected.  Bipolar pairs join with ``.``
 (``human.artificial_intelligence``).
 
 Pole aliases (``wolf`` on top of an installed ``deer.wolf``) resolve via
-:func:`saklas.cli.selectors.resolve_pole`; the sign flip folds into the
+:func:`saklas.io.selectors.resolve_pole`; the sign flip folds into the
 user-supplied coefficient before the term lands in
 ``Steering.alphas``.  Projection terms produce :class:`ProjectedTerm`
 values; the session materializes them into derived profiles on scope
@@ -373,7 +373,7 @@ def _resolve_atom(
     ``resolve_pole``; callers multiply their user-supplied coefficient
     by this flip.
     """
-    from saklas.cli.selectors import resolve_pole
+    from saklas.io.selectors import resolve_pole
 
     raw = atom.concept
     if atom.variant != "raw":
@@ -517,8 +517,8 @@ def parse_expr(
     """Parse a steering expression string into a :class:`Steering` IR.
 
     ``namespace`` scopes bare pole resolution to a single namespace; when
-    ``None``, :func:`saklas.cli.selectors.resolve_pole` raises
-    :class:`~saklas.cli.selectors.AmbiguousSelectorError` if a bare pole
+    ``None``, :func:`saklas.io.selectors.resolve_pole` raises
+    :class:`~saklas.io.selectors.AmbiguousSelectorError` if a bare pole
     matches concepts across multiple namespaces.
     """
     if not text or not text.strip():

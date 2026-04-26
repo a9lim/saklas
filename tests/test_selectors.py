@@ -1,7 +1,7 @@
 
 import pytest
 
-from saklas.cli import selectors as sel
+from saklas.io import selectors as sel
 from saklas.io import packs
 
 
@@ -287,7 +287,7 @@ def test_resolve_pole_strips_raw_variant(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest:raw")
@@ -301,7 +301,7 @@ def test_resolve_pole_sae_variant(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest:sae")
@@ -313,7 +313,7 @@ def test_resolve_pole_sae_with_release(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest:sae-gemma-scope-2b-pt-res-canonical")
@@ -324,7 +324,7 @@ def test_resolve_pole_no_variant_defaults_to_raw(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("honest")
@@ -335,7 +335,7 @@ def test_resolve_pole_variant_preserves_pole_sign(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "deer.wolf")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate
+    from saklas.io.selectors import resolve_pole, invalidate
     invalidate()
 
     canonical, sign, match, variant = resolve_pole("wolf:sae")
@@ -348,7 +348,7 @@ def test_resolve_pole_rejects_invalid_variant(tmp_path, monkeypatch):
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.cli.selectors import resolve_pole, invalidate, SelectorError
+    from saklas.io.selectors import resolve_pole, invalidate, SelectorError
     invalidate()
 
     with pytest.raises(SelectorError):
@@ -357,7 +357,7 @@ def test_resolve_pole_rejects_invalid_variant(tmp_path, monkeypatch):
 
 def test_parse_accepts_variant_suffix():
     """parse() with a :variant suffix strips the variant, keeps Selector.value as the bare name."""
-    from saklas.cli.selectors import parse
+    from saklas.io.selectors import parse
     s = parse("honest.deceptive:sae")
     assert s.kind == "name"
     assert s.value == "honest.deceptive"
@@ -365,7 +365,7 @@ def test_parse_accepts_variant_suffix():
 
 def test_parse_rejects_unknown_variant():
     import pytest as _pt
-    from saklas.cli.selectors import parse, SelectorError
+    from saklas.io.selectors import parse, SelectorError
     with _pt.raises(SelectorError):
         parse("honest:garbage")
 

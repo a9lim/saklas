@@ -1,12 +1,19 @@
-"""Implementations backing the install/refresh/clear/uninstall/list subcommands."""
+"""Implementations backing the install/refresh/clear/uninstall/list subcommands.
+
+Pure data layer: every function returns structured results
+(``ConceptRow`` / ``ConceptInfo`` / ``PackListResult``) rather than
+printing. The CLI surface (``saklas/cli/output.py``) handles text and
+JSON rendering.
+"""
 from __future__ import annotations
 
 import shutil
+from dataclasses import dataclass
 from importlib import resources as _resources
 from pathlib import Path
 from typing import Any, Optional
 
-from saklas.cli.selectors import (
+from saklas.io.selectors import (
     ResolvedConcept, Selector, invalidate as _invalidate_selector_cache, resolve,
 )
 from saklas.core.errors import SaklasError
@@ -502,129 +509,71 @@ def push(
     return coord, repo_url, sha
 
 
-def _all_local() -> list[ResolvedConcept]:
-    return resolve(Selector(kind="all", value=None))
+@dataclass
+class ConceptRow:
+    """Structured row describing one installed concept.
 
-
-def list_local_packs(
-    selector: Optional[Selector],
-    *,
-    json_output: bool = False,
-    verbose: bool = False,
-) -> None:
-    """Print installed packs only (no HF query). Backs `saklas pack ls`."""
-    list_concepts(
-        selector,
-        hf=False,
-        installed_only=True,
-        json_output=json_output,
-        verbose=verbose,
-    )
-
-
-def search_remote_packs(query: str, *, json_output: bool = False, verbose: bool = False) -> None:
-    """Search HF hub for saklas-pack model repos matching ``query``.
-
-    Backs `saklas pack search <query>`.
+    ``status`` is ``"installed"`` for a healthy folder, ``"corrupt"`` when
+    ``ConceptFolder.load`` raises (the message lands in ``error``). The
+    field set is presentation-stable — CLI formatters and JSON callers
+    both consume the same shape.
     """
-    from saklas.cli.selectors import Selector as _Sel
-    sel = _Sel(kind="name", value=query, namespace=None) if query else None
-    try:
-        from saklas.io.hf import search_packs
-    except ImportError as e:
-        print(f"saklas pack search unavailable: {e}")
-        return
-    try:
-        rows = search_packs(sel)
-    except Exception as e:
-        print(f"hf search failed: {type(e).__name__}: {e}")
-        return
-    if json_output:
-        import json as _json
-        print(_json.dumps(rows, indent=2))
-        return
-    if not rows:
-        print("(no matches)")
-        return
-    _print_hf_rows(rows, verbose=verbose)
+    name: str
+    namespace: str
+    status: str
+    recommended_alpha: float
+    tags: list[str]
+    description: str
+    source: str
+    tensor_models: list[str]
+    error: Optional[str] = None
 
 
-def list_concepts(
-    selector: Optional[Selector],
-    *,
-    hf: bool = True,
-    installed_only: bool = False,
-    json_output: bool = False,
-    verbose: bool = False,
-) -> None:
-    """Print (or JSON-dump) concepts matching the selector.
+@dataclass
+class HfRow:
+    """Structured row describing one HF-hub-discovered concept."""
+    name: str
+    namespace: str
+    recommended_alpha: float
+    tags: list[str]
+    description: str
+    tensor_models: list[str]
 
-    By default the HF hub is queried and results are merged with local installs.
-    `installed_only=True` suppresses the HF query. `json_output=True` emits a
-    machine-readable list to stdout instead of the table.
+
+@dataclass
+class ConceptInfo:
+    """Structured payload for ``pack info`` against a single ``ns/name``.
+
+    ``status`` is ``"installed"`` when the folder is present locally,
+    ``"hf"`` when only the HF hub knows about it. ``recommended_alpha``
+    and ``source`` are populated for the local case only — HF-hub info
+    has neither.
     """
-    if hf and installed_only:
-        hf = False
-
-    if (
-        selector is not None
-        and selector.kind == "name"
-        and selector.namespace is not None
-        and selector.value is not None
-    ):
-        _print_info(selector.namespace, selector.value, hf=hf, json_output=json_output)
-        return
-
-    if selector is None:
-        concepts = _all_local()
-    else:
-        concepts = resolve(selector)
-
-    hf_rows: list[dict[str, Any]] = []
-    if hf:
-        from saklas.io.hf import HFError, search_packs
-        try:
-            from huggingface_hub.errors import HfHubHTTPError
-            _hf_http_err: type[BaseException] = HfHubHTTPError
-        except ImportError:
-            _hf_http_err = type("HfHubHTTPError", (Exception,), {})
-        try:
-            hf_rows = search_packs(selector)
-        except (HFError, _hf_http_err, OSError) as e:
-            msg = f"hf search unavailable: {type(e).__name__}: {e}"
-            if json_output:
-                import json as _json
-                print(_json.dumps({"error": msg, "installed": [_row_from_concept(c) for c in concepts]}))
-                return
-            _print_list(concepts, verbose=verbose)
-            print(f"({msg})")
-            return
-
-    if json_output:
-        import json as _json
-        payload = [_row_from_concept(c) for c in concepts]
-        installed_keys = {(r["namespace"], r["name"]) for r in payload}
-        for row in hf_rows:
-            if (row.get("namespace"), row.get("name")) in installed_keys:
-                continue
-            payload.append({
-                "name": row.get("name"),
-                "namespace": row.get("namespace"),
-                "status": "hf",
-                "recommended_alpha": row.get("recommended_alpha", 0.0),
-                "tags": row.get("tags", []),
-                "description": row.get("description", ""),
-                "tensor_models": row.get("tensor_models", []),
-            })
-        print(_json.dumps(payload, indent=2))
-        return
-
-    _print_list(concepts, verbose=verbose)
-    if hf_rows:
-        _print_hf_rows(hf_rows, verbose=verbose)
+    name: str
+    namespace: str
+    status: str
+    description: str
+    long_description: str
+    tags: list[str]
+    tensor_models: list[str]
+    recommended_alpha: Optional[float] = None
+    source: Optional[str] = None
 
 
-def _row_from_concept(c: ResolvedConcept) -> dict[str, Any]:
+@dataclass
+class PackListResult:
+    """Result of ``list_concepts`` — installed rows + optional HF rows.
+
+    ``error`` carries an HF-search failure message when the local listing
+    succeeded but the HF query did not; the CLI surface renders the
+    installed rows and appends the error as a parenthetical.
+    """
+    installed: list[ConceptRow]
+    hf_rows: list[HfRow]
+    error: Optional[str] = None
+
+
+def _row_from_concept(c: ResolvedConcept) -> ConceptRow:
     from saklas.io.packs import ConceptFolder
     tensor_models: list[str] = []
     status = "installed"
@@ -635,100 +584,128 @@ def _row_from_concept(c: ResolvedConcept) -> dict[str, Any]:
     except Exception as e:
         status = "corrupt"
         error = f"{type(e).__name__}: {e}"
-    row = {
-        "name": c.name,
-        "namespace": c.namespace,
-        "status": status,
-        "recommended_alpha": c.metadata.recommended_alpha,
-        "tags": list(c.metadata.tags),
-        "description": c.metadata.description,
-        "source": c.metadata.source,
-        "tensor_models": tensor_models,
-    }
-    if error is not None:
-        row["error"] = error
-    return row
+    return ConceptRow(
+        name=c.name,
+        namespace=c.namespace,
+        status=status,
+        recommended_alpha=c.metadata.recommended_alpha,
+        tags=list(c.metadata.tags),
+        description=c.metadata.description,
+        source=c.metadata.source,
+        tensor_models=tensor_models,
+        error=error,
+    )
 
 
-def _print_list(concepts: list[ResolvedConcept], *, verbose: bool = False) -> None:
-    if verbose:
-        print(f"{'NAME':<24} {'NS':<12} {'STATUS':<13} {'ALPHA':<6} {'TAGS':<24} DESCRIPTION")
+def _hf_row_from_dict(row: dict[str, Any]) -> HfRow:
+    return HfRow(
+        name=row.get("name", ""),
+        namespace=row.get("namespace", ""),
+        recommended_alpha=row.get("recommended_alpha", 0.0),
+        tags=list(row.get("tags", [])),
+        description=row.get("description", ""),
+        tensor_models=list(row.get("tensor_models", [])),
+    )
+
+
+def _all_local() -> list[ResolvedConcept]:
+    return resolve(Selector(kind="all", value=None))
+
+
+def list_concepts(
+    selector: Optional[Selector],
+    *,
+    hf: bool = True,
+) -> PackListResult:
+    """Return concepts matching the selector as a structured result.
+
+    ``hf=True`` queries the HF hub and merges results with local installs;
+    failures land in ``PackListResult.error`` rather than raising. The
+    caller (CLI / programmatic) decides how to present the result.
+    """
+    if selector is None:
+        concepts = _all_local()
     else:
-        print(f"{'NAME':<24} {'NS':<12} {'STATUS':<13} {'ALPHA':<6} TAGS")
-    for c in concepts:
-        r = _row_from_concept(c)
-        tags = ",".join(r["tags"])
-        tag = "[corrupt]    " if r["status"] == "corrupt" else "[installed]  "
-        line = (
-            f"{c.name:<24} {c.namespace:<12} {tag} "
-            f"{c.metadata.recommended_alpha:<6.2f} {tags}"
+        concepts = resolve(selector)
+    installed_rows = [_row_from_concept(c) for c in concepts]
+
+    if not hf:
+        return PackListResult(installed=installed_rows, hf_rows=[], error=None)
+
+    from saklas.io.hf import HFError, search_packs
+    try:
+        from huggingface_hub.errors import HfHubHTTPError
+        _hf_http_err: type[BaseException] = HfHubHTTPError
+    except ImportError:
+        _hf_http_err = type("HfHubHTTPError", (Exception,), {})
+    try:
+        raw_hf_rows = search_packs(selector)
+    except (HFError, _hf_http_err, OSError) as e:
+        return PackListResult(
+            installed=installed_rows,
+            hf_rows=[],
+            error=f"hf search unavailable: {type(e).__name__}: {e}",
         )
-        if verbose:
-            line = (
-                f"{c.name:<24} {c.namespace:<12} {tag} "
-                f"{c.metadata.recommended_alpha:<6.2f} {tags:<24} {c.metadata.description}"
-            )
-        print(line)
-        if r.get("error"):
-            print(f"  ! {r['error']}")
+    return PackListResult(
+        installed=installed_rows,
+        hf_rows=[_hf_row_from_dict(r) for r in raw_hf_rows],
+        error=None,
+    )
 
 
-def _print_info(namespace: str, name: str, *, hf: bool, json_output: bool = False) -> None:
+def pack_info(
+    namespace: str,
+    name: str,
+    *,
+    hf: bool = True,
+) -> Optional[ConceptInfo]:
+    """Return the info payload for ``ns/name`` as a structured result.
+
+    Local first; falls back to HF when ``hf=True`` and the folder is
+    absent. Returns ``None`` when neither source has the concept.
+    """
     folder = concept_dir(namespace, name)
     if folder.exists():
         from saklas.io.packs import ConceptFolder
         cf = ConceptFolder.load(folder)
-        if json_output:
-            import json as _json
-            print(_json.dumps({
-                "name": name, "namespace": namespace, "status": "installed",
-                "description": cf.metadata.description,
-                "long_description": cf.metadata.long_description,
-                "tags": list(cf.metadata.tags),
-                "recommended_alpha": cf.metadata.recommended_alpha,
-                "source": cf.metadata.source,
-                "tensor_models": cf.tensor_models(),
-            }, indent=2))
-            return
-        print(f"{namespace}/{name} [installed]")
-        print(f"  description: {cf.metadata.description}")
-        if cf.metadata.long_description:
-            print(f"  long:        {cf.metadata.long_description}")
-        print(f"  tags:        {', '.join(cf.metadata.tags) or '(none)'}")
-        print(f"  alpha:       {cf.metadata.recommended_alpha}")
-        print(f"  source:      {cf.metadata.source}")
-        print(f"  tensors:     {', '.join(cf.tensor_models()) or '(none)'}")
-        return
-    if hf:
-        from saklas.io.hf import fetch_info
-        info = fetch_info(f"{namespace}/{name}")
-        if json_output:
-            import json as _json
-            print(_json.dumps({
-                "name": name, "namespace": namespace, "status": "hf",
-                "description": info.get("description", ""),
-                "tags": info.get("tags", []),
-                "tensor_models": info.get("tensor_models", []),
-            }, indent=2))
-            return
-        print(f"{namespace}/{name} [hf]")
-        print(f"  description: {info.get('description', '')}")
-        print(f"  tags:        {', '.join(info.get('tags', []))}")
-        print(f"  tensors:     {', '.join(info.get('tensor_models', []))}")
-        return
-    print(f"not found: {namespace}/{name}")
-
-
-def _print_hf_rows(rows: list[dict[str, Any]], *, verbose: bool = False) -> None:
-    for row in rows:
-        line = (
-            f"{row['name']:<24} {row['namespace']:<12} [hf]          "
-            f"{row.get('recommended_alpha', 0.0):<6.2f} {','.join(row.get('tags', []))}"
+        return ConceptInfo(
+            name=name,
+            namespace=namespace,
+            status="installed",
+            description=cf.metadata.description,
+            long_description=cf.metadata.long_description,
+            tags=list(cf.metadata.tags),
+            tensor_models=cf.tensor_models(),
+            recommended_alpha=cf.metadata.recommended_alpha,
+            source=cf.metadata.source,
         )
-        if verbose:
-            line = (
-                f"{row['name']:<24} {row['namespace']:<12} [hf]          "
-                f"{row.get('recommended_alpha', 0.0):<6.2f} "
-                f"{','.join(row.get('tags', [])):<24} {row.get('description', '')}"
-            )
-        print(line)
+    if not hf:
+        return None
+    from saklas.io.hf import fetch_info
+    info = fetch_info(f"{namespace}/{name}")
+    if not info:
+        return None
+    return ConceptInfo(
+        name=name,
+        namespace=namespace,
+        status="hf",
+        description=info.get("description", ""),
+        long_description="",
+        tags=list(info.get("tags", [])),
+        tensor_models=list(info.get("tensor_models", [])),
+        recommended_alpha=None,
+        source=None,
+    )
+
+
+def search_remote_packs(query: str) -> list[HfRow]:
+    """Search HF hub for saklas-pack model repos matching ``query``.
+
+    Returns a list of ``HfRow``; the CLI layer formats / prints them.
+    Raises ``ImportError`` (HF deps missing) or any other exception
+    raised by the HF backend — callers translate to user-visible text.
+    """
+    from saklas.io.hf import search_packs
+    sel = Selector(kind="name", value=query, namespace=None) if query else None
+    raw = search_packs(sel)
+    return [_hf_row_from_dict(r) for r in raw]

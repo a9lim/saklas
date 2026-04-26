@@ -19,7 +19,7 @@ from textual.widgets import Input
 from textual.timer import Timer
 
 from saklas import SamplingConfig, Steering
-from saklas.cli.selectors import AmbiguousSelectorError, resolve_pole
+from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking
 from saklas.io.paths import saklas_home

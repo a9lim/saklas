@@ -120,7 +120,7 @@ def _setup_steering_vectors(
     :class:`Steering` with every atom pre-warmed in ``session._profiles``.
     Returns ``None`` when ``expression`` is empty / falsy.
     """
-    from saklas.cli.selectors import resolve_pole, AmbiguousSelectorError
+    from saklas.io.selectors import resolve_pole, AmbiguousSelectorError
     from saklas.core.steering_expr import (
         parse_expr, referenced_selectors,
     )
@@ -286,7 +286,7 @@ def _run_install(args: argparse.Namespace) -> None:
 
 def _run_refresh(args: argparse.Namespace) -> None:
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse
+    from saklas.io.selectors import parse as sel_parse
 
     if args.selector == "neutrals":
         if args.model is not None:
@@ -302,7 +302,7 @@ def _run_refresh(args: argparse.Namespace) -> None:
 
 def _run_clear(args: argparse.Namespace) -> None:
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse
+    from saklas.io.selectors import parse as sel_parse
 
     selector = sel_parse(args.selector)
     if selector.kind in {"all", "namespace"} and not args.yes:
@@ -317,7 +317,7 @@ def _run_clear(args: argparse.Namespace) -> None:
 
 def _run_rm(args: argparse.Namespace) -> None:
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse
+    from saklas.io.selectors import parse as sel_parse
 
     selector = sel_parse(args.selector)
     try:
@@ -329,11 +329,11 @@ def _run_rm(args: argparse.Namespace) -> None:
 
 
 def _run_ls(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse
+    from saklas.cli.output import render_local_pack_list
+    from saklas.io.selectors import parse as sel_parse
 
     selector = sel_parse(args.selector) if args.selector else None
-    cache_ops.list_local_packs(
+    render_local_pack_list(
         selector,
         json_output=args.json_output,
         verbose=args.verbose,
@@ -341,8 +341,8 @@ def _run_ls(args: argparse.Namespace) -> None:
 
 
 def _run_search(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    cache_ops.search_remote_packs(
+    from saklas.cli.output import render_remote_search
+    render_remote_search(
         args.query,
         json_output=args.json_output,
         verbose=args.verbose,
@@ -354,7 +354,7 @@ def _run_export(args: argparse.Namespace) -> None:
         print(f"Unknown export format: {args.format}", file=sys.stderr)
         sys.exit(2)
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse
+    from saklas.io.selectors import parse as sel_parse
     selector = sel_parse(args.selector)
     written = cache_ops.export_gguf(
         selector,
@@ -377,7 +377,7 @@ def _run_merge(args: argparse.Namespace) -> None:
 
 def _run_push(args: argparse.Namespace) -> None:
     from saklas.io import cache_ops
-    from saklas.cli.selectors import parse as sel_parse
+    from saklas.io.selectors import parse as sel_parse
 
     selector = sel_parse(args.selector)
     try:
@@ -417,7 +417,7 @@ def _run_clone(args: argparse.Namespace) -> None:
     from saklas.io.cloning import (
         CorpusTooShortError, CorpusTooLongError, InsufficientPairsError,
     )
-    from saklas.cli.selectors import _all_concepts
+    from saklas.io.selectors import _all_concepts
 
     for c in _all_concepts():
         if c.name == args.name and c.namespace != "local":
@@ -472,7 +472,7 @@ def _run_extract(args: argparse.Namespace) -> None:
 
     import pathlib
     from saklas.io.paths import tensor_filename
-    from saklas.cli.selectors import _all_concepts
+    from saklas.io.selectors import _all_concepts
     candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
     candidate_folders.append(session._local_concept_folder(canonical))
     requested_release = getattr(args, "sae", None)
@@ -578,7 +578,7 @@ def _run_config_validate(args: argparse.Namespace) -> None:
             print(f"{p}: ok")
             return
         # Dry-run: don't install, just check resolvability.
-        from saklas.cli.selectors import _all_concepts
+        from saklas.io.selectors import _all_concepts
         installed = {(c.namespace, c.name) for c in _all_concepts()}
         installed_names = {c.name for c in _all_concepts()}
         missing: list[str] = []
@@ -694,7 +694,7 @@ def _resolve_variant_tensor(
 
 def _run_compare(args: argparse.Namespace) -> None:
     import json as _json
-    from saklas.cli.selectors import parse as sel_parse, resolve
+    from saklas.io.selectors import parse as sel_parse, resolve
     from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
     from saklas.io.paths import vectors_dir
     from saklas.core.profile import Profile, ProfileError
@@ -879,7 +879,7 @@ def _run_compare(args: argparse.Namespace) -> None:
 
 def _run_why(args: argparse.Namespace) -> None:
     import json as _json
-    from saklas.cli.selectors import parse as sel_parse, resolve
+    from saklas.io.selectors import parse as sel_parse, resolve
     from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
     from saklas.core.profile import Profile, ProfileError
 

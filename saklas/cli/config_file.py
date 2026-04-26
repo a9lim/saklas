@@ -178,7 +178,7 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
     missing: list[str] = []
     for ns, concept, _variant in referenced_selectors(config.vectors):
         if ns is None:
-            from saklas.cli.selectors import _all_concepts
+            from saklas.io.selectors import _all_concepts
             slug = concept.split(".")[0] if "." in concept else concept
             matches = [
                 c for c in _all_concepts()

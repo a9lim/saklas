@@ -302,7 +302,7 @@ class SaklasSession:
         # the invariant intact regardless of probe-loading config; the call
         # is cheap when up-to-date (pack.json format-version short-circuit).
         from saklas.io.packs import materialize_bundled as _materialize_bundled
-        from saklas.cli import selectors as _selectors
+        from saklas.io import selectors as _selectors
         _materialize_bundled()
         _selectors.invalidate()
 
@@ -908,7 +908,7 @@ class SaklasSession:
         # String source — full pipeline. Pack lookup scans installed
         # namespaces, but bare names must not silently pick the first duplicate.
         # If the caller supplies namespace=, honor only that namespace.
-        from saklas.cli.selectors import _all_concepts, AmbiguousSelectorError
+        from saklas.io.selectors import _all_concepts, AmbiguousSelectorError
         matches = [
             c for c in _all_concepts()
             if c.name == canonical and (namespace is None or c.namespace == namespace)
@@ -1127,7 +1127,7 @@ class SaklasSession:
         pre-built :class:`Steering`.  Dict inputs are not accepted; build
         :class:`Steering` directly if you need typed construction.
 
-        Pole aliases (``cli.selectors.resolve_pole``) resolve at parse
+        Pole aliases (``io.selectors.resolve_pole``) resolve at parse
         time; this is the canonical resolver site — CLI, server, and
         TUI all route through here.  Nesting flattens: an inner
         ``steering("0.5 angry.calm")`` overrides the outer
@@ -1245,7 +1245,7 @@ class SaklasSession:
         Names already in ``self._profiles`` pass through verbatim — a caller
         who pre-registered under a specific key stays addressed by that key.
         """
-        from saklas.cli.selectors import resolve_pole
+        from saklas.io.selectors import resolve_pole
 
         out: dict[str, tuple[float, Trigger]] = {}
         for name, (alpha, trig) in entries.items():
@@ -1292,7 +1292,7 @@ class SaklasSession:
         Registered key in ``_profiles`` is ``canonical`` for raw, and
         ``f"{canonical}:{variant}"`` otherwise.
         """
-        from saklas.cli.selectors import _all_concepts
+        from saklas.io.selectors import _all_concepts
         from saklas.io.packs import enumerate_variants
         from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
         from saklas.core.vectors import load_profile
@@ -2003,7 +2003,7 @@ class SaklasSession:
             input: prompt string or list of message dicts.
             steering: expression string (e.g. ``"0.5 honest + 0.3 warm"``)
                 or a pre-built :class:`Steering`.  Pole aliases resolve at
-                parse time via ``cli.selectors.resolve_pole``.  ``None`` =
+                parse time via ``io.selectors.resolve_pole``.  ``None`` =
                 no steering.
             sampling: per-call ``SamplingConfig``.  ``None`` fields fall
                 through to the session's ``GenerationConfig`` defaults.

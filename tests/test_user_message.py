@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from saklas.cli.config_file import ConfigFileError
-from saklas.cli.selectors import AmbiguousSelectorError, SelectorError
+from saklas.io.selectors import AmbiguousSelectorError, SelectorError
 from saklas.core.errors import (
     AmbiguousVariantError,
     SaeBackendImportError,
@@ -69,7 +69,7 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (ProfileError, 400),
     # core/steering_expr.py
     (SteeringExprError, 400),
-    # cli/selectors.py
+    # io/selectors.py
     (SelectorError, 400),
     (AmbiguousSelectorError, 400),
     # cli/config_file.py

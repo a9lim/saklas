@@ -506,7 +506,7 @@ def test_steer_expression_parses_sae_variant(monkeypatch, tmp_path):
     """``/steer 0.3 myvec:sae`` parses through the shared grammar; the
     variant is preserved on the alphas key."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.cli import selectors as _sel
+    from saklas.io import selectors as _sel
     _sel.invalidate()
     from saklas.core.steering_expr import parse_expr
     s = parse_expr("0.3 myvec:sae")
@@ -518,7 +518,7 @@ def test_steer_expression_hyphenated_concept(monkeypatch, tmp_path):
     resolver's slug step collapses ``-`` to ``_`` so the final key uses
     underscores."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.cli import selectors as _sel
+    from saklas.io import selectors as _sel
     _sel.invalidate()
     from saklas.core.steering_expr import parse_expr
     s = parse_expr("0.3 high-context")
@@ -528,7 +528,7 @@ def test_steer_expression_hyphenated_concept(monkeypatch, tmp_path):
 def test_steer_expression_release_suffix(monkeypatch, tmp_path):
     """Explicit release rides on the ``:sae-<release>`` suffix."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.cli import selectors as _sel
+    from saklas.io import selectors as _sel
     _sel.invalidate()
     from saklas.core.steering_expr import parse_expr
     s = parse_expr("0.3 myvec:sae-gemma-scope-2b-pt-res-canonical")
@@ -546,7 +546,7 @@ def test_handle_extract_trusts_canonical_from_session(monkeypatch, tmp_path):
     """
     import torch
     from saklas.core.profile import Profile
-    from saklas.cli import selectors as _sel
+    from saklas.io import selectors as _sel
     # Isolate from user's real pack tree so pole alias resolution is a
     # no-op on the fabricated name.
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -587,7 +587,7 @@ def test_handle_extract_raw_variant_passes_canonical_through(monkeypatch, tmp_pa
     """Raw (no SAE) path: ``session.extract`` returns the bare canonical."""
     import torch
     from saklas.core.profile import Profile
-    from saklas.cli import selectors as _sel
+    from saklas.io import selectors as _sel
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _sel.invalidate()
 
@@ -619,7 +619,7 @@ def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch, tmp_path):
     """
     import torch
     from saklas.core.profile import Profile
-    from saklas.cli import selectors as _sel
+    from saklas.io import selectors as _sel
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _sel.invalidate()
 
@@ -655,7 +655,7 @@ def test_handle_extract_bare_sae_uses_autoload(monkeypatch, tmp_path):
     picks the unique SAE tensor already on disk.
     """
     import torch
-    from saklas.cli import selectors as _sel
+    from saklas.io import selectors as _sel
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _sel.invalidate()
 

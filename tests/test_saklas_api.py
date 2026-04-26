@@ -616,7 +616,7 @@ def test_autoload_picks_sae_variant(tmp_path, monkeypatch):
     }))
 
     from saklas.core import session as S
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -662,7 +662,7 @@ def test_autoload_picks_sae_with_explicit_release(tmp_path, monkeypatch):
     }))
 
     from saklas.core import session as S
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -701,7 +701,7 @@ def test_autoload_raises_ambiguous_when_multiple_sae_variants(tmp_path, monkeypa
 
     from saklas.core import session as S
     from saklas.core.errors import AmbiguousVariantError
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -737,7 +737,7 @@ def test_autoload_raises_unknown_when_variant_missing(tmp_path, monkeypatch):
 
     from saklas.core import session as S
     from saklas.core.errors import UnknownVariantError
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -755,7 +755,7 @@ def test_autoload_raw_default_is_silent_on_miss(tmp_path, monkeypatch):
     """variant='raw' stays silent when no tensor exists — matches pre-Task-7 behavior."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.core import session as S
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     class StubSession:
@@ -790,7 +790,7 @@ def test_steering_resolves_sae_variant_key(tmp_path, monkeypatch):
         "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     from saklas.core.triggers import Trigger
@@ -833,7 +833,7 @@ def test_steering_variant_with_pole_sign_flip(tmp_path, monkeypatch):
         "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     from saklas.core.triggers import Trigger
     from saklas.core import session as S
@@ -879,7 +879,7 @@ def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
         "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     from saklas.core.triggers import Trigger
     from saklas.core import session as S
@@ -947,7 +947,7 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     # SaklasSession.extract reaches for: _model, _tokenizer, _layers, _device,
     # model_id, _local_concept_folder, _update_local_pack_files, events, and
     # the caching helpers. Use the actual SaklasSession method bound to a stub.
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
 
     from saklas.core.events import EventBus
@@ -1027,7 +1027,7 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
         {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
     ]))
 
-    from saklas.cli.selectors import invalidate
+    from saklas.io.selectors import invalidate
     invalidate()
     from saklas.core.events import EventBus
 
