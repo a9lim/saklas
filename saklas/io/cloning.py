@@ -50,13 +50,22 @@ _NUMBERED_RE = re.compile(r"^\s*(\d+)[.)]\s*(.*?)\s*$")
 class CorpusTooShortError(ValueError, SaklasError):
     """Corpus has fewer than the minimum number of usable lines."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 class CorpusTooLongError(ValueError, SaklasError):
     """A batch prompt plus its generation budget does not fit in context."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 class InsufficientPairsError(RuntimeError, SaklasError):
     """Too few pairs survived generation/parsing to extract a stable vector."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (422, str(self) or self.__class__.__name__)
 
 
 # ---------------------------------------------------------------------------

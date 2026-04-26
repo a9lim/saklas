@@ -23,7 +23,8 @@ _KNOWN_KEYS = {
 
 
 class ConfigFileError(ValueError, SaklasError):
-    pass
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
 
 
 @dataclass

@@ -25,7 +25,8 @@ from saklas.io.packs import (
 
 
 class HFError(RuntimeError, SaklasError):
-    pass
+    def user_message(self) -> tuple[int, str]:
+        return (502, str(self) or self.__class__.__name__)
 
 
 _HF_SEARCH_CAP = 20

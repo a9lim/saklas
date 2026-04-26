@@ -26,9 +26,21 @@ _VARIANT_REGEX = _re.compile(r"^(raw|sae(?:-[a-z0-9._-]+)?)$")
 class SelectorError(ValueError, SaklasError):
     """Raised when a selector string cannot be parsed."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 class AmbiguousSelectorError(SelectorError):
     """Raised when a bare name matches multiple namespaces."""
+
+    def user_message(self) -> tuple[int, str]:
+        msg = str(self) or self.__class__.__name__
+        # Suffix the canonical disambiguation tip — keeps the original
+        # message (which already lists the colliding namespaces) but
+        # nudges the user toward the fix.
+        if "namespace/name" not in msg:
+            msg = f"{msg} (disambiguate with namespace/name)"
+        return (400, msg)
 
 
 @dataclass

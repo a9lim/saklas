@@ -16,11 +16,13 @@ from saklas.io.paths import concept_dir, neutral_statements_path, safe_model_id,
 
 
 class InstallConflict(RuntimeError, SaklasError):
-    pass
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or self.__class__.__name__)
 
 
 class RefreshError(RuntimeError, SaklasError):
-    pass
+    def user_message(self) -> tuple[int, str]:
+        return (500, str(self) or self.__class__.__name__)
 
 
 def _variant_matches_key(key: str, filter_: str) -> bool:

@@ -44,6 +44,9 @@ _TENSOR_PREFIX = "direction."
 class GGUFNotInstalled(ImportError, SaklasError):
     """Raised when the optional ``gguf`` package is not available."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 def _import_gguf():
     try:

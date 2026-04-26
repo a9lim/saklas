@@ -20,6 +20,7 @@ from textual.timer import Timer
 
 from saklas import SamplingConfig, Steering
 from saklas.cli.selectors import AmbiguousSelectorError, resolve_pole
+from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking
 from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_defaults
@@ -547,7 +548,7 @@ class SaklasApp(App):
                 if explicit_variant != "raw":
                     variant = explicit_variant
             except AmbiguousSelectorError as e:
-                chat.add_system_message(f"Error: {e}")
+                chat.add_system_message(f"Error: {e.user_message()[1]}")
                 return
             if alpha is not None:
                 alpha *= sign
@@ -598,6 +599,8 @@ class SaklasApp(App):
                 # ``/alpha`` / ``/unsteer`` / pole lookup.
                 canonical, profile = self._session.extract(concept, **extract_kwargs)
                 on_success(canonical, profile, alpha)
+            except SaklasError as e:
+                self.call_from_thread(self._steer_status, e.user_message()[1])
             except ValueError as e:
                 self.call_from_thread(self._steer_status, str(e))
             except Exception as e:
@@ -636,7 +639,7 @@ class SaklasApp(App):
         try:
             steering = parse_expr(text)
         except SteeringExprError as e:
-            chat.add_system_message(f"Steering expression error: {e}")
+            chat.add_system_message(f"Steering expression error: {e.user_message()[1]}")
             return
 
         # Iterate the parsed IR; for each term dispatch through the
@@ -834,7 +837,8 @@ class SaklasApp(App):
                 # session and push to the widget for highlight.
                 self._ui_token_queue.put(("finalize", widget))
             except BaseException as e:
-                self._ui_token_queue.put(("error", str(e)))
+                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+                self._ui_token_queue.put(("error", msg))
             finally:
                 if self._session._device.type == "mps":
                     try:
@@ -1472,7 +1476,7 @@ class SaklasApp(App):
                 )
                 self.call_from_thread(self._show_ab_result, result.text)
             except Exception as e:
-                err = str(e)
+                err = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self.call_from_thread(
                     lambda: (setattr(self, '_ab_in_progress', False),
                              self._chat_panel.add_system_message(f"A/B error: {err}"))

@@ -3,15 +3,38 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, TypeVar
 
 from saklas.cli.parsers import _PACK_VERBS, _VECTOR_VERBS
+from saklas.core.errors import SaklasError
 
 if TYPE_CHECKING:
     from saklas.core.steering import Steering
+
+
+_R = TypeVar("_R")
+
+
+def _saklas_error_exit(fn: Callable[..., _R]) -> Callable[..., _R]:
+    """Translate any ``SaklasError`` escaping a runner to a stderr line + exit.
+
+    Maps the exception's HTTP-style status (from ``user_message()``) to a
+    process exit code via ``min(2, code // 100)``: 4xx/5xx land on exit 2,
+    nothing softer. The TUI is excluded — it owns its own surface.
+    """
+    @functools.wraps(fn)
+    def _wrapper(*args: object, **kwargs: object) -> _R:
+        try:
+            return fn(*args, **kwargs)
+        except SaklasError as e:
+            code, msg = e.user_message()
+            print(msg, file=sys.stderr)
+            sys.exit(min(2, code // 100))
+    return _wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +186,7 @@ def _warmup_session(session) -> None:
 # Top-level runners
 # ---------------------------------------------------------------------------
 
+@_saklas_error_exit
 def _run_tui(args: argparse.Namespace) -> None:
     _load_effective_config(args)
     if not args.model:
@@ -185,6 +209,7 @@ def _run_tui(args: argparse.Namespace) -> None:
     app.run()
 
 
+@_saklas_error_exit
 def _run_serve(args: argparse.Namespace) -> None:
     try:
         import fastapi  # noqa: F401
@@ -231,6 +256,7 @@ def _run_serve(args: argparse.Namespace) -> None:
 
 # --- pack runners --------------------------------------------------------
 
+@_saklas_error_exit
 def _run_pack(args: argparse.Namespace) -> None:
     pack_cmd = getattr(args, "pack_cmd", None)
     if pack_cmd is None:
@@ -513,6 +539,7 @@ _PACK_RUNNERS = {
 
 # --- config runners ------------------------------------------------------
 
+@_saklas_error_exit
 def _run_config(args: argparse.Namespace) -> None:
     cmd = getattr(args, "config_cmd", None)
     if cmd == "show":
@@ -944,6 +971,7 @@ _VECTOR_RUNNERS = {
 }
 
 
+@_saklas_error_exit
 def _run_vector(args: argparse.Namespace) -> None:
     vector_cmd = getattr(args, "vector_cmd", None)
     if vector_cmd is None:

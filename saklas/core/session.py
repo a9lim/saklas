@@ -127,12 +127,19 @@ def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
     """Raised when a generation call is made while another is in progress."""
-    pass
+
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or self.__class__.__name__)
 
 
 class VectorNotRegisteredError(KeyError, SaklasError):
     """Raised when a steering call references a vector not in the registry."""
-    pass
+
+    def user_message(self) -> tuple[int, str]:
+        # KeyError str-formats the message as repr; reach into args
+        # so the user sees the original text.
+        msg = self.args[0] if self.args else self.__class__.__name__
+        return (404, str(msg))
 
 
 # Internal steering-stack entry shape: additive entries are

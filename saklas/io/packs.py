@@ -38,6 +38,9 @@ PACK_FORMAT_VERSION = 2
 class PackFormatError(ValueError, SaklasError):
     """Raised when a pack folder or pack.json is malformed."""
 
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
 
 @dataclass
 class PackMetadata:
