@@ -286,6 +286,19 @@ class SaklasSession:
         self._trait_queues: list[tuple] = []
         self._trait_lock = threading.Lock()
 
+        # Ensure bundled concepts are materialized in the user cache and
+        # the selector cache reflects them.  ``bootstrap_probes`` does this
+        # transitively via ``load_defaults``, but is skipped entirely when
+        # ``probes=[]`` — leaving freshly-added bundled concepts (e.g. via
+        # ``regenerate_bundled_statements.py``) invisible to the selector
+        # layer for the rest of the session.  Calling explicitly here keeps
+        # the invariant intact regardless of probe-loading config; the call
+        # is cheap when up-to-date (pack.json format-version short-circuit).
+        from saklas.io.packs import materialize_bundled as _materialize_bundled
+        from saklas.cli import selectors as _selectors
+        _materialize_bundled()
+        _selectors.invalidate()
+
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
 

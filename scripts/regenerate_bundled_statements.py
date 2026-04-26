@@ -50,10 +50,12 @@ BIPOLAR: dict[str, tuple[str, str, str]] = {
     # affect
     "angry.calm":               ("angry", "calm", "affect"),
     "happy.sad":                ("happy", "sad", "affect"),
+    "fearful.unflinching":      ("fearful", "unflinching", "affect"),
     # epistemic
     "confident.uncertain":      ("confident", "uncertain", "epistemic"),
     "honest.deceptive":         ("honest", "deceptive", "epistemic"),
     "hallucinating.grounded":   ("hallucinating", "factually grounded", "epistemic"),
+    "curious.disinterested":    ("curious", "disinterested", "epistemic"),
     # alignment
     "refusal.compliant":        ("refusal", "compliant", "alignment"),
     "sycophantic.blunt":        ("sycophantic", "blunt", "alignment"),
@@ -72,6 +74,7 @@ BIPOLAR: dict[str, tuple[str, str, str]] = {
     "masculine.feminine":       ("masculine", "feminine", "cultural"),
     "religious.secular":        ("religious", "secular", "cultural"),
     "traditional.progressive":  ("traditional", "progressive", "cultural"),
+    "individualist.collectivist": ("individualist", "collectivist", "cultural"),
 }
 
 # name -> category

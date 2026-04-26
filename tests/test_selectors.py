@@ -368,3 +368,43 @@ def test_parse_rejects_unknown_variant():
     from saklas.cli.selectors import parse, SelectorError
     with _pt.raises(SelectorError):
         parse("honest:garbage")
+
+
+def test_materialize_then_invalidate_makes_bundled_visible(monkeypatch, tmp_path):
+    """The contract `SaklasSession.__init__` relies on for bundled visibility.
+
+    Regression: when bundled concepts are added (e.g. via
+    `regenerate_bundled_statements.py`) but the user-cache hasn't been
+    refreshed since, `_all_concepts()` doesn't see them — and
+    `session.extract(name)` silently falls through to the local namespace
+    and re-runs scenario+pair generation instead of using the bundled
+    statements. `SaklasSession.__init__` calls `materialize_bundled()` +
+    `selectors.invalidate()` to guarantee bundled visibility per session
+    boot. This test pins that invariant at the helper level so the
+    contract holds even when probes=[] skips probes_bootstrap entirely.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    sel.invalidate()
+
+    # Prime the cache with an empty walk — bundled not visible yet.
+    user_default = tmp_path / "vectors" / "default"
+    assert not user_default.exists()
+    initial = sel._all_concepts()
+    assert all(c.namespace != "default" for c in initial)
+
+    bundled = set(packs.bundled_concept_names())
+    assert bundled, "test prereq: shipped saklas.data.vectors must be non-empty"
+
+    # The session-init contract: materialize, then invalidate the cache.
+    packs.materialize_bundled()
+    sel.invalidate()
+
+    # Bundled concepts are now in user cache and visible to the selector.
+    assert user_default.is_dir()
+    concepts = sel._all_concepts()
+    names = {c.name for c in concepts if c.namespace == "default"}
+    missing = bundled - names
+    assert not missing, (
+        f"_all_concepts() did not surface bundled concepts after "
+        f"materialize+invalidate: {sorted(missing)}"
+    )
