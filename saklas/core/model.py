@@ -394,10 +394,17 @@ def load_model(model_id: str, quantize=None, device="auto"):
 def _get_memory_gb(device: str) -> float:
     if device.startswith("cuda") and torch.cuda.is_available():
         return round(torch.cuda.memory_allocated() / 1024**3, 2)
-    if device.startswith("mps"):
+    if device.startswith("mps") and torch.backends.mps.is_available():
+        # `torch.mps` exists on every torch build but the underlying call
+        # raises RuntimeError ("Cannot execute getCurrentAllocatedMemory()
+        # without MPS backend") when the backend isn't actually present
+        # (e.g. Linux CI with `device='mps'` requested by tests).  Gating
+        # on `is_available()` mirrors the cuda branch and keeps the older
+        # `AttributeError` swallow as a belt-and-suspenders fallback for
+        # very old torch builds.
         try:
             return round(torch.mps.current_allocated_memory() / 1024**3, 2)
-        except AttributeError:
+        except (AttributeError, RuntimeError):
             return 0.0
     return 0.0
 

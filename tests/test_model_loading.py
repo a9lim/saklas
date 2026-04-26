@@ -125,3 +125,19 @@ def test_mla_in_text_config_also_triggers():
     # plain (non-multimodal) deepseek_v2 to confirm.
     kwargs = _captured_load_kwargs(device="mps", model_type="deepseek_v2")
     assert kwargs["attn_implementation"] == "eager"
+
+
+def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch):
+    """``device='mps'`` on a host without an MPS backend (e.g. Linux CI)
+    must not crash.  The CUDA branch already gates on
+    ``torch.cuda.is_available()``; the MPS branch must mirror that — the
+    bare ``torch.mps.current_allocated_memory()`` call raises RuntimeError
+    rather than AttributeError when the backend isn't actually present,
+    so a plain ``except AttributeError`` is insufficient.
+    """
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    # Make the underlying call raise to prove the gate fires before it.
+    def _raise():
+        raise RuntimeError("Cannot execute getCurrentAllocatedMemory() without MPS backend.")
+    monkeypatch.setattr(torch.mps, "current_allocated_memory", _raise)
+    assert model_mod._get_memory_gb("mps") == 0.0
