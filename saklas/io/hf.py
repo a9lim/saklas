@@ -156,7 +156,22 @@ def pull_pack(
     staging = target_folder.with_name(target_folder.name + ".staging")
     backup = target_folder.with_name(target_folder.name + ".bak")
 
-    # Wipe any leftovers from a previous interrupted pull.
+    # Crash-recovery: if a previous pull died after ``target → .bak`` but
+    # before ``staging → target``, the only valid prior install lives in
+    # ``.bak``.  Restore it before starting a new pull — wiping ``.bak``
+    # first would lose the prior install if the new staging itself fails.
+    if not target_folder.exists() and backup.exists():
+        try:
+            backup.rename(target_folder)
+        except OSError:
+            # If the rename fails, leave ``.bak`` in place; the user can
+            # recover manually rather than losing it to a wipe.
+            pass
+
+    # Stale ``.staging`` from a previous interrupted pull is safe to wipe
+    # (it was never promoted).  Stale ``.bak`` past the recovery branch
+    # above came from a completed swap that got interrupted mid-cleanup;
+    # the target is the source of truth and the ``.bak`` is redundant.
     if staging.exists():
         shutil.rmtree(staging)
     if backup.exists():

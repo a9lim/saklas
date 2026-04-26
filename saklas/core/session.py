@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+import os
 import pathlib
 import queue
 import re
@@ -12,7 +13,7 @@ from typing import Callable, Iterator, Literal, overload
 
 import torch
 
-from saklas.core.errors import SaklasError
+from saklas.core.errors import SaklasError, StaleSidecarError
 from saklas.core.events import (
     EventBus,
     GenerationFinished,
@@ -870,20 +871,33 @@ class SaklasSession:
           from scratch.  **Also bypasses the tensor cache** — same
           reasoning as ``scenarios=[...]``.
         """
-        if self._gen_phase is not GenState.IDLE:
+        # Must hold ``_gen_lock`` to read ``_gen_phase`` race-free against
+        # ``_generate_core``, which acquires the lock first then flips
+        # ``_gen_phase = PREAMBLE``.  Without the lock, a concurrent
+        # ``generate()`` could pass ``extract()``'s gate and then race
+        # extraction over model forward passes.  The lock generalizes from
+        # "serialize generations" to "serialize all model uses".
+        if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentExtractionError(
-                "session.extract called while a generation is in flight"
+                "session.extract called while another model use is in flight"
             )
-        return self._extraction.extract(
-            source, baseline,
-            scenarios=scenarios,
-            reuse_scenarios=reuse_scenarios,
-            force_statements=force_statements,
-            on_progress=on_progress,
-            sae=sae,
-            sae_revision=sae_revision,
-            namespace=namespace,
-        )
+        try:
+            if self._gen_phase is not GenState.IDLE:
+                raise ConcurrentExtractionError(
+                    "session.extract called while a generation is in flight"
+                )
+            return self._extraction.extract(
+                source, baseline,
+                scenarios=scenarios,
+                reuse_scenarios=reuse_scenarios,
+                force_statements=force_statements,
+                on_progress=on_progress,
+                sae=sae,
+                sae_revision=sae_revision,
+                namespace=namespace,
+            )
+        finally:
+            self._gen_lock.release()
 
     def clone_from_corpus(
         self,
@@ -1146,6 +1160,27 @@ class SaklasSession:
                 profile_dict, _meta = load_profile(str(path))
             except Exception:
                 continue
+            # Phase 2 contract: tensor must not be stale relative to the
+            # concept's on-disk statements.json.  bootstrap_probes raises
+            # StaleSidecarError on the same condition; autoload would
+            # otherwise be a silent escape hatch for the same mismatch.
+            recorded_sha = _meta.get("statements_sha256") if _meta else None
+            stmts_path = concept.folder / "statements.json"
+            if recorded_sha and stmts_path.exists():
+                from saklas.io.packs import hash_file as _hash_file
+                if (
+                    _hash_file(stmts_path) != recorded_sha
+                    and os.environ.get("SAKLAS_ALLOW_STALE") != "1"
+                ):
+                    raise StaleSidecarError(
+                        f"{concept.namespace}/{canonical}: statements.json has "
+                        f"changed since this tensor was extracted "
+                        f"(model={self.model_id}). The baked PCA no longer "
+                        f"matches the on-disk pairs. Re-extract: "
+                        f"`saklas pack refresh {concept.namespace}/{canonical} "
+                        f"-m {self.model_id}` — or set SAKLAS_ALLOW_STALE=1 "
+                        f"to load the stale tensor anyway."
+                    )
             self._profiles[registry_key] = self._promote_profile(profile_dict)
             return
 
@@ -1752,14 +1787,17 @@ class SaklasSession:
 
             want_hidden = bool(sampling and sampling.return_hidden)
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
-            self._begin_capture(widen=want_hidden)
-            self._monitor.begin_live()
-            # Reset the steering manager's TriggerContext for this generation.
-            # ``generate_steered`` mutates it at lifecycle boundaries; hooks
-            # read it on each forward.
-            self._steering.ctx.reset()
-            self._gen_phase = GenState.RUNNING
             try:
+                # Capture attach + monitor live + ctx.reset live INSIDE the
+                # inner try so a BaseException (KeyboardInterrupt, etc.)
+                # between any pair of these still hits the cleanup finally.
+                # ``_end_capture`` and ``end_live`` are idempotent.
+                self._begin_capture(widen=want_hidden)
+                self._monitor.begin_live()
+                # Reset the steering manager's TriggerContext for this gen;
+                # ``generate_steered`` mutates it at lifecycle boundaries.
+                self._steering.ctx.reset()
+                self._gen_phase = GenState.RUNNING
                 start = time.monotonic()
                 generated_ids = generate_steered(
                     self._model, self._tokenizer, input_ids,
@@ -1803,6 +1841,10 @@ class SaklasSession:
                     pass
             raise
         finally:
+            # Defense-in-depth: even if the inner finally never ran (e.g. a
+            # BaseException between the outer try entry and ``begin_capture``),
+            # any hooks that did get attached must come off.  Idempotent.
+            self._end_capture()
             self._monitor.end_live()
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
