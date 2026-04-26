@@ -168,7 +168,7 @@ This lets you find concepts that are correlated. For example, on Gemma 4 the mod
 
 ### The probe library
 
-There are 24 default probes across 6 categories, containing 45 contrastive pairs generated using the program's pipeline.
+There are 24 default probes across 6 categories. Each probe is built from 45 contrastive pairs generated using the program's pipeline.
 
 | Category | Probes |
 |---|---|
@@ -230,7 +230,7 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | Command | Description |
 |---|---|
 | `/steer <expression>` | Apply a steering expression (grammar: `0.5 honest + 0.3 warm@after`, `0.5 honest:sae`, `0.5 a\|b`, …) |
-| `/alpha <name> <val>` | Adjust an already-registered vector's alpha |
+| `/alpha <val> <name>` | Adjust an already-registered vector's alpha |
 | `/unsteer <name>` | Remove a registered vector |
 | `/probe <name>` | Extract and register a probe vector |
 | `/probe <pos> . <neg>` | Same, bipolar form |
@@ -443,7 +443,7 @@ saklas vector compare <concepts...> -m MODEL [-v] [-j]
 saklas vector why <concept> -m MODEL [-j]
 ```
 
-Merge expressions share the steering grammar. Terms combine with `+` / `-`, coefficients lead each term, and `~` projects one direction's component out of another. For example, `saklas vector merge dehallu "0.8 default/creative.conventional~default/hallucinating.grounded"` gives you creative with hallucination projected out.
+Merge expressions share the steering grammar. Terms combine with `+` or `-`, coefficients lead each term, `~` keeps the component aligned with another direction, and `|` projects another direction's component out. For example, `saklas vector merge dehallu "0.8 default/creative.conventional|default/hallucinating.grounded"` gives you creative with hallucination projected out.
 
 Selectors: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `default`, `all`. Bare names resolve across namespaces and error if ambiguous.
 
