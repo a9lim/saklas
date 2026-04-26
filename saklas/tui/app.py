@@ -316,144 +316,90 @@ class SaklasApp(App):
         self._start_generation(text)
 
     def _handle_command(self, text: str) -> None:
-        chat = self._chat_panel
-        parts = text.split(maxsplit=1)
-        cmd = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
+        from saklas.tui.commands import dispatch
+        dispatch(self, text)
 
-        if cmd == "/steer":
-            if not arg:
-                chat.add_system_message(
-                    "Usage: /steer <expression>\n"
-                    "  e.g. /steer 0.5 honest\n"
-                    "       /steer 0.3 warm@after\n"
-                    "       /steer 0.5 honest:sae\n"
-                    "  For a new bipolar extraction, use /extract <pos> <neg>."
-                )
-                return
-            self._handle_steer(arg)
-        elif cmd == "/alpha":
-            self._handle_alpha(arg)
-        elif cmd == "/unsteer":
-            self._handle_unsteer(arg)
-        elif cmd == "/unprobe":
-            self._handle_unprobe(arg)
-        elif cmd == "/seed":
-            self._handle_seed(arg)
-        elif cmd == "/save":
-            self._handle_save(arg)
-        elif cmd == "/load":
-            self._handle_load(arg)
-        elif cmd == "/export":
-            self._handle_export(arg)
-        elif cmd == "/regen":
-            self.action_regenerate()
-        elif cmd == "/model":
-            self._handle_model_info()
-        elif cmd == "/probe":
-            if not arg:
-                chat.add_system_message(
-                    "Usage: /probe <concept>\n"
-                    "       /probe <pos> . <neg>"
-                )
-                return
-            self._handle_probe(arg)
-        elif cmd == "/extract":
-            if not arg:
-                chat.add_system_message(
-                    "Usage: /extract <concept>\n"
-                    "       /extract <pos> . <neg>"
-                )
-                return
-            self._handle_extract_only(arg)
-        elif cmd == "/clear":
-            if self._session.is_generating:
-                self._pending_action = ("clear",)
-                self._session.stop()
-                return
-            self._do_clear()
-        elif cmd == "/rewind":
-            if self._session.is_generating:
-                self._pending_action = ("rewind",)
-                self._session.stop()
-                return
-            self._do_rewind()
-        elif cmd in ("/system", "/sys"):
-            if not arg:
-                chat.add_system_message(f"System prompt: {self._session.config.system_prompt or '(none)'}")
-            else:
-                self._session.config = replace(self._session.config, system_prompt=arg)
-                chat.add_system_message("System prompt set.")
-                self._refresh_gen_config()
-        elif cmd == "/temp":
-            if not arg:
-                chat.add_system_message(f"Temperature: {self._session.config.temperature}")
-            else:
-                try:
-                    val = max(0.0, float(arg))
-                    self._session.config = replace(self._session.config, temperature=val)
-                    chat.add_system_message(f"Temperature set to {val}")
-                    self._refresh_gen_config()
-                except ValueError:
-                    chat.add_system_message("Invalid temperature value")
-        elif cmd == "/top-p":
-            if not arg:
-                chat.add_system_message(f"Top-p: {self._session.config.top_p}")
-            else:
-                try:
-                    val = max(0.0, min(1.0, float(arg)))
-                    self._session.config = replace(self._session.config, top_p=val)
-                    chat.add_system_message(f"Top-p set to {val}")
-                    self._refresh_gen_config()
-                except ValueError:
-                    chat.add_system_message("Invalid top-p value")
-        elif cmd == "/max":
-            if not arg:
-                chat.add_system_message(f"Max tokens: {self._session.config.max_new_tokens}")
-            else:
-                try:
-                    val = max(1, int(arg))
-                    self._session.config = replace(self._session.config, max_new_tokens=val)
-                    chat.add_system_message(f"Max tokens set to {val}")
-                    self._refresh_gen_config()
-                except ValueError:
-                    chat.add_system_message("Invalid max tokens value")
-        elif cmd in ("/exit", "/quit"):
-            if self._session.is_generating:
-                self._pending_action = ("quit",)
-                self._session.stop()
-                return
-            self.exit()
-        elif cmd == "/compare":
-            self._handle_compare(arg)
-        elif cmd == "/help":
+    # -- /sys, /temp, /top-p, /max, /help (registry-callable shims) --
+
+    def _handle_sys(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
             chat.add_system_message(
-                "Steering:\n"
-                "  /steer <concept> [alpha]    — add (extract if needed)\n"
-                "  /steer <pos> . <neg> [a]    — add bipolar (period delim)\n"
-                "  /alpha <val> <name>         — adjust existing alpha\n"
-                "  /unsteer <name>             — remove vector\n"
-                "Probes:\n"
-                "  /probe <concept>            — add probe (highlight on)\n"
-                "  /unprobe <name>             — remove probe\n"
-                "  /extract <concept>          — cache-warm only\n"
-                "  /compare <a> [b]            — cosine similarity\n"
-                "Session:\n"
-                "  /clear, /rewind, /regen     — history ops\n"
-                "  /save <name>, /load <name>  — snapshot conv + alphas\n"
-                "  /export <path>              — JSONL w/ probe readings\n"
-                "  /seed [n|clear]             — default sampling seed\n"
-                "  /sys [prompt]               — system prompt\n"
-                "  /temp, /top-p, /max         — sampling defaults\n"
-                "  /model                      — model + session info\n"
-                "  /exit, /help\n"
-                "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
-                "Backspace remove · Ctrl+T think · Ctrl+R regen\n"
-                "Ctrl+A A/B compare · Ctrl+S cycle sort · Ctrl+Y highlight\n"
-                "[ ] temp · { } top-p · Esc stop · Ctrl+Q quit"
+                f"System prompt: {self._session.config.system_prompt or '(none)'}"
             )
-        else:
-            chat.add_system_message(f"Unknown command: {cmd}. Type /help for commands.")
+            return
+        self._session.config = replace(self._session.config, system_prompt=arg)
+        chat.add_system_message("System prompt set.")
+        self._refresh_gen_config()
+
+    def _handle_temp(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
+            chat.add_system_message(f"Temperature: {self._session.config.temperature}")
+            return
+        try:
+            val = max(0.0, float(arg))
+        except ValueError:
+            chat.add_system_message("Invalid temperature value")
+            return
+        self._session.config = replace(self._session.config, temperature=val)
+        chat.add_system_message(f"Temperature set to {val}")
+        self._refresh_gen_config()
+
+    def _handle_top_p(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
+            chat.add_system_message(f"Top-p: {self._session.config.top_p}")
+            return
+        try:
+            val = max(0.0, min(1.0, float(arg)))
+        except ValueError:
+            chat.add_system_message("Invalid top-p value")
+            return
+        self._session.config = replace(self._session.config, top_p=val)
+        chat.add_system_message(f"Top-p set to {val}")
+        self._refresh_gen_config()
+
+    def _handle_max(self, arg: str) -> None:
+        chat = self._chat_panel
+        if not arg:
+            chat.add_system_message(f"Max tokens: {self._session.config.max_new_tokens}")
+            return
+        try:
+            val = max(1, int(arg))
+        except ValueError:
+            chat.add_system_message("Invalid max tokens value")
+            return
+        self._session.config = replace(self._session.config, max_new_tokens=val)
+        chat.add_system_message(f"Max tokens set to {val}")
+        self._refresh_gen_config()
+
+    def _handle_help(self, _arg: str) -> None:
+        self._chat_panel.add_system_message(
+            "Steering:\n"
+            "  /steer <concept> [alpha]    — add (extract if needed)\n"
+            "  /steer <pos> . <neg> [a]    — add bipolar (period delim)\n"
+            "  /alpha <val> <name>         — adjust existing alpha\n"
+            "  /unsteer <name>             — remove vector\n"
+            "Probes:\n"
+            "  /probe <concept>            — add probe (highlight on)\n"
+            "  /unprobe <name>             — remove probe\n"
+            "  /extract <concept>          — cache-warm only\n"
+            "  /compare <a> [b]            — cosine similarity\n"
+            "Session:\n"
+            "  /clear, /rewind, /regen     — history ops\n"
+            "  /save <name>, /load <name>  — snapshot conv + alphas\n"
+            "  /export <path>              — JSONL w/ probe readings\n"
+            "  /seed [n|clear]             — default sampling seed\n"
+            "  /sys [prompt]               — system prompt\n"
+            "  /temp, /top-p, /max         — sampling defaults\n"
+            "  /model                      — model + session info\n"
+            "  /exit, /help\n"
+            "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
+            "Backspace remove · Ctrl+T think · Ctrl+R regen\n"
+            "Ctrl+A A/B compare · Ctrl+S cycle sort · Ctrl+Y highlight\n"
+            "[ ] temp · { } top-p · Esc stop · Ctrl+Q quit"
+        )
 
     # -- Vector Management --
 
