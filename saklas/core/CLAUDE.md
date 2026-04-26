@@ -78,7 +78,7 @@ session.generate(input, *, steering=None, sampling=None, stateless=False, raw=Fa
 **`session.steering(value)` context manager** takes `str | Steering`, coerces via `Steering.from_value`, materializes any `ProjectedTerm` entries into derived profiles (`_materialize_projections` + `_ensure_profile_loaded`), and pushes onto a LIFO stack. `_resolve_pole_aliases` is post-materialization — synthetic projection keys already live in `_profiles` and short-circuit the pole resolver. Pole aliasing itself happens in the parser via `io.selectors.resolve_pole`. Nesting flattens with inner-wins semantics; emits `SteeringApplied` / `SteeringCleared`. `_resolve_pole_aliases` keeps its **cache-hit auto-load fast path** (`_try_autoload_vector`) — if a concept name isn't in `_profiles` but has an installed pack with an already-extracted per-model tensor, the tensor is loaded inline so HTTP clients can steer bundled probes without pre-registration. No PCA, no network.
 
 **No persistent steering hooks.** `generate` and `generate_stream` are thin wrappers around `_generate_core`, which owns:
-- `_gen_lock` threading re-entry guard (flips `_gen_active`)
+- `_gen_lock` threading re-entry guard; `_gen_phase: GenState` (typed lifecycle: `IDLE`/`PREAMBLE`/`RUNNING`/`FINALIZING`) — read via `session.gen_state` / `session.is_generating`
 - the steering context
 - `_begin_capture` / `_end_capture`
 - `_finalize_generation`
