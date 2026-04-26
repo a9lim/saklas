@@ -337,8 +337,10 @@ class TestSessionGate:
             ConcurrentExtractionError, GenState, SaklasSession,
         )
 
+        import threading
         session = SaklasSession.__new__(SaklasSession)
         session._gen_phase = GenState.RUNNING
+        session._gen_lock = threading.Lock()
         # _extraction won't be reached — gate fires first.
         session._extraction = SimpleNamespace(extract=lambda *a, **kw: ("x", None))
 

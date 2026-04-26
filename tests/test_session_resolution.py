@@ -51,6 +51,8 @@ def _stub_session(model_id: str) -> SaklasSession:
     session._layers = []
     session._profiles = {}
     session._gen_phase = GenState.IDLE
+    import threading
+    session._gen_lock = threading.Lock()
     # Pipeline normally constructed in __init__; stub skips that, wire one in.
     session._extraction = ExtractionPipeline(session, session, session, session.events)
     return session
