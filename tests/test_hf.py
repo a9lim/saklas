@@ -114,6 +114,53 @@ def test_pull_pack_without_pack_json_and_no_tensors_errors(tmp_path, monkeypatch
     target = tmp_path / "installed" / "nope"
     with pytest.raises(hf.HFError, match="no .safetensors or .gguf"):
         hf.pull_pack("user/nope", target_folder=target, force=False)
+    # Failed install must NOT leave a half-baked target or staging behind.
+    assert not target.exists()
+    assert not target.with_name(target.name + ".staging").exists()
+
+
+def test_pull_pack_failed_synthesis_preserves_existing_install(tmp_path, monkeypatch):
+    """If staging fails after a previous good install exists at the target,
+    the prior install must remain intact — staging-and-swap discipline
+    means the target is never touched until staging verifies."""
+    # First, plant a good install at the target with `force=False`.
+    fake_good = _fake_repo(tmp_path, name="happy")
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(fake_good))
+    target = tmp_path / "installed" / "happy"
+    hf.pull_pack("user/happy", target_folder=target, force=False)
+    assert (target / "pack.json").is_file()
+    good_pack_bytes = (target / "pack.json").read_bytes()
+
+    # Now point the downloader at a broken repo (no pack.json, no tensors).
+    bad = tmp_path / "downloaded" / "broken"
+    bad.mkdir(parents=True)
+    (bad / "random.txt").write_text("garbage")
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(bad))
+
+    with pytest.raises(hf.HFError):
+        hf.pull_pack("user/happy", target_folder=target, force=True)
+
+    # Original install survives.
+    assert (target / "pack.json").is_file()
+    assert (target / "pack.json").read_bytes() == good_pack_bytes
+    # No staging/backup leftovers.
+    assert not target.with_name(target.name + ".staging").exists()
+    assert not target.with_name(target.name + ".bak").exists()
+
+
+def test_pull_pack_cleans_up_stale_staging(tmp_path, monkeypatch):
+    """A leftover ``<target>.staging`` from a previously-interrupted pull
+    must be wiped before a new pull starts; the new pull then succeeds."""
+    fake = _fake_repo(tmp_path)
+    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(fake))
+    target = tmp_path / "installed" / "happy"
+    # Leftover staging from a hypothetical prior crash.
+    stale_staging = target.with_name(target.name + ".staging")
+    stale_staging.mkdir(parents=True)
+    (stale_staging / "leftover.txt").write_text("from a prior crash")
+    hf.pull_pack("user/happy", target_folder=target, force=False)
+    assert (target / "pack.json").is_file()
+    assert not stale_staging.exists()
 
 
 def test_pull_pack_synthesizes_pack_json_from_raw_safetensors(tmp_path, monkeypatch):

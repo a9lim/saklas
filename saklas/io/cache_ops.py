@@ -10,6 +10,7 @@ from saklas.cli.selectors import (
     ResolvedConcept, Selector, invalidate as _invalidate_selector_cache, resolve,
 )
 from saklas.core.errors import SaklasError
+from saklas.io.atomic import write_bytes_atomic
 from saklas.io.packs import PackMetadata, hash_file, verify_integrity
 from saklas.io.paths import concept_dir, neutral_statements_path, safe_model_id, vectors_dir
 
@@ -139,7 +140,7 @@ def install_folder(src: Path, namespace: str, as_: Optional[str], *, force: bool
     dst.mkdir(parents=True, exist_ok=True)
     for entry in src.iterdir():
         if entry.is_file() and entry.name != "pack.json":
-            (dst / entry.name).write_bytes(entry.read_bytes())
+            write_bytes_atomic(dst / entry.name, entry.read_bytes())
 
     src_meta.write(dst)
 
@@ -161,8 +162,7 @@ def _refresh_bundled(target: Path, concept_name: str) -> None:
             entry.unlink()
     for entry in pkg_root.iterdir():
         if entry.is_file():
-            with entry.open("rb") as s, open(target / entry.name, "wb") as d:
-                d.write(s.read())
+            write_bytes_atomic(target / entry.name, entry.read_bytes())
 
 
 def refresh(selector: Selector, *, model_scope: Optional[str] = None) -> int:
@@ -221,8 +221,7 @@ def refresh_neutrals() -> Path:
     dst = neutral_statements_path()
     dst.parent.mkdir(parents=True, exist_ok=True)
     src = _resources.files("saklas.data").joinpath("neutral_statements.json")
-    with src.open("rb") as s, open(dst, "wb") as d:
-        d.write(s.read())
+    write_bytes_atomic(dst, src.read_bytes())
     return dst
 
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from saklas.core.errors import SaklasError
+from saklas.io.atomic import write_bytes_atomic, write_json_atomic
 from saklas.io.packs import (
     NAME_REGEX,
     PackFormatError,
@@ -118,6 +119,15 @@ def pull_pack(
 ) -> Path:
     """Download <coord> from HF and install into target_folder.
 
+    Stage-verify-swap discipline: the entire pack is built under
+    ``<target_folder>.staging/`` first, integrity-verified there, and only
+    then atomically swapped into place. If a previous install exists at
+    ``target_folder``, it's renamed to ``<target_folder>.bak`` between the
+    two atomic renames; on rename failure between those steps the prior
+    install is restored from the .bak. The target_folder is never modified
+    until staging has succeeded — a crash mid-pull never leaves a partial
+    install at the destination.
+
     If the repo contains a ``pack.json``, it's treated as a native saklas
     pack: the manifest's ``files`` map is verified, every listed file is
     copied, and ``source`` is rewritten to the ``hf://`` coord.
@@ -136,16 +146,69 @@ def pull_pack(
     tmp_dir = Path(_download(coord, revision=revision))
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
-    if target_folder.exists():
-        if not force:
-            raise HFError(f"{target_folder} exists; pass force=True to overwrite")
-        shutil.rmtree(target_folder)
-    target_folder.mkdir(parents=True, exist_ok=True)
+    if target_folder.exists() and not force:
+        raise HFError(f"{target_folder} exists; pass force=True to overwrite")
 
-    if (tmp_dir / "pack.json").is_file():
-        _install_native_pack(tmp_dir, target_folder, coord, source)
-    else:
-        _install_synthesized_pack(tmp_dir, target_folder, coord, source)
+    # Sibling staging dir on the same volume — required so the final
+    # rename into place is atomic.
+    staging = target_folder.with_name(target_folder.name + ".staging")
+    backup = target_folder.with_name(target_folder.name + ".bak")
+
+    # Wipe any leftovers from a previous interrupted pull.
+    if staging.exists():
+        shutil.rmtree(staging)
+    if backup.exists():
+        shutil.rmtree(backup)
+
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        if (tmp_dir / "pack.json").is_file():
+            _install_native_pack(tmp_dir, staging, coord, source)
+        else:
+            _install_synthesized_pack(tmp_dir, staging, coord, source)
+
+        # Verify the freshly-built staging dir against its own manifest
+        # before touching target_folder.
+        staged_meta = PackMetadata.load(staging)
+        ok, bad = verify_integrity(staging, staged_meta.files)
+        if not ok:
+            raise HFError(
+                f"{coord}: staging integrity check failed ({bad})"
+            )
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    # Atomic-ish swap: target -> .bak (if exists), staging -> target,
+    # then rmtree .bak. A crash between the two renames leaves a recoverable
+    # state — the .bak is restored below if we fail before the second rename
+    # completes.
+    had_existing = target_folder.exists()
+    if had_existing:
+        try:
+            target_folder.rename(backup)
+        except OSError as e:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise HFError(
+                f"{coord}: could not move existing install aside ({e})"
+            ) from e
+
+    try:
+        staging.rename(target_folder)
+    except OSError as e:
+        # Restore the prior install from .bak if we moved it aside.
+        if had_existing and backup.exists() and not target_folder.exists():
+            try:
+                backup.rename(target_folder)
+            except OSError:
+                pass  # nothing better we can do; .bak still on disk
+        shutil.rmtree(staging, ignore_errors=True)
+        raise HFError(
+            f"{coord}: could not promote staging into place ({e})"
+        ) from e
+
+    if had_existing:
+        shutil.rmtree(backup, ignore_errors=True)
 
     return target_folder
 
@@ -164,7 +227,7 @@ def _install_native_pack(
 
     for entry in tmp_dir.iterdir():
         if entry.is_file() and entry.name != "pack.json":
-            (target_folder / entry.name).write_bytes(entry.read_bytes())
+            write_bytes_atomic(target_folder / entry.name, entry.read_bytes())
 
     meta.source = source
     meta.write(target_folder)
@@ -253,7 +316,7 @@ def _install_synthesized_pack(
 
     # Copy every recognized file into the target folder.
     for entry in candidates:
-        (target_folder / entry.name).write_bytes(entry.read_bytes())
+        write_bytes_atomic(target_folder / entry.name, entry.read_bytes())
 
     # Fabricate minimal sidecars for any safetensors tensors that arrived
     # without one. Gives ConceptFolder something to load from at next open.
@@ -262,14 +325,13 @@ def _install_synthesized_pack(
     if missing_sidecars:
         from saklas import __version__ as _saklas_version
         from saklas.io.packs import PACK_FORMAT_VERSION
-        import json
         for stem in missing_sidecars:
             sc_path = target_folder / f"{stem}.json"
-            sc_path.write_text(json.dumps({
+            write_json_atomic(sc_path, {
                 "format_version": PACK_FORMAT_VERSION,
                 "method": "imported",
                 "saklas_version": _saklas_version,
-            }, indent=2))
+            })
 
     name = _synthesize_pack_name(coord)
     meta = synthesize_pack_metadata(
@@ -466,7 +528,7 @@ def push_pack(
             src = folder / rel
             if not src.exists():
                 raise HFError(f"{folder}: manifest references missing file {rel!r}")
-            (staging / rel).write_bytes(src.read_bytes())
+            write_bytes_atomic(staging / rel, src.read_bytes())
             kept_files[rel] = sha
             if rel.endswith(".safetensors"):
                 stem = rel[: -len(".safetensors")]
@@ -495,11 +557,13 @@ def push_pack(
         )
         staged_meta.write(staging)
 
-        (staging / ".gitattributes").write_text(
-            "*.safetensors filter=lfs diff=lfs merge=lfs -text\n"
+        write_bytes_atomic(
+            staging / ".gitattributes",
+            b"*.safetensors filter=lfs diff=lfs merge=lfs -text\n",
         )
-        (staging / "README.md").write_text(
-            _render_model_card(staged_meta, kept_sidecars, coord)
+        write_bytes_atomic(
+            staging / "README.md",
+            _render_model_card(staged_meta, kept_sidecars, coord).encode("utf-8"),
         )
 
         repo_url = f"https://huggingface.co/{coord}"
