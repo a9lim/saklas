@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "saklas"
 dynamic = ["version"]
-description = "Activation steering and trait monitoring for HuggingFace transformers — Python library, OpenAI-compatible server, and terminal UI"
+description = "Activation steering and trait monitoring for HuggingFace transformers"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{name = "a9lim", email = "mx@a9l.im"}]
