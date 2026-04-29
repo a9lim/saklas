@@ -7,6 +7,15 @@ dist/
 build/
 *.whl
 
+# Web UI build artifact ships in the wheel — committed despite the
+# generic dist/ rule above.  Refresh via `cd webui && npm run build`.
+!saklas/web/dist/
+!saklas/web/dist/**
+
+# Node modules from the webui/ Svelte source.
+webui/node_modules/
+webui/dist/
+
 # Virtual environments
 .venv/
 venv/

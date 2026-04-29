@@ -1,0 +1,223 @@
+/* saklas web UI — analytics dashboard.
+   Hand-written baseline; the webui/ Svelte source builds on top. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #0d1117;
+  color: #e6edf3;
+  font-family: -apple-system, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1.5em;
+  padding: 0.5em 1em;
+  background: #010409;
+  border-bottom: 1px solid #30363d;
+}
+.brand {
+  font-weight: bold;
+  letter-spacing: 0.05em;
+  color: #7ee787;
+}
+#status-bar {
+  color: #8b949e;
+  font-size: 0.9em;
+}
+
+.grid {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 30% 40% 30%;
+  grid-template-rows: 1fr 1fr;
+  gap: 1px;
+  background: #30363d;
+  overflow: hidden;
+}
+.panel {
+  background: #0d1117;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0.5em;
+}
+.chat       { grid-column: 1; grid-row: 1 / span 2; }
+.inspector  { grid-column: 2; grid-row: 1 / span 2; }
+.correlation{ grid-column: 3; grid-row: 1; }
+.layer-norms{ grid-column: 3; grid-row: 2; }
+
+.panel-header {
+  font-size: 0.85em;
+  letter-spacing: 0.1em;
+  color: #7d8590;
+  border-bottom: 1px solid #21262d;
+  padding-bottom: 0.3em;
+  margin-bottom: 0.5em;
+  text-transform: uppercase;
+}
+
+#chat-log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+  padding-right: 0.3em;
+}
+.msg {
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-left: 2px solid #30363d;
+  padding-left: 0.6em;
+}
+.msg.user     { border-color: #58a6ff; color: #c9d1d9; }
+.msg.assistant{ border-color: #7ee787; }
+.msg.system   { border-color: #f85149; color: #ff7b72; font-size: 0.85em; }
+.msg.thinking { color: #8b949e; opacity: 0.75; font-style: italic; }
+
+.chat-input {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0.4em;
+  margin-top: 0.5em;
+}
+.chat-input input {
+  flex: 1 1 auto;
+  background: #161b22;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  padding: 0.4em 0.6em;
+  font: inherit;
+}
+.chat-input button {
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  padding: 0.4em 0.8em;
+  cursor: pointer;
+  font: inherit;
+}
+.chat-input button:hover { background: #30363d; }
+.chat-input button[type="submit"] { color: #7ee787; }
+
+.hint { color: #6e7681; font-size: 0.9em; padding: 0.5em; }
+
+#inspector-grid {
+  flex: 1 1 auto;
+  overflow: auto;
+  display: grid;
+  /* columns set inline once we know token count */
+  font-size: 11px;
+}
+#inspector-grid .row-label {
+  color: #6e7681;
+  text-align: right;
+  padding-right: 0.3em;
+  white-space: nowrap;
+  position: sticky;
+  left: 0;
+  background: #0d1117;
+  z-index: 1;
+}
+#inspector-grid .col-label {
+  color: #6e7681;
+  font-size: 10px;
+  text-align: center;
+  border-bottom: 1px solid #21262d;
+  padding-bottom: 0.2em;
+}
+#inspector-grid .cell {
+  width: 14px;
+  height: 14px;
+  cursor: help;
+}
+
+#correlation-grid {
+  flex: 1 1 auto;
+  overflow: auto;
+  display: grid;
+  font-size: 10px;
+  margin-top: 0.4em;
+}
+#correlation-grid .col-label {
+  color: #6e7681;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 9px;
+  padding: 0.1em;
+}
+#correlation-grid .row-label {
+  color: #6e7681;
+  text-align: right;
+  padding-right: 0.3em;
+}
+#correlation-grid .cell {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+}
+
+#corr-refresh {
+  align-self: flex-start;
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  padding: 0.2em 0.6em;
+  cursor: pointer;
+  font: inherit;
+  margin-bottom: 0.2em;
+}
+
+#vector-select {
+  background: #161b22;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  padding: 0.3em;
+  font: inherit;
+  margin-bottom: 0.4em;
+}
+#layer-norms {
+  flex: 1 1 auto;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 10px;
+}
+#layer-norms .row {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+}
+#layer-norms .label {
+  color: #6e7681;
+  width: 3em;
+  text-align: right;
+}
+#layer-norms .bar {
+  background: #58a6ff;
+  height: 8px;
+  flex: 0 0 auto;
+}
+#layer-norms .value {
+  color: #6e7681;
+  width: 4em;
+  text-align: right;
+}
