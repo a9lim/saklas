@@ -32,8 +32,16 @@ Routes:
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`
 - Vector management under `/sessions/{id}/vectors` — list / get / load-from-disk / delete
 - `POST /sessions/{id}/extract` — async via `asyncio.to_thread(session.extract, ...)`, SSE progress when `Accept: text/event-stream`, JSON otherwise
+- `POST /sessions/{id}/vectors/merge` body `{name, expression}` — wraps `saklas.io.merge.merge_into_pack` (model-scoped to the session, `force=True`), loads the merged tensor through `session.load_profile`, and registers it via `session.steer(name, profile)`. Held under `session.lock`. Returns the same profile-JSON `GET /vectors/{name}` produces. `MergeError` propagates as 400 via the `SaklasError` handler.
+- `POST /sessions/{id}/vectors/clone` body `{name, corpus_path, n_pairs?, seed?, baseline?}` — wraps `session.clone_from_corpus` in `asyncio.to_thread` under `session.lock`. SSE branch on `Accept: text/event-stream` mirrors `/extract` but only emits `done` / `error` events (the underlying clone path has no progress callback hook). Auto-registers the cloned profile on success. `FileNotFoundError` (missing corpus) → 404.
+- `GET /sessions/{id}/vectors/{name}/diagnostics` — 16-bucket `||baked||` histogram via `saklas.core.histogram.bucketize` + per-layer magnitudes, plus `diagnostics_by_layer` / `diagnostics_summary` (reused from `cli.runners._summarize_diagnostics`) when the profile carries them. Drives the WHY-histogram strip in the web UI's probe rack. 404 when the vector isn't registered on the session.
 - Probe management under `/sessions/{id}/probes` — list / defaults / activate / deactivate
 - `POST /sessions/{id}/probe` — one-shot scoring via `monitor.measure(model, tokenizer, layers, text)` under the session lock; no generation required
+
+**Pack management (top-level, not under a session):**
+- `GET /saklas/v1/packs` — locally installed packs only, via `cache_ops.list_concepts(None, hf=False)`. Mirrors `saklas pack ls` but JSON-only; HF queries are the separate `/packs/search` route so the common UI rack-refresh case stays off the network.
+- `GET /saklas/v1/packs/search?q=<query>&limit=<n>` — HF-hub search proxy via `cache_ops.search_remote_packs`. Returns structured `HfRow` dicts, not the CLI's text rendering. Missing `huggingface_hub` → 503; HF transport errors → 502; `limit` clamps response size client-side.
+- `POST /saklas/v1/packs` body `{target, as?, force?, statements_only?}` — wraps `cache_ops.install` in `asyncio.to_thread`. `target` accepts the same surface as `saklas pack install` (HF coord `ns/name[@rev]` or local folder path). `InstallConflict` → 409, `ValueError` → 400, missing target → 404.
 
 **Killer feature — `WS /saklas/v1/sessions/{id}/stream`**: bidirectional token+probe co-stream.
 - Client sends `{type: "generate", input, steering, sampling, thinking, stateless, raw}` or `{type: "stop"}`

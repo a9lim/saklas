@@ -19,6 +19,8 @@ Old ``/v1/saklas/*`` routes were removed in the same commit that
 introduced this file — no aliases.
 """
 
+# pyright: reportUnusedFunction=false
+
 from __future__ import annotations
 
 from saklas.server.app import acquire_session_lock, ws_auth_ok
@@ -109,6 +111,51 @@ class WSGenerateMessage(BaseModel):
     raw: bool = False
 
 
+class InstallPackRequest(BaseModel):
+    """Body for ``POST /saklas/v1/packs``.
+
+    ``target`` is an HF coordinate (``ns/name[@rev]``) or a local folder
+    path — the same surface ``saklas pack install`` consumes.  ``as_``
+    relocates the install to ``<dst_ns>/<dst_name>``; ``force``
+    overwrites an existing folder; ``statements_only`` strips tensors
+    after install.  Field name ``as_`` (Pydantic alias ``as``) avoids
+    shadowing the Python keyword on the wire.
+    """
+    target: str
+    as_: str | None = Field(default=None, alias="as")
+    force: bool = False
+    statements_only: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class MergeVectorRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/vectors/merge``.
+
+    ``expression`` is a merge expression in the shared steering grammar
+    (``"0.3 default/honest + 0.4 default/warm"``); ``name`` becomes the
+    new merged pack's local name.  Reuses :func:`saklas.io.merge.merge_into_pack`.
+    """
+    name: str
+    expression: str
+
+
+class CloneVectorRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/vectors/clone``.
+
+    Mirrors ``saklas vector clone`` flags: ``corpus_path`` points at a
+    one-utterance-per-line text file; ``n_pairs`` and ``seed`` carry
+    through to :func:`saklas.io.cloning.clone_from_corpus`. ``baseline``
+    is currently unused by the underlying clone path but reserved for
+    symmetry with extract.
+    """
+    name: str
+    corpus_path: str
+    n_pairs: int = 90
+    seed: int | None = None
+    baseline: str | None = None
+
+
 class SweepRequest(BaseModel):
     """Body for ``POST /saklas/v1/sessions/{id}/sweep``.
 
@@ -144,7 +191,7 @@ def _resolve_session_id(session: SaklasSession, session_id: str) -> None:
     )
 
 
-def _session_config_dict(session: SaklasSession) -> dict:
+def _session_config_dict(session: SaklasSession) -> dict[str, Any]:
     cfg = session.config
     return {
         "temperature": getattr(cfg, "temperature", None),
@@ -164,7 +211,7 @@ def _device_dtype(session: SaklasSession) -> tuple[str, str]:
 
 def _session_info(
     session: SaklasSession, default_steering: "Steering | None",
-) -> dict:
+) -> dict[str, Any]:
     device, dtype = _device_dtype(session)
     try:
         thinks = bool(supports_thinking(session._tokenizer))
@@ -187,7 +234,7 @@ def _session_info(
     }
 
 
-def _profile_to_json(name: str, profile: Profile) -> dict:
+def _profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
     layer_norms = [(idx, float(vec.norm().item())) for idx, vec in profile.items()]
     top = sorted(layer_norms, key=lambda x: x[1], reverse=True)[:5]
     # Full per-layer ||baked|| keyed by layer index — stringified for
@@ -203,7 +250,7 @@ def _profile_to_json(name: str, profile: Profile) -> dict:
     }
 
 
-def _probe_info(session: SaklasSession, name: str) -> dict:
+def _probe_info(session: SaklasSession, name: str) -> dict[str, Any]:
     layers: list[int] = []
     try:
         profiles = session._monitor.profiles
@@ -253,7 +300,7 @@ def _build_steering(
     if req is not None and req.thinking is not None:
         thinking = req.thinking
 
-    merged: dict = {}
+    merged: dict[str, Any] = {}
     if default_steering is not None:
         merged.update(default_steering.alphas)
     if req is not None:
@@ -288,7 +335,7 @@ def _coerce_pair_source(source: Any) -> Any:
     return pairs
 
 
-def _result_to_json(result: GenerationResult | None) -> dict:
+def _result_to_json(result: GenerationResult | None) -> dict[str, Any]:
     if result is None:
         return {}
     prompt_tokens = getattr(result, "prompt_tokens", 0) or 0
@@ -305,11 +352,11 @@ def _result_to_json(result: GenerationResult | None) -> dict:
     }
 
 
-def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict]:
+def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict[str, Any]]:
     scores = session.last_per_token_scores
     if not scores:
         return []
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     n = min(n_tokens, *(len(v) for v in scores.values())) if scores else 0
     for i in range(n):
         out.append({
@@ -333,6 +380,99 @@ def register_saklas_routes(app: FastAPI) -> None:
     """
 
     session: SaklasSession = app.state.session
+
+    # ----- packs (top-level, not under a session) ------------------------
+
+    @app.get("/saklas/v1/packs")
+    def list_packs():
+        """Return locally installed packs as JSON.
+
+        Mirrors ``saklas pack ls`` (local-only branch). HF hub query is
+        the separate ``GET /saklas/v1/packs/search`` route — keeps the
+        common case (UI rack refresh) off the network.
+        """
+        from saklas.io.cache_ops import list_concepts as _list_concepts
+        result = _list_concepts(None, hf=False)
+        return {
+            "packs": [
+                {
+                    "name": r.name,
+                    "namespace": r.namespace,
+                    "status": r.status,
+                    "recommended_alpha": r.recommended_alpha,
+                    "tags": list(r.tags),
+                    "description": r.description,
+                    "source": r.source,
+                    "tensor_models": list(r.tensor_models),
+                    **({"error": r.error} if r.error else {}),
+                }
+                for r in result.installed
+            ],
+        }
+
+    @app.get("/saklas/v1/packs/search")
+    def search_packs(q: str = "", limit: int = 50):
+        """HF-hub search proxy returning JSON.
+
+        Wraps :func:`saklas.io.cache_ops.search_remote_packs` so the UI
+        gets structured rows (not the CLI's text rendering). ``q`` is a
+        free-form query against repo ids; ``limit`` clamps the response
+        size client-side. HF transport errors land as 502; missing
+        ``huggingface_hub`` lands as 503.
+        """
+        from saklas.io.cache_ops import search_remote_packs as _search
+        try:
+            rows = _search(q)
+        except ImportError as e:
+            raise HTTPException(503, f"hf search unavailable: {e}")
+        except Exception as e:
+            raise HTTPException(502, f"hf search failed: {type(e).__name__}: {e}")
+        if limit and limit > 0:
+            rows = rows[:limit]
+        return {
+            "query": q,
+            "results": [
+                {
+                    "name": r.name,
+                    "namespace": r.namespace,
+                    "recommended_alpha": r.recommended_alpha,
+                    "tags": list(r.tags),
+                    "description": r.description,
+                    "tensor_models": list(r.tensor_models),
+                }
+                for r in rows
+            ],
+        }
+
+    @app.post("/saklas/v1/packs")
+    async def install_pack(req: InstallPackRequest):
+        """Install a pack from HF or a local folder.
+
+        Wraps :func:`saklas.io.cache_ops.install`; runs in a worker
+        thread because the HF download path is blocking. ``InstallConflict``
+        (409) and ``ValueError`` (400) propagate via the existing
+        ``SaklasError`` handler / generic mapping.
+        """
+        from saklas.io.cache_ops import install as _install, InstallConflict
+        try:
+            dst = await asyncio.to_thread(
+                _install,
+                req.target,
+                req.as_,
+                force=req.force,
+                statements_only=req.statements_only,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(404, f"pack not found: {e}")
+        except InstallConflict as e:
+            raise HTTPException(409, str(e))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {
+            "target": req.target,
+            "installed_at": str(dst),
+            "statements_only": req.statements_only,
+        }
 
     # ----- sessions collection -------------------------------------------
 
@@ -370,7 +510,7 @@ def register_saklas_routes(app: FastAPI) -> None:
     @app.patch("/saklas/v1/sessions/{session_id}")
     def patch_session(session_id: str, req: PatchSessionRequest):
         _resolve_session_id(session, session_id)
-        overrides: dict = {}
+        overrides: dict[str, Any] = {}
         if req.temperature is not None:
             overrides["temperature"] = req.temperature
         if req.top_p is not None:
@@ -560,12 +700,165 @@ def register_saklas_routes(app: FastAPI) -> None:
             "progress": progress_msgs,
         }
 
+    @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
+    async def merge_vector(session_id: str, req: MergeVectorRequest):
+        """Merge an expression of installed vectors into a new local pack.
+
+        Wraps :func:`saklas.io.merge.merge_into_pack` (model-scoped to
+        the session's loaded model), then loads the merged tensor into
+        ``session._profiles`` so it's immediately steerable. Returns the
+        same profile-JSON shape ``GET /vectors/{name}`` produces.
+        """
+        from saklas.io.merge import merge_into_pack, MergeError
+        from saklas.io.paths import tensor_filename
+        _resolve_session_id(session, session_id)
+
+        async with session.lock:
+            try:
+                dst_folder = await asyncio.to_thread(
+                    merge_into_pack,
+                    req.name,
+                    req.expression,
+                    session.model_id,
+                    force=True,  # session-driven merges always overwrite
+                    strict=False,
+                )
+            except MergeError:
+                # Re-raised through the SaklasError handler (400).
+                raise
+            tensor_path = dst_folder / tensor_filename(session.model_id)
+            if not tensor_path.is_file():
+                raise HTTPException(
+                    500,
+                    f"merge produced no tensor for {session.model_id} at {tensor_path}",
+                )
+            profile = await asyncio.to_thread(session.load_profile, str(tensor_path))
+            session.steer(req.name, profile)
+        return _profile_to_json(req.name, profile)
+
+    @app.post("/saklas/v1/sessions/{session_id}/vectors/clone")
+    async def clone_vector(session_id: str, req: CloneVectorRequest, request: Request):
+        """Corpus-based persona clone, optionally streamed via SSE.
+
+        Mirrors :meth:`SaklasSession.clone_from_corpus`. JSON when the
+        client sends ``Accept: application/json`` (default); SSE
+        progress when ``Accept: text/event-stream`` — same shape as
+        the ``/extract`` endpoint, except clone has no native progress
+        stream so the only events emitted are ``done`` / ``error``.
+        """
+        _resolve_session_id(session, session_id)
+
+        accept = request.headers.get("accept", "application/json")
+        wants_sse = "text/event-stream" in accept
+
+        def _do_clone() -> tuple[str, "Profile"]:
+            return session.clone_from_corpus(
+                req.corpus_path,
+                req.name,
+                n_pairs=req.n_pairs,
+                seed=req.seed,
+            )
+
+        if wants_sse:
+            async def _sse():
+                async with session.lock:
+                    try:
+                        canonical, profile = await asyncio.to_thread(_do_clone)
+                    except FileNotFoundError as e:
+                        err = {"message": str(e), "code": "FileNotFoundError"}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                        return
+                    except SaklasError as e:
+                        import logging
+                        logging.getLogger("saklas.api").exception(
+                            "clone failed for session=%s", session_id,
+                        )
+                        err = {"message": "clone failed", "code": type(e).__name__}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                        return
+                    except Exception as e:
+                        err = {"message": str(e), "code": type(e).__name__}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                        return
+                    session.steer(req.name, profile)
+                    body = {
+                        "done": True,
+                        "canonical": canonical,
+                        "profile": _profile_to_json(req.name, profile),
+                    }
+                    yield f"event: done\ndata: {json.dumps(body)}\n\n"
+
+            return StreamingResponse(_sse(), media_type="text/event-stream")
+
+        async with session.lock:
+            try:
+                canonical, profile = await asyncio.to_thread(_do_clone)
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e))
+            session.steer(req.name, profile)
+        return {
+            "canonical": canonical,
+            "profile": _profile_to_json(req.name, profile),
+        }
+
+    @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}/diagnostics")
+    def vector_diagnostics(session_id: str, name: str):
+        """Per-layer ``||baked||`` histogram + diagnostics for a registered vector.
+
+        Mirrors what ``saklas vector why <concept> -m MODEL --json`` produces:
+        a 16-bucket layer-magnitude histogram plus the ``diagnostics_by_layer``
+        / ``diagnostics_summary`` block when the profile carries them.
+        Drives the WHY-histogram strip in the web UI's probe rack.
+        """
+        from saklas.cli.runners import _summarize_diagnostics
+        from saklas.core.histogram import HIST_BUCKETS, bucketize
+
+        _resolve_session_id(session, session_id)
+        vectors = session.vectors
+        if name not in vectors:
+            raise HTTPException(404, f"vector '{name}' not found")
+        profile = vectors[name]
+
+        layer_mags: list[tuple[int, float]] = sorted(
+            ((layer, float(vec.norm().item())) for layer, vec in profile.items()),
+            key=lambda kv: kv[0],
+        )
+        buckets = bucketize(layer_mags, HIST_BUCKETS)
+        # Buckets: ``(lo_layer, hi_layer, mean_norm)`` triples — same shape the
+        # CLI ``vector why`` text path renders, JSON-friendly here.
+        bucket_payload = [
+            {"lo": lo, "hi": hi, "mean_norm": round(mag, 6)}
+            for lo, hi, mag in buckets
+        ]
+
+        diagnostics = profile.diagnostics  # None when extracted pre-1.6
+        payload: dict[str, Any] = {
+            "name": name,
+            "model": session.model_id,
+            "total_layers": len(profile),
+            "histogram": {
+                "buckets": HIST_BUCKETS,
+                "data": bucket_payload,
+            },
+            "layers": [
+                {"layer": layer, "magnitude": round(mag, 6)}
+                for layer, mag in layer_mags
+            ],
+        }
+        if diagnostics is not None:
+            payload["diagnostics_by_layer"] = {
+                str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
+                for layer, metrics in sorted(diagnostics.items())
+            }
+            payload["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
+        return payload
+
     # ----- probes --------------------------------------------------------
 
     @app.get("/saklas/v1/sessions/{session_id}/probes")
     def list_probes(session_id: str):
         _resolve_session_id(session, session_id)
-        names = sorted(session.probes.keys()) if isinstance(session.probes, dict) else list(session.probes)
+        names = sorted(session.probes.keys())
         return {"probes": [_probe_info(session, n) for n in names]}
 
     @app.get("/saklas/v1/sessions/{session_id}/probes/defaults")
@@ -647,7 +940,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         # Drive ``generate_sweep`` in a worker thread; bridge per-result
         # events to the asyncio queue this handler reads.
         loop = asyncio.get_running_loop()
-        result_queue: asyncio.Queue = asyncio.Queue()
+        result_queue: asyncio.Queue[tuple[Any, Any]] = asyncio.Queue()
         DONE = object()
         ERROR = object()
 
@@ -784,10 +1077,10 @@ def register_saklas_routes(app: FastAPI) -> None:
         from saklas.core.events import GenerationStarted, GenerationFinished
 
         loop = asyncio.get_running_loop()
-        trait_queue: asyncio.Queue = asyncio.Queue()
+        trait_queue: asyncio.Queue[Any] = asyncio.Queue()
 
         # EventBus callback: push start/done into the same queue as tokens.
-        def _on_event(event):
+        def _on_event(event: object) -> None:
             if isinstance(event, GenerationStarted):
                 try:
                     loop.call_soon_threadsafe(
@@ -887,7 +1180,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         # incoming frame through one queue lets both the outer dispatch
         # loop and the in-flight generation share the read side without
         # ever overlapping calls into the WS.
-        incoming: asyncio.Queue = asyncio.Queue()
+        incoming: asyncio.Queue[Any] = asyncio.Queue()
         _DISCONNECT = object()
 
         async def _reader():
@@ -971,7 +1264,7 @@ async def _ws_handle_generate(
     session: SaklasSession,
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
-    incoming: asyncio.Queue,
+    incoming: asyncio.Queue[Any],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
@@ -1000,10 +1293,17 @@ async def _ws_handle_generate(
     sampling = _build_sampling(msg.sampling)
     steering = _build_steering(msg.steering, default_steering)
 
-    token_queue: asyncio.Queue = asyncio.Queue()
+    token_queue: asyncio.Queue[Any] = asyncio.Queue()
     _SENTINEL = object()
 
-    def _on_token(text, is_thinking, tid, lp, top, perplexity=None):
+    def _on_token(
+        text: str,
+        is_thinking: bool,
+        tid: int | None,
+        lp: float | None,
+        top: list[tuple[str, float]] | None,
+        perplexity: float | None = None,
+    ) -> None:
         event: dict[str, Any] = {
             "type": "token",
             "text": text,

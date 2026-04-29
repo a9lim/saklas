@@ -1,0 +1,58 @@
+/* Centralized design tokens.  Imported once from App.svelte (later phase);
+ * every panel and drawer reads these custom properties instead of hardcoding
+ * the GitHub-dark palette inline.  Swap palette = edit this file. */
+
+:root {
+  /* Surfaces */
+  --bg: #0d1117;
+  --bg-alt: #161b22;
+  --bg-deep: #010409;
+  --bg-elev: #21262d;
+
+  /* Text */
+  --fg: #e6edf3;
+  --fg-strong: #c9d1d9;
+  --fg-dim: #8b949e;
+  --fg-muted: #6e7681;
+  --fg-subtle: #7d8590;
+
+  /* Lines */
+  --border: #30363d;
+  --border-dim: #21262d;
+
+  /* Accents */
+  --accent-green: #7ee787;
+  --accent-blue: #58a6ff;
+  --accent-red: #f85149;
+  --accent-yellow: #d29922;
+  --accent-error: #ff7b72;
+  --accent-purple: #d2a8ff;
+
+  /* Highlight palette — driven by tokens.ts ``scoreToRgb`` at runtime,
+   * but kept here as named handles for future skin overrides. */
+  --highlight-pos: #00ff00;
+  --highlight-neg: #ff0000;
+
+  /* Typography */
+  --font-mono: -apple-system, "SF Mono", Menlo, Consolas, monospace;
+  --font-size-base: 13px;
+  --font-size-small: 11px;
+  --font-size-tiny: 10px;
+
+  /* Geometry — unitless, multiplied to px in component styles.
+   * 24 mirrors the TUI's BAR_WIDTH constant. */
+  --bar-width: 24;
+  --bar-px: 24px;
+  --bar-height: 8px;
+  --row-gap: 0.4em;
+  --panel-pad: 0.5em;
+
+  /* Highlighting saturation — score / HIGHLIGHT_SAT clamps to [-1, 1]
+   * before mapping to RGB.  Exposed as a CSS var so a debug skin can
+   * raise it to 1.0 (full-range) without touching JS. */
+  --highlight-sat: 0.5;
+
+  /* Z-layers */
+  --z-drawer: 50;
+  --z-modal: 100;
+}
