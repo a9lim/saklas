@@ -20,6 +20,12 @@ It runs on CUDA and Apple Silicon MPS. The full TUI has been tested to run comfo
 
 ---
 
+## Reporting issues
+
+If you notice any errors while using the program, please update to the most recent version and reinstall the hooks. If it still persists, please open an issue. This project is a work in progress and I am actively finding and fixing bugs.
+
+---
+
 ## Credits
 
 The contrastive-PCA approach comes from the Representation Engineering paper ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)). [repeng](https://github.com/vgel/repeng) by Theia Vogel, is the well-known implementation in this space and is what most people might reach for. Saklas implements the same idea from a different angle: repeng is lean and more of a library, saklas is more of a TUI with monitoring and a chat server bundled in. Both are worth your time!
