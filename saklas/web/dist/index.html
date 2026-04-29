@@ -4,43 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>saklas — analytics dashboard</title>
-  <link rel="stylesheet" href="/assets/saklas.css" />
+  <script type="module" crossorigin src="/assets/saklas.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index.css">
 </head>
 <body>
-  <div id="app">
-    <header class="topbar">
-      <span class="brand">saklas</span>
-      <span id="status-bar">connecting…</span>
-    </header>
-    <main class="grid">
-      <section class="panel chat" aria-label="Chat">
-        <div class="panel-header">CHAT</div>
-        <div id="chat-log"></div>
-        <form id="chat-form" class="chat-input">
-          <input id="chat-input" type="text" placeholder="message…" autocomplete="off" />
-          <button type="submit">send</button>
-          <button type="button" id="chat-stop">stop</button>
-        </form>
-      </section>
-      <section class="panel inspector" aria-label="Inspector">
-        <div class="panel-header">PER-TOKEN × PER-LAYER × PER-PROBE</div>
-        <div id="inspector-empty" class="hint">
-          Generate a response with at least one probe loaded to populate the heatmap.
-        </div>
-        <div id="inspector-grid"></div>
-      </section>
-      <section class="panel correlation" aria-label="Correlation">
-        <div class="panel-header">PROBE CORRELATION</div>
-        <button type="button" id="corr-refresh">refresh</button>
-        <div id="correlation-grid"></div>
-      </section>
-      <section class="panel layer-norms" aria-label="Layer norms">
-        <div class="panel-header">LAYER NORMS</div>
-        <select id="vector-select"></select>
-        <div id="layer-norms"></div>
-      </section>
-    </main>
-  </div>
-  <script type="module" src="/assets/saklas.js"></script>
+  <div id="app"></div>
 </body>
 </html>

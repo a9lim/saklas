@@ -111,25 +111,43 @@ def api_only_client():
 # ---------------------------------------------------------------------------
 
 
+def _index_asset_paths(html: bytes) -> list[str]:
+    """Extract /assets/* paths the index.html references.
+
+    Vite emits hashed filenames by default; the source-tree config pins
+    saklas.js but lets the CSS chunk name itself.  Pulling references
+    out of the html keeps the tests robust across bundler changes
+    without sacrificing real coverage of the asset-mount path.
+    """
+    import re
+
+    return [
+        m.decode("utf-8")
+        for m in re.findall(rb'(?:src|href)="(/assets/[^"]+)"', html)
+    ]
+
+
 class TestWebMount:
-    def test_root_serves_index_html(self, web_client) -> None:
+    def test_root_serves_spa_shell(self, web_client) -> None:
         _session, client = web_client
         r = client.get("/")
         assert r.status_code == 200
-        # Index references the bundled stylesheet + JS by absolute path.
-        assert b"saklas.css" in r.content
-        assert b"saklas.js" in r.content
+        # SPA shell: doctype + an #app mount point + at least one /assets/*
+        # reference (script or stylesheet — the bundler owns the names).
+        assert b"<!DOCTYPE html>" in r.content
+        assert b'id="app"' in r.content
+        assets = _index_asset_paths(r.content)
+        assert len(assets) >= 1, "index.html should reference at least one /assets/* file"
 
-    def test_assets_path_serves_bundle(self, web_client) -> None:
+    def test_assets_referenced_by_index_are_servable(self, web_client) -> None:
         _session, client = web_client
-        r_js = client.get("/assets/saklas.js")
-        assert r_js.status_code == 200
-        # Anchor on a stable identifier in the committed bundle.
-        assert b"saklas web UI" in r_js.content
-
-        r_css = client.get("/assets/saklas.css")
-        assert r_css.status_code == 200
-        assert b"saklas web UI" in r_css.content
+        index = client.get("/").content
+        for path in _index_asset_paths(index):
+            r = client.get(path)
+            assert r.status_code == 200, f"missing asset: {path}"
+            # Bundles are never empty in practice; even the smallest
+            # Vite chunk weighs in at hundreds of bytes.
+            assert len(r.content) > 0
 
     def test_unknown_route_falls_back_to_index(self, web_client) -> None:
         _session, client = web_client
@@ -137,15 +155,14 @@ class TestWebMount:
         # server returns index.html so the SPA can take over routing.
         r = client.get("/lab")
         assert r.status_code == 200
-        assert b"saklas.css" in r.content
+        assert b'id="app"' in r.content
 
     def test_no_web_flag_does_not_mount_root(self, api_only_client) -> None:
         _session, client = api_only_client
-        # Without --web, GET / shouldn't return the dashboard.  The
-        # exact response code depends on FastAPI's default 404 handler;
-        # it should NOT be the SPA index.
+        # Without --web, GET / shouldn't return the dashboard.  Detect
+        # by absence of the SPA's mount point.
         r = client.get("/")
-        assert b"saklas.css" not in r.content
+        assert b'id="app"' not in r.content
 
 
 # ---------------------------------------------------------------------------
