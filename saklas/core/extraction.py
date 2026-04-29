@@ -291,11 +291,16 @@ class ExtractionPipeline:
                 "sae_ids_by_layer": getattr(sae_backend, "sae_ids_by_layer", {}),
             }
 
-        def _build_return(profile_dict: dict) -> tuple[str, Profile]:
+        def _build_return(
+            profile_dict: dict,
+            diagnostics: dict[int, dict[str, float]] | None = None,
+        ) -> tuple[str, Profile]:
             meta: dict = {
                 "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
             }
             meta.update(sae_metadata)
+            if diagnostics:
+                meta["diagnostics"] = diagnostics
             out_name = (
                 canonical
                 if sae_backend is None
@@ -303,13 +308,19 @@ class ExtractionPipeline:
             )
             return out_name, Profile(profile_dict, metadata=meta)
 
-        def _save_meta(extra: dict | None = None) -> dict:
+        def _save_meta(
+            extra: dict | None = None,
+            *,
+            diagnostics: dict[int, dict[str, float]] | None = None,
+        ) -> dict:
             meta: dict = {
                 "method": "pca_center_sae" if sae_backend is not None else "contrastive_pca",
             }
             if extra:
                 meta.update(extra)
             meta.update(sae_metadata)
+            if diagnostics:
+                meta["diagnostics"] = diagnostics
             return meta
 
         model = self._handle.model
@@ -340,13 +351,14 @@ class ExtractionPipeline:
 
             _progress(f"Extracting profile ({len(ds.pairs)} pairs)...")
             pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
-            profile = extract_contrastive(
+            profile, diagnostics = extract_contrastive(
                 model, tokenizer, pairs, layers=layers,
                 sae=sae_backend,
+                concept_label=canonical,
             )
-            _save_profile(profile, cache_path, _save_meta())
+            _save_profile(profile, cache_path, _save_meta(diagnostics=diagnostics))
             self._packs._update_local_pack_files(folder)
-            return _build_return(profile)
+            return _build_return(profile, diagnostics)
 
         # String source — full pipeline.  Pack lookup scans installed
         # namespaces, but bare names must not silently pick the first
@@ -408,16 +420,18 @@ class ExtractionPipeline:
             if pack_stmts.exists():
                 _progress(f"Using curated statements for '{canonical}'...")
                 ds = load_contrastive_pairs(str(pack_stmts))
-                profile = extract_contrastive(
+                profile, diagnostics = extract_contrastive(
                     model, tokenizer, ds["pairs"],
                     layers=layers,
                     sae=sae_backend,
+                    concept_label=canonical,
                 )
-                _save_profile(profile, cache_path, _save_meta({
-                    "statements_sha256": hash_file(pack_stmts),
-                }))
+                _save_profile(profile, cache_path, _save_meta(
+                    {"statements_sha256": hash_file(pack_stmts)},
+                    diagnostics=diagnostics,
+                ))
                 self._packs._update_local_pack_files(pack_folder)
-                return _build_return(profile)
+                return _build_return(profile, diagnostics)
 
         # 3. Local statements cache — default reuses if present.
         local_folder = self._packs._local_concept_folder(canonical)
@@ -503,12 +517,14 @@ class ExtractionPipeline:
 
         # 5. Extract.
         _progress(f"Extracting contrastive profile ({len(pairs)} pairs)...")
-        profile = extract_contrastive(
+        profile, diagnostics = extract_contrastive(
             model, tokenizer, pairs, layers=layers,
             sae=sae_backend,
+            concept_label=canonical,
         )
-        _save_profile(profile, cache_path, _save_meta({
-            "statements_sha256": hash_file(pathlib.Path(stmt_cache_path)),
-        }))
+        _save_profile(profile, cache_path, _save_meta(
+            {"statements_sha256": hash_file(pathlib.Path(stmt_cache_path))},
+            diagnostics=diagnostics,
+        ))
         self._packs._update_local_pack_files(local_folder)
-        return _build_return(profile)
+        return _build_return(profile, diagnostics)

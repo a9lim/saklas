@@ -7,7 +7,7 @@ import functools
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import _PACK_VERBS, _VECTOR_VERBS
 from saklas.core.errors import SaklasError
@@ -917,17 +917,100 @@ def _run_why(args: argparse.Namespace) -> None:
         key=lambda kv: kv[0],
     )
     total_layers = len(profile)
+    diagnostics = profile.diagnostics  # None when extracted before saklas 1.6
 
     if args.json_output:
-        result = {
+        result: dict[str, Any] = {
             "concept": concept_name,
             "model": args.model,
             "total_layers": total_layers,
             "layers": [{"layer": l, "magnitude": round(m, 6)} for l, m in layer_mags],
         }
+        if diagnostics is not None:
+            result["diagnostics_by_layer"] = {
+                str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
+                for layer, metrics in sorted(diagnostics.items())
+            }
+            result["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
         print(_json.dumps(result, indent=2))
     else:
         _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
+        if diagnostics is not None:
+            _print_diagnostics(diagnostics)
+
+
+def _summarize_diagnostics(
+    diagnostics: dict[int, dict[str, float]],
+) -> dict[str, float | str]:
+    """Aggregate per-layer metrics into a small summary block.
+
+    Reports medians (robust to outlier layers) for the four metrics, plus
+    a coarse ``quality`` stoplight derived from the same thresholds the
+    extraction-time warning uses.  Mirrored in the JSON output so callers
+    don't have to recompute it client-side.
+    """
+    def _median(values: list[float]) -> float:
+        s = sorted(values)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        mid = n // 2
+        if n % 2 == 1:
+            return s[mid]
+        return 0.5 * (s[mid - 1] + s[mid])
+
+    evrs = [m["evr"] for m in diagnostics.values() if "evr" in m]
+    intras = [
+        m["intra_pair_variance_mean"]
+        for m in diagnostics.values()
+        if "intra_pair_variance_mean" in m
+    ]
+    aligns = [
+        m["inter_pair_alignment"]
+        for m in diagnostics.values()
+        if "inter_pair_alignment" in m
+    ]
+    projs = [
+        m["diff_principal_projection"]
+        for m in diagnostics.values()
+        if "diff_principal_projection" in m
+    ]
+
+    med_evr = _median(evrs) if evrs else 0.0
+    med_intra = _median(intras) if intras else 0.0
+    med_align = _median(aligns) if aligns else 0.0
+    med_proj = _median(projs) if projs else 0.0
+
+    if med_evr > 0.95 and med_intra < 0.01:
+        quality = "poor"
+    elif med_align < 0.2:
+        quality = "poor"
+    elif med_align < 0.4 or med_evr < 0.2:
+        quality = "shaky"
+    else:
+        quality = "solid"
+
+    return {
+        "median_evr": round(med_evr, 4),
+        "median_intra_pair_variance": round(med_intra, 4),
+        "median_inter_pair_alignment": round(med_align, 4),
+        "median_diff_principal_projection": round(med_proj, 4),
+        "quality": quality,
+    }
+
+
+def _print_diagnostics(diagnostics: dict[int, dict[str, float]]) -> None:
+    """Render the diagnostics summary + per-layer table beneath the histogram."""
+    summary = _summarize_diagnostics(diagnostics)
+    quality = summary["quality"]
+    print()
+    print(f"  DIAGNOSTICS (probe quality: {quality}):")
+    print(
+        f"    median EVR:                 {summary['median_evr']:.3f}\n"
+        f"    median intra-pair variance: {summary['median_intra_pair_variance']:.4f}\n"
+        f"    median inter-pair alignment:{summary['median_inter_pair_alignment']:>7.3f}\n"
+        f"    median diff→PC projection:  {summary['median_diff_principal_projection']:.3f}"
+    )
 
 
 def _print_why_histogram(

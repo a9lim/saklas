@@ -53,7 +53,10 @@ def num_layers(layers):
 def _extract_profile(model, tokenizer, concept, layers):
     """Extract a profile for a single concept with one pair."""
     from saklas.core.vectors import extract_contrastive
-    return extract_contrastive(model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers)
+    profile, _ = extract_contrastive(
+        model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers,
+    )
+    return profile
 
 
 @pytest.fixture(scope="module")
@@ -290,7 +293,7 @@ class TestExtractContrastive:
             {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
             {"positive": "I love this", "negative": "I hate this"},
         ]
-        profile = extract_contrastive(model, tokenizer, pairs, layers=layers)
+        profile, diagnostics = extract_contrastive(model, tokenizer, pairs, layers=layers)
         assert isinstance(profile, dict)
         assert len(profile) > 0
         for idx, vec in profile.items():
@@ -298,6 +301,18 @@ class TestExtractContrastive:
             assert vec.shape == (hidden_dim,)
             norm = vec.norm().item()
             assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
+        # Diagnostics surface for multi-pair extractions; layer set must
+        # match the profile so downstream consumers can index either dict
+        # by layer index without branching.
+        assert set(diagnostics.keys()) == set(profile.keys())
+        for metrics in diagnostics.values():
+            assert {
+                "evr",
+                "intra_pair_variance_mean",
+                "intra_pair_variance_std",
+                "inter_pair_alignment",
+                "diff_principal_projection",
+            } <= set(metrics.keys())
 
 
 class TestBuildChatInput:

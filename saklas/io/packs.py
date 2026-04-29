@@ -135,16 +135,40 @@ class Sidecar:
     saklas_version: str
     statements_sha256: Optional[str] = None
     components: Optional[dict[str, dict[str, Any]]] = None
+    # Per-layer probe-quality metrics computed at extraction time.  Keys are
+    # the same layer indices the profile carries (stringified on disk for
+    # JSON-key compatibility, ``int``-keyed in memory).  Old saklas readers
+    # ignore this field; readers that know about it surface it through
+    # ``Profile.diagnostics`` and the CLI ``vector why`` output.  See
+    # ``saklas.core.vectors._compute_layer_diagnostics`` for the metric set.
+    diagnostics_by_layer: Optional[dict[int, dict[str, float]]] = None
 
     @classmethod
     def load(cls, path: Path) -> "Sidecar":
         with open(path) as f:
             data = json.load(f)
+        raw_diag = data.get("diagnostics_by_layer")
+        diagnostics: Optional[dict[int, dict[str, float]]]
+        if isinstance(raw_diag, dict) and raw_diag:
+            try:
+                diagnostics = {
+                    int(layer): {k: float(v) for k, v in metrics.items()}
+                    for layer, metrics in raw_diag.items()
+                }
+            except (TypeError, ValueError):
+                # Malformed sidecar diagnostics — drop the field.  Tensors
+                # themselves are still valid; integrity is enforced by
+                # ``ConceptFolder.load`` over the file hash, not the
+                # diagnostics shape.
+                diagnostics = None
+        else:
+            diagnostics = None
         return cls(
             method=data["method"],
             saklas_version=data["saklas_version"],
             statements_sha256=data.get("statements_sha256"),
             components=data.get("components"),
+            diagnostics_by_layer=diagnostics,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -156,6 +180,11 @@ class Sidecar:
             out["statements_sha256"] = self.statements_sha256
         if self.components is not None:
             out["components"] = self.components
+        if self.diagnostics_by_layer:
+            out["diagnostics_by_layer"] = {
+                str(layer): {k: float(v) for k, v in metrics.items()}
+                for layer, metrics in self.diagnostics_by_layer.items()
+            }
         return out
 
     def write(self, path: Path) -> None:
