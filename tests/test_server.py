@@ -257,6 +257,18 @@ class TestCLIParsing:
         args = parse_args(["serve", "m", "--cors", "http://localhost:3000", "--cors", "*"])
         assert args.cors == ["http://localhost:3000", "*"]
 
+    def test_serve_no_web_flag_default_off(self):
+        from saklas.cli import parse_args
+        # Dashboard is on by default; ``args.no_web`` defaults to False
+        # so create_app will receive ``web=True`` from the runner.
+        args = parse_args(["serve", "m"])
+        assert args.no_web is False
+
+    def test_serve_no_web_flag_opt_out(self):
+        from saklas.cli import parse_args
+        args = parse_args(["serve", "m", "--no-web"])
+        assert args.no_web is True
+
     # Cache-op coverage lives in tests/test_cache_ops.py (delete_tensors
     # across concept/tag/model selectors) and tests/test_cli_flags.py
     # (the -r/-x/-i/-l/-m cache-ops flag grammar).

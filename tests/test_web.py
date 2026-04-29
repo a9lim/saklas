@@ -93,8 +93,9 @@ def web_client():
 
 @pytest.fixture
 def api_only_client():
-    """Same session but no --web mount; used to verify the API surface
-    works even when the dashboard isn't enabled."""
+    """Same session but no dashboard mount; mirrors ``--no-web`` mode
+    on the CLI and the library default (``create_app(..., web=False)``)
+    so embedded API surfaces don't pick up the dashboard."""
     from saklas.server import create_app
 
     vectors = {
@@ -157,10 +158,11 @@ class TestWebMount:
         assert r.status_code == 200
         assert b'id="app"' in r.content
 
-    def test_no_web_flag_does_not_mount_root(self, api_only_client) -> None:
+    def test_no_web_does_not_mount_root(self, api_only_client) -> None:
         _session, client = api_only_client
-        # Without --web, GET / shouldn't return the dashboard.  Detect
-        # by absence of the SPA's mount point.
+        # ``--no-web`` (CLI) / ``web=False`` (library): GET / shouldn't
+        # return the dashboard.  Detect by absence of the SPA's mount
+        # point.
         r = client.get("/")
         assert b'id="app"' not in r.content
 

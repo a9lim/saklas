@@ -10,7 +10,8 @@ Two paths to install / run:
 * ``pip install saklas[web]`` brings in the same FastAPI + uvicorn the
   ``[serve]`` extra carries (the static-file mount needs nothing more
   than what the API server already requires).  Then
-  ``saklas serve --web <model>`` exposes the dashboard at ``/``.
+  ``saklas serve <model>`` exposes the dashboard at ``/`` by default;
+  add ``--no-web`` for API-only mode.
 * From source: ``cd webui && npm ci && npm run build`` regenerates the
   bundle into ``saklas/web/dist/``.  CI verifies the committed bundle
   matches the source tree.

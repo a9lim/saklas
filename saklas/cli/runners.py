@@ -239,10 +239,15 @@ def _run_serve(args: argparse.Namespace) -> None:
         default_steering = parse_expr(config_expr)
 
     from saklas.server import create_app
+    # Default-on: the dashboard ships with the wheel and is the easiest
+    # way for casual users to drive saklas; ``--no-web`` opts out for
+    # production / proxied deployments where ``/`` already belongs to
+    # something else.
+    web_enabled = not getattr(args, "no_web", False)
     app = create_app(session, default_steering=default_steering,
                      cors_origins=args.cors or None,
                      api_key=getattr(args, "api_key", None),
-                     web=getattr(args, "web", False))
+                     web=web_enabled)
 
     _warmup_session(session)
 

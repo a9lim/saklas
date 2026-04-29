@@ -14,10 +14,12 @@ from fastapi import FastAPI
 
 
 class WebUINotBuilt(RuntimeError):
-    """Raised when ``saklas serve --web`` runs against an empty dist dir.
+    """Raised when ``saklas serve`` runs against an empty dist dir.
 
     The wheel ships a pre-built bundle; this only fires in source-tree
-    installs that haven't run ``cd webui && npm run build`` yet.
+    installs that haven't run ``cd webui && npm run build`` yet.  Pass
+    ``--no-web`` to skip the dashboard mount when the bundle is missing
+    on purpose.
     """
 
 
@@ -38,9 +40,9 @@ def register_web_routes(app: FastAPI) -> None:
     """Mount the SPA bundle at ``/`` with an SPA-fallback to index.html.
 
     Idempotent — calling it twice on the same app is a no-op (the second
-    mount would shadow the first).  Caller (server.create_app) is
-    expected to gate this on a ``--web`` opt-in flag so production API
-    deployments don't pay the static-files mount cost.
+    mount would shadow the first).  CLI default-on (``saklas serve``);
+    ``--no-web`` opts out for production / proxied deployments.
+    Library callers using ``create_app`` directly default-off.
     """
     from fastapi.responses import FileResponse
     from fastapi.staticfiles import StaticFiles
@@ -69,7 +71,7 @@ def register_web_routes(app: FastAPI) -> None:
     # Catch-all for any other top-level route the SPA needs to handle —
     # e.g. /chat, /lab, /vectors/<name>.  Won't shadow any earlier
     # /api/*, /v1/*, /saklas/v1/* routes because FastAPI evaluates in
-    # registration order; --web opt-in mounts this last.
+    # registration order; create_app mounts this last.
     @app.get("/{full_path:path}", include_in_schema=False)
     async def _spa_fallback(full_path: str) -> FileResponse:
         # Direct file under dist/ wins (favicon, manifest, etc).  Anything

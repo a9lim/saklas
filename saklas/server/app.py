@@ -531,9 +531,12 @@ def create_app(session: SaklasSession,
     register_saklas_routes(app)
 
     # Mount the Svelte+Vite SPA dashboard last so its catch-all route
-    # doesn't shadow any of the API routes registered above.  Opt-in via
-    # ``--web`` on the CLI; production API deployments don't pay the
-    # static-files mount cost unless they ask for it.
+    # doesn't shadow any of the API routes registered above.  CLI
+    # default-on (``saklas serve``); ``--no-web`` opts out for
+    # production / proxied deployments where ``/`` already belongs to
+    # something else.  Library callers using ``create_app`` directly
+    # default-off so embedded API surfaces don't accidentally pick up
+    # the dashboard.
     if web:
         from saklas.web import register_web_routes
 
