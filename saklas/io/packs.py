@@ -142,6 +142,14 @@ class Sidecar:
     # ``Profile.diagnostics`` and the CLI ``vector why`` output.  See
     # ``saklas.core.vectors._compute_layer_diagnostics`` for the metric set.
     diagnostics_by_layer: Optional[dict[int, dict[str, float]]] = None
+    # Transfer provenance — set on transferred profiles only (v1.6).
+    # ``source_model_id`` is the HF coord of the model the probe was
+    # extracted on; ``alignment_map_hash`` pins the specific Procrustes
+    # fit used; ``transfer_quality_estimate`` is the median per-layer R²
+    # from :func:`saklas.io.alignment.alignment_quality`.
+    source_model_id: Optional[str] = None
+    alignment_map_hash: Optional[str] = None
+    transfer_quality_estimate: Optional[float] = None
 
     @classmethod
     def load(cls, path: Path) -> "Sidecar":
@@ -163,12 +171,16 @@ class Sidecar:
                 diagnostics = None
         else:
             diagnostics = None
+        tqe = data.get("transfer_quality_estimate")
         return cls(
             method=data["method"],
             saklas_version=data["saklas_version"],
             statements_sha256=data.get("statements_sha256"),
             components=data.get("components"),
             diagnostics_by_layer=diagnostics,
+            source_model_id=data.get("source_model_id"),
+            alignment_map_hash=data.get("alignment_map_hash"),
+            transfer_quality_estimate=float(tqe) if tqe is not None else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -185,6 +197,12 @@ class Sidecar:
                 str(layer): {k: float(v) for k, v in metrics.items()}
                 for layer, metrics in self.diagnostics_by_layer.items()
             }
+        if self.source_model_id is not None:
+            out["source_model_id"] = self.source_model_id
+        if self.alignment_map_hash is not None:
+            out["alignment_map_hash"] = self.alignment_map_hash
+        if self.transfer_quality_estimate is not None:
+            out["transfer_quality_estimate"] = float(self.transfer_quality_estimate)
         return out
 
     def write(self, path: Path) -> None:
@@ -569,10 +587,14 @@ def merge_components_stale(
 def enumerate_variants(folder: Path, model_id: str) -> dict[str, Path]:
     """List all on-disk tensor variants for ``(folder, model_id)``.
 
-    Returns ``{variant_key: path}`` where ``variant_key`` is ``"raw"`` for
-    the unsuffixed tensor and ``"sae-<release>"`` for SAE variants. Paths
-    point at the ``.safetensors`` files; callers derive the sidecar path by
-    swapping the extension.
+    Returns ``{variant_key: path}`` where ``variant_key`` is one of:
+      * ``"raw"`` — unsuffixed PCA tensor.
+      * ``"sae-<release>"`` — SAE variant (one per release).
+      * ``"from-<safe_src>"`` — transferred-from variant (one per source
+        model the user has aligned from).
+
+    Paths point at the ``.safetensors`` files; callers derive the sidecar
+    path by swapping the extension.
     """
     from saklas.io.paths import safe_model_id, parse_tensor_filename
 
@@ -587,9 +609,11 @@ def enumerate_variants(folder: Path, model_id: str) -> dict[str, Path]:
         parsed = parse_tensor_filename(p.name)
         if parsed is None:
             continue
-        model, release = parsed
+        model, variant = parsed
         if model != target_model:
             continue
-        key = "raw" if release is None else f"sae-{release}"
+        # ``variant`` is already prefixed with its kind ("sae-..." /
+        # "from-...") or None for raw — see ``parse_tensor_filename``.
+        key = "raw" if variant is None else variant
         out[key] = p
     return out

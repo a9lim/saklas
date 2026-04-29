@@ -9,10 +9,26 @@ import os
 import re
 from pathlib import Path
 
-# Variant filename convention: `<safe_model_id>[_sae-<release>].safetensors`.
-# The literal `_sae-` is the separator — no HF model id contains it, and
-# SAELens release names are ASCII lower/digits/./-, all fitting our slug rules.
-_VARIANT_SEP = "_sae-"
+# Variant filename conventions:
+#   raw                 -> ``<safe_model_id>.safetensors``
+#   SAE                 -> ``<safe_model_id>_sae-<release>.safetensors``
+#   transferred (v1.6)  -> ``<safe_model_id>_from-<safe_src>.safetensors``
+#
+# The literals ``_sae-`` and ``_from-`` are the separators — no HF model id
+# slug contains either, and the right-hand-side slugs (release strings,
+# safe-model-ids) follow the same ``[a-z0-9._-]`` discipline so the parse
+# is unambiguous.  Adding more variant kinds means adding another entry to
+# ``_VARIANT_SEPARATORS`` and another ``safe_*_suffix`` constructor.
+_VARIANT_SEP_SAE = "_sae-"
+_VARIANT_SEP_FROM = "_from-"
+_VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
+    (_VARIANT_SEP_SAE, "sae"),
+    (_VARIANT_SEP_FROM, "from"),
+)
+# Back-compat: the old single-separator alias many callers already
+# imported.  Kept identical to the SAE form because that's what every
+# external caller meant when they reached for it pre-1.6.
+_VARIANT_SEP = _VARIANT_SEP_SAE
 _UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
 
 
@@ -50,33 +66,101 @@ def model_dir(model_id: str) -> Path:
 
 
 def safe_variant_suffix(release: str | None) -> str:
-    """Render the filename suffix for a variant. ``None``/``""`` = raw (no suffix)."""
+    """Render the SAE filename suffix.  ``None``/``""`` = raw (no suffix).
+
+    Kept for back-compat with callers that pre-date the v1.6 transfer
+    variant.  New code should prefer :func:`safe_sae_suffix` for SAE or
+    :func:`safe_from_suffix` for transferred profiles.
+    """
     if not release:
         return ""
     slug = _UNSAFE_VARIANT_CHARS.sub("_", release.lower())
-    return f"{_VARIANT_SEP}{slug}"
+    return f"{_VARIANT_SEP_SAE}{slug}"
 
 
-def tensor_filename(model_id: str, *, release: str | None = None) -> str:
-    """Construct the canonical tensor filename for a (model, variant) pair."""
-    return f"{safe_model_id(model_id)}{safe_variant_suffix(release)}.safetensors"
+def safe_sae_suffix(release: str | None) -> str:
+    """Filename suffix for an SAE variant.  ``None``/``""`` = raw."""
+    return safe_variant_suffix(release)
 
 
-def sidecar_filename(model_id: str, *, release: str | None = None) -> str:
+def safe_from_suffix(source_safe_id: str | None) -> str:
+    """Filename suffix for a transferred-profile variant.
+
+    Input is a *safe model id* (already passed through :func:`safe_model_id`)
+    so the slug is byte-stable across operating systems.  Returns the
+    empty string for ``None`` / empty (no transfer = raw).
+    """
+    if not source_safe_id:
+        return ""
+    slug = _UNSAFE_VARIANT_CHARS.sub("_", source_safe_id.lower())
+    return f"{_VARIANT_SEP_FROM}{slug}"
+
+
+def tensor_filename(
+    model_id: str,
+    *,
+    release: str | None = None,
+    transferred_from: str | None = None,
+) -> str:
+    """Construct the canonical tensor filename.
+
+    Exactly one of ``release`` and ``transferred_from`` may be set —
+    SAE-on-transferred and transferred-on-SAE are not supported as
+    composed variants in v1.6.  ``transferred_from`` accepts either an
+    HF model id (``"google/gemma-3-4b-it"``) or its safe form
+    (``"google__gemma-3-4b-it"``); both flatten to the same slug.
+    """
+    if release and transferred_from:
+        raise ValueError(
+            "tensor_filename: release and transferred_from are mutually exclusive"
+        )
+    if release:
+        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.safetensors"
+    if transferred_from:
+        # Accept either form; ``safe_model_id`` is idempotent on
+        # already-safe ids (no '/' to replace), so callers can pass
+        # whichever they have.
+        src = safe_model_id(transferred_from)
+        return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.safetensors"
+    return f"{safe_model_id(model_id)}.safetensors"
+
+
+def sidecar_filename(
+    model_id: str,
+    *,
+    release: str | None = None,
+    transferred_from: str | None = None,
+) -> str:
     """Sidecar JSON partner for a tensor filename."""
-    return f"{safe_model_id(model_id)}{safe_variant_suffix(release)}.json"
+    if release and transferred_from:
+        raise ValueError(
+            "sidecar_filename: release and transferred_from are mutually exclusive"
+        )
+    if release:
+        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.json"
+    if transferred_from:
+        src = safe_model_id(transferred_from)
+        return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.json"
+    return f"{safe_model_id(model_id)}.json"
 
 
 def parse_tensor_filename(filename: str) -> tuple[str, str | None] | None:
-    """Reverse of :func:`tensor_filename`. Returns ``(safe_model_id, release)``.
+    """Reverse of :func:`tensor_filename`. Returns ``(safe_model_id, variant)``.
 
-    Returns ``None`` for filenames that aren't ``.safetensors``. Release is
-    ``None`` for raw-PCA filenames (no ``_sae-`` marker).
+    ``variant`` is one of:
+      * ``None`` — raw PCA tensor (no separator).
+      * ``"sae-<release>"`` — SAE variant.
+      * ``"from-<safe_src>"`` — transferred-from variant.
+
+    The variant string carries its kind prefix so callers can dispatch
+    without re-parsing.  Returns ``None`` for filenames that aren't
+    ``.safetensors``.
     """
     if not filename.endswith(".safetensors"):
         return None
     stem = filename[: -len(".safetensors")]
-    if _VARIANT_SEP in stem:
-        model, release = stem.split(_VARIANT_SEP, 1)
-        return model, release
+    for sep, kind in _VARIANT_SEPARATORS:
+        if sep in stem:
+            model, value = stem.split(sep, 1)
+            return model, f"{kind}-{value}"
     return stem, None

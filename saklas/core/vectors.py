@@ -235,6 +235,47 @@ def compute_layer_means(
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 
+def compute_neutral_activations(
+    model,
+    tokenizer,
+    layers,
+    device=None,
+) -> dict[int, torch.Tensor]:
+    """Per-layer ``[N, D]`` stack across the 90 neutral prompts.
+
+    Same forward-pass discipline as :func:`compute_layer_means` — last
+    non-special-token pooling, fp32, MPS-friendly.  Returns one stacked
+    tensor per layer (rows = prompts).  Used by cross-model alignment
+    (:func:`saklas.io.alignment.fit_alignment`) which needs paired
+    observations to fit Procrustes; the means alone (N=1) are degenerate
+    for that fit.
+
+    Storage cost: ~90 · n_layers · hidden_dim · 4B in fp32 (≈ 56MB on
+    a 4096-dim, 80-layer model).  Callers persist this through
+    :func:`saklas.io.alignment.load_or_compute_neutral_activations`.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    n_layers = len(layers)
+    rows: list[dict[int, torch.Tensor]] = []
+    _mps = device.type == "mps"
+
+    for text in _load_neutral_prompts():
+        per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
+        # Move each layer's vector to CPU before discarding the rest of
+        # the captured dict — same MPS discipline as ``compute_layer_means``.
+        rows.append({idx: per_layer[idx].detach().to("cpu") for idx in range(n_layers)})
+        del per_layer
+        if _mps:
+            torch.mps.empty_cache()
+
+    return {
+        idx: torch.stack([row[idx] for row in rows])  # (N, D), fp32 on cpu
+        for idx in range(n_layers)
+    }
+
+
 def _compute_layer_diagnostics(
     diff_matrix: torch.Tensor,
     principal_direction: torch.Tensor,
@@ -730,6 +771,17 @@ def save_profile(
         sidecar["components"] = metadata["components"]
     # SAE provenance — present only when extraction used an SAE backend.
     for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
+        if key in metadata:
+            sidecar[key] = metadata[key]
+    # Transfer provenance — present only on transferred profiles
+    # (method="procrustes_transfer").  ``alignment_map_hash`` pins the
+    # specific Procrustes fit; ``transfer_quality_estimate`` is the
+    # median per-layer R² across shared layers.
+    for key in (
+        "source_model_id",
+        "alignment_map_hash",
+        "transfer_quality_estimate",
+    ):
         if key in metadata:
             sidecar[key] = metadata[key]
     # Diagnostics: stringify layer keys so the JSON round-trips through
