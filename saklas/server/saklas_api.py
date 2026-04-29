@@ -877,10 +877,42 @@ def register_saklas_routes(app: FastAPI) -> None:
             return
         await websocket.accept()
 
+        # Single perpetual reader.  ``websocket.receive_json()`` is bound
+        # to a per-connection ``recv_in_progress`` flag in the underlying
+        # ``websockets`` library; cancelling a pending receive doesn't
+        # clear the flag immediately, so any handler that called
+        # ``receive_json()`` while another concurrent (even just-cancelled)
+        # caller was pending tripped a "cannot call recv while another
+        # coroutine is already waiting" RuntimeError.  Routing every
+        # incoming frame through one queue lets both the outer dispatch
+        # loop and the in-flight generation share the read side without
+        # ever overlapping calls into the WS.
+        incoming: asyncio.Queue = asyncio.Queue()
+        _DISCONNECT = object()
+
+        async def _reader():
+            try:
+                while True:
+                    msg = await websocket.receive_json()
+                    await incoming.put(msg)
+            except WebSocketDisconnect:
+                await incoming.put(_DISCONNECT)
+            except Exception as e:
+                # Surface any other read-side failure into the queue so
+                # the dispatcher can close cleanly instead of leaking.
+                await incoming.put({"_reader_error": str(e), "_type": type(e).__name__})
+
+        reader_task = asyncio.create_task(_reader())
+
         try:
             while True:
-                msg = await websocket.receive_json()
-                mtype = msg.get("type")
+                msg = await incoming.get()
+                if msg is _DISCONNECT:
+                    raise WebSocketDisconnect(code=1000)
+                if isinstance(msg, dict) and "_reader_error" in msg:
+                    raise RuntimeError(msg["_reader_error"])
+
+                mtype = msg.get("type") if isinstance(msg, dict) else None
                 if mtype == "generate":
                     try:
                         parsed = WSGenerateMessage(**msg)
@@ -892,7 +924,8 @@ def register_saklas_routes(app: FastAPI) -> None:
                         })
                         continue
                     await _ws_handle_generate(
-                        websocket, session, parsed, app.state.default_steering,
+                        websocket, session, parsed,
+                        app.state.default_steering, incoming,
                     )
                 elif mtype == "stop":
                     # Idle-state stop: nothing in flight.
@@ -922,6 +955,15 @@ def register_saklas_routes(app: FastAPI) -> None:
                     await websocket.close(code=1011)
                 except Exception:
                     pass
+        finally:
+            # Reader holds the only ``receive_json()`` call on the WS.
+            # Cancel + await so the cancellation propagates fully before
+            # the connection tears down.
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 async def _ws_handle_generate(
@@ -929,6 +971,7 @@ async def _ws_handle_generate(
     session: SaklasSession,
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
+    incoming: asyncio.Queue,
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
@@ -936,16 +979,20 @@ async def _ws_handle_generate(
     worker thread via ``asyncio.to_thread``.  Its ``on_token`` callback
     is invoked on the worker thread; it bridges into the asyncio loop by
     calling ``loop.call_soon_threadsafe(queue.put_nowait, event)``.  The
-    main coroutine races two tasks: one pulls ``TokenEvent``s from the
-    queue and forwards them as ``{type: "token", ...}`` frames; the other
-    awaits the next client frame so an incoming ``{type: "stop"}`` can
-    call ``session.stop()`` without blocking on the token loop.
+    main coroutine races two tasks: one pulls ``TokenEvent``s from a
+    local queue and forwards them as ``{type: "token", ...}`` frames;
+    the other pulls client frames from the shared ``incoming`` queue
+    (populated by the connection's single reader task) so an in-flight
+    ``{type: "stop"}`` can call ``session.stop()`` without blocking on
+    the token loop.
 
     ``asyncio.wait(..., FIRST_COMPLETED)`` is used in a loop: whenever
-    the recv task returns a stop frame we signal the session and keep
+    the incoming task returns a stop frame we signal the session and keep
     draining tokens until the worker joins; whenever the queue delivers
     a sentinel we finish.  The WS stays open across generate turns — a
-    client can submit ``{type: "generate", ...}`` again after ``done``.
+    client can submit ``{type: "generate", ...}`` again after ``done``,
+    and the perpetual reader keeps feeding the shared queue between
+    turns so we never have two ``receive_json()`` calls in flight.
     """
     loop = asyncio.get_running_loop()
     generation_id = uuid.uuid4().hex[:12]
@@ -1016,47 +1063,67 @@ async def _ws_handle_generate(
 
         worker_task = asyncio.create_task(asyncio.to_thread(_worker))
 
-        recv_task: asyncio.Task | None = asyncio.create_task(websocket.receive_json())
+        # Race two queue reads — token frames from the worker and client
+        # frames from the connection's perpetual reader.  Neither side
+        # ever calls ``websocket.receive_json()`` directly, so the
+        # underlying ``recv_in_progress`` flag is owned by the reader
+        # task alone for the connection's lifetime.
         done = False
         try:
             while not done:
-                get_task = asyncio.create_task(token_queue.get())
-                wait_for = {get_task}
-                if recv_task is not None:
-                    wait_for.add(recv_task)
+                token_get = asyncio.create_task(token_queue.get())
+                client_get = asyncio.create_task(incoming.get())
                 finished, _pending = await asyncio.wait(
-                    wait_for, return_when=asyncio.FIRST_COMPLETED,
+                    {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
                 )
-                if recv_task is not None and recv_task in finished:
-                    try:
-                        incoming = recv_task.result()
-                    except WebSocketDisconnect:
-                        session.stop()
-                        recv_task = None
-                    except Exception:
-                        recv_task = None
-                    else:
-                        if isinstance(incoming, dict) and incoming.get("type") == "stop":
+                if client_get in finished:
+                    incoming_msg = client_get.result()
+                    # ``_DISCONNECT`` / reader-error sentinels: signal
+                    # the worker to wind down; let the outer loop
+                    # propagate the disconnect on the next iteration.
+                    if isinstance(incoming_msg, dict):
+                        if incoming_msg.get("type") == "stop":
                             try:
                                 session.stop()
                             except Exception:
                                 pass
-                        recv_task = asyncio.create_task(websocket.receive_json())
-                if get_task in finished:
-                    item = get_task.result()
+                        elif "_reader_error" in incoming_msg:
+                            try:
+                                session.stop()
+                            except Exception:
+                                pass
+                            # Re-enqueue so the outer dispatch loop
+                            # surfaces the error after we wind down.
+                            await incoming.put(incoming_msg)
+                        else:
+                            # Out-of-band frame during a generation —
+                            # re-enqueue so the outer loop sees it after
+                            # this turn finishes.  Most likely an early
+                            # ``{type: "generate"}`` from a client that
+                            # didn't wait for ``done``.
+                            await incoming.put(incoming_msg)
+                    else:
+                        # Disconnect sentinel from the reader.
+                        try:
+                            session.stop()
+                        except Exception:
+                            pass
+                        await incoming.put(incoming_msg)
+                else:
+                    client_get.cancel()
+                if token_get in finished:
+                    item = token_get.result()
                     if item is _SENTINEL:
                         done = True
                     else:
                         await websocket.send_json(item)
                 else:
-                    get_task.cancel()
+                    token_get.cancel()
         finally:
             # Drain any residual events the worker pushed between sentinel
             # and join — should be none because the sentinel is last, but
             # cheap insurance.
             await worker_task
-            if recv_task is not None and not recv_task.done():
-                recv_task.cancel()
 
         if error_holder and not result_holder:
             exc = error_holder[0]
