@@ -814,10 +814,19 @@ def register_saklas_routes(app: FastAPI) -> None:
         from saklas.core.histogram import HIST_BUCKETS, bucketize
 
         _resolve_session_id(session, session_id)
-        vectors = session.vectors
-        if name not in vectors:
-            raise HTTPException(404, f"vector '{name}' not found")
-        profile = vectors[name]
+        # Probes and steering vectors share the Profile shape but live in
+        # different registries — session.vectors holds steering profiles,
+        # session._monitor.profiles holds probe profiles.  The diagnostics
+        # endpoint serves either; the WHY histogram in the web UI's probe
+        # rack hits this for every active probe.
+        profile = session.vectors.get(name)
+        if profile is None:
+            try:
+                profile = session._monitor.profiles.get(name)
+            except Exception:
+                profile = None
+        if profile is None:
+            raise HTTPException(404, f"vector or probe '{name}' not found")
 
         layer_mags: list[tuple[int, float]] = sorted(
             ((layer, float(vec.norm().item())) for layer, vec in profile.items()),
@@ -831,7 +840,9 @@ def register_saklas_routes(app: FastAPI) -> None:
             for lo, hi, mag in buckets
         ]
 
-        diagnostics = profile.diagnostics  # None when extracted pre-1.6
+        # ``diagnostics`` is a Profile attribute; probe profiles are raw
+        # ``dict[int, Tensor]`` and don't carry it.  ``getattr`` covers both.
+        diagnostics = getattr(profile, "diagnostics", None)
         payload: dict[str, Any] = {
             "name": name,
             "model": session.model_id,

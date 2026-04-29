@@ -490,6 +490,8 @@ export interface PendingAction {
 export type DrawerName =
   | "extract"
   | "load"
+  | "vector_picker"
+  | "probe_picker"
   | "save_conversation"
   | "load_conversation"
   | "compare"

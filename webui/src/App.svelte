@@ -124,6 +124,10 @@
             <Drawers.Extract params={drawerState.params} />
           {:else if drawerState.open === "load"}
             <Drawers.Load params={drawerState.params} />
+          {:else if drawerState.open === "vector_picker"}
+            <Drawers.VectorPicker params={drawerState.params} />
+          {:else if drawerState.open === "probe_picker"}
+            <Drawers.ProbePicker params={drawerState.params} />
           {:else if drawerState.open === "save_conversation"}
             <Drawers.SaveConversation params={drawerState.params} />
           {:else if drawerState.open === "load_conversation"}
@@ -206,11 +210,16 @@
     display: flex;
     flex-direction: column;
   }
+  /* Three-row grid: steering rack, probe rack, reference collapsibles
+   * (auto height so they expand without fighting the racks for space).
+   * No overflow at this level — each rack handles its own internal
+   * scroll so its actions row stays anchored at the bottom. */
   .rack-zone {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-rows: 1fr 1fr auto;
     gap: 0.6em;
-    overflow-y: auto;
+    min-height: 0;
+    overflow: hidden;
   }
 
   /* Drawer host — slides in from the right over the rack zone.  Backdrop

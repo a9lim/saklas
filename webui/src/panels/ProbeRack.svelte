@@ -50,11 +50,7 @@
   }
 
   function onAddProbe(): void {
-    // TODO(phase-9): introduce a dedicated "probe_picker" DrawerName +
-    // drawer that lists /probes/defaults for one-click activation.  For
-    // now route through extract — it's the next-best fit (creating a new
-    // probe by extracting a vector also auto-registers + activates).
-    openDrawer("extract");
+    openDrawer("probe_picker");
   }
 </script>
 
@@ -134,38 +130,44 @@
   <div class="actions">
     <button
       type="button"
-      class="add"
+      class="add primary"
       onclick={onAddProbe}
-      title="Add a probe — extract a new concept and auto-register"
+      title="Pick a concept to monitor — TUI-style /probe"
     >
-      + add probe
+      + probe
     </button>
   </div>
 </section>
 
 <style>
+  /* Three-row internal grid: header + highlight bar (auto), scrollable
+   * strips (1fr), actions row (auto).  Steers symmetric with SteeringRack. */
   .rack {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
     gap: 0.4em;
-    padding: 0.5em;
+    padding: var(--panel-pad);
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 4px;
-    min-height: 7em;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .header {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     justify-content: space-between;
     border-bottom: 1px solid var(--border-dim);
     padding-bottom: 0.3em;
   }
+  /* Match SteeringRack's title — bold accent-blue so the two racks look
+   * like siblings, not strangers. */
   .title {
-    color: var(--fg-subtle);
+    font-weight: bold;
+    color: var(--accent-blue);
     font-size: 0.85em;
-    letter-spacing: 0.1em;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
   }
   .sort {
@@ -221,11 +223,16 @@
     accent-color: var(--accent-blue);
   }
 
+  /* Strips own the scroll inside the rack — with 24 auto-loaded probes
+   * the list overflows the rack viewport, but the actions row stays
+   * anchored at the bottom. */
   .strips {
     display: flex;
     flex-direction: column;
     gap: 0.25em;
     min-height: 0;
+    overflow-y: auto;
+    padding-right: 0.2em;
   }
   .empty {
     color: var(--fg-muted);
@@ -236,22 +243,35 @@
     border-radius: 3px;
   }
 
+  /* Anchored at the bottom — same border-top + padding as SteeringRack
+   * so the two racks read as visual siblings. */
   .actions {
     display: flex;
-    gap: 0.3em;
-    padding-top: 0.2em;
+    gap: 0.4em;
+    border-top: 1px solid var(--border-dim);
+    padding-top: 0.4em;
   }
   .add {
+    flex: 1 1 100%;
     background: transparent;
     color: var(--fg-strong);
     border: 1px solid var(--border);
-    padding: 0.25em 0.7em;
+    padding: 0.3em 0.6em;
     border-radius: 3px;
     font-size: 0.85em;
+    line-height: 1.3;
+    cursor: pointer;
   }
   .add:hover {
     background: var(--bg-elev);
     border-color: var(--accent-blue);
     color: var(--accent-blue);
+  }
+  .add.primary {
+    color: var(--accent-blue);
+    border-color: var(--accent-blue);
+  }
+  .add.primary:hover {
+    background: rgba(88, 166, 255, 0.1);
   }
 </style>
