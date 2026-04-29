@@ -1975,6 +1975,143 @@ class SaklasSession:
             if exc_holder and not result_holder:
                 raise exc_holder[0]
 
+    # -- Generation: batch + sweep --
+
+    def generate_batch(
+        self,
+        prompts: list,
+        *,
+        steering: "str | Steering | None" = None,
+        sampling: SamplingConfig | None = None,
+        thinking: bool | None = None,
+        stateless: bool = True,
+        raw: bool = False,
+        on_result: Callable[[int, GenerationResult], None] | None = None,
+    ) -> list[GenerationResult]:
+        """Run N prompts under the same steering, return results in order.
+
+        Wrapper-loop over the existing single-prompt generation path:
+        each prompt acquires the gen-lock, runs through ``_generate_core``,
+        releases.  The session's threading lock keeps concurrent
+        ``generate_batch`` calls from interleaving — they queue FIFO at
+        the per-call level, same as today's ``generate``.
+
+        Args mirror ``generate``.  ``stateless`` defaults to ``True``
+        (batch generation is overwhelmingly used for sweeps and evals
+        where conversational history would corrupt the comparison);
+        pass ``stateless=False`` if you genuinely want each prompt to
+        accumulate against the running history.
+
+        ``on_result(idx, result)`` fires after each completion — useful
+        for the server's SSE sweep endpoint, which streams per-result
+        events without waiting for the full batch.
+
+        Returns:
+            ``list[GenerationResult]`` aligned with ``prompts``.
+        """
+        if not isinstance(prompts, list) or not prompts:
+            raise ValueError("generate_batch: prompts must be a non-empty list")
+
+        results: list[GenerationResult] = []
+        for idx, prompt in enumerate(prompts):
+            r = self._generate_core(
+                prompt,
+                steering=steering,
+                sampling=sampling,
+                stateless=stateless,
+                raw=raw,
+                thinking=thinking,
+            )
+            results.append(r)
+            if on_result is not None:
+                on_result(idx, r)
+        return results
+
+    def generate_sweep(
+        self,
+        prompt,
+        sweep: dict[str, list[float]],
+        *,
+        base_steering: "str | Steering | None" = None,
+        sampling: SamplingConfig | None = None,
+        thinking: bool | None = None,
+        stateless: bool = True,
+        raw: bool = False,
+        on_result: Callable[[int, GenerationResult, dict[str, float]], None] | None = None,
+    ) -> list[GenerationResult]:
+        """Sweep a single prompt across a Cartesian product of alpha values.
+
+        ``sweep`` maps ``concept_name → [alpha_0, alpha_1, ...]``.  The
+        function generates one result per element of the product across
+        every concept's alpha list.  For a single-concept sweep
+        (``{"honest": [0.0, 0.3, 0.6]}``) you get three results; for
+        ``{"honest": [-0.4, 0.0, 0.4], "warm": [0.0, 0.3]}`` you get
+        six (3 × 2).
+
+        Each generation runs under the steering expression
+        ``base_steering + " + ".join(f"{α} {name}")``.  ``base_steering``
+        defaults to ``None`` so the swept alphas are the only steering;
+        pass a string to layer a fixed-alpha context underneath.
+
+        ``on_result(idx, result, alpha_values)`` fires per completion.
+        ``alpha_values`` is the ``{concept: alpha}`` dict that produced
+        this row — recorded on each result's ``applied_steering`` too,
+        but exposed here so SSE consumers don't have to re-parse the
+        expression.
+
+        Returns:
+            ``list[GenerationResult]`` in iteration order over the
+            product.  Each result's ``applied_steering`` carries the
+            canonical expression string for round-trip reproduction.
+        """
+        if not isinstance(sweep, dict) or not sweep:
+            raise ValueError("generate_sweep: sweep dict must be non-empty")
+        for name, alphas in sweep.items():
+            if not isinstance(alphas, (list, tuple)) or not alphas:
+                raise ValueError(
+                    f"generate_sweep: sweep['{name}'] must be a non-empty "
+                    f"list of alpha values"
+                )
+
+        # Cartesian product across concepts.  ``itertools.product``
+        # preserves the order of ``sweep.items()`` so the per-concept
+        # alpha lists in the output are predictable.
+        import itertools
+
+        concept_names = list(sweep.keys())
+        alpha_lists = [list(sweep[name]) for name in concept_names]
+
+        base_str: str | None
+        if base_steering is None:
+            base_str = None
+        elif isinstance(base_steering, str):
+            base_str = base_steering
+        else:
+            # Pre-built Steering — render through the canonical formatter
+            # so we can compose with new alpha terms via string concat.
+            base_str = str(base_steering)
+
+        results: list[GenerationResult] = []
+        for idx, combo in enumerate(itertools.product(*alpha_lists)):
+            alpha_values = dict(zip(concept_names, combo))
+            terms = [f"{alpha} {name}" for name, alpha in alpha_values.items()]
+            expr = " + ".join(terms)
+            if base_str:
+                expr = f"{base_str} + {expr}"
+
+            r = self._generate_core(
+                prompt,
+                steering=expr,
+                sampling=sampling,
+                stateless=stateless,
+                raw=raw,
+                thinking=thinking,
+            )
+            results.append(r)
+            if on_result is not None:
+                on_result(idx, r, alpha_values)
+        return results
+
     # -- Generation control --
 
     def stop(self) -> None:

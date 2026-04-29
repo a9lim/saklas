@@ -21,7 +21,7 @@ introduced this file — no aliases.
 
 from __future__ import annotations
 
-from saklas.server.app import ws_auth_ok
+from saklas.server.app import acquire_session_lock, ws_auth_ok
 
 import asyncio
 import json
@@ -103,6 +103,24 @@ class WSGenerateMessage(BaseModel):
     # Steering expression string (shared grammar); pole aliases resolve
     # inside session.steering().
     steering: str | None = None
+    sampling: WSSamplingParams | None = None
+    thinking: bool | None = None
+    stateless: bool = True
+    raw: bool = False
+
+
+class SweepRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/sweep``.
+
+    ``sweep`` maps concept name → list of alpha values.  Cartesian
+    product across concepts becomes one generation per row.
+    ``base_steering`` (optional) is a steering expression string
+    composed underneath each swept term so callers can hold a
+    fixed-alpha context while sweeping another concept.
+    """
+    prompt: Any
+    sweep: dict[str, list[float]]
+    base_steering: str | None = None
     sampling: WSSamplingParams | None = None
     thinking: bool | None = None
     stateless: bool = True
@@ -525,6 +543,161 @@ def register_saklas_routes(app: FastAPI) -> None:
         if requested:
             readings = {k: v for k, v in readings.items() if k in requested}
         return {"readings": {k: float(v) for k, v in readings.items()}}
+
+    # ----- Sweep: alpha grid over a single prompt --------------------------
+
+    @app.post("/saklas/v1/sessions/{session_id}/sweep")
+    async def run_sweep(session_id: str, req: SweepRequest, request: Request):
+        """SSE-streamed alpha sweep.
+
+        One result per Cartesian-product element across ``sweep[concept]``
+        alpha lists.  Held under ``acquire_session_lock`` for the full
+        sweep so concurrent endpoints queue FIFO (the sweep can be
+        long-running, the lock's 5-minute timeout still applies).
+
+        Emits ``data: {"type": "started", "sweep_id", "total"}``,
+        then ``data: {"type": "result", "idx", "alpha_values", "result"}``
+        per completion (result subset: text, finish_reason, usage,
+        applied_steering, readings means), then
+        ``data: {"type": "done", "sweep_id", "summary"}``.
+        """
+        _resolve_session_id(session, session_id)
+
+        # Pre-validate the sweep dict so the SSE start event reports
+        # ``total`` accurately and so a bad request fails before any
+        # gen acquires the lock.  ``generate_sweep`` would raise the
+        # same way, but the SSE caller never sees the exception cleanly.
+        if not req.sweep:
+            raise HTTPException(400, "sweep dict must be non-empty")
+        for name, alphas in req.sweep.items():
+            if not alphas:
+                raise HTTPException(400, f"sweep['{name}'] must be non-empty")
+
+        total = 1
+        for alphas in req.sweep.values():
+            total *= len(alphas)
+        sweep_id = uuid.uuid4().hex[:8]
+        sampling_cfg = _build_sampling(req.sampling)
+
+        # Drive ``generate_sweep`` in a worker thread; bridge per-result
+        # events to the asyncio queue this handler reads.
+        loop = asyncio.get_running_loop()
+        result_queue: asyncio.Queue = asyncio.Queue()
+        DONE = object()
+        ERROR = object()
+
+        def _emit_result(idx: int, result: Any, alpha_values: dict[str, float]) -> None:
+            # Subset the result to keep SSE payloads small; full hidden
+            # states / per-token logprobs aren't useful for a sweep
+            # consumer and can be reloaded out-of-band by replaying
+            # ``applied_steering``.
+            readings_summary: dict[str, float] = {}
+            try:
+                for probe_name, r in (getattr(result, "readings", {}) or {}).items():
+                    pg = getattr(r, "per_generation", None)
+                    val = pg[-1] if pg else getattr(r, "mean", 0.0)
+                    readings_summary[probe_name] = round(float(val), 6)
+            except Exception:
+                pass
+            payload = {
+                "idx": idx,
+                "alpha_values": {k: float(v) for k, v in alpha_values.items()},
+                "result": {
+                    "text": getattr(result, "text", ""),
+                    "token_count": int(getattr(result, "token_count", 0)),
+                    "tok_per_sec": float(getattr(result, "tok_per_sec", 0.0)),
+                    "elapsed": float(getattr(result, "elapsed", 0.0)),
+                    "finish_reason": getattr(result, "finish_reason", "stop"),
+                    "applied_steering": getattr(result, "applied_steering", None),
+                    "readings": readings_summary,
+                },
+            }
+            try:
+                loop.call_soon_threadsafe(result_queue.put_nowait, ("result", payload))
+            except Exception:
+                pass
+
+        def _worker() -> None:
+            try:
+                session.generate_sweep(
+                    req.prompt,
+                    req.sweep,
+                    base_steering=req.base_steering,
+                    sampling=sampling_cfg,
+                    thinking=req.thinking,
+                    stateless=req.stateless,
+                    raw=req.raw,
+                    on_result=_emit_result,
+                )
+                loop.call_soon_threadsafe(result_queue.put_nowait, (DONE, None))
+            except Exception as exc:
+                loop.call_soon_threadsafe(result_queue.put_nowait, (ERROR, exc))
+
+        async def event_generator():
+            async with acquire_session_lock(session) as acquired:
+                if not acquired:
+                    yield (
+                        f"data: {json.dumps({'type': 'error', 'message': 'session locked'})}"
+                        "\n\n"
+                    )
+                    return
+
+                yield (
+                    f"data: {json.dumps({'type': 'started', 'sweep_id': sweep_id, 'total': total})}"
+                    "\n\n"
+                )
+
+                fut = asyncio.get_running_loop().run_in_executor(None, _worker)
+                completed = 0
+                start = time.monotonic()
+                total_tokens = 0
+                try:
+                    while True:
+                        if await request.is_disconnected():
+                            session.stop()
+                            break
+                        try:
+                            tag, payload = await asyncio.wait_for(
+                                result_queue.get(), timeout=15.0,
+                            )
+                        except asyncio.TimeoutError:
+                            yield ": heartbeat\n\n"
+                            continue
+                        if tag == "result":
+                            completed += 1
+                            total_tokens += int(payload["result"].get("token_count", 0))
+                            yield (
+                                f"data: {json.dumps({'type': 'result', **payload})}"
+                                "\n\n"
+                            )
+                            continue
+                        if tag is DONE:
+                            elapsed = time.monotonic() - start
+                            tps = (total_tokens / elapsed) if elapsed > 0 else 0.0
+                            yield (
+                                f"data: {json.dumps({'type': 'done', 'sweep_id': sweep_id, 'summary': {'completed': completed, 'total': total, 'total_tokens': total_tokens, 'tok_per_sec': round(tps, 2), 'elapsed': round(elapsed, 3)}})}"
+                                "\n\n"
+                            )
+                            break
+                        if tag is ERROR:
+                            yield (
+                                f"data: {json.dumps({'type': 'error', 'message': str(payload)})}"
+                                "\n\n"
+                            )
+                            break
+                finally:
+                    # Wait for the worker to fully wind down so the gen
+                    # lock isn't released mid-generation.
+                    try:
+                        await fut
+                    except Exception:
+                        pass
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     # ----- Live traits SSE stream ------------------------------------------
 
