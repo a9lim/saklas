@@ -188,14 +188,17 @@ def _session_info(
 
 
 def _profile_to_json(name: str, profile: Profile) -> dict:
-    top = sorted(
-        ((idx, float(vec.norm().item())) for idx, vec in profile.items()),
-        key=lambda x: x[1], reverse=True,
-    )[:5]
+    layer_norms = [(idx, float(vec.norm().item())) for idx, vec in profile.items()]
+    top = sorted(layer_norms, key=lambda x: x[1], reverse=True)[:5]
+    # Full per-layer ||baked|| keyed by layer index — stringified for
+    # JSON-key compatibility, mirroring how diagnostics_by_layer round-trips.
+    # The web UI's LayerNorms panel consumes this directly.
+    per_layer_norms = {str(idx): round(mag, 6) for idx, mag in sorted(layer_norms)}
     return {
         "name": name,
         "layers": profile.layers,
         "top_layers": [{"layer": idx, "magnitude": round(m, 4)} for idx, m in top],
+        "per_layer_norms": per_layer_norms,
         "metadata": profile.metadata,
     }
 
@@ -430,6 +433,68 @@ def register_saklas_routes(app: FastAPI) -> None:
             raise HTTPException(400, f"file not found: {req.source_path}")
         session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
+
+    @app.get("/saklas/v1/sessions/{session_id}/correlation")
+    def correlation_matrix(session_id: str, names: str | None = None):
+        """N×N magnitude-weighted cosine matrix across loaded vectors.
+
+        Query: ``?names=a,b,c`` restricts the matrix to a subset; default
+        is every vector currently registered in the session.  Output:
+
+            {
+              "names": ["a", "b", ...],
+              "matrix": {"a": {"a": 1.0, "b": 0.42, ...}, ...},
+              "layers_shared": {"a__b": 36, ...}
+            }
+
+        Used by the web UI's correlation panel — heavy compute lives
+        server-side so the client doesn't have to ship full per-layer
+        tensors over the wire.
+        """
+        _resolve_session_id(session, session_id)
+
+        all_vectors = session.vectors
+        if names is not None and names.strip():
+            requested = [n.strip() for n in names.split(",") if n.strip()]
+            missing = [n for n in requested if n not in all_vectors]
+            if missing:
+                raise HTTPException(404, f"vectors not loaded: {missing}")
+            ordered = requested
+        else:
+            ordered = sorted(all_vectors.keys())
+
+        matrix: dict[str, dict[str, float | None]] = {a: {} for a in ordered}
+        layers_shared: dict[str, int] = {}
+        for i, a in enumerate(ordered):
+            for j, b in enumerate(ordered):
+                if j < i:
+                    matrix[a][b] = matrix[b][a]
+                    continue
+                if i == j:
+                    matrix[a][b] = 1.0
+                    continue
+                try:
+                    # ``cosine_similarity`` without ``per_layer=`` returns
+                    # the magnitude-weighted aggregate ``float`` — narrow
+                    # explicitly because the method's union return type
+                    # is ``float | dict[int, float]``.
+                    cos = all_vectors[a].cosine_similarity(all_vectors[b])
+                    matrix[a][b] = (
+                        round(float(cos), 6) if isinstance(cos, (int, float)) else None
+                    )
+                except Exception:
+                    matrix[a][b] = None
+                shared = sorted(
+                    set(all_vectors[a].keys()) & set(all_vectors[b].keys())
+                )
+                # Pair key sorted alphabetically so a__b == b__a in the lookup.
+                key = "__".join(sorted([a, b]))
+                layers_shared[key] = len(shared)
+        return {
+            "names": ordered,
+            "matrix": matrix,
+            "layers_shared": layers_shared,
+        }
 
     @app.delete("/saklas/v1/sessions/{session_id}/vectors/{name}", status_code=204)
     def delete_vector(session_id: str, name: str):
@@ -892,12 +957,36 @@ async def _ws_handle_generate(
     _SENTINEL = object()
 
     def _on_token(text, is_thinking, tid, lp, top, perplexity=None):
-        event = {
+        event: dict[str, Any] = {
             "type": "token",
             "text": text,
             "thinking": bool(is_thinking),
             "token_id": int(tid) if tid is not None else None,
         }
+        # Per-layer × per-probe heatmap data for the inspector panel.
+        # Computed inline only when probes are loaded (covers the cost
+        # of N matmul + N CPU syncs against the latest captured hidden
+        # state).  Falls through silently when no capture exists yet
+        # (e.g. extremely short generations where the hook never fires).
+        try:
+            monitor = session._monitor
+            if monitor.probe_names:
+                latest_hidden = {
+                    layer_idx: bucket[-1]
+                    for layer_idx, bucket in session._capture._per_layer.items()
+                    if bucket
+                }
+                if latest_hidden:
+                    per_layer = monitor.score_single_token_per_layer(latest_hidden)
+                    if per_layer:
+                        event["per_layer_scores"] = {
+                            str(layer): {p: round(float(v), 6) for p, v in metrics.items()}
+                            for layer, metrics in per_layer.items()
+                        }
+        except Exception:
+            # Inspector data is best-effort — never let a failure here
+            # break the streaming token path.
+            pass
         loop.call_soon_threadsafe(token_queue.put_nowait, event)
 
     result_holder: list[GenerationResult] = []

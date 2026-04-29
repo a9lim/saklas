@@ -217,6 +217,56 @@ class TraitMonitor:
         """
         return self._score_probes(hidden_per_layer, accumulate=False)
 
+    def score_single_token_per_layer(
+        self,
+        hidden_per_layer: dict[int, torch.Tensor],
+    ) -> dict[int, dict[str, float]]:
+        """Per-layer × per-probe cosine scores for a single token.
+
+        Same input shape as :meth:`score_single_token` but returns the
+        raw per-layer cosines instead of the magnitude-weighted aggregate.
+        Powers the web UI's per-token × per-layer × per-probe heatmap
+        inspector — surfaces what each probe was reading at each layer
+        for each generated token, not just the rolled-up score.
+
+        Output: ``{layer_idx: {probe_name: cosine}}``.  Layers absent
+        from the cache (no probe covers them) are omitted from the
+        output entirely; missing-probe entries land as 0.0 to keep the
+        per-layer dict shape stable.
+
+        Cost: one matmul per layer × one ``.cpu().tolist()`` per layer.
+        Heavier than the aggregate ``score_single_token`` (one matmul
+        total + one sync); only called when at least one WS subscriber
+        is consuming the per-layer payload.  Probe-key set is the union
+        of registered probes — same as the aggregate path.
+        """
+        if not hidden_per_layer or not self._raw_profiles:
+            return {}
+
+        device = next(iter(hidden_per_layer.values())).device
+        self._ensure_cache(device)
+        probe_keys = self._cache_probe_keys
+        if not probe_keys:
+            return {}
+
+        out: dict[int, dict[str, float]] = {}
+        for layer_idx, h in hidden_per_layer.items():
+            entry = self._layer_cache.get(layer_idx)
+            if entry is None:
+                continue
+            V, _W = entry  # V: (P, D) unit-normed
+            h_unit = self._normalize_hidden(layer_idx, h.float())
+            sims = (V @ h_unit).cpu().tolist()  # one sync per layer
+            out[layer_idx] = {
+                name: sims[i] for i, name in enumerate(probe_keys)
+            }
+            # Probes registered but not covering this layer fall to 0
+            # — keeps every layer's dict the same shape regardless of
+            # which subset of probes the layer's cache holds.
+            for name in self._raw_profiles:
+                out[layer_idx].setdefault(name, 0.0)
+        return out
+
     def measure(self, model, tokenizer, layers, text: str, device=None, accumulate: bool = True) -> dict[str, float]:
         """Run one forward pass over *text* and compute probe similarities.
 

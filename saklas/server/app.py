@@ -476,7 +476,9 @@ def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
 def create_app(session: SaklasSession,
                default_steering: "Steering | None" = None,
                cors_origins: list[str] | None = None,
-               api_key: str | None = None) -> FastAPI:
+               api_key: str | None = None,
+               *,
+               web: bool = False) -> FastAPI:
     app = FastAPI(
         title="saklas",
         description="OpenAI-compatible API with activation steering",
@@ -527,6 +529,15 @@ def create_app(session: SaklasSession,
 
     from saklas.server.saklas_api import register_saklas_routes
     register_saklas_routes(app)
+
+    # Mount the Svelte+Vite SPA dashboard last so its catch-all route
+    # doesn't shadow any of the API routes registered above.  Opt-in via
+    # ``--web`` on the CLI; production API deployments don't pay the
+    # static-files mount cost unless they ask for it.
+    if web:
+        from saklas.web import register_web_routes
+
+        register_web_routes(app)
 
     return app
 
