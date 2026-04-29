@@ -61,7 +61,31 @@ def test_tensor_filename_roundtrip_sae():
     name = paths.tensor_filename("google/gemma-2-2b-it", release="gemma-scope-2b-pt-res-canonical")
     assert name == "google__gemma-2-2b-it_sae-gemma-scope-2b-pt-res-canonical.safetensors"
     parsed = paths.parse_tensor_filename(name)
-    assert parsed == ("google__gemma-2-2b-it", "gemma-scope-2b-pt-res-canonical")
+    # parse_tensor_filename returns the kind-prefixed variant slug so
+    # callers can dispatch on prefix without re-detecting the kind.
+    assert parsed == ("google__gemma-2-2b-it", "sae-gemma-scope-2b-pt-res-canonical")
+
+
+def test_tensor_filename_roundtrip_from_transferred(monkeypatch):
+    # Transferred profiles ride the same variant-suffix machinery as SAE.
+    name = paths.tensor_filename(
+        "Qwen/Qwen2.5-7B-Instruct",
+        transferred_from="google/gemma-3-4b-it",
+    )
+    assert name == "Qwen__Qwen2.5-7B-Instruct_from-google__gemma-3-4b-it.safetensors"
+    parsed = paths.parse_tensor_filename(name)
+    assert parsed == ("Qwen__Qwen2.5-7B-Instruct", "from-google__gemma-3-4b-it")
+
+
+def test_tensor_filename_rejects_double_variant():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="mutually exclusive"):
+        paths.tensor_filename(
+            "Qwen/Qwen2.5-7B-Instruct",
+            release="gemma-scope-2b-pt-res-canonical",
+            transferred_from="google/gemma-3-4b-it",
+        )
 
 
 def test_parse_tensor_filename_rejects_non_safetensors():
@@ -74,3 +98,15 @@ def test_sidecar_filename_partners_tensor():
     assert paths.sidecar_filename(
         "google/gemma-2-2b-it", release="gemma-scope-2b-pt-res-canonical",
     ) == "google__gemma-2-2b-it_sae-gemma-scope-2b-pt-res-canonical.json"
+    assert paths.sidecar_filename(
+        "Qwen/Qwen2.5-7B-Instruct",
+        transferred_from="google/gemma-3-4b-it",
+    ) == "Qwen__Qwen2.5-7B-Instruct_from-google__gemma-3-4b-it.json"
+
+
+def test_safe_from_suffix_slugs_unsafe_chars():
+    # Source ids are usually already safe (since the caller passes the
+    # safe form), but the helper is defensively idempotent on slashes.
+    assert paths.safe_from_suffix(None) == ""
+    assert paths.safe_from_suffix("") == ""
+    assert paths.safe_from_suffix("google__gemma-3-4b-it") == "_from-google__gemma-3-4b-it"

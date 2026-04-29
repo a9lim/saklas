@@ -378,7 +378,7 @@ def _sidecar_stem_to_hf_coord(stem: str) -> Optional[str]:
     parsed = parse_tensor_filename(f"{stem}.safetensors")
     if parsed is None:
         return None
-    safe_model, _release = parsed
+    safe_model, _variant = parsed
     return safe_model.replace("__", "/")
 
 
@@ -496,8 +496,8 @@ def push_pack(
         parsed = parse_tensor_filename(rel)
         if parsed is None:
             return None
-        _m, release = parsed
-        return "raw" if release is None else f"sae-{release}"
+        _m, variant_slug = parsed
+        return "raw" if variant_slug is None else variant_slug
 
     def _variant_matches(key: str) -> bool:
         if variant == "all":
@@ -506,6 +506,12 @@ def push_pack(
             return key == "raw"
         if variant == "sae":
             return key.startswith("sae-")
+        if variant == "from":
+            # Transferred-from variants are not currently sharable via
+            # ``pack push`` (the alignment map is local), but the key
+            # filter is provided for parity with raw/sae so a future
+            # release can opt in without changing this site.
+            return key.startswith("from-")
         return False
 
     cf = ConceptFolder.load(folder)  # runs integrity check
@@ -536,10 +542,10 @@ def push_pack(
                 parsed = parse_tensor_filename(tensor_rel)
                 if parsed is None:
                     continue
-                file_model, release = parsed
+                file_model, variant_slug = parsed
                 if scope_safe is not None and file_model != scope_safe:
                     continue
-                vkey = "raw" if release is None else f"sae-{release}"
+                vkey = "raw" if variant_slug is None else variant_slug
                 if not _variant_matches(vkey):
                     continue
             src = folder / rel
