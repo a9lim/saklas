@@ -167,19 +167,11 @@
   <div class="actions">
     <button
       type="button"
-      class="action"
-      onclick={() => openDrawer("extract")}
-      title="Extract a new vector from a concept name or pos/neg pair"
+      class="action primary"
+      onclick={() => openDrawer("vector_picker")}
+      title="Pick a concept to steer with — TUI-style /steer"
     >
-      + extract
-    </button>
-    <button
-      type="button"
-      class="action"
-      onclick={() => openDrawer("load")}
-      title="Load a vector from an on-disk path"
-    >
-      + load
+      + steer
     </button>
   </div>
 
@@ -241,15 +233,20 @@
 </section>
 
 <style>
+  /* Four-row internal grid: header, scrollable strips, actions row,
+   * paste-edit expression block.  The strips row owns the only flexible
+   * track so the actions + expression stay anchored at the bottom even
+   * with 24+ vectors loaded. */
   .rack {
-    display: flex;
-    flex-direction: column;
-    gap: 0.6em;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+    gap: 0.5em;
     padding: var(--panel-pad);
     border: 1px solid var(--border);
     border-radius: 4px;
     background: var(--bg);
-    min-height: 7em;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .header {
@@ -265,16 +262,22 @@
     color: var(--accent-blue);
     letter-spacing: 0.08em;
     font-size: 0.85em;
+    text-transform: uppercase;
   }
   .count {
     color: var(--fg-muted);
     font-size: var(--font-size-small);
   }
 
+  /* Strips own the scroll — overflow at the rack level would push the
+   * actions + expression block off-screen when vectors pile up. */
   .strips {
     display: flex;
     flex-direction: column;
     gap: 0.3em;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 0.2em;
   }
   .empty {
     color: var(--fg-muted);
@@ -285,12 +288,16 @@
     border-radius: 3px;
   }
 
+  /* Anchored at the bottom of the rack (above the expression block).
+   * Border-top mirrors the probe rack's actions row for visual symmetry. */
   .actions {
     display: flex;
     gap: 0.4em;
+    border-top: 1px solid var(--border-dim);
+    padding-top: 0.4em;
   }
   .action {
-    flex: 1 1 50%;
+    flex: 1 1 100%;
     background: transparent;
     color: var(--fg-strong);
     border: 1px solid var(--border);
@@ -298,11 +305,19 @@
     border-radius: 3px;
     font-size: 0.85em;
     line-height: 1.3;
+    cursor: pointer;
   }
   .action:hover {
     background: var(--bg-elev);
     border-color: var(--accent-blue);
     color: var(--accent-blue);
+  }
+  .action.primary {
+    color: var(--accent-blue);
+    border-color: var(--accent-blue);
+  }
+  .action.primary:hover {
+    background: rgba(88, 166, 255, 0.1);
   }
 
   .expression-block {

@@ -228,7 +228,7 @@ export const apiSessions = {
     }>,
     id: string = SESSION,
   ): Promise<SessionInfo> {
-    return request(SESSION_BASE(id), { method: "PATCH", ...jsonBody(body) });
+    return request(SESSION_BASE(id), { ...jsonBody(body), method: "PATCH" });
   },
   delete(id: string = SESSION): Promise<void> {
     return request<void>(SESSION_BASE(id), { method: "DELETE" });
