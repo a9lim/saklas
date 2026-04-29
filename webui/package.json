@@ -1,0 +1,22 @@
+{
+  "name": "saklas-webui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Svelte+Vite source for the saklas analytics dashboard. `npm run build` emits to ../saklas/web/dist/.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^3.0.0",
+    "@tsconfig/svelte": "^5.0.0",
+    "svelte": "^4.2.0",
+    "svelte-check": "^3.6.0",
+    "tslib": "^2.6.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.4.0"
+  }
+}

@@ -10,10 +10,11 @@ Saklas is a library for activation steering and trait probing on local HuggingFa
 
 Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. The main feature is a terminal UI with live steering controls and a built-in trait monitor that scores every generated token against any probe you care about, with live averages and sparklines so you can see where in a response a trait shifts. There's also an HTTP server that supports both OpenAI `/v1/*` and Ollama `/api/*` on the same port so Open WebUI, Enchanted, or any other OpenAI/Ollama client can talk to a steered model without changes. Persona cloning works on any text sample: point it at a corpus and it pulls out a voice/style vector without hand-labeled pairs.
 
-Three ways to use it:
+Four ways to use it:
 
 - **`saklas tui <model>`**: Terminal UI
 - **`saklas serve <model>`**: HTTP server compatible with both OpenAI and Ollama
+- **`saklas serve --web <model>`**: HTTP server plus an analytics dashboard at `/`
 - **`SaklasSession`**: Python API
 
 It runs on CUDA and Apple Silicon MPS. The full TUI has been tested to run comfortably on a MacBook. CPU does work but it's slow. Tested on Qwen, Gemma, Ministral, gpt-oss, Llama, and GLM. A lot more architectures are wired up in `saklas/core/model.py:_LAYER_ACCESSORS` but have not been tested; if you try one, please let me know how it went.
@@ -66,8 +67,10 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it") as s:
 ```bash
 pip install saklas             # library + TUI
 pip install saklas[serve]      # + FastAPI/uvicorn for the API server
+pip install saklas[web]        # + the same deps as serve, plus the dashboard mount
 pip install saklas[gguf]       # + gguf package for llama.cpp interchange
 pip install saklas[research]   # + datasets/pandas for dataset loading and DataFrames
+pip install saklas[notebook]   # + plotly/pandas/kaleido for Jupyter figure helpers
 pip install saklas[sae]        # + sae-lens for SAE-backed extraction
 ```
 
@@ -165,6 +168,18 @@ One caveat on custom axes: when the two poles are asymmetric — one specific an
 ### Trait monitor
 
 While generating, saklas records the hidden state at every probe layer and every step. They are mean-centered against a neutral baseline and then scored by weighted cosine similarity against every active probe. You can see the history as a sparkline in the TUI; in the library you get `result.readings` as a dict of `ProbeReadings`.
+
+### Cross-model probe transfer
+
+Probes are extracted per (model, concept). To use a probe extracted on one model with a different model, run `saklas vector transfer --from SRC --to TGT NAME`. Saklas computes neutral activations on both models, fits a per-layer Procrustes alignment between them, and writes a transferred tensor at the target's `_from-<safe_src>` variant path. Transferred profiles coexist with native ones — `/steer 0.3 angry:from-google__gemma-3-4b-it` picks the transferred variant explicitly when both exist.
+
+The transfer carries a `transfer_quality_estimate` in its sidecar (median per-layer R² across shared layers). Values near 1.0 mean the linear map captures the cross-model geometry; values below 0.5 mean transferred probes will be noisy. Visible in `pack ls -v` and the web UI.
+
+### Probe quality diagnostics
+
+Every contrastive extraction emits per-layer metrics — explained variance ratio, intra-pair variance, inter-pair alignment, diff-to-PC projection — alongside the tensor. `saklas vector why <concept> -m MODEL` shows them as a quality stoplight (`solid` / `shaky` / `poor`) below the layer histogram. A soft warning fires at extraction time when the median across layers looks degenerate (one-sided pairs or pairs that disagree on direction); the tensor still extracts, the warning just flags low-confidence probes.
+
+Bundled probes extracted before v1.6 don't carry diagnostics on disk. Run `saklas pack refresh <selector> -m MODEL` to backfill.
 
 ### Vector comparison
 
@@ -366,6 +381,43 @@ result.to_dict()
 ```
 
 ---
+
+## Web UI
+
+```bash
+pip install saklas[web]
+saklas serve --web google/gemma-3-4b-it
+```
+
+Open `http://localhost:8000/`. The dashboard is analytics-first: a persistent chat panel on the left drives generation, a per-token × per-layer × per-probe heatmap inspector occupies the center, and a probe correlation matrix plus a full-resolution layer-norms bar chart sit on the right. Every active probe lights up at every layer for every generated token, so you see *which* layers each probe responded to as the model spoke.
+
+The web UI is a Svelte+Vite single-page app that ships pre-built in the wheel. Source lives at `webui/`; `cd webui && npm run build` regenerates the bundle into `saklas/web/dist/` if you want to iterate on it.
+
+## Notebook helpers
+
+```bash
+pip install saklas[notebook]
+```
+
+```python
+from saklas import SaklasSession, ResultCollector
+from saklas.notebook import plot_alpha_sweep, plot_probe_correlation, plot_layer_norms, plot_trait_history
+
+with SaklasSession.from_pretrained("google/gemma-3-4b-it") as s:
+    results = s.generate_sweep("Describe a sunset.", sweep={"happy.sad": [-0.4, 0.0, 0.4]})
+    plot_alpha_sweep(ResultCollector.from_results(results)).show()
+```
+
+Four plotly figure builders: `plot_alpha_sweep`, `plot_probe_correlation`, `plot_layer_norms`, `plot_trait_history`. Each accepts the structured types saklas already returns (`ResultCollector`, `dict[str, Profile]`, `Profile`, `dict[str, ProbeReadings]`) and returns a plotly `Figure` you can render inline, export to HTML via `.write_html()`, or save as PNG via `.write_image()`. The `to_dataframe(...)` helper coerces results into pandas DataFrames for ad-hoc analysis.
+
+## Batched generation
+
+```python
+results = session.generate_batch(["What's a good day?", "Describe a sunset.", "Tell me a joke."], steering="0.4 cheerful")
+sweep = session.generate_sweep("Describe a rainy day.", sweep={"happy.sad": [-0.4, 0.0, 0.4]})
+```
+
+Both run under one steering setup, return ordered `list[GenerationResult]`. The HTTP server exposes `POST /saklas/v1/sessions/{id}/sweep` as an SSE stream for the same shape — useful for orchestrating sweeps over the network without repeatedly re-tokenizing.
 
 ## API server
 

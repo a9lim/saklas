@@ -241,7 +241,8 @@ def _run_serve(args: argparse.Namespace) -> None:
     from saklas.server import create_app
     app = create_app(session, default_steering=default_steering,
                      cors_origins=args.cors or None,
-                     api_key=getattr(args, "api_key", None))
+                     api_key=getattr(args, "api_key", None),
+                     web=getattr(args, "web", False))
 
     _warmup_session(session)
 

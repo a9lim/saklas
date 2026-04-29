@@ -92,6 +92,8 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
                         help="CORS allowed origin (repeatable)")
     parser.add_argument("-k", "--api-key", default=None, metavar="KEY",
                         help="Require Bearer token auth; falls back to $SAKLAS_API_KEY")
+    parser.add_argument("--web", action="store_true",
+                        help="Mount the Svelte+Vite analytics dashboard at /")
     _add_config_args(parser)
 
 
