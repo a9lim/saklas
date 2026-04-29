@@ -168,7 +168,7 @@ def main():
     # Extract contrastive PCA on French pairs, using the same ministral model
     print(f"[extract] contrastive PCA on {len(translated)} French pairs …", file=sys.stderr)
     layers = get_layers(model)
-    profile = extract_contrastive(model, tokenizer, translated, layers, device=device)
+    profile, _ = extract_contrastive(model, tokenizer, translated, layers, device=device)
 
     safe_mid = safe_model_id(args.model)
     baked_out = dst_dir / f"{safe_mid}.safetensors"

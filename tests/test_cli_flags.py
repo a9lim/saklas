@@ -649,8 +649,14 @@ def _setup_why_env(monkeypatch, tmp_path):
     return tmp_path / "vectors"
 
 
-def _mock_why_profile(layer_mags: dict):
-    """Return a duck-typed mock profile for _run_why (only needs .items() and len)."""
+def _mock_why_profile(layer_mags: dict, diagnostics: dict | None = None):
+    """Return a duck-typed mock profile for _run_why.
+
+    Carries the four surfaces ``_run_why`` reads: ``items()`` (per-layer
+    magnitudes), ``__len__`` (total layers), ``diagnostics``, and
+    ``has_diagnostics``.  Diagnostics default to ``None`` to mirror the
+    pre-1.6 sidecar shape.
+    """
     import torch
 
     class MockProfile:
@@ -659,6 +665,14 @@ def _mock_why_profile(layer_mags: dict):
 
         def __len__(self):
             return len(layer_mags)
+
+        @property
+        def diagnostics(self):
+            return diagnostics
+
+        @property
+        def has_diagnostics(self):
+            return diagnostics is not None and bool(diagnostics)
 
     return MockProfile()
 

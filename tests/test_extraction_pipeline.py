@@ -122,11 +122,13 @@ def _fake_extract(monkeypatch, *, response=None):
 
     captured: dict = {}
 
-    def _fake(model, tokenizer, pairs, layers, device=None, *, sae=None):
+    def _fake(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
         captured["pairs"] = pairs
         captured["sae"] = sae
+        captured["concept_label"] = concept_label
         captured["call_count"] = captured.get("call_count", 0) + 1
-        return response if response is not None else {0: torch.ones(4), 2: torch.ones(4)}
+        profile = response if response is not None else {0: torch.ones(4), 2: torch.ones(4)}
+        return profile, {}
 
     monkeypatch.setattr(E, "extract_contrastive", _fake)
     return captured

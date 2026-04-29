@@ -163,12 +163,18 @@ def bootstrap_probes(
     model_device = next(model.parameters()).device
     for name, cdir, ts, ds, stmts_path in progress(datasets_to_extract, desc="Extracting probes", unit="probe"):
         try:
-            profile = extract_contrastive(model, tokenizer, ds["pairs"], layers=layers)
+            profile, diagnostics = extract_contrastive(
+                model, tokenizer, ds["pairs"], layers=layers,
+                concept_label=f"default/{name}",
+            )
             probes[name] = profile
-            save_profile(profile, str(ts), {
+            save_meta: dict[str, Any] = {
                 "method": "contrastive_pca",
                 "statements_sha256": hash_file(stmts_path),
-            })
+            }
+            if diagnostics:
+                save_meta["diagnostics"] = diagnostics
+            save_profile(profile, str(ts), save_meta)
         except Exception as e:
             log.warning("Contrastive extraction failed for %s: %s", name, e)
         if model_device.type == "mps":

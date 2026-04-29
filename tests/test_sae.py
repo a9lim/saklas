@@ -144,7 +144,7 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch):
     layers_list = [object()] * 4
     sae = MockSaeBackend(layers=frozenset({1, 3}), d_model=8)
 
-    profile = V.extract_contrastive(
+    profile, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
@@ -183,7 +183,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
     layers_list = [object()] * 2
     sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
 
-    profile = V.extract_contrastive(
+    profile, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
@@ -254,7 +254,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
     layers_list = [object()] * 2
     sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
 
-    profile = V.extract_contrastive(
+    profile, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
@@ -450,7 +450,7 @@ def test_extract_contrastive_drop_edges_default_drops_two_each_end(monkeypatch):
         pass
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
-    profile = V.extract_contrastive(
+    profile, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,
         device=torch.device("cpu"),
     )
@@ -479,7 +479,7 @@ def test_extract_contrastive_drop_edges_zero_preserves_old_behavior(monkeypatch)
         pass
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
-    profile = V.extract_contrastive(
+    profile, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,
         device=torch.device("cpu"),
         drop_edges=(0, 0),
@@ -548,14 +548,14 @@ def test_extract_contrastive_drop_edges_asymmetric(monkeypatch):
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(3)]
 
-    profile_front = V.extract_contrastive(
+    profile_front, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,
         device=torch.device("cpu"),
         drop_edges=(3, 0),
     )
     assert set(profile_front.keys()) == set(range(3, N))
 
-    profile_back = V.extract_contrastive(
+    profile_back, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,
         device=torch.device("cpu"),
         drop_edges=(0, 3),
