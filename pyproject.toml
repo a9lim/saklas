@@ -68,6 +68,7 @@ gguf = ["gguf>=0.10"]
 pandas = ["pandas>=3.0.2"]
 research = ["datasets>=2.0", "pandas>=3.0.2"]
 sae = ["sae-lens>=6.0,<7.0"]
+notebook = ["plotly>=5.0", "pandas>=3.0.2", "kaleido>=0.2"]
 
 [project.scripts]
 saklas = "saklas.cli.main:main"
