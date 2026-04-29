@@ -332,33 +332,47 @@ def _build_root_parser() -> argparse.ArgumentParser:
         prog="saklas",
         description="Activation steering + trait monitoring for local HuggingFace models",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "top-level verbs:\n"
-            "  tui      Launch the interactive TUI (requires <model>)\n"
-            "  serve    Start the OpenAI + Ollama compatible API server\n"
-            "  pack     Manage concept packs (install/ls/search/push/...)\n"
-            "  vector   Vector operations (extract/merge/clone/compare/why)\n"
-            "  config   Inspect and validate saklas config files\n"
-            "\n"
-            "Run `saklas <verb> -h` for verb-specific options."
-        ),
+        epilog="Run `saklas <verb> -h` for verb-specific options.",
     )
     sub = root.add_subparsers(dest="command", required=False, metavar="VERB")
 
-    tui = sub.add_parser("tui", help="Launch the interactive TUI", description="Launch the interactive TUI")
+    # Each ``help=`` here is the single source of truth — it lands in
+    # the auto-generated ``positional arguments`` table on ``saklas -h``.
+    # Keep it short enough to fit one line at the typical terminal
+    # width; the verb's own ``-h`` carries the long-form description.
+    tui = sub.add_parser(
+        "tui",
+        help="Launch the interactive TUI (requires <model>)",
+        description="Launch the interactive TUI",
+    )
     _build_tui_parser(tui)
 
-    serve = sub.add_parser("serve", help="Start the API server", description="Start the API server")
+    serve = sub.add_parser(
+        "serve",
+        help="Start the OpenAI + Ollama API server (--web mounts the dashboard)",
+        description="Start the OpenAI + Ollama compatible API server",
+    )
     _build_serve_parser(serve)
 
-    pack = sub.add_parser("pack", help="Manage concept packs", description="Manage concept packs")
+    pack = sub.add_parser(
+        "pack",
+        help="Manage concept packs (install/ls/search/push/refresh/...)",
+        description="Manage concept packs",
+    )
     _build_pack_parser(pack)
 
-    vector = sub.add_parser("vector", help="Vector operations",
-                               description="Vector operations (extract/merge/clone/compare/why)")
+    vector = sub.add_parser(
+        "vector",
+        help="Vector operations (extract/merge/clone/compare/why/transfer)",
+        description="Vector operations (extract/merge/clone/compare/why/transfer)",
+    )
     _build_vector_parser(vector)
 
-    cfg = sub.add_parser("config", help="Inspect/validate config", description="Inspect/validate config")
+    cfg = sub.add_parser(
+        "config",
+        help="Inspect and validate saklas config files",
+        description="Inspect/validate config",
+    )
     _build_config_parser(cfg)
 
     return root
