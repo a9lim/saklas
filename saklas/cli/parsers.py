@@ -92,8 +92,9 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
                         help="CORS allowed origin (repeatable)")
     parser.add_argument("-k", "--api-key", default=None, metavar="KEY",
                         help="Require Bearer token auth; falls back to $SAKLAS_API_KEY")
-    parser.add_argument("--web", action="store_true",
-                        help="Mount the Svelte+Vite analytics dashboard at /")
+    parser.add_argument("--no-web", dest="no_web", action="store_true",
+                        help="Skip the analytics dashboard mount at / "
+                             "(API-only mode for production / proxied deployments)")
     _add_config_args(parser)
 
 
@@ -349,7 +350,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser(
         "serve",
-        help="Start the OpenAI + Ollama API server (--web mounts the dashboard)",
+        help="Start the OpenAI + Ollama API server + analytics dashboard at /",
         description="Start the OpenAI + Ollama compatible API server",
     )
     _build_serve_parser(serve)

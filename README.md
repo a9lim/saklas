@@ -10,11 +10,10 @@ Saklas is a library for activation steering and trait probing on local HuggingFa
 
 Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. The main feature is a terminal UI with live steering controls and a built-in trait monitor that scores every generated token against any probe you care about, with live averages and sparklines so you can see where in a response a trait shifts. There's also an HTTP server that supports both OpenAI `/v1/*` and Ollama `/api/*` on the same port so Open WebUI, Enchanted, or any other OpenAI/Ollama client can talk to a steered model without changes. Persona cloning works on any text sample: point it at a corpus and it pulls out a voice/style vector without hand-labeled pairs.
 
-Four ways to use it:
+Three ways to use it:
 
 - **`saklas tui <model>`**: Terminal UI
-- **`saklas serve <model>`**: HTTP server compatible with both OpenAI and Ollama
-- **`saklas serve --web <model>`**: HTTP server plus an analytics dashboard at `/`
+- **`saklas serve <model>`**: HTTP server compatible with both OpenAI and Ollama, with an analytics dashboard mounted at `/` (pass `--no-web` for API-only mode)
 - **`SaklasSession`**: Python API
 
 It runs on CUDA and Apple Silicon MPS. The full TUI has been tested to run comfortably on a MacBook. CPU does work but it's slow. Tested on Qwen, Gemma, Ministral, gpt-oss, Llama, and GLM. A lot more architectures are wired up in `saklas/core/model.py:_LAYER_ACCESSORS` but have not been tested; if you try one, please let me know how it went.
@@ -386,10 +385,12 @@ result.to_dict()
 
 ```bash
 pip install saklas[web]
-saklas serve --web google/gemma-3-4b-it
+saklas serve google/gemma-3-4b-it
 ```
 
 Open `http://localhost:8000/`. The dashboard is analytics-first: a persistent chat panel on the left drives generation, a per-token × per-layer × per-probe heatmap inspector occupies the center, and a probe correlation matrix plus a full-resolution layer-norms bar chart sit on the right. Every active probe lights up at every layer for every generated token, so you see *which* layers each probe responded to as the model spoke.
+
+The dashboard mounts by default on every `saklas serve`. Pass `--no-web` for API-only mode (production / proxied deployments where `/` already belongs to something else).
 
 The web UI is a Svelte+Vite single-page app that ships pre-built in the wheel. Source lives at `webui/`; `cd webui && npm run build` regenerates the bundle into `saklas/web/dist/` if you want to iterate on it.
 

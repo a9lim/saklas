@@ -1,6 +1,6 @@
 # web/
 
-Static analytics dashboard mounted at `/` when `saklas serve --web` is passed.  Opt-in only — production API deployments don't pay the StaticFiles mount cost unless they ask for it.
+Static analytics dashboard mounted at `/` by default when `saklas serve` runs.  Opt out with `--no-web` for production / proxied deployments where `/` already belongs to something else.  Library callers using `create_app(..., web=False)` directly default-off — only the CLI presumes the casual-user UX.
 
 ## Layout
 
@@ -18,7 +18,7 @@ The Svelte+Vite source lives at the repo's `webui/` directory (peer of `saklas/`
 
 ## Mount
 
-`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` for the bundled CSS/JS, registers `GET /` to return `index.html`, and a catch-all `GET /{full_path:path}` that serves real files when present and falls back to `index.html` for SPA-owned routes (`/lab`, `/chat`, ...).  Caller (`server.create_app(..., web=True)`) is expected to register the dashboard last so the catch-all doesn't shadow `/v1/*`, `/api/*`, `/saklas/v1/*`.
+`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` for the bundled CSS/JS, registers `GET /` to return `index.html`, and a catch-all `GET /{full_path:path}` that serves real files when present and falls back to `index.html` for SPA-owned routes (`/lab`, `/chat`, ...).  `server.create_app` registers the dashboard last so the catch-all doesn't shadow `/v1/*`, `/api/*`, `/saklas/v1/*`.  CLI default is `web=True` (the dashboard mounts on every `saklas serve` unless `--no-web` is passed); the library default is `web=False` so embedded API surfaces don't pick up the dashboard accidentally.
 
 `dist_path()` resolves the bundled assets through `importlib.resources` so it works for both editable and wheel installs.  `WebUINotBuilt` is raised on mount when the dist directory is empty — only fires in source-tree installs that haven't run `npm run build` yet.
 
