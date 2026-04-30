@@ -14,6 +14,7 @@
 // ``onWsMessage(cb)`` and receive every ``WSServerMessage`` the
 // connection emits.
 
+import { SvelteMap, SvelteSet } from "svelte/reactivity";
 import {
   apiSessions,
   apiVectors,
@@ -124,9 +125,14 @@ export interface VectorRack {
   correlation: CorrelationData | null;
 }
 
+// SvelteMap from svelte/reactivity — plain Map mutations don't trigger
+// Svelte 5 rune reactivity, so any rack add/remove or profile cache
+// update wouldn't re-render the strips list.  SvelteMap.set/.delete is
+// rune-tracked.  Inner-object property writes still aren't tracked, so
+// callers that mutate an entry must reassign via .set(name, {...e, …}).
 export const vectorRack: VectorRack = $state({
-  entries: new Map(),
-  profiles: new Map(),
+  entries: new SvelteMap(),
+  profiles: new SvelteMap(),
   correlation: null,
 });
 
@@ -162,11 +168,14 @@ export async function refreshCorrelation(
   }
 }
 
+// SvelteMap tracks .set/.delete; mutations on stored objects are NOT
+// tracked, so each setter reassigns the entry via .set with a fresh
+// spread.  This pattern is uniform across every rack mutator.
 export function setVectorAlpha(name: string, alpha: number): void {
   enqueueOrApply(`alpha ${name} ${alpha.toFixed(3)}`, () => {
     const e = vectorRack.entries.get(name);
     if (e) {
-      e.alpha = alpha;
+      vectorRack.entries.set(name, { ...e, alpha });
     } else {
       vectorRack.entries.set(name, defaultRackEntry(alpha));
     }
@@ -176,21 +185,21 @@ export function setVectorAlpha(name: string, alpha: number): void {
 export function setVectorEnabled(name: string, enabled: boolean): void {
   enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
     const e = vectorRack.entries.get(name);
-    if (e) e.enabled = enabled;
+    if (e) vectorRack.entries.set(name, { ...e, enabled });
   });
 }
 
 export function setVectorTrigger(name: string, trigger: Trigger): void {
   enqueueOrApply(`trigger ${name} ${trigger}`, () => {
     const e = vectorRack.entries.get(name);
-    if (e) e.trigger = trigger;
+    if (e) vectorRack.entries.set(name, { ...e, trigger });
   });
 }
 
 export function setVectorVariant(name: string, variant: Variant): void {
   enqueueOrApply(`variant ${name} ${variant}`, () => {
     const e = vectorRack.entries.get(name);
-    if (e) e.variant = variant;
+    if (e) vectorRack.entries.set(name, { ...e, variant });
   });
 }
 
@@ -201,10 +210,13 @@ export function setVectorProjection(
   enqueueOrApply(`project ${name}`, () => {
     const e = vectorRack.entries.get(name);
     if (e) {
-      e.projection = projection;
       // Ablation can't compose with projection — clear if a projection
       // was just set on top of an ablated entry.
-      if (projection) e.ablate = false;
+      vectorRack.entries.set(name, {
+        ...e,
+        projection,
+        ablate: projection ? false : e.ablate,
+      });
     }
   });
 }
@@ -213,15 +225,24 @@ export function setVectorAblate(name: string, ablate: boolean): void {
   enqueueOrApply(`ablate ${name} ${ablate}`, () => {
     const e = vectorRack.entries.get(name);
     if (e) {
-      e.ablate = ablate;
-      if (ablate) e.projection = null;
+      vectorRack.entries.set(name, {
+        ...e,
+        ablate,
+        projection: ablate ? null : e.projection,
+      });
     }
   });
 }
 
+/** Default α for a freshly-added rack entry — matches DEFAULT_COEFF in
+ * saklas.core.steering_expr (TUI's /steer assumes 0.5 when the user
+ * types a bare term).  α=0 would serialize to an empty expression and
+ * make the new strip invisible in the EXPR block. */
+const DEFAULT_RACK_ALPHA = 0.5;
+
 export function addVectorToRack(
   name: string,
-  alpha: number = 0,
+  alpha: number = DEFAULT_RACK_ALPHA,
   trigger: Trigger = "BOTH",
 ): void {
   if (vectorRack.entries.has(name)) return;
@@ -264,7 +285,7 @@ export interface ProbeRackState {
 }
 
 export const probeRack: ProbeRackState = $state({
-  entries: new Map(),
+  entries: new SvelteMap(),
   sortMode: "value",
   active: [],
 });
@@ -346,18 +367,24 @@ export function setProbeSortMode(mode: ProbeSortMode): void {
  * across long sessions. */
 const MAX_SPARKLINE = 60;
 export function updateProbeFromScores(scores: Record<string, number>): void {
+  // Reassign the entry on every score so the SvelteMap fires reactivity
+  // for whichever component reads ``current`` / ``sparkline`` — bare
+  // ``entry.current = val`` would update the in-memory object but the
+  // map's ``set``-tracked subscribers never see it, leaving probe
+  // strips frozen at zero throughout a generation.
   for (const [name, val] of Object.entries(scores)) {
-    let entry = probeRack.entries.get(name);
-    if (!entry) {
-      entry = { sparkline: [], current: 0, previous: 0 };
-      probeRack.entries.set(name, entry);
+    const prev = probeRack.entries.get(name);
+    const previous = prev?.current ?? 0;
+    const sparkline = prev ? prev.sparkline.slice() : [];
+    sparkline.push(val);
+    if (sparkline.length > MAX_SPARKLINE) {
+      sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
     }
-    entry.previous = entry.current;
-    entry.current = val;
-    entry.sparkline.push(val);
-    if (entry.sparkline.length > MAX_SPARKLINE) {
-      entry.sparkline.splice(0, entry.sparkline.length - MAX_SPARKLINE);
-    }
+    probeRack.entries.set(name, {
+      sparkline,
+      current: val,
+      previous,
+    });
   }
 }
 
@@ -365,8 +392,8 @@ export function updateProbeFromScores(scores: Record<string, number>): void {
  * — call after a generation lands so the next gen's deltas are computed
  * against the post-gen state, not mid-gen. */
 export function snapshotProbeBaseline(): void {
-  for (const e of probeRack.entries.values()) {
-    e.previous = e.current;
+  for (const [name, e] of probeRack.entries) {
+    probeRack.entries.set(name, { ...e, previous: e.current });
   }
 }
 
@@ -595,7 +622,7 @@ interface WsConnection {
 
 const wsConn: WsConnection = {
   socket: null,
-  listeners: new Set(),
+  listeners: new SvelteSet(),
   ready: null,
 };
 
