@@ -166,6 +166,24 @@ class TestWebMount:
         r = client.get("/")
         assert b'id="app"' not in r.content
 
+    def test_path_traversal_falls_back_to_index(self, web_client) -> None:
+        # The SPA fallback ``/{full_path:path}`` accepts attacker-
+        # controlled input.  ``..`` segments and absolute-style paths
+        # must not escape the dist directory; the resolver clamps to
+        # ``index.html`` when the candidate would resolve outside.
+        _session, client = web_client
+        for evil in (
+            "../../../etc/passwd",
+            "..%2f..%2fetc%2fpasswd",
+            "assets/../../../etc/passwd",
+        ):
+            r = client.get(f"/{evil}")
+            assert r.status_code == 200, f"unexpected status for {evil!r}"
+            # Either the SPA shell or a real /assets/* asset; never the
+            # contents of /etc/passwd.
+            assert b"root:" not in r.content
+            assert b"/bin/" not in r.content
+
 
 # ---------------------------------------------------------------------------
 # Protocol additions: correlation + per_layer_norms.

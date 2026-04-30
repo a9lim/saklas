@@ -72,11 +72,22 @@ def register_web_routes(app: FastAPI) -> None:
     # e.g. /chat, /lab, /vectors/<name>.  Won't shadow any earlier
     # /api/*, /v1/*, /saklas/v1/* routes because FastAPI evaluates in
     # registration order; create_app mounts this last.
+    dist_root = dist.resolve()
+    index_html = dist_root / "index.html"
+
     @app.get("/{full_path:path}", include_in_schema=False)
     async def _spa_fallback(full_path: str) -> FileResponse:
         # Direct file under dist/ wins (favicon, manifest, etc).  Anything
-        # else is an SPA route; serve index.html.
-        candidate = dist / full_path
+        # else is an SPA route; serve index.html.  ``full_path`` is
+        # attacker-controlled — resolve the join and verify the result
+        # stays inside ``dist_root`` to block ``..`` traversal and
+        # absolute-path injection.
+        try:
+            candidate = (dist_root / full_path).resolve()
+        except (OSError, RuntimeError):
+            return FileResponse(str(index_html))
+        if not candidate.is_relative_to(dist_root):
+            return FileResponse(str(index_html))
         if candidate.is_file():
             return FileResponse(str(candidate))
-        return FileResponse(str(dist / "index.html"))
+        return FileResponse(str(index_html))
