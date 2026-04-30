@@ -6,7 +6,7 @@ from collections import OrderedDict
 
 from rich.markup import escape as _rich_escape
 from textual.app import ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Static, Input, Collapsible
 from textual.widget import Widget
 from textual.message import Message
@@ -227,6 +227,80 @@ class _AssistantMessage(Vertical):
         self._thinking_view.update(markup if markup is not None else self._escaped_thinking_text)
 
 
+def _build_user_widget(text: str) -> Vertical:
+    """Build a fresh user-message Vertical (header + content) for one column.
+
+    A separate widget instance is used in each column so the same text can
+    be mirrored in both primary and shadow without a single widget being
+    parented twice.
+    """
+    return Vertical(
+        Static("[bold ansi_cyan]User:[/]"),
+        Static(_rich_escape(text)),
+        classes="user-message",
+    )
+
+
+def _build_shadow_placeholder() -> Static:
+    """Placeholder mounted in the shadow column of an assistant turn until
+    the unsteered shadow gen actually fires.  Visible in AB mode while the
+    steered branch is still streaming, then replaced by an
+    ``_AssistantMessage`` when the shadow worker starts."""
+    return Static("[dim](pending unsteered)[/]", classes="shadow-placeholder")
+
+
+class _TurnRow(Horizontal):
+    """A single chat-log row carrying matched primary + shadow columns.
+
+    Visual mirror of the webui's ``.ab-grid`` two-column layout: every turn
+    (user or assistant) lives in a Horizontal with two ``Vertical`` columns
+    of equal width.  The shadow column is hidden (``display: none`` via the
+    ``ChatPanel.ab-on`` CSS gate in ``styles.tcss``) when A/B mode is off,
+    so the primary column expands to full width and the layout is identical
+    to the pre-AB rendering.
+
+    Children are passed at construction time — Textual's ``Widget.mount``
+    raises if called before the parent has joined the app tree, so we hand
+    the inner widgets to ``Vertical()`` constructors and let the row's
+    ``compose`` yield them as a single mount unit.  Post-mount swaps (e.g.
+    replacing a shadow placeholder with the real shadow ``_AssistantMessage``)
+    happen via ``shadow.remove_children()`` + ``shadow.mount(widget)`` once
+    the row is live.
+    """
+
+    def __init__(
+        self, kind: str, primary_child: Widget, shadow_child: Widget, **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.add_class("turn-row")
+        self.add_class(f"{kind}-row")
+        self._kind = kind
+        # Raw (unescaped) user text for user rows, so the AB shadow worker
+        # can rebuild the messages list without unescaping rendered Rich
+        # markup.  Set by ``ChatPanel.add_user_message``; ``None`` for
+        # assistant rows.
+        self.user_text: str | None = None
+        self._primary: Vertical = Vertical(primary_child, classes="turn-col primary")
+        self._shadow: Vertical = Vertical(shadow_child, classes="turn-col shadow")
+
+    def compose(self) -> ComposeResult:
+        yield self._primary
+        yield self._shadow
+
+    @property
+    def kind(self) -> str:
+        """``"user"`` or ``"assistant"`` — drives rewind / backfill walks."""
+        return self._kind
+
+    @property
+    def primary(self) -> Vertical:
+        return self._primary
+
+    @property
+    def shadow(self) -> Vertical:
+        return self._shadow
+
+
 class ChatPanel(Widget):
 
     class UserSubmitted(Message):
@@ -238,6 +312,7 @@ class ChatPanel(Widget):
         super().__init__(**kwargs)
         self._log: VerticalScroll | None = None
         self._status_bar: Static | None = None
+        self._ab_mode: bool = False
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
@@ -257,40 +332,125 @@ class ChatPanel(Widget):
             self.add_user_message(text)
         self.post_message(self.UserSubmitted(text))
 
+    # -- AB mode --
+
+    def set_ab_mode(self, on: bool) -> None:
+        """Toggle the two-column AB layout.  Adds/removes ``ab-on`` on the
+        panel; the column's ``display`` is gated by this class in
+        ``styles.tcss``.  Pre-existing shadow-column widgets stay alive so
+        toggling off then on restores any prior shadow content untouched.
+        """
+        self._ab_mode = on
+        if on:
+            self.add_class("ab-on")
+        else:
+            self.remove_class("ab-on")
+
+    @property
+    def ab_mode(self) -> bool:
+        return self._ab_mode
+
+    # -- Log walking helpers --
+
+    def _turn_rows(self) -> list[_TurnRow]:
+        """All ``_TurnRow`` children of the log, in mount order."""
+        return [c for c in self._log.children if isinstance(c, _TurnRow)]
+
+    def assistant_rows_pending_shadow(self) -> list[_TurnRow]:
+        """Assistant rows whose shadow column still holds the placeholder
+        (no real shadow ``_AssistantMessage`` mounted yet).  Used by the
+        AB-toggle-on backfill to find rows in need of a shadow gen.
+        """
+        out: list[_TurnRow] = []
+        for row in self._turn_rows():
+            if row.kind != "assistant":
+                continue
+            shadow_kids = list(row.shadow.children)
+            if not any(isinstance(c, _AssistantMessage) for c in shadow_kids):
+                out.append(row)
+        return out
+
+    def shadow_widget_for(self, row: _TurnRow) -> _AssistantMessage | None:
+        """Return the shadow column's mounted assistant widget, or ``None``
+        if it still holds the placeholder."""
+        for c in row.shadow.children:
+            if isinstance(c, _AssistantMessage):
+                return c
+        return None
+
+    # -- Mutation --
+
     def clear_log(self) -> None:
         """Remove all messages from the chat log."""
         self._log.remove_children()
 
     def rewind(self) -> None:
-        """Remove the last user message and everything after it."""
+        """Remove the last user turn-row and everything after it."""
         children = list(self._log.children)
         for i in range(len(children) - 1, -1, -1):
-            if "user-message" in children[i].classes:
+            child = children[i]
+            if isinstance(child, _TurnRow) and child.kind == "user":
                 self._log.remove_children(children[i:])
                 break
         self._log.scroll_end(animate=False)
 
     def rewind_last_assistant(self) -> None:
-        """Remove the last assistant message widget only."""
+        """Remove the last assistant turn-row only.
+
+        With AB mode the row carries both steered + shadow widgets, so the
+        whole row goes — there's no useful intermediate state where we'd
+        keep one column and drop the other.
+        """
         children = list(self._log.children)
         for i in range(len(children) - 1, -1, -1):
-            if "assistant-message" in children[i].classes:
-                children[i].remove()
+            child = children[i]
+            if isinstance(child, _TurnRow) and child.kind == "assistant":
+                child.remove()
                 break
         self._log.scroll_end(animate=False)
 
-    def add_user_message(self, text: str) -> None:
-        container = Vertical(
-            Static("[bold ansi_cyan]User:[/]"),
-            Static(_rich_escape(text)),
-            classes="user-message",
+    def add_user_message(self, text: str) -> _TurnRow:
+        """Mount a user turn-row.  The same text is mirrored into both
+        columns so the primary view sees the user prompt regardless of AB
+        mode, and the shadow view (when revealed) is row-aligned with it.
+        Returns the row so callers can hand it to ``start_assistant_message``
+        for an attached assistant turn.
+        """
+        row = _TurnRow(
+            kind="user",
+            primary_child=_build_user_widget(text),
+            shadow_child=_build_user_widget(text),
         )
-        self._log.mount(container)
+        row.user_text = text
+        self._log.mount(row)
         self._log.scroll_end(animate=False)
+        return row
 
-    def start_assistant_message(self) -> _AssistantMessage:
+    def start_assistant_message(self) -> tuple[_TurnRow, _AssistantMessage]:
+        """Mount a fresh assistant turn-row.  Primary holds a streaming
+        ``_AssistantMessage``; shadow holds a placeholder until / unless a
+        shadow gen replaces it via ``start_shadow_message``.
+        Returns ``(row, primary_widget)``.
+        """
         widget = _AssistantMessage(classes="assistant-message")
-        self._log.mount(widget)
+        placeholder = _build_shadow_placeholder()
+        row = _TurnRow(
+            kind="assistant", primary_child=widget, shadow_child=placeholder,
+        )
+        self._log.mount(row)
+        return row, widget
+
+    def start_shadow_message(self, row: _TurnRow) -> _AssistantMessage:
+        """Replace ``row``'s shadow placeholder with a fresh streaming
+        assistant widget.  Caller is responsible for routing tokens into
+        it from a shadow worker.
+        """
+        existing = self.shadow_widget_for(row)
+        if existing is not None:
+            return existing
+        row.shadow.remove_children()
+        widget = _AssistantMessage(classes="assistant-message shadow-message")
+        row.shadow.mount(widget)
         return widget
 
     def scroll_to_bottom(self) -> None:

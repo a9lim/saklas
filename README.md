@@ -39,7 +39,7 @@ pip install saklas
 saklas tui google/gemma-3-4b-it
 ```
 
-The first run downloads the model and extracts the 24 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` does a direct A/B comparison against the unsteered model.
+The first run downloads the model and extracts the 24 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` toggles a persistent two-column A/B view that runs an unsteered shadow alongside every steered turn — same flow as the webui's A/B mode.
 
 As an API server:
 
@@ -236,7 +236,7 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | `Enter` | Toggle vector on/off |
 | `Backspace` / `Delete` | Remove selected vector or probe |
 | `Ctrl+T` | Toggle thinking mode |
-| `Ctrl+A` | A/B compare (steered vs. unsteered) |
+| `Ctrl+A` | A/B side-by-side (toggle steered + unsteered shadow columns) |
 | `Ctrl+R` | Regenerate last response |
 | `Ctrl+S` | Cycle trait sort mode |
 | `Ctrl+Y` | Per-token probe highlighting |
@@ -396,7 +396,7 @@ The steering rack has one strip per loaded vector: ●/○ enable toggle, α sli
 
 The probe rack is symmetric: one strip per active probe with a live sparkline, current value bar, signed value display, and an always-visible per-layer reading strip — one heatmap cell per covered layer, tinted by the probe's score at that layer for the most recent token. The whole row is the click target for highlight selection (●/○ toggles between selected and off). "+ probe" opens a probe picker that mirrors the steering picker.
 
-A/B compare runs an unsteered shadow alongside the steered conversation. Toggling it on mid-conversation replays the steered conversation through the unsteered agent — past steered turns ride along as context, only the most recent user turn (and any subsequent ones) get a fresh unsteered response.
+A/B compare runs an unsteered shadow alongside the steered conversation, with each turn rendered in two row-aligned columns (steered left, unsteered right). The TUI's `Ctrl+A` toggle and the webui's A/B button share the same flow: toggling on mid-conversation replays the steered conversation through the unsteered agent — past steered turns ride along as context, only the most recent user turn (and any subsequent ones) get a fresh unsteered response.
 
 The topbar's tools menu opens drawers for extract, load, compare, system prompt, model info, help, export, sweep launcher (with linspace alpha lists and a live result table), pack browse / install, vector merge, corpus-based clone, plus correlation matrix and layer norms overlays — both spanning the union of registered steering vectors and active probes.
 

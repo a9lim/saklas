@@ -28,7 +28,7 @@ Default-on when a probe is explicitly selected via `/probe`. `Ctrl+Y` toggles th
 
 **Live highlighting**: TUI worker forwards `event.scores` from each `TokenEvent` through `_ui_token_queue`; `_poll_generation` calls `widget.append_token_score(scores, is_thinking)` per emit, which appends to the per-probe score list, clears the markup cache, and re-renders. `_build_highlight_markup` tolerates `len(scores) < len(token_strs)` (unscored tokens render plain) and skips leading-whitespace tokens on the response side. At finalize the canonical projected scores from `session.last_per_token_scores` overwrite live ones via `_finalize_widget_highlight`.
 
-`Ctrl+A` A/B compare and `Ctrl+S` cycle trait sort — documented in `/help`.
+`Ctrl+A` toggles persistent A/B side-by-side mode (mirrors the webui's `abState.enabled`). When on, the chat log paints two columns per turn — steered on the left, unsteered shadow on the right — driven by the `_TurnRow` Horizontal in `chat_panel.py` whose shadow column is gated `display: none` until the panel carries `.ab-on`. The shadow gen runs after each steered `done`: `_start_shadow_generation(row)` rebuilds the conversation as a messages list via `_build_shadow_messages`, calls `session.generate_stream(messages, steering=None, stateless=True, …)`, and streams tokens into the shadow column through the same `_ui_token_queue` (items tagged `is_shadow=True` so gen-stat counters and the steered-`done` follow-up don't double-fire). Toggling AB on with prior history fires a one-shot backfill for the most recent assistant turn (matches `toggleAb` in the webui store). `Ctrl+S` cycles trait sort — both documented in `/help`.
 
 ## Trait-panel WHY footer
 
