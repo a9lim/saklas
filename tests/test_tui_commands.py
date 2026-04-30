@@ -55,7 +55,10 @@ def _make_app():
     app._current_assistant_widget = None
     app._poll_timer = None
     app._last_prompt = None
-    app._ab_in_progress = False
+    app._ab_mode = False
+    app._ab_shadow_active = False
+    app._ab_shadow_row = None
+    app._row_for_widget = {}
     app._pending_action = None
     app._ui_gen_active = False
     app._focused_panel_idx = 1
@@ -271,7 +274,7 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
 
     # Mock the chat panel widget machinery.
     widget = MagicMock()
-    app._chat_panel.start_assistant_message = MagicMock(return_value=widget)
+    app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), widget))
 
     # Track worker dispatch — run inline.
     def _run_worker(fn, thread=True):
@@ -302,7 +305,7 @@ def test_start_generation_inherits_highlight_state():
     app._highlight_probe = "honest.deceptive"
 
     widget = MagicMock()
-    app._chat_panel.start_assistant_message = MagicMock(return_value=widget)
+    app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), widget))
     app._session.generate_stream = MagicMock(return_value=iter([]))
 
     def _run_worker(fn, thread=True):
@@ -319,7 +322,7 @@ def test_start_generation_skips_highlight_when_off():
     app._highlighting = False
 
     widget = MagicMock()
-    app._chat_panel.start_assistant_message = MagicMock(return_value=widget)
+    app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), widget))
     app._session.generate_stream = MagicMock(return_value=iter([]))
 
     def _run_worker(fn, thread=True):
@@ -340,7 +343,7 @@ def test_generate_worker_passes_steering_when_alphas_active():
         captured["kwargs"] = kwargs
         return iter([])
     app._session.generate_stream = _fake_stream
-    app._chat_panel.start_assistant_message = MagicMock(return_value=MagicMock())
+    app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), MagicMock()))
 
     def _run_worker(fn, thread=True):
         fn()

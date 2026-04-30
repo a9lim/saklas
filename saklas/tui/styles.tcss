@@ -150,6 +150,45 @@ Widget {
     height: auto;
 }
 
+/* A/B turn rows.
+ *
+ * Each user / assistant turn lives in a Horizontal with two columns. The
+ * shadow column is hidden when AB mode is off so the primary column owns
+ * the full width — pre-AB rendering is unchanged. With ``.ab-on`` on the
+ * chat panel both columns share width 1fr, the inner widgets fall into
+ * lockstep, and Textual's max-child-height row sizing keeps them row-
+ * aligned without an explicit grid. */
+.turn-row {
+    height: auto;
+    layout: horizontal;
+}
+
+.turn-col {
+    width: 1fr;
+    height: auto;
+    padding: 0 0;
+}
+
+.turn-col.shadow {
+    display: none;
+    padding-left: 1;
+}
+
+ChatPanel.ab-on .turn-col.shadow {
+    display: block;
+    border-left: solid ansi_bright_black;
+}
+
+.shadow-placeholder {
+    color: ansi_bright_black;
+    text-style: italic;
+    height: 1;
+}
+
+.shadow-message {
+    /* Tag visible to readers — no behavioural diff vs. primary widget. */
+}
+
 
 /* Thinking block (Qwen 3.5, QwQ, etc.) */
 #thinking-block {
