@@ -4,9 +4,7 @@
 
 `saklas` is a Python library + Textual TUI + dual-protocol HTTP server (OpenAI `/v1/*` **and** Ollama `/api/*` on the same port) for activation steering and trait monitoring on HuggingFace causal LMs. Representation Engineering via contrastive PCA; per-call alpha control; no model mutation. Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve` (HTTP), `saklas tui` (TUI).
 
-Version lives in **two places** — bump both or `saklas.__version__` drifts from PyPI:
-- `pyproject.toml` → `[project] version`
-- `saklas/__init__.py` → `__version__`
+Version lives in `saklas/__init__.py` as `__version__`. `pyproject.toml` reads it dynamically via `version = {attr = "saklas.__version__"}`, so there's only one place to bump.
 
 Releases: merge bump to `main` → `.github/workflows/release.yml` tags `v$VERSION`, builds, publishes via trusted publishing, cuts a GitHub release. Push without bumping → no-op.
 
@@ -19,6 +17,7 @@ Deep internals live in subtree `CLAUDE.md` files — Claude Code auto-loads thes
 - `saklas/tui/CLAUDE.md` — slash commands, highlighting, panels, status footer
 - `saklas/cli/CLAUDE.md` — verb dispatch, config loading, warmup
 - `saklas/io/CLAUDE.md` — packs, HF distribution, GGUF, cloning, datasource
+- `saklas/web/CLAUDE.md` — webui mount, wire protocol, source layout, reactivity gotchas
 
 ## Commands
 
