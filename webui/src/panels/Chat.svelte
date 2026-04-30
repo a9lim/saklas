@@ -15,6 +15,7 @@
   // text fall-through when no probe is selected.
 
   import { onMount, untrack } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import {
     chatLog,
     highlightState,
@@ -127,8 +128,11 @@
    * render of the chat log preserves user-explicit collapse choices.  We
    * default to "collapsed" on creation and auto-expand when the first
    * thinking token lands; on done the turn collapses again unless the
-   * user manually expanded. */
-  const collapsedThinking: Map<number, boolean> = $state(new Map());
+   * user manually expanded.
+   *
+   * SvelteMap (not plain Map) — Svelte 5's $state doesn't track plain
+   * Map mutations, so a bare Map.set wouldn't re-render the toggle UI. */
+  const collapsedThinking: SvelteMap<number, boolean> = $state(new SvelteMap());
 
   function turnCollapsed(turnIdx: number, turn: ChatTurn): boolean {
     const explicit = collapsedThinking.get(turnIdx);
