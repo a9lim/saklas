@@ -65,9 +65,12 @@
     return null;
   }
 
-  function regen(): void {
-    const input = lastUserInput();
-    if (input === null) return;
+  /** Proper regen: rewind one user→assistant pair on both server and
+   * local log, then re-send the user input.  Without the rewind, the
+   * server's history is unchanged and the new gen lands as a fresh
+   * appended turn — looking visually like a duplicate-then-continue. */
+  async function regen(input: string): Promise<void> {
+    await rewindSession();
     void sendGenerate(input);
   }
 
@@ -88,10 +91,16 @@
   }
 
   function regenAction(): void {
+    // Capture the input *now* — by the time a queued action fires, the
+    // local chat log may have shifted (e.g. another regen got queued
+    // first).  The rewind+resend pair is anchored to the message the
+    // user actually intended to regenerate.
+    const input = lastUserInput();
+    if (input === null) return;
     if (genStatus.active) {
-      enqueuePending({ label: "regen", apply: regen });
+      enqueuePending({ label: "regen", apply: () => void regen(input) });
     } else {
-      regen();
+      void regen(input);
     }
   }
 
