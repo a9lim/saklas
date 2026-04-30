@@ -786,8 +786,16 @@ def register_saklas_routes(app: FastAPI) -> None:
                 async with session.lock:
                     try:
                         canonical, profile = await asyncio.to_thread(_do_clone)
-                    except FileNotFoundError as e:
-                        err = {"message": str(e), "code": "FileNotFoundError"}
+                    except FileNotFoundError:
+                        # Don't surface ``str(e)`` — Python's "No such file
+                        # or directory: '<path>'" leaks server-side
+                        # filesystem layout.  Echo the request's own
+                        # ``corpus_path`` instead so the client gets a
+                        # useful 404 without any traceback content.
+                        err = {
+                            "message": f"corpus not found: {req.corpus_path}",
+                            "code": "FileNotFoundError",
+                        }
                         yield f"event: error\ndata: {json.dumps(err)}\n\n"
                         return
                     except SaklasError as e:

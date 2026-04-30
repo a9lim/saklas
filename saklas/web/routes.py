@@ -75,19 +75,22 @@ def register_web_routes(app: FastAPI) -> None:
     dist_root = dist.resolve()
     index_html = dist_root / "index.html"
 
+    # Build an allowlist of top-level dist files at mount time
+    # (favicon.ico, manifest.json, robots.txt, …).  ``full_path`` from
+    # the request is then only ever used as a dict key — never as a
+    # path component — so ``..`` traversal and absolute-path injection
+    # are structurally impossible.  Nested paths fall through to the
+    # SPA shell; hashed bundle assets are already served by the
+    # StaticFiles mount on ``/assets``.
+    top_level_files: dict[str, Path] = {
+        p.name: p
+        for p in dist_root.iterdir()
+        if p.is_file() and p.name != "index.html"
+    }
+
     @app.get("/{full_path:path}", include_in_schema=False)
     async def _spa_fallback(full_path: str) -> FileResponse:
-        # Direct file under dist/ wins (favicon, manifest, etc).  Anything
-        # else is an SPA route; serve index.html.  ``full_path`` is
-        # attacker-controlled — resolve the join and verify the result
-        # stays inside ``dist_root`` to block ``..`` traversal and
-        # absolute-path injection.
-        try:
-            candidate = (dist_root / full_path).resolve()
-        except (OSError, RuntimeError):
-            return FileResponse(str(index_html))
-        if not candidate.is_relative_to(dist_root):
-            return FileResponse(str(index_html))
-        if candidate.is_file():
-            return FileResponse(str(candidate))
+        direct = top_level_files.get(full_path)
+        if direct is not None:
+            return FileResponse(str(direct))
         return FileResponse(str(index_html))
