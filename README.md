@@ -13,7 +13,7 @@ Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.
 Three ways to use it:
 
 - **`saklas tui <model>`**: Terminal UI
-- **`saklas serve <model>`**: HTTP server compatible with both OpenAI and Ollama, with an analytics dashboard mounted at `/` (pass `--no-web` for API-only mode on a proxied or production deployment)
+- **`saklas serve <model>`**: HTTP server compatible with both OpenAI and Ollama, with an analytics dashboard mounted at `/` (pass `--no-web` for API-only mode)
 - **`SaklasSession`**: Python API
 
 It runs on CUDA and Apple Silicon MPS. The full TUI has been tested to run comfortably on a MacBook. CPU does work but it's slow. Tested on Qwen, Gemma, Ministral, gpt-oss, Llama, and GLM. A lot more architectures are wired up in `saklas/core/model.py:_LAYER_ACCESSORS` but have not been tested; if you try one, please let me know how it went.
@@ -39,7 +39,7 @@ pip install saklas
 saklas tui google/gemma-3-4b-it
 ```
 
-The first run downloads the model and extracts the 24 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` toggles a persistent two-column A/B view that runs an unsteered shadow alongside every steered turn — same flow as the webui's A/B mode.
+The first run downloads the model and extracts the 24 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` toggles a two-column A/B view that runs an unsteered shadow alongside every steered turn.
 
 As an API server:
 
@@ -170,13 +170,13 @@ While generating, saklas records the hidden state at every probe layer and every
 
 ### Cross-model probe transfer
 
-Probes are extracted per (model, concept). To use a probe extracted on one model with a different model, run `saklas vector transfer --from SRC --to TGT NAME`. Saklas computes neutral activations on both models, fits a per-layer Procrustes alignment between them, and writes a transferred tensor at the target's `_from-<safe_src>` variant path. Transferred profiles coexist with native ones; `/steer 0.3 angry:from-google__gemma-3-4b-it` picks the transferred variant explicitly when both exist.
+Probes are extracted per (model, concept). To use a probe extracted on one model with a different model, run `saklas vector transfer --from SRC --to TGT NAME`. Saklas computes neutral activations on both models, fits a per-layer alignment between them, and writes a transferred tensor at the target's `_from-<safe_src>` variant path. Transferred profiles coexist with native ones; `/steer 0.3 angry:from-google__gemma-3-4b-it` picks the transferred variant explicitly when both exist.
 
 The transfer carries a `transfer_quality_estimate` in its sidecar (median per-layer R² across shared layers). Values near 1.0 mean the linear map captures the cross-model geometry; values below 0.5 mean transferred probes will be noisy. Visible in `pack ls -v` and the web UI.
 
 ### Probe quality diagnostics
 
-Every contrastive extraction emits per-layer metrics alongside the tensor: explained variance ratio, intra-pair variance, inter-pair alignment, and diff-to-PC projection. `saklas vector why <concept> -m MODEL` shows them as a quality stoplight (`solid`, `shaky`, or `poor`) below the layer histogram. A soft warning fires at extraction time when the median across layers looks degenerate (one-sided pairs, or pairs that disagree on direction); the tensor still extracts, the warning just flags low-confidence probes.
+Every contrastive extraction emits per-layer metrics alongside the tensor: explained variance ratio, intra-pair variance, inter-pair alignment, and diff-to-PC projection. `saklas vector why <concept> -m MODEL` shows them as a quality stoplight below the layer histogram. A soft warning fires at extraction time when the median across layers looks degenerate.
 
 Bundled probes extracted before v1.6 don't carry diagnostics on disk. Please run `saklas pack refresh <selector> -m MODEL` to backfill.
 
