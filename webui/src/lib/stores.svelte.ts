@@ -1137,14 +1137,164 @@ async function _sendShadowGenerate(
   else sock.addEventListener("open", send, { once: true });
 }
 
+// =================================================== persistence ========
+//
+// Chat log + highlight selection are persisted to localStorage so a page
+// reload doesn't wipe the conversation.  Server-side history (in
+// ``session.history``) is the authoritative state for generation
+// context, but there's no GET endpoint to retrieve it as turn objects —
+// the local serialized log is what we render.  Scoping the storage key
+// by ``model_id`` keeps a model swap from leaking turns across runs.
+//
+// We persist on a debounced effect rather than synchronously per
+// mutation so token-streaming gens don't write hundreds of times per
+// turn — once per ~250 ms is enough to survive an unplanned reload.
+
+const PERSIST_VERSION = 1;
+const PERSIST_KEY_PREFIX = "saklas.chat.v" + PERSIST_VERSION + ".";
+
+function persistKey(): string | null {
+  const id = sessionState.info?.model_id;
+  return id ? PERSIST_KEY_PREFIX + id : null;
+}
+
+interface PersistedSnapshot {
+  version: number;
+  model_id: string;
+  saved_at: number;
+  turns: ChatTurn[];
+  highlight: {
+    target: string | null;
+    compareTarget: string | null;
+    compareTwo: boolean;
+  };
+}
+
+function safeLocalStorageGet(key: string): string | null {
+  try {
+    return globalThis.localStorage?.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function safeLocalStorageSet(key: string, value: string): void {
+  try {
+    globalThis.localStorage?.setItem(key, value);
+  } catch {
+    // Quota exceeded / private-mode / SSR — silently drop.  Persistence
+    // is a UX nicety, not a correctness requirement.
+  }
+}
+
+function loadPersistedChat(): void {
+  const key = persistKey();
+  if (!key) return;
+  const raw = safeLocalStorageGet(key);
+  if (!raw) return;
+  try {
+    const parsed = JSON.parse(raw) as PersistedSnapshot;
+    if (parsed.version !== PERSIST_VERSION) return;
+    if (parsed.model_id !== sessionState.info?.model_id) return;
+    // Server-restart guard: if the server's history is empty but the
+    // local snapshot has user turns, the server was restarted while
+    // the page was closed.  Replaying the visual log would lie about
+    // generation context (server-side history is gone, next gen would
+    // see no prior turns).  Drop the local snapshot to match reality.
+    const serverHistory = sessionState.info?.history_length ?? 0;
+    const hasUserTurns =
+      Array.isArray(parsed.turns) &&
+      parsed.turns.some((t) => t?.role === "user");
+    if (serverHistory === 0 && hasUserTurns) {
+      try { globalThis.localStorage?.removeItem(key); } catch { /* ignore */ }
+      return;
+    }
+    if (Array.isArray(parsed.turns)) {
+      // Sanitize: drop any pendingIndex spillage; in-flight turns from
+      // the previous session can't be resumed.
+      chatLog.turns = parsed.turns.filter(
+        (t) => t && typeof t === "object" && typeof (t as ChatTurn).role === "string",
+      );
+      chatLog.pendingIndex = null;
+    }
+    if (parsed.highlight) {
+      highlightState.target = parsed.highlight.target ?? null;
+      highlightState.compareTarget = parsed.highlight.compareTarget ?? null;
+      highlightState.compareTwo = !!parsed.highlight.compareTwo;
+    }
+  } catch {
+    // Corrupt blob — drop it on the floor.
+  }
+}
+
+let _persistTimer: ReturnType<typeof setTimeout> | null = null;
+function schedulePersist(): void {
+  if (_persistTimer) return;
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    const key = persistKey();
+    if (!key) return;
+    const snapshot: PersistedSnapshot = {
+      version: PERSIST_VERSION,
+      model_id: sessionState.info!.model_id,
+      saved_at: Date.now(),
+      turns: chatLog.turns,
+      highlight: {
+        target: highlightState.target,
+        compareTarget: highlightState.compareTarget,
+        compareTwo: highlightState.compareTwo,
+      },
+    };
+    safeLocalStorageSet(key, JSON.stringify(snapshot));
+  }, 250);
+}
+
+/** Wire a $effect.root that watches the chat log + highlight slice and
+ * debounces a save to localStorage.  Called from ``bootstrap`` after
+ * the model id is known so the storage key resolves. */
+function attachPersistence(): void {
+  $effect.root(() => {
+    $effect(() => {
+      // Touch every reactive field we want to persist so the effect
+      // re-runs whenever any of them change.
+      void chatLog.turns.length;
+      // Mutate-in-place arrays (token stream) — read .length on every
+      // turn so ``schedulePersist`` debouncer fires through gen.
+      for (const t of chatLog.turns) {
+        void t.text;
+        void t.tokens?.length;
+        void t.thinkingTokens?.length;
+      }
+      void highlightState.target;
+      void highlightState.compareTarget;
+      void highlightState.compareTwo;
+      // Skip the initial call (right after restore) — saves cycles and
+      // avoids overwriting the snapshot before the user has done
+      // anything.  Detect via the sentinel below.
+      if (!_persistArmed) {
+        _persistArmed = true;
+        return;
+      }
+      schedulePersist();
+    });
+  });
+}
+
+let _persistArmed = false;
+
 // ============================================================ misc ======
 
 /** Bootstrap the dashboard — call once on App mount.  Resolves only once
  * every parallel fetch settles so the UI's first paint has a real session
  * shape. */
 export async function bootstrap(): Promise<void> {
+  // Session info has to land before the localStorage key is known
+  // (it's scoped by model_id), so we serialize that step.  The other
+  // refreshes parallelize as before.
+  await refreshSession();
+  loadPersistedChat();
+  attachPersistence();
   await Promise.allSettled([
-    refreshSession(),
     refreshVectorList(),
     refreshProbeList(),
     refreshCorrelation(),
