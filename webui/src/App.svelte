@@ -186,6 +186,7 @@
     min-height: 720px;
     background: var(--bg);
     color: var(--fg);
+    overflow: hidden;
   }
   .shell.loading {
     /* Slight desaturation so users can tell bootstrap hasn't finished
@@ -200,6 +201,11 @@
     position: relative; /* drawer sits over rack-zone via absolute pos */
     background: var(--border);
     gap: 1px;
+    /* Clip the drawer's translateX(100%) entry — without this the
+     * offscreen-right starting position extends the page's horizontal
+     * overflow by ~640px, the body scrolls during the 160ms animation,
+     * and the chat/rack content visibly shifts left then snaps back. */
+    overflow: hidden;
   }
   .chat-zone,
   .rack-zone {
