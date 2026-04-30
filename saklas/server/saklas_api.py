@@ -576,10 +576,13 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/correlation")
     def correlation_matrix(session_id: str, names: str | None = None):
-        """N×N magnitude-weighted cosine matrix across loaded vectors.
+        """N×N magnitude-weighted cosine matrix across loaded vectors and probes.
 
         Query: ``?names=a,b,c`` restricts the matrix to a subset; default
-        is every vector currently registered in the session.  Output:
+        is every steering vector AND every active probe currently
+        registered in the session, deduplicated by name (a registered
+        steering vector wins over a same-named probe — they share the
+        underlying tensor).  Output:
 
             {
               "names": ["a", "b", ...],
@@ -587,21 +590,40 @@ def register_saklas_routes(app: FastAPI) -> None:
               "layers_shared": {"a__b": 36, ...}
             }
 
-        Used by the web UI's correlation panel — heavy compute lives
+        Used by the web UI's correlation overlay — heavy compute lives
         server-side so the client doesn't have to ship full per-layer
         tensors over the wire.
         """
+        from saklas import Profile
+
         _resolve_session_id(session, session_id)
 
-        all_vectors = session.vectors
+        # Build a unified pool of {name: Profile} covering both registries.
+        # Steering vectors come first (so they win on collision); probe
+        # tensors are wrapped into Profile so the same cosine_similarity
+        # call works for either source.
+        pool: dict[str, "Profile"] = dict(session.vectors)
+        try:
+            probe_profiles = session._monitor.profiles
+            for probe_name in session._monitor.probe_names:
+                if probe_name in pool:
+                    continue
+                tensors = probe_profiles.get(probe_name)
+                if tensors is None:
+                    continue
+                pool[probe_name] = Profile(tensors)
+        except Exception:
+            # Monitor not available — fall back to vectors-only pool.
+            pass
+
         if names is not None and names.strip():
             requested = [n.strip() for n in names.split(",") if n.strip()]
-            missing = [n for n in requested if n not in all_vectors]
+            missing = [n for n in requested if n not in pool]
             if missing:
-                raise HTTPException(404, f"vectors not loaded: {missing}")
+                raise HTTPException(404, f"names not loaded: {missing}")
             ordered = requested
         else:
-            ordered = sorted(all_vectors.keys())
+            ordered = sorted(pool.keys())
 
         matrix: dict[str, dict[str, float | None]] = {a: {} for a in ordered}
         layers_shared: dict[str, int] = {}
@@ -618,14 +640,14 @@ def register_saklas_routes(app: FastAPI) -> None:
                     # the magnitude-weighted aggregate ``float`` — narrow
                     # explicitly because the method's union return type
                     # is ``float | dict[int, float]``.
-                    cos = all_vectors[a].cosine_similarity(all_vectors[b])
+                    cos = pool[a].cosine_similarity(pool[b])
                     matrix[a][b] = (
                         round(float(cos), 6) if isinstance(cos, (int, float)) else None
                     )
                 except Exception:
                     matrix[a][b] = None
                 shared = sorted(
-                    set(all_vectors[a].keys()) & set(all_vectors[b].keys())
+                    set(pool[a].keys()) & set(pool[b].keys())
                 )
                 # Pair key sorted alphabetically so a__b == b__a in the lookup.
                 key = "__".join(sorted([a, b]))
@@ -817,8 +839,8 @@ def register_saklas_routes(app: FastAPI) -> None:
         # Probes and steering vectors share the Profile shape but live in
         # different registries — session.vectors holds steering profiles,
         # session._monitor.profiles holds probe profiles.  The diagnostics
-        # endpoint serves either; the WHY histogram in the web UI's probe
-        # rack hits this for every active probe.
+        # endpoint serves either; the layer-norms drawer overlay in the
+        # web UI hits this for every selected name (vector or probe).
         profile = session.vectors.get(name)
         if profile is None:
             try:

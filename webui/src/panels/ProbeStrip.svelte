@@ -1,27 +1,31 @@
 <script lang="ts">
-  // One row in the probe rack — radio + name + sparkline + value bar +
-  // ✕.  Clicking the strip body (anywhere outside the radio / ✕) toggles
-  // an inline WHY histogram below the row.  The histogram lazy-fetches
-  // /vectors/{name}/diagnostics on first expand and falls back to a
-  // client-side bucketize over the cached profile if the endpoint 404s
-  // (probe registered without a steering profile).
+  // One row in the probe rack — selection indicator + name + sparkline +
+  // value bar + value + ✕, with a horizontal per-layer reading strip
+  // rendered directly beneath.  The row body is the click target for
+  // toggling the highlight selection: click anywhere on the row to
+  // select this probe as the chat-token highlight; click the same row
+  // again to deselect (highlight off).  ✕ stops propagation so removal
+  // doesn't accidentally toggle selection on the way out.
   //
-  // Mirrors saklas/tui/trait_panel.py — same sparkline + bar visual
-  // rhythm, same WHY footer in HIST_BUCKETS=16 buckets.
+  // Visual frame matches VectorStrip: flex layout, 32px min-height,
+  // 0.85em font, 0.25em padding, 0.4em gap.  Same "● / ○" glyph as the
+  // vector's enable button, recoloured to the highlight-blue accent so
+  // a glance distinguishes "this term is steering" (green) from "this
+  // probe is the highlight" (blue).
+  //
+  // Mirrors saklas/tui/trait_panel.py for the row visual rhythm; the
+  // layer strip is a webui-only addition (the TUI's per-layer view
+  // lives in `/why`).
 
   import Bar from "../lib/charts/Bar.svelte";
   import Sparkline from "../lib/charts/Sparkline.svelte";
-  import Histogram from "../lib/charts/Histogram.svelte";
-  import { bucketize, type HistogramBucket } from "../lib/charts";
-  import { apiVectors, ApiError } from "../lib/api";
+  import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
   import {
     deactivateProbe,
     highlightState,
     probeRack,
     setHighlightTarget,
-    vectorRack,
   } from "../lib/stores.svelte";
-  import type { VectorDiagnosticsResponse } from "../lib/types";
 
   interface Props {
     name: string;
@@ -30,115 +34,77 @@
   let { name }: Props = $props();
 
   // Live entry view — re-reads from the rack on every paint so live
-  // sparkline updates from updateProbeFromScores propagate.
+  // sparkline + per-layer updates from updateProbeFromScores propagate.
   const entry = $derived(probeRack.entries.get(name));
   const current = $derived(entry?.current ?? 0);
   const sparkline = $derived(entry?.sparkline ?? []);
   const isHighlight = $derived(highlightState.target === name);
 
-  // Expander + WHY state.  The diagnostics fetch is one-shot per probe
-  // life — once successful, we cache and never re-issue.  A failure
-  // (404 or network) flips ``loadError`` and the render falls back to
-  // client-side bucketize.
-  let expanded = $state(false);
-  let diagnostics = $state<VectorDiagnosticsResponse | null>(null);
-  let loading = $state(false);
-  let loadError = $state<string | null>(null);
+  // Layer keys sorted ascending (numeric).  The wire shape is zero-
+  // padded ints keyed as strings; Number() coerces cleanly for any
+  // base-10 prefix the server emits.
+  const layerKeys = $derived<string[]>(
+    entry?.perLayer
+      ? Object.keys(entry.perLayer).sort((a, b) => Number(a) - Number(b))
+      : [],
+  );
 
-  async function loadDiagnostics(): Promise<void> {
-    if (diagnostics !== null || loading) return;
-    loading = true;
-    loadError = null;
-    try {
-      diagnostics = await apiVectors.diagnostics(name);
-    } catch (e) {
-      // 404 is the common branch (probe registered without a registered
-      // steering profile by that name).  Lump every failure into a
-      // single fallback path — the client-side bucketize over the
-      // cached vectorRack profile still gives a usable histogram.
-      if (e instanceof ApiError) {
-        loadError = `${e.status}`;
-      } else {
-        loadError = e instanceof Error ? e.message : String(e);
-      }
-    } finally {
-      loading = false;
+  function cellTooltip(layer: string): string {
+    const v = entry?.perLayer?.[layer];
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      return `L${layer} · —`;
     }
+    const sign = v >= 0 ? "+" : "";
+    return `L${layer} · ${sign}${v.toFixed(3)}`;
   }
 
-  // The rendered histogram buckets — server's pre-bucketed list when
-  // diagnostics landed; client-side bucketize() over the cached profile
-  // otherwise.  Returns [] when neither source has data, which the
-  // <Histogram> component renders as "no data".
-  const buckets = $derived.by<HistogramBucket[]>(() => {
-    if (diagnostics?.histogram?.length) {
-      return diagnostics.histogram.map((b) => ({
-        lo: b.lo,
-        hi: b.hi,
-        value: b.value,
-        label: b.label,
-      }));
-    }
-    // Two fallback sources: the diagnostics response's per_layer_norms
-    // (when the server returned the response but with empty histogram —
-    // shouldn't happen but cheap to handle) and the cached profile from
-    // vectorRack.profiles (populated by refreshVectorList).
-    const norms =
-      diagnostics?.per_layer_norms ??
-      vectorRack.profiles.get(name)?.per_layer_norms;
-    if (!norms) return [];
-    return bucketize(norms);
-  });
+  // Cell width — 14px reads cleanly on a 28-layer Gemma without forcing
+  // horizontal scroll on a 1280px viewport, and stays usable on 60+
+  // layer models (e.g. larger qwen variants) when the strip wraps inside
+  // its own scroll container.
+  const CELL_SIZE = 14;
 
-  function onSelectHighlight(ev: Event): void {
-    ev.stopPropagation();
-    setHighlightTarget(name);
+  // Click anywhere on the row toggles highlight: select if not selected,
+  // deselect (back to "off") if already selected.  Mirrors the TUI's
+  // /probe behavior — one click anchors the row, click again to unset.
+  function toggleHighlight(): void {
+    setHighlightTarget(isHighlight ? null : name);
+  }
+
+  function onRowKey(ev: KeyboardEvent): void {
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      toggleHighlight();
+    }
   }
 
   function onRemove(ev: MouseEvent): void {
     ev.stopPropagation();
     void deactivateProbe(name);
   }
-
-  function onToggleExpand(): void {
-    expanded = !expanded;
-    if (expanded) void loadDiagnostics();
-  }
-
-  // Keyboard a11y — Enter/Space on the body toggles, matching the
-  // mouse click.  The radio + remove button keep their native semantics.
-  function onBodyKey(ev: KeyboardEvent): void {
-    if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      onToggleExpand();
-    }
-  }
 </script>
 
-<div class="strip" class:selected={isHighlight} class:expanded>
+<div class="strip" class:selected={isHighlight}>
   <div
     class="row"
     role="button"
     tabindex="0"
-    aria-expanded={expanded}
-    aria-label="Toggle WHY histogram for {name}"
-    onclick={onToggleExpand}
-    onkeydown={onBodyKey}
+    aria-pressed={isHighlight}
+    aria-label={isHighlight
+      ? `Deselect ${name} as highlight target`
+      : `Select ${name} as highlight target`}
+    onclick={toggleHighlight}
+    onkeydown={onRowKey}
   >
-    <label class="radio" title="Highlight {name} on chat tokens">
-      <input
-        type="radio"
-        name="probe-highlight"
-        checked={isHighlight}
-        value={name}
-        onclick={onSelectHighlight}
-        onchange={onSelectHighlight}
-        aria-label="Set {name} as highlight target"
-      />
-      <span class="radio-glyph" aria-hidden="true">{isHighlight ? "●" : "○"}</span>
-    </label>
+    <span
+      class="select-glyph"
+      aria-hidden="true"
+      title={isHighlight ? "Selected — click to deselect" : "Click to select for highlighting"}
+    >{isHighlight ? "●" : "○"}</span>
 
     <span class="name" title={name}>{name}</span>
+
+    <span class="spacer" aria-hidden="true"></span>
 
     <Sparkline points={sparkline} width={56} height={14} />
 
@@ -150,54 +116,57 @@
 
     <button
       type="button"
-      class="remove"
+      class="icon remove"
       aria-label="Remove probe {name}"
       title="Remove probe"
       onclick={onRemove}
     >✕</button>
   </div>
 
-  {#if expanded}
-    <div class="why" aria-label="WHY histogram for {name}">
-      {#if loading}
-        <div class="why-status">loading…</div>
-      {:else if buckets.length === 0}
-        <div class="why-status">
-          {loadError ? `no diagnostics (${loadError})` : "no data"}
-        </div>
-      {:else}
-        {#if loadError}
-          <div class="why-status fallback">
-            client-side bucketize ({loadError})
-          </div>
-        {/if}
-        <Histogram {buckets} barWidth={140} barHeight={6} />
-      {/if}
-    </div>
-  {/if}
+  <div class="layers" aria-label="Per-layer readings for {name}">
+    {#if layerKeys.length === 0}
+      <div class="layers-status">no data — generate a token first</div>
+    {:else}
+      <span class="endcap" aria-hidden="true">L{Number(layerKeys[0])}</span>
+      <div class="cells">
+        {#each layerKeys as layer (layer)}
+          <HeatmapCell
+            value={entry?.perLayer?.[layer]}
+            size={CELL_SIZE}
+            title={cellTooltip(layer)}
+          />
+        {/each}
+      </div>
+      <span class="endcap" aria-hidden="true">
+        L{Number(layerKeys[layerKeys.length - 1])}
+      </span>
+    {/if}
+  </div>
 </div>
 
 <style>
+  /* Match VectorStrip's outer frame so steering and probe rows read as
+   * one visual family — same border, radius, background, font-size. */
   .strip {
     border: 1px solid var(--border-dim);
     border-radius: 3px;
     background: var(--bg-alt);
     transition: border-color 0.1s ease;
+    font-size: 0.85em;
   }
   .strip.selected {
     border-color: var(--accent-blue);
   }
-  .strip.expanded {
-    background: var(--bg);
-  }
 
+  /* Row body — flex / 32px / 0.4em gap / 0.25em·0.4em padding to match
+   * VectorStrip exactly.  The whole row is the click target for toggling
+   * highlight selection. */
   .row {
-    display: grid;
-    grid-template-columns: auto 1fr auto auto auto auto;
+    display: flex;
     align-items: center;
-    gap: var(--row-gap);
-    height: 40px;
-    padding: 0 0.6em;
+    gap: 0.4em;
+    min-height: 32px;
+    padding: 0.25em 0.4em;
     cursor: pointer;
     user-select: none;
   }
@@ -209,34 +178,36 @@
     outline-offset: -1px;
   }
 
-  .radio {
-    display: inline-flex;
-    align-items: center;
-    cursor: pointer;
-    width: 1.2em;
-  }
-  .radio input {
-    position: absolute;
-    opacity: 0;
-    width: 0;
-    height: 0;
-  }
-  .radio-glyph {
-    color: var(--fg-dim);
-    font-size: 0.95em;
+  /* Selection indicator — same ●/○ glyph as VectorStrip's .enable, but
+   * tuned to the highlight-blue accent so the colour distinguishes the
+   * two semantics ("this term is steering" green vs "this probe is
+   * highlighted" blue). */
+  .select-glyph {
+    color: var(--fg-muted);
+    font-size: 1em;
     line-height: 1;
+    padding: 0 0.2em;
+    flex: 0 0 auto;
   }
-  .strip.selected .radio-glyph {
+  .strip.selected .select-glyph {
     color: var(--accent-blue);
   }
 
   .name {
-    color: var(--fg-strong);
-    font-size: 0.9em;
+    flex: 0 1 auto;
+    min-width: 5em;
+    max-width: 14em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+    color: var(--fg-strong);
+  }
+  /* Eats the available row width so the sparkline + bar + value + ✕
+   * cluster pins to the right edge — keeps the readings group aligned
+   * across rows regardless of name length. */
+  .spacer {
+    flex: 1 1 auto;
+    min-width: 0.4em;
   }
   .strip.selected .name {
     color: var(--accent-blue);
@@ -245,10 +216,10 @@
 
   .value {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
     font-variant-numeric: tabular-nums;
     min-width: 3.5em;
     text-align: right;
+    flex: 0 0 auto;
   }
   .value.pos {
     color: var(--accent-green);
@@ -257,33 +228,48 @@
     color: var(--accent-red);
   }
 
-  .remove {
+  /* Icon button — same shape as VectorStrip's .icon. */
+  .icon {
     background: transparent;
     border: 0;
     color: var(--fg-muted);
-    font-size: 0.85em;
+    font-size: 0.95em;
     line-height: 1;
-    padding: 0.2em 0.3em;
+    padding: 0.1em 0.35em;
     border-radius: 2px;
+    flex: 0 0 auto;
   }
-  .remove:hover {
-    color: var(--accent-red);
+  .icon:hover:not(:disabled) {
+    color: var(--fg-strong);
     background: var(--bg-elev);
   }
-
-  .why {
-    padding: 0.4em 0.6em 0.6em 0.6em;
-    border-top: 1px solid var(--border-dim);
-    /* Total expanded height ~140px: 40 row + ~100 histogram block. */
-    max-height: 110px;
-    overflow-y: auto;
+  .remove:hover:not(:disabled) {
+    color: var(--accent-red);
   }
-  .why-status {
+
+  .layers {
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+    padding: 0.3em 0.4em 0.4em 0.4em;
+    border-top: 1px solid var(--border-dim);
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .layers-status {
     color: var(--fg-muted);
     font-size: var(--font-size-small);
-    padding: 0.2em 0;
+    padding: 0.1em 0;
   }
-  .why-status.fallback {
-    color: var(--accent-yellow);
+  .cells {
+    display: flex;
+    gap: 0;
+    flex: 0 0 auto;
+  }
+  .endcap {
+    color: var(--fg-dim);
+    font-size: var(--font-size-tiny);
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
   }
 </style>

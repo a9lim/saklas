@@ -15,7 +15,6 @@
   import SamplingStrip from "./panels/SamplingStrip.svelte";
   import SteeringRack from "./panels/SteeringRack.svelte";
   import ProbeRack from "./panels/ProbeRack.svelte";
-  import ReferenceCollapsibles from "./panels/ReferenceCollapsibles.svelte";
 
   import * as Drawers from "./drawers";
   import SweepDrawer from "./drawers/SweepDrawer.svelte";
@@ -105,7 +104,6 @@
       <section class="rack-zone" aria-label="Control rack">
         <SteeringRack />
         <ProbeRack />
-        <ReferenceCollapsibles />
       </section>
 
       {#if drawerState.open !== null}
@@ -152,6 +150,10 @@
             <CloneDrawer params={drawerState.params} />
           {:else if drawerState.open === "token_drilldown"}
             <TokenDrilldownDrawer params={drawerState.params} />
+          {:else if drawerState.open === "correlation"}
+            <Drawers.Correlation params={drawerState.params} />
+          {:else if drawerState.open === "layer_norms"}
+            <Drawers.LayerNorms params={drawerState.params} />
           {:else}
             <header class="drawer-header">
               <span class="drawer-title">{drawerState.open}</span>
@@ -210,13 +212,14 @@
     display: flex;
     flex-direction: column;
   }
-  /* Three-row grid: steering rack, probe rack, reference collapsibles
-   * (auto height so they expand without fighting the racks for space).
-   * No overflow at this level — each rack handles its own internal
-   * scroll so its actions row stays anchored at the bottom. */
+  /* Two-row grid: steering rack and probe rack.  Reference views
+   * (correlation N×N, per-name layer norms) live in drawer overlays
+   * launched from the topbar tools menu — keeping them out of the rack
+   * zone gives both racks the full vertical budget.  Each rack handles
+   * its own internal scroll so its actions row stays anchored. */
   .rack-zone {
     display: grid;
-    grid-template-rows: 1fr 1fr auto;
+    grid-template-rows: 1fr 1fr;
     gap: 0.6em;
     min-height: 0;
     overflow: hidden;

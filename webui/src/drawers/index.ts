@@ -32,3 +32,5 @@ export { default as SystemPrompt } from "./SystemPromptDrawer.svelte";
 export { default as ModelInfo } from "./ModelInfoDrawer.svelte";
 export { default as Help } from "./HelpDrawer.svelte";
 export { default as Export } from "./ExportDrawer.svelte";
+export { default as Correlation } from "./CorrelationDrawer.svelte";
+export { default as LayerNorms } from "./LayerNormsDrawer.svelte";

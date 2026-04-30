@@ -268,9 +268,18 @@
     return i === 0 ? tokens : tokens.slice(i);
   }
 
-  function tokenClicked(turnIdx: number, tokenIdx: number, ev: MouseEvent): void {
+  function tokenClicked(
+    turnIdx: number,
+    tokenIdx: number,
+    ev: MouseEvent,
+    isThinking: boolean = false,
+  ): void {
     ev.stopPropagation();
-    openDrawer("token_drilldown", { turnIdx, tokenIdx });
+    // Pass ``isThinking`` through so the drilldown drawer reads from
+    // ``turn.thinkingTokens`` when the click came from the thinking
+    // body (otherwise it would index the response stream and either
+    // miss or surface the wrong token).
+    openDrawer("token_drilldown", { turnIdx, tokenIdx, isThinking });
   }
 
   // The bare-text form for plain (no-highlight) rendering.  We still want
@@ -445,18 +454,19 @@
           </button>
           {#if !turnCollapsed(turnIdx, turn)}
             <div class="thinking-body">
-              {#if highlightState.target && (turn.thinkingTokens?.length ?? 0) > 0}
+              {#if (turn.thinkingTokens?.length ?? 0) > 0}
                 {#each turn.thinkingTokens ?? [] as tok, tokenIdx (tokenIdx)}
                   <span
                     class="tok"
+                    class:tinted={highlightState.target !== null}
                     style={styleString(tokenStyle(tok))}
                     title={tooltipFor(tok)}
-                    onclick={(ev) => tokenClicked(turnIdx, tokenIdx, ev)}
+                    onclick={(ev) => tokenClicked(turnIdx, tokenIdx, ev, true)}
                     onkeydown={(ev) => {
                       if (ev.key === "Enter" || ev.key === " ") {
                         ev.preventDefault();
                         ev.stopPropagation();
-                        openDrawer("token_drilldown", { turnIdx, tokenIdx });
+                        openDrawer("token_drilldown", { turnIdx, tokenIdx, isThinking: true });
                       }
                     }}
                     role="button"
@@ -464,9 +474,7 @@
                   >{tok.text}</span>
                 {/each}
               {:else}
-                <span class="plain">{(turn.thinkingTokens ?? [])
-                  .map((t) => t.text)
-                  .join("")}</span>
+                <span class="plain">{turn.text ?? ""}</span>
               {/if}
             </div>
           {/if}
@@ -474,13 +482,14 @@
       {/if}
 
       <div class="response-body">
-        {#if highlightState.target && (turn.tokens?.length ?? 0) > 0}
+        {#if (turn.tokens?.length ?? 0) > 0}
           {#each stripLeadingWhitespace(turn.tokens ?? []) as tok, tokenIdx (tokenIdx)}
             <span
               class="tok"
+              class:tinted={highlightState.target !== null}
               style={styleString(tokenStyle(tok))}
               title={tooltipFor(tok)}
-              onclick={(ev) => tokenClicked(turnIdx, tokenIdx, ev)}
+              onclick={(ev) => tokenClicked(turnIdx, tokenIdx, ev, false)}
               onkeydown={(ev) => {
                 if (ev.key === "Enter" || ev.key === " ") {
                   ev.preventDefault();
@@ -702,9 +711,12 @@
     font-style: italic;
   }
 
-  /* Tokens — minimal padding so the tinted span hugs the glyph; click-
-   * affordance via cursor pointer when highlighting is on (visual-only,
-   * the click handler attaches regardless). */
+  /* Tokens — minimal padding so the tinted span hugs the glyph.  The
+   * click handler attaches regardless of highlight state; ``.tinted``
+   * marks rows whose background is being painted by the score so the
+   * untinted hover outline only fires when there's no other visual.
+   * Hover outline gives the click affordance even when highlighting is
+   * off (matches the user-visible click contract). */
   .tok {
     cursor: pointer;
     border-radius: 1px;

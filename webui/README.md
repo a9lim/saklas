@@ -42,16 +42,15 @@ src/
     Chat.svelte                  # thinking-collapsible + probe-tinted tokens + A/B
     SamplingStrip.svelte         # T / P / K / max / seed / thinking
     SteeringRack.svelte          # vector strips + canonical EXPR + "+ steer"
-    VectorStrip.svelte           # enable / α slider / trigger / variant / ⋮ menu / ✕
+    VectorStrip.svelte           # ●/○ enable + α slider + α display + trigger / variant / ⋮ menu / ✕ + inline projection modal
     ProbeRack.svelte             # highlight + compare-two + sort + "+ probe"
-    ProbeStrip.svelte            # radio + sparkline + value bar + WHY histogram
-    ReferenceCollapsibles.svelte # ▶ correlation N×N · ▶ layer norms per vector
+    ProbeStrip.svelte            # ●/○ select (whole-row click) + name + right-aligned sparkline + bar + value + ✕ + per-layer cells
   drawers/
     Extract / Load / Compare / SystemPrompt / ModelInfo / Help / Export
     SaveConversation / LoadConversation
     VectorPicker / ProbePicker
     Sweep / Pack / Merge / Clone
-    TokenDrilldown
+    TokenDrilldown / Correlation / LayerNorms
     _SearchableConceptList.svelte
     index.ts             # barrel re-exports for App.svelte's drawer switch
 ```
@@ -79,7 +78,7 @@ The dashboard speaks the existing `/saklas/v1/*` native API:
 
 * `GET /saklas/v1/sessions/default` — `SessionInfo`
 * `GET/POST/DELETE /saklas/v1/sessions/default/vectors[/{name}]` — list / load-from-disk / drop, with per-layer `||baked||` on the GET
-* `GET /saklas/v1/sessions/default/vectors/{name}/diagnostics` — 16-bucket WHY histogram (falls back to monitor profiles for probes)
+* `GET /saklas/v1/sessions/default/vectors/{name}/diagnostics` — 16-bucket layer-magnitude histogram + summary metrics (powers `saklas vector why`; falls back to monitor profiles for probes)
 * `GET /saklas/v1/sessions/default/correlation[?names=a,b]` — N×N cosine
 * `GET/POST/DELETE /saklas/v1/sessions/default/probes[/{name}]` — list / activate / deactivate
 * `POST /saklas/v1/sessions/default/extract` — JSON or SSE-progress when `Accept: text/event-stream`
