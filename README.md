@@ -388,11 +388,23 @@ pip install saklas[web]
 saklas serve google/gemma-3-4b-it
 ```
 
-Open `http://localhost:8000/`. The dashboard has four panels. The left column is a chat panel that drives generation. The center is a per-token by per-layer by per-probe heatmap inspector: every active probe gets a cell at every layer for every generated token, so you can see which layers each probe responded to during the response. The right column is split between a probe correlation matrix and a full-resolution layer-norms bar chart.
+Open `http://localhost:8000/`. The v2.0 dashboard is an interpretability cockpit: chat on the left, a stack of control rack panels on the right, status footer pinned to the bottom. Everything the TUI does is here through buttons and sliders, plus a few things the TUI structurally can't.
 
-The dashboard mounts by default on every `saklas serve`. Please pass `--no-web` for API-only mode on a proxied or production deployment where `/` already belongs to something else.
+Per-token highlighting lives directly on the chat tokens — pick a probe in the highlight dropdown above the chat and tokens tint red/green by score. Compare two probes side-by-side via a two-stripe overlay. Click any token to open a per-layer × per-probe heatmap drawer for that one token.
 
-The web UI is a Svelte and Vite single-page app that ships pre-built in the wheel. Source lives at `webui/`; `cd webui && npm run build` regenerates the bundle into `saklas/web/dist/` if you want to iterate on it.
+The steering rack has one strip per loaded vector: enable toggle, α slider with a 0 detent, trigger pill, variant chip, ⋮ menu for projection / ablation / duplicate / copy expression. The canonical steering expression renders below the rack and is paste-editable. Adding a vector goes through "+ steer" — a picker that lists local concepts (mirrors TUI `/steer 0.5 honest`); advanced affordances (extract from pos/neg, load from a path) are in the picker's footer.
+
+The probe rack is symmetric: one strip per active probe with a live sparkline, current value bar, and an expandable WHY histogram (16-bucket layer-norm chart). "+ probe" opens a probe picker that mirrors the steering picker.
+
+A reference section at the bottom holds collapsibles for the N×N probe correlation matrix and a per-vector layer-norms bar chart.
+
+The topbar's tools menu opens drawers for extract, load, compare, system prompt, model info, help, export, sweep launcher (with linspace alpha lists and a live result table), pack browse / install, vector merge, and corpus-based clone.
+
+Chat history and the highlight selection persist to `localStorage` per model, so a page reload comes back to where you left off.
+
+The dashboard mounts by default on every `saklas serve`. Pass `--no-web` for API-only mode on a proxied or production deployment where `/` already belongs to something else.
+
+The web UI is a Svelte 5 + Vite single-page app that ships pre-built in the wheel. Source lives at `webui/`; `cd webui && npm run build` regenerates the bundle into `saklas/web/dist/` if you want to iterate on it.
 
 ## Notebook helpers
 
