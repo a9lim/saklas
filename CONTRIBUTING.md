@@ -44,4 +44,4 @@ If the model is quirky (multimodal text extraction, FP8 dequantization, nonstand
 
 ## Questions
 
-Please reach out to me and/or open an issue. For anything security-sensitive, also see [SECURITY.md](SECURITY.md).
+Please reach out to me or open an issue. For anything security-sensitive, also see [SECURITY.md](SECURITY.md).
