@@ -799,7 +799,17 @@ def register_saklas_routes(app: FastAPI) -> None:
                         yield f"event: error\ndata: {json.dumps(err)}\n\n"
                         return
                     except Exception as e:
-                        err = {"message": str(e), "code": type(e).__name__}
+                        # Don't surface ``str(e)`` — Python exception messages
+                        # routinely echo paths, traceback fragments, or vendor
+                        # error text that we don't want flowing to a remote
+                        # caller.  Log the full traceback server-side and
+                        # return a generic shape that mirrors the SaklasError
+                        # branch above.
+                        import logging
+                        logging.getLogger("saklas.api").exception(
+                            "clone failed for session=%s", session_id,
+                        )
+                        err = {"message": "clone failed", "code": type(e).__name__}
                         yield f"event: error\ndata: {json.dumps(err)}\n\n"
                         return
                     session.steer(req.name, profile)
