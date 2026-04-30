@@ -298,9 +298,11 @@ export function activeProbeNames(): string[] {
   if (probeRack.sortMode === "name") {
     arr.sort();
   } else if (probeRack.sortMode === "value") {
+    // Signed value desc — matches the TUI's trait_panel.py sort_key
+    // (line 191).  Magnitude sort is what "change" is for.
     arr.sort((a, b) => {
-      const av = Math.abs(probeRack.entries.get(a)?.current ?? 0);
-      const bv = Math.abs(probeRack.entries.get(b)?.current ?? 0);
+      const av = probeRack.entries.get(a)?.current ?? 0;
+      const bv = probeRack.entries.get(b)?.current ?? 0;
       return bv - av;
     });
   } else if (probeRack.sortMode === "change") {
