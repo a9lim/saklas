@@ -390,15 +390,15 @@ saklas serve google/gemma-3-4b-it
 
 Open `http://localhost:8000/`. The v2.0 dashboard is an interpretability cockpit: chat on the left, a stack of control rack panels on the right, status footer pinned to the bottom. Everything the TUI does is here through buttons and sliders, plus a few things the TUI structurally can't.
 
-Per-token highlighting lives directly on the chat tokens — pick a probe in the highlight dropdown above the chat and tokens tint red/green by score. Compare two probes side-by-side via a two-stripe overlay. Click any token to open a per-layer × per-probe heatmap drawer for that one token.
+Per-token highlighting lives directly on the chat tokens — pick a probe in the highlight dropdown above the chat and tokens tint red/green by score. Compare two probes side-by-side via a two-stripe overlay. Every token is clickable regardless of highlight state; clicking opens a per-layer × per-probe heatmap drawer for that one token (thinking-block tokens drill into the thinking stream, response tokens into the response stream).
 
-The steering rack has one strip per loaded vector: enable toggle, α slider with a 0 detent, trigger pill, variant chip, ⋮ menu for projection / ablation / duplicate / copy expression. The canonical steering expression renders below the rack and is paste-editable. Adding a vector goes through "+ steer" — a picker that lists local concepts (mirrors TUI `/steer 0.5 honest`); advanced affordances (extract from pos/neg, load from a path) are in the picker's footer.
+The steering rack has one strip per loaded vector: ●/○ enable toggle, α slider with a 0 detent, signed α display, trigger pill, variant chip, ⋮ menu for projection / ablation / duplicate / copy expression. Project-onto and project-orthogonal-to open an inline modal that takes a target concept name. The canonical steering expression renders below the rack and is paste-editable. Adding a vector goes through "+ steer" — a picker that lists local concepts (mirrors TUI `/steer 0.5 honest`); advanced affordances (extract from pos/neg, load from a path) are in the picker's footer.
 
-The probe rack is symmetric: one strip per active probe with a live sparkline, current value bar, and an expandable WHY histogram (16-bucket layer-norm chart). "+ probe" opens a probe picker that mirrors the steering picker.
+The probe rack is symmetric: one strip per active probe with a live sparkline, current value bar, signed value display, and an always-visible per-layer reading strip — one heatmap cell per covered layer, tinted by the probe's score at that layer for the most recent token. The whole row is the click target for highlight selection (●/○ toggles between selected and off). "+ probe" opens a probe picker that mirrors the steering picker.
 
-A reference section at the bottom holds collapsibles for the N×N probe correlation matrix and a per-vector layer-norms bar chart.
+A/B compare runs an unsteered shadow alongside the steered conversation. Toggling it on mid-conversation replays the steered conversation through the unsteered agent — past steered turns ride along as context, only the most recent user turn (and any subsequent ones) get a fresh unsteered response.
 
-The topbar's tools menu opens drawers for extract, load, compare, system prompt, model info, help, export, sweep launcher (with linspace alpha lists and a live result table), pack browse / install, vector merge, and corpus-based clone.
+The topbar's tools menu opens drawers for extract, load, compare, system prompt, model info, help, export, sweep launcher (with linspace alpha lists and a live result table), pack browse / install, vector merge, corpus-based clone, plus correlation matrix and layer norms overlays — both spanning the union of registered steering vectors and active probes.
 
 Chat history and the highlight selection persist to `localStorage` per model, so a page reload comes back to where you left off.
 

@@ -49,18 +49,6 @@
     setVectorAlpha(name, snapAlpha(raw));
   }
 
-  function onNumericInput(ev: Event): void {
-    const t = ev.currentTarget as HTMLInputElement;
-    let raw = t.value.trim();
-    // Permit leading +/- prefix; parseFloat handles "+0.3" only on
-    // some browsers, so strip the explicit '+' first.
-    if (raw.startsWith("+")) raw = raw.slice(1);
-    const v = parseFloat(raw);
-    if (!Number.isFinite(v)) return;
-    // Numeric input is precise — no detent.
-    setVectorAlpha(name, v);
-  }
-
   function formatAlpha(a: number): string {
     if (a === 0) return "0.00";
     const sign = a > 0 ? "+" : "-";
@@ -162,30 +150,56 @@
     menuOpen = !menuOpen;
   }
 
-  /** Prompt for a target name to project base onto.  Empty cancels;
-   * existing target shown for easy edit.  No autocomplete from the
-   * loaded-vector list yet — v1 keeps the input dumb. */
-  function promptProjection(op: ProjectionSpec["op"]): string | null {
-    const cur = entry.projection?.target ?? "";
-    const verb = op === "~" ? "Project onto" : "Project orthogonal to";
-    const raw = window.prompt(`${verb} (target concept name):`, cur);
-    if (raw === null) return null;
-    const target = raw.trim();
-    return target || null;
-  }
+  // ---------- inline projection modal ----------
+  //
+  // Replaces the v1 ``window.prompt`` for picking a projection target.
+  // Modal is local to the strip — backdrop covers the viewport, the
+  // dialog itself is centered, Esc / click-outside cancel, Enter
+  // confirms, the input autofocuses on open.  Preselects the current
+  // target so a re-open lands on the existing value.
+
+  let projectionPromptOp = $state<ProjectionSpec["op"] | null>(null);
+  let projectionTargetDraft = $state("");
+  let projectionInputRef: HTMLInputElement | null = $state(null);
 
   function pickProjection(op: ProjectionSpec["op"]): void {
     menuOpen = false;
-    // Toggle off when the same operator is already wired and the user
-    // accepts the current target via empty input.
+    // Toggle off when the same operator is already wired — clicking the
+    // same projection in the menu clears it without opening the dialog.
     if (entry.projection && entry.projection.op === op) {
-      // Clear projection.
       setVectorProjection(name, null);
       return;
     }
-    const target = promptProjection(op);
-    if (target === null) return;
+    projectionTargetDraft = entry.projection?.target ?? "";
+    projectionPromptOp = op;
+    // Autofocus the input once the modal mounts.  A microtask is
+    // enough because Svelte 5 flushes the DOM before setTimeout.
+    queueMicrotask(() => projectionInputRef?.focus());
+  }
+
+  function cancelProjection(): void {
+    projectionPromptOp = null;
+    projectionTargetDraft = "";
+  }
+
+  function confirmProjection(): void {
+    const op = projectionPromptOp;
+    if (op === null) return;
+    const target = projectionTargetDraft.trim();
+    projectionPromptOp = null;
+    projectionTargetDraft = "";
+    if (!target) return;
     setVectorProjection(name, { op, target });
+  }
+
+  function onProjectionKey(ev: KeyboardEvent): void {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      confirmProjection();
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      cancelProjection();
+    }
   }
 
   function toggleAblate(): void {
@@ -302,18 +316,6 @@
     {formatAlpha(entry.alpha)}
   </span>
 
-  <input
-    type="number"
-    class="alpha-input"
-    min="-1"
-    max="1"
-    step="0.05"
-    value={entry.alpha}
-    oninput={onNumericInput}
-    aria-label="alpha numeric for {name}"
-    title="α numeric — accepts +/- prefix, no detent snap"
-  />
-
   <button
     type="button"
     class="trigger-pill"
@@ -399,6 +401,59 @@
   </button>
 </div>
 
+{#if projectionPromptOp !== null}
+  <!-- Inline projection-target dialog.  Backdrop covers the viewport;
+       click-outside / Escape cancels; Enter confirms.  Stops outer
+       click propagation so clicking inside the dialog box doesn't trip
+       the cancel handler. -->
+  <div
+    class="projection-backdrop"
+    role="presentation"
+    onclick={cancelProjection}
+    onkeydown={onProjectionKey}
+  >
+    <div
+      class="projection-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Pick projection target"
+      tabindex="-1"
+      onclick={(ev) => ev.stopPropagation()}
+      onkeydown={(ev) => ev.stopPropagation()}
+    >
+      <header class="projection-header">
+        <span class="projection-title">
+          {projectionPromptOp === "~"
+            ? `project ${name} onto`
+            : `project ${name} orthogonal to`}
+        </span>
+      </header>
+      <input
+        bind:this={projectionInputRef}
+        bind:value={projectionTargetDraft}
+        class="projection-input"
+        placeholder="target concept name"
+        spellcheck="false"
+        autocomplete="off"
+        onkeydown={onProjectionKey}
+      />
+      <footer class="projection-actions">
+        <button
+          type="button"
+          class="projection-btn cancel"
+          onclick={cancelProjection}
+        >cancel</button>
+        <button
+          type="button"
+          class="projection-btn confirm"
+          onclick={confirmProjection}
+          disabled={!projectionTargetDraft.trim()}
+        >ok</button>
+      </footer>
+    </div>
+  </div>
+{/if}
+
 <style>
   .strip {
     display: flex;
@@ -422,11 +477,15 @@
     border-color: var(--accent-purple);
   }
 
+  /* Enable / disable toggle — same ●/○ glyph the probe row uses, so the
+   * two row families read as one visual system.  Colour is the blue
+   * highlight accent for "active state on this row" parity with the
+   * probe-rack selection glyph. */
   .enable {
     background: transparent;
     border: 0;
     padding: 0 0.2em;
-    color: var(--accent-green);
+    color: var(--accent-blue);
     font-size: 1em;
     line-height: 1;
   }
@@ -461,23 +520,8 @@
     min-width: 3.5em;
     text-align: right;
     font-variant-numeric: tabular-nums;
-    font-size: 0.85em;
-  }
-
-  .alpha-input {
-    flex: 0 0 4.5em;
-    width: 4.5em;
-    background: var(--bg);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    border-radius: 2px;
-    padding: 0.1em 0.3em;
-    font-size: 0.8em;
-    font-variant-numeric: tabular-nums;
-  }
-  .alpha-input:focus {
-    border-color: var(--accent-blue);
-    outline: none;
+    /* Inherits 0.85em from .strip — matches the probe row's .value so
+     * the two row families read as one visual system. */
   }
 
   .trigger-pill,
@@ -567,5 +611,87 @@
     border: 0;
     border-top: 1px solid var(--border-dim);
     margin: 0.2em 0;
+  }
+
+  /* ----- projection modal ----- */
+  .projection-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(1, 4, 9, 0.55);
+    z-index: var(--z-modal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .projection-modal {
+    min-width: 360px;
+    max-width: 480px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.8em 1em;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6em;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+    font-family: var(--font-mono);
+  }
+  .projection-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4em;
+  }
+  .projection-title {
+    color: var(--fg-strong);
+    font-size: 0.9em;
+  }
+  .projection-input {
+    background: var(--bg);
+    color: var(--fg-strong);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 0.4em 0.6em;
+    font: inherit;
+    font-size: 0.9em;
+    font-family: var(--font-mono);
+  }
+  .projection-input:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+  }
+  .projection-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.4em;
+  }
+  .projection-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-strong);
+    padding: 0.3em 0.9em;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    cursor: pointer;
+    border-radius: 2px;
+  }
+  .projection-btn.cancel {
+    color: var(--fg-dim);
+  }
+  .projection-btn.cancel:hover {
+    color: var(--fg-strong);
+    border-color: var(--fg-muted);
+  }
+  .projection-btn.confirm {
+    color: var(--accent-blue);
+    border-color: var(--accent-blue);
+  }
+  .projection-btn.confirm:hover:not(:disabled) {
+    background: rgba(88, 166, 255, 0.12);
+  }
+  .projection-btn.confirm:disabled {
+    color: var(--fg-muted);
+    border-color: var(--border-dim);
+    cursor: not-allowed;
   }
 </style>

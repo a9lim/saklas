@@ -119,25 +119,33 @@ export interface CloneVectorResponse {
   progress: string[];
 }
 
-/** Output of GET /sessions/{id}/vectors/{name}/diagnostics — 16-bucket
- * histogram + summary metrics from `saklas vector why`. */
+/** Output of GET /sessions/{id}/vectors/{name}/diagnostics — per-layer
+ * ``||baked||`` magnitudes + bucket histogram + (optional) probe-quality
+ * diagnostics from ``saklas vector why``.  Resolves either steering
+ * vectors or active probes — the server falls back to monitor profiles
+ * on miss. */
 export interface VectorDiagnosticsResponse {
   name: string;
-  /** Layer histogram entries.  ``label`` is ``LXX`` or ``LXX-YY`` zero-padded;
-   * ``value`` is the mean ``||baked||`` for the bucket. */
-  histogram: { label: string; value: number; lo: number; hi: number }[];
-  /** Per-layer ``||baked||`` keyed by string layer index. */
-  per_layer_norms: Record<string, number>;
-  /** Median diagnostics across retained layers (when extracted with v1.6+). */
-  diagnostics_summary: {
+  model: string;
+  total_layers: number;
+  /** Bucket histogram for the WHY view.  ``buckets`` is the bucket count
+   * (HIST_BUCKETS, 16 by default); ``data`` is the per-bucket entries. */
+  histogram: {
+    buckets: number;
+    data: { lo: number; hi: number; mean_norm: number }[];
+  };
+  /** Full per-layer ``||baked||`` magnitudes — one entry per retained
+   * model layer, sorted ascending.  Drives the layer-norms overlay. */
+  layers: { layer: number; magnitude: number }[];
+  /** Probe-quality diagnostics when the profile carries them (v1.6+). */
+  diagnostics_by_layer?: Record<string, Record<string, number>>;
+  diagnostics_summary?: {
     evr: number | null;
     intra_pair_variance_mean: number | null;
     inter_pair_alignment: number | null;
     diff_principal_projection: number | null;
-    /** "solid" | "shaky" | "poor" — derived stoplight. */
     stoplight: "solid" | "shaky" | "poor" | "unknown";
   };
-  diagnostics_by_layer: Record<string, Record<string, number>>;
 }
 
 // ----------------------------------------------------- probes --
@@ -449,6 +457,10 @@ export interface ProbeRackEntry {
   sparkline: number[];
   current: number;
   previous: number;
+  /** Most recent token's per-layer readings for *this* probe.  Layer-key
+   * strings keep the wire shape; ProbeStrip sorts numerically.  Empty
+   * until the first ``token`` event with ``per_layer_scores`` lands. */
+  perLayer: Record<string, number>;
 }
 
 // ----------------------------------------------------- gen status --
@@ -502,6 +514,8 @@ export type DrawerName =
   | "system_prompt"
   | "model_info"
   | "token_drilldown"
+  | "correlation"
+  | "layer_norms"
   | "export"
   | "help";
 

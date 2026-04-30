@@ -203,6 +203,9 @@
           <button type="button" role="menuitem" onclick={() => pickTool("sweep")}>sweep…</button>
           <button type="button" role="menuitem" onclick={() => pickTool("pack")}>packs…</button>
           <hr />
+          <button type="button" role="menuitem" onclick={() => pickTool("correlation")}>correlation matrix…</button>
+          <button type="button" role="menuitem" onclick={() => pickTool("layer_norms")}>layer norms…</button>
+          <hr />
           <button type="button" role="menuitem" onclick={() => pickTool("system_prompt")}>system prompt…</button>
           <button type="button" role="menuitem" onclick={() => pickTool("model_info")}>model info…</button>
           <hr />

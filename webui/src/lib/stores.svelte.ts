@@ -333,6 +333,7 @@ export async function refreshProbeList(): Promise<void> {
         sparkline: [],
         current: 0,
         previous: 0,
+        perLayer: {},
       });
     }
   }
@@ -364,18 +365,47 @@ export function setProbeSortMode(mode: ProbeSortMode): void {
   probeRack.sortMode = mode;
 }
 
-/** Update a probe row from a streaming token's per-probe scores.  Drops
- * stale sparkline entries past ``MAX_SPARKLINE`` so memory stays bounded
- * across long sessions. */
+/** Update probe rows from a streaming token's full per-layer × per-probe
+ * map.  Each entry records:
+ *   - ``current`` / ``sparkline`` — deepest-layer value, used by the row's
+ *     value bar + sparkline (proxy for "live trait reading").
+ *   - ``perLayer`` — the full per-layer column for that probe at this
+ *     token, used by the expanded layer strip.
+ *
+ * Drops stale sparkline entries past ``MAX_SPARKLINE`` so memory stays
+ * bounded across long sessions. */
 const MAX_SPARKLINE = 60;
-export function updateProbeFromScores(scores: Record<string, number>): void {
+export function updateProbeFromScores(
+  perLayerScores: Record<string, Record<string, number>>,
+): void {
+  // Layer keys are zero-padded ints from the server; sort numerically so
+  // "deepest" really means highest index regardless of insertion order.
+  const layers = Object.keys(perLayerScores).sort(
+    (a, b) => Number(a) - Number(b),
+  );
+  if (layers.length === 0) return;
+  const deepest = layers[layers.length - 1];
+
+  // Pivot: gather per-probe column across all layers in one pass so the
+  // hot WS handler doesn't iterate L × P twice per token.
+  const probeNames = new Set<string>();
+  const perProbeLayer: Record<string, Record<string, number>> = {};
+  for (const layer of layers) {
+    const row = perLayerScores[layer] ?? {};
+    for (const [name, val] of Object.entries(row)) {
+      probeNames.add(name);
+      (perProbeLayer[name] ??= {})[layer] = val;
+    }
+  }
+
   // Reassign the entry on every score so the SvelteMap fires reactivity
-  // for whichever component reads ``current`` / ``sparkline`` — bare
-  // ``entry.current = val`` would update the in-memory object but the
-  // map's ``set``-tracked subscribers never see it, leaving probe
+  // for whichever component reads ``current`` / ``sparkline`` / ``perLayer``
+  // — bare ``entry.current = val`` would update the in-memory object but
+  // the map's ``set``-tracked subscribers never see it, leaving probe
   // strips frozen at zero throughout a generation.
-  for (const [name, val] of Object.entries(scores)) {
+  for (const name of probeNames) {
     const prev = probeRack.entries.get(name);
+    const val = perLayerScores[deepest]?.[name] ?? 0;
     const previous = prev?.current ?? 0;
     const sparkline = prev ? prev.sparkline.slice() : [];
     sparkline.push(val);
@@ -386,6 +416,7 @@ export function updateProbeFromScores(scores: Record<string, number>): void {
       sparkline,
       current: val,
       previous,
+      perLayer: perProbeLayer[name] ?? {},
     });
   }
 }
@@ -398,6 +429,12 @@ export function snapshotProbeBaseline(): void {
     probeRack.entries.set(name, { ...e, previous: e.current });
   }
 }
+
+/** Sentinel value the ProbeStrip layer strip falls back to when a probe
+ * has been activated but no token has streamed yet.  Returned as a
+ * computed default so consumers can switch on emptiness without a
+ * separate ``hasReadings`` flag. */
+export const EMPTY_PER_LAYER: Readonly<Record<string, number>> = Object.freeze({});
 
 // ============================================================ chat ======
 
@@ -506,7 +543,12 @@ export const samplingState: SamplingState = $state({
   max_tokens: 256,
   seed: null,
   system_prompt: "",
-  thinking: null,
+  // Initial thinking state: explicit ``false`` so an unchecked checkbox
+  // on first paint actually sends ``thinking: false`` to the server.
+  // The previous ``null`` (auto) state silently fell through to whatever
+  // the model template defaults to — for thinking-capable templates that
+  // meant the model thought even though the box was visually off.
+  thinking: false,
   oneShotOverride: true,
 });
 
@@ -804,16 +846,13 @@ function handleWsMessage(msg: WSServerMessage): void {
           }
         }
       }
-      // Update probe rack from the deepest-layer per-probe row when
-      // available — cheap proxy for the TUI's live trait readings.
-      // Skip during shadow runs so the rack stays anchored to the
-      // steered branch's signal.
+      // Update probe rack from the full per-layer × per-probe map.  The
+      // store derives the deepest-layer scalar for ``current``/sparkline
+      // and keeps the per-layer column on each entry for the expanded
+      // layer-strip view.  Skip during shadow runs so the rack stays
+      // anchored to the steered branch's signal.
       if (msg.per_layer_scores && !abState.processingAb) {
-        const layers = Object.keys(msg.per_layer_scores);
-        if (layers.length > 0) {
-          const last = layers[layers.length - 1];
-          updateProbeFromScores(msg.per_layer_scores[last]);
-        }
+        updateProbeFromScores(msg.per_layer_scores);
       }
       return;
     }
@@ -877,16 +916,16 @@ function handleWsMessage(msg: WSServerMessage): void {
       applyPendingActions();
 
       // If A/B is on and this was the steered run that just finished,
-      // dispatch the unsteered shadow generate against the same input.
-      // We require the steered idx + lastInput to be intact and the
-      // turn to actually be an assistant turn (not a system error).
+      // dispatch the unsteered shadow generate.  The shadow now builds
+      // its prompt from chatLog directly (full message-list playback)
+      // rather than replaying a single input string — that's what makes
+      // mid-conversation A/B comparison work.
       if (
         abState.enabled &&
-        abState.lastInput !== null &&
         steeredIdx !== null &&
         chatLog.turns[steeredIdx]?.role === "assistant"
       ) {
-        void _sendShadowGenerate(abState.lastInput, steeredIdx);
+        void _sendShadowGenerate(steeredIdx);
       }
       return;
     }
@@ -958,13 +997,16 @@ export async function sendGenerate(
   // Remember the input verbatim so the A/B path can replay it as the
   // shadow gen.  Only meaningful when ``abState.enabled``; otherwise it's
   // dead weight that's free to keep up to date.
-  abState.lastInput = input;
   const payload: WSClientMessage = {
     type: "generate",
     input,
     steering: steering || null,
     sampling,
-    thinking: samplingState.thinking,
+    // Coerce ``null`` (legacy "auto") to explicit ``false`` so the
+    // unchecked checkbox really means "no thinking" — the server's
+    // chat-template templates treat ``null`` and ``False`` differently
+    // on some families and we promised the user a binary toggle.
+    thinking: samplingState.thinking ?? false,
     stateless: opts.stateless ?? false,
     raw: opts.raw ?? false,
   };
@@ -1057,8 +1099,6 @@ export function ingestSweepEvent(ev: SweepEvent): void {
 /** A/B compare state.  ``enabled`` is the user-visible toggle.  The
  * remaining fields drive the dual-roundtrip dance:
  *
- * - ``lastInput`` — the input the user just sent, replayed verbatim for the
- *   shadow (unsteered) gen.
  * - ``pendingTurnIdx`` — the steered-turn index waiting for its unsteered
  *   pair.  Set the moment the shadow gen is dispatched; cleared on shadow
  *   ``done`` or ``error``.
@@ -1066,6 +1106,11 @@ export function ingestSweepEvent(ev: SweepEvent): void {
  *   (``started``/``token``/``done``) routes into ``turn.abPair`` on
  *   ``chatLog.turns[pendingTurnIdx]`` instead of allocating a fresh turn.
  *   This is the WS-side flag the message handler keys off.
+ *
+ * The shadow's prompt is reconstructed from ``chatLog.turns`` at fire
+ * time (see ``_buildShadowMessages``) — no per-turn input string is
+ * cached on this state, so toggling A/B mid-conversation works for any
+ * turn, not only the just-sent one.
  *
  * Mid-flight toggle-off semantics: once a shadow gen is in flight, we let
  * it finish writing into ``abPair`` even if the user toggles A/B off — the
@@ -1077,34 +1122,79 @@ export function ingestSweepEvent(ev: SweepEvent): void {
  */
 export interface AbState {
   enabled: boolean;
-  lastInput: string | null;
   pendingTurnIdx: number | null;
   processingAb: boolean;
 }
 
 export const abState: AbState = $state({
   enabled: false,
-  lastInput: null,
   pendingTurnIdx: null,
   processingAb: false,
 });
 
 export function toggleAb(): void {
+  const wasOff = !abState.enabled;
   abState.enabled = !abState.enabled;
   // Toggling off does not abandon an in-flight shadow gen — the events
-  // route through to ``abPair`` regardless.  Toggling back on while a
-  // shadow is mid-flight is a no-op for the WS path; the next steered
-  // gen will spawn its own pair.
+  // route through to ``abPair`` regardless.  Toggling off only prevents
+  // the *next* steered gen from spawning a shadow.
+  if (!wasOff) return;
+  // Toggling on: replay the conversation through the unsteered agent
+  // for the most recent steered assistant turn that doesn't already
+  // carry an abPair.  Skip when a generation is in flight — the
+  // ``done`` handler will fire its own shadow when it lands.
+  if (genStatus.active) return;
+  for (let i = chatLog.turns.length - 1; i >= 0; i--) {
+    const t = chatLog.turns[i];
+    if (!t) continue;
+    if (t.role !== "assistant") continue;
+    if (t.abPair) break; // already has a shadow — nothing to fire
+    void _sendShadowGenerate(i);
+    break;
+  }
+}
+
+/** Build the conversation as a messages list to replay through the
+ * unsteered shadow.  Walks ``chatLog.turns[0..steeredIdx-1]`` (excluding
+ * ``steeredIdx`` itself, which is the steered assistant response we
+ * don't want the shadow to inherit), filtering out system / error turns
+ * that aren't real conversation context.
+ *
+ * The unsteered model sees prior steered assistant turns as if they
+ * happened naturally — that's the user's "play the conversation back"
+ * contract.  Only the most recent user turn (the last entry in the
+ * returned list) is what the shadow generates a fresh response for.
+ *
+ * Returns ``null`` when the slice doesn't end on a user turn (no
+ * generation possible — the chatLog must have a trailing user turn for
+ * the steered response to pair against). */
+function _buildShadowMessages(
+  steeredIdx: number,
+): Array<{ role: "user" | "assistant"; content: string }> | null {
+  const out: Array<{ role: "user" | "assistant"; content: string }> = [];
+  for (let i = 0; i < steeredIdx; i++) {
+    const t = chatLog.turns[i];
+    if (!t) continue;
+    if (t.role !== "user" && t.role !== "assistant") continue; // skip system / errors
+    // Use the accumulated text — assistant turns already exclude their
+    // thinking content (only response tokens land in ``turn.text``), so
+    // replaying them through ``enable_thinking=False`` is well-formed.
+    out.push({ role: t.role, content: t.text ?? "" });
+  }
+  if (out.length === 0 || out[out.length - 1].role !== "user") return null;
+  return out;
 }
 
 /** Internal: dispatch the unsteered shadow generate that pairs with the
- * just-finished steered turn at index ``steeredIdx``.  Pushes no user turn
- * (it was already rendered when the steered gen started) and routes WS
- * events into the steered turn's ``abPair`` via ``processingAb``. */
-async function _sendShadowGenerate(
-  input: string,
-  steeredIdx: number,
-): Promise<void> {
+ * just-finished steered turn at index ``steeredIdx``.  Sends the full
+ * conversation as a ``messages`` list instead of a bare input string +
+ * server-side history — the shadow runs ``stateless: true`` so the
+ * server doesn't append to history (the steered branch already did) and
+ * the messages list is the *only* context the unsteered model sees.
+ * That makes the comparison work for any turn, not just the first. */
+async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
+  const messages = _buildShadowMessages(steeredIdx);
+  if (messages === null) return;
   const sock = await ensureWebSocket();
   const sampling = samplingState.oneShotOverride
     ? {
@@ -1121,14 +1211,18 @@ async function _sendShadowGenerate(
   abState.processingAb = true;
   const payload: WSClientMessage = {
     type: "generate",
-    input,
+    // ``input`` accepts ``Any`` server-side; a list goes straight through
+    // to ``session._prepare_input`` which dispatches on isinstance(list).
+    input: messages,
     // Empty steering string == unsteered shadow per the WS protocol
     // (saklas_api._build_steering treats "" as "no expression").
     steering: "",
     sampling,
-    thinking: samplingState.thinking,
+    thinking: samplingState.thinking ?? false,
     // Stateless so the shadow doesn't pollute server-side history; the
-    // steered turn already populated history.
+    // steered turn already populated history.  Combined with the
+    // explicit messages list this means the shadow's prompt is exactly
+    // the conversation up to (but not including) the steered response.
     stateless: true,
     raw: false,
   };

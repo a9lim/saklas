@@ -33,8 +33,8 @@ Per-token highlighting now lives on the chat tokens themselves, driven by a sing
 The dashboard speaks the existing `/saklas/v1/*` native API plus six routes added in v2.0:
 
 1. **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. The `token` event carries optional `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed) when probes are loaded; `done` carries `per_token_probes` assembled from `session._last_per_token_scores`. Drives chat tinting + click-token drilldown.
-2. **GET `/saklas/v1/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix. Drives the correlation collapsible.
-3. **GET `/saklas/v1/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + summary metrics. Falls back to `session._monitor.profiles` when the name is a probe rather than a registered steering vector. Drives the WHY histogram inside expanded probe strips.
+2. **GET `/saklas/v1/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix. Default pool unions registered steering vectors AND active probes (deduplicated by name). Drives the correlation drawer overlay.
+3. **GET `/saklas/v1/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + per-layer magnitudes + (optional) probe-quality metrics. Falls back to `session._monitor.profiles` when the name is a probe rather than a registered steering vector. Drives the layer-norms drawer overlay (and `saklas vector why` from the CLI).
 4. **GET `/saklas/v1/packs`** — locally installed packs, JSON shape. Drives the vector picker and probe picker.
 5. **GET `/saklas/v1/packs/search?q=…`** — HF Hub proxy. Drives the Pack drawer's search tab.
 6. **POST `/saklas/v1/packs`** — install pack from HF coord or local folder.
@@ -64,14 +64,14 @@ webui/src/
     Chat.svelte               # thinking-collapsible, probe-tinted tokens, A/B split
     SamplingStrip.svelte      # T / P / K / max / seed / thinking / session-vs-one-shot
     SteeringRack.svelte       # one strip per loaded vector + canonical EXPR + "+ steer"
-    VectorStrip.svelte        # enable / α slider / trigger pill / variant / projection / ✕
+    VectorStrip.svelte        # ●/○ enable + α slider + α display + trigger pill + variant chip + ⋮ menu + ✕ + inline projection modal
     ProbeRack.svelte          # highlight + compare-two dropdowns + sort + "+ probe"
-    ProbeStrip.svelte         # radio + sparkline + value bar + WHY histogram on expand
-    ReferenceCollapsibles.svelte # ▶ correlation N×N + ▶ layer norms (per vector)
+    ProbeStrip.svelte         # ●/○ select-for-highlight (whole-row click target) + name + right-aligned sparkline + value bar + α display + ✕ + always-visible per-layer reading strip
   drawers/
     {Extract,Load,SaveConversation,LoadConversation,Compare,
      SystemPrompt,ModelInfo,Help,Export,Sweep,Pack,Merge,Clone,
-     VectorPicker,ProbePicker,TokenDrilldown}Drawer.svelte
+     VectorPicker,ProbePicker,TokenDrilldown,
+     Correlation,LayerNorms}Drawer.svelte
     _SearchableConceptList.svelte  # shared between picker drawers
     index.ts                  # barrel re-exports for App.svelte's switch
 ```
@@ -96,10 +96,31 @@ Server-restart guard: if the persisted snapshot has user turns but the fresh ses
 
 The picker drawers (`VectorPickerDrawer`, `ProbePickerDrawer`) mirror the TUI's `/steer 0.5 honest` ergonomics: the user picks a concept name from `GET /packs`, the server's extract endpoint short-circuits to the cached profile when the model already has it, the rack lands. `addVectorToRack` defaults α to 0.5 (matches `DEFAULT_COEFF` in `saklas.core.steering_expr`). The picker's footer keeps the advanced affordances — extract from pos/neg, load from disk path.
 
+## Click semantics
+
+Probe rows: clicking anywhere on the row body (not the ✕) toggles highlight selection — first click anchors the probe as the chat-token highlight target, click again on the same row to deselect. ✕ is `stopPropagation`'d so removal doesn't trip toggle on the way out. The row uses `role="button"` + `aria-pressed` so the toggle is keyboard-reachable (Enter/Space).
+
+Chat tokens: every per-token span is clickable regardless of whether a highlight probe is selected — the click opens `token_drilldown` with `{turnIdx, tokenIdx, isThinking}`. The `isThinking` flag routes the drilldown to `turn.thinkingTokens` vs `turn.tokens` so clicks inside the thinking-collapsible body resolve to the right token row. With no highlight target, tokens render bare but the hover outline still gives a click affordance.
+
+Vector strip projection picker: the `⋮` menu's "project onto (~)…" / "project orthogonal (|)…" entries open an inline modal at `--z-modal` (above drawers) — text input autofocuses, Enter confirms, Escape / click-outside / cancel cancel. Replaces the v1 `window.prompt`. Re-clicking the same operator with an existing projection clears it (no dialog).
+
+## A/B compare
+
+`abState.enabled` toggles two-column rendering. The shadow gen (unsteered) runs after the steered turn finishes via `_sendShadowGenerate(steeredIdx)`, which:
+
+1. Builds a messages list from `chatLog.turns[0..steeredIdx-1]` via `_buildShadowMessages` — past steered assistant turns ride along as context, the trailing user turn is what the unsteered model responds to.
+2. Sends `input: <messages list>` + `stateless: true` over the WS so the server's `prior=[]` (stateless) and the messages list is the *only* context — no contamination from server-side history.
+
+Toggling A/B from off→on while the chat already has steered turns immediately fires a shadow for the most recent assistant turn that doesn't have an `abPair` (skipped if a generation is in flight — the `done` handler will fire its own shadow). This is the "play the conversation back to the unsteered agent" flow: previously A/B only worked when regenerating the first turn.
+
+## Thinking semantics
+
+The thinking checkbox is a strict binary. Initial `samplingState.thinking` is `false` (not legacy `null` "auto"). Both `sendGenerate` and `_sendShadowGenerate` send `thinking: samplingState.thinking ?? false` so any null write that leaked through still serialises as explicit-off — the previous null path could leak through to the chat-template `enable_thinking=null` ambiguity and have the model think anyway.
+
 ## Out of scope (v2.0)
 
 - Multi-session UI (server URL-paths support it; the client assumes `default`).
 - Auth UI for `SAKLAS_API_KEY` — the underlying Bearer middleware applies; no dedicated UI surface.
 - Mobile / touch-first responsive layout. Saklas is a desktop research tool; min-width 1280px.
-- Combobox autocomplete on the projection-target picker (currently `window.prompt`).
+- Combobox autocomplete on the projection-target picker — the modal takes a free-form name; no live name-completion against the loaded-vector list.
 - Pagination on HF pack search (capped at 20 results).
