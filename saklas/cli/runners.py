@@ -7,7 +7,7 @@ import functools
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import _PACK_VERBS, _VECTOR_VERBS
 from saklas.core.errors import SaklasError
@@ -239,9 +239,15 @@ def _run_serve(args: argparse.Namespace) -> None:
         default_steering = parse_expr(config_expr)
 
     from saklas.server import create_app
+    # Default-on: the dashboard ships with the wheel and is the easiest
+    # way for casual users to drive saklas; ``--no-web`` opts out for
+    # production / proxied deployments where ``/`` already belongs to
+    # something else.
+    web_enabled = not getattr(args, "no_web", False)
     app = create_app(session, default_steering=default_steering,
                      cors_origins=args.cors or None,
-                     api_key=getattr(args, "api_key", None))
+                     api_key=getattr(args, "api_key", None),
+                     web=web_enabled)
 
     _warmup_session(session)
 
@@ -917,17 +923,100 @@ def _run_why(args: argparse.Namespace) -> None:
         key=lambda kv: kv[0],
     )
     total_layers = len(profile)
+    diagnostics = profile.diagnostics  # None when extracted before saklas 1.6
 
     if args.json_output:
-        result = {
+        result: dict[str, Any] = {
             "concept": concept_name,
             "model": args.model,
             "total_layers": total_layers,
             "layers": [{"layer": l, "magnitude": round(m, 6)} for l, m in layer_mags],
         }
+        if diagnostics is not None:
+            result["diagnostics_by_layer"] = {
+                str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
+                for layer, metrics in sorted(diagnostics.items())
+            }
+            result["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
         print(_json.dumps(result, indent=2))
     else:
         _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
+        if diagnostics is not None:
+            _print_diagnostics(diagnostics)
+
+
+def _summarize_diagnostics(
+    diagnostics: dict[int, dict[str, float]],
+) -> dict[str, float | str]:
+    """Aggregate per-layer metrics into a small summary block.
+
+    Reports medians (robust to outlier layers) for the four metrics, plus
+    a coarse ``quality`` stoplight derived from the same thresholds the
+    extraction-time warning uses.  Mirrored in the JSON output so callers
+    don't have to recompute it client-side.
+    """
+    def _median(values: list[float]) -> float:
+        s = sorted(values)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        mid = n // 2
+        if n % 2 == 1:
+            return s[mid]
+        return 0.5 * (s[mid - 1] + s[mid])
+
+    evrs = [m["evr"] for m in diagnostics.values() if "evr" in m]
+    intras = [
+        m["intra_pair_variance_mean"]
+        for m in diagnostics.values()
+        if "intra_pair_variance_mean" in m
+    ]
+    aligns = [
+        m["inter_pair_alignment"]
+        for m in diagnostics.values()
+        if "inter_pair_alignment" in m
+    ]
+    projs = [
+        m["diff_principal_projection"]
+        for m in diagnostics.values()
+        if "diff_principal_projection" in m
+    ]
+
+    med_evr = _median(evrs) if evrs else 0.0
+    med_intra = _median(intras) if intras else 0.0
+    med_align = _median(aligns) if aligns else 0.0
+    med_proj = _median(projs) if projs else 0.0
+
+    if med_evr > 0.95 and med_intra < 0.01:
+        quality = "poor"
+    elif med_align < 0.2:
+        quality = "poor"
+    elif med_align < 0.4 or med_evr < 0.2:
+        quality = "shaky"
+    else:
+        quality = "solid"
+
+    return {
+        "median_evr": round(med_evr, 4),
+        "median_intra_pair_variance": round(med_intra, 4),
+        "median_inter_pair_alignment": round(med_align, 4),
+        "median_diff_principal_projection": round(med_proj, 4),
+        "quality": quality,
+    }
+
+
+def _print_diagnostics(diagnostics: dict[int, dict[str, float]]) -> None:
+    """Render the diagnostics summary + per-layer table beneath the histogram."""
+    summary = _summarize_diagnostics(diagnostics)
+    quality = summary["quality"]
+    print()
+    print(f"  DIAGNOSTICS (probe quality: {quality}):")
+    print(
+        f"    median EVR:                 {summary['median_evr']:.3f}\n"
+        f"    median intra-pair variance: {summary['median_intra_pair_variance']:.4f}\n"
+        f"    median inter-pair alignment:{summary['median_inter_pair_alignment']:>7.3f}\n"
+        f"    median diff→PC projection:  {summary['median_diff_principal_projection']:.3f}"
+    )
 
 
 def _print_why_histogram(
@@ -962,12 +1051,196 @@ def _print_why_histogram(
         print(f"    {_label(lo, hi):<{label_col}}  {bar}  {norm:>{value_w}.3f}")
 
 
+def _run_transfer(args: argparse.Namespace) -> None:
+    """Cross-model probe transfer via Procrustes (v1.6).
+
+    Resolves the concept folder, loads the source-model tensor, fits
+    (or loads) the per-layer alignment between source and target's
+    cached neutral activations, applies the transfer, and writes the
+    result at the target's ``_from-<safe_src>`` variant path with a
+    sidecar carrying transfer provenance.
+    """
+    import json as _json
+
+    from saklas.core.profile import Profile, ProfileError
+    from saklas.io.alignment import (
+        AlignmentError,
+        alignment_cache_path,
+        alignment_quality,
+        fit_alignment,
+        load_alignment_map,
+        load_or_compute_neutral_activations,
+        save_alignment_map,
+        transfer_profile,
+    )
+    from saklas.io.packs import hash_file
+    from saklas.io.paths import safe_model_id, sidecar_filename, tensor_filename
+    from saklas.io.selectors import parse as sel_parse, resolve
+
+    sel = sel_parse(args.concept)
+    matches = resolve(sel)
+    if not matches:
+        print(f"transfer: '{args.concept}' not found", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        qualified = ", ".join(f"{c.namespace}/{c.name}" for c in matches)
+        print(
+            f"transfer: '{args.concept}' is ambiguous (matches {qualified}); "
+            f"specify ns/name",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    folder = matches[0].folder
+    src_tensor = folder / tensor_filename(args.src_model)
+    if not src_tensor.is_file():
+        print(
+            f"transfer: source tensor not found at {src_tensor} — extract "
+            f"the concept on {args.src_model} first",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    tgt_tensor = folder / tensor_filename(
+        args.tgt_model, transferred_from=args.src_model,
+    )
+    tgt_sidecar = folder / sidecar_filename(
+        args.tgt_model, transferred_from=args.src_model,
+    )
+    if tgt_tensor.exists() and not args.force:
+        print(
+            f"transfer: target already exists at {tgt_tensor}; pass -f to recompute",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Load + fit / load alignment.  Heavy work — both forward passes
+    # and the SVD — so we lazy-load saklas.core.session to avoid paying
+    # the model-load cost when the user just runs --help.
+    from saklas.core.session import SaklasSession
+
+    try:
+        src_profile = Profile.load(src_tensor)
+    except ProfileError as e:
+        print(f"transfer: failed to load source profile: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    cached = None if args.force else load_alignment_map(args.src_model, args.tgt_model)
+
+    if cached is None:
+        # Need both models loaded to compute neutrals.  Loading two
+        # large models simultaneously is non-trivial; we serialize:
+        # load src, compute its neutrals, drop, load tgt, compute, drop.
+        print(
+            f"transfer: fitting Procrustes alignment {args.src_model} -> {args.tgt_model} "
+            f"(this may load each model briefly)...",
+            file=sys.stderr,
+        )
+
+        with SaklasSession.from_pretrained(args.src_model, device="auto", probes=[]) as src_sess:
+            src_acts = load_or_compute_neutral_activations(
+                src_sess._model, src_sess._tokenizer, src_sess._layers,
+                model_id=args.src_model, force=args.force,
+            )
+
+        with SaklasSession.from_pretrained(args.tgt_model, device="auto", probes=[]) as tgt_sess:
+            tgt_acts = load_or_compute_neutral_activations(
+                tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
+                model_id=args.tgt_model, force=args.force,
+            )
+
+        try:
+            M = fit_alignment(src_acts, tgt_acts)
+        except AlignmentError as e:
+            print(f"transfer: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
+        map_path = save_alignment_map(
+            M, args.src_model, args.tgt_model,
+            quality_per_layer=quality_per_layer,
+        )
+    else:
+        M, sidecar = cached
+        # Replay the per-layer quality from the sidecar when present;
+        # otherwise leave it None — transfer still runs.
+        raw_q = sidecar.get("quality_per_layer") or {}
+        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
+        map_path, _ = alignment_cache_path(args.src_model, args.tgt_model)
+
+    median_quality: float | None = None
+    if quality_per_layer:
+        ordered = sorted(quality_per_layer.values())
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            median_quality = ordered[mid]
+        else:
+            median_quality = 0.5 * (ordered[mid - 1] + ordered[mid])
+
+    transferred = transfer_profile(
+        src_profile, M,
+        source_model_id=args.src_model,
+        transfer_quality_estimate=median_quality,
+    )
+
+    # Persist the alignment-map hash on the transferred sidecar so
+    # callers can detect when an old transfer is stale against a newer
+    # alignment cache.
+    map_hash = hash_file(map_path) if map_path.exists() else None
+    save_meta: dict[str, Any] = dict(transferred.metadata)
+    if map_hash is not None:
+        save_meta["alignment_map_hash"] = map_hash
+
+    transferred.save(tgt_tensor, metadata=save_meta)
+
+    # Refresh the pack.json files map so the new variant lands in the
+    # integrity check on next load.
+    from saklas.io.packs import PackMetadata, hash_folder_files
+    try:
+        meta = PackMetadata.load(folder)
+        meta.files = hash_folder_files(folder)
+        meta.write(folder)
+    except Exception:
+        # Pack metadata refresh is best-effort — the tensor itself is
+        # written, and the next ``pack ls`` will notice the discrepancy.
+        pass
+
+    payload = {
+        "concept": matches[0].name,
+        "namespace": matches[0].namespace,
+        "source_model": args.src_model,
+        "target_model": args.tgt_model,
+        "tensor": str(tgt_tensor),
+        "sidecar": str(tgt_sidecar),
+        "transferred_layers": sorted(M.keys()),
+        "median_transfer_quality": (
+            round(median_quality, 4) if median_quality is not None else None
+        ),
+    }
+    if args.json_output:
+        print(_json.dumps(payload, indent=2))
+        return
+
+    quality_str = (
+        f"{median_quality:.3f}" if median_quality is not None else "n/a"
+    )
+    print(
+        f"Transferred {matches[0].namespace}/{matches[0].name} "
+        f"from {args.src_model} -> {args.tgt_model}\n"
+        f"  layers:           {len(M)} shared\n"
+        f"  median quality:   {quality_str} (R^2 across shared layers)\n"
+        f"  tensor:           {tgt_tensor}\n"
+        f"  variant suffix:   :from-{safe_model_id(args.src_model)}"
+    )
+
+
 _VECTOR_RUNNERS = {
-    "extract": _run_extract,
-    "merge":   _run_merge,
-    "clone":   _run_clone,
-    "compare": _run_compare,
-    "why":     _run_why,
+    "extract":  _run_extract,
+    "merge":    _run_merge,
+    "clone":    _run_clone,
+    "compare":  _run_compare,
+    "why":      _run_why,
+    "transfer": _run_transfer,
 }
 
 

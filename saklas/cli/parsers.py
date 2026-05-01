@@ -62,6 +62,7 @@ _VECTOR_VERBS: list[tuple[str, str]] = [
     ("clone",     "Clone a persona from a text corpus"),
     ("compare",   "Cosine similarity between steering vectors"),
     ("why",       "Show which layers contribute most to a steering vector"),
+    ("transfer",  "Transfer a probe from one model to another via Procrustes"),
 ]
 
 
@@ -91,6 +92,9 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
                         help="CORS allowed origin (repeatable)")
     parser.add_argument("-k", "--api-key", default=None, metavar="KEY",
                         help="Require Bearer token auth; falls back to $SAKLAS_API_KEY")
+    parser.add_argument("--no-web", dest="no_web", action="store_true",
+                        help="Skip the analytics dashboard mount at / "
+                             "(API-only mode for production / proxied deployments)")
     _add_config_args(parser)
 
 
@@ -257,12 +261,46 @@ def _build_vector_why(p: argparse.ArgumentParser) -> None:
                    help="Emit machine-readable JSON (full per-layer detail)")
 
 
+def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
+    """``saklas vector transfer`` — cross-model probe alignment.
+
+    Required:
+        ``concept`` — selector resolving to a single concept folder.
+        ``--from`` — HF coord of the source model (must already have a
+        baked tensor for the concept under ~/.saklas/vectors/...).
+        ``--to`` — HF coord of the target model (the alignment is fit
+        between these two using cached neutral activations).
+
+    Behavior: writes a transferred tensor at the target model's
+    ``_from-<safe_src>`` variant path, with a sidecar carrying transfer
+    provenance (``method=procrustes_transfer``, ``source_model_id``,
+    ``alignment_map_hash``, ``transfer_quality_estimate``).  Reuses the
+    same tensor-filename machinery as SAE variants, so subsequent
+    ``saklas pack ls`` / ``saklas vector why`` see the transferred
+    profile alongside any native or SAE variants.
+
+    Cached alignment maps live at
+    ``~/.saklas/models/<safe_tgt>/alignments/<safe_src>.{safetensors,json}``;
+    ``--force`` recomputes even when the cache hits.
+    """
+    p.add_argument("concept", help="Concept selector (name or ns/name)")
+    p.add_argument("--from", dest="src_model", required=True, metavar="SRC_MODEL",
+                   help="Source model id (where the probe was extracted)")
+    p.add_argument("--to", dest="tgt_model", required=True, metavar="TGT_MODEL",
+                   help="Target model id (where the transferred probe will live)")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="Recompute alignment + transfer even when cached")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true",
+                   help="Emit machine-readable JSON (path + quality summary)")
+
+
 _VECTOR_BUILDERS = {
-    "extract": _build_vector_extract,
-    "merge":   _build_vector_merge,
-    "clone":   _build_vector_clone,
-    "compare": _build_vector_compare,
-    "why":     _build_vector_why,
+    "extract":  _build_vector_extract,
+    "merge":    _build_vector_merge,
+    "clone":    _build_vector_clone,
+    "compare":  _build_vector_compare,
+    "why":      _build_vector_why,
+    "transfer": _build_vector_transfer,
 }
 
 
@@ -295,33 +333,47 @@ def _build_root_parser() -> argparse.ArgumentParser:
         prog="saklas",
         description="Activation steering + trait monitoring for local HuggingFace models",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "top-level verbs:\n"
-            "  tui      Launch the interactive TUI (requires <model>)\n"
-            "  serve    Start the OpenAI + Ollama compatible API server\n"
-            "  pack     Manage concept packs (install/ls/search/push/...)\n"
-            "  vector   Vector operations (extract/merge/clone/compare/why)\n"
-            "  config   Inspect and validate saklas config files\n"
-            "\n"
-            "Run `saklas <verb> -h` for verb-specific options."
-        ),
+        epilog="Run `saklas <verb> -h` for verb-specific options.",
     )
     sub = root.add_subparsers(dest="command", required=False, metavar="VERB")
 
-    tui = sub.add_parser("tui", help="Launch the interactive TUI", description="Launch the interactive TUI")
+    # Each ``help=`` here is the single source of truth — it lands in
+    # the auto-generated ``positional arguments`` table on ``saklas -h``.
+    # Keep it short enough to fit one line at the typical terminal
+    # width; the verb's own ``-h`` carries the long-form description.
+    tui = sub.add_parser(
+        "tui",
+        help="Launch the interactive TUI (requires <model>)",
+        description="Launch the interactive TUI",
+    )
     _build_tui_parser(tui)
 
-    serve = sub.add_parser("serve", help="Start the API server", description="Start the API server")
+    serve = sub.add_parser(
+        "serve",
+        help="Start the OpenAI + Ollama API server + analytics dashboard at /",
+        description="Start the OpenAI + Ollama compatible API server",
+    )
     _build_serve_parser(serve)
 
-    pack = sub.add_parser("pack", help="Manage concept packs", description="Manage concept packs")
+    pack = sub.add_parser(
+        "pack",
+        help="Manage concept packs (install/ls/search/push/refresh/...)",
+        description="Manage concept packs",
+    )
     _build_pack_parser(pack)
 
-    vector = sub.add_parser("vector", help="Vector operations",
-                               description="Vector operations (extract/merge/clone/compare/why)")
+    vector = sub.add_parser(
+        "vector",
+        help="Vector operations (extract/merge/clone/compare/why/transfer)",
+        description="Vector operations (extract/merge/clone/compare/why/transfer)",
+    )
     _build_vector_parser(vector)
 
-    cfg = sub.add_parser("config", help="Inspect/validate config", description="Inspect/validate config")
+    cfg = sub.add_parser(
+        "config",
+        help="Inspect and validate saklas config files",
+        description="Inspect/validate config",
+    )
     _build_config_parser(cfg)
 
     return root

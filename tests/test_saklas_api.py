@@ -356,6 +356,41 @@ class TestWebSocket:
             assert msg["type"] == "error"
             assert "unknown message type" in msg["message"]
 
+    def test_multi_turn_no_recv_race(self, session_and_client):
+        """Three back-to-back generate turns on the same WS.
+
+        Regression for the "cannot call recv while another coroutine is
+        already waiting for the next message" RuntimeError that fired
+        when both the outer dispatch loop and the inner generation
+        handler called ``websocket.receive_json()``.  The fix routes
+        every incoming frame through a single perpetual reader task +
+        shared queue.  This test exercises the inter-turn boundary
+        repeatedly so any regression of that pattern surfaces.
+        """
+        session, client = session_and_client
+        self._attach_generate(session, ["a", "b"])
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            for _ in range(3):
+                ws.send_json({"type": "generate", "input": "hi"})
+                started = ws.receive_json()
+                assert started["type"] == "started"
+                while True:
+                    msg = ws.receive_json()
+                    if msg["type"] == "done":
+                        break
+                    assert msg["type"] == "token"
+
+    def test_idle_stop_is_noop(self, session_and_client):
+        """A ``{type: "stop"}`` outside any generation closes cleanly."""
+        _, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            # Stop while idle — server should ignore and stay open.
+            ws.send_json({"type": "stop"})
+            ws.send_json({"type": "frobnicate"})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+
     def test_session_mismatch_closes(self, session_and_client):
         _, client = session_and_client
         with pytest.raises(Exception):
@@ -918,9 +953,9 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     from saklas.core import extraction as E
 
     captured: dict = {}
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None):
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
         captured["sae"] = sae
-        return {0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}
+        return ({0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}, {})
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
     monkeypatch.setattr(E, "extract_contrastive", fake_extract)
 
@@ -1009,8 +1044,8 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
     from saklas.core import vectors as V
     from saklas.core import extraction as E
 
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None):
-        return {0: torch.ones(4), 2: torch.ones(4)}
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
+        return ({0: torch.ones(4), 2: torch.ones(4)}, {})
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
     monkeypatch.setattr(E, "extract_contrastive", fake_extract)
 

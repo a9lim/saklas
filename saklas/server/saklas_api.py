@@ -19,9 +19,11 @@ Old ``/v1/saklas/*`` routes were removed in the same commit that
 introduced this file — no aliases.
 """
 
+# pyright: reportUnusedFunction=false
+
 from __future__ import annotations
 
-from saklas.server.app import ws_auth_ok
+from saklas.server.app import acquire_session_lock, ws_auth_ok
 
 import asyncio
 import json
@@ -109,6 +111,69 @@ class WSGenerateMessage(BaseModel):
     raw: bool = False
 
 
+class InstallPackRequest(BaseModel):
+    """Body for ``POST /saklas/v1/packs``.
+
+    ``target`` is an HF coordinate (``ns/name[@rev]``) or a local folder
+    path — the same surface ``saklas pack install`` consumes.  ``as_``
+    relocates the install to ``<dst_ns>/<dst_name>``; ``force``
+    overwrites an existing folder; ``statements_only`` strips tensors
+    after install.  Field name ``as_`` (Pydantic alias ``as``) avoids
+    shadowing the Python keyword on the wire.
+    """
+    target: str
+    as_: str | None = Field(default=None, alias="as")
+    force: bool = False
+    statements_only: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class MergeVectorRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/vectors/merge``.
+
+    ``expression`` is a merge expression in the shared steering grammar
+    (``"0.3 default/honest + 0.4 default/warm"``); ``name`` becomes the
+    new merged pack's local name.  Reuses :func:`saklas.io.merge.merge_into_pack`.
+    """
+    name: str
+    expression: str
+
+
+class CloneVectorRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/vectors/clone``.
+
+    Mirrors ``saklas vector clone`` flags: ``corpus_path`` points at a
+    one-utterance-per-line text file; ``n_pairs`` and ``seed`` carry
+    through to :func:`saklas.io.cloning.clone_from_corpus`. ``baseline``
+    is currently unused by the underlying clone path but reserved for
+    symmetry with extract.
+    """
+    name: str
+    corpus_path: str
+    n_pairs: int = 90
+    seed: int | None = None
+    baseline: str | None = None
+
+
+class SweepRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/sweep``.
+
+    ``sweep`` maps concept name → list of alpha values.  Cartesian
+    product across concepts becomes one generation per row.
+    ``base_steering`` (optional) is a steering expression string
+    composed underneath each swept term so callers can hold a
+    fixed-alpha context while sweeping another concept.
+    """
+    prompt: Any
+    sweep: dict[str, list[float]]
+    base_steering: str | None = None
+    sampling: WSSamplingParams | None = None
+    thinking: bool | None = None
+    stateless: bool = True
+    raw: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -126,7 +191,7 @@ def _resolve_session_id(session: SaklasSession, session_id: str) -> None:
     )
 
 
-def _session_config_dict(session: SaklasSession) -> dict:
+def _session_config_dict(session: SaklasSession) -> dict[str, Any]:
     cfg = session.config
     return {
         "temperature": getattr(cfg, "temperature", None),
@@ -146,7 +211,7 @@ def _device_dtype(session: SaklasSession) -> tuple[str, str]:
 
 def _session_info(
     session: SaklasSession, default_steering: "Steering | None",
-) -> dict:
+) -> dict[str, Any]:
     device, dtype = _device_dtype(session)
     try:
         thinks = bool(supports_thinking(session._tokenizer))
@@ -169,20 +234,23 @@ def _session_info(
     }
 
 
-def _profile_to_json(name: str, profile: Profile) -> dict:
-    top = sorted(
-        ((idx, float(vec.norm().item())) for idx, vec in profile.items()),
-        key=lambda x: x[1], reverse=True,
-    )[:5]
+def _profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
+    layer_norms = [(idx, float(vec.norm().item())) for idx, vec in profile.items()]
+    top = sorted(layer_norms, key=lambda x: x[1], reverse=True)[:5]
+    # Full per-layer ||baked|| keyed by layer index — stringified for
+    # JSON-key compatibility, mirroring how diagnostics_by_layer round-trips.
+    # The web UI's LayerNorms panel consumes this directly.
+    per_layer_norms = {str(idx): round(mag, 6) for idx, mag in sorted(layer_norms)}
     return {
         "name": name,
         "layers": profile.layers,
         "top_layers": [{"layer": idx, "magnitude": round(m, 4)} for idx, m in top],
+        "per_layer_norms": per_layer_norms,
         "metadata": profile.metadata,
     }
 
 
-def _probe_info(session: SaklasSession, name: str) -> dict:
+def _probe_info(session: SaklasSession, name: str) -> dict[str, Any]:
     layers: list[int] = []
     try:
         profiles = session._monitor.profiles
@@ -232,7 +300,7 @@ def _build_steering(
     if req is not None and req.thinking is not None:
         thinking = req.thinking
 
-    merged: dict = {}
+    merged: dict[str, Any] = {}
     if default_steering is not None:
         merged.update(default_steering.alphas)
     if req is not None:
@@ -267,7 +335,7 @@ def _coerce_pair_source(source: Any) -> Any:
     return pairs
 
 
-def _result_to_json(result: GenerationResult | None) -> dict:
+def _result_to_json(result: GenerationResult | None) -> dict[str, Any]:
     if result is None:
         return {}
     prompt_tokens = getattr(result, "prompt_tokens", 0) or 0
@@ -284,11 +352,11 @@ def _result_to_json(result: GenerationResult | None) -> dict:
     }
 
 
-def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict]:
+def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict[str, Any]]:
     scores = session.last_per_token_scores
     if not scores:
         return []
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     n = min(n_tokens, *(len(v) for v in scores.values())) if scores else 0
     for i in range(n):
         out.append({
@@ -312,6 +380,99 @@ def register_saklas_routes(app: FastAPI) -> None:
     """
 
     session: SaklasSession = app.state.session
+
+    # ----- packs (top-level, not under a session) ------------------------
+
+    @app.get("/saklas/v1/packs")
+    def list_packs():
+        """Return locally installed packs as JSON.
+
+        Mirrors ``saklas pack ls`` (local-only branch). HF hub query is
+        the separate ``GET /saklas/v1/packs/search`` route — keeps the
+        common case (UI rack refresh) off the network.
+        """
+        from saklas.io.cache_ops import list_concepts as _list_concepts
+        result = _list_concepts(None, hf=False)
+        return {
+            "packs": [
+                {
+                    "name": r.name,
+                    "namespace": r.namespace,
+                    "status": r.status,
+                    "recommended_alpha": r.recommended_alpha,
+                    "tags": list(r.tags),
+                    "description": r.description,
+                    "source": r.source,
+                    "tensor_models": list(r.tensor_models),
+                    **({"error": r.error} if r.error else {}),
+                }
+                for r in result.installed
+            ],
+        }
+
+    @app.get("/saklas/v1/packs/search")
+    def search_packs(q: str = "", limit: int = 50):
+        """HF-hub search proxy returning JSON.
+
+        Wraps :func:`saklas.io.cache_ops.search_remote_packs` so the UI
+        gets structured rows (not the CLI's text rendering). ``q`` is a
+        free-form query against repo ids; ``limit`` clamps the response
+        size client-side. HF transport errors land as 502; missing
+        ``huggingface_hub`` lands as 503.
+        """
+        from saklas.io.cache_ops import search_remote_packs as _search
+        try:
+            rows = _search(q)
+        except ImportError as e:
+            raise HTTPException(503, f"hf search unavailable: {e}")
+        except Exception as e:
+            raise HTTPException(502, f"hf search failed: {type(e).__name__}: {e}")
+        if limit and limit > 0:
+            rows = rows[:limit]
+        return {
+            "query": q,
+            "results": [
+                {
+                    "name": r.name,
+                    "namespace": r.namespace,
+                    "recommended_alpha": r.recommended_alpha,
+                    "tags": list(r.tags),
+                    "description": r.description,
+                    "tensor_models": list(r.tensor_models),
+                }
+                for r in rows
+            ],
+        }
+
+    @app.post("/saklas/v1/packs")
+    async def install_pack(req: InstallPackRequest):
+        """Install a pack from HF or a local folder.
+
+        Wraps :func:`saklas.io.cache_ops.install`; runs in a worker
+        thread because the HF download path is blocking. ``InstallConflict``
+        (409) and ``ValueError`` (400) propagate via the existing
+        ``SaklasError`` handler / generic mapping.
+        """
+        from saklas.io.cache_ops import install as _install, InstallConflict
+        try:
+            dst = await asyncio.to_thread(
+                _install,
+                req.target,
+                req.as_,
+                force=req.force,
+                statements_only=req.statements_only,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(404, f"pack not found: {e}")
+        except InstallConflict as e:
+            raise HTTPException(409, str(e))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {
+            "target": req.target,
+            "installed_at": str(dst),
+            "statements_only": req.statements_only,
+        }
 
     # ----- sessions collection -------------------------------------------
 
@@ -349,7 +510,7 @@ def register_saklas_routes(app: FastAPI) -> None:
     @app.patch("/saklas/v1/sessions/{session_id}")
     def patch_session(session_id: str, req: PatchSessionRequest):
         _resolve_session_id(session, session_id)
-        overrides: dict = {}
+        overrides: dict[str, Any] = {}
         if req.temperature is not None:
             overrides["temperature"] = req.temperature
         if req.top_p is not None:
@@ -412,6 +573,90 @@ def register_saklas_routes(app: FastAPI) -> None:
             raise HTTPException(400, f"file not found: {req.source_path}")
         session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
+
+    @app.get("/saklas/v1/sessions/{session_id}/correlation")
+    def correlation_matrix(session_id: str, names: str | None = None):
+        """N×N magnitude-weighted cosine matrix across loaded vectors and probes.
+
+        Query: ``?names=a,b,c`` restricts the matrix to a subset; default
+        is every steering vector AND every active probe currently
+        registered in the session, deduplicated by name (a registered
+        steering vector wins over a same-named probe — they share the
+        underlying tensor).  Output:
+
+            {
+              "names": ["a", "b", ...],
+              "matrix": {"a": {"a": 1.0, "b": 0.42, ...}, ...},
+              "layers_shared": {"a__b": 36, ...}
+            }
+
+        Used by the web UI's correlation overlay — heavy compute lives
+        server-side so the client doesn't have to ship full per-layer
+        tensors over the wire.
+        """
+        from saklas import Profile
+
+        _resolve_session_id(session, session_id)
+
+        # Build a unified pool of {name: Profile} covering both registries.
+        # Steering vectors come first (so they win on collision); probe
+        # tensors are wrapped into Profile so the same cosine_similarity
+        # call works for either source.
+        pool: dict[str, "Profile"] = dict(session.vectors)
+        try:
+            probe_profiles = session._monitor.profiles
+            for probe_name in session._monitor.probe_names:
+                if probe_name in pool:
+                    continue
+                tensors = probe_profiles.get(probe_name)
+                if tensors is None:
+                    continue
+                pool[probe_name] = Profile(tensors)
+        except Exception:
+            # Monitor not available — fall back to vectors-only pool.
+            pass
+
+        if names is not None and names.strip():
+            requested = [n.strip() for n in names.split(",") if n.strip()]
+            missing = [n for n in requested if n not in pool]
+            if missing:
+                raise HTTPException(404, f"names not loaded: {missing}")
+            ordered = requested
+        else:
+            ordered = sorted(pool.keys())
+
+        matrix: dict[str, dict[str, float | None]] = {a: {} for a in ordered}
+        layers_shared: dict[str, int] = {}
+        for i, a in enumerate(ordered):
+            for j, b in enumerate(ordered):
+                if j < i:
+                    matrix[a][b] = matrix[b][a]
+                    continue
+                if i == j:
+                    matrix[a][b] = 1.0
+                    continue
+                try:
+                    # ``cosine_similarity`` without ``per_layer=`` returns
+                    # the magnitude-weighted aggregate ``float`` — narrow
+                    # explicitly because the method's union return type
+                    # is ``float | dict[int, float]``.
+                    cos = pool[a].cosine_similarity(pool[b])
+                    matrix[a][b] = (
+                        round(float(cos), 6) if isinstance(cos, (int, float)) else None
+                    )
+                except Exception:
+                    matrix[a][b] = None
+                shared = sorted(
+                    set(pool[a].keys()) & set(pool[b].keys())
+                )
+                # Pair key sorted alphabetically so a__b == b__a in the lookup.
+                key = "__".join(sorted([a, b]))
+                layers_shared[key] = len(shared)
+        return {
+            "names": ordered,
+            "matrix": matrix,
+            "layers_shared": layers_shared,
+        }
 
     @app.delete("/saklas/v1/sessions/{session_id}/vectors/{name}", status_code=204)
     def delete_vector(session_id: str, name: str):
@@ -477,12 +722,194 @@ def register_saklas_routes(app: FastAPI) -> None:
             "progress": progress_msgs,
         }
 
+    @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
+    async def merge_vector(session_id: str, req: MergeVectorRequest):
+        """Merge an expression of installed vectors into a new local pack.
+
+        Wraps :func:`saklas.io.merge.merge_into_pack` (model-scoped to
+        the session's loaded model), then loads the merged tensor into
+        ``session._profiles`` so it's immediately steerable. Returns the
+        same profile-JSON shape ``GET /vectors/{name}`` produces.
+        """
+        from saklas.io.merge import merge_into_pack, MergeError
+        from saklas.io.paths import tensor_filename
+        _resolve_session_id(session, session_id)
+
+        async with session.lock:
+            try:
+                dst_folder = await asyncio.to_thread(
+                    merge_into_pack,
+                    req.name,
+                    req.expression,
+                    session.model_id,
+                    force=True,  # session-driven merges always overwrite
+                    strict=False,
+                )
+            except MergeError:
+                # Re-raised through the SaklasError handler (400).
+                raise
+            tensor_path = dst_folder / tensor_filename(session.model_id)
+            if not tensor_path.is_file():
+                raise HTTPException(
+                    500,
+                    f"merge produced no tensor for {session.model_id} at {tensor_path}",
+                )
+            profile = await asyncio.to_thread(session.load_profile, str(tensor_path))
+            session.steer(req.name, profile)
+        return _profile_to_json(req.name, profile)
+
+    @app.post("/saklas/v1/sessions/{session_id}/vectors/clone")
+    async def clone_vector(session_id: str, req: CloneVectorRequest, request: Request):
+        """Corpus-based persona clone, optionally streamed via SSE.
+
+        Mirrors :meth:`SaklasSession.clone_from_corpus`. JSON when the
+        client sends ``Accept: application/json`` (default); SSE
+        progress when ``Accept: text/event-stream`` — same shape as
+        the ``/extract`` endpoint, except clone has no native progress
+        stream so the only events emitted are ``done`` / ``error``.
+        """
+        _resolve_session_id(session, session_id)
+
+        accept = request.headers.get("accept", "application/json")
+        wants_sse = "text/event-stream" in accept
+
+        def _do_clone() -> tuple[str, "Profile"]:
+            return session.clone_from_corpus(
+                req.corpus_path,
+                req.name,
+                n_pairs=req.n_pairs,
+                seed=req.seed,
+            )
+
+        if wants_sse:
+            async def _sse():
+                async with session.lock:
+                    try:
+                        canonical, profile = await asyncio.to_thread(_do_clone)
+                    except FileNotFoundError:
+                        # Don't surface ``str(e)`` — Python's "No such file
+                        # or directory: '<path>'" leaks server-side
+                        # filesystem layout.  Echo the request's own
+                        # ``corpus_path`` instead so the client gets a
+                        # useful 404 without any traceback content.
+                        err = {
+                            "message": f"corpus not found: {req.corpus_path}",
+                            "code": "FileNotFoundError",
+                        }
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                        return
+                    except SaklasError as e:
+                        import logging
+                        logging.getLogger("saklas.api").exception(
+                            "clone failed for session=%s", session_id,
+                        )
+                        err = {"message": "clone failed", "code": type(e).__name__}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                        return
+                    except Exception as e:
+                        # Don't surface ``str(e)`` — Python exception messages
+                        # routinely echo paths, traceback fragments, or vendor
+                        # error text that we don't want flowing to a remote
+                        # caller.  Log the full traceback server-side and
+                        # return a generic shape that mirrors the SaklasError
+                        # branch above.
+                        import logging
+                        logging.getLogger("saklas.api").exception(
+                            "clone failed for session=%s", session_id,
+                        )
+                        err = {"message": "clone failed", "code": type(e).__name__}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                        return
+                    session.steer(req.name, profile)
+                    body = {
+                        "done": True,
+                        "canonical": canonical,
+                        "profile": _profile_to_json(req.name, profile),
+                    }
+                    yield f"event: done\ndata: {json.dumps(body)}\n\n"
+
+            return StreamingResponse(_sse(), media_type="text/event-stream")
+
+        async with session.lock:
+            try:
+                canonical, profile = await asyncio.to_thread(_do_clone)
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e))
+            session.steer(req.name, profile)
+        return {
+            "canonical": canonical,
+            "profile": _profile_to_json(req.name, profile),
+        }
+
+    @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}/diagnostics")
+    def vector_diagnostics(session_id: str, name: str):
+        """Per-layer ``||baked||`` histogram + diagnostics for a registered vector.
+
+        Mirrors what ``saklas vector why <concept> -m MODEL --json`` produces:
+        a 16-bucket layer-magnitude histogram plus the ``diagnostics_by_layer``
+        / ``diagnostics_summary`` block when the profile carries them.
+        Drives the WHY-histogram strip in the web UI's probe rack.
+        """
+        from saklas.cli.runners import _summarize_diagnostics
+        from saklas.core.histogram import HIST_BUCKETS, bucketize
+
+        _resolve_session_id(session, session_id)
+        # Probes and steering vectors share the Profile shape but live in
+        # different registries — session.vectors holds steering profiles,
+        # session._monitor.profiles holds probe profiles.  The diagnostics
+        # endpoint serves either; the layer-norms drawer overlay in the
+        # web UI hits this for every selected name (vector or probe).
+        profile = session.vectors.get(name)
+        if profile is None:
+            try:
+                profile = session._monitor.profiles.get(name)
+            except Exception:
+                profile = None
+        if profile is None:
+            raise HTTPException(404, f"vector or probe '{name}' not found")
+
+        layer_mags: list[tuple[int, float]] = sorted(
+            ((layer, float(vec.norm().item())) for layer, vec in profile.items()),
+            key=lambda kv: kv[0],
+        )
+        buckets = bucketize(layer_mags, HIST_BUCKETS)
+        # Buckets: ``(lo_layer, hi_layer, mean_norm)`` triples — same shape the
+        # CLI ``vector why`` text path renders, JSON-friendly here.
+        bucket_payload = [
+            {"lo": lo, "hi": hi, "mean_norm": round(mag, 6)}
+            for lo, hi, mag in buckets
+        ]
+
+        # ``diagnostics`` is a Profile attribute; probe profiles are raw
+        # ``dict[int, Tensor]`` and don't carry it.  ``getattr`` covers both.
+        diagnostics = getattr(profile, "diagnostics", None)
+        payload: dict[str, Any] = {
+            "name": name,
+            "model": session.model_id,
+            "total_layers": len(profile),
+            "histogram": {
+                "buckets": HIST_BUCKETS,
+                "data": bucket_payload,
+            },
+            "layers": [
+                {"layer": layer, "magnitude": round(mag, 6)}
+                for layer, mag in layer_mags
+            ],
+        }
+        if diagnostics is not None:
+            payload["diagnostics_by_layer"] = {
+                str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
+                for layer, metrics in sorted(diagnostics.items())
+            }
+            payload["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
+        return payload
+
     # ----- probes --------------------------------------------------------
 
     @app.get("/saklas/v1/sessions/{session_id}/probes")
     def list_probes(session_id: str):
         _resolve_session_id(session, session_id)
-        names = sorted(session.probes.keys()) if isinstance(session.probes, dict) else list(session.probes)
+        names = sorted(session.probes.keys())
         return {"probes": [_probe_info(session, n) for n in names]}
 
     @app.get("/saklas/v1/sessions/{session_id}/probes/defaults")
@@ -526,6 +953,161 @@ def register_saklas_routes(app: FastAPI) -> None:
             readings = {k: v for k, v in readings.items() if k in requested}
         return {"readings": {k: float(v) for k, v in readings.items()}}
 
+    # ----- Sweep: alpha grid over a single prompt --------------------------
+
+    @app.post("/saklas/v1/sessions/{session_id}/sweep")
+    async def run_sweep(session_id: str, req: SweepRequest, request: Request):
+        """SSE-streamed alpha sweep.
+
+        One result per Cartesian-product element across ``sweep[concept]``
+        alpha lists.  Held under ``acquire_session_lock`` for the full
+        sweep so concurrent endpoints queue FIFO (the sweep can be
+        long-running, the lock's 5-minute timeout still applies).
+
+        Emits ``data: {"type": "started", "sweep_id", "total"}``,
+        then ``data: {"type": "result", "idx", "alpha_values", "result"}``
+        per completion (result subset: text, finish_reason, usage,
+        applied_steering, readings means), then
+        ``data: {"type": "done", "sweep_id", "summary"}``.
+        """
+        _resolve_session_id(session, session_id)
+
+        # Pre-validate the sweep dict so the SSE start event reports
+        # ``total`` accurately and so a bad request fails before any
+        # gen acquires the lock.  ``generate_sweep`` would raise the
+        # same way, but the SSE caller never sees the exception cleanly.
+        if not req.sweep:
+            raise HTTPException(400, "sweep dict must be non-empty")
+        for name, alphas in req.sweep.items():
+            if not alphas:
+                raise HTTPException(400, f"sweep['{name}'] must be non-empty")
+
+        total = 1
+        for alphas in req.sweep.values():
+            total *= len(alphas)
+        sweep_id = uuid.uuid4().hex[:8]
+        sampling_cfg = _build_sampling(req.sampling)
+
+        # Drive ``generate_sweep`` in a worker thread; bridge per-result
+        # events to the asyncio queue this handler reads.
+        loop = asyncio.get_running_loop()
+        result_queue: asyncio.Queue[tuple[Any, Any]] = asyncio.Queue()
+        DONE = object()
+        ERROR = object()
+
+        def _emit_result(idx: int, result: Any, alpha_values: dict[str, float]) -> None:
+            # Subset the result to keep SSE payloads small; full hidden
+            # states / per-token logprobs aren't useful for a sweep
+            # consumer and can be reloaded out-of-band by replaying
+            # ``applied_steering``.
+            readings_summary: dict[str, float] = {}
+            try:
+                for probe_name, r in (getattr(result, "readings", {}) or {}).items():
+                    pg = getattr(r, "per_generation", None)
+                    val = pg[-1] if pg else getattr(r, "mean", 0.0)
+                    readings_summary[probe_name] = round(float(val), 6)
+            except Exception:
+                pass
+            payload = {
+                "idx": idx,
+                "alpha_values": {k: float(v) for k, v in alpha_values.items()},
+                "result": {
+                    "text": getattr(result, "text", ""),
+                    "token_count": int(getattr(result, "token_count", 0)),
+                    "tok_per_sec": float(getattr(result, "tok_per_sec", 0.0)),
+                    "elapsed": float(getattr(result, "elapsed", 0.0)),
+                    "finish_reason": getattr(result, "finish_reason", "stop"),
+                    "applied_steering": getattr(result, "applied_steering", None),
+                    "readings": readings_summary,
+                },
+            }
+            try:
+                loop.call_soon_threadsafe(result_queue.put_nowait, ("result", payload))
+            except Exception:
+                pass
+
+        def _worker() -> None:
+            try:
+                session.generate_sweep(
+                    req.prompt,
+                    req.sweep,
+                    base_steering=req.base_steering,
+                    sampling=sampling_cfg,
+                    thinking=req.thinking,
+                    stateless=req.stateless,
+                    raw=req.raw,
+                    on_result=_emit_result,
+                )
+                loop.call_soon_threadsafe(result_queue.put_nowait, (DONE, None))
+            except Exception as exc:
+                loop.call_soon_threadsafe(result_queue.put_nowait, (ERROR, exc))
+
+        async def event_generator():
+            async with acquire_session_lock(session) as acquired:
+                if not acquired:
+                    yield (
+                        f"data: {json.dumps({'type': 'error', 'message': 'session locked'})}"
+                        "\n\n"
+                    )
+                    return
+
+                yield (
+                    f"data: {json.dumps({'type': 'started', 'sweep_id': sweep_id, 'total': total})}"
+                    "\n\n"
+                )
+
+                fut = asyncio.get_running_loop().run_in_executor(None, _worker)
+                completed = 0
+                start = time.monotonic()
+                total_tokens = 0
+                try:
+                    while True:
+                        if await request.is_disconnected():
+                            session.stop()
+                            break
+                        try:
+                            tag, payload = await asyncio.wait_for(
+                                result_queue.get(), timeout=15.0,
+                            )
+                        except asyncio.TimeoutError:
+                            yield ": heartbeat\n\n"
+                            continue
+                        if tag == "result":
+                            completed += 1
+                            total_tokens += int(payload["result"].get("token_count", 0))
+                            yield (
+                                f"data: {json.dumps({'type': 'result', **payload})}"
+                                "\n\n"
+                            )
+                            continue
+                        if tag is DONE:
+                            elapsed = time.monotonic() - start
+                            tps = (total_tokens / elapsed) if elapsed > 0 else 0.0
+                            yield (
+                                f"data: {json.dumps({'type': 'done', 'sweep_id': sweep_id, 'summary': {'completed': completed, 'total': total, 'total_tokens': total_tokens, 'tok_per_sec': round(tps, 2), 'elapsed': round(elapsed, 3)}})}"
+                                "\n\n"
+                            )
+                            break
+                        if tag is ERROR:
+                            yield (
+                                f"data: {json.dumps({'type': 'error', 'message': str(payload)})}"
+                                "\n\n"
+                            )
+                            break
+                finally:
+                    # Wait for the worker to fully wind down so the gen
+                    # lock isn't released mid-generation.
+                    try:
+                        await fut
+                    except Exception:
+                        pass
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
     # ----- Live traits SSE stream ------------------------------------------
 
     @app.get("/saklas/v1/sessions/{session_id}/traits/stream")
@@ -546,10 +1128,10 @@ def register_saklas_routes(app: FastAPI) -> None:
         from saklas.core.events import GenerationStarted, GenerationFinished
 
         loop = asyncio.get_running_loop()
-        trait_queue: asyncio.Queue = asyncio.Queue()
+        trait_queue: asyncio.Queue[Any] = asyncio.Queue()
 
         # EventBus callback: push start/done into the same queue as tokens.
-        def _on_event(event):
+        def _on_event(event: object) -> None:
             if isinstance(event, GenerationStarted):
                 try:
                     loop.call_soon_threadsafe(
@@ -639,10 +1221,42 @@ def register_saklas_routes(app: FastAPI) -> None:
             return
         await websocket.accept()
 
+        # Single perpetual reader.  ``websocket.receive_json()`` is bound
+        # to a per-connection ``recv_in_progress`` flag in the underlying
+        # ``websockets`` library; cancelling a pending receive doesn't
+        # clear the flag immediately, so any handler that called
+        # ``receive_json()`` while another concurrent (even just-cancelled)
+        # caller was pending tripped a "cannot call recv while another
+        # coroutine is already waiting" RuntimeError.  Routing every
+        # incoming frame through one queue lets both the outer dispatch
+        # loop and the in-flight generation share the read side without
+        # ever overlapping calls into the WS.
+        incoming: asyncio.Queue[Any] = asyncio.Queue()
+        _DISCONNECT = object()
+
+        async def _reader():
+            try:
+                while True:
+                    msg = await websocket.receive_json()
+                    await incoming.put(msg)
+            except WebSocketDisconnect:
+                await incoming.put(_DISCONNECT)
+            except Exception as e:
+                # Surface any other read-side failure into the queue so
+                # the dispatcher can close cleanly instead of leaking.
+                await incoming.put({"_reader_error": str(e), "_type": type(e).__name__})
+
+        reader_task = asyncio.create_task(_reader())
+
         try:
             while True:
-                msg = await websocket.receive_json()
-                mtype = msg.get("type")
+                msg = await incoming.get()
+                if msg is _DISCONNECT:
+                    raise WebSocketDisconnect(code=1000)
+                if isinstance(msg, dict) and "_reader_error" in msg:
+                    raise RuntimeError(msg["_reader_error"])
+
+                mtype = msg.get("type") if isinstance(msg, dict) else None
                 if mtype == "generate":
                     try:
                         parsed = WSGenerateMessage(**msg)
@@ -654,7 +1268,8 @@ def register_saklas_routes(app: FastAPI) -> None:
                         })
                         continue
                     await _ws_handle_generate(
-                        websocket, session, parsed, app.state.default_steering,
+                        websocket, session, parsed,
+                        app.state.default_steering, incoming,
                     )
                 elif mtype == "stop":
                     # Idle-state stop: nothing in flight.
@@ -684,6 +1299,15 @@ def register_saklas_routes(app: FastAPI) -> None:
                     await websocket.close(code=1011)
                 except Exception:
                     pass
+        finally:
+            # Reader holds the only ``receive_json()`` call on the WS.
+            # Cancel + await so the cancellation propagates fully before
+            # the connection tears down.
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 async def _ws_handle_generate(
@@ -691,6 +1315,7 @@ async def _ws_handle_generate(
     session: SaklasSession,
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
+    incoming: asyncio.Queue[Any],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
@@ -698,16 +1323,20 @@ async def _ws_handle_generate(
     worker thread via ``asyncio.to_thread``.  Its ``on_token`` callback
     is invoked on the worker thread; it bridges into the asyncio loop by
     calling ``loop.call_soon_threadsafe(queue.put_nowait, event)``.  The
-    main coroutine races two tasks: one pulls ``TokenEvent``s from the
-    queue and forwards them as ``{type: "token", ...}`` frames; the other
-    awaits the next client frame so an incoming ``{type: "stop"}`` can
-    call ``session.stop()`` without blocking on the token loop.
+    main coroutine races two tasks: one pulls ``TokenEvent``s from a
+    local queue and forwards them as ``{type: "token", ...}`` frames;
+    the other pulls client frames from the shared ``incoming`` queue
+    (populated by the connection's single reader task) so an in-flight
+    ``{type: "stop"}`` can call ``session.stop()`` without blocking on
+    the token loop.
 
     ``asyncio.wait(..., FIRST_COMPLETED)`` is used in a loop: whenever
-    the recv task returns a stop frame we signal the session and keep
+    the incoming task returns a stop frame we signal the session and keep
     draining tokens until the worker joins; whenever the queue delivers
     a sentinel we finish.  The WS stays open across generate turns — a
-    client can submit ``{type: "generate", ...}`` again after ``done``.
+    client can submit ``{type: "generate", ...}`` again after ``done``,
+    and the perpetual reader keeps feeding the shared queue between
+    turns so we never have two ``receive_json()`` calls in flight.
     """
     loop = asyncio.get_running_loop()
     generation_id = uuid.uuid4().hex[:12]
@@ -715,16 +1344,47 @@ async def _ws_handle_generate(
     sampling = _build_sampling(msg.sampling)
     steering = _build_steering(msg.steering, default_steering)
 
-    token_queue: asyncio.Queue = asyncio.Queue()
+    token_queue: asyncio.Queue[Any] = asyncio.Queue()
     _SENTINEL = object()
 
-    def _on_token(text, is_thinking, tid, lp, top, perplexity=None):
-        event = {
+    def _on_token(
+        text: str,
+        is_thinking: bool,
+        tid: int | None,
+        lp: float | None,
+        top: list[tuple[str, float]] | None,
+        perplexity: float | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
             "type": "token",
             "text": text,
             "thinking": bool(is_thinking),
             "token_id": int(tid) if tid is not None else None,
         }
+        # Per-layer × per-probe heatmap data for the inspector panel.
+        # Computed inline only when probes are loaded (covers the cost
+        # of N matmul + N CPU syncs against the latest captured hidden
+        # state).  Falls through silently when no capture exists yet
+        # (e.g. extremely short generations where the hook never fires).
+        try:
+            monitor = session._monitor
+            if monitor.probe_names:
+                latest_hidden = {
+                    layer_idx: bucket[-1]
+                    for layer_idx, bucket in session._capture._per_layer.items()
+                    if bucket
+                }
+                if latest_hidden:
+                    per_layer = monitor.score_single_token_per_layer(latest_hidden)
+                    if per_layer:
+                        event["per_layer_scores"] = {
+                            str(layer): {p: round(float(v), 6) for p, v in metrics.items()}
+                            for layer, metrics in per_layer.items()
+                        }
+        except Exception:
+            # Inspector data is best-effort — never let a failure here
+            # break the streaming token path.
+            pass
         loop.call_soon_threadsafe(token_queue.put_nowait, event)
 
     result_holder: list[GenerationResult] = []
@@ -754,47 +1414,67 @@ async def _ws_handle_generate(
 
         worker_task = asyncio.create_task(asyncio.to_thread(_worker))
 
-        recv_task: asyncio.Task | None = asyncio.create_task(websocket.receive_json())
+        # Race two queue reads — token frames from the worker and client
+        # frames from the connection's perpetual reader.  Neither side
+        # ever calls ``websocket.receive_json()`` directly, so the
+        # underlying ``recv_in_progress`` flag is owned by the reader
+        # task alone for the connection's lifetime.
         done = False
         try:
             while not done:
-                get_task = asyncio.create_task(token_queue.get())
-                wait_for = {get_task}
-                if recv_task is not None:
-                    wait_for.add(recv_task)
+                token_get = asyncio.create_task(token_queue.get())
+                client_get = asyncio.create_task(incoming.get())
                 finished, _pending = await asyncio.wait(
-                    wait_for, return_when=asyncio.FIRST_COMPLETED,
+                    {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
                 )
-                if recv_task is not None and recv_task in finished:
-                    try:
-                        incoming = recv_task.result()
-                    except WebSocketDisconnect:
-                        session.stop()
-                        recv_task = None
-                    except Exception:
-                        recv_task = None
-                    else:
-                        if isinstance(incoming, dict) and incoming.get("type") == "stop":
+                if client_get in finished:
+                    incoming_msg = client_get.result()
+                    # ``_DISCONNECT`` / reader-error sentinels: signal
+                    # the worker to wind down; let the outer loop
+                    # propagate the disconnect on the next iteration.
+                    if isinstance(incoming_msg, dict):
+                        if incoming_msg.get("type") == "stop":
                             try:
                                 session.stop()
                             except Exception:
                                 pass
-                        recv_task = asyncio.create_task(websocket.receive_json())
-                if get_task in finished:
-                    item = get_task.result()
+                        elif "_reader_error" in incoming_msg:
+                            try:
+                                session.stop()
+                            except Exception:
+                                pass
+                            # Re-enqueue so the outer dispatch loop
+                            # surfaces the error after we wind down.
+                            await incoming.put(incoming_msg)
+                        else:
+                            # Out-of-band frame during a generation —
+                            # re-enqueue so the outer loop sees it after
+                            # this turn finishes.  Most likely an early
+                            # ``{type: "generate"}`` from a client that
+                            # didn't wait for ``done``.
+                            await incoming.put(incoming_msg)
+                    else:
+                        # Disconnect sentinel from the reader.
+                        try:
+                            session.stop()
+                        except Exception:
+                            pass
+                        await incoming.put(incoming_msg)
+                else:
+                    client_get.cancel()
+                if token_get in finished:
+                    item = token_get.result()
                     if item is _SENTINEL:
                         done = True
                     else:
                         await websocket.send_json(item)
                 else:
-                    get_task.cancel()
+                    token_get.cancel()
         finally:
             # Drain any residual events the worker pushed between sentinel
             # and join — should be none because the sentinel is last, but
             # cheap insurance.
             await worker_task
-            if recv_task is not None and not recv_task.done():
-                recv_task.cancel()
 
         if error_holder and not result_holder:
             exc = error_holder[0]

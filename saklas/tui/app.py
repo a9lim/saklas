@@ -26,7 +26,7 @@ from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_defaults
 from saklas.core.results import ResultCollector
 from saklas.core.session import MIN_ELAPSED_FOR_RATE
-from saklas.tui.chat_panel import ChatPanel, _AssistantMessage
+from saklas.tui.chat_panel import ChatPanel, _AssistantMessage, _TurnRow
 from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
 from saklas.tui.trait_panel import TraitPanel
 
@@ -128,7 +128,24 @@ class SaklasApp(App):
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
         self._last_prompt: str | None = None
-        self._ab_in_progress: bool = False
+        # ``_ab_mode`` is the persistent two-column-layout toggle (Ctrl+A);
+        # ``_ab_shadow_active`` is the transient flag set while a shadow
+        # gen worker is streaming — gates panels/highlight/probe-rack
+        # mutations the same way the v1 one-shot ``_ab_in_progress`` did,
+        # so users can't fiddle with steering while the unsteered shadow
+        # is in flight.  The two flags are independent: AB mode can be on
+        # without an active shadow and vice versa (e.g. shadow runs to
+        # completion even after the user toggles AB off).
+        self._ab_mode: bool = False
+        self._ab_shadow_active: bool = False
+        # The turn-row whose shadow column is being streamed into right
+        # now (``_current_assistant_widget`` lives inside it during a
+        # shadow gen).  Cleared on shadow ``done``.
+        self._ab_shadow_row: _TurnRow | None = None
+        # Map id(widget) → owning row, so when a steered ``done`` lands
+        # we can locate the row to fire its shadow into without a tree
+        # walk per gen.
+        self._row_for_widget: dict[int, _TurnRow] = {}
         self._pending_action: tuple | None = None  # ("regenerate",) or ("submit", text)
         # UI-side gen flag.  Tracks the *TUI's* gen lifecycle, which differs
         # slightly from the session's: the TUI counts a gen as "still going"
@@ -397,7 +414,7 @@ class SaklasApp(App):
             "  /exit, /help\n"
             "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
             "Backspace remove · Ctrl+T think · Ctrl+R regen\n"
-            "Ctrl+A A/B compare · Ctrl+S cycle sort · Ctrl+Y highlight\n"
+            "Ctrl+A A/B side-by-side · Ctrl+S cycle sort · Ctrl+Y highlight\n"
             "[ ] temp · { } top-p · Esc stop · Ctrl+Q quit"
         )
 
@@ -455,8 +472,8 @@ class SaklasApp(App):
                         pending_type: str | None = None,
                         variant: str = "raw") -> None:
         chat = self._chat_panel
-        if self._ab_in_progress:
-            chat.add_system_message("Cannot modify vectors during A/B comparison.")
+        if self._ab_shadow_active:
+            chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
             return
         if pending_type is None:
             pending_type = "steer" if include_alpha else "probe"
@@ -679,6 +696,7 @@ class SaklasApp(App):
         self._session.clear_history()
         self._chat_panel.clear_log()
         self._assistant_messages.clear()
+        self._row_for_widget.clear()
         self._trait_panel.update_values({}, {}, {})
         self._refresh_trait_why()
         self._chat_panel.add_system_message("Chat history cleared.")
@@ -690,6 +708,11 @@ class SaklasApp(App):
         self._session.rewind()
         self._chat_panel.rewind()
         self._assistant_messages = [w for w in self._assistant_messages if w.is_mounted]
+        # Drop stale row references so the next AB backfill walk doesn't
+        # see widgets whose rows are gone.
+        self._row_for_widget = {
+            wid: row for wid, row in self._row_for_widget.items() if row.is_mounted
+        }
         self._chat_panel.add_system_message("Rewound to before last message.")
 
     def _refresh_gen_config(self) -> None:
@@ -737,7 +760,8 @@ class SaklasApp(App):
         self._ppl_count = 0
         self._gen_start_time = time.monotonic()
 
-        widget = self._chat_panel.start_assistant_message()
+        row, widget = self._chat_panel.start_assistant_message()
+        self._row_for_widget[id(widget)] = row
         self._current_assistant_widget = widget
         self._assistant_messages.append(widget)
         # Fresh widgets spawn with ``_highlight_on=False``; inherit the
@@ -784,22 +808,22 @@ class SaklasApp(App):
                 for event in stream:
                     self._ui_token_queue.put(
                         ("tok", event.text, event.thinking, event.scores,
-                         event.perplexity)
+                         event.perplexity, widget, False),
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
                 # session and push to the widget for highlight.
-                self._ui_token_queue.put(("finalize", widget))
+                self._ui_token_queue.put(("finalize", widget, False))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg))
+                self._ui_token_queue.put(("error", msg, False))
             finally:
                 if self._session._device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done",))
+                self._ui_token_queue.put(("done", False))
 
         self.run_worker(_generate, thread=True)
 
@@ -815,9 +839,13 @@ class SaklasApp(App):
                 break
             kind = item[0]
             if kind == "tok":
-                _, token, is_thinking, scores, perplexity = item
-                widget = self._current_assistant_widget
-                if widget:
+                # Tagged with the target widget + ``is_shadow`` flag so
+                # steered and shadow streams route to the right column
+                # without a global "current" lookup.  Shadow streams
+                # bypass the gen-stat counters (token count, ppl) — those
+                # describe the steered run only.
+                _, token, is_thinking, scores, perplexity, widget, is_shadow = item
+                if widget is not None:
                     if is_thinking:
                         widget.append_thinking_token(token)
                     else:
@@ -825,33 +853,60 @@ class SaklasApp(App):
                         widget.append_token(token)
                     if scores is not None:
                         widget.append_token_score(scores, is_thinking)
-                if perplexity is not None and perplexity > 0:
-                    # Geometric mean over the gen: accumulate log(ppl),
-                    # display exp(mean).  Equivalent to classical sequence
-                    # perplexity; one step dominated by a rare token
-                    # doesn't swamp the aggregate the way an arithmetic
-                    # mean would.
-                    self._log_ppl_sum += math.log(perplexity)
-                    self._ppl_count += 1
+                if not is_shadow:
+                    if perplexity is not None and perplexity > 0:
+                        # Geometric mean over the gen: accumulate log(ppl),
+                        # display exp(mean).  Equivalent to classical sequence
+                        # perplexity; one step dominated by a rare token
+                        # doesn't swamp the aggregate the way an arithmetic
+                        # mean would.
+                        self._log_ppl_sum += math.log(perplexity)
+                        self._ppl_count += 1
                 tokens_consumed += 1
             elif kind == "finalize":
                 # Normal end — pull per-token scores stashed by session's
                 # _finalize_generation and push to the widget for highlight.
-                _, widget = item
+                _, widget, _is_shadow = item
                 self._finalize_widget_highlight(widget)
             elif kind == "error":
-                chat.add_system_message(f"generation error: {item[1]}")
+                _, msg, is_shadow = item
+                tag = "A/B shadow error" if is_shadow else "generation error"
+                chat.add_system_message(f"{tag}: {msg}")
             elif kind == "done":
-                if self._current_assistant_widget:
-                    self._current_assistant_widget.ensure_thinking_collapsed()
+                _, is_shadow = item
+                widget = self._current_assistant_widget
+                if widget:
+                    widget.ensure_thinking_collapsed()
                 self._current_assistant_widget = None
                 self._ui_gen_active = False
                 generating = False
-                if self._gen_start_time > 0:
+                if not is_shadow and self._gen_start_time > 0:
                     self._last_elapsed = time.monotonic() - self._gen_start_time
                     if self._last_elapsed > MIN_ELAPSED_FOR_RATE:
                         self._last_tok_per_sec = self._gen_token_count / self._last_elapsed
                     self._gen_start_time = 0.0
+
+                # Shadow done: clear shadow flags, then fall through to
+                # pending-action drain so anything queued during the
+                # shadow gen runs now.
+                if is_shadow:
+                    self._ab_shadow_active = False
+                    self._ab_shadow_row = None
+
+                # Steered done: if AB mode is on and we have a row to
+                # backfill, fire a shadow gen and DON'T drain pending —
+                # let the shadow's own ``done`` handle that, so a
+                # mid-flight pending action waits until the AB pair is
+                # complete.
+                elif (
+                    self._ab_mode
+                    and widget is not None
+                    and self._pending_action is None
+                ):
+                    row = self._row_for_widget.get(id(widget))
+                    if row is not None:
+                        self._start_shadow_generation(row)
+                        break
 
                 pending = self._pending_action
                 if pending is not None:
@@ -897,7 +952,7 @@ class SaklasApp(App):
     # -- Actions --
 
     def action_remove_vector(self) -> None:
-        if self._ab_in_progress:
+        if self._ab_shadow_active:
             return
         if self._focused_panel_idx == _TRAIT:
             self._remove_selected_probe()
@@ -921,7 +976,7 @@ class SaklasApp(App):
         self._refresh_trait_why()
 
     def action_toggle_vector(self) -> None:
-        if self._ab_in_progress:
+        if self._ab_shadow_active:
             return
         lp = self._left_panel
         sel = lp.get_selected()
@@ -931,7 +986,7 @@ class SaklasApp(App):
             self._refresh_left_panel()
 
     def _adjust_alpha(self, delta: float) -> None:
-        if self._ab_in_progress:
+        if self._ab_shadow_active:
             return
         lp = self._left_panel
         sel = lp.get_selected()
@@ -941,7 +996,7 @@ class SaklasApp(App):
             self._refresh_left_panel()
 
     def action_toggle_highlight(self) -> None:
-        if self._ab_in_progress:
+        if self._ab_shadow_active:
             return
         if not self._highlighting:
             # Prefer the stored seed, fall back to trait-panel selection.
@@ -1180,6 +1235,7 @@ class SaklasApp(App):
         self._session.clear_history()
         self._chat_panel.clear_log()
         self._assistant_messages.clear()
+        self._row_for_widget.clear()
         for msg in snapshot.get("history", []):
             self._session._history.append(msg)
             if msg["role"] == "user":
@@ -1409,38 +1465,140 @@ class SaklasApp(App):
         self._start_generation()
 
     def action_ab_compare(self) -> None:
+        """Toggle the persistent A/B two-column layout.
+
+        Mirrors the webui's ``abState.enabled`` toggle: turning it on
+        reveals each turn's shadow column (steered on the left, unsteered
+        on the right) and dispatches a backfill shadow gen for the most
+        recent assistant turn that doesn't already have one — exactly
+        matching the webui's "play the conversation back to the unsteered
+        agent" affordance.
+
+        Toggling off doesn't kill an in-flight shadow gen — the data is
+        kept and stays harmless when the column is hidden.  Toggling back
+        on re-reveals it without re-running.
+        """
         chat = self._chat_panel
-        if self._session.is_generating:
-            chat.add_system_message("Cannot A/B compare while generating. Stop generation first.")
+        was_off = not self._ab_mode
+        self._ab_mode = not self._ab_mode
+        chat.set_ab_mode(self._ab_mode)
+        chat.add_system_message(
+            f"A/B mode {'on' if self._ab_mode else 'off'}."
+        )
+        if not self._ab_mode or not was_off:
             return
-        if not self._last_prompt:
-            chat.add_system_message("No previous prompt to compare.")
+        # Toggling on: backfill the latest assistant turn without a
+        # shadow.  Skipped while a generation is in flight — the steered
+        # ``done`` will fire its own shadow when it lands.
+        if self._session.is_generating or self._ui_gen_active:
             return
-        self._ab_in_progress = True
-        chat.add_system_message("A/B comparison: generating unsteered response...")
+        pending = chat.assistant_rows_pending_shadow()
+        if not pending:
+            return
+        self._start_shadow_generation(pending[-1])
 
-        def _ab_generate():
+    def _build_shadow_messages(
+        self, row: _TurnRow,
+    ) -> list[dict[str, str]] | None:
+        """Reconstruct the conversation up to (but not including) ``row``'s
+        steered response, as a messages list to feed an unsteered shadow
+        gen.  Mirrors ``_buildShadowMessages`` in the webui store: walks
+        all turn-rows that come before ``row`` in mount order, projecting
+        each into ``{"role": ..., "content": ...}``.
+
+        Returns ``None`` when the slice doesn't end on a user turn — the
+        steered response we're pairing against must follow a user prompt
+        for the comparison to make sense.
+        """
+        chat = self._chat_panel
+        if chat._log is None:
+            return None
+        out: list[dict[str, str]] = []
+        for child in chat._log.children:
+            if child is row:
+                break
+            if not isinstance(child, _TurnRow):
+                continue
+            if child.kind == "user":
+                if child.user_text is not None:
+                    out.append({"role": "user", "content": child.user_text})
+            elif child.kind == "assistant":
+                widget = next(
+                    (c for c in child.primary.children
+                     if isinstance(c, _AssistantMessage)),
+                    None,
+                )
+                if widget is None:
+                    continue
+                # Reuse the streamed-token list (matches what was rendered);
+                # thinking is excluded so replay through enable_thinking=False
+                # is well-formed.
+                text = "".join(widget._streamed_response_tokens).lstrip()
+                if text:
+                    out.append({"role": "assistant", "content": text})
+        if not out or out[-1]["role"] != "user":
+            return None
+        return out
+
+    def _start_shadow_generation(self, row: _TurnRow) -> None:
+        """Kick off an unsteered shadow gen that streams into ``row``'s
+        shadow column.  Uses the same ``_ui_token_queue`` pipeline as the
+        steered branch — the queue items are tagged with ``is_shadow=True``
+        so ``_poll_generation`` knows not to roll the gen-stat counters
+        and to skip firing a follow-up shadow on its ``done``.
+        """
+        if self._ab_shadow_active:
+            return
+        chat = self._chat_panel
+        messages = self._build_shadow_messages(row)
+        if messages is None:
+            chat.add_system_message("A/B: no prior user prompt to replay.")
+            return
+        widget = chat.start_shadow_message(row)
+        self._row_for_widget[id(widget)] = row
+        self._assistant_messages.append(widget)
+        if self._highlighting:
+            widget.apply_highlight(True, self._highlight_probe)
+        self._current_assistant_widget = widget
+        self._ab_shadow_active = True
+        self._ab_shadow_row = row
+        self._ui_gen_active = True
+
+        sampling = SamplingConfig(
+            temperature=self._session.config.temperature,
+            top_p=self._session.config.top_p,
+            max_tokens=self._session.config.max_new_tokens,
+            seed=self._default_seed,
+        )
+        use_thinking = self._thinking
+
+        def _shadow_generate() -> None:
             try:
-                # Stateless so we don't mutate history; no steering.
-                result = self._session.generate(
-                    self._last_prompt,
+                stream = self._session.generate_stream(
+                    messages,
                     steering=None,
+                    sampling=sampling,
                     stateless=True,
-                    thinking=self._thinking,
+                    thinking=use_thinking,
                 )
-                self.call_from_thread(self._show_ab_result, result.text)
-            except Exception as e:
-                err = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self.call_from_thread(
-                    lambda: (setattr(self, '_ab_in_progress', False),
-                             self._chat_panel.add_system_message(f"A/B error: {err}"))
-                )
+                for event in stream:
+                    self._ui_token_queue.put(
+                        ("tok", event.text, event.thinking, event.scores,
+                         event.perplexity, widget, True),
+                    )
+                self._ui_token_queue.put(("finalize", widget, True))
+            except BaseException as e:
+                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+                self._ui_token_queue.put(("error", msg, True))
+            finally:
+                if self._session._device.type == "mps":
+                    try:
+                        torch.mps.synchronize()
+                    except Exception:
+                        pass
+                self._ui_token_queue.put(("done", True))
 
-        self.run_worker(_ab_generate, thread=True)
-
-    def _show_ab_result(self, unsteered: str) -> None:
-        self._ab_in_progress = False
-        self._chat_panel.add_system_message(f"[Unsteered]: {unsteered}")
+        self.run_worker(_shadow_generate, thread=True)
 
     def action_cycle_sort(self) -> None:
         self._trait_panel.cycle_sort()

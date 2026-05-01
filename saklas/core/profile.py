@@ -107,6 +107,31 @@ class Profile:
         """Copy of the metadata dict carried alongside the tensors."""
         return dict(self._metadata)
 
+    @property
+    def diagnostics(self) -> dict[int, dict[str, float]] | None:
+        """Per-layer probe-quality metrics, when available.
+
+        Keys are the same layer indices the profile carries; values are
+        small dicts of metric-name → float (``evr``,
+        ``intra_pair_variance_mean`` / ``_std``, ``inter_pair_alignment``,
+        ``diff_principal_projection``).  Returns ``None`` when the profile
+        was extracted before diagnostics existed (saklas < 1.6) or loaded
+        from a sidecar that didn't carry them — callers should branch on
+        ``has_diagnostics`` first.
+        """
+        diag = self._metadata.get("diagnostics")
+        if not isinstance(diag, dict) or not diag:
+            return None
+        # Defensive copy: callers shouldn't be able to mutate the cached
+        # metric dicts through this surface.
+        return {int(L): dict(metrics) for L, metrics in diag.items()}
+
+    @property
+    def has_diagnostics(self) -> bool:
+        """True iff this profile carries per-layer diagnostic metrics."""
+        diag = self._metadata.get("diagnostics")
+        return isinstance(diag, dict) and bool(diag)
+
     def as_dict(self) -> dict[int, torch.Tensor]:
         """Return the underlying dict (shared reference, not a copy).
 

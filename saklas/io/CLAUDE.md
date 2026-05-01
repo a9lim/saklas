@@ -44,13 +44,27 @@ Training-free persona cloning. `clone_from_corpus(session, path, name, *, n_pair
 
 Cache key: `sha256(corpus) + n_pairs + batch_size + seed` compared against existing `pack.json`; `force=True` bypasses. `session.clone_from_corpus(...)` is the thin public entry point.
 
-## SAE variant coexistence
+## SAE + transfer variant coexistence
 
-A concept folder can hold multiple baked tensors per model, distinguished by filename suffix: `<safe_model>.safetensors` (raw PCA) and `<safe_model>_sae-<release>.safetensors` (SAE-PCA, one per release). `safe_variant_suffix(release)` slugs unsafe chars; `tensor_filename(model_id, release=...)` / `sidecar_filename(...)` / `parse_tensor_filename(name)` in `paths.py` are the canonical constructors and inverse. `enumerate_variants(folder, model_id)` in `packs.py` returns `{"raw" | "sae-<release>": Path}`.
+A concept folder can hold multiple baked tensors per model, distinguished by filename suffix: `<safe_model>.safetensors` (raw PCA), `<safe_model>_sae-<release>.safetensors` (SAE-PCA, one per release), and `<safe_model>_from-<safe_src>.safetensors` (cross-model transfer, one per source model). `safe_variant_suffix(release)` and `safe_from_suffix(src)` slug unsafe chars; `tensor_filename(model_id, release=...|transferred_from=...)` / `sidecar_filename(...)` / `parse_tensor_filename(name)` in `paths.py` are the canonical constructors and inverse. `parse_tensor_filename` returns `(safe_model, variant_slug)` where `variant_slug` is `None` (raw), `"sae-<release>"`, or `"from-<safe_src>"` — kind-prefixed so callers dispatch without re-detecting. `enumerate_variants(folder, model_id)` in `packs.py` returns `{"raw" | "sae-<release>" | "from-<safe_src>": Path}`. `release` and `transferred_from` are mutually exclusive on `tensor_filename` — composed variants (SAE-on-transferred) are not supported in v1.6.
 
 Sidecar JSON gets three additional optional fields when `method == "pca_center_sae"`: `sae_release`, `sae_revision`, `sae_ids_by_layer`. Additive on top of `PACK_FORMAT_VERSION = 2` — no migration required. `pack.json.files` hashes every variant, so `ConceptFolder`-style integrity checks verify both raw and SAE tensors on every load.
 
 `cache_ops.delete_tensors(selector, model_scope, *, variant="all")` and `hf.push_pack(..., variant="all")` both accept a variant filter: `"raw"` / `"sae"` / `"all"`. CLI defaults encode the UX intent — `pack clear --variant all`, `pack push --variant raw` (users opt into sharing SAE provenance explicitly).
+
+## alignment.py (v1.6)
+
+Cross-model probe alignment via per-layer Procrustes.  `load_or_compute_neutral_activations(model, tokenizer, layers, *, model_id, force=False)` is the disk-cached per-model neutrals: same hash check as `layer_means.json` decides staleness; cache is `~/.saklas/models/<safe_id>/neutral_activations.{safetensors,json}` with the 90 prompts × n_layers × hidden_dim stored as fp16 to halve the artifact size (~30MB at 4096-dim, 80-layer).  Stored fp16 → memory fp32 promotion happens on load because Procrustes wants fp32 SVD precision.
+
+`fit_alignment(src_acts, tgt_acts, *, min_shared_layers=10) -> dict[int, Tensor]` fits per-layer ``M_L : ℝ^D_src → ℝ^D_tgt``.  Same hidden dim → orthogonal Procrustes via SVD on `X_tgt^T @ X_src`; different dims → rectangular least-squares via `torch.linalg.lstsq`.  Both branches center on each side first (translation-invariance).  `AlignmentError` raised when shared layer count drops below `min_shared_layers` (default 10) — partial alignment under that produces noisy transfers.
+
+`alignment_quality(M, src_acts, tgt_acts) -> dict[int, float]` is per-layer R² between transferred-source and target on centered observations.  Median across layers lands as `Sidecar.transfer_quality_estimate` so users see one summary number.
+
+`transfer_profile(profile, alignment_map, *, source_model_id, transfer_quality_estimate=None) -> Profile` applies `M_L @ v_src` per layer.  Layers not covered by the alignment are dropped (partial transfer is the only sensible behavior).  Carries `method="procrustes_transfer"`, `source_model_id`, optional `transfer_quality_estimate` through `Profile.metadata`.  Existing diagnostics on the source profile pass through unchanged so users can reason about source-side separation when judging the transfer.
+
+`alignment_cache_path(src_model_id, tgt_model_id) -> (safetensors, sidecar)` and `save_alignment_map`/`load_alignment_map` round-trip the fitted map under `~/.saklas/models/<safe_tgt>/alignments/<safe_src>.{safetensors,json}` — under the *target* model's directory so deleting a target wipes its alignments too.  Sidecar carries source/target ids, the layer set fitted, and per-layer R² when computed.
+
+`saklas vector transfer --from SRC --to TGT <concept> [-f]` is the CLI surface.  Resolves the concept folder, loads the source-model tensor, fits or loads the alignment, applies the transfer, writes the result at the target's `_from-<safe_src>` variant path.  `-f` recomputes both the alignment map and the transfer when the cache hits; without `-f` the verb refuses to overwrite an existing transfer.  `pack.json.files` refreshes after the write so integrity checks include the new variant.
 
 ## datasource.py
 

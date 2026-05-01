@@ -45,8 +45,10 @@ def _variant_matches_key(key: str, filter_: str) -> bool:
 def _variant_key_from_filename(name: str) -> Optional[str]:
     """Return the variant key for a tensor/sidecar filename, or None if unparseable.
 
-    ``<model>.safetensors`` → ``"raw"``; ``<model>_sae-<release>.safetensors`` →
-    ``"sae-<release>"``; sidecars mirror their tensor partners.
+    ``<model>.safetensors`` → ``"raw"``;
+    ``<model>_sae-<release>.safetensors`` → ``"sae-<release>"``;
+    ``<model>_from-<safe_src>.safetensors`` → ``"from-<safe_src>"``;
+    sidecars mirror their tensor partners.
     """
     from saklas.io.paths import parse_tensor_filename
     if name.endswith(".json"):
@@ -54,8 +56,8 @@ def _variant_key_from_filename(name: str) -> Optional[str]:
     parsed = parse_tensor_filename(name)
     if parsed is None:
         return None
-    _model, release = parsed
-    return "raw" if release is None else f"sae-{release}"
+    _model, variant = parsed
+    return "raw" if variant is None else variant
 
 
 def _tensor_files_for(

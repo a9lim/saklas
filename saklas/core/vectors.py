@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import warnings
 from importlib import resources as _resources
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +17,14 @@ if TYPE_CHECKING:
     from saklas.core.sae import SaeBackend
 
 log = logging.getLogger(__name__)
+
+# Per-layer probe-quality diagnostics: thresholds for the soft warning the
+# extractor emits at end-of-extraction.  Fired against the median across
+# retained layers — a single dim layer with rough metrics is normal; a
+# concept whose median is degenerate is the failure mode users care about.
+_DIAG_DEGENERATE_EVR = 0.95         # ~all variance in one direction
+_DIAG_DEGENERATE_INTRA_VAR = 0.01   # almost-identical pos/neg pairs
+_DIAG_LOW_ALIGNMENT = 0.2           # pairs disagree on direction
 
 # Skip the chat template for extraction when it adds more than this many
 # tokens of overhead (e.g. Ministral injects a ~500-token system prompt).
@@ -159,15 +168,24 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         ids = torch.tensor([[bos_id]])
     ids = ids.to(device)
 
-    # Find the last non-special-token position.  Chat templates append
+    # Find the last non-template-token position.  Chat templates append
     # trailing markers like Llama's <|eot_id|>, Gemma's <end_of_turn>,
     # Qwen's <|im_end|> — pooling from those positions yields degenerate
-    # signals disconnected from the content.
-    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    # signals disconnected from the content.  Some tokenizers don't
+    # promote chat boundary tokens to ``all_special_ids`` (talkie's
+    # ``<|user|>``/``<|end|>``/``<|assistant|>`` are added tokens but
+    # not "special"), so we also skip everything in
+    # ``added_tokens_encoder``.  Without this, extraction pools at the
+    # structural turn marker — talkie's outlier channels then dominate
+    # the captured ref_norm, baking 100×-too-large probe magnitudes
+    # that produce gibberish at any nonzero alpha.
+    skip_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    added = getattr(tokenizer, "added_tokens_encoder", None) or {}
+    skip_ids.update(int(v) for v in added.values())
     content_end = ids.shape[1] - 1
-    if special_ids:
+    if skip_ids:
         id_list = ids[0].tolist()
-        while content_end > 0 and id_list[content_end] in special_ids:
+        while content_end > 0 and id_list[content_end] in skip_ids:
             content_end -= 1
 
     hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
@@ -226,6 +244,192 @@ def compute_layer_means(
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 
+def compute_neutral_activations(
+    model,
+    tokenizer,
+    layers,
+    device=None,
+) -> dict[int, torch.Tensor]:
+    """Per-layer ``[N, D]`` stack across the 90 neutral prompts.
+
+    Same forward-pass discipline as :func:`compute_layer_means` — last
+    non-special-token pooling, fp32, MPS-friendly.  Returns one stacked
+    tensor per layer (rows = prompts).  Used by cross-model alignment
+    (:func:`saklas.io.alignment.fit_alignment`) which needs paired
+    observations to fit Procrustes; the means alone (N=1) are degenerate
+    for that fit.
+
+    Storage cost: ~90 · n_layers · hidden_dim · 4B in fp32 (≈ 56MB on
+    a 4096-dim, 80-layer model).  Callers persist this through
+    :func:`saklas.io.alignment.load_or_compute_neutral_activations`.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    n_layers = len(layers)
+    rows: list[dict[int, torch.Tensor]] = []
+    _mps = device.type == "mps"
+
+    for text in _load_neutral_prompts():
+        per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
+        # Move each layer's vector to CPU before discarding the rest of
+        # the captured dict — same MPS discipline as ``compute_layer_means``.
+        rows.append({idx: per_layer[idx].detach().to("cpu") for idx in range(n_layers)})
+        del per_layer
+        if _mps:
+            torch.mps.empty_cache()
+
+    return {
+        idx: torch.stack([row[idx] for row in rows])  # (N, D), fp32 on cpu
+        for idx in range(n_layers)
+    }
+
+
+def _compute_layer_diagnostics(
+    diff_matrix: torch.Tensor,
+    principal_direction: torch.Tensor,
+    evr: float,
+) -> dict[str, float]:
+    """Compute per-layer probe-quality metrics from contrastive diffs.
+
+    All inputs in fp32.  ``diff_matrix`` is ``(N, dim)`` of pos-neg pair
+    diffs; ``principal_direction`` is the first PC ``(dim,)`` (unsigned,
+    pre-orientation); ``evr`` is the explained-variance ratio computed at
+    the SVD site.
+
+    Returns a small dict with four scalars:
+
+    * ``evr`` — passes through the input.  Captures how concentrated the
+      contrastive signal is along its principal direction; values near 1.0
+      with low intra-pair variance indicate one-sided / repetitive pair sets.
+    * ``intra_pair_variance_mean`` / ``intra_pair_variance_std`` — stats over
+      ``||diff_i||`` across pairs.  Mean near zero with EVR near 1.0 is the
+      "all pairs identical" pathology.
+    * ``inter_pair_alignment`` — mean off-diagonal absolute cosine across
+      pairs, batched as ``D̂ @ D̂^T``.  Low values mean pairs disagree on
+      direction; the principal component still emerges from SVD but is
+      weakly grounded.
+    * ``diff_principal_projection`` — mean of ``|cos(diff_i, v)|`` across
+      pairs.  How much of each pair's diff lives along the principal
+      direction; complements ``inter_pair_alignment`` (the former measures
+      pairs vs each other, the latter pairs vs the chosen direction).
+
+    Cost is O(N·d + N²) per layer, dominated by the ``D @ D.T`` for
+    ``inter_pair_alignment`` — at typical N=45, d=4096 this is ~50µs on
+    CPU.  Negligible against the SVD it follows.
+    """
+    n_pairs = diff_matrix.shape[0]
+    if n_pairs < 2:
+        # Single-pair: most metrics degenerate.  Return minimal info so
+        # callers can still distinguish "computed but degenerate" from
+        # "not computed at all".
+        diff_norm = float(diff_matrix.norm(dim=-1)[0].item())
+        return {
+            "evr": float(evr),
+            "intra_pair_variance_mean": diff_norm,
+            "intra_pair_variance_std": 0.0,
+            "inter_pair_alignment": 1.0,
+            "diff_principal_projection": 1.0,
+        }
+
+    diff_norms = diff_matrix.norm(dim=-1)  # (N,)
+    intra_mean = float(diff_norms.mean().item())
+    intra_std = float(diff_norms.std().item())
+
+    # Unit-normalize diffs in fp32; clamp avoids NaN on a zero diff.
+    unit_diffs = diff_matrix / diff_norms.clamp(min=1e-12).unsqueeze(-1)
+
+    # Inter-pair alignment: mean |cos| of off-diagonal pairs.
+    # D̂ @ D̂^T is symmetric with 1.0 on the diagonal; we want the mean
+    # absolute value of the off-diagonal entries.
+    cos_matrix = unit_diffs @ unit_diffs.transpose(0, 1)  # (N, N)
+    abs_cos = cos_matrix.abs()
+    n = abs_cos.shape[0]
+    # Subtract the diagonal (self-cosine, always 1.0) and average the rest.
+    off_diag_sum = abs_cos.sum() - abs_cos.diagonal().sum()
+    inter_alignment = float((off_diag_sum / max(n * (n - 1), 1)).item())
+
+    # Diff-to-PC projection: mean |cos(diff_i, v)|.
+    v_norm = principal_direction.norm().clamp(min=1e-12)
+    v_unit = principal_direction / v_norm
+    proj_cos = (unit_diffs @ v_unit).abs()  # (N,)
+    diff_pc_proj = float(proj_cos.mean().item())
+
+    return {
+        "evr": float(evr),
+        "intra_pair_variance_mean": intra_mean,
+        "intra_pair_variance_std": intra_std,
+        "inter_pair_alignment": inter_alignment,
+        "diff_principal_projection": diff_pc_proj,
+    }
+
+
+def _emit_diagnostics_warning(
+    diagnostics: dict[int, dict[str, float]],
+    *,
+    concept_label: str | None = None,
+) -> None:
+    """Soft-warn when the median across layers looks degenerate.
+
+    Fires at most once per call.  Threshold pair (a) catches one-sided /
+    repetitive pair sets (high EVR, near-zero intra variance); threshold
+    (b) catches incoherent pair sets (low inter-pair alignment).  Both
+    leave the extracted profile usable — the warning is informational,
+    not a block.
+    """
+    if not diagnostics:
+        return
+
+    def _median(values: list[float]) -> float:
+        s = sorted(values)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        mid = n // 2
+        if n % 2 == 1:
+            return s[mid]
+        return 0.5 * (s[mid - 1] + s[mid])
+
+    evrs = [d["evr"] for d in diagnostics.values() if "evr" in d]
+    intras = [
+        d["intra_pair_variance_mean"]
+        for d in diagnostics.values()
+        if "intra_pair_variance_mean" in d
+    ]
+    aligns = [
+        d["inter_pair_alignment"]
+        for d in diagnostics.values()
+        if "inter_pair_alignment" in d
+    ]
+    if not evrs:
+        return
+
+    med_evr = _median(evrs)
+    med_intra = _median(intras) if intras else float("inf")
+    med_align = _median(aligns) if aligns else 1.0
+
+    label = concept_label or "probe"
+    if med_evr > _DIAG_DEGENERATE_EVR and med_intra < _DIAG_DEGENERATE_INTRA_VAR:
+        warnings.warn(
+            f"{label}: probe likely one-sided "
+            f"(median EVR={med_evr:.2f}, intra-pair variance={med_intra:.4f}); "
+            f"contrastive pairs may be too similar. Diversify the negative "
+            f"pole and re-extract for a stronger direction.",
+            UserWarning,
+            stacklevel=3,
+        )
+    elif med_align < _DIAG_LOW_ALIGNMENT:
+        warnings.warn(
+            f"{label}: pair directions disagree "
+            f"(median inter-pair alignment={med_align:.2f}); "
+            f"the principal component still extracts but pairs point in "
+            f"conflicting directions. Review statements.json for "
+            f"semantically orthogonal pairs.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def extract_contrastive(
     model,
     tokenizer,
@@ -235,7 +439,8 @@ def extract_contrastive(
     *,
     sae: "SaeBackend | None" = None,
     drop_edges: tuple[int, int] = (2, 2),
-) -> dict[int, torch.Tensor]:
+    concept_label: str | None = None,
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Contrastive direction extraction via PCA across all layers.
 
     Hooks every layer in the same 2N forward passes. For each layer,
@@ -270,11 +475,21 @@ def extract_contrastive(
             over retained layers automatically. Default ``(2, 2)``; pass
             ``(0, 0)`` to recover pre-fix behavior (useful for tests on
             small mock models and for A/B comparisons).
+        concept_label: Optional human-readable name surfaced in the
+            soft-warning text when diagnostics flag a degenerate probe.
+            Defaults to a generic label.
 
     Returns:
-        Profile dict mapping layer_idx -> baked direction vector. Dropped
-        edge layers are simply absent from the dict — downstream hook
-        attachment iterates over present keys.
+        ``(profile, diagnostics)``:
+
+        * ``profile`` — dict mapping layer_idx → baked direction vector.
+          Dropped edge layers are simply absent from the dict; downstream
+          hook attachment iterates over present keys.
+        * ``diagnostics`` — dict mapping layer_idx → ``{evr,
+          intra_pair_variance_mean, intra_pair_variance_std,
+          inter_pair_alignment, diff_principal_projection}``.  Same key
+          set as ``profile`` (no diagnostics for dropped edges).  Empty
+          dict when ``len(pairs) < 2`` and the SVD path is skipped.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -359,6 +574,10 @@ def extract_contrastive(
         # Accumulate EVR scalars as tensors, one .tolist() after the loop
         # (matches the raw-PCA path's discipline — one GPU→CPU transfer).
         evr_tensors: list[torch.Tensor] = []
+        # Diagnostics computed in *model space* on the contrastive diffs
+        # — gives a cross-comparable readout against raw PCA, even though
+        # the principal direction itself was fit in SAE feature space.
+        diagnostics_per_layer: dict[int, dict[str, float]] = {}
         for idx in sae_layers:
             pos_stack = torch.stack(pos_per_layer[idx])  # (N, d_model), fp32
             neg_stack = torch.stack(neg_per_layer[idx])
@@ -373,7 +592,8 @@ def extract_contrastive(
 
             _, S, Vh = torch.linalg.svd(stacked, full_matrices=False)
             v_feat = Vh[0]
-            evr_tensors.append(S[0] / S.sum())
+            evr_layer_t = S[0] / S.sum()
+            evr_tensors.append(evr_layer_t)
 
             # Orient by majority vote: pos-minus-neg projected onto v_feat
             # should majority-positive.
@@ -386,6 +606,16 @@ def extract_contrastive(
 
             directions[idx] = _normalize(v_model, ref_norm=ref_norm)
 
+            # Per-layer diagnostics: model-space diffs are pos_stack -
+            # neg_stack (already fp32 on CPU when MPS, on device otherwise);
+            # principal direction in model space is v_model (pre-share-bake).
+            diff_model = (pos_stack - neg_stack).to("cpu")
+            diagnostics_per_layer[idx] = _compute_layer_diagnostics(
+                diff_model,
+                v_model.detach().to("cpu"),
+                float(evr_layer_t.item()),
+            )
+
         evrs = torch.stack(evr_tensors).tolist()
         raw: dict[int, tuple[torch.Tensor, float]] = {
             idx: (directions[idx], evr) for idx, evr in zip(sae_layers, evrs)
@@ -393,6 +623,7 @@ def extract_contrastive(
 
         for i in edge_idx:
             raw.pop(i, None)
+            diagnostics_per_layer.pop(i, None)
 
         # Bake shares across the covered subset (same logic as raw path).
         total_score = sum(score for _, score in raw.values())
@@ -403,7 +634,11 @@ def extract_contrastive(
         else:
             shares = {i: score / total_score for i, (_, score) in raw.items()}
 
-        return {i: direction * shares[i] for i, (direction, _) in raw.items()}
+        baked = {i: direction * shares[i] for i, (direction, _) in raw.items()}
+        _emit_diagnostics_warning(
+            diagnostics_per_layer, concept_label=concept_label,
+        )
+        return baked, diagnostics_per_layer
 
     # Per-layer: compute direction and score, then bake shares into magnitude.
     n_pairs = len(pairs)
@@ -413,6 +648,7 @@ def extract_contrastive(
 
     # First pass: extract raw (direction, score) per layer.
     raw: dict[int, tuple[torch.Tensor, float]] = {}
+    diagnostics_per_layer: dict[int, dict[str, float]] = {}
 
     if n_pairs < 2:
         # Single pair: score as diff norm relative to activation magnitude.
@@ -431,6 +667,15 @@ def extract_contrastive(
             activation_norm = norm_sums_cpu[idx]  # pos_norm + neg_norm
             score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
             raw[idx] = (direction, score)
+            # Single-pair diagnostics carry only what's defined for N=1
+            # (intra mean = the single diff norm, std = 0, alignment / proj
+            # tautologically 1.0).  Helps the JSON sidecar stay shape-stable
+            # across pair counts.
+            diagnostics_per_layer[idx] = _compute_layer_diagnostics(
+                diff_vec.unsqueeze(0),
+                direction,
+                score,
+            )
     else:
         # Multi-pair: batched SVD across all layers.
         # Stack into (n_layers, N, dim) and run one batched SVD call —
@@ -461,8 +706,19 @@ def extract_contrastive(
 
             raw[idx] = (_normalize(direction, ref_norm=ref_norms[idx]), scores_cpu[idx])
 
+            # Per-layer diagnostics on the same diff matrix the SVD ran on.
+            # Use the unsigned principal direction — sign convention doesn't
+            # affect any of the diagnostic metrics (all are absolute-value
+            # or magnitude based).
+            diagnostics_per_layer[idx] = _compute_layer_diagnostics(
+                diff_matrices[idx],
+                Vh[idx, 0].detach().to(diff_matrices[idx].device),
+                scores_cpu[idx],
+            )
+
     for i in edge_idx:
         raw.pop(i, None)
+        diagnostics_per_layer.pop(i, None)
 
     # Bake shares into the stored tensors. Total share is 1.0 across retained
     # layers, so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
@@ -478,7 +734,9 @@ def extract_contrastive(
     else:
         shares = {idx: score / total_score for idx, (_, score) in raw.items()}
 
-    return {idx: direction * shares[idx] for idx, (direction, _) in raw.items()}
+    baked = {idx: direction * shares[idx] for idx, (direction, _) in raw.items()}
+    _emit_diagnostics_warning(diagnostics_per_layer, concept_label=concept_label)
+    return baked, diagnostics_per_layer
 
 
 def save_profile(
@@ -494,6 +752,10 @@ def save_profile(
     Optional keys honored:
         statements_sha256 - str, hash of source statements at extraction time
         components        - dict, merge provenance (method="merge" only)
+        diagnostics       - dict[int, dict[str, float]], per-layer probe-quality
+                            metrics (see ``_compute_layer_diagnostics``).
+                            Persisted as ``diagnostics_by_layer`` on the
+                            sidecar with stringified layer keys.
 
     The safetensors file contains keys ``"layer_{i}"`` for each active layer.
     Tensors are already baked (share pre-multiplied into magnitude) — the
@@ -520,10 +782,29 @@ def save_profile(
     for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
         if key in metadata:
             sidecar[key] = metadata[key]
+    # Transfer provenance — present only on transferred profiles
+    # (method="procrustes_transfer").  ``alignment_map_hash`` pins the
+    # specific Procrustes fit; ``transfer_quality_estimate`` is the
+    # median per-layer R² across shared layers.
+    for key in (
+        "source_model_id",
+        "alignment_map_hash",
+        "transfer_quality_estimate",
+    ):
+        if key in metadata:
+            sidecar[key] = metadata[key]
+    # Diagnostics: stringify layer keys so the JSON round-trips through
+    # standard parsers (JSON object keys must be strings).  Reader inverts.
+    diagnostics = metadata.get("diagnostics")
+    if diagnostics:
+        sidecar["diagnostics_by_layer"] = {
+            str(layer): {k: float(v) for k, v in metrics.items()}
+            for layer, metrics in diagnostics.items()
+        }
 
+    from saklas.io.atomic import write_json_atomic
     meta_path = path.with_suffix(".json")
-    with open(meta_path, "w") as f:
-        json.dump(sidecar, f, indent=2)
+    write_json_atomic(meta_path, sidecar)
 
     log.info("Saved profile (%d layers) to %s", len(profile), path)
 
@@ -561,6 +842,22 @@ def load_profile(path: str) -> tuple[dict[int, torch.Tensor], dict]:
         )
 
     profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}
+
+    # Invert the layer-key stringification done at save time so diagnostics
+    # are addressable by ``int`` consistently with the profile dict.
+    raw_diag = metadata.get("diagnostics_by_layer")
+    if isinstance(raw_diag, dict) and raw_diag:
+        try:
+            metadata["diagnostics"] = {
+                int(layer): dict(metrics)
+                for layer, metrics in raw_diag.items()
+            }
+        except (TypeError, ValueError):
+            # Leave the raw dict in place; downstream readers can decide
+            # whether to fall back.  Don't fail the load over malformed
+            # diagnostics — the tensors themselves are still valid.
+            pass
+
     return profile, metadata
 
 
