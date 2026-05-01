@@ -113,6 +113,7 @@ _TESTED_ARCHS: frozenset[str] = frozenset({
     "qwen2", "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe",
     "gemma2", "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "mistral3", "ministral3", "gpt_oss", "llama", "glm",
+    "talkie",
 })
 _warned: set[str] = set()
 
