@@ -184,7 +184,7 @@ These gate `test_session.py::test_throughput` (steered ≥ 85% of vanilla tok/s)
 
 ## Tested architectures
 
-`_TESTED_ARCHS` frozenset in `core/model.py` — emit one-time `UserWarning` on load when `model_type` isn't in this set. **Known working**: `qwen2`, `qwen3`, `qwen3_5` (+ `_text`/`_moe`), `gemma2`, `gemma3` (+ `_text`), `gemma4` (+ `_text`), `mistral3`, `ministral3`, `gpt_oss`, `llama`, `glm`. **Wired up but untested**: mistral/mixtral, phi/phi3/phimoe, cohere 1–2, deepseek v2/v3, starcoder2, olmo 1–3 + moe, granite/granitemoe, nemotron, stablelm, gpt2/neo/j/bigcode/neox, bloom, falcon/falcon_h1, mpt, dbrx, opt, recurrent_gemma. Adding a new architecture = one entry in `_LAYER_ACCESSORS`. **Be careful claiming breadth in user-facing docs** — 54 accessor entries is not the same as 54 architectures working.
+`_TESTED_ARCHS` frozenset in `core/model.py` — emit one-time `UserWarning` on load when `model_type` isn't in this set. **Known working**: `qwen2`, `qwen3`, `qwen3_5` (+ `_text`/`_moe`), `gemma2`, `gemma3` (+ `_text`), `gemma4` (+ `_text`), `mistral3`, `ministral3`, `gpt_oss`, `llama`, `glm`. **Wired up but untested**: mistral/mixtral, phi/phi3/phimoe, cohere 1–2, deepseek v2/v3, starcoder2, olmo 1–3 + moe, granite/granitemoe, nemotron, stablelm, gpt2/neo/j/bigcode/neox, bloom, falcon/falcon_h1, mpt, dbrx, opt, recurrent_gemma, talkie. Adding a new architecture = one entry in `_LAYER_ACCESSORS`. Architectures whose custom modeling ignores `past_key_values` (e.g. talkie) auto-fall back to no-KV-cache generation in `generate_steered` — correct but O(N²), one-time warning. **Be careful claiming breadth in user-facing docs** — 54 accessor entries is not the same as 54 architectures working.
 
 ## Bundled concepts
 

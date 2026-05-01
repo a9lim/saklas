@@ -100,6 +100,8 @@ _LAYER_ACCESSORS = {
     "dbrx": lambda m: m.transformer.blocks,
     # OPT
     "opt": lambda m: m.model.decoder.layers,
+    # Talkie (vintage pre-1931 model; embedding-skip + per-block actgain decoder)
+    "talkie": lambda m: m.model.blocks,
 }
 
 _SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
@@ -227,18 +229,29 @@ def _pick_dtype(device: str) -> torch.dtype:
     return torch.float32
 
 
-def load_model(model_id: str, quantize=None, device="auto"):
+def _resolve_dtype(dtype, device: str) -> torch.dtype:
+    if dtype is None:
+        return _pick_dtype(device)
+    if isinstance(dtype, str):
+        return getattr(torch, dtype)
+    return dtype
+
+
+def load_model(model_id: str, quantize=None, device="auto", dtype=None):
     """Load a HuggingFace causal LM and its tokenizer.
 
     Args:
         model_id: Hub ID or local path.
         quantize: None for bf16/fp16/fp32, "4bit", or "8bit".
         device: "auto" (detect), "cuda", "mps", or "cpu".
+        dtype: torch.dtype or string ("bfloat16"/"float16"/"float32"). None
+            picks the device default — bf16 on CUDA/MPS, fp32 on CPU.
 
     Returns:
         (model, tokenizer) tuple.
     """
     device = detect_device(device)
+    resolved_dtype = _resolve_dtype(dtype, device)
     log.info("Device: %s", device)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -247,7 +260,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
     if quantize and device != "cuda":
         warnings.warn(
             f"bitsandbytes quantization ({quantize}) requires CUDA. "
-            f"Ignoring --quantize on {device}, loading in {_pick_dtype(device)}."
+            f"Ignoring --quantize on {device}, loading in {resolved_dtype}."
         )
         quantize = None
 
@@ -326,7 +339,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
     elif quantize == "8bit":
         load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     else:
-        load_kwargs["dtype"] = _pick_dtype(device)
+        load_kwargs["dtype"] = resolved_dtype
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust)
     text_cfg = getattr(config, "text_config", None)
     extract_text_model = (
@@ -346,7 +359,7 @@ def load_model(model_id: str, quantize=None, device="auto"):
         log.info("extracting text model (%s) from multimodal checkpoint (%s)",
                  text_cfg.model_type, config.model_type)
         model = _load_text_from_multimodal(
-            model_id, text_cfg, load_kwargs.get("dtype", _pick_dtype(device)),
+            model_id, text_cfg, load_kwargs.get("dtype", resolved_dtype),
             device,
         )
     else:

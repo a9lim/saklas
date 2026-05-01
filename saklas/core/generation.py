@@ -5,6 +5,7 @@ import math
 import queue
 import logging
 import threading
+import warnings
 from enum import IntEnum
 from typing import Callable
 
@@ -419,6 +420,12 @@ def generate_steered(
     eos_ids = _get_eos_ids(model, tokenizer)
     past_key_values = None
     current_input = input_ids
+    # Set True after the first forward if the model returns no
+    # past_key_values — i.e. it doesn't implement KV cache (custom modeling
+    # like talkie that ignores `**kwargs`).  We then pass the full
+    # accumulated sequence on every step instead of just the new token.
+    # O(N²) generation cost, but correct.
+    no_cache_mode = False
     generated_ids: list[int] = []
     _cfg = getattr(model.config, "text_config", model.config)
     _vocab = _cfg.vocab_size
@@ -520,6 +527,13 @@ def generate_steered(
                 prefill = False
 
                 past_key_values = outputs.past_key_values
+                if not no_cache_mode and past_key_values is None and current_input.shape[1] > 1:
+                    no_cache_mode = True
+                    warnings.warn(
+                        "model returned no past_key_values during prefill — "
+                        "falling back to no-KV-cache mode (O(N²) generation)",
+                        stacklevel=2,
+                    )
                 logits = outputs.logits[:, -1, :]
                 # Steering can push hidden states past fp16 range, cascading
                 # to inf/NaN logits.  nan_to_num clears NaN/inf first;
@@ -595,7 +609,10 @@ def generate_steered(
                         state.finish_reason = "stop"
                         break
                     generated_ids.append(token_id)
-                    current_input = next_token
+                    if no_cache_mode:
+                        current_input = torch.cat([current_input, next_token], dim=1)
+                    else:
+                        current_input = next_token
                     if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
                             _emit_token(tokenizer.decode(pending_ids),
@@ -617,7 +634,10 @@ def generate_steered(
 
                 # Advance KV cache state (common to all non-EOS paths)
                 generated_ids.append(token_id)
-                current_input = next_token
+                if no_cache_mode:
+                    current_input = torch.cat([current_input, next_token], dim=1)
+                else:
+                    current_input = next_token
 
                 # Handle thinking start delimiter (Gemma-style: model
                 # explicitly opens a thinking channel)

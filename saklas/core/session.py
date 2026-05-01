@@ -240,6 +240,7 @@ class SaklasSession:
         model_id: str,
         *,
         device: str = "auto",
+        dtype=None,
         quantize: str | None = None,
         probes: list[str] | None = None,
         system_prompt: str | None = None,
@@ -251,7 +252,7 @@ class SaklasSession:
         HF-loading heavy lifting. To wrap an already-loaded model use the
         plain ``__init__(model, tokenizer, ...)`` form.
         """
-        model, tokenizer = load_model(model_id, quantize=quantize, device=device)
+        model, tokenizer = load_model(model_id, quantize=quantize, device=device, dtype=dtype)
         return cls(
             model, tokenizer,
             probes=probes,
