@@ -168,15 +168,24 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         ids = torch.tensor([[bos_id]])
     ids = ids.to(device)
 
-    # Find the last non-special-token position.  Chat templates append
+    # Find the last non-template-token position.  Chat templates append
     # trailing markers like Llama's <|eot_id|>, Gemma's <end_of_turn>,
     # Qwen's <|im_end|> — pooling from those positions yields degenerate
-    # signals disconnected from the content.
-    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    # signals disconnected from the content.  Some tokenizers don't
+    # promote chat boundary tokens to ``all_special_ids`` (talkie's
+    # ``<|user|>``/``<|end|>``/``<|assistant|>`` are added tokens but
+    # not "special"), so we also skip everything in
+    # ``added_tokens_encoder``.  Without this, extraction pools at the
+    # structural turn marker — talkie's outlier channels then dominate
+    # the captured ref_norm, baking 100×-too-large probe magnitudes
+    # that produce gibberish at any nonzero alpha.
+    skip_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    added = getattr(tokenizer, "added_tokens_encoder", None) or {}
+    skip_ids.update(int(v) for v in added.values())
     content_end = ids.shape[1] - 1
-    if special_ids:
+    if skip_ids:
         id_list = ids[0].tolist()
-        while content_end > 0 and id_list[content_end] in special_ids:
+        while content_end > 0 and id_list[content_end] in skip_ids:
             content_end -= 1
 
     hidden_per_layer = _capture_all_hidden_states(model, layers, ids)

@@ -8,7 +8,7 @@ HF causal LM loading. `_LAYER_ACCESSORS` maps `model_type` → layer-list access
 
 ## vectors.py
 
-One forward pass per prompt; `_capture_all_hidden_states` hooks every layer in a single pass. `_encode_and_capture_all` pools from the **last content token**, walking back past `tokenizer.all_special_ids` to skip trailing chat-template markers (Llama `<|eot_id|>`, Gemma `<end_of_turn>`, Qwen `<|im_end|>`). Contrastive diffs cast to **fp32** before differencing (fp16 loses precision on close vectors, makes SVD degenerate).
+One forward pass per prompt; `_capture_all_hidden_states` hooks every layer in a single pass. `_encode_and_capture_all` pools from the **last content token**, walking back past `tokenizer.all_special_ids` *and* `tokenizer.added_tokens_encoder` to skip trailing chat-template markers (Llama `<|eot_id|>`, Gemma `<end_of_turn>`, Qwen `<|im_end|>`). The `added_tokens_encoder` arm matters for tokenizers that don't promote chat boundary tokens to `all_special_ids` (talkie's `<|user|>`/`<|end|>`/`<|assistant|>` are added tokens but not "special") — without it, extraction pools at the structural turn marker where outlier channels dominate, baking 100×-too-large probe magnitudes that produce gibberish at any nonzero α. Contrastive diffs cast to **fp32** before differencing (fp16 loses precision on close vectors, makes SVD degenerate).
 
 - **Multi-pair**: batched SVD across all layers (one `torch.linalg.svd` on stacked `(n_layers, N, dim)`), scored by explained-variance ratio.
 - **Single-pair**: scored by `diff_norm / activation_norm`.
