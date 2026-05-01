@@ -127,6 +127,63 @@ def test_mla_in_text_config_also_triggers():
     assert kwargs["attn_implementation"] == "eager"
 
 
+def _captured_tokenizer_kwargs(model_id: str, model_type: str = "qwen3"):
+    """Run load_model with a mocked transformers stack; return the kwargs
+    actually handed to AutoTokenizer.from_pretrained."""
+    cfg = _FakeConfig(model_type)
+    captured: dict = {}
+
+    def _fake_tok_from_pretrained(mid, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
+    ):
+        mock_tok.from_pretrained.side_effect = _fake_tok_from_pretrained
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_model.from_pretrained.return_value = _FakeModel("sdpa")
+        model_mod.load_model(model_id, device="cpu")
+
+    return captured
+
+
+def test_mistral_regex_fix_passed_for_mistral():
+    """HF-distributed Mistral checkpoints ship a buggy pre-tokenizer regex
+    that mis-splits ~1% of tokens. ``load_model`` must pass
+    ``fix_mistral_regex=True`` to AutoTokenizer for any mistral-family
+    repo so the corrected regex from ``mistral_common`` is used.
+    See https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84
+    """
+    for mid in (
+        "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        "mistralai/Ministral-3-14B-Instruct-2512",
+        "someorg/mistral-7b-finetune",
+    ):
+        kwargs = _captured_tokenizer_kwargs(mid)
+        assert kwargs.get("fix_mistral_regex") is True, (
+            f"{mid}: expected fix_mistral_regex=True in tokenizer kwargs, "
+            f"got {kwargs!r}"
+        )
+
+
+def test_mistral_regex_fix_skipped_for_non_mistral():
+    """The fix kwarg is mistral-tokenizer-specific. Don't pass it for
+    other architectures — modern transformers may absorb unknown kwargs
+    silently, but we shouldn't rely on that."""
+    for mid in (
+        "google/gemma-4-31b-it",
+        "Qwen/Qwen3.6-27B",
+        "meta-llama/Llama-3.1-8B-Instruct",
+    ):
+        kwargs = _captured_tokenizer_kwargs(mid)
+        assert "fix_mistral_regex" not in kwargs, (
+            f"{mid}: fix_mistral_regex should NOT be set, got {kwargs!r}"
+        )
+
+
 def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch):
     """``device='mps'`` on a host without an MPS backend (e.g. Linux CI)
     must not crash.  The CUDA branch already gates on

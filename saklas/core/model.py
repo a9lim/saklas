@@ -254,7 +254,17 @@ def load_model(model_id: str, quantize=None, device="auto", dtype=None):
     resolved_dtype = _resolve_dtype(dtype, device)
     log.info("Device: %s", device)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    # HF-distributed Mistral checkpoints ship a buggy pre-tokenizer regex
+    # that mis-splits ~1% of tokens (e.g. ``"'The'"`` → ``["'", "T", "he", "'"]``
+    # instead of ``["'", "The", "'"]``).  ``fix_mistral_regex=True`` swaps in the
+    # correct regex from ``mistral_common``.  Substring-match on the model_id
+    # so it fires for any mistralai/* repo (Mistral-Small, Ministral, etc.) and
+    # third-party finetunes whose name carries the family.
+    # https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84
+    tokenizer_kwargs: dict = {"trust_remote_code": True}
+    if "mistral" in model_id.lower():
+        tokenizer_kwargs["fix_mistral_regex"] = True
+    tokenizer = AutoTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
 
     # --- quantization config ---
     if quantize and device != "cuda":
