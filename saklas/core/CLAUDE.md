@@ -116,7 +116,7 @@ Per-call `SamplingConfig` (frozen with `merged_with`), `Steering` (frozen; `from
 
 ## generation.py
 
-Token-by-token + KV cache, wrapped in `torch.inference_mode()`. `GenerationConfig` is `@dataclass(frozen=True)` holding session-level defaults (`max_new_tokens`, `temperature`, `top_p`, `top_k`, `system_prompt`); callers rebind session defaults via `dataclasses.replace(session.config, ...)` rather than mutating.
+Token-by-token + KV cache, wrapped in `torch.inference_mode()`. Models that return no `past_key_values` during prefill (custom modeling that ignores the cache kwarg, e.g. talkie) flip a `no_cache_mode` flag and pass the full accumulated `current_input` each step instead of just `next_token` — O(N²) generation, one-time `UserWarning`, off the throughput-invariant path. The flag adds one `is None` check per step on the standard path. `GenerationConfig` is `@dataclass(frozen=True)` holding session-level defaults (`max_new_tokens`, `temperature`, `top_p`, `top_k`, `system_prompt`); callers rebind session defaults via `dataclasses.replace(session.config, ...)` rather than mutating.
 
 **Per-call sampling overrides never touch `session.config`** — `_generate_core` composes a local `GenerationConfig` from `session.config` merged with the call's `SamplingConfig` via `_compose_gen_config(sampling)`, and hands that to `generate_steered`. In-flight gens are immune to concurrent session-default rebinds.
 
