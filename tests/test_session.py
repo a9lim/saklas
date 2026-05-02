@@ -400,3 +400,116 @@ def test_return_hidden_false_leaves_hidden_states_none(session):
         sampling=SamplingConfig(max_tokens=4, temperature=0.0),
     )
     assert result.hidden_states is None
+
+
+class TestPrefixCache:
+    """Prefix KV cache: opt-in optimization for batch workloads with a
+    shared chat prefix.  See ``SaklasSession.cache_prefix``.
+    """
+
+    def _shared_prefix_messages(self, session, prompt_body: str):
+        """Build a (prefix_messages, full_messages) pair where the
+        full chat-template encoding of full_messages begins with the
+        prefix_messages encoding.
+
+        Trick: encode the prefix-only messages with
+        ``add_generation_prompt=False`` and prepend its decoded text
+        to the prompt body in a single user message — that shape
+        always satisfies the byte-prefix invariant on tokenizers
+        whose user-turn tokens partition cleanly on whitespace
+        (Gemma's chat template is one such).
+        """
+        # Prefix is its own user turn; full is the same prefix +
+        # additional user turn.  The chat-template encoding of
+        # [u1] is a prefix of [u1, u2] under add_generation_prompt
+        # = False for prefix_only and True for full.  But that
+        # ISN'T sufficient — the False-encoded prefix may differ
+        # by trailing tokens.  Instead, encode the prefix as a token
+        # tensor to bypass the issue.
+        from saklas.core.generation import build_chat_input
+
+        prefix_msg = [
+            {"role": "user", "content": "Be concise. Always end with a period."},
+        ]
+        full_msg = prefix_msg + [
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": prompt_body},
+        ]
+        full_ids = build_chat_input(
+            session._tokenizer, full_msg, session.config.system_prompt,
+        )
+        # Find the longest token prefix that's a clean head of full_ids.
+        # We just take everything up to (but not including) the second
+        # user-turn opener.  Falling back to a deterministic split by
+        # token-string match keeps this independent of model family.
+        prefix_ids = build_chat_input(
+            session._tokenizer, prefix_msg, session.config.system_prompt,
+            add_generation_prompt=False,
+        )
+        # Trim prefix_ids to the longest matching head of full_ids.
+        L = 0
+        max_L = min(prefix_ids.shape[1], full_ids.shape[1])
+        for i in range(max_L):
+            if int(prefix_ids[0, i]) == int(full_ids[0, i]):
+                L = i + 1
+            else:
+                break
+        prefix_ids_trim = prefix_ids[:, :L]
+        return prefix_ids_trim, full_msg
+
+    def test_cache_hit_matches_no_cache_output(self, session):
+        from saklas import SamplingConfig
+
+        session.clear_history()
+        prefix_ids, full_msg = self._shared_prefix_messages(
+            session, "Say the word 'banana' three times.",
+        )
+
+        # Baseline: no cache, deterministic.
+        session.cache_prefix(None)
+        baseline = session.generate(
+            full_msg,
+            sampling=SamplingConfig(max_tokens=12, temperature=0.0, seed=42),
+            stateless=True,
+        )
+
+        # Warm the cache and rerun the same prompt; outputs must match.
+        prefix_len = session.cache_prefix(prefix_ids)
+        assert prefix_len > 0
+        cached = session.generate(
+            full_msg,
+            sampling=SamplingConfig(max_tokens=12, temperature=0.0, seed=42),
+            stateless=True,
+        )
+        # Same prompt + same seed + same model state → identical token
+        # stream regardless of how prefill was sliced.
+        assert cached.tokens == baseline.tokens, (
+            f"prefix-cache hit produced different tokens than no-cache:\n"
+            f"  no-cache: {baseline.tokens}\n"
+            f"  cached:   {cached.tokens}"
+        )
+        # Cleanup so other tests aren't affected.
+        session.cache_prefix(None)
+
+    def test_steering_invalidates_cache(self, session):
+        # Warm the cache.
+        prefix_ids, _ = self._shared_prefix_messages(session, "Hello.")
+        session.cache_prefix(prefix_ids)
+        assert session._prefix_cache is not None
+
+        # Make sure there's a steering vector to push.
+        if not session.has_vector("happy"):
+            _, prof = session.extract([("I am happy", "I am sad")])
+            session.steer("happy", prof)
+        # steer() itself invalidates; re-warm and verify scope-entry
+        # is what we're really testing.
+        session.cache_prefix(prefix_ids)
+        assert session._prefix_cache is not None
+
+        with session.steering("0.1 happy"):
+            # Scope entry must drop the cache.
+            assert session._prefix_cache is None
+
+        # And the post-scope rebuild must NOT magically reinstate it.
+        assert session._prefix_cache is None
+        session.unsteer("happy")

@@ -365,6 +365,18 @@ class SaklasSession:
 
         self._monitor = TraitMonitor(probe_profiles, self._layer_means)
 
+        # Prefix KV cache (opt-in, off by default).  Populated by
+        # :meth:`cache_prefix`; consumed by :meth:`_generate_core` when the
+        # incoming ``input_ids`` start with the cached prefix.  Shape:
+        # ``(prefix_token_ids: torch.Tensor [seq_len] long, past_key_values,
+        # prefix_len: int)``.  ``past_key_values`` is the live HF cache
+        # (DynamicCache et al.) returned by the prefix-prefill forward pass
+        # — generation cropping back to ``prefix_len`` after each consuming
+        # call keeps it reusable.  Invalidated on any state change that
+        # would alter the cached prefix's hidden-state semantics: steering
+        # push/pop/steer/unsteer, probe install/remove, profile mutation.
+        self._prefix_cache: tuple[torch.Tensor, object, int] | None = None
+
         # Concept-extraction pipeline.  Constructed once so the session
         # holds a single live instance; the pipeline takes the structural
         # dependencies it needs (model handle / pack writer / registry /
@@ -944,10 +956,16 @@ class SaklasSession:
         can read tensors without attribute lookups.
         """
         self._profiles[name] = dict(profile.as_dict())
+        # Profile addition can change downstream steering composition
+        # if a future steering scope references it; conservatively drop
+        # the prefix cache so the next gen reprefills under the new
+        # registry view.
+        self._invalidate_prefix_cache()
 
     def unsteer(self, name: str) -> None:
         """Remove a steering vector from the registry."""
         self._profiles.pop(name, None)
+        self._invalidate_prefix_cache()
 
     def steering(
         self, value: "str | Steering",
@@ -1208,6 +1226,10 @@ class SaklasSession:
         except BaseException:
             self._steering_stack.pop()
             raise
+        # Steering hooks just changed; the prefix cache (built under the
+        # previous regime) no longer represents the current pre-attention
+        # residual stream.  Drop it.
+        self._invalidate_prefix_cache()
         self._emit_steering_applied()
 
     def _pop_steering(self) -> None:
@@ -1216,6 +1238,7 @@ class SaklasSession:
             return
         self._steering_stack.pop()
         self._rebuild_steering_hooks()
+        self._invalidate_prefix_cache()
         if not self._steering_stack:
             self.events.emit(SteeringCleared())
         else:
@@ -1496,9 +1519,16 @@ class SaklasSession:
             )
             self._monitor.layer_means = self._layer_means
         self._monitor.add_probe(name, profile)
+        # New probe → _begin_capture would attach to a different
+        # layer set than was live when the prefix was prefilled.
+        # Drop the cache so the next gen reprefills with the fresh
+        # capture-attach layout in place. (Probes don't mutate hidden
+        # states, but the safer default keeps the contract simple.)
+        self._invalidate_prefix_cache()
 
     def unprobe(self, name: str) -> None:
         self._monitor.remove_probe(name)
+        self._invalidate_prefix_cache()
 
     # -- History --
 
@@ -1511,6 +1541,156 @@ class SaklasSession:
     def clear_history(self) -> None:
         self._history.clear()
         self._monitor.reset_history()
+
+    # -- Prefix KV cache --
+
+    def cache_prefix(
+        self,
+        messages: "list[dict[str, str]] | torch.Tensor | None",
+    ) -> int:
+        """Pre-prefill an identical chat prefix so subsequent ``generate()``
+        calls forward only the suffix.
+
+        Useful for batch workloads that re-issue the same chat-template
+        head (system + leading user-instruction) hundreds of times — the
+        v3 emotional run motivating this method does 800 stateless
+        generations with the same kaomoji instruction prefix tokens.
+        Per-call savings scale with prefix_len / total_input_len.
+
+        Accepts:
+        - ``list[dict[str, str]]``: encoded via ``build_chat_input`` with
+          ``add_generation_prompt=False`` (the prefix should be the
+          turn(s) that PRECEDE the assistant turn — generation-prompt
+          tokens for the assistant turn are part of the per-call suffix).
+        - ``torch.Tensor`` of shape ``[seq_len]`` or ``[1, seq_len]``:
+          stored verbatim. Use this when the natural common prefix sits
+          mid-content and isn't a clean message-list boundary (e.g. a
+          fixed instruction concatenated into the user message before
+          the variable prompt body).
+        - ``None``: clear the cache. Equivalent to ``cache_prefix()``.
+
+        Returns the cached prefix length in tokens (0 when clearing).
+
+        Caveats (DOCUMENTED INLINE because they're easy to step on):
+        1. Only safe to call OUTSIDE any active ``session.steering()``
+           scope.  The prefix is prefilled with whatever steering hooks
+           are live at call time — if those differ from the steering
+           regime active at consume time, the cached hidden states are
+           stale.  We invalidate the cache automatically on push/pop,
+           but the call itself errors if a scope is open.
+        2. Hidden-state capture is suspended for the duration of the
+           prefill so the cached prefix doesn't pollute later score
+           buckets.  No guarantees about what the monitor sees mid-call;
+           callers shouldn't rely on probe state during cache_prefix.
+        3. The cached tokens MUST appear as a byte-prefix of every
+           ``generate()`` call's ``input_ids``.  If the caller's
+           messages drift, the cache silently MISSES (cheap — full
+           prefill on miss) but never silently MIS-HITS — the
+           ``input_ids[..., :prefix_len].equal(prefix_tokens)`` check
+           is exact.
+        """
+        # Clear path.
+        if messages is None:
+            self._invalidate_prefix_cache()
+            return 0
+
+        if self._steering_stack:
+            raise SaklasError(
+                "cache_prefix called inside an active session.steering() "
+                "scope; prefill must run with the neutral baseline so the "
+                "cached prefix is consume-regime independent. Cache before "
+                "entering any steering scope."
+            )
+        if self.is_generating:
+            raise ConcurrentGenerationError(
+                "cache_prefix called while a generation is in flight"
+            )
+
+        # Build prefix tokens.
+        if isinstance(messages, torch.Tensor):
+            prefix_ids = messages
+            if prefix_ids.dim() == 1:
+                prefix_ids = prefix_ids.unsqueeze(0)
+            prefix_ids = prefix_ids.to(device=self._device, dtype=torch.long)
+        else:
+            # List of message dicts.  add_generation_prompt=False so we
+            # don't bake the assistant-turn opener into the prefix —
+            # the per-call suffix carries that, ensuring the same
+            # cached prefix can serve multi-turn variants.
+            prefix_ids = build_chat_input(
+                self._tokenizer, list(messages),
+                self.config.system_prompt,
+                thinking=False,
+                add_generation_prompt=False,
+            ).to(self._device)
+
+        prefix_len = int(prefix_ids.shape[1])
+        if prefix_len == 0:
+            self._invalidate_prefix_cache()
+            return 0
+
+        # Replace any prior cache entry; old past_key_values goes out of
+        # scope and is GC'd when no longer referenced.
+        self._prefix_cache = None
+
+        # Suspend capture for the prefill so the prefix tokens don't fill
+        # the per-layer buckets the next generation's scoring code reads.
+        # _begin_capture/_end_capture are idempotent re no-op no-probe
+        # configurations, so the bracketing here is always safe.
+        self._end_capture()
+
+        with torch.inference_mode():
+            outputs = self._model(
+                input_ids=prefix_ids,
+                attention_mask=torch.ones_like(prefix_ids),
+                use_cache=True,
+            )
+
+        past_key_values = outputs.past_key_values
+        if past_key_values is None:
+            # Model doesn't expose KV cache (custom modeling that ignores
+            # use_cache).  Nothing to cache; drop the prefix.
+            return 0
+
+        # Store on CPU so we can ``.equal`` against fresh device tensors
+        # without round-trip cost; the cache itself stays on device.
+        prefix_ids_cpu = prefix_ids[0].detach().to("cpu")
+        self._prefix_cache = (prefix_ids_cpu, past_key_values, prefix_len)
+        return prefix_len
+
+    def _invalidate_prefix_cache(self) -> None:
+        """Drop the prefix KV cache.
+
+        Called on every state change that affects what a fresh prefill
+        of the cached prefix would produce: steering push/pop, steer /
+        unsteer, probe install / remove, profile autoload.  Cheap — just
+        a reference drop; HF's cache objects are GC'd when their refcount
+        falls to zero.
+        """
+        self._prefix_cache = None
+
+    def _try_prefix_cache_hit(
+        self, input_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, object, int] | None:
+        """Return (suffix_ids, past_key_values, prefix_len) on cache hit, else None.
+
+        Cache-hit precondition: the cached prefix tokens match
+        ``input_ids[0, :prefix_len]`` byte-for-byte AND the suffix is
+        non-empty (a zero-length suffix has no last-token logit to
+        sample from on the first iteration; we'd need a different
+        codepath to handle it — for now, fall through to no-cache).
+        """
+        cache = self._prefix_cache
+        if cache is None:
+            return None
+        prefix_ids_cpu, past_key_values, prefix_len = cache
+        if input_ids.shape[1] <= prefix_len:
+            return None
+        head = input_ids[0, :prefix_len].detach().to("cpu")
+        if not torch.equal(head, prefix_ids_cpu):
+            return None
+        suffix_ids = input_ids[:, prefix_len:].contiguous()
+        return suffix_ids, past_key_values, prefix_len
 
     # -- Generation helpers --
 
@@ -1755,6 +1935,26 @@ class SaklasSession:
                             except Exception:
                                 pass
 
+        # Pass _token_tap into generate_steered only when at least one of its
+        # branches is live: caller-supplied on_token, logprobs collection, or
+        # live trait subscribers.  When all three are inactive, _token_tap
+        # would be a no-op called once per generated token, AND its presence
+        # forces generate_steered to compute the unconditional fp32
+        # log_softmax + entropy sync per step (gate at generation.py:571).
+        # Skipping it here trims that cost from the v3 stateless prefill
+        # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
+        # no streaming, no SSE).  Stop-sequence behavior is preserved by
+        # not wiring _token_tap=None when stop_list is set — the tokenizer-
+        # decode + stop-match in generation.py only runs under on_token.
+        _has_trait_consumer = bool(self._trait_queues and self._monitor.probe_names)
+        _need_tap = (
+            on_token is not None
+            or logprobs_list is not None
+            or _has_trait_consumer
+            or stop_list is not None
+        )
+        _effective_tap = _token_tap if _need_tap else None
+
         steering_cm = None
         if steering_obj is not None and steering_obj.alphas:
             steering_cm = self.steering(steering_obj)
@@ -1799,18 +1999,64 @@ class SaklasSession:
                 # ``generate_steered`` mutates it at lifecycle boundaries.
                 self._steering.ctx.reset()
                 self._gen_phase = GenState.RUNNING
+
+                # Prefix KV cache lookup. Skipped when the caller asked
+                # for return_hidden — the all-layer dump expects per-token
+                # captures starting from the prefix's last token forward,
+                # which the cached path can't synthesize (the prefix
+                # forward ran with capture suspended).  Skipped under
+                # thinking too: the thinking state machine bookkeeping
+                # gets twitchy when prefill spans multiple tokens of
+                # already-decided content, and the v3 motivating workload
+                # never sets thinking=True. Under steering scopes the
+                # cache was invalidated at scope entry so this path is
+                # naturally a miss; explicit guard keeps that contract
+                # legible. ``cache_position_offset`` is the cached
+                # prefix length — generate_steered widens its prefill
+                # attention mask to cover both prefix + suffix.
+                cached_pkv = None
+                cache_position_offset = 0
+                effective_input_ids = input_ids
+                if (
+                    not want_hidden
+                    and not use_thinking
+                    and not self._steering_stack
+                    and self._prefix_cache is not None
+                ):
+                    hit = self._try_prefix_cache_hit(input_ids)
+                    if hit is not None:
+                        suffix_ids, cached_pkv, cache_position_offset = hit
+                        effective_input_ids = suffix_ids
+
                 start = time.monotonic()
                 generated_ids = generate_steered(
-                    self._model, self._tokenizer, input_ids,
+                    self._model, self._tokenizer, effective_input_ids,
                     gen_config, self._gen_state, thinking=use_thinking,
-                    on_token=_token_tap,
+                    on_token=_effective_tap,
                     seed=seed, stop=stop_list, logit_bias=logit_bias,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
                     logprobs=lp_count,
                     trigger_ctx=self._steering.ctx,
+                    past_key_values=cached_pkv,
+                    cache_position_offset=cache_position_offset,
                 )
                 elapsed = time.monotonic() - start
+
+                # Crop the cache back to prefix_len so the next consumer
+                # gets the same bare-prefix state. HF's DynamicCache.crop
+                # truncates per-layer K/V tensors in-place to a max length;
+                # the appended suffix + generated tokens are dropped.
+                # When the cache was a miss (cached_pkv None) the stored
+                # cache wasn't touched — nothing to crop.
+                if cached_pkv is not None and self._prefix_cache is not None:
+                    try:
+                        cached_pkv.crop(cache_position_offset)
+                    except (AttributeError, TypeError):
+                        # Cache type doesn't support crop (legacy tuple
+                        # format, or HF API drift). Drop rather than risk
+                        # serving a stale cache to the next call.
+                        self._invalidate_prefix_cache()
             finally:
                 self._gen_state.stop_requested.set()
                 self._end_capture()

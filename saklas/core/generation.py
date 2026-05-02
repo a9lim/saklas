@@ -348,27 +348,85 @@ class GenerationState:
         self.response_text = None
 
 
+# Hand-rolled LRU for build_chat_input results.  functools.lru_cache won't
+# work cleanly because (a) we'd need every kwarg hashable (the tokenizer
+# isn't reliably so across HF versions), and (b) the cached value is a
+# torch.Tensor we want to ``.clone()`` on hit so callers can't mutate the
+# cached buffer.  Keyed on (id(tokenizer), system_prompt, frozen-tuple of
+# chat, thinking, add_generation_prompt) — id(tokenizer) implicitly
+# invalidates when a fresh tokenizer instance is loaded into a session.
+# Sized to comfortably absorb the v3 stateless workload (one identical
+# prefix repeated 800×) without bloating; small chat lists serialize
+# cheaply to tuples so the per-lookup hash cost is negligible.
+_CHAT_INPUT_CACHE_MAX = 128
+_chat_input_cache: dict[
+    tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool],
+    torch.Tensor,
+] = {}
+
+
+def _chat_input_cache_key(
+    tokenizer,
+    chat: list[dict[str, str]],
+    system_prompt: str | None,
+    thinking: bool,
+    add_generation_prompt: bool,
+) -> tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool]:
+    return (
+        id(tokenizer),
+        system_prompt,
+        tuple((m["role"], m["content"]) for m in chat),
+        thinking,
+        add_generation_prompt,
+    )
+
+
 def build_chat_input(
     tokenizer,
     messages: list[dict[str, str]],
     system_prompt: str | None = None,
     thinking: bool = False,
+    *,
+    add_generation_prompt: bool = True,
 ) -> torch.Tensor:
     chat = []
     if system_prompt:
         chat.append({"role": "system", "content": system_prompt})
     chat.extend(messages)
     if getattr(tokenizer, "chat_template", None) is not None:
+        # Cache lookup: see _chat_input_cache docstring for invalidation
+        # semantics.  Only the chat-template branch is cached — the
+        # base-model fallback is sub-ms and not worth complicating.
+        key = _chat_input_cache_key(
+            tokenizer, chat, system_prompt, thinking, add_generation_prompt,
+        )
+        cached = _chat_input_cache.get(key)
+        if cached is not None:
+            # Return a clone — callers (notably ``_prepare_input``) ``.to``
+            # device-move the tensor and would otherwise alias the cache.
+            return cached.clone()
         kwargs: dict = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = thinking
         result = tokenizer.apply_chat_template(
-            chat, add_generation_prompt=True, return_tensors="pt", **kwargs,
+            chat, add_generation_prompt=add_generation_prompt,
+            return_tensors="pt", **kwargs,
         )
         # Some tokenizers return a BatchEncoding dict instead of a raw tensor
         if isinstance(result, torch.Tensor):
-            return result
-        return result["input_ids"]
+            tensor = result
+        else:
+            tensor = result["input_ids"]
+        # Insert into cache — evict FIFO at the size cap. dict insertion
+        # order is the eviction order; popping the first key removes the
+        # oldest entry. Not strictly LRU (no touch-on-hit reorder), but
+        # the workload that motivates this — identical prefix replayed
+        # many times — hits the same key repeatedly so FIFO and LRU
+        # behave identically here.
+        if len(_chat_input_cache) >= _CHAT_INPUT_CACHE_MAX:
+            _chat_input_cache.pop(next(iter(_chat_input_cache)))
+        _chat_input_cache[key] = tensor
+        return tensor.clone()
     # Base model without chat template — add minimal role markers
     text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in chat) + "\nAssistant:"
     return tokenizer(text, return_tensors="pt")["input_ids"]
@@ -389,6 +447,8 @@ def generate_steered(
     frequency_penalty: float = 0.0,
     logprobs: int | None = None,
     trigger_ctx: TriggerContext | None = None,
+    past_key_values=None,
+    cache_position_offset: int = 0,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -418,7 +478,12 @@ def generate_steered(
 
     device = input_ids.device
     eos_ids = _get_eos_ids(model, tokenizer)
-    past_key_values = None
+    # ``past_key_values`` is normally None (full prefill); a non-None value
+    # means the caller pre-prefilled some prefix tokens through the model
+    # and is handing us the resulting cache.  ``cache_position_offset`` is
+    # that prefix's seq_len — the suffix in ``input_ids`` follows it.
+    # Full-sequence attention mask covers both; downstream HF derives
+    # position ids from the cache's seq_length and the new input length.
     current_input = input_ids
     # Set True after the first forward if the model returns no
     # past_key_values — i.e. it doesn't implement KV cache (custom modeling
@@ -436,7 +501,7 @@ def generate_steered(
     _user_top_k = config.top_k if (config.top_k and config.top_k > 0) else 1024
     topk_k = min(_user_top_k, _vocab)
     token_table = _get_token_table(tokenizer, _vocab) if on_token else None
-    seq_len = input_ids.shape[1]
+    seq_len = input_ids.shape[1] + cache_position_offset
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
 
@@ -554,25 +619,28 @@ def generate_steered(
                     logits[0, bias_idx] += bias_val.to(logits.dtype)
 
                 # Full-vocab log-softmax in fp32 — feeds both perplexity
-                # (every step) and chosen/top logprobs (on demand). One
-                # extra softmax + one .item() per step; ~1-3% of a forward
-                # pass on typical hardware, comfortably inside the steered
-                # throughput headroom.
+                # (every step) and chosen/top logprobs (on demand).
                 #
-                # TODO(perf): logprobs hot path forces per-token .item()/.tolist()
-                # CPU syncs below. Batching to a single post-loop transfer would
-                # win a few % on logprobs-enabled runs, but on_token streams
-                # logprobs live in each emitted chunk (chat completions chunks,
-                # TUI), so deferring would either break streaming semantics or
-                # require parallel index bookkeeping. Leaving per-token sync
-                # until we have a non-streaming caller that actually cares.
+                # Gated: when no caller consumes per-token info (no on_token
+                # callback and logprobs disabled), skip the fp32 softmax + the
+                # entropy .item() sync entirely.  Sentinel ``current_perplexity =
+                # float("nan")`` is propagated to ``_emit_token`` for the
+                # otherwise-degenerate partial-flush path so downstream
+                # destructuring stays type-stable.  The session-side
+                # ``_token_tap`` only gets installed when at least one of
+                # logprobs / user on_token / trait-queue scoring is live, so
+                # this gate fires for the v3-style stateless prefill workload
+                # that pegged this block on the profile.
                 chosen_logprob: float | None = None
                 top_lp_pairs: list[tuple[int, float]] | None = None
-                lp = torch.log_softmax(logits.float(), dim=-1)
-                # Shannon entropy in nats → perplexity via exp.  Using the
-                # already-allocated lp tensor; one .item() sync.
-                entropy_nats = float((-lp.exp() * lp).sum().item())
-                current_perplexity = math.exp(entropy_nats)
+                if on_token is not None or logprobs is not None:
+                    lp = torch.log_softmax(logits.float(), dim=-1)
+                    # Shannon entropy in nats → perplexity via exp.
+                    entropy_nats = float((-lp.exp() * lp).sum().item())
+                    current_perplexity = math.exp(entropy_nats)
+                else:
+                    lp = None
+                    current_perplexity = float("nan")
 
                 if config.temperature <= 0:
                     # Greedy
