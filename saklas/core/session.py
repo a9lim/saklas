@@ -117,7 +117,13 @@ def _snapshot_la_layers(cache) -> None:
     for layer in layers:
         save = getattr(layer, "_saklas_save_snapshot", None)
         if save is not None:
-            save(layer)
+            # ``_saklas_save_snapshot`` is ``setattr``-ed on the
+            # ``LinearAttentionLayer`` class, so attribute lookup on an
+            # instance returns a bound method — ``self`` (the layer) is
+            # already passed automatically. Calling ``save(layer)`` here
+            # would hand layer through *twice*, raising
+            # ``TypeError: takes 1 positional argument but 2 were given``.
+            save()
 
 
 _N_PAIRS = 45
