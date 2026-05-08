@@ -18,7 +18,6 @@ from saklas.io.paths import (
     concept_dir,
     model_dir,
     neutral_statements_path,
-    safe_model_id,
     sidecar_filename,
     tensor_filename,
     vectors_dir,
@@ -126,7 +125,6 @@ def bootstrap_probes(
 
     defaults = load_defaults()
     model_id = model_info.get("model_id", "unknown")
-    sid = safe_model_id(model_id)
     if method not in ("dim", "pca"):
         raise ValueError(
             f"unknown extraction method {method!r} (expected 'dim' | 'pca')"

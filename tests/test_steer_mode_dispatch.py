@@ -28,7 +28,6 @@ from saklas.core.events import EventBus
 from saklas.core.hooks import DEFAULT_THETA_MAX, SteeringManager
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
-from saklas.core.triggers import Trigger
 from saklas.io import selectors as _sel
 
 

@@ -31,8 +31,12 @@ from saklas.io.datasource import DataSource
 from saklas.io.packs import hash_file
 from saklas.io.paths import tensor_filename
 from saklas.core.vectors import (
-    extract_contrastive,
-    extract_difference_of_means,
+    # Imported for ``_extractor_for``'s ``globals()`` lookup, which is
+    # the deliberate dispatch pattern that lets test monkeypatches at
+    # module scope reach the dispatcher.  Direct name references would
+    # bypass the indirection.
+    extract_contrastive,  # noqa: F401
+    extract_difference_of_means,  # noqa: F401
     save_profile as _save_profile,
     load_profile as _load_profile,
     load_contrastive_pairs,

@@ -168,8 +168,12 @@ class TestMahalanobisCosine:
             layers=(0,), n=200, d=d, seed=2,
             cov_scale=scale, ridge_scale=0.05,
         )
-        u = torch.zeros(d); u[0] = 1.0; u[1] = 1.0
-        v = torch.zeros(d); v[0] = 1.0; v[1] = -1.0
+        u = torch.zeros(d)
+        u[0] = 1.0
+        u[1] = 1.0
+        v = torch.zeros(d)
+        v[0] = 1.0
+        v[1] = -1.0
         m_cos = w.mahalanobis_cosine(0, u, v)
         e_cos = float(torch.dot(u, v) / (u.norm() * v.norm()))
         # In Euclidean, e_cos = 0 (orthogonal axes 1 vs -1 cancel axis 0).
