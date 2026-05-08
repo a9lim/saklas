@@ -8,7 +8,7 @@ import logging
 import warnings
 from importlib import resources as _resources
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -819,15 +819,28 @@ def extract_difference_of_means(
     sae: "SaeBackend | None" = None,
     drop_edges: tuple[int, int] = (2, 2),
     concept_label: str | None = None,
+    whitener: "Any | None" = None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Contrastive direction extraction via **difference of means** (DiM).
 
     Per-layer direction is the mean over pos-neg diffs ``mean_i (h_pos_i -
-    h_neg_i)``, computed in fp32.  Score is ``||direction|| / ref_norm``,
-    which lives in the same range as the EVR scores from
-    :func:`extract_contrastive` so share-baking magnitudes stay
-    comparable across methods within a profile and across profiles
-    extracted by either method.
+    h_neg_i)``, computed in fp32.
+
+    **Score (default since v2.1, opt-out):** ``||direction||_M / ref_norm``
+    where ``||·||_M`` is the Mahalanobis norm against the per-layer
+    activation covariance built from cached neutral activations.  The
+    ``/ ref_norm`` normalization is what makes the existing share-bake
+    pipeline give pure-Mahalanobis hook shares: ``share_L_hook =
+    ||m_L||_M / Σ ||m_L'||_M``, with ``ref_norm_L`` cancelling from the
+    cross-layer ratio (preserves the Euclidean bake's algebraic shape).
+    Layers where the contrastive signal sits in low-variance directions
+    score higher than under Euclidean — the metric directly measures
+    "how much linearly-decodable signal does this layer carry."
+
+    **Score (Euclidean fallback):** when ``whitener=None``, score is
+    ``||direction||_2 / ref_norm`` — the v1.x form.  Used by tests and
+    by sessions that haven't populated ``neutral_activations`` yet.
+    Pure Euclidean magnitude weighting at hook time.
 
     Theoretical motivation: Im & Li (2025, arXiv 2502.02716) prove that
     the mean-of-differences direction is optimal for the linear-steering
@@ -835,17 +848,33 @@ def extract_difference_of_means(
     variance among the diffs, which can be near-orthogonal to the actual
     class-separation axis on noisy / inconsistent pair sets — DiM picks
     the class-separation axis directly.  AxBench (Wu et al., ICML 2025)
-    corroborates empirically.
+    corroborates empirically.  The Mahalanobis score is the natural
+    extension of LEACE-style metric awareness (Belrose et al. 2023,
+    arXiv 2306.03819) to the share-allocation problem: under anisotropic
+    activation distributions, Euclidean magnitude over-weights layers
+    whose mean-diff happens to align with high-variance noise axes; the
+    Mahalanobis form measures signal strength against the activation
+    distribution itself.
 
     Shape and metadata are identical to :func:`extract_contrastive`:
     same returned tuple ``(profile, diagnostics)``, same edge-drop and
     share-baking discipline, same diagnostics fields.  The only behavior
-    delta is the per-layer direction itself; downstream hook math sees
-    a baked direction tensor either way.
+    delta is the per-layer score (and therefore share allocation) when
+    a whitener is provided; downstream hook math sees a baked direction
+    tensor either way.
 
     Args / Returns: see :func:`extract_contrastive`.  The ``sae=...``
     branch runs the same mean-of-diffs in feature space and decodes back
-    through the SAE before share-baking; no SVD is performed.
+    through the SAE before share-baking; no SVD is performed.  The
+    Mahalanobis score is computed on the *decoded* model-space direction,
+    where the residual-stream whitener applies; SAE feature-space norms
+    don't have a meaningful Mahalanobis interpretation under the same
+    covariance.
+
+    The ``whitener`` parameter is a :class:`saklas.core.mahalanobis.LayerWhitener`
+    (or ``None`` for the Euclidean fallback).  Layers absent from the
+    whitener fall back to Euclidean per-layer — the whitener may
+    legitimately cover a subset of layers in edge cases.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -883,8 +912,18 @@ def extract_difference_of_means(
             with torch.no_grad():
                 v_model = sae.decode_layer(idx, v_feat).float()
 
-            v_model_norm = v_model.norm().clamp(min=1e-8)
-            score_tensors.append(v_model_norm / max(ref_norm, 1e-8))
+            # Score: Mahalanobis norm of the decoded model-space direction
+            # (same shape as the raw branch — see ``score`` docstring).
+            # Whitener-absent or layer-uncovered → Euclidean fallback so
+            # SAE extraction without a populated neutral_activations cache
+            # still works.
+            if whitener is not None and whitener.covers(idx):
+                m_norm = whitener.mahalanobis_norm(idx, v_model)
+                score_value = m_norm / max(ref_norm, 1e-8)
+                score_tensors.append(torch.tensor(score_value, dtype=torch.float32))
+            else:
+                v_model_norm = v_model.norm().clamp(min=1e-8)
+                score_tensors.append(v_model_norm / max(ref_norm, 1e-8))
 
             directions[idx] = _normalize(v_model, ref_norm=ref_norm)
 
@@ -931,7 +970,13 @@ def extract_difference_of_means(
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
             activation_norm = norm_sums_cpu[idx]
-            score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
+            if whitener is not None and whitener.covers(idx):
+                # Mahalanobis on the single diff vector; ``activation_norm``
+                # is pos+neg sum, mirrors the Euclidean form's denominator.
+                m_norm = whitener.mahalanobis_norm(idx, diff_vec)
+                score = m_norm / max(activation_norm, 1e-8)
+            else:
+                score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
             raw[idx] = (direction, score)
             diagnostics_per_layer[idx] = _compute_layer_diagnostics(
                 diff_vec.unsqueeze(0),
@@ -951,14 +996,30 @@ def extract_difference_of_means(
 
         batched = torch.stack(diff_matrices)        # (n_layers, N, dim)
         means = batched.mean(dim=1)                 # (n_layers, dim)
-        # Score = ||mean_diff|| / ref_norm — lands in the same band as
-        # the EVR scores from PCA (~0.01–0.4) so share-baking math
-        # carries over without recalibration.
         means_norms = means.norm(dim=-1)            # (n_layers,)
-        scores_t = means_norms / torch.tensor(
-            ref_norms, device=means_norms.device, dtype=means_norms.dtype,
-        ).clamp(min=1e-8)
-        scores_cpu = scores_t.tolist()
+
+        if whitener is not None:
+            # Mahalanobis branch: per-layer matvec via Woodbury through
+            # ``LayerWhitener.mahalanobis_norm``.  Loop instead of batch
+            # because each layer has its own ``Σ_L^{-1}`` and ``X_L``;
+            # extraction is one-shot, not a hot path.  Layers absent from
+            # the whitener fall back to Euclidean for that layer.
+            scores_cpu = []
+            for idx in range(n_layers):
+                ref_L = max(ref_norms[idx], 1e-8)
+                if whitener.covers(idx):
+                    m_norm = whitener.mahalanobis_norm(idx, means[idx])
+                    scores_cpu.append(m_norm / ref_L)
+                else:
+                    scores_cpu.append(float(means_norms[idx].item()) / ref_L)
+        else:
+            # Euclidean fallback: original batched path, single GPU→CPU
+            # transfer.  Score = ||mean_diff||_2 / ref_norm — lands in
+            # the same range as PCA's EVR (~0.01–0.4).
+            scores_t = means_norms / torch.tensor(
+                ref_norms, device=means_norms.device, dtype=means_norms.dtype,
+            ).clamp(min=1e-8)
+            scores_cpu = scores_t.tolist()
 
         for idx in range(n_layers):
             direction = means[idx].to(device)
@@ -1018,6 +1079,14 @@ def save_profile(
         sidecar["statements_sha256"] = metadata["statements_sha256"]
     if "components" in metadata:
         sidecar["components"] = metadata["components"]
+    # v2.1: bake method records which scoring metric drove share allocation
+    # (``"euclidean"`` = legacy ``||m||_2 / r``; ``"mahalanobis"`` =
+    # ``||m||_M / r`` via per-layer activation covariance).  Loaders read
+    # this only for diagnostics; the runtime hook reads tensor magnitudes
+    # regardless of bake flavor.  Default ``"euclidean"`` is back-compat
+    # for tensors written before the bake field existed.
+    if "bake" in metadata:
+        sidecar["bake"] = metadata["bake"]
     # SAE provenance — present only when extraction used an SAE backend.
     for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
         if key in metadata:
@@ -1105,12 +1174,30 @@ def project_profile(
     base: dict[int, torch.Tensor],
     onto: dict[int, torch.Tensor],
     operator: str,
+    *,
+    whitener: "Any | None" = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer projection of ``base`` against ``onto``.
 
-    For each shared layer (fp32)::
+    Default (Euclidean), per shared layer (fp32)::
 
         proj = (dot(base, onto) / dot(onto, onto)) * onto
+
+    With ``whitener`` (a :class:`saklas.core.mahalanobis.LayerWhitener`),
+    switches to LEACE-style projection in the Mahalanobis metric::
+
+        coef = <base, onto>_M / <onto, onto>_M
+        proj = coef * onto                # direction is ``onto``; metric is M
+
+    The output direction is still ``onto``, but the *amount* removed is
+    the component along ``onto`` measured in the whitened space.  For
+    operator ``"|"``, this is the closed-form LEACE projector for a
+    single direction (Belrose et al. 2023, arXiv 2306.03819) — provably
+    erases linearly-decodable information along ``onto`` from ``base``
+    with minimum collateral damage.  Reduces to plain Gram-Schmidt when
+    ``Σ = I``.
+
+    Operator semantics (both metrics):
 
     - ``operator == "~"``   returns ``proj``       (component of base aligned with onto).
     - ``operator == "|"`` returns ``base - proj`` (component of base orthogonal to onto).
@@ -1120,8 +1207,10 @@ def project_profile(
     are dropped (projection onto an absent direction is undefined).
 
     Near-zero ``||onto|| < 1e-12`` layers are treated the same way: ``"|"``
-    passes base through unchanged, ``"~"`` drops the layer. Result tensors
-    are cast back to the source dtype of ``base``.
+    passes base through unchanged, ``"~"`` drops the layer.  Layers absent
+    from the whitener fall back to the Euclidean projection — the whitener
+    may legitimately cover a subset of layers (e.g. SAE-only releases).
+    Result tensors are cast back to the source dtype of ``base``.
 
     The returned dict shape matches :func:`extract_contrastive` so it
     plugs into ``SteeringManager.add_vector`` without adaptation.
@@ -1135,6 +1224,17 @@ def project_profile(
             if operator == "|":
                 out[layer] = base_t
             continue
+        # LEACE branch: whitener available + covers this layer.
+        if whitener is not None and whitener.covers(layer):
+            projected = whitener.leace_project(layer, base_t, onto_t, operator)
+            # Drop the layer for ``~`` when ``onto`` is degenerate under
+            # the Mahalanobis metric — leace_project returns a zero
+            # tensor in that case, mirroring the Euclidean drop rule.
+            if operator == "~" and torch.all(projected == 0):
+                continue
+            out[layer] = projected
+            continue
+        # Euclidean fallback (no whitener, or layer not covered).
         a_f = base_t.to(dtype=torch.float32)
         b_f = onto_t.to(dtype=torch.float32)
         b_dot = torch.dot(b_f, b_f).item()

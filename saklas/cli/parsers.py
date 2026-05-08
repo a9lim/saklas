@@ -86,6 +86,14 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
              "π/2 (≈1.5708) — α=1 fully aligns the residual with the "
              "concept direction.  No effect under --steer-mode additive.",
     )
+    p.add_argument(
+        "--legacy", action="store_true",
+        help="v2.0 backcompat preset for steering: equivalent to "
+             "``--steer-mode additive`` plus PCA extraction on first-run "
+             "probe bootstrap (instead of v2.1's DiM + Mahalanobis bake "
+             "+ angular).  Useful for A/B-comparing the v2.0 stack on "
+             "the same model.  Mutually exclusive with ``--steer-mode``.",
+    )
 
 
 def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
@@ -240,6 +248,14 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "configured, else 'dim'.",
     )
     p.add_argument(
+        "--legacy", action="store_true",
+        help="v2.0 backcompat preset.  On ``vector extract`` this is "
+             "equivalent to ``--method pca``; combined with ``--legacy`` "
+             "on ``tui``/``serve`` (additive injection) and ``vector "
+             "compare`` (Euclidean cosine), it round-trips the entire "
+             "pre-v2.1 stack.  Mutually exclusive with ``--method``.",
+    )
+    p.add_argument(
         "--sae", default=None, metavar="RELEASE",
         help="Extract via a SAELens SAE release (requires `pip install .[sae]`). "
              "No implicit default — you must name a release.",
@@ -284,6 +300,35 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
                    help="Show per-layer breakdown (2-arg pairwise mode)")
     p.add_argument("-j", "--json", dest="json_output", action="store_true",
                    help="Emit machine-readable JSON")
+    p.add_argument(
+        "--metric", choices=("euclidean", "mahalanobis"), default="euclidean",
+        help=(
+            "Cosine metric. 'euclidean' (default) = standard cosine. "
+            "'mahalanobis' = whitened cosine ⟨u,v⟩_M = u^T Σ^{-1} v "
+            "(Belrose et al. 2023), reads cached neutral activations + "
+            "layer means under ~/.saklas/models/<id>/ to build the per-"
+            "layer whitener; falls back to Euclidean per layer when the "
+            "whitener doesn't cover that layer."
+        ),
+    )
+    p.add_argument(
+        "--ridge-scale", type=float, default=1.0, metavar="FLOAT",
+        help=(
+            "Ridge multiplier on the regularized covariance "
+            "(λ_L = (||X_L||_F²/(N·D)) × ridge_scale). Only consulted "
+            "with --metric mahalanobis; default 1.0 (mean diagonal of "
+            "the un-regularized sample covariance)."
+        ),
+    )
+    p.add_argument(
+        "--legacy", action="store_true",
+        help=(
+            "v2.0 backcompat preset: equivalent to ``--metric euclidean`` "
+            "(currently the default; future-proofs this verb against a "
+            "Mahalanobis default flip).  Mutually exclusive with "
+            "``--metric``."
+        ),
+    )
 
 
 def _build_vector_why(p: argparse.ArgumentParser) -> None:

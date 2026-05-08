@@ -455,7 +455,12 @@ def _setup_compare_env(monkeypatch, tmp_path):
 def _mock_profile(agg_fn, pl_fn):
     """Return a simple duck-typed mock (not a Profile subclass) with cosine_similarity."""
     class MockProfile:
-        def cosine_similarity(self, other, *, per_layer=False):
+        def cosine_similarity(self, other, *, per_layer=False, whitener=None):
+            # ``whitener`` is accepted (forwarded by ``_run_compare`` after
+            # the v2.2 ``--metric mahalanobis`` wiring) but ignored here —
+            # the mocks return a fixed scalar that doesn't depend on the
+            # metric.  Tests that need to exercise the Mahalanobis path
+            # use ``test_mahalanobis.py`` against real Profile + tensors.
             return pl_fn(other) if per_layer else agg_fn(other)
     return MockProfile()
 

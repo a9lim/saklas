@@ -350,11 +350,25 @@ class ExtractionPipeline:
         method_label = _method_label(method, sae_backend)
         extractor = _extractor_for(method)
 
+        # Mahalanobis bake (v2.1+): DiM extraction uses the per-model
+        # whitener for share allocation when available.  We pull off the
+        # handle via getattr — keeps the ModelHandle protocol minimal
+        # and lets test stubs that don't implement ``.whitener`` fall
+        # back to Euclidean.  PCA branch ignores the whitener (it scores
+        # via EVR, not magnitude).
+        bake_label = "euclidean"
+        extract_kwargs: dict = {"sae": sae_backend, "concept_label": canonical}
+        if method == "dim":
+            handle_whitener = getattr(self._handle, "whitener", None)
+            if handle_whitener is not None:
+                extract_kwargs["whitener"] = handle_whitener
+                bake_label = "mahalanobis"
+
         def _build_return(
             profile_dict: dict,
             diagnostics: dict[int, dict[str, float]] | None = None,
         ) -> tuple[str, Profile]:
-            meta: dict = {"method": method_label}
+            meta: dict = {"method": method_label, "bake": bake_label}
             meta.update(sae_metadata)
             if diagnostics:
                 meta["diagnostics"] = diagnostics
@@ -370,7 +384,7 @@ class ExtractionPipeline:
             *,
             diagnostics: dict[int, dict[str, float]] | None = None,
         ) -> dict:
-            meta: dict = {"method": method_label}
+            meta: dict = {"method": method_label, "bake": bake_label}
             if extra:
                 meta.update(extra)
             meta.update(sae_metadata)
@@ -413,8 +427,7 @@ class ExtractionPipeline:
             pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
             profile, diagnostics = extractor(
                 model, tokenizer, pairs, layers=layers,
-                sae=sae_backend,
-                concept_label=canonical,
+                **extract_kwargs,
             )
             _save_profile(profile, cache_path, _save_meta(diagnostics=diagnostics))
             self._packs._update_local_pack_files(folder)

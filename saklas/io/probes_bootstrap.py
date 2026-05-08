@@ -105,6 +105,7 @@ def bootstrap_probes(
     categories: list[str],
     *,
     method: str = "dim",
+    whitener: Any = None,
 ) -> dict[str, dict[int, torch.Tensor]]:
     """Load or extract probe vector profiles for the given categories.
 
@@ -113,6 +114,13 @@ def bootstrap_probes(
     pass ``"pca"`` to recover the legacy contrastive-PCA path.  Cached
     tensors are loaded as-is regardless of method — the sidecar carries
     the method that produced them.
+
+    ``whitener`` is a :class:`saklas.core.mahalanobis.LayerWhitener` (or
+    ``None``).  When provided, DiM extraction uses Mahalanobis-flavored
+    scores for share allocation (see :func:`saklas.core.vectors.extract_difference_of_means`);
+    written sidecars carry ``bake: "mahalanobis"``.  ``None`` falls back
+    to Euclidean scoring (sidecar ``bake: "euclidean"``).  Whitener has
+    no effect on PCA extraction (legacy method, kept on EVR scoring).
     """
     from saklas import __version__ as _saklas_version
 
@@ -195,15 +203,23 @@ def bootstrap_probes(
     method_label = (
         "difference_of_means" if method == "dim" else "contrastive_pca"
     )
+    # Whitener only affects DiM; PCA stays on EVR scoring (legacy path).
+    extract_kwargs: dict[str, Any] = {}
+    bake_label = "euclidean"
+    if method == "dim" and whitener is not None:
+        extract_kwargs["whitener"] = whitener
+        bake_label = "mahalanobis"
     for name, cdir, ts, ds, stmts_path in progress(datasets_to_extract, desc="Extracting probes", unit="probe"):
         try:
             profile, diagnostics = extractor(
                 model, tokenizer, ds["pairs"], layers=layers,
                 concept_label=f"default/{name}",
+                **extract_kwargs,
             )
             probes[name] = profile
             save_meta: dict[str, Any] = {
                 "method": method_label,
+                "bake": bake_label,
                 "statements_sha256": hash_file(stmts_path),
             }
             if diagnostics:

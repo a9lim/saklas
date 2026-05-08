@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from enum import IntEnum
-from typing import Callable, Iterator, Literal, overload
+from typing import Any, Callable, Iterator, Literal, overload
 
 import torch
 
@@ -361,6 +361,7 @@ class SaklasSession:
         max_tokens: int = 1024,
         injection_mode: str = "angular",
         theta_max: float | None = None,
+        extraction_method: str = "dim",
     ) -> "SaklasSession":
         """Load a HF model + tokenizer and return a fully initialized session.
 
@@ -382,6 +383,7 @@ class SaklasSession:
             max_tokens=max_tokens,
             injection_mode=injection_mode,
             theta_max=theta_max,
+            extraction_method=extraction_method,
         )
 
     def __init__(
@@ -394,6 +396,7 @@ class SaklasSession:
         max_tokens: int = 1024,
         injection_mode: str = "angular",
         theta_max: float | None = None,
+        extraction_method: str = "dim",
     ):
         self._model = model
         self._tokenizer = tokenizer
@@ -499,17 +502,39 @@ class SaklasSession:
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
 
+        # Order matters: layer_means + neutral_activations + whitener must
+        # exist BEFORE ``bootstrap_probes`` runs, because v2.1+ DiM
+        # extraction uses the whitener for Mahalanobis-flavored share
+        # allocation.  Pre-v2.1 ordering computed layer_means *after* probe
+        # extraction (just for monitor centering) — the flip is the
+        # extract-time dependency on the activation covariance.  When
+        # ``probe_categories`` is empty there's nothing to extract, so we
+        # skip the whitener build to keep ``probes=[]`` sessions cheap;
+        # ad-hoc later extraction lazily builds via ``self.whitener``.
+        self._layer_means: dict[int, torch.Tensor] = {}
+        self._whitener: Any = None
+        if probe_categories:
+            self._layer_means = bootstrap_layer_means(
+                self._model, self._tokenizer, self._layers, self._model_info,
+            )
+            self._whitener = self._build_whitener_from_cache_or_compute()
+
+        # Stash for later session.extract calls — same default applies
+        # to ad-hoc extraction unless the caller overrides per-call.
+        if extraction_method not in ("dim", "pca"):
+            raise ValueError(
+                f"extraction_method must be 'dim' or 'pca', "
+                f"got {extraction_method!r}"
+            )
+        self._extraction_method: str = extraction_method
+
         probe_profiles: dict[str, dict] = {}
         if probe_categories:
             probe_profiles = bootstrap_probes(
                 self._model, self._tokenizer, self._layers, self._model_info,
                 probe_categories,
-            )
-
-        self._layer_means: dict[int, torch.Tensor] = {}
-        if probe_profiles:
-            self._layer_means = bootstrap_layer_means(
-                self._model, self._tokenizer, self._layers, self._model_info,
+                method=extraction_method,
+                whitener=self._whitener if extraction_method == "dim" else None,
             )
 
         self._monitor = TraitMonitor(probe_profiles, self._layer_means)
@@ -653,6 +678,72 @@ class SaklasSession:
                 self._trait_queues.remove((loop, q))
             except ValueError:
                 pass
+
+    # -- Mahalanobis whitener (v2.1) --
+
+    @property
+    def whitener(self) -> "Any":
+        """Per-layer Mahalanobis whitener; built lazily on first access.
+
+        Used by v2.1+ DiM extraction for Mahalanobis-flavored share
+        allocation, by ``vector compare --metric mahalanobis``, and by
+        callers that pass a whitener to ``project_profile`` for
+        LEACE-style projection.  Returns a
+        :class:`saklas.core.mahalanobis.LayerWhitener` or ``None`` if
+        construction failed (model is mid-load, neutral activations
+        couldn't be computed, etc. — we never raise here, so probe
+        scoring stays alive).
+        """
+        if self._whitener is None:
+            self._whitener = self._build_whitener_from_cache_or_compute()
+        return self._whitener
+
+    def _build_whitener_from_cache_or_compute(self) -> "Any":
+        """Compute or load the per-model whitener.
+
+        Uses ``load_or_compute_neutral_activations`` (alignment.py) for
+        disk caching; combines with the in-memory ``_layer_means`` to
+        instantiate the :class:`LayerWhitener`.  Soft-fails to ``None``
+        on any error — extraction falls back to Euclidean scoring, and
+        ``vector compare --metric mahalanobis`` already errors with a
+        useful hint when ``LayerWhitener.from_cache`` can't find the
+        cache.
+
+        Lazy: only callers who actually need Mahalanobis math (DiM
+        extraction at session init, on-demand ``session.whitener``
+        access, or ``vector compare --metric mahalanobis``) trigger the
+        forward-pass loop over neutral statements.
+        """
+        from saklas.core.mahalanobis import LayerWhitener
+        from saklas.io.alignment import load_or_compute_neutral_activations
+
+        if not self._layer_means:
+            # Whitener requires the centering means; if they haven't been
+            # built yet, build them now.  This keeps ``session.whitener``
+            # working even on ``probes=[]`` sessions where the eager init
+            # path was skipped.
+            try:
+                self._layer_means = bootstrap_layer_means(
+                    self._model, self._tokenizer, self._layers, self._model_info,
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                _log.warning("whitener: layer_means build failed: %s", exc)
+                return None
+        try:
+            neutral_acts = load_or_compute_neutral_activations(
+                self._model, self._tokenizer, self._layers,
+                model_id=self._model_info.get("model_id", "unknown"),
+            )
+            return LayerWhitener.from_neutral_activations(
+                neutral_acts, self._layer_means,
+            )
+        except Exception as exc:
+            _log.warning(
+                "whitener: build failed (%s); DiM extraction will use "
+                "Euclidean scoring. Error: %s",
+                type(exc).__name__, exc,
+            )
+            return None
 
     # -- Extraction --
 
