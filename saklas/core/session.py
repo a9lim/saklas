@@ -725,6 +725,44 @@ class SaklasSession:
             except ValueError:
                 pass
 
+    # -- Neutral baseline (v2.1) --
+
+    @property
+    def layer_means(self) -> dict[int, torch.Tensor]:
+        """Per-layer neutral baseline means, built lazily on first access.
+
+        Sessions instantiated with ``probes=[]`` skip the eager
+        :func:`bootstrap_layer_means` call to keep init cheap.  Callers
+        that later need the means — DLS centering at extraction time,
+        the Mahalanobis whitener, the trait monitor — hit this
+        property, which triggers the bootstrap once and caches the
+        result on ``self._layer_means``.  Disk-cached when the
+        ``neutral_statements.json`` hash matches the on-disk
+        ``layer_means.safetensors``; recomputes otherwise.
+
+        Returns ``{}`` only if the bootstrap path itself fails (model
+        not loaded, missing neutrals pack, etc.) — DLS / whitener
+        callers fall back to no-baseline behavior in that case.
+
+        v2.1 fix-up: previously DLS extraction read ``self._layer_means``
+        directly, which left ``probes=[]`` sessions with an empty dict
+        and silently disabled DLS (every layer fell through the
+        "missing baseline" conservative-keep branch in
+        :func:`compute_dls_mask`).  The property closes that footgun.
+        """
+        if not self._layer_means:
+            try:
+                self._layer_means = bootstrap_layer_means(
+                    self._model, self._tokenizer, self._layers, self._model_info,
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                _log.warning(
+                    "session.layer_means lazy build failed: %s; "
+                    "DLS and Mahalanobis paths will fall back to "
+                    "no-baseline behavior", exc,
+                )
+        return self._layer_means
+
     # -- Mahalanobis whitener (v2.1) --
 
     @property

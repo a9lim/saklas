@@ -364,11 +364,16 @@ class ExtractionPipeline:
         # check fires when both are present.  Tests / mock stubs that
         # don't carry layer_means just keep all layers.
         bake_label = "euclidean"
+        # ``layer_means`` via the public property triggers lazy
+        # bootstrap on ``probes=[]`` sessions (closes the v2.1 footgun
+        # where DLS silently disabled because ``self._layer_means``
+        # was an empty dict).  Test stubs without a real model
+        # override the property to return ``{}`` directly.
         extract_kwargs: dict = {
             "sae": sae_backend,
             "concept_label": canonical,
             "dls": True,
-            "layer_means": getattr(self._handle, "_layer_means", None),
+            "layer_means": getattr(self._handle, "layer_means", None),
         }
         if method == "dim":
             handle_whitener = getattr(self._handle, "whitener", None)

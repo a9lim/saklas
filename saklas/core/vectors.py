@@ -487,7 +487,19 @@ def compute_dls_mask(
         downstream extractor diagnostics will already flag the probe
         quality).
     """
-    if layer_means is None:
+    # Empty-dict is treated identically to ``None`` — both mean "no
+    # baseline available, fall back to keep-all silently."  Without
+    # the explicit early-out, every layer in the loop would hit
+    # ``mu_n = layer_means.get(L) → None`` and fall through the
+    # conservative-keep branch, which produces the same observable
+    # result but routes through confusing per-layer logic.  This
+    # guard also catches the v2.1 footgun where ``probes=[]``
+    # sessions had ``self._layer_means = {}`` propagate to the
+    # helper, silently disabling DLS even when neutrals were
+    # cacheable — fixed at the session layer via the lazy
+    # ``layer_means`` property, but the helper-level guard is cheap
+    # insurance against future leak paths.
+    if layer_means is None or not layer_means:
         return set(mu_pos)
     keep: set[int] = set()
     for L in mu_pos:

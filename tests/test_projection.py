@@ -363,3 +363,127 @@ class TestProjectionMetricDefault:
         with pytest.raises(ValueError, match="projection_metric"):
             with s.steering(bad):
                 pass
+
+
+# ----------------------------------- v2.1 layer_means lazy-load fix-up ---
+
+class TestLayerMeansLazy:
+    """The ``session.layer_means`` property lazy-builds when
+    ``probes=[]`` left ``self._layer_means`` empty.
+
+    Closes the v2.1 footgun where ``probes=[]`` sessions hit
+    ``compute_dls_mask`` with an empty dict, every layer fell into
+    the conservative-keep branch, and DLS silently disabled itself.
+    """
+
+    def test_property_returns_existing_means_without_rebuild(self, monkeypatch):
+        """Non-empty ``self._layer_means`` short-circuits the property
+        — no bootstrap call.  Sanity check that the lazy path is
+        only triggered on miss."""
+        s = _Stub({"a": _profile_a()})
+        s._layer_means = {0: torch.tensor([1.0, 2.0])}
+
+        called: list = []
+
+        def _fail_bootstrap(*args, **kwargs):
+            called.append(args)
+            return {99: torch.tensor([0.0])}
+
+        from saklas.core import session as session_mod
+        monkeypatch.setattr(session_mod, "bootstrap_layer_means", _fail_bootstrap)
+        result = s.layer_means
+        assert set(result.keys()) == {0}
+        assert torch.equal(result[0], torch.tensor([1.0, 2.0]))
+        assert called == [], "bootstrap_layer_means should not run on hit"
+
+    def test_property_lazy_builds_when_empty(self, monkeypatch):
+        """Empty ``self._layer_means`` triggers ``bootstrap_layer_means``
+        on first access; result is cached on subsequent calls."""
+        s = _Stub({"a": _profile_a()})
+        # Stub has _layer_means = {} from _Stub.__init__, plus the
+        # whitener-property override returns None.  Override the
+        # session.py-level whitener property override on the stub so
+        # we can test layer_means in isolation: replace the class
+        # method with the *real* SaklasSession.layer_means property.
+        from saklas.core.session import SaklasSession
+        # The stub doesn't override ``layer_means`` — it inherits the
+        # real property, which is what we want to exercise.
+        # Replace bootstrap_layer_means with a tracker.
+        built = {3: torch.tensor([5.0, 6.0]), 4: torch.tensor([7.0, 8.0])}
+        calls: list = []
+
+        def _spy(*args, **kwargs):
+            calls.append(args)
+            return built
+
+        # Stub doesn't have _model/_tokenizer/_layers, so the property's
+        # try-except will fire and bootstrap_layer_means won't even be
+        # reached — instead the except block warns and returns {}.
+        # Patch *the same module the property imports from* so that
+        # call lookup resolves to our spy without needing the model.
+        from saklas.core import session as session_mod
+
+        # Give the stub the minimal handle attributes the bootstrap call
+        # looks at, so the try-block actually runs.
+        s._model = object()  # type: ignore[attr-defined]
+        s._tokenizer = object()  # type: ignore[attr-defined]
+        s._layers = []  # type: ignore[attr-defined]
+        s._model_info = {}  # type: ignore[attr-defined]
+        monkeypatch.setattr(session_mod, "bootstrap_layer_means", _spy)
+
+        # First access — triggers build.
+        out = SaklasSession.layer_means.fget(s)  # type: ignore[union-attr]
+        assert out is built
+        assert len(calls) == 1
+        # Second access — caches; no second call.
+        out2 = SaklasSession.layer_means.fget(s)  # type: ignore[union-attr]
+        assert out2 is built
+        assert len(calls) == 1
+
+
+class TestComputeDlsMaskEmptyGuard:
+    """``compute_dls_mask`` treats ``layer_means={}`` identically to
+    ``layer_means=None`` — both fall back to keep-all silently.
+
+    Closes the v2.1 path where an empty dict propagated through
+    ``probes=[]`` sessions and walked the per-layer loop without
+    a baseline, hitting "conservative keep" on every layer.  The
+    behavior was technically the same (keep all), but the early-out
+    makes intent explicit.
+    """
+
+    def test_none_keeps_all(self):
+        from saklas.core.vectors import compute_dls_mask
+        mu_pos = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([2.0, 0.0])}
+        mu_neg = {0: torch.tensor([-1.0, 0.0]), 1: torch.tensor([-2.0, 0.0])}
+        directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
+        out = compute_dls_mask(mu_pos, mu_neg, directions, None)
+        assert out == {0, 1}
+
+    def test_empty_dict_keeps_all(self):
+        from saklas.core.vectors import compute_dls_mask
+        mu_pos = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([2.0, 0.0])}
+        mu_neg = {0: torch.tensor([-1.0, 0.0]), 1: torch.tensor([-2.0, 0.0])}
+        directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
+        out = compute_dls_mask(mu_pos, mu_neg, directions, {})
+        assert out == {0, 1}
+
+    def test_partial_layer_means_runs_check(self):
+        """Layers with a baseline get checked; layers without fall
+        through the per-layer ``mu_n is None`` conservative-keep."""
+        from saklas.core.vectors import compute_dls_mask
+        mu_pos = {
+            0: torch.tensor([1.0, 0.0]),  # opposite-signed → kept
+            1: torch.tensor([0.5, 0.0]),  # same-signed (both positive after centering) → drop
+            2: torch.tensor([3.0, 0.0]),  # no baseline → conservative keep
+        }
+        mu_neg = {
+            0: torch.tensor([-1.0, 0.0]),
+            1: torch.tensor([0.3, 0.0]),
+            2: torch.tensor([-3.0, 0.0]),
+        }
+        directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
+        # Baseline = 0 for layers 0+1 but absent for layer 2.
+        layer_means = {0: torch.zeros(2), 1: torch.zeros(2)}
+        out = compute_dls_mask(mu_pos, mu_neg, directions, layer_means)
+        assert out == {0, 2}  # 1 dropped (both leans positive); 2 kept (no baseline)
