@@ -37,7 +37,7 @@ class _Stub(SaklasSession):
         self._steering_override_stack = []
         # Session-level defaults consulted by _resolve_steering_override
         # and _resolve_projection_metric when the LIFO has no overrides.
-        # Mirror the v2.2 SaklasSession defaults so the stub flows through
+        # Mirror the v2.1 SaklasSession defaults so the stub flows through
         # the same code paths the real session uses.
         self._injection_mode = "angular"
         from saklas.core.hooks import DEFAULT_THETA_MAX

@@ -416,7 +416,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
         monkeypatch.setattr(V, "_encode_and_capture_all", self._stub_separable_with_seed(7))
 
         pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(15)]
-        common = dict(layers=[object()] * 6, device=torch.device("cpu"), drop_edges=(0, 0))
+        common = dict(layers=[object()] * 6, device=torch.device("cpu"), dls=False)
 
         # Build whitener with isotropic activations (Σ ≈ I): synthetic
         # neutrals are pure N(0, I).
@@ -460,7 +460,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
 
         pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(20)]
         layers = [object()] * 5
-        common = dict(layers=layers, device=torch.device("cpu"), drop_edges=(0, 0))
+        common = dict(layers=layers, device=torch.device("cpu"), dls=False)
         d = 8
 
         # Anisotropic Σ — axis 0 (the concept axis) has high variance at
@@ -527,7 +527,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
 
         profile, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
-            device=torch.device("cpu"), drop_edges=(0, 0), whitener=w,
+            device=torch.device("cpu"), dls=False, whitener=w,
         )
         # All layers retained, magnitudes positive.
         assert set(profile) == {0, 1, 2, 3}
@@ -549,7 +549,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
 
         profile, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
-            device=torch.device("cpu"), drop_edges=(0, 0), whitener=w,
+            device=torch.device("cpu"), dls=False, whitener=w,
         )
         # All 4 layers in profile; layers 2,3 used Euclidean fallback.
         assert set(profile) == {0, 1, 2, 3}

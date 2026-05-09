@@ -19,7 +19,7 @@ Grammar::
     coeff       := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
     variant     := "raw" | "sae" | "sae-" ID
 
-Probe gates (v2.2): ``@when:<probe><op><threshold>`` fires the term only
+Probe gates (v2.1): ``@when:<probe><op><threshold>`` fires the term only
 on decode steps where the named probe's last reading satisfies the
 comparison.  Implicit ``prompt=False`` (no probe reading during prefill).
 Compose with other windows via the programmatic surface — the v1
@@ -154,7 +154,7 @@ _SINGLE_CHAR_TOKENS = {
 # Comparison-op tokens.  Two-char ops (``>=``, ``<=``) take precedence
 # over the single-char ones; the lexer peeks one char ahead before
 # emitting GT / LT.  ``=`` alone is not a token — equality (``==``) is
-# not part of the gate grammar in v2.2 (probe scores are continuous
+# not part of the gate grammar in v2.1 (probe scores are continuous
 # floats; equality is meaningless).
 _COMPARE_OPS: dict[str, str] = {
     ">=": "GTE", "<=": "LTE",
@@ -374,7 +374,7 @@ class _Parser:
         identifier (with optional ``.<pole>`` for bipolar concepts), one
         of ``>``/``>=``/``<``/``<=``, then a numeric threshold.
 
-        Probe atoms are simple identifiers — no namespace prefix in v2.2
+        Probe atoms are simple identifiers — no namespace prefix in v2.1
         (the monitor is keyed by canonical concept name regardless of
         which pack the probe came from).  No SAE variant suffix
         either: gates fire on the live monitor reading, which is
@@ -686,7 +686,7 @@ def _fmt_ablation(a: AblationTerm) -> str:
 def _trigger_name(trig: Trigger) -> str:
     if trig in _TRIGGER_CANONICAL:
         return _TRIGGER_CANONICAL[trig]
-    # Probe gate (v2.2) — round-trip via the ``when:`` syntax.  Gate-
+    # Probe gate (v2.1) — round-trip via the ``when:`` syntax.  Gate-
     # only triggers (the canonical shape produced by ``Trigger.when``)
     # render as ``when:<probe><op><threshold>``; any other custom
     # trigger (e.g. user-built with ``first_n=`` plus a gate) falls

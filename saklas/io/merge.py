@@ -113,6 +113,30 @@ def _resolve_coord(ns: Optional[str], name: str) -> ConceptFolder:
     return ConceptFolder.load(folder)
 
 
+def _variant_tensor_path(
+    cf: ConceptFolder, sid: str, variant: Optional[str], coord: str,
+) -> Path:
+    """Resolve a per-model tensor path honoring ``:variant`` suffix.
+
+    Pre-v2.1 merge always loaded ``cf.tensor_path(sid)`` regardless of
+    parsed variant, so ``default/foo:pca`` silently picked the raw DiM
+    tensor instead of the PCA one.  ``enumerate_variants`` is the
+    canonical lookup — ``"raw"`` / ``"pca"`` / ``"sae-<release>"`` etc.
+    """
+    from saklas.io.packs import enumerate_variants
+
+    variants = enumerate_variants(cf.folder, sid)
+    key = "raw" if variant in (None, "raw") else variant
+    path = variants.get(key)
+    if path is None:
+        available = sorted(variants) or ["(none)"]
+        raise MergeError(
+            f"component {coord} has no '{key}' tensor for {sid} "
+            f"(available variants: {available})"
+        )
+    return path
+
+
 def _parse_merge_expr(expression: str) -> "list[_MergeTerm]":
     """Parse a merge expression into a list of (ns, name, variant,
     coeff, operator, onto) terms.
@@ -151,12 +175,25 @@ def _parse_merge_expr(expression: str) -> "list[_MergeTerm]":
         onto_ns = onto_name = onto_variant = None
         op = None
         if sel.operator is not None:
-            if sel.operator != "~":
+            # Project-away (orthogonal) is ``|`` per the unified
+            # grammar in saklas.core.steering_expr; ``~`` is the
+            # *aligned* component (Gram-Schmidt onto, not away).
+            # Pre-v2.1 merge accepted ``~`` and treated it as
+            # project-away — silently inverting the user's intent
+            # vs. every other surface.  Now ``|`` is the canonical
+            # form; ``~`` raises with a hint pointing users at the
+            # right operator (and at vector_merge if they actually
+            # wanted the aligned component, which merge can't
+            # currently express because the kept-aligned-only profile
+            # would always have norm < the original).
+            if sel.operator != "|":
                 raise MergeError(
-                    f"merge expressions support only '~' for projection "
-                    f"(got '{sel.operator}'). Use '~' for project-away."
+                    f"merge expressions support only '|' for "
+                    f"project-away (got '{sel.operator}').  Note: pre-"
+                    f"v2.1 merge accepted '~' for the same operation; "
+                    f"the new spelling matches the unified grammar."
                 )
-            op = "~"
+            op = "|"
             onto = sel.onto
             assert onto is not None
             if onto.namespace is None:
@@ -277,17 +314,21 @@ def merge_into_pack(
         profiles_and_alphas: list[tuple[Profile, float]] = []
         for term in terms:
             cf = _resolve_coord(term.ns, term.name)
-            profile, _meta = load_profile(str(cf.tensor_path(sid)))
+            base_path = _variant_tensor_path(cf, sid, term.variant, term.coord)
+            profile, _meta = load_profile(str(base_path))
             if term.operator is not None:
                 assert term.onto_ns is not None and term.onto_name is not None
                 cf_b2 = _resolve_coord(term.onto_ns, term.onto_name)
-                b_profile, _ = load_profile(str(cf_b2.tensor_path(sid)))
+                onto_path = _variant_tensor_path(
+                    cf_b2, sid, term.onto_variant, term.onto_coord or "",
+                )
+                b_profile, _ = load_profile(str(onto_path))
                 profile = project_away(profile, b_profile)
             profiles_and_alphas.append((profile, term.coeff))
             component_info.setdefault(term.coord, {
                 "alpha": term.coeff,
                 "project_away": term.onto_coord,
-                "tensor_sha256": hash_file(cf.tensor_path(sid)),
+                "tensor_sha256": hash_file(base_path),
             })
 
         merged = linear_sum(profiles_and_alphas, strict=strict)

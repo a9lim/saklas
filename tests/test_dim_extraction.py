@@ -81,14 +81,19 @@ class TestDimReturnShape:
         profile, diagnostics = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs, layers=[object()] * 6,
             device=torch.device("cpu"),
-            drop_edges=(0, 0),
+            dls=False,
         )
         assert set(profile.keys()) == set(diagnostics.keys()) == set(range(6))
         for v in profile.values():
             assert v.shape == (4,)
             assert v.dtype == torch.float32
 
-    def test_drop_edges_drops_diagnostics_layers(self, monkeypatch) -> None:
+    def test_dls_keep_set_aligns_diagnostics_with_profile(
+        self, monkeypatch,
+    ) -> None:
+        # v2.1: edge-drop replaced by data-driven DLS.  Without
+        # ``layer_means`` the helper falls back to "keep all layers"
+        # silently — diagnostics and profile cover the same set.
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode_separable)
 
@@ -98,9 +103,9 @@ class TestDimReturnShape:
         profile, diagnostics = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs, layers=[object()] * 8,
             device=torch.device("cpu"),
-            drop_edges=(2, 2),
+            dls=False,
         )
-        assert set(profile.keys()) == set(diagnostics.keys()) == set(range(2, 6))
+        assert set(profile.keys()) == set(diagnostics.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +125,7 @@ class TestDimAgreesWithPca:
         common = dict(
             layers=[object()] * 6,
             device=torch.device("cpu"),
-            drop_edges=(0, 0),
+            dls=False,
         )
 
         torch.manual_seed(0)
@@ -149,7 +154,7 @@ class TestDimAgreesWithPca:
         common = dict(
             layers=[object()] * 6,
             device=torch.device("cpu"),
-            drop_edges=(0, 0),
+            dls=False,
         )
         torch.manual_seed(0)
         pca, _ = V.extract_contrastive(_FakeModel(), _FakeTok(), pairs, **common)
@@ -178,7 +183,7 @@ class TestDimOnNoisyPairs:
 
         profile, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs, layers=[object()] * 5,
-            device=torch.device("cpu"), drop_edges=(0, 0),
+            device=torch.device("cpu"), dls=False,
         )
         # Baked tensors carry share × ref_norm; we don't assert unit
         # norm, but the per-layer magnitude must be > 0 (no degenerate
@@ -213,12 +218,12 @@ class TestDimSaeBranch:
         torch.manual_seed(0)
         raw, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs,
-            layers=layers, device=torch.device("cpu"), drop_edges=(0, 0),
+            layers=layers, device=torch.device("cpu"), dls=False,
         )
         torch.manual_seed(0)
         sae_profile, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs,
-            layers=layers, device=torch.device("cpu"), drop_edges=(0, 0),
+            layers=layers, device=torch.device("cpu"), dls=False,
             sae=sae,
         )
 

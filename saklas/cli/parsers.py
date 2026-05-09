@@ -90,7 +90,7 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
         "--projection-metric", dest="projection_metric",
         choices=["mahalanobis", "euclidean"], default=None,
         help="Metric for runtime ``~`` / ``|`` projection in steering "
-             "expressions.  'mahalanobis' (default since v2.2) uses the "
+             "expressions.  'mahalanobis' (default since v2.1) uses the "
              "closed-form LEACE projector against the per-model whitener "
              "(Belrose et al. 2023) — provably erases linearly-decodable "
              "concept information along ``onto`` from ``base``.  "
@@ -98,14 +98,27 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
              "Unset = inherit YAML / session default.",
     )
     p.add_argument(
+        "--no-dls", dest="no_dls", action="store_true",
+        help="Disable the discriminative-layer-selection mask at "
+             "extraction time.  v2.1 introduced centered DLS (Dang & "
+             "Ngo 2026, Eq. 9) as the default: layers where pos- and "
+             "neg-class means project to the same side of the neutral "
+             "baseline along ``d̂`` are dropped — they encode concept "
+             "intensity rather than concept polarity.  Pass ``--no-dls`` "
+             "to keep every layer (the v2.0–v2.1 behavior, modulo the "
+             "removed ``edge_drop`` heuristic).  Mutually exclusive "
+             "with ``--legacy`` (which already implies ``--no-dls``).",
+    )
+    p.add_argument(
         "--legacy", action="store_true",
         help="v2.0 backcompat preset for steering: equivalent to "
              "``--steer-mode additive`` plus PCA extraction on first-run "
-             "probe bootstrap and Euclidean ``~`` / ``|`` projection "
-             "(instead of v2.2's DiM + Mahalanobis bake + angular + "
-             "LEACE projection).  Useful for A/B-comparing the v2.0 "
-             "stack on the same model.  Mutually exclusive with "
-             "``--steer-mode`` and ``--projection-metric``.",
+             "probe bootstrap, Euclidean ``~`` / ``|`` projection, and "
+             "DLS off (instead of v2.1's DiM + Mahalanobis bake + "
+             "angular + LEACE projection + DLS).  Useful for "
+             "A/B-comparing the pre-v2.1 stack on the same model.  "
+             "Mutually exclusive with ``--steer-mode``, "
+             "``--projection-metric``, and ``--no-dls``.",
     )
 
 
@@ -316,7 +329,7 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--metric", choices=("euclidean", "mahalanobis"), default=None,
         help=(
-            "Cosine metric. 'mahalanobis' (default since v2.2) = whitened "
+            "Cosine metric. 'mahalanobis' (default since v2.1) = whitened "
             "cosine ⟨u,v⟩_M = u^T Σ^{-1} v (Belrose et al. 2023), reads "
             "cached neutral activations + layer means under "
             "~/.saklas/models/<id>/ to build the per-layer whitener; "

@@ -227,6 +227,7 @@ class ExtractionPipeline:
         sae_revision: str | None = None,
         namespace: str | None = None,
         method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
+        dls: bool = True,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit ``VectorExtracted``.
 
@@ -261,6 +262,7 @@ class ExtractionPipeline:
             sae_revision=sae_revision,
             namespace=namespace,
             method=method,
+            dls=dls,
         )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
@@ -286,6 +288,7 @@ class ExtractionPipeline:
         sae_revision: str | None = None,
         namespace: str | None = None,
         method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
+        dls: bool = True,
     ) -> tuple[str, Profile]:
         """Extraction body.  See :meth:`extract` for the wrapper.
 
@@ -359,14 +362,46 @@ class ExtractionPipeline:
         # handle via getattr — keeps the ModelHandle protocol minimal
         # and lets test stubs that don't implement ``.whitener`` fall
         # back to Euclidean.  PCA branch ignores the whitener (it scores
-        # via EVR, not magnitude).
+        # via EVR, not magnitude).  v2.1+: layer_means + dls are
+        # threaded uniformly into both extractors; the centered DLS
+        # check fires when both are present.  Tests / mock stubs that
+        # don't carry layer_means just keep all layers.
         bake_label = "euclidean"
-        extract_kwargs: dict = {"sae": sae_backend, "concept_label": canonical}
-        if method == "dim":
-            handle_whitener = getattr(self._handle, "whitener", None)
-            if handle_whitener is not None:
-                extract_kwargs["whitener"] = handle_whitener
-                bake_label = "mahalanobis"
+        # Eager kwargs — cheap, always known.  The expensive fields
+        # (``layer_means``, ``whitener``) are deferred to
+        # :func:`_resolve_extract_kwargs` so a cache-hit short-circuit
+        # below doesn't trigger ``handle.layer_means`` / ``handle.whitener``
+        # — both can launch a lazy ``bootstrap_layer_means`` /
+        # ``LayerWhitener`` build that runs forward passes through the
+        # model, which is exactly the work the cache hit was supposed
+        # to avoid.  Pre-v2.1 this dict was eager and
+        # ``probes=[]`` sessions paid the neutral build on every
+        # cache-hit ``session.extract`` call.
+        eager_kwargs: dict = {
+            "sae": sae_backend,
+            "concept_label": canonical,
+            "dls": dls,
+        }
+
+        def _resolve_extract_kwargs() -> dict:
+            """Materialize the full extractor kwargs dict on demand.
+
+            Resolves ``layer_means`` and ``whitener`` from the handle
+            — both of which may trigger lazy bootstrap — and mutates
+            the closed-over ``bake_label`` when the whitener loads
+            successfully.  Called at every extractor call site
+            *after* the cache-hit short-circuit so cache hits skip
+            the bootstrap.
+            """
+            nonlocal bake_label
+            out = dict(eager_kwargs)
+            out["layer_means"] = getattr(self._handle, "layer_means", None)
+            if method == "dim":
+                handle_whitener = getattr(self._handle, "whitener", None)
+                if handle_whitener is not None:
+                    out["whitener"] = handle_whitener
+                    bake_label = "mahalanobis"
+            return out
 
         def _build_return(
             profile_dict: dict,
@@ -431,7 +466,7 @@ class ExtractionPipeline:
             pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
             profile, diagnostics = extractor(
                 model, tokenizer, pairs, layers=layers,
-                **extract_kwargs,
+                **_resolve_extract_kwargs(),
             )
             _save_profile(profile, cache_path, _save_meta(diagnostics=diagnostics))
             self._packs._update_local_pack_files(folder)
@@ -496,11 +531,18 @@ class ExtractionPipeline:
             if pack_stmts.exists():
                 _progress(f"Using curated statements for '{canonical}'...")
                 ds = load_contrastive_pairs(str(pack_stmts))
+                # ``**extract_kwargs`` carries ``sae``, ``concept_label``,
+                # ``whitener`` (DiM/Mahalanobis bake), ``dls``, and
+                # ``layer_means`` (DLS centering).  Earlier this site
+                # passed only ``sae`` + ``concept_label`` — silently
+                # dropping whitener and DLS, which made the v2.1
+                # Mahalanobis bake and v2.1 DLS no-ops on bundled
+                # statements paths.  Same fix applied to the local-
+                # statements cache path below (site 3).
                 profile, diagnostics = extractor(
                     model, tokenizer, ds["pairs"],
                     layers=layers,
-                    sae=sae_backend,
-                    concept_label=canonical,
+                    **_resolve_extract_kwargs(),
                 )
                 _save_profile(profile, cache_path, _save_meta(
                     {"statements_sha256": hash_file(pack_stmts)},
@@ -591,14 +633,15 @@ class ExtractionPipeline:
                 f"Try a more specific concept."
             )
 
-        # 5. Extract.
+        # 5. Extract.  See site 2 above for why ``**extract_kwargs`` is
+        # required — without it the v2.1 whitener (Mahalanobis bake)
+        # and DLS keep set both silently fall through.
         _progress(
             f"Extracting {method_label} profile ({len(pairs)} pairs)..."
         )
         profile, diagnostics = extractor(
             model, tokenizer, pairs, layers=layers,
-            sae=sae_backend,
-            concept_label=canonical,
+            **_resolve_extract_kwargs(),
         )
         _save_profile(profile, cache_path, _save_meta(
             {"statements_sha256": hash_file(pathlib.Path(stmt_cache_path))},

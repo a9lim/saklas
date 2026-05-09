@@ -105,6 +105,8 @@ def bootstrap_probes(
     *,
     method: str = "dim",
     whitener: Any = None,
+    layer_means: dict[int, torch.Tensor] | None = None,
+    dls: bool = True,
 ) -> dict[str, dict[int, torch.Tensor]]:
     """Load or extract probe vector profiles for the given categories.
 
@@ -120,6 +122,15 @@ def bootstrap_probes(
     written sidecars carry ``bake: "mahalanobis"``.  ``None`` falls back
     to Euclidean scoring (sidecar ``bake: "euclidean"``).  Whitener has
     no effect on PCA extraction (legacy method, kept on EVR scoring).
+
+    ``layer_means`` is the per-model neutral-baseline mean cache (built
+    by :func:`bootstrap_layer_means` before this call).  Threaded into
+    the extractors for the centered-DLS check.  ``None`` disables DLS
+    centering — the helper falls back to "keep all layers."
+
+    ``dls`` (default ``True``, v2.1+) enables the discriminative-layer
+    selection mask.  Pass ``False`` to extract every layer (the path
+    used by ``--legacy`` and by tests on small mock models).
     """
     from saklas import __version__ as _saklas_version
 
@@ -202,7 +213,8 @@ def bootstrap_probes(
         "difference_of_means" if method == "dim" else "contrastive_pca"
     )
     # Whitener only affects DiM; PCA stays on EVR scoring (legacy path).
-    extract_kwargs: dict[str, Any] = {}
+    # DLS + layer_means flow into both extractors uniformly.
+    extract_kwargs: dict[str, Any] = {"dls": dls, "layer_means": layer_means}
     bake_label = "euclidean"
     if method == "dim" and whitener is not None:
         extract_kwargs["whitener"] = whitener

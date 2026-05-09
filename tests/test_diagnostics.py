@@ -119,7 +119,7 @@ class TestExtractContrastiveReturnsTuple:
         profile, diagnostics = V.extract_contrastive(
             _FakeModel(), _FakeTok(), pairs, layers=[object()] * 6,
             device=torch.device("cpu"),
-            drop_edges=(0, 0),
+            dls=False,
         )
 
         # Diagnostics layer set matches the profile layer set exactly so
@@ -136,18 +136,30 @@ class TestExtractContrastiveReturnsTuple:
                 "diff_principal_projection",
             } <= set(metrics.keys())
 
-    def test_drop_edges_drops_diagnostics_layers(self, monkeypatch) -> None:
+    def test_dls_keep_set_aligns_diagnostics_with_profile(
+        self, monkeypatch,
+    ) -> None:
+        # v2.1: edge-drop is gone.  When DLS runs (centered against
+        # provided layer_means) the diagnostics dict and profile dict
+        # must share the same key set so consumers can index without
+        # branching on missing entries.  Since the synthetic _stub_encode
+        # data is symmetric and the test layer_means is zero, the
+        # discriminative check fails on every layer and DLS's "all
+        # failed → keep all" fallback fires; both dicts cover all 8.
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode)
 
         pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
-        profile, diagnostics = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 8,
-            device=torch.device("cpu"),
-            drop_edges=(2, 2),
-        )
-
-        assert set(profile.keys()) == set(diagnostics.keys()) == set(range(2, 6))
+        # Empty layer_means disables DLS centering (helper returns all
+        # layers); explicit dls=False keeps every layer regardless.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            profile, diagnostics = V.extract_contrastive(
+                _FakeModel(), _FakeTok(), pairs, layers=[object()] * 8,
+                device=torch.device("cpu"),
+                dls=False,
+            )
+        assert set(profile.keys()) == set(diagnostics.keys())
 
 
 class TestSoftWarning:
@@ -169,7 +181,7 @@ class TestSoftWarning:
             V.extract_contrastive(
                 _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
                 device=torch.device("cpu"),
-                drop_edges=(0, 0),
+                dls=False,
                 concept_label="probe-test",
             )
 
@@ -187,7 +199,7 @@ class TestSoftWarning:
             V.extract_contrastive(
                 _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
                 device=torch.device("cpu"),
-                drop_edges=(0, 0),
+                dls=False,
                 concept_label="clean-probe",
             )
 

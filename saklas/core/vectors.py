@@ -430,26 +430,127 @@ def _emit_diagnostics_warning(
         )
 
 
-def _validate_drop_edges(
-    drop_edges: tuple[int, int], n_layers: int,
+def compute_dls_mask(
+    mu_pos: dict[int, torch.Tensor],
+    mu_neg: dict[int, torch.Tensor],
+    directions: dict[int, torch.Tensor],
+    layer_means: dict[int, torch.Tensor] | None,
 ) -> set[int]:
-    """Validate ``drop_edges`` against ``n_layers`` and return the dropped indices.
+    """Discriminative-Layer-Selection (Dang & Ngo 2026, Eq. 9) keep set.
 
-    Shared by every extractor — the validation rules don't depend on which
-    method computes the per-layer direction.  ``n_layers`` is the model's
-    full layer count; the returned set always lives in ``[0, n_layers)``.
+    Returns the set of layer indices that pass the centered-DLS check::
+
+        μ̃_pos = (μ_pos − μ_neutral) · d̂
+        μ̃_neg = (μ_neg − μ_neutral) · d̂
+        keep iff μ̃_pos · μ̃_neg < 0
+
+    Layers where both pos- and neg-class means project to the same side of
+    the neutral baseline along ``d̂`` are non-discriminative — they encode
+    something correlated with concept *intensity* but not concept
+    *polarity*, and steering through them rotates a residual that's
+    already aligned with the same pole as the neutral baseline (i.e.
+    they don't carry the contrast).  Dropping them concentrates share
+    on layers that genuinely encode the pos/neg axis.
+
+    **Centering** is required.  Without subtracting ``μ_neutral`` raw
+    activations all project positively along ``d̂`` at most layers
+    because of shared base-rate variance, and the sign-of-projection
+    test fires near-uniformly across layers (verified empirically: the
+    literal-paper uncentered version on gemma-4-e4b-it / angry.calm
+    keeps 17/42 in fragmented patterns vs. centered 31/42 in the
+    expected mid-stack band).  When ``layer_means`` is ``None``,
+    centering is undefined and the helper returns *all* layers — DLS
+    is disabled silently and the caller falls back to "keep
+    everything."  Real session-driven extraction always passes
+    ``layer_means`` (built before extraction during ``bootstrap_probes``);
+    fixture / mock paths skip it.
+
+    Args:
+        mu_pos: per-layer mean of positive-class final-content-token
+            hidden states, fp32, shape ``[D]`` per layer.
+        mu_neg: same for the negative class.  Must cover the same layer
+            set as ``mu_pos``.
+        directions: per-layer unsigned direction vectors (typically
+            ``unit(μ_pos − μ_neg)`` for DiM, or the principal component
+            for PCA).  Same layer set as ``mu_pos``.  Magnitude doesn't
+            matter — only sign of projection — but unit-normed input
+            is recommended for numerical sanity.
+        layer_means: per-layer neutral baseline (90-prompt mean, cached
+            under ``~/.saklas/models/<id>/layer_means.safetensors``).
+            ``None`` disables DLS (returns all layers).
+
+    Returns:
+        ``set[int]`` of layers that pass the discriminative check.  Empty
+        set is *not* returned — if every layer fails, returns the full
+        layer set with a warning, on the principle that something is
+        better than nothing for a degenerate concept (the caller's
+        downstream extractor diagnostics will already flag the probe
+        quality).
     """
-    n_drop_lo, n_drop_hi = drop_edges
-    if n_drop_lo < 0 or n_drop_hi < 0:
-        raise ValueError(f"drop_edges must be non-negative, got {drop_edges}")
-    if n_drop_lo + n_drop_hi >= n_layers:
-        raise ValueError(
-            f"drop_edges={drop_edges} would leave no retained layers "
-            f"(n_layers={n_layers})"
+    # Empty-dict is treated identically to ``None`` — both mean "no
+    # baseline available, fall back to keep-all silently."  Without
+    # the explicit early-out, every layer in the loop would hit
+    # ``mu_n = layer_means.get(L) → None`` and fall through the
+    # conservative-keep branch, which produces the same observable
+    # result but routes through confusing per-layer logic.  This
+    # guard also catches the v2.1 footgun where ``probes=[]``
+    # sessions had ``self._layer_means = {}`` propagate to the
+    # helper, silently disabling DLS even when neutrals were
+    # cacheable — fixed at the session layer via the lazy
+    # ``layer_means`` property, but the helper-level guard is cheap
+    # insurance against future leak paths.
+    if layer_means is None or not layer_means:
+        return set(mu_pos)
+    keep: set[int] = set()
+    # ``checkable`` is the set of layers we *attempted* the
+    # discriminative test on — i.e. layers with a valid direction.
+    # Layers explicitly skipped for missing direction or zero-norm
+    # direction are excluded from the all-failed fallback (they're
+    # degenerate by construction; re-including them via the fallback
+    # would silently undo the skip).
+    checkable: set[int] = set()
+    for L in mu_pos:
+        d = directions.get(L)
+        if d is None:
+            continue
+        d32 = d.to(dtype=torch.float32, device="cpu").reshape(-1)
+        d_norm = float(d32.norm())
+        if d_norm < 1e-12:
+            continue  # degenerate direction — drop, do not include in fallback
+        checkable.add(L)
+        mu_n = layer_means.get(L)
+        if mu_n is None:
+            # Layer-means doesn't cover this layer.  Conservative: keep —
+            # we'd rather over-include than mistakenly drop a real
+            # discriminative layer due to missing baseline data.
+            keep.add(L)
+            continue
+        d_hat = d32 / d_norm
+        mu_n_cpu = mu_n.to(dtype=torch.float32, device="cpu").reshape(-1)
+        mu_p_cpu = mu_pos[L].to(dtype=torch.float32, device="cpu").reshape(-1)
+        mu_g_cpu = mu_neg[L].to(dtype=torch.float32, device="cpu").reshape(-1)
+        proj_pos = float(((mu_p_cpu - mu_n_cpu) * d_hat).sum())
+        proj_neg = float(((mu_g_cpu - mu_n_cpu) * d_hat).sum())
+        if proj_pos * proj_neg < 0.0:
+            keep.add(L)
+    if not keep:
+        # All checkable layers failed the discriminative check.  Probe
+        # is degenerate on this model (the diagnostics warning will
+        # fire separately).  Keep the *checkable* set rather than every
+        # layer in ``mu_pos`` — re-including layers explicitly skipped
+        # for missing/zero-norm directions would silently undo the
+        # skip.  When no layers are checkable at all (caller passed
+        # all-degenerate directions) the fallback returns an empty
+        # set; the share-bake step's all-zero handler kicks in.
+        warnings.warn(
+            "DLS: no layers pass the discriminative check; falling back "
+            "to keep-all-checkable.  Probe likely degenerate on this "
+            "model — review the diagnostics warning above.",
+            UserWarning,
+            stacklevel=3,
         )
-    return set(range(n_drop_lo)) | set(
-        range(n_layers - n_drop_hi, n_layers)
-    )
+        return checkable
+    return keep
 
 
 def _capture_diffs_for_pairs(
@@ -467,23 +568,37 @@ def _capture_diffs_for_pairs(
     dict[int, list[torch.Tensor]],
     list[float],
     set[int] | None,
+    dict[int, torch.Tensor],
+    dict[int, torch.Tensor],
 ]:
     """Run the contrastive forward-pass capture loop.
 
     Shared by the PCA and DiM extractors — both consume the same set of
-    per-layer diffs, raw activation norm sums, and (when an SAE is wired)
-    per-layer pos/neg activation stacks.  Only the post-capture per-layer
-    direction computation differs between methods.
+    per-layer diffs, raw activation norm sums, per-layer pos/neg means
+    (for centered DLS), and (when an SAE is wired) per-layer pos/neg
+    activation stacks.  Only the post-capture per-layer direction
+    computation differs between methods.
 
     SAE coverage is enforced here so callers don't repeat the check; an
     empty intersection raises :class:`SaeCoverageError` before the forward
     loop burns time.
 
+    Per-layer pos/neg running sums are tracked at O(D) per layer
+    regardless of N_pairs (cheap; no per-pair tensor list to manage)
+    and converted to means on return.  These feed
+    :func:`compute_dls_mask` for the discriminative-layer check; SAE
+    paths get the per-pair pos/neg stacks too via ``pos_per_layer`` /
+    ``neg_per_layer`` so feature-space encoding doesn't need a second
+    pass.
+
     Returns:
         ``(n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
-        norm_sums_cpu, sae_layer_set)``.  ``pos_per_layer`` and
-        ``neg_per_layer`` are empty dicts when ``sae is None``.
-        ``sae_layer_set`` is ``None`` when ``sae is None``.
+        norm_sums_cpu, sae_layer_set, mean_pos_per_layer,
+        mean_neg_per_layer)``.  ``pos_per_layer`` and ``neg_per_layer``
+        are empty dicts when ``sae is None``.  ``sae_layer_set`` is
+        ``None`` when ``sae is None``.  ``mean_pos_per_layer`` and
+        ``mean_neg_per_layer`` always cover every layer in ``[0,
+        n_layers)`` in fp32 on CPU.
     """
     n_layers = len(layers)
 
@@ -516,6 +631,13 @@ def _capture_diffs_for_pairs(
     neg_per_layer: dict[int, list[torch.Tensor]] = (
         {i: [] for i in sae_layer_set} if sae_layer_set is not None else {}
     )
+    # Per-layer pos/neg running sums for centered DLS.  fp32 on CPU
+    # throughout — adds N_pairs * D per pair to the sum, where N_pairs
+    # at the bundled n=45 is well within fp32 precision for any
+    # reasonable D.  None initially; first pair seeds, subsequent pairs
+    # accumulate in place.
+    sum_pos: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
+    sum_neg: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
     norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
 
     # On MPS, keep diffs on CPU — SVD runs there anyway, and the
@@ -532,6 +654,20 @@ def _capture_diffs_for_pairs(
             p_d = p.to(diff_device)
             n_d = n.to(diff_device)
             diffs_per_layer[idx].append(p_d - n_d)
+            # Centered-DLS prep: running fp32 sums on CPU.  Per-layer
+            # cost: one float-cast + one in-place add per pair, vs. the
+            # diff path's stack-then-svd which dominates anyway.
+            p_cpu = p_d.to(dtype=torch.float32, device="cpu")
+            n_cpu = n_d.to(dtype=torch.float32, device="cpu")
+            sp = sum_pos[idx]
+            if sp is None:
+                sum_pos[idx] = p_cpu.clone()
+                sum_neg[idx] = n_cpu.clone()
+            else:
+                sp += p_cpu
+                neg_acc = sum_neg[idx]
+                assert neg_acc is not None
+                neg_acc += n_cpu
             if sae_layer_set is not None and idx in sae_layer_set:
                 # fp32 matches the diff dtype discipline; avoids fp16 overflow.
                 pos_per_layer[idx].append(p_d.float())
@@ -544,6 +680,17 @@ def _capture_diffs_for_pairs(
 
     norm_sums_cpu = norm_sums.tolist()
 
+    n_pairs = len(pairs)
+    mean_pos_per_layer: dict[int, torch.Tensor] = {}
+    mean_neg_per_layer: dict[int, torch.Tensor] = {}
+    if n_pairs > 0:
+        for idx in range(n_layers):
+            sp = sum_pos[idx]
+            sn = sum_neg[idx]
+            if sp is not None and sn is not None:
+                mean_pos_per_layer[idx] = sp / float(n_pairs)
+                mean_neg_per_layer[idx] = sn / float(n_pairs)
+
     return (
         n_layers,
         diffs_per_layer,
@@ -551,26 +698,38 @@ def _capture_diffs_for_pairs(
         neg_per_layer,
         norm_sums_cpu,
         sae_layer_set,
+        mean_pos_per_layer,
+        mean_neg_per_layer,
     )
 
 
 def _share_bake_and_warn(
     raw: dict[int, tuple[torch.Tensor, float]],
     diagnostics_per_layer: dict[int, dict[str, float]],
-    edge_idx: set[int],
+    keep_set: set[int] | None,
     *,
     concept_label: str | None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
-    """Apply edge-drop + share-baking + emit the diagnostics warning.
+    """Apply layer mask + share-baking + emit the diagnostics warning.
 
     Both extractors close on this — the math is identical regardless of
     whether the per-layer directions came from PCA SVD or from the
-    mean-of-diffs.  Mutates ``raw`` and ``diagnostics_per_layer`` in place
-    (drops dropped-edge layers).
+    mean-of-diffs.  Mutates ``raw`` and ``diagnostics_per_layer`` in
+    place by removing layers not in ``keep_set``.
+
+    ``keep_set=None`` means "keep every layer in ``raw``" (no DLS) — the
+    fast path for tests / mock paths that bypass the discriminative
+    check entirely.  When provided, layers absent from ``keep_set`` are
+    dropped from both ``raw`` and ``diagnostics_per_layer`` before
+    share-baking.  The dropped-layer indices are simply absent from the
+    returned profile dict; downstream hook attachment iterates the
+    keys.
     """
-    for i in edge_idx:
-        raw.pop(i, None)
-        diagnostics_per_layer.pop(i, None)
+    if keep_set is not None:
+        drop = [i for i in raw if i not in keep_set]
+        for i in drop:
+            raw.pop(i, None)
+            diagnostics_per_layer.pop(i, None)
 
     # Bake shares into the stored tensors. Total share is 1.0 across retained
     # layers, so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
@@ -599,8 +758,9 @@ def extract_contrastive(
     device=None,
     *,
     sae: "SaeBackend | None" = None,
-    drop_edges: tuple[int, int] = (2, 2),
     concept_label: str | None = None,
+    dls: bool = True,
+    layer_means: dict[int, torch.Tensor] | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Contrastive direction extraction via PCA across all layers.
 
@@ -625,28 +785,36 @@ def extract_contrastive(
     diagnostics machinery — only the per-layer direction computation
     differs.
 
+    **DLS replaces edge-drop in v2.1.**  The `drop_edges` parameter is
+    gone; the layer mask is now derived from the data itself via
+    :func:`compute_dls_mask` (centered Selective-Steering, Dang & Ngo
+    2026).  Layers where both pos- and neg-class means project to the
+    same side of the neutral baseline along ``d̂`` are dropped — they
+    encode concept *intensity* rather than concept *polarity* and
+    inflate share without aiding discrimination.  Empirical incidence
+    (gemma-4-e4b-it / angry.calm: 11/42 dropped; Qwen3.6-27B / same:
+    13/64 dropped, mostly contiguous L49–L60).  Dropped layers are
+    simply absent from the returned profile dict.
+
     Args:
         pairs: List of {"positive": str, "negative": str} prompt pairs.
         sae: Optional SAE backend. When provided, extraction runs a
             feature-space ``pca_center`` branch restricted to the layers
             covered by the SAE, and decodes the principal feature-space
             direction back into model space before baking shares.
-        drop_edges: ``(n_lo, n_hi)`` — exclude the first ``n_lo`` and last
-            ``n_hi`` model layers from the share distribution. Early layers
-            carry tokenization / lexical features; late layers are strongly
-            aligned with the unembedding head. Steering at either end tends
-            to corrupt surface form rather than latent meaning — on some
-            architectures (e.g. ministral-3, loaded via
-            :func:`_load_text_from_multimodal`) L0 PCA share inflates to
-            3–4× the model median, which produces immediate grammar collapse
-            at otherwise-coherent α. Dropping the edges suppresses the
-            pathology uniformly; the remaining share budget redistributes
-            over retained layers automatically. Default ``(2, 2)``; pass
-            ``(0, 0)`` to recover pre-fix behavior (useful for tests on
-            small mock models and for A/B comparisons).
         concept_label: Optional human-readable name surfaced in the
             soft-warning text when diagnostics flag a degenerate probe.
             Defaults to a generic label.
+        dls: When ``True`` (default since v2.1), apply the centered
+            DLS mask via :func:`compute_dls_mask`.  When ``False``,
+            keep every layer — the path tests use for small mock models
+            (DLS on synthetic 4-layer data is degenerate).
+        layer_means: Per-layer neutral baseline (``{layer: [D] fp32}``)
+            used by DLS centering.  Real session-driven extraction always
+            passes this from ``self._layer_means``; ``None`` falls back
+            to "keep all layers" silently (with a warning logged from
+            ``compute_dls_mask`` when DLS is enabled but layer_means is
+            missing).
 
     Returns:
         ``(profile, diagnostics)``:
@@ -663,10 +831,9 @@ def extract_contrastive(
     if device is None:
         device = next(model.parameters()).device
 
-    edge_idx = _validate_drop_edges(drop_edges, len(layers))
-
     (n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
-     norm_sums_cpu, sae_layer_set) = _capture_diffs_for_pairs(
+     norm_sums_cpu, sae_layer_set,
+     mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
         model, tokenizer, pairs, layers, device, sae=sae,
     )
 
@@ -729,8 +896,28 @@ def extract_contrastive(
         raw: dict[int, tuple[torch.Tensor, float]] = {
             idx: (directions[idx], evr) for idx, evr in zip(sae_layers, evrs)
         }
+        # SAE-path DLS: feature-space directions decoded back to model
+        # space; centered DLS check uses the *decoded* direction against
+        # the same neutral baseline.  Unit-norm the decoded vector for
+        # the projection check (magnitude carries no sign information).
+        sae_directions_unit = {
+            idx: directions[idx] / max(float(directions[idx].norm()), 1e-12)
+            for idx in sae_layers
+        }
+        sae_pos_means = {
+            idx: torch.stack(pos_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        sae_neg_means = {
+            idx: torch.stack(neg_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        keep_set = compute_dls_mask(
+            sae_pos_means, sae_neg_means, sae_directions_unit,
+            layer_means,
+        ) if dls else None
         return _share_bake_and_warn(
-            raw, diagnostics_per_layer, edge_idx,
+            raw, diagnostics_per_layer, keep_set,
             concept_label=concept_label,
         )
 
@@ -804,8 +991,25 @@ def extract_contrastive(
                 scores_cpu[idx],
             )
 
+    # Centered-DLS mask.  PCA's per-layer principal components feed the
+    # discriminative check; layer means come from the session's cached
+    # neutrals.  ``dls=False`` skips the mask entirely (tests on small
+    # mock models where the synthetic data is too small for the
+    # discriminative test to be meaningful).
+    if dls:
+        # Build the unit-normed direction dict from raw (the share-bake
+        # multiplies by score; we want the direction shape only).
+        unit_dirs = {
+            idx: tup[0] / max(float(tup[0].norm()), 1e-12)
+            for idx, tup in raw.items()
+        }
+        keep_set = compute_dls_mask(
+            mean_pos_per_layer, mean_neg_per_layer, unit_dirs, layer_means,
+        )
+    else:
+        keep_set = None
     return _share_bake_and_warn(
-        raw, diagnostics_per_layer, edge_idx, concept_label=concept_label,
+        raw, diagnostics_per_layer, keep_set, concept_label=concept_label,
     )
 
 
@@ -817,9 +1021,10 @@ def extract_difference_of_means(
     device=None,
     *,
     sae: "SaeBackend | None" = None,
-    drop_edges: tuple[int, int] = (2, 2),
     concept_label: str | None = None,
     whitener: "Any | None" = None,
+    dls: bool = True,
+    layer_means: dict[int, torch.Tensor] | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Contrastive direction extraction via **difference of means** (DiM).
 
@@ -875,14 +1080,18 @@ def extract_difference_of_means(
     (or ``None`` for the Euclidean fallback).  Layers absent from the
     whitener fall back to Euclidean per-layer — the whitener may
     legitimately cover a subset of layers in edge cases.
+
+    **DLS replaces edge-drop in v2.1.**  The ``drop_edges`` parameter
+    is gone; layer selection is data-driven via :func:`compute_dls_mask`.
+    Pass ``dls=False`` to skip the mask (tests / mock paths).  See
+    :func:`extract_contrastive` for the rationale.
     """
     if device is None:
         device = next(model.parameters()).device
 
-    edge_idx = _validate_drop_edges(drop_edges, len(layers))
-
     (n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
-     norm_sums_cpu, sae_layer_set) = _capture_diffs_for_pairs(
+     norm_sums_cpu, sae_layer_set,
+     mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
         model, tokenizer, pairs, layers, device, sae=sae,
     )
 
@@ -948,8 +1157,27 @@ def extract_difference_of_means(
             idx: (directions[idx], score)
             for idx, score in zip(sae_layers, scores)
         }
+        # Centered DLS on the SAE-decoded directions, restricted to
+        # SAE-covered layers (the means the helper consumes are also
+        # restricted there — feature-space encoding only touched those).
+        sae_directions_unit = {
+            idx: directions[idx] / max(float(directions[idx].norm()), 1e-12)
+            for idx in sae_layers
+        }
+        sae_pos_means = {
+            idx: torch.stack(pos_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        sae_neg_means = {
+            idx: torch.stack(neg_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        keep_set = compute_dls_mask(
+            sae_pos_means, sae_neg_means, sae_directions_unit,
+            layer_means,
+        ) if dls else None
         return _share_bake_and_warn(
-            raw, diagnostics_per_layer, edge_idx,
+            raw, diagnostics_per_layer, keep_set,
             concept_label=concept_label,
         )
 
@@ -1035,8 +1263,29 @@ def extract_difference_of_means(
                 scores_cpu[idx],
             )
 
+    # Centered-DLS mask via the per-layer mean-of-diffs direction.
+    # ``mean_pos - mean_neg`` is exactly the DiM direction (linearity of
+    # expectation), so the projection check works directly on the
+    # CPU-side means without re-computing.  Unit-norm so the projection
+    # check stays scale-invariant.
+    if dls:
+        unit_dirs: dict[int, torch.Tensor] = {}
+        for idx in range(n_layers):
+            mp = mean_pos_per_layer.get(idx)
+            mn = mean_neg_per_layer.get(idx)
+            if mp is None or mn is None:
+                continue
+            d = mp - mn
+            d_n = float(d.norm())
+            if d_n > 1e-12:
+                unit_dirs[idx] = d / d_n
+        keep_set = compute_dls_mask(
+            mean_pos_per_layer, mean_neg_per_layer, unit_dirs, layer_means,
+        )
+    else:
+        keep_set = None
     return _share_bake_and_warn(
-        raw, diagnostics_per_layer, edge_idx, concept_label=concept_label,
+        raw, diagnostics_per_layer, keep_set, concept_label=concept_label,
     )
 
 

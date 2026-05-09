@@ -131,7 +131,11 @@ def _fake_extract(monkeypatch, *, response=None):
     captured: dict = {}
 
     def _make(label):
-        def _fake(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
+        def _fake(model, tokenizer, pairs, layers, device=None, *,
+                  sae=None, concept_label=None, **_kwargs):
+            # ``**_kwargs`` swallows ``dls`` / ``layer_means`` /
+            # ``whitener`` (added in v2.1) — the fake doesn't model
+            # any of them, just records what the pipeline asked for.
             captured["pairs"] = pairs
             captured["sae"] = sae
             captured["concept_label"] = concept_label

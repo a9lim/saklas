@@ -457,7 +457,7 @@ def _mock_profile(agg_fn, pl_fn):
     class MockProfile:
         def cosine_similarity(self, other, *, per_layer=False, whitener=None):
             # ``whitener`` is accepted (forwarded by ``_run_compare`` after
-            # the v2.2 ``--metric mahalanobis`` wiring) but ignored here —
+            # the v2.1 ``--metric mahalanobis`` wiring) but ignored here —
             # the mocks return a fixed scalar that doesn't depend on the
             # metric.  Tests that need to exercise the Mahalanobis path
             # use ``test_mahalanobis.py`` against real Profile + tensors.
@@ -516,7 +516,7 @@ def test_run_compare_one_arg_verbose_text(monkeypatch, tmp_path, capsys):
     invalidate()
 
     # ``--metric euclidean`` keeps the mock-driven test runner-focused —
-    # the v2.2 default flipped to ``mahalanobis``, which would try to
+    # the v2.1 default flipped to ``mahalanobis``, which would try to
     # load a real whitener from disk and fail under the mocked Profile.
     cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v",
               "--metric", "euclidean"])

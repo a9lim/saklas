@@ -61,7 +61,7 @@ class _Stub(SaklasSession):
         self._theta_max = (
             DEFAULT_THETA_MAX if theta_max is None else float(theta_max)
         )
-        # v2.2 default — see ``SaklasSession.__init__``.
+        # v2.1 default — see ``SaklasSession.__init__``.
         self._projection_metric = projection_metric
         self._whitener = None
         self._layer_means = {}

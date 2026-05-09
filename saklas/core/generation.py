@@ -470,7 +470,7 @@ def generate_steered(
     Sets ``state.finish_reason`` on exit: "stop" (EOS/external), "length"
     (max tokens), "stop_sequence" (stop string matched).
 
-    ``score_callback`` enables probe-gated triggers (v2.2): when set,
+    ``score_callback`` enables probe-gated triggers (v2.1): when set,
     it's invoked after every forward pass and the returned
     ``dict[str, float]`` is written to ``trigger_ctx.probe_scores``
     so the next iteration's gates see fresh monitor readings.  Pay
@@ -599,7 +599,7 @@ def generate_steered(
                 )
                 prefill = False
 
-                # Probe-gate scoring (v2.2): after the forward (so
+                # Probe-gate scoring (v2.1): after the forward (so
                 # ``HiddenCapture`` is freshly populated), refresh
                 # ``trigger_ctx.probe_scores`` so the *next* iteration's
                 # gates see last-step readings.  ``score_callback`` is

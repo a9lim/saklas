@@ -75,7 +75,7 @@ class Steering:
         materializing ``~`` / ``|`` projection terms.  ``"mahalanobis"``
         uses the closed-form LEACE projector against the session's
         :class:`~saklas.core.mahalanobis.LayerWhitener` (default since
-        v2.2 — provably erases linearly-decodable information along
+        v2.1 — provably erases linearly-decodable information along
         ``onto`` from ``base``).  ``"euclidean"`` is plain Gram-Schmidt
         (the v2.0/v2.1 behavior).  ``None`` (default) inherits the
         session-level setting.  Programmatic only — the canonical

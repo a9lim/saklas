@@ -305,6 +305,7 @@ class _SteeringContext:
     __slots__ = (
         "_session", "_entries", "_entered",
         "_injection_mode", "_theta_max", "_projection_metric",
+        "_synthetic_snapshots",
     )
 
     def __init__(
@@ -315,6 +316,7 @@ class _SteeringContext:
         injection_mode: str | None = None,
         theta_max: float | None = None,
         projection_metric: str | None = None,
+        synthetic_snapshots: dict[str, "object"] | None = None,
     ) -> None:
         self._session = session
         self._entries = entries
@@ -322,6 +324,15 @@ class _SteeringContext:
         self._injection_mode = injection_mode
         self._theta_max = theta_max
         self._projection_metric = projection_metric
+        # Pre-materialize snapshots of any synthetic-projection keys
+        # this scope wrote to ``session._profiles`` — value is the prior
+        # binding (or :data:`_PROFILE_ABSENT` when the key was unset).
+        # Restored on ``__exit__`` so nested scopes that re-materialize
+        # the same ``a|b`` synthetic key with a different metric don't
+        # leak the inner tensor back into the outer scope's hooks.
+        self._synthetic_snapshots: dict[str, object] = (
+            dict(synthetic_snapshots) if synthetic_snapshots else {}
+        )
 
     def __enter__(self) -> "_SteeringContext":
         # _push_steering rolls its own stack entry back if _rebuild_steering_hooks
@@ -341,6 +352,28 @@ class _SteeringContext:
         if self._entered:
             self._session._pop_steering()
             self._entered = False
+        # Restore any pre-existing values for synthetic-projection
+        # keys this scope clobbered.  Runs even if ``_pop_steering``
+        # raised — best-effort cleanup keeps the registry consistent
+        # across nested scope unwinding.  Out of __exit__'s exception
+        # path on purpose: registry mutation should not swallow user
+        # errors raised during the steered block.
+        snapshots = self._synthetic_snapshots
+        if snapshots:
+            profiles = self._session._profiles
+            for key, prev in snapshots.items():
+                if prev is _PROFILE_ABSENT:
+                    profiles.pop(key, None)
+                else:
+                    profiles[key] = prev  # type: ignore[assignment]
+            self._synthetic_snapshots = {}
+
+
+# Sentinel for ``_SteeringContext._synthetic_snapshots`` entries —
+# distinguishes "key was previously absent" from "key was previously
+# bound to None" (the latter shouldn't happen in practice but the
+# distinction keeps restore semantics unambiguous).
+_PROFILE_ABSENT = object()
 
 
 class SaklasSession:
@@ -366,6 +399,7 @@ class SaklasSession:
         theta_max: float | None = None,
         extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
+        dls: bool = True,
     ) -> "SaklasSession":
         """Load a HF model + tokenizer and return a fully initialized session.
 
@@ -380,10 +414,17 @@ class SaklasSession:
         i.e. α=1 fully aligns the residual with the concept direction).
         ``projection_metric`` selects the metric used when materializing
         ``~`` / ``|`` projection terms in steering expressions:
-        ``"mahalanobis"`` (default since v2.2) uses the closed-form
+        ``"mahalanobis"`` (default since v2.1) uses the closed-form
         LEACE projector against the per-model whitener — provably erases
         linearly-decodable information along ``onto`` from ``base``;
         ``"euclidean"`` is plain Gram-Schmidt (the v2.0/v2.1 behavior).
+
+        ``dls`` toggles the discriminative-layer-selection mask at
+        extraction time (v2.1+).  When ``True`` (default), centered DLS
+        per Dang & Ngo (2026) Eq. 9 drops layers where pos- and
+        neg-class means project to the same side of the neutral
+        baseline along ``d̂``.  Replaces the v2.0–v2.1 ``edge_drop``
+        heuristic (gone in v2.1); ``--legacy`` flips this to ``False``.
         """
         model, tokenizer = load_model(model_id, quantize=quantize, device=device, dtype=dtype)
         return cls(
@@ -395,6 +436,7 @@ class SaklasSession:
             theta_max=theta_max,
             extraction_method=extraction_method,
             projection_metric=projection_metric,
+            dls=dls,
         )
 
     def __init__(
@@ -409,6 +451,7 @@ class SaklasSession:
         theta_max: float | None = None,
         extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
+        dls: bool = True,
     ):
         self._model = model
         self._tokenizer = tokenizer
@@ -447,7 +490,7 @@ class SaklasSession:
                 f"got {projection_metric!r}"
             )
         # Default for runtime ``~`` / ``|`` projection.  Mahalanobis is
-        # default since v2.2: per-layer ``project_profile`` calls receive
+        # default since v2.1: per-layer ``project_profile`` calls receive
         # ``self.whitener`` so projection erases linearly-decodable
         # concept information along ``onto`` (closed-form LEACE per
         # Belrose et al. 2023).  ``"euclidean"`` keeps the v2.0/v2.1
@@ -557,6 +600,10 @@ class SaklasSession:
                 f"got {extraction_method!r}"
             )
         self._extraction_method: str = extraction_method
+        # v2.1+: DLS toggle stored on the session so ad-hoc
+        # ``session.extract`` calls (via ``ExtractionPipeline``) inherit
+        # it without re-passing.  ``--legacy`` sets this to False.
+        self._dls: bool = bool(dls)
 
         probe_profiles: dict[str, dict] = {}
         if probe_categories:
@@ -565,6 +612,8 @@ class SaklasSession:
                 probe_categories,
                 method=extraction_method,
                 whitener=self._whitener if extraction_method == "dim" else None,
+                layer_means=self._layer_means,
+                dls=self._dls,
             )
 
         self._monitor = TraitMonitor(probe_profiles, self._layer_means)
@@ -708,6 +757,44 @@ class SaklasSession:
                 self._trait_queues.remove((loop, q))
             except ValueError:
                 pass
+
+    # -- Neutral baseline (v2.1) --
+
+    @property
+    def layer_means(self) -> dict[int, torch.Tensor]:
+        """Per-layer neutral baseline means, built lazily on first access.
+
+        Sessions instantiated with ``probes=[]`` skip the eager
+        :func:`bootstrap_layer_means` call to keep init cheap.  Callers
+        that later need the means — DLS centering at extraction time,
+        the Mahalanobis whitener, the trait monitor — hit this
+        property, which triggers the bootstrap once and caches the
+        result on ``self._layer_means``.  Disk-cached when the
+        ``neutral_statements.json`` hash matches the on-disk
+        ``layer_means.safetensors``; recomputes otherwise.
+
+        Returns ``{}`` only if the bootstrap path itself fails (model
+        not loaded, missing neutrals pack, etc.) — DLS / whitener
+        callers fall back to no-baseline behavior in that case.
+
+        v2.1 fix-up: previously DLS extraction read ``self._layer_means``
+        directly, which left ``probes=[]`` sessions with an empty dict
+        and silently disabled DLS (every layer fell through the
+        "missing baseline" conservative-keep branch in
+        :func:`compute_dls_mask`).  The property closes that footgun.
+        """
+        if not self._layer_means:
+            try:
+                self._layer_means = bootstrap_layer_means(
+                    self._model, self._tokenizer, self._layers, self._model_info,
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                _log.warning(
+                    "session.layer_means lazy build failed: %s; "
+                    "DLS and Mahalanobis paths will fall back to "
+                    "no-baseline behavior", exc,
+                )
+        return self._layer_means
 
     # -- Mahalanobis whitener (v2.1) --
 
@@ -1123,7 +1210,8 @@ class SaklasSession:
         sae: str | None = None,
         sae_revision: str | None = None,
         namespace: str | None = None,
-        method: str = "dim",
+        method: str | None = None,
+        dls: bool | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit ``VectorExtracted``.
 
@@ -1154,6 +1242,19 @@ class SaklasSession:
         - ``force_statements=True``: regenerate ``statements.json``
           from scratch.  **Also bypasses the tensor cache** — same
           reasoning as ``scenarios=[...]``.
+        - ``method=None`` (default) inherits ``self._extraction_method``
+          (set at session construction; ``"dim"`` unless ``--legacy``
+          flipped it to ``"pca"``).  Explicit ``"dim"`` / ``"pca"``
+          overrides per-call.
+        - ``dls=None`` (default) inherits ``self._dls`` (set at session
+          construction; ``True`` unless ``--legacy`` flipped it).
+          Explicit ``True`` / ``False`` overrides per-call.
+
+        Pre-v2.1 these defaults were hardcoded to ``method="dim"`` and
+        ``dls=True`` regardless of session config — so ``--legacy``
+        sessions calling bare ``session.extract(...)`` got the modern
+        stack instead of the v2.0 one.  The ``None``-inherits-session
+        shape closes that hole.
         """
         # Must hold ``_gen_lock`` to read ``_gen_phase`` race-free against
         # ``_generate_core``, which acquires the lock first then flips
@@ -1170,6 +1271,10 @@ class SaklasSession:
                 raise ConcurrentExtractionError(
                     "session.extract called while a generation is in flight"
                 )
+            effective_method = (
+                method if method is not None else self._extraction_method
+            )
+            effective_dls = dls if dls is not None else self._dls
             return self._extraction.extract(
                 source, baseline,
                 scenarios=scenarios,
@@ -1179,7 +1284,8 @@ class SaklasSession:
                 sae=sae,
                 sae_revision=sae_revision,
                 namespace=namespace,
-                method=method,  # type: ignore[arg-type]
+                method=effective_method,  # type: ignore[arg-type]
+                dls=effective_dls,
             )
         finally:
             self._gen_lock.release()
@@ -1271,7 +1377,7 @@ class SaklasSession:
         # Must run before ``normalized_entries`` because the normalized
         # form flattens ``ProjectedTerm`` into ``(coeff, trigger)`` and
         # loses the ``base`` / ``onto`` / ``operator`` fields.
-        self._materialize_projections(steering_obj)
+        snapshots = self._materialize_projections(steering_obj)
         raw_entries = steering_obj.normalized_entries()
         resolved: dict[str, SteeringStackEntry] = dict(
             self._resolve_pole_aliases(raw_entries)
@@ -1325,9 +1431,10 @@ class SaklasSession:
             injection_mode=mode_override,
             theta_max=theta_override,
             projection_metric=metric_override,
+            synthetic_snapshots=snapshots,
         )
 
-    def _materialize_projections(self, steering: Steering) -> None:
+    def _materialize_projections(self, steering: Steering) -> dict[str, object]:
         """Populate ``self._profiles`` with derived profiles for every
         :class:`~saklas.core.steering_expr.ProjectedTerm` in
         ``steering.alphas``.
@@ -1341,12 +1448,12 @@ class SaklasSession:
         resolution + hook install find the profile via the
         ``name in self._profiles`` fast path.
 
-        Metric selection (v2.2): the active projection metric is
+        Metric selection (v2.1): the active projection metric is
         resolved via :meth:`_resolve_projection_metric`, which composes
         the per-call ``Steering.projection_metric`` override (if set)
         with any outer-scope override on
         ``_steering_override_stack`` and the session-level default.
-        Under ``"mahalanobis"`` (default since v2.2) the call site
+        Under ``"mahalanobis"`` (default since v2.1) the call site
         passes ``self.whitener`` to ``project_profile``, which switches
         ``~`` / ``|`` to the closed-form LEACE projector — provably
         erases linearly-decodable concept information along ``onto``.
@@ -1356,6 +1463,15 @@ class SaklasSession:
         a ``probes=[]`` session that hasn't extracted yet) the call
         gracefully falls back to Euclidean per-layer transparently —
         ``project_profile``'s coverage check handles per-layer misses.
+
+        Returns a snapshot dict ``{syn_key: prev_value_or_PROFILE_ABSENT}``
+        of the synthetic-projection bindings this call clobbered, so
+        the caller can restore them on scope exit.  Without this
+        nested scopes that materialize the same ``a|b`` synthetic
+        key under a different ``projection_metric`` would leak the
+        inner tensor back into the outer scope's hooks after pop —
+        the global ``self._profiles`` registry is shared across all
+        active scopes.
         """
         from saklas.core.steering_expr import ProjectedTerm
         from saklas.core.vectors import project_profile
@@ -1369,6 +1485,7 @@ class SaklasSession:
         )
         whitener = self.whitener if metric == "mahalanobis" else None
 
+        snapshots: dict[str, object] = {}
         for syn_key, val in steering.alphas.items():
             if not isinstance(val, ProjectedTerm):
                 continue
@@ -1380,7 +1497,18 @@ class SaklasSession:
                 base_tensors, onto_tensors, val.operator,
                 whitener=whitener,
             )
+            # Snapshot prior binding *before* overwrite so the
+            # context manager can restore on exit.  ``setdefault`` —
+            # if the same syn_key appears twice in this Steering, only
+            # the first occurrence's snapshot matters (subsequent
+            # writes are this scope's own, not the outer's).
+            if syn_key not in snapshots:
+                if syn_key in self._profiles:
+                    snapshots[syn_key] = self._profiles[syn_key]
+                else:
+                    snapshots[syn_key] = _PROFILE_ABSENT
             self._profiles[syn_key] = projected
+        return snapshots
 
     def _ensure_profile_loaded(self, key: str) -> None:
         """Ensure ``key`` is registered in ``self._profiles``.
@@ -1700,7 +1828,7 @@ class SaklasSession:
         ``__enter__`` pushes the new scope onto
         ``_steering_override_stack``, projection materialization has
         already run and committed derived profiles to ``self._profiles``.
-        Threading the override here keeps the v2.2 default end-to-end
+        Threading the override here keeps the v2.1 default end-to-end
         correct without re-running materialization on every scope flip.
         """
         if override is not None:
@@ -2478,7 +2606,7 @@ class SaklasSession:
                         effective_input_ids = suffix_ids
 
                 start = time.monotonic()
-                # Probe-gate score callback (v2.2): wire only when the
+                # Probe-gate score callback (v2.1): wire only when the
                 # active steering stack carries at least one probe-gated
                 # trigger.  ``_steering_needs_probe_gating`` is a cheap
                 # walk over the flattened head; the closure references

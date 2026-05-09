@@ -122,7 +122,7 @@ class _Stub(SaklasSession):
         self._profiles = dict(profiles)
         self._steering_stack = []
         self._steering_override_stack = []
-        # v2.2 session-level defaults consulted by ``_resolve_*``
+        # v2.1 session-level defaults consulted by ``_resolve_*``
         # helpers when the override LIFO has no entries.
         from saklas.core.hooks import DEFAULT_THETA_MAX as _DTM
         self._injection_mode = "angular"
@@ -240,7 +240,7 @@ class TestSessionProjection:
         assert s._rebuild_calls[-1] == {}
 
 
-# ---------------------------------------- v2.2 metric-default integration ---
+# ---------------------------------------- v2.1 metric-default integration ---
 
 class _MetricStub(_Stub):
     """Variant of ``_Stub`` that lets tests select a metric and stand-in
@@ -266,7 +266,7 @@ class _MetricStub(_Stub):
 
 
 class TestProjectionMetricDefault:
-    """The v2.2 default flips runtime ``~`` / ``|`` to Mahalanobis.
+    """The v2.1 default flips runtime ``~`` / ``|`` to Mahalanobis.
 
     Verifies that ``_materialize_projections`` passes ``self.whitener``
     to ``project_profile`` under the default metric, and ``None``
@@ -363,3 +363,223 @@ class TestProjectionMetricDefault:
         with pytest.raises(ValueError, match="projection_metric"):
             with s.steering(bad):
                 pass
+
+
+# ----------------------------------- v2.1 layer_means lazy-load fix-up ---
+
+class TestLayerMeansLazy:
+    """The ``session.layer_means`` property lazy-builds when
+    ``probes=[]`` left ``self._layer_means`` empty.
+
+    Closes the v2.1 footgun where ``probes=[]`` sessions hit
+    ``compute_dls_mask`` with an empty dict, every layer fell into
+    the conservative-keep branch, and DLS silently disabled itself.
+    """
+
+    def test_property_returns_existing_means_without_rebuild(self, monkeypatch):
+        """Non-empty ``self._layer_means`` short-circuits the property
+        — no bootstrap call.  Sanity check that the lazy path is
+        only triggered on miss."""
+        s = _Stub({"a": _profile_a()})
+        s._layer_means = {0: torch.tensor([1.0, 2.0])}
+
+        called: list = []
+
+        def _fail_bootstrap(*args, **kwargs):
+            called.append(args)
+            return {99: torch.tensor([0.0])}
+
+        from saklas.core import session as session_mod
+        monkeypatch.setattr(session_mod, "bootstrap_layer_means", _fail_bootstrap)
+        result = s.layer_means
+        assert set(result.keys()) == {0}
+        assert torch.equal(result[0], torch.tensor([1.0, 2.0]))
+        assert called == [], "bootstrap_layer_means should not run on hit"
+
+    def test_property_lazy_builds_when_empty(self, monkeypatch):
+        """Empty ``self._layer_means`` triggers ``bootstrap_layer_means``
+        on first access; result is cached on subsequent calls."""
+        s = _Stub({"a": _profile_a()})
+        # Stub has _layer_means = {} from _Stub.__init__, plus the
+        # whitener-property override returns None.  Override the
+        # session.py-level whitener property override on the stub so
+        # we can test layer_means in isolation: replace the class
+        # method with the *real* SaklasSession.layer_means property.
+        from saklas.core.session import SaklasSession
+        # The stub doesn't override ``layer_means`` — it inherits the
+        # real property, which is what we want to exercise.
+        # Replace bootstrap_layer_means with a tracker.
+        built = {3: torch.tensor([5.0, 6.0]), 4: torch.tensor([7.0, 8.0])}
+        calls: list = []
+
+        def _spy(*args, **kwargs):
+            calls.append(args)
+            return built
+
+        # Stub doesn't have _model/_tokenizer/_layers, so the property's
+        # try-except will fire and bootstrap_layer_means won't even be
+        # reached — instead the except block warns and returns {}.
+        # Patch *the same module the property imports from* so that
+        # call lookup resolves to our spy without needing the model.
+        from saklas.core import session as session_mod
+
+        # Give the stub the minimal handle attributes the bootstrap call
+        # looks at, so the try-block actually runs.
+        s._model = object()  # type: ignore[attr-defined]
+        s._tokenizer = object()  # type: ignore[attr-defined]
+        s._layers = []  # type: ignore[attr-defined]
+        s._model_info = {}  # type: ignore[attr-defined]
+        monkeypatch.setattr(session_mod, "bootstrap_layer_means", _spy)
+
+        # First access — triggers build.
+        out = SaklasSession.layer_means.fget(s)  # type: ignore[union-attr]
+        assert out is built
+        assert len(calls) == 1
+        # Second access — caches; no second call.
+        out2 = SaklasSession.layer_means.fget(s)  # type: ignore[union-attr]
+        assert out2 is built
+        assert len(calls) == 1
+
+
+class TestComputeDlsMaskEmptyGuard:
+    """``compute_dls_mask`` treats ``layer_means={}`` identically to
+    ``layer_means=None`` — both fall back to keep-all silently.
+
+    Closes the v2.1 path where an empty dict propagated through
+    ``probes=[]`` sessions and walked the per-layer loop without
+    a baseline, hitting "conservative keep" on every layer.  The
+    behavior was technically the same (keep all), but the early-out
+    makes intent explicit.
+    """
+
+    def test_none_keeps_all(self):
+        from saklas.core.vectors import compute_dls_mask
+        mu_pos = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([2.0, 0.0])}
+        mu_neg = {0: torch.tensor([-1.0, 0.0]), 1: torch.tensor([-2.0, 0.0])}
+        directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
+        out = compute_dls_mask(mu_pos, mu_neg, directions, None)
+        assert out == {0, 1}
+
+    def test_empty_dict_keeps_all(self):
+        from saklas.core.vectors import compute_dls_mask
+        mu_pos = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([2.0, 0.0])}
+        mu_neg = {0: torch.tensor([-1.0, 0.0]), 1: torch.tensor([-2.0, 0.0])}
+        directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
+        out = compute_dls_mask(mu_pos, mu_neg, directions, {})
+        assert out == {0, 1}
+
+    def test_all_failed_fallback_excludes_skipped_layers(self):
+        # All layers fail the discriminative test, but layers 0+1 also
+        # had degenerate directions that the loop explicitly skipped.
+        # Fallback should return only the *checkable* set (layer 2),
+        # not every layer in mu_pos — re-including skipped layers via
+        # the fallback would silently undo the skip.
+        import warnings as _warnings
+        from saklas.core.vectors import compute_dls_mask
+        mu_pos = {
+            0: torch.tensor([0.5, 0.0]),
+            1: torch.tensor([0.7, 0.0]),
+            2: torch.tensor([0.6, 0.0]),
+        }
+        mu_neg = {
+            0: torch.tensor([0.3, 0.0]),
+            1: torch.tensor([0.4, 0.0]),
+            2: torch.tensor([0.4, 0.0]),
+        }
+        # Layers 0+1 have zero-norm directions (skipped).
+        directions = {
+            0: torch.zeros(2),
+            1: torch.zeros(2),
+            2: mu_pos[2] - mu_neg[2],  # non-degenerate, but won't pass DLS
+        }
+        layer_means = {0: torch.zeros(2), 1: torch.zeros(2), 2: torch.zeros(2)}
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            out = compute_dls_mask(mu_pos, mu_neg, directions, layer_means)
+
+        # Layer 2 is checkable but failed; fallback returns just it.
+        # Layers 0+1 stay dropped despite the fallback.
+        assert out == {2}
+        msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+        assert any("DLS" in m for m in msgs)
+
+    def test_partial_layer_means_runs_check(self):
+        """Layers with a baseline get checked; layers without fall
+        through the per-layer ``mu_n is None`` conservative-keep."""
+        from saklas.core.vectors import compute_dls_mask
+        mu_pos = {
+            0: torch.tensor([1.0, 0.0]),  # opposite-signed → kept
+            1: torch.tensor([0.5, 0.0]),  # same-signed (both positive after centering) → drop
+            2: torch.tensor([3.0, 0.0]),  # no baseline → conservative keep
+        }
+        mu_neg = {
+            0: torch.tensor([-1.0, 0.0]),
+            1: torch.tensor([0.3, 0.0]),
+            2: torch.tensor([-3.0, 0.0]),
+        }
+        directions = {L: mu_pos[L] - mu_neg[L] for L in mu_pos}
+        # Baseline = 0 for layers 0+1 but absent for layer 2.
+        layer_means = {0: torch.zeros(2), 1: torch.zeros(2)}
+        out = compute_dls_mask(mu_pos, mu_neg, directions, layer_means)
+        assert out == {0, 2}  # 1 dropped (both leans positive); 2 kept (no baseline)
+
+
+# ------------------------------- v2.1 nested projection scope restore ---
+
+class TestNestedProjectionScopeLeak:
+    """Inner scope's projection should not leak back to outer scope.
+
+    ``_materialize_projections`` writes synthetic keys (``a|b``) into
+    the global ``self._profiles`` registry.  Without snapshot+restore
+    on the ``_SteeringContext`` exit path, an inner scope materializing
+    the same synthetic key under a different ``projection_metric`` (or
+    different base/onto pair) leaves the inner tensor bound when the
+    outer scope's hooks re-build, silently using the inner's projection.
+    """
+
+    def test_inner_overwrite_restored_on_exit(self):
+        s = _Stub({"a": _profile_a(), "b": _profile_b()})
+        outer_steering = parse_expr("0.5 a|b")
+        inner_steering = parse_expr("0.7 a|b")
+        with s.steering(outer_steering):
+            outer_tensor = s._profiles["a|b"][0].clone()
+            with s.steering(inner_steering):
+                inner_tensor = s._profiles["a|b"][0].clone()
+            # After inner exits, outer's binding must be restored.
+            restored = s._profiles["a|b"][0]
+            assert torch.equal(restored, outer_tensor), (
+                "outer scope's projected tensor must be restored when "
+                "inner scope exits"
+            )
+            # Sanity: inner did write a value (test would be vacuous
+            # if the inner write was identical).  The values are equal
+            # in practice because the projection is deterministic from
+            # base/onto, but the key point is the registry binding got
+            # restored to a snapshot regardless of value equality.
+            _ = inner_tensor
+
+    def test_outer_binding_absent_pre_scope_removed_after_pop(self):
+        # Synthetic key ``a|b`` doesn't exist before any scope opens.
+        # Entering a scope materializes it; exiting must remove it
+        # rather than leaving a stale binding behind.
+        s = _Stub({"a": _profile_a(), "b": _profile_b()})
+        assert "a|b" not in s._profiles
+        with s.steering(parse_expr("0.5 a|b")):
+            assert "a|b" in s._profiles
+        assert "a|b" not in s._profiles, (
+            "synthetic key materialized inside a scope must be removed "
+            "from the registry on exit when no outer binding existed"
+        )
+
+    def test_outer_pre_existing_binding_survives_inner_overwrite(self):
+        # Pre-bind ``a|b`` with a sentinel tensor, enter a scope that
+        # overwrites it, exit, and assert the sentinel is restored.
+        s = _Stub({"a": _profile_a(), "b": _profile_b()})
+        sentinel = {0: torch.tensor([99.0, 99.0])}
+        s._profiles["a|b"] = sentinel  # type: ignore[assignment]
+        with s.steering(parse_expr("0.5 a|b")):
+            assert s._profiles["a|b"] is not sentinel
+        assert s._profiles["a|b"] is sentinel, (
+            "pre-scope binding for a|b must be restored on scope exit"
+        )

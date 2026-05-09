@@ -148,7 +148,7 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch):
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
-        drop_edges=(0, 0),
+        dls=False,
     )
     assert set(profile.keys()) == {1, 3}
     mags = [profile[i].norm().item() for i in profile]
@@ -187,7 +187,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
-        drop_edges=(0, 0),
+        dls=False,
     )
     for idx, vec in profile.items():
         assert vec[0].item() > 0
@@ -220,7 +220,7 @@ def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch):
             FakeModel(), FakeTok(), pairs, layers=layers_list,
             device=torch.device("cpu"),
             sae=sae,
-            drop_edges=(0, 0),
+            dls=False,
         )
 
 
@@ -258,7 +258,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
         FakeModel(), FakeTok(), pairs, layers=layers_list,
         device=torch.device("cpu"),
         sae=sae,
-        drop_edges=(0, 0),
+        dls=False,
     )
     # Both layers covered, both have signal, both non-zero
     assert set(profile.keys()) == {0, 1}
@@ -424,12 +424,16 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, rec
     assert backend.layers == frozenset({0, 2})
 
 
-# --- drop_edges tests (raw PCA path; co-located with the SAE extract tests
-# above because they share the _encode_and_capture_all mock infrastructure).
+# --- DLS tests (raw PCA path; co-located with the SAE extract tests above
+# because they share the ``_encode_and_capture_all`` mock infrastructure).
+# Replaces the v2.0–v2.1 ``drop_edges`` test family — edge-drop is gone in
+# v2.1, layer selection is now data-driven via :func:`compute_dls_mask`.
 
 
-def test_extract_contrastive_drop_edges_default_drops_two_each_end(monkeypatch):
-    """Default drop_edges=(2,2) omits L0, L1, L_N-2, L_N-1 from the profile."""
+def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypatch):
+    """Without ``layer_means``, DLS centering is undefined and the helper
+    falls back to "keep all layers" silently — every layer in the
+    profile when ``layer_means=None``."""
     import torch
     from saklas.core import vectors as V
 
@@ -454,11 +458,12 @@ def test_extract_contrastive_drop_edges_default_drops_two_each_end(monkeypatch):
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,
         device=torch.device("cpu"),
     )
-    assert set(profile.keys()) == set(range(2, N - 2))
+    # No layer_means → no DLS — every synthesized layer is retained.
+    assert set(profile.keys()) == set(range(N))
 
 
-def test_extract_contrastive_drop_edges_zero_preserves_old_behavior(monkeypatch):
-    """drop_edges=(0,0) keeps all layers (pre-fix behavior)."""
+def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch):
+    """``dls=False`` skips the discriminative check entirely."""
     import torch
     from saklas.core import vectors as V
 
@@ -482,61 +487,35 @@ def test_extract_contrastive_drop_edges_zero_preserves_old_behavior(monkeypatch)
     profile, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,
         device=torch.device("cpu"),
-        drop_edges=(0, 0),
+        dls=False,
     )
     assert set(profile.keys()) == set(range(N))
 
 
-def test_extract_contrastive_drop_edges_rejects_total_drop():
-    """drop_edges that would empty the retained set raises ValueError."""
-    import torch
-    from saklas.core import vectors as V
-
-    class FakeModel:
-        def parameters(self):
-            yield torch.zeros(1)
-    class FakeTok:
-        pass
-
-    with pytest.raises(ValueError, match="no retained layers"):
-        V.extract_contrastive(
-            FakeModel(), FakeTok(), [], layers=[object()] * 4,
-            device=torch.device("cpu"),
-            drop_edges=(2, 2),
-        )
-
-
-def test_extract_contrastive_drop_edges_rejects_negative():
-    """Negative drop counts are rejected."""
-    import torch
-    from saklas.core import vectors as V
-
-    class FakeModel:
-        def parameters(self):
-            yield torch.zeros(1)
-    class FakeTok:
-        pass
-
-    with pytest.raises(ValueError, match="non-negative"):
-        V.extract_contrastive(
-            FakeModel(), FakeTok(), [], layers=[object()] * 10,
-            device=torch.device("cpu"),
-            drop_edges=(-1, 2),
-        )
-
-
-def test_extract_contrastive_drop_edges_asymmetric(monkeypatch):
-    """Asymmetric drop — front only or back only — works."""
+def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch):
+    """With ``layer_means`` and centered separation, layers where pos
+    and neg both project the same side of the baseline are dropped."""
     import torch
     from saklas.core import vectors as V
 
     torch.manual_seed(0)
     N = 8
 
+    # Layers 0..3: clean opposite-sign separation (pos = +e0, neg = -e0).
+    # Layers 4..7: both poles project +e0 from baseline (= 0) — both
+    # land on the *same side* of the neutral.  DLS should drop these.
     def fake_encode(model, tokenizer, text, layers, device):
-        sign = 1.0 if "pos" in text else -1.0
-        return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
-                for i in range(N)}
+        is_pos = "pos" in text
+        out = {}
+        for i in range(N):
+            if i < 4:
+                v = torch.tensor([1.0 if is_pos else -1.0, 0.0, 0.0, 0.0])
+            else:
+                # both leaning positive but pos leads — d̂ ≈ +e0,
+                # μ̃_pos ≈ +0.5, μ̃_neg ≈ +0.3; product positive → drop.
+                v = torch.tensor([0.5 if is_pos else 0.3, 0.0, 0.0, 0.0])
+            out[i] = v + 0.001 * torch.randn(4)
+        return out
 
     monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode)
 
@@ -546,18 +525,53 @@ def test_extract_contrastive_drop_edges_asymmetric(monkeypatch):
     class FakeTok:
         pass
 
-    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(3)]
-
-    profile_front, _ = V.extract_contrastive(
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(10)]
+    layer_means = {i: torch.zeros(4) for i in range(N)}
+    profile, _ = V.extract_contrastive(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,
         device=torch.device("cpu"),
-        drop_edges=(3, 0),
+        layer_means=layer_means,
     )
-    assert set(profile_front.keys()) == set(range(3, N))
+    # Discriminative layers retained; non-discriminative dropped.
+    assert set(profile.keys()) == set(range(4))
 
-    profile_back, _ = V.extract_contrastive(
-        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
-        device=torch.device("cpu"),
-        drop_edges=(0, 3),
-    )
-    assert set(profile_back.keys()) == set(range(N - 3))
+
+def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch):
+    """When every layer fails the discriminative check, the helper
+    warns and falls back to keep-all rather than emptying the profile."""
+    import warnings as _warnings
+    import torch
+    from saklas.core import vectors as V
+
+    torch.manual_seed(0)
+    N = 4
+
+    # Both poles always lean positive — nothing is discriminative.
+    def fake_encode(model, tokenizer, text, layers, device):
+        is_pos = "pos" in text
+        return {i: torch.tensor(
+            [0.7 if is_pos else 0.3, 0.0, 0.0, 0.0],
+        ) + 0.001 * torch.randn(4) for i in range(N)}
+
+    monkeypatch.setattr(V, "_encode_and_capture_all", fake_encode)
+
+    class FakeModel:
+        def parameters(self):
+            yield torch.zeros(1)
+    class FakeTok:
+        pass
+
+    pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
+    layer_means = {i: torch.zeros(4) for i in range(N)}
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        profile, _ = V.extract_contrastive(
+            FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+            device=torch.device("cpu"),
+            layer_means=layer_means,
+        )
+    # Fallback engaged — every layer kept.
+    assert set(profile.keys()) == set(range(N))
+    msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    assert any("DLS" in m and "keep-all" in m for m in msgs)

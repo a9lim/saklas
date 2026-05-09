@@ -1,4 +1,4 @@
-"""Probe-gated triggers (v2.2): grammar, runtime gate, session detection.
+"""Probe-gated triggers (v2.1): grammar, runtime gate, session detection.
 
 Covers:
 - ``ProbeGate.evaluate`` semantics across all four ops.
