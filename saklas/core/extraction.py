@@ -227,6 +227,7 @@ class ExtractionPipeline:
         sae_revision: str | None = None,
         namespace: str | None = None,
         method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
+        dls: bool = True,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit ``VectorExtracted``.
 
@@ -261,6 +262,7 @@ class ExtractionPipeline:
             sae_revision=sae_revision,
             namespace=namespace,
             method=method,
+            dls=dls,
         )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
@@ -286,6 +288,7 @@ class ExtractionPipeline:
         sae_revision: str | None = None,
         namespace: str | None = None,
         method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
+        dls: bool = True,
     ) -> tuple[str, Profile]:
         """Extraction body.  See :meth:`extract` for the wrapper.
 
@@ -368,11 +371,15 @@ class ExtractionPipeline:
         # bootstrap on ``probes=[]`` sessions (closes the v2.1 footgun
         # where DLS silently disabled because ``self._layer_means``
         # was an empty dict).  Test stubs without a real model
-        # override the property to return ``{}`` directly.
+        # override the property to return ``{}`` directly.  ``dls``
+        # is per-call (defaults to ``True`` here, but the
+        # ``SaklasSession.extract`` wrapper threads its own session-
+        # level ``self._dls`` through, so ``--legacy`` flows correctly
+        # even on bare ``session.extract(...)`` calls).
         extract_kwargs: dict = {
             "sae": sae_backend,
             "concept_label": canonical,
-            "dls": True,
+            "dls": dls,
             "layer_means": getattr(self._handle, "layer_means", None),
         }
         if method == "dim":

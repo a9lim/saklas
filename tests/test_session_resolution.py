@@ -53,6 +53,13 @@ def _stub_session(model_id: str) -> SaklasSession:
     session._gen_phase = GenState.IDLE
     import threading
     session._gen_lock = threading.Lock()
+    # v2.1+: ``session.extract`` consults ``_extraction_method`` /
+    # ``_dls`` / ``_layer_means`` for defaults; without them on the
+    # stub it crashes with AttributeError before delegating to the
+    # pipeline.
+    session._extraction_method = "dim"
+    session._dls = True
+    session._layer_means = {}
     # Pipeline normally constructed in __init__; stub skips that, wire one in.
     session._extraction = ExtractionPipeline(session, session, session, session.events)
     return session
