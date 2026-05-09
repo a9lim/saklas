@@ -953,7 +953,8 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     from saklas.core import extraction as E
 
     captured: dict = {}
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *,
+                     sae=None, concept_label=None, **_kwargs):
         captured["sae"] = sae
         return ({0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}, {})
     # Stub both extractors — pipeline dispatches to DiM by default in v2.1+,
@@ -1050,7 +1051,8 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
     from saklas.core import vectors as V
     from saklas.core import extraction as E
 
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *,
+                     sae=None, concept_label=None, **_kwargs):
         return ({0: torch.ones(4), 2: torch.ones(4)}, {})
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
     monkeypatch.setattr(E, "extract_contrastive", fake_extract)

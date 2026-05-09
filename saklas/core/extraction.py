@@ -509,11 +509,18 @@ class ExtractionPipeline:
             if pack_stmts.exists():
                 _progress(f"Using curated statements for '{canonical}'...")
                 ds = load_contrastive_pairs(str(pack_stmts))
+                # ``**extract_kwargs`` carries ``sae``, ``concept_label``,
+                # ``whitener`` (DiM/Mahalanobis bake), ``dls``, and
+                # ``layer_means`` (DLS centering).  Earlier this site
+                # passed only ``sae`` + ``concept_label`` — silently
+                # dropping whitener and DLS, which made the v2.1
+                # Mahalanobis bake and v2.1 DLS no-ops on bundled
+                # statements paths.  Same fix applied to the local-
+                # statements cache path below (site 3).
                 profile, diagnostics = extractor(
                     model, tokenizer, ds["pairs"],
                     layers=layers,
-                    sae=sae_backend,
-                    concept_label=canonical,
+                    **extract_kwargs,
                 )
                 _save_profile(profile, cache_path, _save_meta(
                     {"statements_sha256": hash_file(pack_stmts)},
@@ -604,14 +611,15 @@ class ExtractionPipeline:
                 f"Try a more specific concept."
             )
 
-        # 5. Extract.
+        # 5. Extract.  See site 2 above for why ``**extract_kwargs`` is
+        # required — without it the v2.1 whitener (Mahalanobis bake)
+        # and DLS keep set both silently fall through.
         _progress(
             f"Extracting {method_label} profile ({len(pairs)} pairs)..."
         )
         profile, diagnostics = extractor(
             model, tokenizer, pairs, layers=layers,
-            sae=sae_backend,
-            concept_label=canonical,
+            **extract_kwargs,
         )
         _save_profile(profile, cache_path, _save_meta(
             {"statements_sha256": hash_file(pathlib.Path(stmt_cache_path))},
