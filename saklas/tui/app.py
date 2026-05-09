@@ -470,7 +470,8 @@ class SaklasApp(App):
 
     def _handle_extract(self, text: str, include_alpha: bool, on_success,
                         pending_type: str | None = None,
-                        variant: str = "raw") -> None:
+                        variant: str = "raw",
+                        namespace: str | None = None) -> None:
         chat = self._chat_panel
         if self._ab_shadow_active:
             chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
@@ -503,10 +504,14 @@ class SaklasApp(App):
         # explicit form wins over the ``variant`` kwarg when both are set.
         # Explicit bipolar form (`concept - baseline`) skips resolution
         # so the user's declared poles always win.
+        # ``namespace`` (when set) scopes the resolution so ``alice/foo``
+        # and ``bob/foo`` stay distinct.
         sign = 1
         if baseline is None:
             try:
-                resolved_name, sign, _match, explicit_variant = resolve_pole(concept)
+                resolved_name, sign, _match, explicit_variant = resolve_pole(
+                    concept, namespace=namespace,
+                )
                 if resolved_name != concept:
                     chat.add_system_message(
                         f"  Resolved '{concept}' → '{resolved_name}'"
@@ -547,13 +552,17 @@ class SaklasApp(App):
                 # means "use the unique SAE variant that's already on disk".
                 # Ambiguous / missing cases surface via the session errors.
                 if variant == "sae" and sae_release is None:
-                    self._session._try_autoload_vector(concept, variant="sae")
-                    key = f"{concept}:sae"
+                    autoload_key = (
+                        concept if namespace is None
+                        else f"{namespace}/{concept}"
+                    )
+                    self._session._try_autoload_vector(autoload_key, variant="sae")
+                    key = f"{autoload_key}:sae"
                     profile_dict = self._session._profiles.get(key)
                     if profile_dict is None:
                         raise ValueError(
-                            f"no SAE variant loaded for '{concept}' — "
-                            f"run `saklas vector extract {concept} --sae <RELEASE>` "
+                            f"no SAE variant loaded for '{autoload_key}' — "
+                            f"run `saklas vector extract {autoload_key} --sae <RELEASE>` "
                             f"first, or pick a release with "
                             f"`:sae-<release>` in the concept name."
                         )
@@ -563,12 +572,23 @@ class SaklasApp(App):
                 extract_kwargs = {"baseline": baseline, "on_progress": _progress}
                 if sae_release is not None:
                     extract_kwargs["sae"] = sae_release
+                if namespace is not None:
+                    extract_kwargs["namespace"] = namespace
                 # ``session.extract`` already returns the fully-qualified
                 # canonical name — including the ``:sae-<release>`` suffix
                 # when ``sae=`` was passed. Rebuilding it here would
                 # double-suffix the key and break every downstream
                 # ``/alpha`` / ``/unsteer`` / pole lookup.
                 canonical, profile = self._session.extract(concept, **extract_kwargs)
+                if namespace is not None:
+                    # Re-attach the namespace so the registered key matches
+                    # what the parser produced (so ``/alpha`` / ``/unsteer``
+                    # against the namespace-qualified form keep working).
+                    if ":" in canonical:
+                        bare, suffix = canonical.rsplit(":", 1)
+                        canonical = f"{namespace}/{bare}:{suffix}"
+                    else:
+                        canonical = f"{namespace}/{canonical}"
                 on_success(canonical, profile, alpha)
             except SaklasError as e:
                 self.call_from_thread(self._steer_status, e.user_message()[1])
@@ -642,16 +662,30 @@ class SaklasApp(App):
                 concept, variant = key.rsplit(":", 1)
             else:
                 concept, variant = key, "raw"
-            self._dispatch_steer_term(concept, variant, alpha)
+            # Peel namespace prefix so ``_handle_extract`` -> ``resolve_pole``
+            # scopes to the user's typed namespace instead of slugging
+            # ``ns/name`` into a single token.  ``_handle_extract`` will
+            # use ``namespace`` as the kwarg into ``session.extract`` so
+            # disk discovery stays scoped too.
+            namespace: str | None = None
+            if "/" in concept:
+                namespace, concept = concept.split("/", 1)
+            self._dispatch_steer_term(
+                concept, variant, alpha, namespace=namespace,
+            )
 
     def _dispatch_steer_term(
         self, concept: str, variant: str, alpha: float,
+        *, namespace: str | None = None,
     ) -> None:
         """Route one plain steering term through the extract pipeline.
 
         The concept has already been canonicalized and sign-flipped by
         ``parse_expr``; ``_handle_extract`` will re-run ``resolve_pole``
         on the canonical form which is idempotent (returns sign +1).
+        ``namespace`` (when set) scopes that re-resolution and the
+        downstream ``session.extract`` call so ``alice/foo`` and
+        ``bob/foo`` stay distinct end-to-end.
         """
         def _on_success(name, profile, a):
             self._session.steer(name, profile)
@@ -665,7 +699,8 @@ class SaklasApp(App):
         )
         text = f"{concept_with_variant} {alpha}"
         self._handle_extract(
-            text, include_alpha=True, on_success=_on_success, variant=variant,
+            text, include_alpha=True, on_success=_on_success,
+            variant=variant, namespace=namespace,
         )
 
     def _handle_probe(self, text: str) -> None:

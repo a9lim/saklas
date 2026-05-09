@@ -1542,6 +1542,13 @@ class SaklasSession:
         is variant-aware — ``honest:sae`` will look for a ``_sae-*`` tensor
         file, not the raw one.
 
+        Namespace-qualified inputs (``alice/foo``) keep the namespace
+        through resolution: the prefix is split off, fed to ``resolve_pole``
+        as the ``namespace=`` kwarg so the lookup scopes to that namespace,
+        and re-attached to the registry key.  This is what lets two
+        installed packs that share a concept name across namespaces stay
+        addressable via their fully-qualified form.
+
         Names already in ``self._profiles`` pass through verbatim — a caller
         who pre-registered under a specific key stays addressed by that key.
         """
@@ -1552,15 +1559,34 @@ class SaklasSession:
             if name in self._profiles:
                 out[name] = (float(alpha), trig)
                 continue
+            # Split namespace prefix so re-resolution scopes to the
+            # namespace the user originally typed (parser preserves it
+            # in the key when supplied).  Bare names leave ``ns=None``
+            # so cross-namespace collisions still raise.
+            ns: str | None = None
+            bare_name = name
+            if "/" in name:
+                ns, bare_name = name.split("/", 1)
             try:
-                canonical, sign, _match, variant = resolve_pole(name)
+                canonical, sign, _match, variant = resolve_pole(
+                    bare_name, namespace=ns,
+                )
             except Exception:
                 out[name] = (float(alpha), trig)
                 continue
-            registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
+            canonical_qualified = (
+                canonical if ns is None else f"{ns}/{canonical}"
+            )
+            registry_key = (
+                canonical_qualified
+                if variant == "raw"
+                else f"{canonical_qualified}:{variant}"
+            )
             if registry_key not in self._profiles:
                 try:
-                    self._try_autoload_vector(canonical, variant=variant)
+                    self._try_autoload_vector(
+                        canonical_qualified, variant=variant,
+                    )
                 except Exception:
                     # Autoload may raise AmbiguousVariantError / UnknownVariantError.
                     # Keep the user's original name in `out` so the error surfaces
@@ -1589,18 +1615,32 @@ class SaklasSession:
         - ``"sae-<release>"`` — loads that specific release.
           :class:`UnknownVariantError` when absent.
 
-        Registered key in ``_profiles`` is ``canonical`` for raw, and
-        ``f"{canonical}:{variant}"`` otherwise.
+        ``canonical`` may be namespace-qualified (``alice/foo``), in which
+        case discovery is scoped to that namespace.  Registered key in
+        ``_profiles`` matches the input form: ``canonical`` for raw, and
+        ``f"{canonical}:{variant}"`` otherwise — so namespace-qualified
+        callers get a namespace-qualified registry key back.
         """
         from saklas.io.selectors import _all_concepts
         from saklas.io.packs import enumerate_variants
         from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
         from saklas.core.vectors import load_profile
 
+        # Split namespace prefix so concept discovery scopes to the
+        # namespace the caller specified.  Bare canonicals leave
+        # ``namespace=None`` and pick up the first matching concept
+        # across every namespace (the historical behavior).
+        ns: str | None = None
+        bare_canonical = canonical
+        if "/" in canonical:
+            ns, bare_canonical = canonical.split("/", 1)
+
         registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
         available: list[str] = []
         for concept in _all_concepts():
-            if concept.name != canonical:
+            if ns is not None and concept.namespace != ns:
+                continue
+            if concept.name != bare_canonical:
                 continue
             variants = enumerate_variants(concept.folder, self.model_id)
             available.extend(variants.keys())
@@ -1642,11 +1682,11 @@ class SaklasSession:
                     and os.environ.get("SAKLAS_ALLOW_STALE") != "1"
                 ):
                     raise StaleSidecarError(
-                        f"{concept.namespace}/{canonical}: statements.json has "
+                        f"{concept.namespace}/{bare_canonical}: statements.json has "
                         f"changed since this tensor was extracted "
                         f"(model={self.model_id}). The baked PCA no longer "
                         f"matches the on-disk pairs. Re-extract: "
-                        f"`saklas pack refresh {concept.namespace}/{canonical} "
+                        f"`saklas pack refresh {concept.namespace}/{bare_canonical} "
                         f"-m {self.model_id}` — or set SAKLAS_ALLOW_STALE=1 "
                         f"to load the stale tensor anyway."
                     )

@@ -121,15 +121,39 @@ def test_underscore_segments_survive():
 
 # ---------------------------------------------------------- namespace ---
 
-def test_namespace_prefix_resolves_to_name():
+def test_namespace_prefix_preserved_in_key():
+    # User-typed namespace prefixes must survive into the alphas key so
+    # downstream lookups can disambiguate ``alice/foo`` from ``bob/foo``
+    # when both packs are installed.  Bare references (no slash) keep
+    # the canonical name verbatim.
     s = parse_expr("0.5 bob/foo")
-    # No pack installed -> resolve_pole returns the slug with sign +1.
-    assert s.alphas == {"foo": 0.5}
+    assert s.alphas == {"bob/foo": 0.5}
 
 
 def test_namespace_with_bipolar():
     s = parse_expr("0.3 bob/deer.wolf")
-    assert s.alphas == {"deer.wolf": 0.3}
+    assert s.alphas == {"bob/deer.wolf": 0.3}
+
+
+def test_namespace_disambiguates_collision(tmp_path):
+    # Two packs sharing a concept name across namespaces — the parser
+    # must keep the user's explicit ``alice/`` / ``bob/`` prefix in the
+    # alphas key so each pack ends up at a distinct registry slot.
+    # Pre-fix this case raised ``AmbiguousSelectorError`` from the
+    # session's pole-resolution second pass because the namespace was
+    # dropped at parse time.
+    _mk(tmp_path, "alice", "shared", tags=[])
+    _mk(tmp_path, "bob", "shared", tags=[])
+    sel.invalidate()
+    s = parse_expr("0.3 alice/shared + 0.4 bob/shared")
+    assert s.alphas == {"alice/shared": 0.3, "bob/shared": 0.4}
+
+
+def test_namespace_round_trips_through_format():
+    # Namespace-qualified keys must render back through ``format_expr``
+    # to a string the parser accepts unchanged.
+    s = parse_expr("0.3 alice/foo + 0.5 bob/honest:sae")
+    assert format_expr(s) == "0.3 alice/foo + 0.5 bob/honest:sae"
 
 
 # ----------------------------------------------------------- variant ---
@@ -674,11 +698,13 @@ def test_ablation_with_namespace(tmp_path):
     from saklas.core.steering_expr import AblationTerm
     _mk(tmp_path, "bob", "custom", tags=[])
     s = parse_expr("!bob/custom")
-    # Namespace prefix is resolved away to the canonical concept name,
-    # matching plain-term behavior (see test_namespace_prefix_resolves_to_name).
-    term = s.alphas["!custom"]
+    # Namespace prefix is preserved through to the registry key,
+    # matching plain-term behavior (see test_namespace_prefix_preserved_in_key)
+    # — the ablation key is ``!<namespace>/<concept>`` so two packs sharing
+    # a concept name across namespaces ablate independently.
+    term = s.alphas["!bob/custom"]
     assert isinstance(term, AblationTerm)
-    assert term.target == "custom"
+    assert term.target == "bob/custom"
 
 
 def test_ablation_with_trigger():
