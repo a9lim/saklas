@@ -292,6 +292,7 @@ class Profile:
         other: "Profile",
         *,
         per_layer: bool = False,
+        whitener: "Any | None" = None,
     ) -> "float | dict[int, float]":
         """Cosine similarity against *other*.
 
@@ -299,6 +300,16 @@ class Profile:
         intersection.  Weighting by ``||baked||`` matches the monitor regime.
 
         **Per-layer** (``per_layer=True``): raw cosine per shared layer.
+
+        **Whitened metric** (``whitener=<LayerWhitener>``): switches to
+        Mahalanobis cosine ``<u, v>_M = u^T Σ^{-1} v``.  Reduces to plain
+        cosine when ``Σ = I``; predicts cross-domain probe generalization
+        better than plain cosine on activation distributions with strongly
+        anisotropic covariance.  The aggregate still weights by Mahalanobis
+        norms (analogous to the Euclidean-magnitude weighting), so the
+        scalar result is on the same ``[-1, 1]`` scale.  Layers absent
+        from the whitener silently fall back to plain cosine — the
+        whitener may legitimately cover a subset (e.g. SAE-only releases).
 
         Raises :class:`ProfileError` when no layers are shared.
         """
@@ -312,20 +323,42 @@ class Profile:
             out: dict[int, float] = {}
             for L in shared:
                 a, b = self._tensors[L].float(), other._tensors[L].float()
-                cos = (torch.dot(a, b) / (a.norm() * b.norm())).item()
-                out[L] = cos
+                if whitener is not None and whitener.covers(L):
+                    out[L] = whitener.mahalanobis_cosine(L, a, b)
+                else:
+                    out[L] = (
+                        torch.dot(a, b) / (a.norm() * b.norm())
+                    ).item()
             return out
 
-        # Magnitude-weighted aggregate.
+        # Magnitude-weighted aggregate.  Under Mahalanobis, the per-layer
+        # weight uses Mahalanobis norms (same role as ``||baked||`` in the
+        # Euclidean case — directions whose typical activations don't
+        # cover them dominate the average less, mirroring the monitor
+        # regime).
         num = 0.0
         den = 0.0
         for L in shared:
             a, b = self._tensors[L].float(), other._tensors[L].float()
-            na, nb = a.norm().item(), b.norm().item()
-            cos = (torch.dot(a, b) / (na * nb)).item()
+            if whitener is not None and whitener.covers(L):
+                na = whitener.mahalanobis_norm(L, a)
+                nb = whitener.mahalanobis_norm(L, b)
+                if na < 1e-12 or nb < 1e-12:
+                    continue
+                cos = whitener.mahalanobis_dot(L, a, b) / (na * nb)
+            else:
+                na, nb = a.norm().item(), b.norm().item()
+                if na < 1e-12 or nb < 1e-12:
+                    continue
+                cos = (torch.dot(a, b) / (na * nb)).item()
             w = na * nb
             num += w * cos
             den += w
+        if den < 1e-12:
+            raise ProfileError(
+                "cosine_similarity: every shared layer has near-zero "
+                "magnitude under the requested metric"
+            )
         return num / den
 
     def __repr__(self) -> str:

@@ -66,6 +66,62 @@ _VECTOR_VERBS: list[tuple[str, str]] = [
 ]
 
 
+def _add_injection_args(p: argparse.ArgumentParser) -> None:
+    """Steering-injection options shared between ``tui`` and ``serve``.
+
+    ``None`` defaults flow through to the YAML override layer (or
+    ultimately to the v2.1 session defaults: angular + π/2).
+    """
+    p.add_argument(
+        "--steer-mode", dest="injection_mode",
+        choices=["angular", "additive"], default=None,
+        help="Steering injection math.  'angular' (default) maps user α "
+             "to a rotation angle; 'additive' is the legacy v1.x add+"
+             "rescale path.  Unset = inherit YAML / session default.",
+    )
+    p.add_argument(
+        "--theta-max", dest="theta_max", type=float, default=None,
+        metavar="RAD",
+        help="Maximum rotation angle for angular mode (radians).  Default "
+             "π/2 (≈1.5708) — α=1 fully aligns the residual with the "
+             "concept direction.  No effect under --steer-mode additive.",
+    )
+    p.add_argument(
+        "--projection-metric", dest="projection_metric",
+        choices=["mahalanobis", "euclidean"], default=None,
+        help="Metric for runtime ``~`` / ``|`` projection in steering "
+             "expressions.  'mahalanobis' (default since v2.1) uses the "
+             "closed-form LEACE projector against the per-model whitener "
+             "(Belrose et al. 2023) — provably erases linearly-decodable "
+             "concept information along ``onto`` from ``base``.  "
+             "'euclidean' is plain Gram-Schmidt (the v2.0/v2.1 behavior).  "
+             "Unset = inherit YAML / session default.",
+    )
+    p.add_argument(
+        "--no-dls", dest="no_dls", action="store_true",
+        help="Disable the discriminative-layer-selection mask at "
+             "extraction time.  v2.1 introduced centered DLS (Dang & "
+             "Ngo 2026, Eq. 9) as the default: layers where pos- and "
+             "neg-class means project to the same side of the neutral "
+             "baseline along ``d̂`` are dropped — they encode concept "
+             "intensity rather than concept polarity.  Pass ``--no-dls`` "
+             "to keep every layer (the v2.0–v2.1 behavior, modulo the "
+             "removed ``edge_drop`` heuristic).  Mutually exclusive "
+             "with ``--legacy`` (which already implies ``--no-dls``).",
+    )
+    p.add_argument(
+        "--legacy", action="store_true",
+        help="v2.0 backcompat preset for steering: equivalent to "
+             "``--steer-mode additive`` plus PCA extraction on first-run "
+             "probe bootstrap, Euclidean ``~`` / ``|`` projection, and "
+             "DLS off (instead of v2.1's DiM + Mahalanobis bake + "
+             "angular + LEACE projection + DLS).  Useful for "
+             "A/B-comparing the pre-v2.1 stack on the same model.  "
+             "Mutually exclusive with ``--steer-mode``, "
+             "``--projection-metric``, and ``--no-dls``.",
+    )
+
+
 def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
     # When a model supplies -c/--config pointing at a YAML with model: set,
     # the positional can be omitted. Handled in _run_tui via composed config.
@@ -79,6 +135,7 @@ def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
                         help="Probe categories (default: all)")
     parser.add_argument("--max-tokens", type=int, default=1024,
                         help="Default max generation tokens")
+    _add_injection_args(parser)
     _add_config_args(parser)
 
 
@@ -95,6 +152,7 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-web", dest="no_web", action="store_true",
                         help="Skip the analytics dashboard mount at / "
                              "(API-only mode for production / proxied deployments)")
+    _add_injection_args(parser)
     _add_config_args(parser)
 
 
@@ -207,6 +265,23 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
     p.add_argument("-f", "--force", action="store_true")
     p.add_argument(
+        "--method", choices=["dim", "pca"], default=None,
+        help="Extraction algorithm: 'dim' (difference-of-means, default) or "
+             "'pca' (legacy contrastive PCA).  DiM is the v2.1+ default per "
+             "Im & Li 2025; --method pca recovers the v1.x path and writes "
+             "to the legacy ``_pca`` filename suffix for side-by-side "
+             "comparison.  Unset = defer to YAML ``extraction_method:`` if "
+             "configured, else 'dim'.",
+    )
+    p.add_argument(
+        "--legacy", action="store_true",
+        help="v2.0 backcompat preset.  On ``vector extract`` this is "
+             "equivalent to ``--method pca``; combined with ``--legacy`` "
+             "on ``tui``/``serve`` (additive injection) and ``vector "
+             "compare`` (Euclidean cosine), it round-trips the entire "
+             "pre-v2.1 stack.  Mutually exclusive with ``--method``.",
+    )
+    p.add_argument(
         "--sae", default=None, metavar="RELEASE",
         help="Extract via a SAELens SAE release (requires `pip install .[sae]`). "
              "No implicit default — you must name a release.",
@@ -251,6 +326,34 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
                    help="Show per-layer breakdown (2-arg pairwise mode)")
     p.add_argument("-j", "--json", dest="json_output", action="store_true",
                    help="Emit machine-readable JSON")
+    p.add_argument(
+        "--metric", choices=("euclidean", "mahalanobis"), default=None,
+        help=(
+            "Cosine metric. 'mahalanobis' (default since v2.1) = whitened "
+            "cosine ⟨u,v⟩_M = u^T Σ^{-1} v (Belrose et al. 2023), reads "
+            "cached neutral activations + layer means under "
+            "~/.saklas/models/<id>/ to build the per-layer whitener; "
+            "falls back to Euclidean per layer when the whitener doesn't "
+            "cover that layer.  'euclidean' = standard cosine (the "
+            "v2.0/v2.1 behavior; selected by ``--legacy``)."
+        ),
+    )
+    p.add_argument(
+        "--ridge-scale", type=float, default=1.0, metavar="FLOAT",
+        help=(
+            "Ridge multiplier on the regularized covariance "
+            "(λ_L = (||X_L||_F²/(N·D)) × ridge_scale). Only consulted "
+            "with --metric mahalanobis; default 1.0 (mean diagonal of "
+            "the un-regularized sample covariance)."
+        ),
+    )
+    p.add_argument(
+        "--legacy", action="store_true",
+        help=(
+            "v2.0 backcompat preset: equivalent to ``--metric euclidean``."
+            "  Mutually exclusive with ``--metric``."
+        ),
+    )
 
 
 def _build_vector_why(p: argparse.ArgumentParser) -> None:

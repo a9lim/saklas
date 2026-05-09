@@ -6,14 +6,24 @@ turns a user-supplied string into the same :class:`Steering` IR.
 
 Grammar::
 
-    expr     := term (("+" | "-") term)*
-    term     := [coeff ["*"]] selector ["@" trigger]
-    selector := atom (("~" | "|") atom)?
-    atom     := [ns "/"] NAME ["." NAME] [":" variant]
-    trigger  := "before" | "after" | "both" | "thinking" | "response"
-              | "prompt" | "generated"
-    coeff    := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
-    variant  := "raw" | "sae" | "sae-" ID
+    expr        := term (("+" | "-") term)*
+    term        := [coeff ["*"]] selector ["@" trigger]
+    selector    := atom (("~" | "|") atom)?
+    atom        := [ns "/"] NAME ["." NAME] [":" variant]
+    trigger     := preset | gate
+    preset      := "before" | "after" | "both" | "thinking" | "response"
+                 | "prompt" | "generated"
+    gate        := "when" ":" probe_atom op NUM
+    probe_atom  := NAME ["." NAME]    # canonical concept (e.g. "angry.calm")
+    op          := ">" | ">=" | "<" | "<="
+    coeff       := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
+    variant     := "raw" | "sae" | "sae-" ID
+
+Probe gates (v2.1): ``@when:<probe><op><threshold>`` fires the term only
+on decode steps where the named probe's last reading satisfies the
+comparison.  Implicit ``prompt=False`` (no probe reading during prefill).
+Compose with other windows via the programmatic surface — the v1
+grammar accepts a single ``@`` clause per term.
 
 Concept names are ASCII identifiers: letter followed by any of
 ``[a-z0-9_-]``.  Multi-word concepts use underscores
@@ -141,6 +151,16 @@ _SINGLE_CHAR_TOKENS = {
     "|": "ORTHO", "!": "BANG",
 }
 
+# Comparison-op tokens.  Two-char ops (``>=``, ``<=``) take precedence
+# over the single-char ones; the lexer peeks one char ahead before
+# emitting GT / LT.  ``=`` alone is not a token — equality (``==``) is
+# not part of the gate grammar in v2.1 (probe scores are continuous
+# floats; equality is meaningless).
+_COMPARE_OPS: dict[str, str] = {
+    ">=": "GTE", "<=": "LTE",
+    ">": "GT", "<": "LT",
+}
+
 
 @dataclass
 class _Tok:
@@ -166,6 +186,16 @@ def _lex(text: str) -> list[_Tok]:
                 raise SteeringExprError(f"malformed number at {c!r}", col=i)
             toks.append(_Tok("NUM", float(m.group()), i))
             i = m.end()
+            continue
+        # Comparison ops: two-char first, then single-char.
+        if c in (">", "<"):
+            two = text[i:i + 2]
+            if two in _COMPARE_OPS:
+                toks.append(_Tok(_COMPARE_OPS[two], two, i))
+                i += 2
+                continue
+            toks.append(_Tok(_COMPARE_OPS[c], c, i))
+            i += 1
             continue
         if c in _SINGLE_CHAR_TOKENS:
             toks.append(_Tok(_SINGLE_CHAR_TOKENS[c], c, i))
@@ -226,7 +256,12 @@ class _Selector:
 class _Term:
     coeff: float
     selector: _Selector
-    trigger: Optional[str]  # raw trigger keyword; None = fall through
+    # Pre-resolved Trigger object (or ``None`` to fall through to the
+    # session/Steering default).  Preset triggers map through
+    # :data:`_TRIGGER_PRESETS`; probe gates (``@when:angry>0.4``)
+    # produce a ``Trigger(prompt=False, gate=ProbeGate(...))`` directly
+    # at parse time.  Rendered back to canonical form by ``_fmt_*``.
+    trigger: Optional[Trigger]
     # True iff the user typed a numeric coefficient; False when the parser
     # substituted ``DEFAULT_COEFF``.  Internal — lets a future resolver step
     # swap in per-vector defaults without re-parsing the expression.
@@ -297,23 +332,81 @@ class _Parser:
                 # Bare `!x` defaults to fully-replace (coeff=1.0).
                 coeff = float(sign) * DEFAULT_ABLATION_COEFF
         selector = self._selector()
-        trigger: str | None = None
+        trigger: Trigger | None = None
         if self._peek().kind == "AT":
             self._consume()
             tok = self._expect("IDENT")
-            trigger = str(tok.value)
-            if trigger not in _TRIGGER_PRESETS:
+            kw = str(tok.value)
+            if kw == "when":
+                # Probe-gated trigger: ``when:<probe><op><threshold>``.
+                # The trailing COLON disambiguates from preset names that
+                # happen to start with "when" (none ship today, but the
+                # check keeps future namespace freedom).
+                if self._peek().kind != "COLON":
+                    raise SteeringExprError(
+                        f"trigger '@when' requires ':' followed by a "
+                        f"probe gate (e.g. '@when:angry.calm>0.4'); "
+                        f"got {self._peek().kind}",
+                        col=self._peek().col,
+                    )
+                self._consume()  # COLON
+                trigger = self._parse_when_gate(tok.col)
+            elif kw in _TRIGGER_PRESETS:
+                trigger = _TRIGGER_PRESETS[kw]
+            else:
                 valid = ", ".join(sorted(_TRIGGER_PRESETS.keys()))
                 raise SteeringExprError(
-                    f"unknown trigger '@{trigger}'; valid: {valid}. "
-                    f"Note: '@' is for triggers only; HF revisions are not "
-                    f"accepted inside steering expressions.",
+                    f"unknown trigger '@{kw}'; valid: {valid}, or "
+                    f"'when:<probe><op><threshold>'.  Note: '@' is for "
+                    f"triggers only; HF revisions are not accepted "
+                    f"inside steering expressions.",
                     col=tok.col,
                 )
         return _Term(
             coeff=coeff, selector=selector, trigger=trigger,
             explicit_coeff=explicit, ablation=ablation,
         )
+
+    def _parse_when_gate(self, when_col: int) -> Trigger:
+        """Parse the ``when:`` payload into a probe-gated :class:`Trigger`.
+
+        Already consumed: ``@`` ``when`` ``:``.  Expects the probe
+        identifier (with optional ``.<pole>`` for bipolar concepts), one
+        of ``>``/``>=``/``<``/``<=``, then a numeric threshold.
+
+        Probe atoms are simple identifiers — no namespace prefix in v2.1
+        (the monitor is keyed by canonical concept name regardless of
+        which pack the probe came from).  No SAE variant suffix
+        either: gates fire on the live monitor reading, which is
+        already a single number per probe, not a per-variant tensor.
+        """
+        probe_tok = self._expect("IDENT")
+        probe = str(probe_tok.value)
+        if self._peek().kind == "DOT":
+            self._consume()
+            rhs = self._expect("IDENT")
+            probe = f"{probe}.{rhs.value}"
+        op_tok = self._consume()
+        op_kind = op_tok.kind
+        if op_kind not in ("GT", "GTE", "LT", "LTE"):
+            raise SteeringExprError(
+                f"expected comparison op (>, >=, <, <=) in '@when:' "
+                f"clause, got {op_kind} ({op_tok.value!r})",
+                col=op_tok.col,
+            )
+        op_str = {"GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="}[op_kind]
+        # Allow a leading ``-`` on the threshold so ``@when:x>-0.5``
+        # parses as ``threshold = -0.5``.  Comparison-op token already
+        # consumed; the next token may be MINUS or NUM.
+        sign = +1.0
+        if self._peek().kind == "MINUS":
+            self._consume()
+            sign = -1.0
+        elif self._peek().kind == "PLUS":
+            self._consume()
+        num_tok = self._expect("NUM")
+        threshold = sign * float(num_tok.value)
+        return Trigger.when(probe, op_str, threshold)  # type: ignore[arg-type]
 
     def _selector(self) -> _Selector:
         base = self._atom()
@@ -480,8 +573,11 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
         sel = term.selector
         base_key, base_sign = _resolve_atom(sel.base, namespace)
         coeff = term.coeff * base_sign
-        trig: Trigger | None
-        trig = _TRIGGER_PRESETS[term.trigger] if term.trigger is not None else None
+        # ``_Term.trigger`` already carries a resolved Trigger object
+        # (built by :class:`_Parser._term`) — preset names map through
+        # _TRIGGER_PRESETS at parse time, gates produce a fresh
+        # Trigger directly.  Pass through verbatim.
+        trig: Trigger | None = term.trigger
         if term.ablation:
             if sel.operator is not None:
                 raise SteeringExprError(
@@ -590,7 +686,37 @@ def _fmt_ablation(a: AblationTerm) -> str:
 def _trigger_name(trig: Trigger) -> str:
     if trig in _TRIGGER_CANONICAL:
         return _TRIGGER_CANONICAL[trig]
+    # Probe gate (v2.1) — round-trip via the ``when:`` syntax.  Gate-
+    # only triggers (the canonical shape produced by ``Trigger.when``)
+    # render as ``when:<probe><op><threshold>``; any other custom
+    # trigger (e.g. user-built with ``first_n=`` plus a gate) falls
+    # through to the ``"custom"`` sentinel — programmatic-only,
+    # callers don't expect it to round-trip through the grammar.
+    if (
+        trig.gate is not None
+        and trig.prompt is False
+        and trig.generated is True
+        and trig.thinking is True
+        and trig.response is True
+        and trig.first_n is None
+        and trig.after_n is None
+    ):
+        g = trig.gate
+        return f"when:{g.probe}{g.op}{_fmt_number(g.threshold)}"
     return "custom"
+
+
+def _fmt_number(x: float) -> str:
+    """Render a probe threshold compactly while staying parseable.
+
+    The grammar accepts a leading ``-`` before NUM, so negative
+    thresholds render with the minus sign in-line.  Uses ``%g`` so
+    integer-valued thresholds drop the trailing ``.0`` and small
+    fractions render at full precision without scientific notation.
+    """
+    if x < 0:
+        return f"-{x * -1.0:g}"
+    return f"{x:g}"
 
 
 def referenced_selectors(

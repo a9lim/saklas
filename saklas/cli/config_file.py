@@ -19,7 +19,14 @@ log = logging.getLogger(__name__)
 _KNOWN_KEYS = {
     "model", "vectors", "thinking",
     "temperature", "top_p", "max_tokens", "system_prompt",
+    "extraction_method",
+    "injection_mode", "theta_max",
+    "projection_metric",
 }
+
+_VALID_EXTRACTION_METHODS = ("dim", "pca")
+_VALID_INJECTION_MODES = ("angular", "additive")
+_VALID_PROJECTION_METRICS = ("mahalanobis", "euclidean")
 
 
 class ConfigFileError(ValueError, SaklasError):
@@ -36,6 +43,10 @@ class ConfigFile:
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     system_prompt: Optional[str] = None
+    extraction_method: Optional[str] = None  # "dim" | "pca"; None = use default
+    injection_mode: Optional[str] = None     # "angular" | "additive"; None = default
+    theta_max: Optional[float] = None        # radians; None = default π/2
+    projection_metric: Optional[str] = None  # "mahalanobis" | "euclidean"; None = default
 
     @classmethod
     def load_default(cls) -> Optional["ConfigFile"]:
@@ -123,6 +134,55 @@ class ConfigFile:
                     ) from e
                 vectors = text
 
+        extraction_method = data.get("extraction_method")
+        if extraction_method is not None:
+            if (
+                not isinstance(extraction_method, str)
+                or extraction_method not in _VALID_EXTRACTION_METHODS
+            ):
+                raise ConfigFileError(
+                    f"{path}: extraction_method must be one of "
+                    f"{list(_VALID_EXTRACTION_METHODS)} "
+                    f"(got {extraction_method!r})"
+                )
+
+        injection_mode = data.get("injection_mode")
+        if injection_mode is not None:
+            if (
+                not isinstance(injection_mode, str)
+                or injection_mode not in _VALID_INJECTION_MODES
+            ):
+                raise ConfigFileError(
+                    f"{path}: injection_mode must be one of "
+                    f"{list(_VALID_INJECTION_MODES)} "
+                    f"(got {injection_mode!r})"
+                )
+
+        theta_max = data.get("theta_max")
+        if theta_max is not None:
+            if not isinstance(theta_max, (int, float)) or isinstance(theta_max, bool):
+                raise ConfigFileError(
+                    f"{path}: theta_max must be a number (radians); "
+                    f"got {type(theta_max).__name__} {theta_max!r}"
+                )
+            if theta_max <= 0:
+                raise ConfigFileError(
+                    f"{path}: theta_max must be > 0 (got {theta_max!r})"
+                )
+            theta_max = float(theta_max)
+
+        projection_metric = data.get("projection_metric")
+        if projection_metric is not None:
+            if (
+                not isinstance(projection_metric, str)
+                or projection_metric not in _VALID_PROJECTION_METRICS
+            ):
+                raise ConfigFileError(
+                    f"{path}: projection_metric must be one of "
+                    f"{list(_VALID_PROJECTION_METRICS)} "
+                    f"(got {projection_metric!r})"
+                )
+
         return cls(
             model=data.get("model"),
             vectors=vectors,
@@ -131,6 +191,10 @@ class ConfigFile:
             top_p=data.get("top_p"),
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
+            extraction_method=extraction_method,
+            injection_mode=injection_mode,
+            theta_max=theta_max,
+            projection_metric=projection_metric,
         )
 
 
@@ -143,8 +207,12 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
     """
     out = ConfigFile()
     for c in configs:
-        for f in ("model", "thinking", "temperature",
-                  "top_p", "max_tokens", "system_prompt", "vectors"):
+        for f in (
+            "model", "thinking", "temperature",
+            "top_p", "max_tokens", "system_prompt", "vectors",
+            "extraction_method", "injection_mode", "theta_max",
+            "projection_metric",
+        ):
             v = getattr(c, f)
             if v is not None:
                 setattr(out, f, v)

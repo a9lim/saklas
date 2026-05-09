@@ -34,11 +34,15 @@ def test_trigger_rejected():
         )
 
 
-def test_ortho_operator_rejected():
-    """| (orthogonal) isn't meaningful at extract/merge time — require ~."""
-    with pytest.raises(merge.MergeError, match="~"):
+def test_aligned_operator_rejected():
+    """``~`` (component-aligned with onto) isn't meaningful at merge time —
+    require ``|`` (project-away).  Pre-v2.1 merge accepted ``~`` and
+    treated it as project-away, which silently inverted the meaning vs
+    the unified grammar (``~`` keeps aligned, ``|`` projects away).
+    """
+    with pytest.raises(merge.MergeError, match=r"\|"):
         merge.merge_into_pack(
-            "x", "0.5 default/happy|default/sad", model=None,
+            "x", "0.5 default/happy~default/sad", model=None,
         )
 
 
@@ -183,7 +187,12 @@ def test_merge_into_pack_explicit_model(monkeypatch, tmp_path):
 
 
 def test_merge_into_pack_with_projection(monkeypatch, tmp_path):
-    """merge_into_pack applies projection when ~ operator is used."""
+    """merge_into_pack applies project-away when ``|`` operator is used.
+
+    v2.1 fix-up: pre-v2.1 merge accepted ``~`` for project-away,
+    inverting the unified-grammar semantics (``~`` keeps aligned,
+    ``|`` projects away).  Now ``|`` is the canonical spelling.
+    """
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     # a = [1, 0]: direction along x
     # b = [1, 0]: same direction — projecting b out of a yields [0, 0]
@@ -193,7 +202,7 @@ def test_merge_into_pack_with_projection(monkeypatch, tmp_path):
     _make_concept_with_tensors(tmp_path, "default", "b_vec", {"gemma": p_b})
     dst = merge.merge_into_pack(
         "projected",
-        "1.0 default/a_vec~default/b_vec",
+        "1.0 default/a_vec|default/b_vec",
         model=None,
         force=False,
     )

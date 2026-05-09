@@ -34,6 +34,21 @@ class _Stub(SaklasSession):
     def __init__(self, profiles: dict) -> None:  # type: ignore[override]
         self._profiles = dict(profiles)
         self._steering_stack = []
+        self._steering_override_stack = []
+        # Session-level defaults consulted by _resolve_steering_override
+        # and _resolve_projection_metric when the LIFO has no overrides.
+        # Mirror the v2.1 SaklasSession defaults so the stub flows through
+        # the same code paths the real session uses.
+        self._injection_mode = "angular"
+        from saklas.core.hooks import DEFAULT_THETA_MAX
+        self._theta_max = DEFAULT_THETA_MAX
+        self._projection_metric = "mahalanobis"
+        # No whitener in stub mode — _materialize_projections silently
+        # falls back to Euclidean per-layer when whitener is None.  Stub
+        # the lazy ``whitener`` property to skip the model-dependent
+        # neutral-activation build path.
+        self._whitener = None
+        self._layer_means = {}
         self.events = EventBus()
         self._rebuild_calls: list[dict[str, float]] = []
         self._rebuild_entries: list[dict[str, tuple[float, Trigger]]] = []
@@ -50,6 +65,16 @@ class _Stub(SaklasSession):
 
     def _resolve_pole_aliases(self, entries):  # type: ignore[override]
         return {k: (float(v[0]), v[1]) for k, v in entries.items()}
+
+    # Override the lazy whitener property so tests stay model-free —
+    # the stub doesn't have a model/tokenizer to feed
+    # ``_build_whitener_from_cache_or_compute``.  Returns ``None`` so
+    # ``_materialize_projections`` falls back to Euclidean per-layer
+    # transparently (same path real sessions hit when neutral
+    # activations aren't cached yet).
+    @property
+    def whitener(self) -> None:  # type: ignore[override]
+        return None
 
 
 def test_single_scope_push_pop():

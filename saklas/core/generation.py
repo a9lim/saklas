@@ -449,6 +449,7 @@ def generate_steered(
     trigger_ctx: TriggerContext | None = None,
     past_key_values=None,
     cache_position_offset: int = 0,
+    score_callback: Callable[[], dict[str, float]] | None = None,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -468,6 +469,13 @@ def generate_steered(
 
     Sets ``state.finish_reason`` on exit: "stop" (EOS/external), "length"
     (max tokens), "stop_sequence" (stop string matched).
+
+    ``score_callback`` enables probe-gated triggers (v2.1): when set,
+    it's invoked after every forward pass and the returned
+    ``dict[str, float]`` is written to ``trigger_ctx.probe_scores``
+    so the next iteration's gates see fresh monitor readings.  Pay
+    nothing on the no-gate path — session-level wiring sets this to
+    ``None`` unless the active steering contains a gated trigger.
 
     Returns list of generated token IDs.
     """
@@ -590,6 +598,17 @@ def generate_steered(
                     use_cache=True,
                 )
                 prefill = False
+
+                # Probe-gate scoring (v2.1): after the forward (so
+                # ``HiddenCapture`` is freshly populated), refresh
+                # ``trigger_ctx.probe_scores`` so the *next* iteration's
+                # gates see last-step readings.  ``score_callback`` is
+                # ``None`` by default — sessions only wire it up when
+                # the active steering carries at least one probe-gated
+                # ``Trigger``.  Cost on the no-gate path: zero (the
+                # branch is a single ``is None`` check per step).
+                if score_callback is not None and trigger_ctx is not None:
+                    trigger_ctx.probe_scores = score_callback()
 
                 past_key_values = outputs.past_key_values
                 if not no_cache_mode and past_key_values is None and current_input.shape[1] > 1:

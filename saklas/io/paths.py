@@ -10,17 +10,23 @@ import re
 from pathlib import Path
 
 # Variant filename conventions:
-#   raw                 -> ``<safe_model_id>.safetensors``
-#   SAE                 -> ``<safe_model_id>_sae-<release>.safetensors``
+#   raw (DiM, default)  -> ``<safe_model_id>.safetensors``
+#   raw (PCA, legacy)   -> ``<safe_model_id>_pca.safetensors``
+#   SAE-DiM             -> ``<safe_model_id>_sae-<release>.safetensors``
+#   SAE-PCA (legacy)    -> ``<safe_model_id>_sae-<release>_pca.safetensors``
 #   transferred (v1.6)  -> ``<safe_model_id>_from-<safe_src>.safetensors``
 #
-# The literals ``_sae-`` and ``_from-`` are the separators — no HF model id
-# slug contains either, and the right-hand-side slugs (release strings,
-# safe-model-ids) follow the same ``[a-z0-9._-]`` discipline so the parse
-# is unambiguous.  Adding more variant kinds means adding another entry to
-# ``_VARIANT_SEPARATORS`` and another ``safe_*_suffix`` constructor.
+# The literals ``_sae-`` and ``_from-`` are the *kind* separators — no HF
+# model id slug contains either, and the right-hand-side slugs (release
+# strings, safe-model-ids) follow the same ``[a-z0-9._-]`` discipline so
+# the parse is unambiguous.  ``_pca`` is a *method* suffix: applied last,
+# stripped first on parse, never composed with ``_from-`` (transfer
+# preserves the source method).  Default method is DiM (no suffix);
+# ``_pca`` opts into the legacy contrastive-PCA tensors that coexist with
+# the canonical DiM file.
 _VARIANT_SEP_SAE = "_sae-"
 _VARIANT_SEP_FROM = "_from-"
+_METHOD_SUFFIX_PCA = "_pca"
 _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
     (_VARIANT_SEP_SAE, "sae"),
     (_VARIANT_SEP_FROM, "from"),
@@ -30,6 +36,26 @@ _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
 # external caller meant when they reached for it pre-1.6.
 _VARIANT_SEP = _VARIANT_SEP_SAE
 _UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
+
+# Recognised extraction methods.  ``"dim"`` is the canonical default
+# (difference-of-means, Im & Li 2025); ``"pca"`` is the legacy
+# contrastive-PCA path retained behind the ``--method pca`` flag and
+# the ``:pca`` selector variant.
+_KNOWN_METHODS: frozenset[str] = frozenset({"dim", "pca"})
+
+
+def _method_suffix(method: str) -> str:
+    """Filename suffix for an extraction method.  ``"dim"`` (default) returns
+    the empty string; ``"pca"`` returns ``_pca``.
+    """
+    if method == "dim":
+        return ""
+    if method == "pca":
+        return _METHOD_SUFFIX_PCA
+    raise ValueError(
+        f"unknown extraction method {method!r} (expected one of "
+        f"{sorted(_KNOWN_METHODS)})"
+    )
 
 
 def saklas_home() -> Path:
@@ -101,6 +127,7 @@ def tensor_filename(
     *,
     release: str | None = None,
     transferred_from: str | None = None,
+    method: str = "dim",
 ) -> str:
     """Construct the canonical tensor filename.
 
@@ -109,20 +136,38 @@ def tensor_filename(
     composed variants in v1.6.  ``transferred_from`` accepts either an
     HF model id (``"google/gemma-3-4b-it"``) or its safe form
     (``"google__gemma-3-4b-it"``); both flatten to the same slug.
+
+    ``method`` controls the trailing method suffix:
+
+      * ``"dim"`` (default, v2.1+) — no suffix.  Tensors at the canonical
+        path were extracted via difference-of-means.
+      * ``"pca"`` — legacy contrastive-PCA tensors land at the same path
+        with a ``_pca`` suffix appended after any kind suffix.
+        ``transferred_from`` rejects ``method="pca"`` because transfers
+        preserve their source method (the source's sidecar carries the
+        provenance string).
     """
     if release and transferred_from:
         raise ValueError(
             "tensor_filename: release and transferred_from are mutually exclusive"
         )
+    if transferred_from and method != "dim":
+        raise ValueError(
+            "tensor_filename: transferred_from preserves source method; "
+            "explicit method= is not supported"
+        )
+    suffix = _method_suffix(method)
     if release:
-        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.safetensors"
+        return (
+            f"{safe_model_id(model_id)}{safe_sae_suffix(release)}{suffix}.safetensors"
+        )
     if transferred_from:
         # Accept either form; ``safe_model_id`` is idempotent on
         # already-safe ids (no '/' to replace), so callers can pass
         # whichever they have.
         src = safe_model_id(transferred_from)
         return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.safetensors"
-    return f"{safe_model_id(model_id)}.safetensors"
+    return f"{safe_model_id(model_id)}{suffix}.safetensors"
 
 
 def sidecar_filename(
@@ -130,37 +175,64 @@ def sidecar_filename(
     *,
     release: str | None = None,
     transferred_from: str | None = None,
+    method: str = "dim",
 ) -> str:
     """Sidecar JSON partner for a tensor filename."""
     if release and transferred_from:
         raise ValueError(
             "sidecar_filename: release and transferred_from are mutually exclusive"
         )
+    if transferred_from and method != "dim":
+        raise ValueError(
+            "sidecar_filename: transferred_from preserves source method; "
+            "explicit method= is not supported"
+        )
+    suffix = _method_suffix(method)
     if release:
-        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.json"
+        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}{suffix}.json"
     if transferred_from:
         src = safe_model_id(transferred_from)
         return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.json"
-    return f"{safe_model_id(model_id)}.json"
+    return f"{safe_model_id(model_id)}{suffix}.json"
 
 
-def parse_tensor_filename(filename: str) -> tuple[str, str | None] | None:
+def parse_tensor_filename(
+    filename: str,
+) -> tuple[str, str | None] | None:
     """Reverse of :func:`tensor_filename`. Returns ``(safe_model_id, variant)``.
 
     ``variant`` is one of:
-      * ``None`` — raw PCA tensor (no separator).
-      * ``"sae-<release>"`` — SAE variant.
-      * ``"from-<safe_src>"`` — transferred-from variant.
+      * ``None`` — raw DiM tensor (no separator, no method suffix).
+      * ``"pca"`` — raw PCA tensor (legacy method suffix only).
+      * ``"sae-<release>"`` — SAE-DiM variant.
+      * ``"sae-<release>-pca"`` — SAE-PCA variant (legacy).
+      * ``"from-<safe_src>"`` — transferred-from variant (method-agnostic;
+        transfers preserve source method).
 
-    The variant string carries its kind prefix so callers can dispatch
-    without re-parsing.  Returns ``None`` for filenames that aren't
-    ``.safetensors``.
+    The variant string carries its kind / method tags so callers can
+    dispatch without re-parsing.  Returns ``None`` for filenames that
+    aren't ``.safetensors``.
     """
     if not filename.endswith(".safetensors"):
         return None
     stem = filename[: -len(".safetensors")]
+    # Method suffix is parsed first (right-to-left): ``_pca`` is applied
+    # last on construction, so we strip it before looking for the kind
+    # separator.  ``_pca`` cannot legally appear inside any kind slug —
+    # ``_UNSAFE_VARIANT_CHARS`` keeps slugs to ``[a-z0-9._-]`` and the
+    # leading ``_`` rules out collision.
+    is_pca = stem.endswith(_METHOD_SUFFIX_PCA)
+    if is_pca:
+        stem = stem[: -len(_METHOD_SUFFIX_PCA)]
     for sep, kind in _VARIANT_SEPARATORS:
         if sep in stem:
             model, value = stem.split(sep, 1)
-            return model, f"{kind}-{value}"
-    return stem, None
+            if kind == "from" and is_pca:
+                # Transferred-from never carries an explicit method —
+                # if a stray ``_pca`` ends up in the filename, treat it
+                # as part of the source slug to keep the round-trip
+                # idempotent.  No production path produces this.
+                value = f"{value}{_METHOD_SUFFIX_PCA}"
+            tag = f"{kind}-{value}"
+            return model, f"{tag}-pca" if is_pca and kind != "from" else tag
+    return stem, ("pca" if is_pca else None)

@@ -588,10 +588,12 @@ def enumerate_variants(folder: Path, model_id: str) -> dict[str, Path]:
     """List all on-disk tensor variants for ``(folder, model_id)``.
 
     Returns ``{variant_key: path}`` where ``variant_key`` is one of:
-      * ``"raw"`` — unsuffixed PCA tensor.
-      * ``"sae-<release>"`` — SAE variant (one per release).
-      * ``"from-<safe_src>"`` — transferred-from variant (one per source
-        model the user has aligned from).
+      * ``"raw"`` — DiM raw tensor (canonical default, v2.1+).
+      * ``"pca"`` — legacy PCA raw tensor.
+      * ``"sae-<release>"`` — SAE-DiM variant (canonical, one per release).
+      * ``"sae-<release>-pca"`` — legacy SAE-PCA variant.
+      * ``"from-<safe_src>"`` — transferred-from variant (method-agnostic;
+        transfers preserve their source method, recorded in the sidecar).
 
     Paths point at the ``.safetensors`` files; callers derive the sidecar
     path by swapping the extension.
@@ -612,8 +614,9 @@ def enumerate_variants(folder: Path, model_id: str) -> dict[str, Path]:
         model, variant = parsed
         if model != target_model:
             continue
-        # ``variant`` is already prefixed with its kind ("sae-..." /
-        # "from-...") or None for raw — see ``parse_tensor_filename``.
+        # ``variant`` is already prefixed with its kind / method tags
+        # ("sae-...", "sae-...-pca", "from-...", "pca") or ``None`` for
+        # the canonical DiM raw tensor — see ``parse_tensor_filename``.
         key = "raw" if variant is None else variant
         out[key] = p
     return out

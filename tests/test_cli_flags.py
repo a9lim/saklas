@@ -455,7 +455,12 @@ def _setup_compare_env(monkeypatch, tmp_path):
 def _mock_profile(agg_fn, pl_fn):
     """Return a simple duck-typed mock (not a Profile subclass) with cosine_similarity."""
     class MockProfile:
-        def cosine_similarity(self, other, *, per_layer=False):
+        def cosine_similarity(self, other, *, per_layer=False, whitener=None):
+            # ``whitener`` is accepted (forwarded by ``_run_compare`` after
+            # the v2.1 ``--metric mahalanobis`` wiring) but ignored here —
+            # the mocks return a fixed scalar that doesn't depend on the
+            # metric.  Tests that need to exercise the Mahalanobis path
+            # use ``test_mahalanobis.py`` against real Profile + tensors.
             return pl_fn(other) if per_layer else agg_fn(other)
     return MockProfile()
 
@@ -510,7 +515,11 @@ def test_run_compare_one_arg_verbose_text(monkeypatch, tmp_path, capsys):
     from saklas.io.selectors import invalidate
     invalidate()
 
-    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v"])
+    # ``--metric euclidean`` keeps the mock-driven test runner-focused —
+    # the v2.1 default flipped to ``mahalanobis``, which would try to
+    # load a real whitener from disk and fail under the mocked Profile.
+    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v",
+              "--metric", "euclidean"])
     out = capsys.readouterr().out
     assert "angry.calm vs all installed" in out
     assert "happy.sad" in out
@@ -551,7 +560,8 @@ def test_run_compare_one_arg_verbose_json(monkeypatch, tmp_path, capsys):
     from saklas.io.selectors import invalidate
     invalidate()
 
-    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v", "-j"])
+    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v", "-j",
+              "--metric", "euclidean"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert data["target"] == "angry.calm"
@@ -590,7 +600,8 @@ def test_run_compare_matrix_verbose_json(monkeypatch, tmp_path, capsys):
     from saklas.io.selectors import invalidate
     invalidate()
 
-    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v", "-j"])
+    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v", "-j",
+                                                  "--metric", "euclidean"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert "per_layer" in data
@@ -628,7 +639,8 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch, tmp_path, capsys
     from saklas.io.selectors import invalidate
     invalidate()
 
-    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v"])
+    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v",
+                                                  "--metric", "euclidean"])
     out = capsys.readouterr().out
     assert "per-layer" not in out
     assert "per_layer" not in out
@@ -921,6 +933,7 @@ def test_run_compare_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
         "vector", "compare",
         "angry.calm:sae-my-release", "happy.sad",
         "-m", model_id,
+        "--metric", "euclidean",
     ])
     out = capsys.readouterr().out
     # Variant suffix carries into display keys.

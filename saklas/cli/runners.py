@@ -53,11 +53,69 @@ def _resolve_probes(raw: list[str] | None) -> list[str]:
 def _make_session(args: argparse.Namespace):
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes)
+    # ``--legacy`` is a v2.0-backcompat shorthand: additive injection +
+    # PCA extraction.  Mutually exclusive with ``--steer-mode`` (the
+    # canonical injection-mode flag).  Probe-bootstrap method is forced
+    # to ``"pca"`` so first-run extractions match the v2.0 stack;
+    # ``--method`` on ``vector extract`` is independent (per-call).
+    legacy = bool(getattr(args, "legacy", False))
+    injection_explicit = getattr(args, "injection_mode", None)
+    metric_explicit = getattr(args, "projection_metric", None)
+    if legacy and injection_explicit is not None:
+        print(
+            f"--legacy and --steer-mode are mutually exclusive "
+            f"(--legacy implies --steer-mode additive); got "
+            f"--steer-mode {injection_explicit}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if legacy and metric_explicit is not None:
+        print(
+            f"--legacy and --projection-metric are mutually exclusive "
+            f"(--legacy implies --projection-metric euclidean); got "
+            f"--projection-metric {metric_explicit}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if legacy and bool(getattr(args, "no_dls", False)):
+        print(
+            "--legacy and --no-dls are mutually exclusive "
+            "(--legacy already implies DLS off)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    # ``--legacy`` also flips the runtime ``~`` / ``|`` projection
+    # metric to Euclidean (the v2.0/v2.1 plain Gram-Schmidt behavior),
+    # and disables DLS (v2.1 introduced data-driven layer selection;
+    # the v2.0 stack used the old ``drop_edges=(2,2)`` heuristic which
+    # is gone in v2.1 — under ``--legacy`` we keep every layer rather
+    # than re-implement the removed edge-drop just for backcompat).
+    if legacy:
+        injection_mode = "additive"
+        extraction_method = "pca"
+        projection_metric = "euclidean"
+        dls = False
+    else:
+        # Steering-injection options: ``None`` flows through to the v2.1
+        # session defaults (angular + π/2).  CLI flag and YAML are both
+        # already merged onto ``args`` by ``_load_effective_config``.
+        injection_mode = injection_explicit or "angular"
+        extraction_method = "dim"
+        projection_metric = getattr(args, "projection_metric", None) or "mahalanobis"
+        # ``--no-dls`` opts out of the discriminative-layer mask without
+        # toggling the rest of the v2.1 stack.
+        dls = not bool(getattr(args, "no_dls", False))
+    theta_max = getattr(args, "theta_max", None)
     return SaklasSession.from_pretrained(
         args.model, device=args.device, quantize=args.quantize,
         probes=probe_categories,
         system_prompt=getattr(args, "system_prompt", None),
         max_tokens=getattr(args, "max_tokens", 1024),
+        injection_mode=injection_mode,
+        theta_max=theta_max,
+        extraction_method=extraction_method,
+        projection_metric=projection_metric,
+        dls=dls,
     )
 
 
@@ -97,6 +155,29 @@ def _load_effective_config(args: argparse.Namespace):
     args.system_prompt = composed.system_prompt
     args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
     args.config_vectors = composed.vectors
+    # Honor YAML ``extraction_method:`` only when the user hasn't already
+    # set --method on the CLI (argparse defaults the attr to "dim").
+    if (
+        composed.extraction_method is not None
+        and getattr(args, "method", None) is None
+    ):
+        args.method = composed.extraction_method
+    # Steering-injection options on tui/serve: YAML wins when CLI is unset.
+    if (
+        composed.injection_mode is not None
+        and getattr(args, "injection_mode", None) is None
+    ):
+        args.injection_mode = composed.injection_mode
+    if (
+        composed.theta_max is not None
+        and getattr(args, "theta_max", None) is None
+    ):
+        args.theta_max = composed.theta_max
+    if (
+        composed.projection_metric is not None
+        and getattr(args, "projection_metric", None) is None
+    ):
+        args.projection_metric = composed.projection_metric
     ensure_vectors_installed(composed, strict=getattr(args, "strict", False))
     return composed
 
@@ -452,9 +533,35 @@ def _run_clone(args: argparse.Namespace) -> None:
     print(f"Cloned persona -> local/{canonical}")
 
 
+def _resolve_legacy_method(args: argparse.Namespace) -> str:
+    """Resolve ``vector extract --legacy`` / ``--method`` into a method string.
+
+    ``--legacy`` is a v2.0-backcompat shorthand for ``--method pca``.
+    Mutually exclusive with ``--method``: passing both is a hard error
+    (we'd otherwise silently pick one and the user wouldn't know which).
+    """
+    legacy = bool(getattr(args, "legacy", False))
+    method = getattr(args, "method", None)
+    if legacy and method is not None:
+        print(
+            "extract: --legacy and --method are mutually exclusive "
+            "(--legacy implies --method pca)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if legacy:
+        return "pca"
+    return method or "dim"
+
+
 def _run_extract(args: argparse.Namespace) -> None:
     _require_model(args)
     from saklas.core.session import canonical_concept_name
+
+    # Validate flag combinations before kicking off the model load —
+    # otherwise the user pays a multi-GB download just to learn their
+    # CLI invocation had conflicting options.
+    method = _resolve_legacy_method(args)
 
     if len(args.concept) == 1:
         raw = args.concept[0]
@@ -479,10 +586,14 @@ def _run_extract(args: argparse.Namespace) -> None:
     import pathlib
     from saklas.io.paths import tensor_filename
     from saklas.io.selectors import _all_concepts
+    # ``method`` was resolved at the top of the function (pre-flight
+    # validation; see ``_resolve_legacy_method``).
     candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
     candidate_folders.append(session._local_concept_folder(canonical))
     requested_release = getattr(args, "sae", None)
-    candidate_tensor_name = tensor_filename(session.model_id, release=requested_release)
+    candidate_tensor_name = tensor_filename(
+        session.model_id, release=requested_release, method=method,
+    )
     candidate_paths = [
         pathlib.Path(folder) / candidate_tensor_name for folder in candidate_folders
     ]
@@ -497,7 +608,7 @@ def _run_extract(args: argparse.Namespace) -> None:
             if p.exists():
                 p.unlink()
 
-    extract_kwargs = {}
+    extract_kwargs: dict = {"method": method}
     if getattr(args, "sae", None):
         extract_kwargs["sae"] = args.sae
     if getattr(args, "sae_revision", None):
@@ -515,17 +626,21 @@ def _run_extract(args: argparse.Namespace) -> None:
     # `canonical` may be "name:sae-<release>" — peel it for filename construction.
     if ":sae-" in canonical:
         core_name, _, rel = canonical.partition(":sae-")
-        tensor_name = tensor_filename(session.model_id, release=rel)
+        tensor_name = tensor_filename(
+            session.model_id, release=rel, method=method,
+        )
     else:
         core_name = canonical
-        tensor_name = tensor_filename(session.model_id, release=None)
+        tensor_name = tensor_filename(
+            session.model_id, release=None, method=method,
+        )
     final_paths = [pathlib.Path(f) / tensor_name for f in candidate_folders]
     final_path = next((p for p in final_paths if p.exists()), None)
     if final_path is None:
         final_path = (
             pathlib.Path(session._local_concept_folder(core_name)) / tensor_name
         )
-    print(f"extracted {canonical} -> {final_path}")
+    print(f"extracted {canonical} ({method}) -> {final_path}")
 
 
 _PACK_RUNNERS = {
@@ -705,6 +820,41 @@ def _run_compare(args: argparse.Namespace) -> None:
     from saklas.io.paths import vectors_dir
     from saklas.core.profile import Profile, ProfileError
 
+    # ``--legacy`` is a v2.0-backcompat shorthand for ``--metric euclidean``.
+    # Mutually exclusive with an explicit ``--metric``.  Default since
+    # v2.1 is ``"mahalanobis"`` — ``args.metric is None`` means "use the
+    # default" (and ``--legacy`` overrides to euclidean).
+    legacy = bool(getattr(args, "legacy", False))
+    explicit_metric = vars(args).get("metric") is not None
+    if legacy and explicit_metric:
+        print(
+            "compare: --legacy and --metric are mutually exclusive "
+            "(--legacy implies --metric euclidean)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if legacy:
+        metric = "euclidean"
+    else:
+        metric = getattr(args, "metric", None) or "mahalanobis"
+
+    # Mahalanobis path: load the per-model whitener once up front, share
+    # across every ``cosine_similarity`` call below.  Failure is fatal —
+    # if the user explicitly asked for the whitened metric, falling
+    # silently back to Euclidean would hide the missing cache.
+    whitener: "Any | None" = None
+    if metric == "mahalanobis":
+        from saklas.core.mahalanobis import LayerWhitener, WhitenerError
+
+        try:
+            whitener = LayerWhitener.from_cache(
+                args.model,
+                ridge_scale=getattr(args, "ridge_scale", 1.0),
+            )
+        except WhitenerError as e:
+            print(f"compare: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Expand selectors into (name, variant) pairs. Variant travels with the
     # name through the load loop so ``foo:sae`` picks the SAE tensor.
     names: list[tuple[str, str | None]] = []
@@ -792,7 +942,7 @@ def _run_compare(args: argparse.Namespace) -> None:
             print(f"compare: no other profiles found for model {args.model}", file=sys.stderr)
             sys.exit(1)
 
-        scores = {name: target.cosine_similarity(p) for name, p in others.items()}
+        scores = {name: target.cosine_similarity(p, whitener=whitener) for name, p in others.items()}
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         if args.json_output:
@@ -803,7 +953,7 @@ def _run_compare(args: argparse.Namespace) -> None:
                 top3 = ranked[:3]
                 result["per_layer_top3"] = {
                     n: {str(k): round(v, 6)
-                        for k, v in target.cosine_similarity(others[n], per_layer=True).items()}
+                        for k, v in target.cosine_similarity(others[n], per_layer=True, whitener=whitener).items()}
                     for n, _ in top3
                 }
             print(_json.dumps(result, indent=2))
@@ -816,7 +966,7 @@ def _run_compare(args: argparse.Namespace) -> None:
                 print()
                 print("  per-layer (top 3):")
                 for name, _ in ranked[:3]:
-                    per_layer = target.cosine_similarity(others[name], per_layer=True)
+                    per_layer = target.cosine_similarity(others[name], per_layer=True, whitener=whitener)
                     print(f"    {name}:")
                     for layer in sorted(per_layer):
                         print(f"      layer {layer:>3}: {per_layer[layer]:+.4f}")
@@ -830,19 +980,19 @@ def _run_compare(args: argparse.Namespace) -> None:
     if len(ordered) == 2:
         a_name, b_name = ordered
         a, b = profiles[a_name], profiles[b_name]
-        sim = a.cosine_similarity(b)
+        sim = a.cosine_similarity(b, whitener=whitener)
 
         if args.json_output:
             result = {"a": a_name, "b": b_name, "model": args.model,
                       "similarity": round(sim, 6)}
             if args.verbose:
                 result["per_layer"] = {str(k): round(v, 6)
-                                       for k, v in a.cosine_similarity(b, per_layer=True).items()}
+                                       for k, v in a.cosine_similarity(b, per_layer=True, whitener=whitener).items()}
             print(_json.dumps(result, indent=2))
         else:
             print(f"{a_name} ~ {b_name}: {sim:+.4f}")
             if args.verbose:
-                per_layer = a.cosine_similarity(b, per_layer=True)
+                per_layer = a.cosine_similarity(b, per_layer=True, whitener=whitener)
                 for layer in sorted(per_layer):
                     print(f"  layer {layer:>3}: {per_layer[layer]:+.4f}")
         return
@@ -855,7 +1005,7 @@ def _run_compare(args: argparse.Namespace) -> None:
             if a_name == b_name:
                 matrix[a_name][b_name] = 1.0
             else:
-                matrix[a_name][b_name] = profiles[a_name].cosine_similarity(profiles[b_name])
+                matrix[a_name][b_name] = profiles[a_name].cosine_similarity(profiles[b_name], whitener=whitener)
 
     if args.json_output:
         result = {"model": args.model, "concepts": ordered,
@@ -869,7 +1019,7 @@ def _run_compare(args: argparse.Namespace) -> None:
                     per_layer[key] = {
                         str(k): round(v, 6)
                         for k, v in profiles[a_name].cosine_similarity(
-                            profiles[b_name], per_layer=True
+                            profiles[b_name], per_layer=True, whitener=whitener,
                         ).items()
                     }
             result["per_layer"] = per_layer

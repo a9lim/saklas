@@ -1,6 +1,6 @@
 """saklas — local activation steering + trait monitoring for HuggingFace causal LMs."""
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 from saklas.core.errors import SaklasError
 from saklas.core.events import (
@@ -12,6 +12,7 @@ from saklas.core.events import (
     SteeringCleared,
     VectorExtracted,
 )
+from saklas.core.mahalanobis import LayerWhitener, WhitenerError
 from saklas.core.profile import Profile, ProfileError
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import GenState, SaklasSession
@@ -24,6 +25,8 @@ __all__ = [
     "SaklasSession",
     "SaklasError",
     "GenState",
+    "LayerWhitener",
+    "WhitenerError",
     "Profile",
     "ProfileError",
     "SamplingConfig",

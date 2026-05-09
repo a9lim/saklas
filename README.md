@@ -6,7 +6,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 
-Saklas is a library for activation steering and trait probing on local HuggingFace models. You give it any concept, from "angry" to "bacterium", and it automatically generates contrastive pairs, extracts a direction from them, and then adds that direction to the model's hidden states when it's time to generate text. The model itself isn't touched, so you can change the steering strength as you go.
+Saklas is a library for activation steering and trait probing on local HuggingFace models. You give it any concept, from "angry" to "bacterium", and it automatically generates contrastive pairs, extracts a direction from them, and then steers the model's hidden states along that direction when it's time to generate text. The model itself isn't touched, so you can change the steering strength as you go.
 
 Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. The main feature is a terminal UI with live steering controls and a built-in trait monitor that scores every generated token against any probe you care about, with live averages and sparklines so you can see where in a response a trait shifts. There's also an HTTP server that supports both OpenAI `/v1/*` and Ollama `/api/*` on the same port so Open WebUI, Enchanted, or any other OpenAI/Ollama client can talk to a steered model without changes. Persona cloning works on any text sample: point it at a corpus and it pulls out a voice and style vector without hand-labeled pairs.
 
@@ -28,7 +28,9 @@ If you notice any errors while using the program, please update to the most rece
 
 ## Credits
 
-The contrastive-PCA approach comes from the Representation Engineering paper ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)). [repeng](https://github.com/vgel/repeng) by Theia Vogel is the well-known implementation in this space and is what most people might reach for. Saklas implements the same idea from a different angle: repeng is lean and more of a library, saklas is more of a TUI with monitoring and a chat server bundled in. Both are worth your time!
+The contrastive-pair approach comes from the Representation Engineering paper ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)). [repeng](https://github.com/vgel/repeng) by Theia Vogel is the well-known implementation in this space and is what most people might reach for. Saklas implements the same idea from a different angle: repeng is lean and more of a library, saklas is more of a TUI with monitoring and a chat server bundled in. Both are worth your time!
+
+Since v2.1 the default extractor is difference-of-means (DiM) per [Im & Li, 2025](https://arxiv.org/abs/2502.02716), and the per-layer share allocation runs in the Mahalanobis metric (whitened against per-model activation covariance) instead of the v1.x Euclidean magnitude. The legacy v1.x stack (PCA extraction, additive steering, Euclidean shares and cosine) is available all together via `--legacy` on `tui`, `serve`, `vector extract`, and `vector compare`, or piecemeal via `--method pca`, `--steer-mode additive`, and `--metric euclidean` on the relevant verbs.
 
 ---
 
@@ -89,16 +91,20 @@ pip install -e ".[dev]"        # + pytest
 
 ### Steering vectors
 
-Saklas takes pairs of sentences and runs them through the model, and then subtracts the two sides. It does an SVD at each layer, takes the largest principal component, and combines them into a steering tensor. When it's time to generate text, it takes every layer and adds `alpha × direction` to the hidden state, then rescales it back to the original magnitude.
+Saklas takes pairs of sentences and runs them through the model, and then subtracts the two sides. By default it averages those differences at each layer (difference-of-means, or DiM); this gives you the direction from one pole to the other. The legacy contrastive-PCA path (first principal component of the diffs at each layer) is still available via `--method pca` if you want to compare or reproduce v1.x results.
 
-Each layer's PCA share is baked into the tensor magnitudes at extraction, so the same α means approximately the same strength across architectures. Roughly:
+When it's time to generate text, the default injection mode is angular: at each layer, saklas rotates the residual stream toward the concept direction. The per-layer rotations are share-weighted so that the cumulative rotation across the residual stream sums to `|α| × π/2`. So α=1 fully aligns the residual with the concept, α=0.5 lands at 45° cumulative, and α=0 is a no-op. The legacy additive path (add `α × direction` then rescale back to the original norm, with the v1.x `_STEER_GAIN = 2.0`) is still available via `--steer-mode additive` and is bit-identical to v1.x.
 
-- **0.1–0.3**: soft nudge
-- **0.3–0.6**: coherent steered
-- **0.6–0.8**: starting to be incoherent
-- **0.8–1.0**: gibberish
+Roughly, for coherent steering under angular:
 
-When multiple vectors are selected, they are added together in sequence. 
+- **0.0–0.2**: barely visible
+- **0.2–0.5**: coherent steered
+- **0.5–0.7**: strong, often a clear behavior shift
+- **0.7–1.0**: saturation territory; expect coherence to break near 1.0
+
+These are rough bands measured on one model and one concept (gemma-4-e4b-it on `angry.calm`); your mileage will vary across models and concepts. Please sweep on your own setup before settling on a number.
+
+When multiple vectors are selected, they compose by summing into a single rotation per layer; cooperating vectors compound, opposing ones cancel.
 
 ### Ablation
 
@@ -113,9 +119,9 @@ Ablation is a runtime operation on activations: no new tensors land on disk, and
 
 ### SAE-backed extraction (experimental)
 
-> **Experimental** This pipeline is not as tested as the contrastive-PCA path. α was measured and calibrated on raw PCA and may not cleanly transfer. Quality also depends on which SAE release you pick. I would recommend using a low α (0.1–0.2) and sweeping. For production use the raw pipeline should be the default. 
+> **Experimental** This pipeline is not as tested as the raw extraction path. α was measured and calibrated on raw extraction and may not cleanly transfer. Quality also depends on which SAE release you pick. I would recommend using a low α (0.1–0.2) and sweeping. For production use the raw pipeline should be the default.
 
-Install `saklas[sae]` and pass `--sae <release>` to `vector extract` to run contrastive PCA in sparse-autoencoder feature space. Saklas routes through SAELens, so any published release it covers (GemmaScope, Eleuther Meta-LLaMA-3.1 SAEs, Joseph Bloom's, Apollo, Goodfire) should be supported. The output uses the same backend as raw PCA.
+Install `saklas[sae]` and pass `--sae <release>` to `vector extract` to run extraction in sparse-autoencoder feature space (DiM by default; pass `--method pca` for the v1.x SAE-PCA path). Saklas routes through SAELens, so any published release it covers (GemmaScope, Eleuther Meta-LLaMA-3.1 SAEs, Joseph Bloom's, Apollo, Goodfire) should be supported. The output uses the same hook backend as raw extraction.
 
 ```bash
 saklas vector extract honest.deceptive -m google/gemma-2-2b-it \
@@ -176,13 +182,13 @@ The transfer carries a `transfer_quality_estimate` in its sidecar (median per-la
 
 ### Probe quality diagnostics
 
-Every contrastive extraction emits per-layer metrics alongside the tensor: explained variance ratio, intra-pair variance, inter-pair alignment, and diff-to-PC projection. `saklas vector why <concept> -m MODEL` shows them as a quality stoplight below the layer histogram. A soft warning fires at extraction time when the median across layers looks degenerate.
+Every contrastive extraction emits per-layer metrics alongside the tensor: explained variance ratio (or score proxy under DiM), intra-pair variance, inter-pair alignment, and diff-to-direction projection. `saklas vector why <concept> -m MODEL` shows them as a quality stoplight below the layer histogram. A soft warning fires at extraction time when the median across layers looks degenerate.
 
 Bundled probes extracted before v1.6 don't carry diagnostics on disk. Please run `saklas pack refresh <selector> -m MODEL` to backfill.
 
 ### Vector comparison
 
-`Profile.cosine_similarity(other)` gives you weighted cosine similarity between two steering profiles over their shared layers. The CLI has three modes: ranked comparison of one selected vector against all installed profiles, direct pairwise comparison, and N×N similarity matrices. The TUI has `/compare` for interactive use.
+`Profile.cosine_similarity(other)` gives you weighted cosine similarity between two steering profiles over their shared layers. Pass `whitener=session.whitener` to score in the Mahalanobis metric instead of Euclidean. The CLI has three modes: ranked comparison of one selected vector against all installed profiles, direct pairwise comparison, and N×N similarity matrices, with `--metric mahalanobis` to switch metrics. The TUI has `/compare` for interactive use.
 
 This lets you find concepts that are correlated. For example, on Gemma 4 the model encodes `masculine.feminine` and `traditional.progressive` along the same direction (+0.53 to +0.59 weighted cosine across the 31b and e4b checkpoints), and `hallucinating.grounded` overlaps with `humorous.serious` (+0.53 to +0.66). Steering one nudges the other; the entanglement is in the model's representation, not in the probe extraction.
 
@@ -223,6 +229,9 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | `-q`, `--quantize` | `4bit` or `8bit` (CUDA only) |
 | `-d`, `--device` | `auto` (default), `cuda`, `mps`, `cpu` |
 | `-p`, `--probes` | Categories: `all`, `none`, `affect`, `epistemic`, `alignment`, `register`, `social_stance`, `cultural` |
+| `--steer-mode` | `angular` (default) or `additive` (legacy v1.x add-and-rescale path) |
+| `--theta-max` | Max rotation angle for angular mode (radians; default π/2 ≈ 1.5708) |
+| `--legacy` | v2.0 backcompat preset: PCA extraction with additive injection. Mutually exclusive with `--steer-mode`. |
 | `-c`, `--config` | Load setup YAML |
 | `-s`, `--strict` | With `-c`: fail on missing vectors |
 
@@ -478,6 +487,9 @@ curl -N http://localhost:8000/api/chat -d '{
 | `-H`, `--host` | `0.0.0.0` | Bind address |
 | `-P`, `--port` | `8000` | Bind port |
 | `-S`, `--steer` | None | Default steering expression, e.g. `"0.2 cheerful"` |
+| `--steer-mode` | `angular` | `angular` (default) or `additive` (legacy v1.x path) |
+| `--theta-max` | `π/2` | Max rotation angle for angular mode (radians) |
+| `--legacy` | off | v2.0 backcompat preset: PCA extraction with additive injection. Mutually exclusive with `--steer-mode`. |
 | `-C`, `--cors` | None | CORS origin, repeatable |
 | `-k`, `--api-key` | None | Bearer auth. Falls back to `$SAKLAS_API_KEY`. |
 
@@ -507,12 +519,14 @@ saklas pack export gguf <selector> [-m MODEL] [-o PATH] [--model-hint HINT]
 ### Vector operations
 
 ```bash
-saklas vector extract <concept> | <pos> <neg> [-m MODEL] [-f]
+saklas vector extract <concept> | <pos> <neg> [-m MODEL] [-f] [--method dim|pca] [--sae RELEASE [--sae-revision REV]] [--legacy]
 saklas vector merge <name> <expression> [-m] [-f] [-s]
 saklas vector clone <corpus-file> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S] [-f]
-saklas vector compare <concepts...> -m MODEL [-v] [-j]
+saklas vector compare <concepts...> -m MODEL [-v] [-j] [--metric euclidean|mahalanobis] [--legacy]
 saklas vector why <concept> -m MODEL [-j]
 ```
+
+`--method dim` (default) writes to `<concept>/<safe_model>.safetensors`; `--method pca` writes to `<concept>/<safe_model>_pca.safetensors` so the two can coexist on disk. Address either at steer time with the variant suffix: `0.3 honest` picks the canonical (DiM) tensor, `0.3 honest:pca` picks the legacy PCA tensor. The `--legacy` shorthand sets `--method pca` for v2.0 reproduction.
 
 Merge expressions share the steering grammar. Terms combine with `+` or `-`, coefficients lead each term, `~` keeps the component aligned with another direction, and `|` projects another direction's component out. For example, `saklas vector merge dehallu "0.8 default/creative.conventional|default/hallucinating.grounded"` gives you creative with hallucination projected out.
 

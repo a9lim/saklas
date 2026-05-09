@@ -30,7 +30,7 @@ def _unit_vec(dim: int, seed: int = 0) -> torch.Tensor:
 
 
 def test_fast_path_both_only_composes_single_tensor():
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     vec = _unit_vec(16)
     hook.recompose(
@@ -43,7 +43,7 @@ def test_fast_path_both_only_composes_single_tensor():
 
 
 def test_slow_path_non_both_uses_groups():
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     vec = _unit_vec(16)
     hook.recompose(
@@ -57,7 +57,7 @@ def test_slow_path_non_both_uses_groups():
 
 
 def test_equal_triggers_collapse_into_single_group():
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     v1 = _unit_vec(16, seed=1)
     v2 = _unit_vec(16, seed=2)
@@ -75,7 +75,7 @@ def test_equal_triggers_collapse_into_single_group():
 
 
 def test_mixed_both_and_non_both_keeps_both_in_slow_path():
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     v_both = _unit_vec(16, seed=1)
     v_after = _unit_vec(16, seed=2)
@@ -92,7 +92,7 @@ def test_mixed_both_and_non_both_keeps_both_in_slow_path():
 
 
 def test_zero_alpha_group_dropped():
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     vec = _unit_vec(16)
     hook.recompose(
@@ -107,7 +107,7 @@ def test_zero_alpha_group_dropped():
 def test_fast_path_hook_apply_bit_identical_to_manual_add():
     """Fast-path apply matches manual add+rescale for a BOTH-only hook."""
     mod = _Passthrough()
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     vec = _unit_vec(16) * 0.5
     hook.recompose(
@@ -133,7 +133,7 @@ def test_fast_path_hook_apply_bit_identical_to_manual_add():
 def test_slow_path_skips_when_no_group_active():
     """AFTER_THINKING during prefill should no-op — hidden unchanged."""
     mod = _Passthrough()
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext(is_prefill=True)  # prefill → AFTER_THINKING off
     vec = _unit_vec(16)
     hook.recompose(
@@ -153,7 +153,7 @@ def test_slow_path_skips_when_no_group_active():
 def test_slow_path_applies_when_group_active():
     """AFTER_THINKING during decode-response should apply."""
     mod = _Passthrough()
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext(is_prefill=False, thinking=False, gen_step=5)
     vec = _unit_vec(16) * 0.5
     hook.recompose(
@@ -172,7 +172,7 @@ def test_slow_path_applies_when_group_active():
 def test_ctx_mutation_between_forwards_gates_apply():
     """Flipping ctx.is_prefill between forwards toggles the AFTER_THINKING group."""
     mod = _Passthrough()
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext(is_prefill=True)
     vec = _unit_vec(16) * 0.5
     hook.recompose(
@@ -199,7 +199,7 @@ def test_ctx_mutation_between_forwards_gates_apply():
 
 def test_manager_threads_ctx_into_hooks():
     """SteeringManager.apply_to_model plumbs its shared ctx into every hook."""
-    mgr = SteeringManager()
+    mgr = SteeringManager(injection_mode="additive")
     layers = nn.ModuleList([_Passthrough() for _ in range(3)])
     profile = {1: _unit_vec(16), 2: _unit_vec(16, seed=1)}
     mgr.add_vector("demo", profile, alpha=0.5, trigger=Trigger.AFTER_THINKING)
@@ -214,7 +214,7 @@ def test_manager_threads_ctx_into_hooks():
 
 def test_manager_alpha_scaled_by_steer_gain():
     """Manager multiplies user alpha by _STEER_GAIN before composing."""
-    mgr = SteeringManager()
+    mgr = SteeringManager(injection_mode="additive")
     layers = nn.ModuleList([_Passthrough() for _ in range(2)])
     vec = _unit_vec(16)
     mgr.add_vector("demo", {0: vec.clone()}, alpha=0.5, trigger=Trigger.BOTH)

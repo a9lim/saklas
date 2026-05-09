@@ -117,20 +117,36 @@ class _StubHandle:
 
 
 def _fake_extract(monkeypatch, *, response=None):
-    """Replace ``extract_contrastive`` inside the extraction module."""
+    """Replace both ``extract_contrastive`` and ``extract_difference_of_means``
+    inside the extraction module.
+
+    The pipeline dispatches to one or the other based on ``method=``; tests
+    that don't care which method ran (the dispatch architecture itself, not
+    the per-method math) get one shared stub via this helper.  Tests that
+    do care about per-method dispatch hit ``captured["method"]`` to read
+    back which extractor fired.
+    """
     from saklas.core import extraction as E
 
     captured: dict = {}
 
-    def _fake(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
-        captured["pairs"] = pairs
-        captured["sae"] = sae
-        captured["concept_label"] = concept_label
-        captured["call_count"] = captured.get("call_count", 0) + 1
-        profile = response if response is not None else {0: torch.ones(4), 2: torch.ones(4)}
-        return profile, {}
+    def _make(label):
+        def _fake(model, tokenizer, pairs, layers, device=None, *,
+                  sae=None, concept_label=None, **_kwargs):
+            # ``**_kwargs`` swallows ``dls`` / ``layer_means`` /
+            # ``whitener`` (added in v2.1) — the fake doesn't model
+            # any of them, just records what the pipeline asked for.
+            captured["pairs"] = pairs
+            captured["sae"] = sae
+            captured["concept_label"] = concept_label
+            captured["method"] = label
+            captured["call_count"] = captured.get("call_count", 0) + 1
+            profile = response if response is not None else {0: torch.ones(4), 2: torch.ones(4)}
+            return profile, {}
+        return _fake
 
-    monkeypatch.setattr(E, "extract_contrastive", _fake)
+    monkeypatch.setattr(E, "extract_contrastive", _make("pca"))
+    monkeypatch.setattr(E, "extract_difference_of_means", _make("dim"))
     return captured
 
 

@@ -8,7 +8,7 @@ import logging
 import warnings
 from importlib import resources as _resources
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -430,86 +430,179 @@ def _emit_diagnostics_warning(
         )
 
 
-def extract_contrastive(
+def compute_dls_mask(
+    mu_pos: dict[int, torch.Tensor],
+    mu_neg: dict[int, torch.Tensor],
+    directions: dict[int, torch.Tensor],
+    layer_means: dict[int, torch.Tensor] | None,
+) -> set[int]:
+    """Discriminative-Layer-Selection (Dang & Ngo 2026, Eq. 9) keep set.
+
+    Returns the set of layer indices that pass the centered-DLS check::
+
+        μ̃_pos = (μ_pos − μ_neutral) · d̂
+        μ̃_neg = (μ_neg − μ_neutral) · d̂
+        keep iff μ̃_pos · μ̃_neg < 0
+
+    Layers where both pos- and neg-class means project to the same side of
+    the neutral baseline along ``d̂`` are non-discriminative — they encode
+    something correlated with concept *intensity* but not concept
+    *polarity*, and steering through them rotates a residual that's
+    already aligned with the same pole as the neutral baseline (i.e.
+    they don't carry the contrast).  Dropping them concentrates share
+    on layers that genuinely encode the pos/neg axis.
+
+    **Centering** is required.  Without subtracting ``μ_neutral`` raw
+    activations all project positively along ``d̂`` at most layers
+    because of shared base-rate variance, and the sign-of-projection
+    test fires near-uniformly across layers (verified empirically: the
+    literal-paper uncentered version on gemma-4-e4b-it / angry.calm
+    keeps 17/42 in fragmented patterns vs. centered 31/42 in the
+    expected mid-stack band).  When ``layer_means`` is ``None``,
+    centering is undefined and the helper returns *all* layers — DLS
+    is disabled silently and the caller falls back to "keep
+    everything."  Real session-driven extraction always passes
+    ``layer_means`` (built before extraction during ``bootstrap_probes``);
+    fixture / mock paths skip it.
+
+    Args:
+        mu_pos: per-layer mean of positive-class final-content-token
+            hidden states, fp32, shape ``[D]`` per layer.
+        mu_neg: same for the negative class.  Must cover the same layer
+            set as ``mu_pos``.
+        directions: per-layer unsigned direction vectors (typically
+            ``unit(μ_pos − μ_neg)`` for DiM, or the principal component
+            for PCA).  Same layer set as ``mu_pos``.  Magnitude doesn't
+            matter — only sign of projection — but unit-normed input
+            is recommended for numerical sanity.
+        layer_means: per-layer neutral baseline (90-prompt mean, cached
+            under ``~/.saklas/models/<id>/layer_means.safetensors``).
+            ``None`` disables DLS (returns all layers).
+
+    Returns:
+        ``set[int]`` of layers that pass the discriminative check.  Empty
+        set is *not* returned — if every layer fails, returns the full
+        layer set with a warning, on the principle that something is
+        better than nothing for a degenerate concept (the caller's
+        downstream extractor diagnostics will already flag the probe
+        quality).
+    """
+    # Empty-dict is treated identically to ``None`` — both mean "no
+    # baseline available, fall back to keep-all silently."  Without
+    # the explicit early-out, every layer in the loop would hit
+    # ``mu_n = layer_means.get(L) → None`` and fall through the
+    # conservative-keep branch, which produces the same observable
+    # result but routes through confusing per-layer logic.  This
+    # guard also catches the v2.1 footgun where ``probes=[]``
+    # sessions had ``self._layer_means = {}`` propagate to the
+    # helper, silently disabling DLS even when neutrals were
+    # cacheable — fixed at the session layer via the lazy
+    # ``layer_means`` property, but the helper-level guard is cheap
+    # insurance against future leak paths.
+    if layer_means is None or not layer_means:
+        return set(mu_pos)
+    keep: set[int] = set()
+    # ``checkable`` is the set of layers we *attempted* the
+    # discriminative test on — i.e. layers with a valid direction.
+    # Layers explicitly skipped for missing direction or zero-norm
+    # direction are excluded from the all-failed fallback (they're
+    # degenerate by construction; re-including them via the fallback
+    # would silently undo the skip).
+    checkable: set[int] = set()
+    for L in mu_pos:
+        d = directions.get(L)
+        if d is None:
+            continue
+        d32 = d.to(dtype=torch.float32, device="cpu").reshape(-1)
+        d_norm = float(d32.norm())
+        if d_norm < 1e-12:
+            continue  # degenerate direction — drop, do not include in fallback
+        checkable.add(L)
+        mu_n = layer_means.get(L)
+        if mu_n is None:
+            # Layer-means doesn't cover this layer.  Conservative: keep —
+            # we'd rather over-include than mistakenly drop a real
+            # discriminative layer due to missing baseline data.
+            keep.add(L)
+            continue
+        d_hat = d32 / d_norm
+        mu_n_cpu = mu_n.to(dtype=torch.float32, device="cpu").reshape(-1)
+        mu_p_cpu = mu_pos[L].to(dtype=torch.float32, device="cpu").reshape(-1)
+        mu_g_cpu = mu_neg[L].to(dtype=torch.float32, device="cpu").reshape(-1)
+        proj_pos = float(((mu_p_cpu - mu_n_cpu) * d_hat).sum())
+        proj_neg = float(((mu_g_cpu - mu_n_cpu) * d_hat).sum())
+        if proj_pos * proj_neg < 0.0:
+            keep.add(L)
+    if not keep:
+        # All checkable layers failed the discriminative check.  Probe
+        # is degenerate on this model (the diagnostics warning will
+        # fire separately).  Keep the *checkable* set rather than every
+        # layer in ``mu_pos`` — re-including layers explicitly skipped
+        # for missing/zero-norm directions would silently undo the
+        # skip.  When no layers are checkable at all (caller passed
+        # all-degenerate directions) the fallback returns an empty
+        # set; the share-bake step's all-zero handler kicks in.
+        warnings.warn(
+            "DLS: no layers pass the discriminative check; falling back "
+            "to keep-all-checkable.  Probe likely degenerate on this "
+            "model — review the diagnostics warning above.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return checkable
+    return keep
+
+
+def _capture_diffs_for_pairs(
     model,
     tokenizer,
     pairs: list[dict],
     layers,
-    device=None,
+    device,
     *,
     sae: "SaeBackend | None" = None,
-    drop_edges: tuple[int, int] = (2, 2),
-    concept_label: str | None = None,
-) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
-    """Contrastive direction extraction via PCA across all layers.
+) -> tuple[
+    int,
+    dict[int, list[torch.Tensor]],
+    dict[int, list[torch.Tensor]],
+    dict[int, list[torch.Tensor]],
+    list[float],
+    set[int] | None,
+    dict[int, torch.Tensor],
+    dict[int, torch.Tensor],
+]:
+    """Run the contrastive forward-pass capture loop.
 
-    Hooks every layer in the same 2N forward passes. For each layer,
-    computes the first principal component of pos-neg differences.
+    Shared by the PCA and DiM extractors — both consume the same set of
+    per-layer diffs, raw activation norm sums, per-layer pos/neg means
+    (for centered DLS), and (when an SAE is wired) per-layer pos/neg
+    activation stacks.  Only the post-capture per-layer direction
+    computation differs between methods.
 
-    Per-layer extraction yields a raw direction (scaled to the mean
-    activation norm of that layer) and a raw score: explained variance
-    ratio for multi-pair, diff_norm/activation_norm for single-pair.
-    The returned tensors are "baked": each direction is pre-multiplied
-    by its share ``score_i / sum(scores)`` so the layer-weighting math
-    that used to live in the steering hook collapses to a flat
-    ``user_alpha * _STEER_GAIN * sum(directions)``. All invariances
-    (layer-count, score-magnitude) are preserved — they just move from
-    apply-time to extract-time.
+    SAE coverage is enforced here so callers don't repeat the check; an
+    empty intersection raises :class:`SaeCoverageError` before the forward
+    loop burns time.
 
-    Args:
-        pairs: List of {"positive": str, "negative": str} prompt pairs.
-        sae: Optional SAE backend. When provided, extraction runs a
-            feature-space ``pca_center`` branch restricted to the layers
-            covered by the SAE, and decodes the principal feature-space
-            direction back into model space before baking shares.
-        drop_edges: ``(n_lo, n_hi)`` — exclude the first ``n_lo`` and last
-            ``n_hi`` model layers from the share distribution. Early layers
-            carry tokenization / lexical features; late layers are strongly
-            aligned with the unembedding head. Steering at either end tends
-            to corrupt surface form rather than latent meaning — on some
-            architectures (e.g. ministral-3, loaded via
-            :func:`_load_text_from_multimodal`) L0 PCA share inflates to
-            3–4× the model median, which produces immediate grammar collapse
-            at otherwise-coherent α. Dropping the edges suppresses the
-            pathology uniformly; the remaining share budget redistributes
-            over retained layers automatically. Default ``(2, 2)``; pass
-            ``(0, 0)`` to recover pre-fix behavior (useful for tests on
-            small mock models and for A/B comparisons).
-        concept_label: Optional human-readable name surfaced in the
-            soft-warning text when diagnostics flag a degenerate probe.
-            Defaults to a generic label.
+    Per-layer pos/neg running sums are tracked at O(D) per layer
+    regardless of N_pairs (cheap; no per-pair tensor list to manage)
+    and converted to means on return.  These feed
+    :func:`compute_dls_mask` for the discriminative-layer check; SAE
+    paths get the per-pair pos/neg stacks too via ``pos_per_layer`` /
+    ``neg_per_layer`` so feature-space encoding doesn't need a second
+    pass.
 
     Returns:
-        ``(profile, diagnostics)``:
-
-        * ``profile`` — dict mapping layer_idx → baked direction vector.
-          Dropped edge layers are simply absent from the dict; downstream
-          hook attachment iterates over present keys.
-        * ``diagnostics`` — dict mapping layer_idx → ``{evr,
-          intra_pair_variance_mean, intra_pair_variance_std,
-          inter_pair_alignment, diff_principal_projection}``.  Same key
-          set as ``profile`` (no diagnostics for dropped edges).  Empty
-          dict when ``len(pairs) < 2`` and the SVD path is skipped.
+        ``(n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
+        norm_sums_cpu, sae_layer_set, mean_pos_per_layer,
+        mean_neg_per_layer)``.  ``pos_per_layer`` and ``neg_per_layer``
+        are empty dicts when ``sae is None``.  ``sae_layer_set`` is
+        ``None`` when ``sae is None``.  ``mean_pos_per_layer`` and
+        ``mean_neg_per_layer`` always cover every layer in ``[0,
+        n_layers)`` in fp32 on CPU.
     """
-    if device is None:
-        device = next(model.parameters()).device
-
     n_layers = len(layers)
 
-    n_drop_lo, n_drop_hi = drop_edges
-    if n_drop_lo < 0 or n_drop_hi < 0:
-        raise ValueError(f"drop_edges must be non-negative, got {drop_edges}")
-    if n_drop_lo + n_drop_hi >= n_layers:
-        raise ValueError(
-            f"drop_edges={drop_edges} would leave no retained layers "
-            f"(n_layers={n_layers})"
-        )
-    edge_idx = set(range(n_drop_lo)) | set(
-        range(n_layers - n_drop_hi, n_layers)
-    )
-
-    # Coverage check for the SAE branch — raise early before any forward
-    # passes if the backend covers none of this model's layers.
+    sae_layer_set: set[int] | None
     if sae is not None:
         from saklas.core.errors import SaeCoverageError
         covered = sae.layers & set(range(n_layers))
@@ -518,26 +611,33 @@ def extract_contrastive(
                 f"SAE release '{sae.release}' covers no layers for a "
                 f"{n_layers}-layer model"
             )
-        sae_layers = sorted(covered)
-        sae_layer_set = set(sae_layers)  # O(1) membership for the inner loop
+        sae_layer_set = set(sorted(covered))
     else:
-        sae_layers = None
         sae_layer_set = None
 
     # Accumulate per-layer diffs and running norm sums.
     # norm_sums is a GPU tensor to avoid per-layer .item() sync points
     # (was 2 * N_pairs * N_layers GPU→CPU syncs, now 0 during the loop).
-    diffs_per_layer: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
+    diffs_per_layer: dict[int, list[torch.Tensor]] = {
+        i: [] for i in range(n_layers)
+    }
     # SAE path: keep the pos/neg tensors themselves (pca_center needs both,
     # not just their diff), but only for layers the SAE actually covers —
     # non-covered layers would allocate O(N · d_model) fp32 tensors for
     # nothing. Raw path: these dicts stay empty, no cost.
     pos_per_layer: dict[int, list[torch.Tensor]] = (
-        {i: [] for i in sae_layer_set} if sae is not None else {}
+        {i: [] for i in sae_layer_set} if sae_layer_set is not None else {}
     )
     neg_per_layer: dict[int, list[torch.Tensor]] = (
-        {i: [] for i in sae_layer_set} if sae is not None else {}
+        {i: [] for i in sae_layer_set} if sae_layer_set is not None else {}
     )
+    # Per-layer pos/neg running sums for centered DLS.  fp32 on CPU
+    # throughout — adds N_pairs * D per pair to the sum, where N_pairs
+    # at the bundled n=45 is well within fp32 precision for any
+    # reasonable D.  None initially; first pair seeds, subsequent pairs
+    # accumulate in place.
+    sum_pos: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
+    sum_neg: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
     norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
 
     # On MPS, keep diffs on CPU — SVD runs there anyway, and the
@@ -554,7 +654,21 @@ def extract_contrastive(
             p_d = p.to(diff_device)
             n_d = n.to(diff_device)
             diffs_per_layer[idx].append(p_d - n_d)
-            if sae is not None and idx in sae_layer_set:
+            # Centered-DLS prep: running fp32 sums on CPU.  Per-layer
+            # cost: one float-cast + one in-place add per pair, vs. the
+            # diff path's stack-then-svd which dominates anyway.
+            p_cpu = p_d.to(dtype=torch.float32, device="cpu")
+            n_cpu = n_d.to(dtype=torch.float32, device="cpu")
+            sp = sum_pos[idx]
+            if sp is None:
+                sum_pos[idx] = p_cpu.clone()
+                sum_neg[idx] = n_cpu.clone()
+            else:
+                sp += p_cpu
+                neg_acc = sum_neg[idx]
+                assert neg_acc is not None
+                neg_acc += n_cpu
+            if sae_layer_set is not None and idx in sae_layer_set:
                 # fp32 matches the diff dtype discipline; avoids fp16 overflow.
                 pos_per_layer[idx].append(p_d.float())
                 neg_per_layer[idx].append(n_d.float())
@@ -564,12 +678,174 @@ def extract_contrastive(
         if _mps:
             torch.mps.empty_cache()
 
+    norm_sums_cpu = norm_sums.tolist()
+
+    n_pairs = len(pairs)
+    mean_pos_per_layer: dict[int, torch.Tensor] = {}
+    mean_neg_per_layer: dict[int, torch.Tensor] = {}
+    if n_pairs > 0:
+        for idx in range(n_layers):
+            sp = sum_pos[idx]
+            sn = sum_neg[idx]
+            if sp is not None and sn is not None:
+                mean_pos_per_layer[idx] = sp / float(n_pairs)
+                mean_neg_per_layer[idx] = sn / float(n_pairs)
+
+    return (
+        n_layers,
+        diffs_per_layer,
+        pos_per_layer,
+        neg_per_layer,
+        norm_sums_cpu,
+        sae_layer_set,
+        mean_pos_per_layer,
+        mean_neg_per_layer,
+    )
+
+
+def _share_bake_and_warn(
+    raw: dict[int, tuple[torch.Tensor, float]],
+    diagnostics_per_layer: dict[int, dict[str, float]],
+    keep_set: set[int] | None,
+    *,
+    concept_label: str | None,
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
+    """Apply layer mask + share-baking + emit the diagnostics warning.
+
+    Both extractors close on this — the math is identical regardless of
+    whether the per-layer directions came from PCA SVD or from the
+    mean-of-diffs.  Mutates ``raw`` and ``diagnostics_per_layer`` in
+    place by removing layers not in ``keep_set``.
+
+    ``keep_set=None`` means "keep every layer in ``raw``" (no DLS) — the
+    fast path for tests / mock paths that bypass the discriminative
+    check entirely.  When provided, layers absent from ``keep_set`` are
+    dropped from both ``raw`` and ``diagnostics_per_layer`` before
+    share-baking.  The dropped-layer indices are simply absent from the
+    returned profile dict; downstream hook attachment iterates the
+    keys.
+    """
+    if keep_set is not None:
+        drop = [i for i in raw if i not in keep_set]
+        for i in drop:
+            raw.pop(i, None)
+            diagnostics_per_layer.pop(i, None)
+
+    # Bake shares into the stored tensors. Total share is 1.0 across retained
+    # layers, so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
+    # magnitude budget is fixed by the reference activation norms and
+    # distributed in proportion to per-layer signal quality.  At apply time
+    # the additive hook does ``alpha * _STEER_GAIN * sum(baked)``; the
+    # angular hook reads the same baked magnitudes as per-layer weights.
+    total_score = sum(score for _, score in raw.values())
+    if total_score <= 0:
+        # Pathological extraction (all-zero diffs).  Fall back to uniform
+        # across retained layers.
+        shares = {idx: 1.0 / len(raw) for idx in raw}
+    else:
+        shares = {idx: score / total_score for idx, (_, score) in raw.items()}
+
+    baked = {idx: direction * shares[idx] for idx, (direction, _) in raw.items()}
+    _emit_diagnostics_warning(diagnostics_per_layer, concept_label=concept_label)
+    return baked, diagnostics_per_layer
+
+
+def extract_contrastive(
+    model,
+    tokenizer,
+    pairs: list[dict],
+    layers,
+    device=None,
+    *,
+    sae: "SaeBackend | None" = None,
+    concept_label: str | None = None,
+    dls: bool = True,
+    layer_means: dict[int, torch.Tensor] | None = None,
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
+    """Contrastive direction extraction via PCA across all layers.
+
+    Hooks every layer in the same 2N forward passes. For each layer,
+    computes the first principal component of pos-neg differences.
+
+    Per-layer extraction yields a raw direction (scaled to the mean
+    activation norm of that layer) and a raw score: explained variance
+    ratio for multi-pair, diff_norm/activation_norm for single-pair.
+    The returned tensors are "baked": each direction is pre-multiplied
+    by its share ``score_i / sum(scores)`` so the layer-weighting math
+    that used to live in the steering hook collapses to a flat
+    ``user_alpha * _STEER_GAIN * sum(directions)``. All invariances
+    (layer-count, score-magnitude) are preserved — they just move from
+    apply-time to extract-time.
+
+    Note: as of v2.1 PCA is the **legacy** extraction method; the default
+    is :func:`extract_difference_of_means`.  PCA picks the axis of maximum
+    contrastive variance, which can be near-orthogonal to the actual
+    class-separation axis on noisy pair sets (Im & Li 2025); DiM picks
+    the class-separation axis directly.  Both share the share-baking and
+    diagnostics machinery — only the per-layer direction computation
+    differs.
+
+    **DLS replaces edge-drop in v2.1.**  The `drop_edges` parameter is
+    gone; the layer mask is now derived from the data itself via
+    :func:`compute_dls_mask` (centered Selective-Steering, Dang & Ngo
+    2026).  Layers where both pos- and neg-class means project to the
+    same side of the neutral baseline along ``d̂`` are dropped — they
+    encode concept *intensity* rather than concept *polarity* and
+    inflate share without aiding discrimination.  Empirical incidence
+    (gemma-4-e4b-it / angry.calm: 11/42 dropped; Qwen3.6-27B / same:
+    13/64 dropped, mostly contiguous L49–L60).  Dropped layers are
+    simply absent from the returned profile dict.
+
+    Args:
+        pairs: List of {"positive": str, "negative": str} prompt pairs.
+        sae: Optional SAE backend. When provided, extraction runs a
+            feature-space ``pca_center`` branch restricted to the layers
+            covered by the SAE, and decodes the principal feature-space
+            direction back into model space before baking shares.
+        concept_label: Optional human-readable name surfaced in the
+            soft-warning text when diagnostics flag a degenerate probe.
+            Defaults to a generic label.
+        dls: When ``True`` (default since v2.1), apply the centered
+            DLS mask via :func:`compute_dls_mask`.  When ``False``,
+            keep every layer — the path tests use for small mock models
+            (DLS on synthetic 4-layer data is degenerate).
+        layer_means: Per-layer neutral baseline (``{layer: [D] fp32}``)
+            used by DLS centering.  Real session-driven extraction always
+            passes this from ``self._layer_means``; ``None`` falls back
+            to "keep all layers" silently (with a warning logged from
+            ``compute_dls_mask`` when DLS is enabled but layer_means is
+            missing).
+
+    Returns:
+        ``(profile, diagnostics)``:
+
+        * ``profile`` — dict mapping layer_idx → baked direction vector.
+          Dropped edge layers are simply absent from the dict; downstream
+          hook attachment iterates over present keys.
+        * ``diagnostics`` — dict mapping layer_idx → ``{evr,
+          intra_pair_variance_mean, intra_pair_variance_std,
+          inter_pair_alignment, diff_principal_projection}``.  Same key
+          set as ``profile`` (no diagnostics for dropped edges).  Empty
+          dict when ``len(pairs) < 2`` and the SVD path is skipped.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    (n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
+     norm_sums_cpu, sae_layer_set,
+     mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
+        model, tokenizer, pairs, layers, device, sae=sae,
+    )
+
+    n_pairs = len(pairs)
+    n_norm_samples = n_pairs * 2  # pos + neg per pair
+
     # SAE branch: feature-space pca_center, decode back to model space.
-    # Runs only on the covered-layer subset; returns early with baked
-    # tensors restricted to those layers.
+    # Runs only on the covered-layer subset; returns early via the shared
+    # share-baking helper with tensors restricted to those layers.
     if sae is not None:
-        norm_sums_cpu = norm_sums.tolist()
-        n_norm_samples = len(pairs) * 2
+        assert sae_layer_set is not None  # capture helper guarantees this
+        sae_layers = sorted(sae_layer_set)
         directions: dict[int, torch.Tensor] = {}
         # Accumulate EVR scalars as tensors, one .tolist() after the loop
         # (matches the raw-PCA path's discipline — one GPU→CPU transfer).
@@ -620,35 +896,34 @@ def extract_contrastive(
         raw: dict[int, tuple[torch.Tensor, float]] = {
             idx: (directions[idx], evr) for idx, evr in zip(sae_layers, evrs)
         }
-
-        for i in edge_idx:
-            raw.pop(i, None)
-            diagnostics_per_layer.pop(i, None)
-
-        # Bake shares across the covered subset (same logic as raw path).
-        total_score = sum(score for _, score in raw.values())
-        # Defensive: evr is always positive when any singular value exists;
-        # the fallback never triggers in practice.
-        if total_score <= 0:
-            shares = {i: 1.0 / len(raw) for i in raw}
-        else:
-            shares = {i: score / total_score for i, (_, score) in raw.items()}
-
-        baked = {i: direction * shares[i] for i, (direction, _) in raw.items()}
-        _emit_diagnostics_warning(
-            diagnostics_per_layer, concept_label=concept_label,
+        # SAE-path DLS: feature-space directions decoded back to model
+        # space; centered DLS check uses the *decoded* direction against
+        # the same neutral baseline.  Unit-norm the decoded vector for
+        # the projection check (magnitude carries no sign information).
+        sae_directions_unit = {
+            idx: directions[idx] / max(float(directions[idx].norm()), 1e-12)
+            for idx in sae_layers
+        }
+        sae_pos_means = {
+            idx: torch.stack(pos_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        sae_neg_means = {
+            idx: torch.stack(neg_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        keep_set = compute_dls_mask(
+            sae_pos_means, sae_neg_means, sae_directions_unit,
+            layer_means,
+        ) if dls else None
+        return _share_bake_and_warn(
+            raw, diagnostics_per_layer, keep_set,
+            concept_label=concept_label,
         )
-        return baked, diagnostics_per_layer
 
-    # Per-layer: compute direction and score, then bake shares into magnitude.
-    n_pairs = len(pairs)
-    n_norm_samples = n_pairs * 2  # pos + neg per pair
-    # Single GPU→CPU transfer for all layer norms
-    norm_sums_cpu = norm_sums.tolist()
-
-    # First pass: extract raw (direction, score) per layer.
-    raw: dict[int, tuple[torch.Tensor, float]] = {}
-    diagnostics_per_layer: dict[int, dict[str, float]] = {}
+    # Per-layer: compute direction and score via PCA, then bake shares.
+    raw = {}
+    diagnostics_per_layer = {}
 
     if n_pairs < 2:
         # Single pair: score as diff norm relative to activation magnitude.
@@ -716,27 +991,302 @@ def extract_contrastive(
                 scores_cpu[idx],
             )
 
-    for i in edge_idx:
-        raw.pop(i, None)
-        diagnostics_per_layer.pop(i, None)
-
-    # Bake shares into the stored tensors. Total share is 1.0 across retained
-    # layers, so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
-    # magnitude budget is fixed by the reference activation norms and
-    # distributed in proportion to per-layer signal quality. At apply time
-    # the hook just does alpha * _STEER_GAIN * sum(baked) — no shares,
-    # no sums, no per-layer weights.
-    total_score = sum(score for _, score in raw.values())
-    if total_score <= 0:
-        # Pathological extraction (all-zero diffs). Fall back to uniform
-        # across retained layers.
-        shares = {idx: 1.0 / len(raw) for idx in raw}
+    # Centered-DLS mask.  PCA's per-layer principal components feed the
+    # discriminative check; layer means come from the session's cached
+    # neutrals.  ``dls=False`` skips the mask entirely (tests on small
+    # mock models where the synthetic data is too small for the
+    # discriminative test to be meaningful).
+    if dls:
+        # Build the unit-normed direction dict from raw (the share-bake
+        # multiplies by score; we want the direction shape only).
+        unit_dirs = {
+            idx: tup[0] / max(float(tup[0].norm()), 1e-12)
+            for idx, tup in raw.items()
+        }
+        keep_set = compute_dls_mask(
+            mean_pos_per_layer, mean_neg_per_layer, unit_dirs, layer_means,
+        )
     else:
-        shares = {idx: score / total_score for idx, (_, score) in raw.items()}
+        keep_set = None
+    return _share_bake_and_warn(
+        raw, diagnostics_per_layer, keep_set, concept_label=concept_label,
+    )
 
-    baked = {idx: direction * shares[idx] for idx, (direction, _) in raw.items()}
-    _emit_diagnostics_warning(diagnostics_per_layer, concept_label=concept_label)
-    return baked, diagnostics_per_layer
+
+def extract_difference_of_means(
+    model,
+    tokenizer,
+    pairs: list[dict],
+    layers,
+    device=None,
+    *,
+    sae: "SaeBackend | None" = None,
+    concept_label: str | None = None,
+    whitener: "Any | None" = None,
+    dls: bool = True,
+    layer_means: dict[int, torch.Tensor] | None = None,
+) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
+    """Contrastive direction extraction via **difference of means** (DiM).
+
+    Per-layer direction is the mean over pos-neg diffs ``mean_i (h_pos_i -
+    h_neg_i)``, computed in fp32.
+
+    **Score (default since v2.1, opt-out):** ``||direction||_M / ref_norm``
+    where ``||·||_M`` is the Mahalanobis norm against the per-layer
+    activation covariance built from cached neutral activations.  The
+    ``/ ref_norm`` normalization is what makes the existing share-bake
+    pipeline give pure-Mahalanobis hook shares: ``share_L_hook =
+    ||m_L||_M / Σ ||m_L'||_M``, with ``ref_norm_L`` cancelling from the
+    cross-layer ratio (preserves the Euclidean bake's algebraic shape).
+    Layers where the contrastive signal sits in low-variance directions
+    score higher than under Euclidean — the metric directly measures
+    "how much linearly-decodable signal does this layer carry."
+
+    **Score (Euclidean fallback):** when ``whitener=None``, score is
+    ``||direction||_2 / ref_norm`` — the v1.x form.  Used by tests and
+    by sessions that haven't populated ``neutral_activations`` yet.
+    Pure Euclidean magnitude weighting at hook time.
+
+    Theoretical motivation: Im & Li (2025, arXiv 2502.02716) prove that
+    the mean-of-differences direction is optimal for the linear-steering
+    objective under squared error.  PCA-of-diffs picks the axis of maximum
+    variance among the diffs, which can be near-orthogonal to the actual
+    class-separation axis on noisy / inconsistent pair sets — DiM picks
+    the class-separation axis directly.  AxBench (Wu et al., ICML 2025)
+    corroborates empirically.  The Mahalanobis score is the natural
+    extension of LEACE-style metric awareness (Belrose et al. 2023,
+    arXiv 2306.03819) to the share-allocation problem: under anisotropic
+    activation distributions, Euclidean magnitude over-weights layers
+    whose mean-diff happens to align with high-variance noise axes; the
+    Mahalanobis form measures signal strength against the activation
+    distribution itself.
+
+    Shape and metadata are identical to :func:`extract_contrastive`:
+    same returned tuple ``(profile, diagnostics)``, same edge-drop and
+    share-baking discipline, same diagnostics fields.  The only behavior
+    delta is the per-layer score (and therefore share allocation) when
+    a whitener is provided; downstream hook math sees a baked direction
+    tensor either way.
+
+    Args / Returns: see :func:`extract_contrastive`.  The ``sae=...``
+    branch runs the same mean-of-diffs in feature space and decodes back
+    through the SAE before share-baking; no SVD is performed.  The
+    Mahalanobis score is computed on the *decoded* model-space direction,
+    where the residual-stream whitener applies; SAE feature-space norms
+    don't have a meaningful Mahalanobis interpretation under the same
+    covariance.
+
+    The ``whitener`` parameter is a :class:`saklas.core.mahalanobis.LayerWhitener`
+    (or ``None`` for the Euclidean fallback).  Layers absent from the
+    whitener fall back to Euclidean per-layer — the whitener may
+    legitimately cover a subset of layers in edge cases.
+
+    **DLS replaces edge-drop in v2.1.**  The ``drop_edges`` parameter
+    is gone; layer selection is data-driven via :func:`compute_dls_mask`.
+    Pass ``dls=False`` to skip the mask (tests / mock paths).  See
+    :func:`extract_contrastive` for the rationale.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    (n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
+     norm_sums_cpu, sae_layer_set,
+     mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
+        model, tokenizer, pairs, layers, device, sae=sae,
+    )
+
+    n_pairs = len(pairs)
+    n_norm_samples = n_pairs * 2  # pos + neg per pair
+
+    # SAE branch: mean of (F_pos - F_neg) in feature space, decode back.
+    if sae is not None:
+        assert sae_layer_set is not None
+        sae_layers = sorted(sae_layer_set)
+        directions: dict[int, torch.Tensor] = {}
+        score_tensors: list[torch.Tensor] = []
+        diagnostics_per_layer: dict[int, dict[str, float]] = {}
+        for idx in sae_layers:
+            pos_stack = torch.stack(pos_per_layer[idx])  # (N, d_model), fp32
+            neg_stack = torch.stack(neg_per_layer[idx])
+            ref_norm = norm_sums_cpu[idx] / n_norm_samples
+
+            with torch.no_grad():
+                F_pos = sae.encode_layer(idx, pos_stack.to(device)).float()
+                F_neg = sae.encode_layer(idx, neg_stack.to(device)).float()
+
+            # DiM in feature space: mean of paired diffs.  No SVD, no
+            # orientation step — pos-minus-neg already points pos-ward.
+            v_feat = (F_pos - F_neg).mean(dim=0)
+
+            with torch.no_grad():
+                v_model = sae.decode_layer(idx, v_feat).float()
+
+            # Score: Mahalanobis norm of the decoded model-space direction
+            # (same shape as the raw branch — see ``score`` docstring).
+            # Whitener-absent or layer-uncovered → Euclidean fallback so
+            # SAE extraction without a populated neutral_activations cache
+            # still works.
+            if whitener is not None and whitener.covers(idx):
+                m_norm = whitener.mahalanobis_norm(idx, v_model)
+                score_value = m_norm / max(ref_norm, 1e-8)
+                score_tensors.append(torch.tensor(score_value, dtype=torch.float32))
+            else:
+                v_model_norm = v_model.norm().clamp(min=1e-8)
+                score_tensors.append(v_model_norm / max(ref_norm, 1e-8))
+
+            directions[idx] = _normalize(v_model, ref_norm=ref_norm)
+
+            # Diagnostics in model space against the contrastive diffs —
+            # same shape as PCA so consumers don't branch.  Principal
+            # direction is the decoded DiM vector, EVR-as-score-proxy is
+            # the same diff-norm-vs-activation ratio used elsewhere for
+            # mean-based scoring (matches single-pair PCA's ``score``).
+            diff_model = (pos_stack - neg_stack).to("cpu")
+            diff_norms = diff_model.norm(dim=-1)
+            score_proxy = float(
+                (diff_norms.mean() / max(ref_norm * 2, 1e-8)).item()
+            )
+            diagnostics_per_layer[idx] = _compute_layer_diagnostics(
+                diff_model,
+                v_model.detach().to("cpu"),
+                score_proxy,
+            )
+
+        scores = torch.stack(score_tensors).tolist()
+        raw: dict[int, tuple[torch.Tensor, float]] = {
+            idx: (directions[idx], score)
+            for idx, score in zip(sae_layers, scores)
+        }
+        # Centered DLS on the SAE-decoded directions, restricted to
+        # SAE-covered layers (the means the helper consumes are also
+        # restricted there — feature-space encoding only touched those).
+        sae_directions_unit = {
+            idx: directions[idx] / max(float(directions[idx].norm()), 1e-12)
+            for idx in sae_layers
+        }
+        sae_pos_means = {
+            idx: torch.stack(pos_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        sae_neg_means = {
+            idx: torch.stack(neg_per_layer[idx]).mean(dim=0).cpu()
+            for idx in sae_layers
+        }
+        keep_set = compute_dls_mask(
+            sae_pos_means, sae_neg_means, sae_directions_unit,
+            layer_means,
+        ) if dls else None
+        return _share_bake_and_warn(
+            raw, diagnostics_per_layer, keep_set,
+            concept_label=concept_label,
+        )
+
+    # Per-layer DiM in residual-stream space.
+    raw = {}
+    diagnostics_per_layer = {}
+
+    if n_pairs < 2:
+        # Single pair degenerates: mean over one element is just the
+        # element.  Use the same scoring as single-pair PCA so share-bake
+        # math is unaffected.
+        diff_stack = torch.stack(
+            [diffs_per_layer[idx][0] for idx in range(n_layers)]
+        )
+        diff_norms_cpu = diff_stack.norm(dim=-1).tolist()
+        for idx in range(n_layers):
+            diff_vec = diffs_per_layer[idx][0]
+            ref_norm = norm_sums_cpu[idx] / n_norm_samples
+            direction = _normalize(diff_vec, ref_norm=ref_norm)
+            activation_norm = norm_sums_cpu[idx]
+            if whitener is not None and whitener.covers(idx):
+                # Mahalanobis on the single diff vector; ``activation_norm``
+                # is pos+neg sum, mirrors the Euclidean form's denominator.
+                m_norm = whitener.mahalanobis_norm(idx, diff_vec)
+                score = m_norm / max(activation_norm, 1e-8)
+            else:
+                score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
+            raw[idx] = (direction, score)
+            diagnostics_per_layer[idx] = _compute_layer_diagnostics(
+                diff_vec.unsqueeze(0),
+                direction,
+                score,
+            )
+    else:
+        # Multi-pair: stack diffs, take mean across pairs in fp32.
+        # One stacked tensor + one ``mean(dim=1)`` per shape — single
+        # GPU→CPU transfer for the per-layer norms (= scores).
+        diff_matrices = [
+            torch.stack(diffs_per_layer[idx]) for idx in range(n_layers)
+        ]  # each (N, dim) fp32
+        ref_norms = [
+            norm_sums_cpu[idx] / n_norm_samples for idx in range(n_layers)
+        ]
+
+        batched = torch.stack(diff_matrices)        # (n_layers, N, dim)
+        means = batched.mean(dim=1)                 # (n_layers, dim)
+        means_norms = means.norm(dim=-1)            # (n_layers,)
+
+        if whitener is not None:
+            # Mahalanobis branch: per-layer matvec via Woodbury through
+            # ``LayerWhitener.mahalanobis_norm``.  Loop instead of batch
+            # because each layer has its own ``Σ_L^{-1}`` and ``X_L``;
+            # extraction is one-shot, not a hot path.  Layers absent from
+            # the whitener fall back to Euclidean for that layer.
+            scores_cpu = []
+            for idx in range(n_layers):
+                ref_L = max(ref_norms[idx], 1e-8)
+                if whitener.covers(idx):
+                    m_norm = whitener.mahalanobis_norm(idx, means[idx])
+                    scores_cpu.append(m_norm / ref_L)
+                else:
+                    scores_cpu.append(float(means_norms[idx].item()) / ref_L)
+        else:
+            # Euclidean fallback: original batched path, single GPU→CPU
+            # transfer.  Score = ||mean_diff||_2 / ref_norm — lands in
+            # the same range as PCA's EVR (~0.01–0.4).
+            scores_t = means_norms / torch.tensor(
+                ref_norms, device=means_norms.device, dtype=means_norms.dtype,
+            ).clamp(min=1e-8)
+            scores_cpu = scores_t.tolist()
+
+        for idx in range(n_layers):
+            direction = means[idx].to(device)
+            raw[idx] = (
+                _normalize(direction, ref_norm=ref_norms[idx]),
+                scores_cpu[idx],
+            )
+            # Diagnostics use the unit-direction so EVR-as-score-proxy
+            # and the alignment metric stay scale-invariant.
+            diagnostics_per_layer[idx] = _compute_layer_diagnostics(
+                diff_matrices[idx],
+                means[idx].detach().to(diff_matrices[idx].device),
+                scores_cpu[idx],
+            )
+
+    # Centered-DLS mask via the per-layer mean-of-diffs direction.
+    # ``mean_pos - mean_neg`` is exactly the DiM direction (linearity of
+    # expectation), so the projection check works directly on the
+    # CPU-side means without re-computing.  Unit-norm so the projection
+    # check stays scale-invariant.
+    if dls:
+        unit_dirs: dict[int, torch.Tensor] = {}
+        for idx in range(n_layers):
+            mp = mean_pos_per_layer.get(idx)
+            mn = mean_neg_per_layer.get(idx)
+            if mp is None or mn is None:
+                continue
+            d = mp - mn
+            d_n = float(d.norm())
+            if d_n > 1e-12:
+                unit_dirs[idx] = d / d_n
+        keep_set = compute_dls_mask(
+            mean_pos_per_layer, mean_neg_per_layer, unit_dirs, layer_means,
+        )
+    else:
+        keep_set = None
+    return _share_bake_and_warn(
+        raw, diagnostics_per_layer, keep_set, concept_label=concept_label,
+    )
 
 
 def save_profile(
@@ -778,6 +1328,14 @@ def save_profile(
         sidecar["statements_sha256"] = metadata["statements_sha256"]
     if "components" in metadata:
         sidecar["components"] = metadata["components"]
+    # v2.1: bake method records which scoring metric drove share allocation
+    # (``"euclidean"`` = legacy ``||m||_2 / r``; ``"mahalanobis"`` =
+    # ``||m||_M / r`` via per-layer activation covariance).  Loaders read
+    # this only for diagnostics; the runtime hook reads tensor magnitudes
+    # regardless of bake flavor.  Default ``"euclidean"`` is back-compat
+    # for tensors written before the bake field existed.
+    if "bake" in metadata:
+        sidecar["bake"] = metadata["bake"]
     # SAE provenance — present only when extraction used an SAE backend.
     for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
         if key in metadata:
@@ -865,12 +1423,30 @@ def project_profile(
     base: dict[int, torch.Tensor],
     onto: dict[int, torch.Tensor],
     operator: str,
+    *,
+    whitener: "Any | None" = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer projection of ``base`` against ``onto``.
 
-    For each shared layer (fp32)::
+    Default (Euclidean), per shared layer (fp32)::
 
         proj = (dot(base, onto) / dot(onto, onto)) * onto
+
+    With ``whitener`` (a :class:`saklas.core.mahalanobis.LayerWhitener`),
+    switches to LEACE-style projection in the Mahalanobis metric::
+
+        coef = <base, onto>_M / <onto, onto>_M
+        proj = coef * onto                # direction is ``onto``; metric is M
+
+    The output direction is still ``onto``, but the *amount* removed is
+    the component along ``onto`` measured in the whitened space.  For
+    operator ``"|"``, this is the closed-form LEACE projector for a
+    single direction (Belrose et al. 2023, arXiv 2306.03819) — provably
+    erases linearly-decodable information along ``onto`` from ``base``
+    with minimum collateral damage.  Reduces to plain Gram-Schmidt when
+    ``Σ = I``.
+
+    Operator semantics (both metrics):
 
     - ``operator == "~"``   returns ``proj``       (component of base aligned with onto).
     - ``operator == "|"`` returns ``base - proj`` (component of base orthogonal to onto).
@@ -880,8 +1456,10 @@ def project_profile(
     are dropped (projection onto an absent direction is undefined).
 
     Near-zero ``||onto|| < 1e-12`` layers are treated the same way: ``"|"``
-    passes base through unchanged, ``"~"`` drops the layer. Result tensors
-    are cast back to the source dtype of ``base``.
+    passes base through unchanged, ``"~"`` drops the layer.  Layers absent
+    from the whitener fall back to the Euclidean projection — the whitener
+    may legitimately cover a subset of layers (e.g. SAE-only releases).
+    Result tensors are cast back to the source dtype of ``base``.
 
     The returned dict shape matches :func:`extract_contrastive` so it
     plugs into ``SteeringManager.add_vector`` without adaptation.
@@ -895,6 +1473,17 @@ def project_profile(
             if operator == "|":
                 out[layer] = base_t
             continue
+        # LEACE branch: whitener available + covers this layer.
+        if whitener is not None and whitener.covers(layer):
+            projected = whitener.leace_project(layer, base_t, onto_t, operator)
+            # Drop the layer for ``~`` when ``onto`` is degenerate under
+            # the Mahalanobis metric — leace_project returns a zero
+            # tensor in that case, mirroring the Euclidean drop rule.
+            if operator == "~" and torch.all(projected == 0):
+                continue
+            out[layer] = projected
+            continue
+        # Euclidean fallback (no whitener, or layer not covered).
         a_f = base_t.to(dtype=torch.float32)
         b_f = onto_t.to(dtype=torch.float32)
         b_dot = torch.dot(b_f, b_f).item()

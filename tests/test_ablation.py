@@ -58,7 +58,7 @@ def _expected_ablation(
 
 def test_recompose_accepts_ablation_entries():
     """Smoke: recompose with an ablation entry populates ablation_groups."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     d = torch.tensor([1.0, 0.0, 0.0])
     mean = torch.tensor([0.5, 0.0, 0.0])
@@ -76,7 +76,7 @@ def test_recompose_accepts_ablation_entries():
 
 def test_single_direction_full_ablation():
     """α=1 mean-replaces the component along d̂; rest of hidden unchanged modulo norm rescale."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     d = torch.tensor([1.0, 0.0, 0.0])
     mean = torch.tensor([0.5, 0.0, 0.0])
@@ -96,7 +96,7 @@ def test_single_direction_full_ablation():
 
 
 def test_partial_ablation_half():
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     d = torch.tensor([1.0, 0.0, 0.0])
     mean = torch.tensor([0.5, 0.0, 0.0])
@@ -117,7 +117,7 @@ def test_partial_ablation_half():
 
 def test_zero_alpha_ablation_is_noop():
     """α=0 entry is filtered out of ablation_groups entirely; hidden is untouched."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     d = torch.tensor([1.0, 0.0, 0.0])
     mean = torch.tensor([0.5, 0.0, 0.0])
@@ -136,7 +136,7 @@ def test_zero_alpha_ablation_is_noop():
 
 def test_ablate_then_add_ordering():
     """Ablation runs before additive; additive injection lands in the cleaned stream."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     d_abl = torch.tensor([1.0, 0.0, 0.0])
     mean_abl = torch.tensor([0.0, 0.0, 0.0])  # zero mean -> zero-ablate the x-component
@@ -160,7 +160,7 @@ def test_ablate_then_add_ordering():
 
 def test_additive_only_hits_fast_path():
     """Additive-only BOTH entries collapse into hook.composed (fast path)."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     add_vec = torch.tensor([0.0, 1.0, 0.0])
     hook.recompose(
@@ -177,7 +177,7 @@ def test_additive_only_hits_fast_path():
 
 def test_additive_both_plus_ablation_uses_slow_path():
     """Any ablation present forces the slow path even if additive is BOTH-only."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     add_vec = torch.tensor([0.0, 1.0, 0.0])
     d_abl = torch.tensor([1.0, 0.0, 0.0])
@@ -196,7 +196,7 @@ def test_additive_both_plus_ablation_uses_slow_path():
 
 def test_ablation_trigger_gated_off():
     """Ablation with AFTER_THINKING trigger is inactive during prefill."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext(is_prefill=True, thinking=False)
     d = torch.tensor([1.0, 0.0, 0.0])
     mean = torch.tensor([0.0, 0.0, 0.0])
@@ -214,7 +214,7 @@ def test_ablation_trigger_gated_off():
 
 def test_ablation_trigger_gated_on():
     """AFTER_THINKING ablation fires after thinking ends."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext(is_prefill=False, thinking=False)
     d = torch.tensor([1.0, 0.0, 0.0])
     mean = torch.tensor([0.0, 0.0, 0.0])
@@ -234,7 +234,7 @@ def test_ablation_trigger_gated_on():
 
 def test_multi_direction_orthogonal_naive_parallel():
     """Two orthogonal ablation directions at one layer match sequential."""
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     d1 = torch.tensor([1.0, 0.0, 0.0])
     d2 = torch.tensor([0.0, 1.0, 0.0])
@@ -266,7 +266,7 @@ def test_multi_direction_correlated_over_ablates():
     Prevents an accidental silent fix (Gram-Schmidt orthogonalization) by
     asserting the current naive-parallel behavior.
     """
-    hook = SteeringHook()
+    hook = SteeringHook(injection_mode="additive")
     ctx = TriggerContext()
     d1 = torch.tensor([1.0, 0.0, 0.0])
     d2 = torch.tensor([0.9, 0.1, 0.0])
@@ -304,7 +304,7 @@ class _NoopModule(torch.nn.Module):
 def test_manager_add_ablation_installs_group_at_profile_layer():
     """add_ablation + apply_to_model attaches a hook with an ablation group at the right layer."""
     layers = torch.nn.ModuleList([_NoopModule(), _NoopModule(), _NoopModule()])
-    mgr = SteeringManager()
+    mgr = SteeringManager(injection_mode="additive")
 
     profile = {1: torch.tensor([1.0, 0.0, 0.0])}
     layer_means = {1: torch.tensor([0.5, 0.0, 0.0])}
@@ -328,7 +328,7 @@ def test_manager_add_ablation_installs_group_at_profile_layer():
 def test_manager_combined_additive_and_ablation_same_layer():
     """Both additive and ablation target layer 1 -> one hook with both groups."""
     layers = torch.nn.ModuleList([_NoopModule(), _NoopModule()])
-    mgr = SteeringManager()
+    mgr = SteeringManager(injection_mode="additive")
 
     additive_profile = {1: torch.tensor([0.0, 1.0, 0.0])}
     ablation_profile = {1: torch.tensor([1.0, 0.0, 0.0])}
@@ -352,7 +352,7 @@ def test_manager_combined_additive_and_ablation_same_layer():
 def test_manager_skips_layers_without_layer_mean():
     """Profile layer 2 with no matching layer_mean -> ablation entry for layer 2 is dropped."""
     layers = torch.nn.ModuleList([_NoopModule(), _NoopModule(), _NoopModule()])
-    mgr = SteeringManager()
+    mgr = SteeringManager(injection_mode="additive")
 
     profile = {
         1: torch.tensor([1.0, 0.0, 0.0]),

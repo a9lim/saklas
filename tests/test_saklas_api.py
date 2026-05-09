@@ -953,11 +953,16 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     from saklas.core import extraction as E
 
     captured: dict = {}
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *,
+                     sae=None, concept_label=None, **_kwargs):
         captured["sae"] = sae
         return ({0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}, {})
+    # Stub both extractors — pipeline dispatches to DiM by default in v2.1+,
+    # PCA via ``method="pca"``.  Test is method-agnostic; intercept both.
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
     monkeypatch.setattr(E, "extract_contrastive", fake_extract)
+    monkeypatch.setattr(V, "extract_difference_of_means", fake_extract)
+    monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
 
     # Stub SAE backend loader.
     def fake_loader(release, **kw):
@@ -1025,13 +1030,15 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     expected_tensor = concept_folder / "m_sae-mock-release.safetensors"
     assert expected_tensor.exists()
 
-    # Sidecar carries sae metadata
+    # Sidecar carries sae metadata.  Default method is DiM (v2.1+); the
+    # SAE branch records ``"dim_sae"``.  Pass ``method="pca"`` to recover
+    # the legacy ``"pca_center_sae"`` label.
     with open(expected_tensor.with_suffix(".json")) as f:
         sidecar = json.load(f)
-    assert sidecar["method"] == "pca_center_sae"
+    assert sidecar["method"] == "dim_sae"
     assert sidecar["sae_release"] == "mock-release"
 
-    # extract_contrastive received the backend instance
+    # The selected extractor received the backend instance.
     assert captured["sae"] is not None
 
 
@@ -1044,10 +1051,13 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
     from saklas.core import vectors as V
     from saklas.core import extraction as E
 
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *, sae=None, concept_label=None):
+    def fake_extract(model, tokenizer, pairs, layers, device=None, *,
+                     sae=None, concept_label=None, **_kwargs):
         return ({0: torch.ones(4), 2: torch.ones(4)}, {})
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
     monkeypatch.setattr(E, "extract_contrastive", fake_extract)
+    monkeypatch.setattr(V, "extract_difference_of_means", fake_extract)
+    monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
 
     import json
     concept_folder = tmp_path / "vectors" / "default" / "honest.deceptive"

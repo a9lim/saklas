@@ -15,10 +15,18 @@ from saklas.io.packs import (
     hash_file, materialize_bundled,
 )
 from saklas.io.paths import (
-    concept_dir, model_dir, neutral_statements_path, safe_model_id, vectors_dir,
+    concept_dir,
+    model_dir,
+    neutral_statements_path,
+    sidecar_filename,
+    tensor_filename,
+    vectors_dir,
 )
 from saklas.core.vectors import (
-    compute_layer_means, extract_contrastive, load_contrastive_pairs,
+    compute_layer_means,
+    extract_contrastive,
+    extract_difference_of_means,
+    load_contrastive_pairs,
     load_profile, save_profile,
 )
 
@@ -89,25 +97,62 @@ def bootstrap_layer_means(
 
 
 def bootstrap_probes(
-    model: Any, tokenizer: Any, layers: list[Any], model_info: dict[str, Any], categories: list[str],
+    model: Any,
+    tokenizer: Any,
+    layers: list[Any],
+    model_info: dict[str, Any],
+    categories: list[str],
+    *,
+    method: str = "dim",
+    whitener: Any = None,
+    layer_means: dict[int, torch.Tensor] | None = None,
+    dls: bool = True,
 ) -> dict[str, dict[int, torch.Tensor]]:
-    """Load or extract probe vector profiles for the given categories."""
+    """Load or extract probe vector profiles for the given categories.
+
+    ``method`` selects the extraction algorithm for any probes that need
+    re-extraction.  Defaults to ``"dim"`` (difference-of-means, v2.1+);
+    pass ``"pca"`` to recover the legacy contrastive-PCA path.  Cached
+    tensors are loaded as-is regardless of method — the sidecar carries
+    the method that produced them.
+
+    ``whitener`` is a :class:`saklas.core.mahalanobis.LayerWhitener` (or
+    ``None``).  When provided, DiM extraction uses Mahalanobis-flavored
+    scores for share allocation (see :func:`saklas.core.vectors.extract_difference_of_means`);
+    written sidecars carry ``bake: "mahalanobis"``.  ``None`` falls back
+    to Euclidean scoring (sidecar ``bake: "euclidean"``).  Whitener has
+    no effect on PCA extraction (legacy method, kept on EVR scoring).
+
+    ``layer_means`` is the per-model neutral-baseline mean cache (built
+    by :func:`bootstrap_layer_means` before this call).  Threaded into
+    the extractors for the centered-DLS check.  ``None`` disables DLS
+    centering — the helper falls back to "keep all layers."
+
+    ``dls`` (default ``True``, v2.1+) enables the discriminative-layer
+    selection mask.  Pass ``False`` to extract every layer (the path
+    used by ``--legacy`` and by tests on small mock models).
+    """
     from saklas import __version__ as _saklas_version
 
     defaults = load_defaults()
     model_id = model_info.get("model_id", "unknown")
-    sid = safe_model_id(model_id)
+    if method not in ("dim", "pca"):
+        raise ValueError(
+            f"unknown extraction method {method!r} (expected 'dim' | 'pca')"
+        )
 
     probes: dict[str, dict[int, torch.Tensor]] = {}
     to_extract: list[tuple[str, Path, Path]] = []
 
     allow_stale = os.environ.get("SAKLAS_ALLOW_STALE") == "1"
+    ts_name = tensor_filename(model_id, method=method)
+    sc_name = sidecar_filename(model_id, method=method)
 
     for cat in categories:
         for probe_name in defaults.get(cat, []):
             cdir = concept_dir("default", probe_name)
-            ts = cdir / f"{sid}.safetensors"
-            sc_path = cdir / f"{sid}.json"
+            ts = cdir / ts_name
+            sc_path = cdir / sc_name
             if ts.exists() and sc_path.exists():
                 try:
                     profile, meta = load_profile(str(ts))
@@ -161,15 +206,30 @@ def bootstrap_probes(
         datasets_to_extract.append((name, cdir, ts, pairs_data, stmts_path))
 
     model_device = next(model.parameters()).device
+    extractor = (
+        extract_difference_of_means if method == "dim" else extract_contrastive
+    )
+    method_label = (
+        "difference_of_means" if method == "dim" else "contrastive_pca"
+    )
+    # Whitener only affects DiM; PCA stays on EVR scoring (legacy path).
+    # DLS + layer_means flow into both extractors uniformly.
+    extract_kwargs: dict[str, Any] = {"dls": dls, "layer_means": layer_means}
+    bake_label = "euclidean"
+    if method == "dim" and whitener is not None:
+        extract_kwargs["whitener"] = whitener
+        bake_label = "mahalanobis"
     for name, cdir, ts, ds, stmts_path in progress(datasets_to_extract, desc="Extracting probes", unit="probe"):
         try:
-            profile, diagnostics = extract_contrastive(
+            profile, diagnostics = extractor(
                 model, tokenizer, ds["pairs"], layers=layers,
                 concept_label=f"default/{name}",
+                **extract_kwargs,
             )
             probes[name] = profile
             save_meta: dict[str, Any] = {
-                "method": "contrastive_pca",
+                "method": method_label,
+                "bake": bake_label,
                 "statements_sha256": hash_file(stmts_path),
             }
             if diagnostics:
