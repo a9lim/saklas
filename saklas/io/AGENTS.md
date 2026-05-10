@@ -34,7 +34,7 @@ Repeng unit-normed GGUFs round-trip fine; saklas-baked GGUFs carry share-weighte
 
 ## probes_bootstrap.py
 
-Walks `~/.saklas/vectors/default/` after `materialize_bundled()`. 24 bundled probes (22 bipolar + 2 monopolar; see `regenerate_bundled_statements.py` manifest) categorized via `pack.json` tags (`affect`, `epistemic`, `alignment`, `register`, `social_stance`, `cultural`). `bootstrap_layer_means` caches `~/.saklas/models/<id>/layer_means.safetensors`, stale when `neutral_statements.json` hash changes. MPS cache flushed between probes.
+Walks `~/.saklas/vectors/default/` after `materialize_bundled()`. 26 bundled probes (24 bipolar + 2 monopolar; see `regenerate_bundled_statements.py` manifest) categorized via `pack.json` tags (`affect`, `epistemic`, `alignment`, `register`, `social_stance`, `cultural`, `identity`). `bootstrap_layer_means` caches `~/.saklas/models/<id>/layer_means.safetensors`, stale when `neutral_statements.json` hash changes. MPS cache flushed between probes.
 
 `bootstrap_probes(..., method="dim", whitener=None)` accepts both new params for the v2.1 stack: `method` selects DiM vs PCA per-extraction (passed in from `SaklasSession.extraction_method`); `whitener` is the `LayerWhitener` built by `SaklasSession._build_whitener_from_cache_or_compute()` before `bootstrap_probes` runs, and gets threaded into `extract_difference_of_means(whitener=...)` for Mahalanobis-flavored share allocation. PCA branch ignores the whitener (EVR is metric-invariant). Sidecar gets a `bake` field (`"mahalanobis"` when whitener is wired and method is DiM, `"euclidean"` otherwise) for cross-version provenance.
 

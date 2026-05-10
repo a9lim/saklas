@@ -70,11 +70,14 @@ BIPOLAR: dict[str, tuple[str, str, str]] = {
     # social stance
     "authoritative.submissive": ("authoritative", "submissive", "social_stance"),
     "high_context.low_context": ("high-context communication", "low-context communication", "social_stance"),
+    "self.other":               ("self-referential", "other-referential", "social_stance"),
     # cultural
     "masculine.feminine":       ("masculine", "feminine", "cultural"),
     "religious.secular":        ("religious", "secular", "cultural"),
     "traditional.progressive":  ("traditional", "progressive", "cultural"),
     "individualist.collectivist": ("individualist", "collectivist", "cultural"),
+    # identity
+    "ai.human":                 ("AI", "human", "identity"),
 }
 
 # name -> category
