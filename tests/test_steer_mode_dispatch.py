@@ -53,9 +53,16 @@ class _Stub(SaklasSession):
         theta_max: float | None = None,
         projection_metric: str = "mahalanobis",
     ) -> None:  # type: ignore[override]
+        import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
         self._steering_override_stack = []
+        # v2.2: _push_steering / _pop_steering acquire _gen_lock and
+        # consult _gen_phase + _internal_steering_pop.
+        self._gen_lock = threading.RLock()
+        from saklas.core.session import GenState
+        self._gen_phase = GenState.IDLE
+        self._internal_steering_pop = False
         self.events = EventBus()
         self._injection_mode = injection_mode
         self._theta_max = (

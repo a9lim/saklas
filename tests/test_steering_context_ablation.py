@@ -34,6 +34,7 @@ class _NoopModule(torch.nn.Module):
 
 
 def _skeleton_session() -> SaklasSession:
+    import threading
     session = SaklasSession.__new__(SaklasSession)
     session._model = None  # type: ignore[attr-defined]
     session._tokenizer = None  # type: ignore[attr-defined]
@@ -47,6 +48,15 @@ def _skeleton_session() -> SaklasSession:
     session._steering = SteeringManager()
     session._steering_stack = []
     session._steering_override_stack = []  # type: ignore[attr-defined]
+    # v2.2: _push_steering / _pop_steering acquire _gen_lock; skeleton
+    # mode never runs gen so the lock is uncontended, but the ``with
+    # self._gen_lock:`` block needs the attribute to exist.
+    session._gen_lock = threading.RLock()  # type: ignore[attr-defined]
+    # Phase guard the push/pop methods read to reject callback
+    # reentry — skeleton sessions are always idle.
+    from saklas.core.session import GenState
+    session._gen_phase = GenState.IDLE  # type: ignore[attr-defined]
+    session._internal_steering_pop = False  # type: ignore[attr-defined]
     session._injection_mode = "additive"  # type: ignore[attr-defined]
     session._theta_max = 1.5707963267948966  # type: ignore[attr-defined]
     session._projection_metric = "mahalanobis"  # type: ignore[attr-defined]

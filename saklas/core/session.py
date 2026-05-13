@@ -400,6 +400,9 @@ class SaklasSession:
         extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
         dls: bool = True,
+        compile: bool = True,
+        compile_mode: str | None = None,
+        cuda_graphs: bool = True,
     ) -> "SaklasSession":
         """Load a HF model + tokenizer and return a fully initialized session.
 
@@ -425,8 +428,109 @@ class SaklasSession:
         neg-class means project to the same side of the neutral
         baseline along ``d̂``.  Replaces the v2.0–v2.1 ``edge_drop``
         heuristic (gone in v2.1); ``--legacy`` flips this to ``False``.
+
+        ``compile`` (default ``True``) auto-enables ``torch.compile`` on
+        CUDA — kernel fusion via inductor, typically 1.2–1.5× decode
+        tok/s on small models.  Auto-skipped on MPS/CPU.  Pass ``False``
+        to debug architecture-specific compile issues; the angular hook
+        scalars are tensor-pinned (v2.2) so a single compiled artifact
+        survives α changes between generations.
+
+        ``cuda_graphs`` (default ``True``, Phase B v2.2) auto-enables
+        ``transformers.StaticCache`` + ``torch.compile(mode=
+        "reduce-overhead")`` on CUDA-supported architectures.  Static
+        K/V buffers across decode steps mean inductor can capture CUDA
+        graphs internally — typical 1.5–2.5× decode tok/s on small
+        models *on top of* the kernel-fusion win from ``compile=True``.
+        Auto-skipped on MPS/CPU and on architectures whose StaticCache
+        construction fails (probed at session init; the fallback reason
+        is logged once).  Pass ``False`` to use DynamicCache (the v2.1
+        path) — useful when debugging cache-related issues or when a
+        specific architecture has subtle StaticCache quirks.
+
+        ``compile_mode`` (default ``None`` → auto-select) overrides the
+        torch.compile mode.  When None, the session picks
+        ``"reduce-overhead"`` if ``cuda_graphs`` is on (paired with
+        StaticCache for full graph capture) and ``"default"`` otherwise
+        (kernel fusion only).  Pass an explicit value to force a
+        specific mode regardless of the cuda_graphs decision.
         """
-        model, tokenizer = load_model(model_id, quantize=quantize, device=device, dtype=dtype)
+        # Load WITHOUT compile so the StaticCache probe runs against the
+        # bare nn.Module (probing through the OptimizedModule wrapper
+        # forwards correctly via __getattr__, but avoiding the wrapper
+        # at probe time keeps the failure mode "StaticCache constructor
+        # raised" rather than "compile + probe interaction").  We then
+        # decide ``compile_mode`` based on the probe outcome and apply
+        # ``torch.compile`` manually below.  This closes the order-of-
+        # operations bug Codex flagged in v2.2 review: the previous
+        # shape committed to ``"reduce-overhead"`` based on the
+        # *requested* ``cuda_graphs=True`` before the probe could veto,
+        # so arch-failed sessions ran DynamicCache under a graph-capture
+        # compile mode (mode-and-cache mismatch).
+        model, tokenizer = load_model(
+            model_id,
+            quantize=quantize,
+            device=device,
+            dtype=dtype,
+            compile=False,
+        )
+
+        cg_supported = False
+        cg_reason: str | None = None
+        device_obj = next(model.parameters()).device
+        if cuda_graphs:
+            from saklas.core.cuda_graphs import is_cuda_graphs_supported
+            cg_supported, cg_reason = is_cuda_graphs_supported(
+                model, device_obj,
+            )
+
+        # Resolve compile_mode now that the probe outcome is known.
+        # ``"reduce-overhead"`` captures CUDA graphs internally for
+        # fixed-shape inference regions and only pays off paired with
+        # StaticCache; ``"default"`` is the kernel-fusion-only fallback
+        # that composes cleanly with DynamicCache.  An explicit
+        # ``compile_mode`` arg overrides regardless of probe outcome —
+        # power users (benching, debugging) can force a mismatch on
+        # purpose.
+        effective_compile_mode = compile_mode
+        if effective_compile_mode is None:
+            effective_compile_mode = (
+                "reduce-overhead" if cg_supported else "default"
+            )
+
+        # Apply compile manually with the resolved mode.  Keeps the
+        # device gating, dynamo availability check, and skip-on-non-cuda
+        # log behavior aligned with what ``load_model`` would have
+        # produced if we'd let it own the compile call.
+        if compile and device_obj.type == "cuda":
+            try:
+                import torch._dynamo  # noqa: F401
+            except ImportError:
+                _log.info("torch.compile unavailable (no _dynamo); skipping")
+            else:
+                _log.info(
+                    "Compiling model with torch.compile(mode=%r)",
+                    effective_compile_mode,
+                )
+                model = torch.compile(
+                    model, mode=effective_compile_mode, dynamic=None,
+                )
+        elif compile:
+            _log.info(
+                "compile=True but device=%s — skipping torch.compile "
+                "(supported only on CUDA)",
+                device_obj.type,
+            )
+
+        # ``__init__`` re-runs the probe on its own.  We could plumb the
+        # result through to skip the duplicate StaticCache(max_cache_len=1)
+        # construction, but that put a private-flavored kwarg on the
+        # public constructor signature where direct-call users could
+        # set it (Codex review flagged this).  The probe is one cache
+        # allocation of one position — cost is dwarfed by the model
+        # weight load that already ran.  ``warn_once`` dedupes on
+        # ``id(model)`` so the user-visible logging fires exactly once
+        # regardless.
         return cls(
             model, tokenizer,
             probes=probes,
@@ -437,6 +541,7 @@ class SaklasSession:
             extraction_method=extraction_method,
             projection_metric=projection_metric,
             dls=dls,
+            cuda_graphs=cuda_graphs,
         )
 
     def __init__(
@@ -452,6 +557,7 @@ class SaklasSession:
         extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
         dls: bool = True,
+        cuda_graphs: bool = True,
     ):
         self._model = model
         self._tokenizer = tokenizer
@@ -503,6 +609,28 @@ class SaklasSession:
             injection_mode=self._injection_mode,  # type: ignore[arg-type]
             theta_max=self._theta_max,
         )
+        # CUDA-graphs / StaticCache routing (Phase B, v2.2).  Probe
+        # support once at construction so the per-generation hot path
+        # only consults a boolean.  Off when (a) user opted out, (b)
+        # device != cuda, or (c) the model's StaticCache constructor
+        # raises (architecture-specific quirks).  The fallback reason
+        # is logged once via :func:`saklas.core.cuda_graphs.warn_once`
+        # which dedupes on ``id(model)``, so when ``from_pretrained``
+        # already probed for its compile_mode decision and we re-probe
+        # here, the user only sees one message.
+        self._cuda_graphs_requested: bool = bool(cuda_graphs)
+        self._cuda_graphs_active: bool = False
+        if self._cuda_graphs_requested:
+            from saklas.core.cuda_graphs import (
+                is_cuda_graphs_supported, warn_once,
+            )
+            supported, reason = is_cuda_graphs_supported(
+                self._model, self._device,
+            )
+            if supported:
+                self._cuda_graphs_active = True
+            elif reason is not None:
+                warn_once(self._model, reason)
         # LIFO stack of per-scope entries dicts pushed by session.steering().
         # Each entry is ``{name: (alpha, Trigger)}`` — triggers are
         # preserved through stack flattening so nested scopes with
@@ -532,7 +660,24 @@ class SaklasSession:
         # without a second forward pass.
         self._capture = HiddenCapture()
 
-        self._gen_lock = threading.Lock()
+        # Reentrant — ``_generate_core`` acquires it for the whole gen,
+        # then enters an internal ``self.steering(...)`` scope which
+        # routes through ``_push_steering`` → re-acquires the lock from
+        # the same thread.  The single-in-flight invariant is enforced
+        # by the ``_gen_phase`` state check, not by the lock owner
+        # count, so RLock is correct: cross-thread re-entry blocks
+        # (which is the property fix #4 wants), same-thread re-entry
+        # passes (which keeps the internal steering scope from
+        # deadlocking against itself).
+        self._gen_lock = threading.RLock()
+        # Bypass flag for the phase guard in ``_push_steering`` /
+        # ``_pop_steering``.  ``_generate_core`` sets this around the
+        # ``steering_cm.__exit__()`` it owns at the end of a generation
+        # so the legitimate internal cleanup passes through the guard
+        # that's there to catch on_token-callback reentry.  Default
+        # False — user code never flips this; it's an implementation-
+        # detail signal between ``_generate_core`` and the pop path.
+        self._internal_steering_pop: bool = False
         # Async-level serializer owned by the HTTP server for back-pressure.
         # Distinct from `_gen_lock` (threading, enforces single-flight at the
         # Python level): `lock` queues concurrent async requests FIFO so they
@@ -1542,6 +1687,13 @@ class SaklasSession:
         is variant-aware — ``honest:sae`` will look for a ``_sae-*`` tensor
         file, not the raw one.
 
+        Namespace-qualified inputs (``alice/foo``) keep the namespace
+        through resolution: the prefix is split off, fed to ``resolve_pole``
+        as the ``namespace=`` kwarg so the lookup scopes to that namespace,
+        and re-attached to the registry key.  This is what lets two
+        installed packs that share a concept name across namespaces stay
+        addressable via their fully-qualified form.
+
         Names already in ``self._profiles`` pass through verbatim — a caller
         who pre-registered under a specific key stays addressed by that key.
         """
@@ -1552,15 +1704,34 @@ class SaklasSession:
             if name in self._profiles:
                 out[name] = (float(alpha), trig)
                 continue
+            # Split namespace prefix so re-resolution scopes to the
+            # namespace the user originally typed (parser preserves it
+            # in the key when supplied).  Bare names leave ``ns=None``
+            # so cross-namespace collisions still raise.
+            ns: str | None = None
+            bare_name = name
+            if "/" in name:
+                ns, bare_name = name.split("/", 1)
             try:
-                canonical, sign, _match, variant = resolve_pole(name)
+                canonical, sign, _match, variant = resolve_pole(
+                    bare_name, namespace=ns,
+                )
             except Exception:
                 out[name] = (float(alpha), trig)
                 continue
-            registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
+            canonical_qualified = (
+                canonical if ns is None else f"{ns}/{canonical}"
+            )
+            registry_key = (
+                canonical_qualified
+                if variant == "raw"
+                else f"{canonical_qualified}:{variant}"
+            )
             if registry_key not in self._profiles:
                 try:
-                    self._try_autoload_vector(canonical, variant=variant)
+                    self._try_autoload_vector(
+                        canonical_qualified, variant=variant,
+                    )
                 except Exception:
                     # Autoload may raise AmbiguousVariantError / UnknownVariantError.
                     # Keep the user's original name in `out` so the error surfaces
@@ -1589,18 +1760,32 @@ class SaklasSession:
         - ``"sae-<release>"`` — loads that specific release.
           :class:`UnknownVariantError` when absent.
 
-        Registered key in ``_profiles`` is ``canonical`` for raw, and
-        ``f"{canonical}:{variant}"`` otherwise.
+        ``canonical`` may be namespace-qualified (``alice/foo``), in which
+        case discovery is scoped to that namespace.  Registered key in
+        ``_profiles`` matches the input form: ``canonical`` for raw, and
+        ``f"{canonical}:{variant}"`` otherwise — so namespace-qualified
+        callers get a namespace-qualified registry key back.
         """
         from saklas.io.selectors import _all_concepts
         from saklas.io.packs import enumerate_variants
         from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
         from saklas.core.vectors import load_profile
 
+        # Split namespace prefix so concept discovery scopes to the
+        # namespace the caller specified.  Bare canonicals leave
+        # ``namespace=None`` and pick up the first matching concept
+        # across every namespace (the historical behavior).
+        ns: str | None = None
+        bare_canonical = canonical
+        if "/" in canonical:
+            ns, bare_canonical = canonical.split("/", 1)
+
         registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
         available: list[str] = []
         for concept in _all_concepts():
-            if concept.name != canonical:
+            if ns is not None and concept.namespace != ns:
+                continue
+            if concept.name != bare_canonical:
                 continue
             variants = enumerate_variants(concept.folder, self.model_id)
             available.extend(variants.keys())
@@ -1642,11 +1827,11 @@ class SaklasSession:
                     and os.environ.get("SAKLAS_ALLOW_STALE") != "1"
                 ):
                     raise StaleSidecarError(
-                        f"{concept.namespace}/{canonical}: statements.json has "
+                        f"{concept.namespace}/{bare_canonical}: statements.json has "
                         f"changed since this tensor was extracted "
                         f"(model={self.model_id}). The baked PCA no longer "
                         f"matches the on-disk pairs. Re-extract: "
-                        f"`saklas pack refresh {concept.namespace}/{canonical} "
+                        f"`saklas pack refresh {concept.namespace}/{bare_canonical} "
                         f"-m {self.model_id}` — or set SAKLAS_ALLOW_STALE=1 "
                         f"to load the stale tensor anyway."
                     )
@@ -1683,32 +1868,88 @@ class SaklasSession:
         name hits ``VectorNotRegisteredError``) the just-pushed entry is
         rolled back before the exception propagates, so the stack is
         never left with stale half-committed state.
+
+        Thread-safety: acquires :attr:`_gen_lock` (blocking) for the
+        rebuild phase.  In-flight generations hold the lock for their
+        whole forward+sample loop, so concurrent ``session.steering()
+        .__enter__()`` from a different thread waits until the active
+        generation finishes rather than mutating hook tensors mid-step.
+        Single-threaded users (TUI, CLI) pay an uncontended acquire;
+        the server's per-session asyncio lock serializes requests
+        upstream so the contention path is exercised mostly by
+        ad-hoc multi-threaded callers.
+
+        Phase guard: rejects calls from the gen worker thread when
+        :attr:`_gen_phase` is ``RUNNING`` or ``FINALIZING`` (i.e. an
+        ``on_token`` callback re-entered the API mid-step).  RLock would
+        otherwise let the same-thread caller pass straight through —
+        the lock alone protects against cross-thread races, not
+        callback reentry.  Legitimate same-thread callers reach
+        ``_push_steering`` only during ``PREAMBLE`` (the internal
+        steering scope that ``_generate_core`` opens before flipping
+        to ``RUNNING``) or ``IDLE`` (regular user code between gens).
         """
-        self._steering_stack.append(dict(entries))
-        self._steering_override_stack.append(
-            (injection_mode, theta_max, projection_metric),
-        )
-        try:
-            self._rebuild_steering_hooks()
-        except BaseException:
-            self._steering_stack.pop()
-            self._steering_override_stack.pop()
-            raise
-        # Steering hooks just changed; the prefix cache (built under the
-        # previous regime) no longer represents the current pre-attention
-        # residual stream.  Drop it.
-        self._invalidate_prefix_cache()
+        # ``_generate_core``'s internal ``steering_cm.__enter__()`` runs
+        # during ``PREAMBLE`` (before the ``RUNNING`` flip), so push
+        # never needs the ``_internal_steering_pop`` bypass — only the
+        # exit path fires under ``RUNNING``/``FINALIZING``.  The check
+        # here catches genuine callback reentry where ``on_token`` /
+        # ``score_callback`` calls back into ``session.steering(...)``
+        # mid-step.
+        if self._gen_phase in (GenState.RUNNING, GenState.FINALIZING):
+            raise ConcurrentGenerationError(
+                "cannot enter session.steering() from inside a generation "
+                "callback (e.g. on_token) — the steering stack mutation "
+                f"would clobber hook tensors mid-step (gen_phase="
+                f"{self._gen_phase.name})"
+            )
+        with self._gen_lock:
+            self._steering_stack.append(dict(entries))
+            self._steering_override_stack.append(
+                (injection_mode, theta_max, projection_metric),
+            )
+            try:
+                self._rebuild_steering_hooks()
+            except BaseException:
+                self._steering_stack.pop()
+                self._steering_override_stack.pop()
+                raise
+            # Steering hooks just changed; the prefix cache (built
+            # under the previous regime) no longer represents the
+            # current pre-attention residual stream.  Drop it.
+            self._invalidate_prefix_cache()
         self._emit_steering_applied()
 
     def _pop_steering(self) -> None:
-        """Pop the top of the steering stack and rebuild hooks."""
+        """Pop the top of the steering stack and rebuild hooks.
+
+        Mirrors :meth:`_push_steering` for thread-safety and phase
+        guarding: acquires :attr:`_gen_lock` so the rebuild can't fire
+        mid-step in another thread's generation, and rejects same-
+        thread callback reentry during ``RUNNING`` / ``FINALIZING``.
+        """
         if not self._steering_stack:
             return
-        self._steering_stack.pop()
-        if self._steering_override_stack:
-            self._steering_override_stack.pop()
-        self._rebuild_steering_hooks()
-        self._invalidate_prefix_cache()
+        # Same internal-vs-callback distinction as ``_push_steering``.
+        # ``_generate_core``'s finally block sets the flag around the
+        # ``steering_cm.__exit__()`` it owns, so its own scope cleanup
+        # passes through; callback reentry (on_token, score_callback)
+        # from inside the running loop hits the reject path.
+        if (
+            not self._internal_steering_pop
+            and self._gen_phase in (GenState.RUNNING, GenState.FINALIZING)
+        ):
+            raise ConcurrentGenerationError(
+                "cannot exit session.steering() from inside a generation "
+                "callback — the steering stack mutation would clobber "
+                f"hook tensors mid-step (gen_phase={self._gen_phase.name})"
+            )
+        with self._gen_lock:
+            self._steering_stack.pop()
+            if self._steering_override_stack:
+                self._steering_override_stack.pop()
+            self._rebuild_steering_hooks()
+            self._invalidate_prefix_cache()
         if not self._steering_stack:
             self.events.emit(SteeringCleared())
         else:
@@ -2621,6 +2862,28 @@ class SaklasSession:
                     else None
                 )
 
+                # StaticCache eligibility (Phase B, v2.2).  Three gates
+                # have to clear before we route through the static path:
+                #
+                # 1. Session-level support flag — set at __init__ via
+                #    ``is_cuda_graphs_supported``; off on MPS/CPU and on
+                #    architectures whose StaticCache constructor failed.
+                # 2. Prefix cache miss — a hit pre-prefilled a
+                #    DynamicCache, and mixing cache flavors mid-generation
+                #    would corrupt the K/V layout.  Future work: build
+                #    the prefix cache as StaticCache when this is
+                #    active so the prefix-hit path also benefits.
+                # 3. Fast-path-eligible steering — slow-path hooks
+                #    (probe gates, ablation, multi-trigger) read mutable
+                #    ``TriggerContext`` per fire, which CUDA-graph
+                #    capture under ``compile(mode="reduce-overhead")``
+                #    can't track.  ``all_fast_path()`` walks the hook
+                #    map; empty manager returns True (unsteered → safe).
+                use_static_cache = (
+                    self._cuda_graphs_active
+                    and cached_pkv is None
+                    and self._steering.all_fast_path()
+                )
                 generated_ids = generate_steered(
                     self._model, self._tokenizer, effective_input_ids,
                     gen_config, self._gen_state, thinking=use_thinking,
@@ -2633,6 +2896,7 @@ class SaklasSession:
                     past_key_values=cached_pkv,
                     cache_position_offset=cache_position_offset,
                     score_callback=gating_callback,
+                    use_static_cache=use_static_cache,
                 )
                 elapsed = time.monotonic() - start
 
@@ -2654,7 +2918,24 @@ class SaklasSession:
                 self._gen_state.stop_requested.set()
                 self._end_capture()
                 if steering_cm is not None:
-                    steering_cm.__exit__(None, None, None)
+                    # Internal scope cleanup — bypass the
+                    # ``_pop_steering`` phase guard since we're past
+                    # the model-forward loop and the rebuild is part
+                    # of the legitimate teardown sequence, not a
+                    # callback mutating the stack mid-step.  Save/
+                    # restore rather than unconditional clear: a
+                    # KeyboardInterrupt between the assignment and
+                    # the ``try:`` could leak the flag as ``True``
+                    # otherwise.  Reading ``old`` first puts the read
+                    # outside the try-protected window so the worst
+                    # case is "we never set True", not "we leave True
+                    # set" (Codex review v2 catch).
+                    old_internal = self._internal_steering_pop
+                    try:
+                        self._internal_steering_pop = True
+                        steering_cm.__exit__(None, None, None)
+                    finally:
+                        self._internal_steering_pop = old_internal
                     steering_cm = None
                 self._gen_phase = GenState.FINALIZING
 
@@ -2673,12 +2954,22 @@ class SaklasSession:
             return result
         except BaseException:
             # If we bailed before the inner finally ran (e.g. preamble threw),
-            # make sure the steering scope is popped.
+            # make sure the steering scope is popped.  Same internal-cleanup
+            # bypass as the inner finally — phase may be PREAMBLE, RUNNING,
+            # or FINALIZING depending on where we threw, and the pop is
+            # always legitimate teardown here.
             if steering_cm is not None:
+                # Same save/restore pattern as the inner finally —
+                # robust against signal-delivery between the
+                # assignment and the ``try``.
+                old_internal = self._internal_steering_pop
                 try:
+                    self._internal_steering_pop = True
                     steering_cm.__exit__(None, None, None)
                 except Exception:
                     pass
+                finally:
+                    self._internal_steering_pop = old_internal
             raise
         finally:
             # Defense-in-depth: even if the inner finally never ran (e.g. a

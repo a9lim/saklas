@@ -38,6 +38,40 @@ _LEFT, _CHAT, _TRAIT = 0, 1, 2
 
 _BIPOLAR_DELIM = " . "
 
+# Step sizes for ←/→ alpha adjustment.  Plain arrow nudges by
+# ``_ALPHA_STEP_FINE``; shift+arrow uses the coarse step.  Both clamp via
+# ``MAX_ALPHA`` inside ``_adjust_alpha``.
+_ALPHA_STEP_FINE = 0.01
+_ALPHA_STEP_COARSE = 0.1
+
+# Cap on shell-style input history (↑/↓ in the chat input).  Bounded to
+# keep ``_input_history`` from growing without limit over a long session
+# — same order of magnitude as readline's default ``HISTSIZE``.
+_INPUT_HISTORY_MAX = 200
+
+
+def _detect_namespace_selector(text: str) -> str | None:
+    """Return the namespace name when ``text`` is a bulk selector.
+
+    A bulk selector is a single ``<ns>/`` token — namespace name followed
+    by a trailing slash, no concept name, no whitespace, no other path
+    components. ``alice/`` matches; ``alice/foo``, ``foo/bar/`` and
+    ``0.5 alice/`` do not. Returns ``None`` for non-matches so the caller
+    falls through to the per-concept parser path.
+    """
+    text = text.strip()
+    if not text.endswith("/"):
+        return None
+    body = text[:-1]
+    if not body or "/" in body:
+        return None
+    # Reuse the canonical name regex so the namespace token has to look
+    # like an installable name (no spaces, no funky chars).
+    from saklas.io.packs import NAME_REGEX
+    if not NAME_REGEX.match(body):
+        return None
+    return body
+
 
 def _unquote(s: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
@@ -128,6 +162,18 @@ class SaklasApp(App):
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
         self._last_prompt: str | None = None
+
+        # Shell-style input history.  ``_input_history`` is the ring of
+        # submitted lines (slash commands and chat messages alike, because
+        # both flow through ``ChatPanel.UserSubmitted``); ``_history_index``
+        # is the cursor into it (``None`` = at the live "current" slot, no
+        # recall in flight); ``_history_stash`` saves whatever the user was
+        # typing the moment they first pressed ↑ so ↓-past-the-end restores
+        # it.  Capped at ``_INPUT_HISTORY_MAX`` to keep the list bounded
+        # over a long session.
+        self._input_history: list[str] = []
+        self._history_index: int | None = None
+        self._history_stash: str = ""
         # ``_ab_mode`` is the persistent two-column-layout toggle (Ctrl+A);
         # ``_ab_shadow_active`` is the transient flag set while a shadow
         # gen worker is streaming — gates panels/highlight/probe-rack
@@ -240,6 +286,16 @@ class SaklasApp(App):
                 event.prevent_default()
                 event.stop()
                 self.action_focus_prev_panel()
+            elif (
+                event.key in ("up", "down")
+                and getattr(self.focused, "id", None) == "chat-input"
+            ):
+                # Shell-style history recall on the chat input only.
+                # ``Input`` is single-line, so up/down have no native
+                # cursor-movement meaning to override.
+                event.prevent_default()
+                event.stop()
+                self._history_navigate(-1 if event.key == "up" else +1)
             return
 
         key = event.key
@@ -256,6 +312,10 @@ class SaklasApp(App):
             self.action_nav_left()
         elif key == "right":
             self.action_nav_right()
+        elif key == "shift+left":
+            self._adjust_alpha(-_ALPHA_STEP_COARSE)
+        elif key == "shift+right":
+            self._adjust_alpha(_ALPHA_STEP_COARSE)
         elif key == "enter":
             self.action_nav_enter()
         else:
@@ -307,10 +367,10 @@ class SaklasApp(App):
             self._refresh_trait_why()
 
     def action_nav_left(self) -> None:
-        self._adjust_alpha(-0.01)
+        self._adjust_alpha(-_ALPHA_STEP_FINE)
 
     def action_nav_right(self) -> None:
-        self._adjust_alpha(0.01)
+        self._adjust_alpha(_ALPHA_STEP_FINE)
 
     def action_nav_enter(self) -> None:
         if self._focused_panel_idx == _LEFT:
@@ -320,6 +380,9 @@ class SaklasApp(App):
 
     def on_chat_panel_user_submitted(self, event: ChatPanel.UserSubmitted) -> None:
         text = event.text
+        # Push to ↑/↓ history before dispatch so a slash command that
+        # errors mid-handler is still recallable.
+        self._push_input_history(text)
         if text.startswith("/"):
             self._handle_command(text)
             return
@@ -396,11 +459,13 @@ class SaklasApp(App):
             "Steering:\n"
             "  /steer <concept> [alpha]    — add (extract if needed)\n"
             "  /steer <pos> . <neg> [a]    — add bipolar (period delim)\n"
+            "  /steer <ns>/                — bulk add namespace (off)\n"
             "  /alpha <val> <name>         — adjust existing alpha\n"
-            "  /unsteer <name>             — remove vector\n"
+            "  /unsteer <name|ns/>         — remove vector(s)\n"
             "Probes:\n"
             "  /probe <concept>            — add probe (highlight on)\n"
-            "  /unprobe <name>             — remove probe\n"
+            "  /probe <ns>/                — bulk add namespace as probes\n"
+            "  /unprobe <name|ns/>         — remove probe(s)\n"
             "  /extract <concept>          — cache-warm only\n"
             "  /compare <a> [b]            — cosine similarity\n"
             "Session:\n"
@@ -412,9 +477,10 @@ class SaklasApp(App):
             "  /temp, /top-p, /max         — sampling defaults\n"
             "  /model                      — model + session info\n"
             "  /exit, /help\n"
-            "Keys: Tab focus · ←/→ alpha · ↑/↓ nav · Enter toggle\n"
-            "Backspace remove · Ctrl+T think · Ctrl+R regen\n"
-            "Ctrl+A A/B side-by-side · Ctrl+S cycle sort · Ctrl+Y highlight\n"
+            "Keys: Tab focus · ←/→ alpha (±0.01) · Shift+←/→ ±0.1\n"
+            "↑/↓ nav (panels) · ↑/↓ in chat input recalls history\n"
+            "Enter toggle · Backspace remove · Ctrl+T think · Ctrl+R regen\n"
+            "Ctrl+A A/B · Ctrl+S sort · Ctrl+Y highlight\n"
             "[ ] temp · { } top-p · Esc stop · Ctrl+Q quit"
         )
 
@@ -470,7 +536,8 @@ class SaklasApp(App):
 
     def _handle_extract(self, text: str, include_alpha: bool, on_success,
                         pending_type: str | None = None,
-                        variant: str = "raw") -> None:
+                        variant: str = "raw",
+                        namespace: str | None = None) -> None:
         chat = self._chat_panel
         if self._ab_shadow_active:
             chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
@@ -503,10 +570,14 @@ class SaklasApp(App):
         # explicit form wins over the ``variant`` kwarg when both are set.
         # Explicit bipolar form (`concept - baseline`) skips resolution
         # so the user's declared poles always win.
+        # ``namespace`` (when set) scopes the resolution so ``alice/foo``
+        # and ``bob/foo`` stay distinct.
         sign = 1
         if baseline is None:
             try:
-                resolved_name, sign, _match, explicit_variant = resolve_pole(concept)
+                resolved_name, sign, _match, explicit_variant = resolve_pole(
+                    concept, namespace=namespace,
+                )
                 if resolved_name != concept:
                     chat.add_system_message(
                         f"  Resolved '{concept}' → '{resolved_name}'"
@@ -547,13 +618,17 @@ class SaklasApp(App):
                 # means "use the unique SAE variant that's already on disk".
                 # Ambiguous / missing cases surface via the session errors.
                 if variant == "sae" and sae_release is None:
-                    self._session._try_autoload_vector(concept, variant="sae")
-                    key = f"{concept}:sae"
+                    autoload_key = (
+                        concept if namespace is None
+                        else f"{namespace}/{concept}"
+                    )
+                    self._session._try_autoload_vector(autoload_key, variant="sae")
+                    key = f"{autoload_key}:sae"
                     profile_dict = self._session._profiles.get(key)
                     if profile_dict is None:
                         raise ValueError(
-                            f"no SAE variant loaded for '{concept}' — "
-                            f"run `saklas vector extract {concept} --sae <RELEASE>` "
+                            f"no SAE variant loaded for '{autoload_key}' — "
+                            f"run `saklas vector extract {autoload_key} --sae <RELEASE>` "
                             f"first, or pick a release with "
                             f"`:sae-<release>` in the concept name."
                         )
@@ -563,12 +638,23 @@ class SaklasApp(App):
                 extract_kwargs = {"baseline": baseline, "on_progress": _progress}
                 if sae_release is not None:
                     extract_kwargs["sae"] = sae_release
+                if namespace is not None:
+                    extract_kwargs["namespace"] = namespace
                 # ``session.extract`` already returns the fully-qualified
                 # canonical name — including the ``:sae-<release>`` suffix
                 # when ``sae=`` was passed. Rebuilding it here would
                 # double-suffix the key and break every downstream
                 # ``/alpha`` / ``/unsteer`` / pole lookup.
                 canonical, profile = self._session.extract(concept, **extract_kwargs)
+                if namespace is not None:
+                    # Re-attach the namespace so the registered key matches
+                    # what the parser produced (so ``/alpha`` / ``/unsteer``
+                    # against the namespace-qualified form keep working).
+                    if ":" in canonical:
+                        bare, suffix = canonical.rsplit(":", 1)
+                        canonical = f"{namespace}/{bare}:{suffix}"
+                    else:
+                        canonical = f"{namespace}/{canonical}"
                 on_success(canonical, profile, alpha)
             except SaklasError as e:
                 self.call_from_thread(self._steer_status, e.user_message()[1])
@@ -604,8 +690,13 @@ class SaklasApp(App):
                 '  e.g. /steer 0.5 honest\n'
                 '       /steer 0.3 warm@after\n'
                 '       /steer 0.5 honest|sycophantic\n'
+                '       /steer alice/                (bulk; default-off)\n'
                 "  For new concept extraction use /extract <pos> <neg>."
             )
+            return
+        ns = _detect_namespace_selector(text)
+        if ns is not None:
+            self._handle_steer_namespace(ns)
             return
         try:
             steering = parse_expr(text)
@@ -642,16 +733,30 @@ class SaklasApp(App):
                 concept, variant = key.rsplit(":", 1)
             else:
                 concept, variant = key, "raw"
-            self._dispatch_steer_term(concept, variant, alpha)
+            # Peel namespace prefix so ``_handle_extract`` -> ``resolve_pole``
+            # scopes to the user's typed namespace instead of slugging
+            # ``ns/name`` into a single token.  ``_handle_extract`` will
+            # use ``namespace`` as the kwarg into ``session.extract`` so
+            # disk discovery stays scoped too.
+            namespace: str | None = None
+            if "/" in concept:
+                namespace, concept = concept.split("/", 1)
+            self._dispatch_steer_term(
+                concept, variant, alpha, namespace=namespace,
+            )
 
     def _dispatch_steer_term(
         self, concept: str, variant: str, alpha: float,
+        *, namespace: str | None = None,
     ) -> None:
         """Route one plain steering term through the extract pipeline.
 
         The concept has already been canonicalized and sign-flipped by
         ``parse_expr``; ``_handle_extract`` will re-run ``resolve_pole``
         on the canonical form which is idempotent (returns sign +1).
+        ``namespace`` (when set) scopes that re-resolution and the
+        downstream ``session.extract`` call so ``alice/foo`` and
+        ``bob/foo`` stay distinct end-to-end.
         """
         def _on_success(name, profile, a):
             self._session.steer(name, profile)
@@ -665,10 +770,16 @@ class SaklasApp(App):
         )
         text = f"{concept_with_variant} {alpha}"
         self._handle_extract(
-            text, include_alpha=True, on_success=_on_success, variant=variant,
+            text, include_alpha=True, on_success=_on_success,
+            variant=variant, namespace=namespace,
         )
 
     def _handle_probe(self, text: str) -> None:
+        ns = _detect_namespace_selector(text.strip())
+        if ns is not None:
+            self._handle_probe_namespace(ns)
+            return
+
         def _on_success(name, profile, _alpha):
             self._session.probe(name, profile)
             self.call_from_thread(self._on_probe_added, name)
@@ -1145,6 +1256,10 @@ class SaklasApp(App):
         if not raw:
             chat.add_system_message("Usage: /unsteer <name>")
             return
+        ns = _detect_namespace_selector(raw)
+        if ns is not None:
+            self._handle_unsteer_namespace(ns)
+            return
         matches = _resolve_active_name(raw, self._alphas)
         if len(matches) == 0:
             chat.add_system_message(f"'{raw}' is not active.")
@@ -1164,6 +1279,10 @@ class SaklasApp(App):
         raw = arg.strip()
         if not raw:
             chat.add_system_message("Usage: /unprobe <name>")
+            return
+        ns = _detect_namespace_selector(raw)
+        if ns is not None:
+            self._handle_unprobe_namespace(ns)
             return
         monitor = self._session._monitor
         if not monitor:
@@ -1185,6 +1304,261 @@ class SaklasApp(App):
             self._apply_highlight_to_all()
         self._refresh_trait_why()
         chat.add_system_message(f"Probe '{name}' removed.")
+
+    # -- Namespace bulk handlers (/steer ns/, /probe ns/, /unsteer ns/, /unprobe ns/) --
+
+    def _bulk_autoload_namespace(self, ns: str) -> tuple[list[str], list[str]]:
+        """Autoload every concept in ``ns`` whose tensor is on disk.
+
+        Returns ``(loaded, skipped)`` lists of namespace-qualified names.
+        ``loaded`` is what landed in ``session._profiles`` (already-present
+        plus freshly loaded); ``skipped`` is concepts whose ``raw`` variant
+        isn't extracted for the current model. Cache-hit only — no PCA,
+        no scenario gen, no network. Worker-thread safe (only touches
+        ``session._profiles`` and the on-disk pack files).
+        """
+        from saklas.io.selectors import _all_concepts
+
+        loaded: list[str] = []
+        skipped: list[str] = []
+        concepts = [c for c in _all_concepts() if c.namespace == ns]
+        for c in concepts:
+            key = f"{ns}/{c.name}"
+            if key in self._session._profiles:
+                loaded.append(key)
+                continue
+            try:
+                self._session._try_autoload_vector(key, variant="raw")
+            except SaklasError:
+                # Stale sidecar / variant errors surface to the user
+                # below by leaving the concept in ``skipped``; the
+                # detailed message would drown out the bulk summary.
+                pass
+            except Exception:
+                pass
+            if key in self._session._profiles:
+                loaded.append(key)
+            else:
+                skipped.append(key)
+        return loaded, skipped
+
+    def _bulk_skip_message(self, ns: str, skipped: list[str]) -> str:
+        """Two-line note for skipped concepts: list + one-line refresh hint."""
+        return (
+            f"Skipped {len(skipped)} not yet extracted for this model: "
+            f"{', '.join(sorted(skipped))}\n"
+            f"  Run `saklas pack refresh {ns} -m <model>` to extract."
+        )
+
+    def _handle_steer_namespace(self, ns: str) -> None:
+        """Bulk-register every cached concept under ``ns/`` as a steering
+        vector with α = ``DEFAULT_ALPHA`` and ``enabled=False`` so users
+        can flip them on individually from the left panel.
+        """
+        chat = self._chat_panel
+        if self._ab_shadow_active:
+            chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
+            return
+        if self._session.is_generating:
+            self._pending_action = ("steer", f"{ns}/")
+            self._session.stop()
+            return
+
+        from saklas.io.selectors import _all_concepts
+        if not [c for c in _all_concepts() if c.namespace == ns]:
+            chat.add_system_message(f"No concepts installed under '{ns}/'.")
+            return
+
+        chat.add_system_message(f"Loading '{ns}/' vectors (toggled off)...")
+
+        def _worker() -> None:
+            loaded, skipped = self._bulk_autoload_namespace(ns)
+
+            def _finish() -> None:
+                for key in loaded:
+                    profile = self._session._profiles.get(key)
+                    if profile is None:
+                        continue
+                    self._session.steer(key, profile)
+                    self._alphas[key] = DEFAULT_ALPHA
+                    self._enabled[key] = False
+                self._refresh_left_panel()
+                lines = [
+                    f"Bulk steer '{ns}/': "
+                    f"added {len(loaded)} vector(s) (toggled off)."
+                ]
+                if skipped:
+                    lines.append(self._bulk_skip_message(ns, skipped))
+                chat.add_system_message("\n".join(lines))
+
+            self.call_from_thread(_finish)
+
+        self.run_worker(_worker, thread=True)
+
+    def _handle_probe_namespace(self, ns: str) -> None:
+        """Bulk-register every cached concept under ``ns/`` as a probe.
+        Highlight seeds to the last-loaded probe so the per-token overlay
+        lights up immediately, matching the single-probe ``/probe`` UX.
+        """
+        chat = self._chat_panel
+        if self._ab_shadow_active:
+            chat.add_system_message("Cannot modify vectors during A/B shadow gen.")
+            return
+        if self._session.is_generating:
+            self._pending_action = ("probe", f"{ns}/")
+            self._session.stop()
+            return
+
+        from saklas.io.selectors import _all_concepts
+        if not [c for c in _all_concepts() if c.namespace == ns]:
+            chat.add_system_message(f"No concepts installed under '{ns}/'.")
+            return
+
+        chat.add_system_message(f"Loading '{ns}/' probes...")
+
+        def _worker() -> None:
+            loaded, skipped = self._bulk_autoload_namespace(ns)
+
+            def _finish() -> None:
+                for key in loaded:
+                    profile = self._session._profiles.get(key)
+                    if profile is None:
+                        continue
+                    self._session.probe(key, profile)
+                if loaded and self._session._monitor is not None:
+                    self._trait_panel.set_active_probes(
+                        set(self._session._monitor.probe_names)
+                    )
+                    # Seed highlight to the last loaded probe — same UX as
+                    # single ``/probe``: the user immediately sees one of
+                    # them lit up and can navigate the trait panel to flip.
+                    self._highlight_probe = sorted(loaded)[-1]
+                    self._highlighting = True
+                    self._apply_highlight_to_all()
+                    self._refresh_trait_why()
+                lines = [f"Bulk probe '{ns}/': added {len(loaded)} probe(s)."]
+                if loaded:
+                    lines.append("  Highlight on (Ctrl+Y to toggle).")
+                if skipped:
+                    lines.append(self._bulk_skip_message(ns, skipped))
+                chat.add_system_message("\n".join(lines))
+
+            self.call_from_thread(_finish)
+
+        self.run_worker(_worker, thread=True)
+
+    def _handle_unsteer_namespace(self, ns: str) -> None:
+        """Remove every active steering vector whose registry key sits
+        under ``ns/``. Mirrors the single-vector ``/unsteer`` no-defer
+        policy — modifying ``_profiles`` mid-gen doesn't disturb hooks
+        already attached to the in-flight forward pass.
+        """
+        chat = self._chat_panel
+        prefix = f"{ns}/"
+        matches = [n for n in list(self._alphas.keys()) if n.startswith(prefix)]
+        if not matches:
+            chat.add_system_message(f"No active vectors under '{ns}/'.")
+            return
+        for name in matches:
+            self._session.unsteer(name)
+            self._alphas.pop(name, None)
+            self._enabled.pop(name, None)
+        self._refresh_left_panel()
+        chat.add_system_message(
+            f"Removed {len(matches)} vector(s) from '{ns}/'."
+        )
+
+    def _handle_unprobe_namespace(self, ns: str) -> None:
+        """Remove every active probe whose registry key sits under ``ns/``.
+        Clears the highlight seed when it points into the namespace.
+        """
+        chat = self._chat_panel
+        monitor = self._session._monitor
+        if monitor is None:
+            chat.add_system_message(f"No active probes under '{ns}/'.")
+            return
+        prefix = f"{ns}/"
+        matches = [n for n in list(monitor.probe_names) if n.startswith(prefix)]
+        if not matches:
+            chat.add_system_message(f"No active probes under '{ns}/'.")
+            return
+        for name in matches:
+            self._session.unprobe(name)
+        self._trait_panel.set_active_probes(set(monitor.probe_names))
+        if self._highlight_probe is not None and self._highlight_probe.startswith(prefix):
+            self._highlight_probe = None
+            self._highlighting = False
+            self._apply_highlight_to_all()
+        self._refresh_trait_why()
+        chat.add_system_message(
+            f"Removed {len(matches)} probe(s) from '{ns}/'."
+        )
+
+    # -- Input history (↑/↓ in chat input) --
+
+    def _push_input_history(self, text: str) -> None:
+        """Append a freshly-submitted line to the recall ring.
+
+        De-dupes against the *immediately preceding* entry (readline /
+        bash semantics — repeated identical lines collapse, but a
+        ping-pong A→B→A still records both A's). Resets the recall
+        cursor so the next ↑ starts at the bottom of the ring.
+        """
+        text = text.rstrip()
+        if not text:
+            return
+        if self._input_history and self._input_history[-1] == text:
+            self._history_index = None
+            self._history_stash = ""
+            return
+        self._input_history.append(text)
+        if len(self._input_history) > _INPUT_HISTORY_MAX:
+            # Drop oldest in one slice rather than calling pop(0) per
+            # overflow — slice is O(N) but only fires once per overflow.
+            del self._input_history[: len(self._input_history) - _INPUT_HISTORY_MAX]
+        self._history_index = None
+        self._history_stash = ""
+
+    def _history_navigate(self, delta: int) -> None:
+        """Walk the recall ring by ``delta`` (-1 for ↑, +1 for ↓).
+
+        First ↑ from the live slot stashes whatever the user was typing
+        so a ↓ past the newest entry restores it. Bounds clamp at the
+        top (no error past the oldest); the bottom returns to the live
+        stash and clears the recall cursor.
+        """
+        if not self._input_history:
+            return
+        try:
+            inp = self.query_one("#chat-input", Input)
+        except Exception:
+            return
+
+        if self._history_index is None:
+            if delta > 0:
+                # Already at the live slot — ↓ is a no-op.
+                return
+            self._history_stash = inp.value
+            self._history_index = len(self._input_history) - 1
+        else:
+            new_idx = self._history_index + delta
+            if new_idx < 0:
+                # Past the oldest — pin to entry 0 rather than wrapping
+                # or erroring; matches readline.
+                self._history_index = 0
+            elif new_idx >= len(self._input_history):
+                # Walked past the newest entry — restore the stash and
+                # reset the cursor so the next ↑ re-stashes fresh input.
+                self._history_index = None
+                inp.value = self._history_stash
+                inp.cursor_position = len(inp.value)
+                self._history_stash = ""
+                return
+            else:
+                self._history_index = new_idx
+
+        inp.value = self._input_history[self._history_index]
+        inp.cursor_position = len(inp.value)
 
     def _handle_seed(self, arg: str) -> None:
         chat = self._chat_panel

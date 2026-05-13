@@ -450,6 +450,7 @@ def generate_steered(
     past_key_values=None,
     cache_position_offset: int = 0,
     score_callback: Callable[[], dict[str, float]] | None = None,
+    use_static_cache: bool = False,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -476,6 +477,20 @@ def generate_steered(
     so the next iteration's gates see fresh monitor readings.  Pay
     nothing on the no-gate path — session-level wiring sets this to
     ``None`` unless the active steering contains a gated trigger.
+
+    ``use_static_cache`` (v2.2 Phase B) routes generation through
+    :class:`transformers.StaticCache` instead of the default
+    ``DynamicCache`` — fixed-shape K/V buffers across decode steps,
+    so the kernel shapes the compiled artifact saw on warmup don't
+    change as the cache grows.  Caller must guarantee CUDA + a
+    StaticCache-compatible architecture (see
+    :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported`); we
+    don't re-probe here.  When ``past_key_values`` is non-None
+    (prefix-cache hit), it's expected to *already* be a StaticCache
+    sized to fit the upcoming decode; we don't re-allocate.  When
+    ``past_key_values is None``, we build a fresh StaticCache sized
+    to ``input_ids.shape[1] + cache_position_offset +
+    config.max_new_tokens``.
 
     Returns list of generated token IDs.
     """
@@ -512,6 +527,65 @@ def generate_steered(
     seq_len = input_ids.shape[1] + cache_position_offset
     attn_mask_buf = torch.ones(1, seq_len, device=device, dtype=torch.long)
     prefill = True
+
+    # ---- StaticCache (Phase B, v2.2) -----------------------------------
+    # Caller flips ``use_static_cache`` after probing
+    # :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported` at session
+    # construction time.  We allocate the static buffer here, sized to
+    # cover the entire upcoming generation, so the decode loop sees no
+    # allocator activity per step.  When the caller hands us a
+    # pre-prefilled ``past_key_values`` (prefix-cache hit), it's expected
+    # to already be a StaticCache with enough headroom — we only build a
+    # fresh one when ``past_key_values is None``.
+    cache_position: torch.Tensor | None = None
+    # Tracked as a Python int so the per-step advance never crosses
+    # CPU↔GPU — we ``fill_`` the GPU buffer rather than read its value
+    # back.  Initialized to the first decode slot (the position right
+    # after the prefill window); on iteration 1 (prefill) the loop uses
+    # the multi-element arange below, then narrows to a 1-element buffer
+    # for every subsequent iteration.
+    next_cache_pos: int = cache_position_offset + input_ids.shape[1]
+    if use_static_cache:
+        try:
+            from saklas.core.cuda_graphs import make_static_cache
+        except ImportError:  # pragma: no cover — saklas is its own package
+            use_static_cache = False
+        else:
+            if past_key_values is None:
+                model_dtype = next(model.parameters()).dtype
+                max_cache_len = (
+                    cache_position_offset
+                    + input_ids.shape[1]
+                    + max(config.max_new_tokens, 1)
+                )
+                try:
+                    past_key_values = make_static_cache(
+                        model,
+                        max_cache_len=max_cache_len,
+                        device=device,
+                        dtype=model_dtype,
+                    )
+                except Exception as e:  # noqa: BLE001 — fallback on any failure
+                    warnings.warn(
+                        f"StaticCache allocation failed ({type(e).__name__}: "
+                        f"{e}); falling back to DynamicCache",
+                        stacklevel=2,
+                    )
+                    use_static_cache = False
+                    past_key_values = None
+            # ``cache_position`` covers the prefill positions on the
+            # first forward, then narrows to the single new token per
+            # decode step.  Allocated once and updated in place via
+            # ``fill_`` so the captured graph (under
+            # ``torch.compile(mode="reduce-overhead")``) sees a stable
+            # tensor input across replays.
+            if use_static_cache:
+                cache_position = torch.arange(
+                    cache_position_offset,
+                    cache_position_offset + input_ids.shape[1],
+                    device=device,
+                    dtype=torch.long,
+                )
 
     # Penalty / bias / stop / logprobs setup
     use_penalties = presence_penalty != 0.0 or frequency_penalty != 0.0
@@ -591,12 +665,26 @@ def generate_steered(
                     trigger_ctx.thinking = (tstate == _ThinkState.THINKING)
                     trigger_ctx.gen_step = len(generated_ids)
 
-                outputs = model(
-                    input_ids=current_input,
-                    attention_mask=attn_mask_buf if prefill else None,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
+                # Static-cache path passes ``cache_position`` explicitly so
+                # the model knows where to write into the pre-allocated
+                # K/V buffers.  Eager (DynamicCache) path leaves it
+                # implicit so HF derives positions from cache seq_length
+                # — bit-identical to the v1.x call shape.
+                if cache_position is not None:
+                    outputs = model(
+                        input_ids=current_input,
+                        attention_mask=attn_mask_buf if prefill else None,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        cache_position=cache_position,
+                    )
+                else:
+                    outputs = model(
+                        input_ids=current_input,
+                        attention_mask=attn_mask_buf if prefill else None,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
                 prefill = False
 
                 # Probe-gate scoring (v2.1): after the forward (so
@@ -610,14 +698,39 @@ def generate_steered(
                 if score_callback is not None and trigger_ctx is not None:
                     trigger_ctx.probe_scores = score_callback()
 
-                past_key_values = outputs.past_key_values
-                if not no_cache_mode and past_key_values is None and current_input.shape[1] > 1:
-                    no_cache_mode = True
-                    warnings.warn(
-                        "model returned no past_key_values during prefill — "
-                        "falling back to no-KV-cache mode (O(N²) generation)",
-                        stacklevel=2,
-                    )
+                # StaticCache mutates in place — the model returns the
+                # same object and re-assigning here would clobber our
+                # reference if a buggy modeling file returned ``None``.
+                # Plain DynamicCache path keeps the v1.x semantics: pull
+                # the cache out of the output, fall back to no-cache
+                # mode if missing.
+                if cache_position is None:
+                    past_key_values = outputs.past_key_values
+                    if not no_cache_mode and past_key_values is None and current_input.shape[1] > 1:
+                        no_cache_mode = True
+                        warnings.warn(
+                            "model returned no past_key_values during prefill — "
+                            "falling back to no-KV-cache mode (O(N²) generation)",
+                            stacklevel=2,
+                        )
+                else:
+                    # Advance ``cache_position`` to the next decode slot.
+                    # Prefill ran with a multi-element arange tensor; from
+                    # here on every step writes a single new K/V slot, so
+                    # we narrow ``cache_position`` to a 1-element tensor
+                    # and update it in place via ``fill_``.  Reusing the
+                    # buffer keeps the captured graph (under
+                    # ``torch.compile(mode="reduce-overhead")``) bound to
+                    # a stable tensor address across replays, and tracking
+                    # ``next_cache_pos`` as a Python int avoids the CPU
+                    # sync that ``cache_position[-1].item()`` would cost.
+                    if cache_position.numel() != 1:
+                        cache_position = torch.tensor(
+                            [next_cache_pos], device=device, dtype=torch.long,
+                        )
+                    else:
+                        cache_position.fill_(next_cache_pos)
+                    next_cache_pos += 1
                 logits = outputs.logits[:, -1, :]
                 # Steering can push hidden states past fp16 range, cascading
                 # to inf/NaN logits.  nan_to_num clears NaN/inf first;

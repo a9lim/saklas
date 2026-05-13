@@ -252,15 +252,16 @@ These gate `test_session.py::test_throughput` (steered ≥ 85% of vanilla tok/s)
 
 ## Bundled concepts
 
-24 curated concepts at **n=45 pairs each** (9 scenarios × 5 pairs/scenario), stored in `saklas/data/vectors/<canonical>/`. 22 bipolar + 2 monopolar (`agentic`, `manipulative`). Authoritative list is the `BIPOLAR`/`MONOPOLAR` manifest in `scripts/regenerate_bundled_statements.py`.
+26 curated concepts at **n=45 pairs each** (9 scenarios × 5 pairs/scenario), stored in `saklas/data/vectors/<canonical>/`. 24 bipolar + 2 monopolar (`agentic`, `manipulative`). Authoritative list is the `BIPOLAR`/`MONOPOLAR` manifest in `scripts/regenerate_bundled_statements.py`.
 
 Categories:
 - `affect`: angry.calm, happy.sad, fearful.unflinching
 - `epistemic`: confident.uncertain, honest.deceptive, hallucinating.grounded, curious.disinterested
 - `alignment`: refusal.compliant, sycophantic.blunt, agentic, manipulative
 - `register`: formal.casual, direct.indirect, verbose.concise, creative.conventional, humorous.serious, warm.clinical, technical.accessible
-- `social_stance`: authoritative.submissive, high_context.low_context
+- `social_stance`: authoritative.submissive, high_context.low_context, self.other
 - `cultural`: masculine.feminine, religious.secular, traditional.progressive, individualist.collectivist
+- `identity`: ai.human
 
 **Known axis entanglements** (cross-model robust on gemma-4-31b-it / gemma-4-e4b-it; weighted cosine via `vector compare`):
 - `masculine.feminine ↔ traditional.progressive` (+0.53 / +0.59) — model treats Hofstede's MAS and traditionalism as the same direction

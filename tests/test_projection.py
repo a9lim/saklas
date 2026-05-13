@@ -119,9 +119,16 @@ class TestProjectProfile:
 class _Stub(SaklasSession):
     """SaklasSession without real model/tokenizer, mirrors test_steering_context."""
     def __init__(self, profiles: dict) -> None:  # type: ignore[override]
+        import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
         self._steering_override_stack = []
+        # v2.2: _push_steering / _pop_steering acquire _gen_lock and
+        # consult _gen_phase + _internal_steering_pop.
+        self._gen_lock = threading.RLock()
+        from saklas.core.session import GenState
+        self._gen_phase = GenState.IDLE
+        self._internal_steering_pop = False
         # v2.1 session-level defaults consulted by ``_resolve_*``
         # helpers when the override LIFO has no entries.
         from saklas.core.hooks import DEFAULT_THETA_MAX as _DTM

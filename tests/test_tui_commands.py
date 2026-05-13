@@ -67,6 +67,10 @@ def _make_app():
     app._default_seed = None
     import queue
     app._ui_token_queue = queue.SimpleQueue()
+    # Input-history ring (↑/↓ recall in the chat input).
+    app._input_history = []
+    app._history_index = None
+    app._history_stash = ""
     app._gen_start_time = 0.0
     app._gen_token_count = 0
     app._last_tok_per_sec = 0.0
@@ -747,3 +751,383 @@ def test_handle_steer_expression_error_still_caught(monkeypatch):
     msgs = _msgs(app)
     assert "Steering expression error" in msgs
     assert app._alphas == {}
+
+
+# ---- Namespace-bulk selector + handlers ----
+
+
+def test_detect_namespace_selector_recognizes_trailing_slash():
+    from saklas.tui.app import _detect_namespace_selector
+
+    assert _detect_namespace_selector("alice/") == "alice"
+    assert _detect_namespace_selector("  alice/  ") == "alice"
+    assert _detect_namespace_selector("default/") == "default"
+
+
+def test_detect_namespace_selector_rejects_non_bulk_forms():
+    from saklas.tui.app import _detect_namespace_selector
+
+    # Per-concept forms must NOT match — bulk would silently shadow them.
+    assert _detect_namespace_selector("alice/foo") is None
+    assert _detect_namespace_selector("0.5 alice/") is None
+    assert _detect_namespace_selector("alice/foo/") is None
+    assert _detect_namespace_selector("/") is None
+    assert _detect_namespace_selector("") is None
+    # Invalid namespace name (uppercase, leading digit) — same regex used
+    # everywhere else for namespace strings.
+    assert _detect_namespace_selector("Alice/") is None
+    assert _detect_namespace_selector("9live/") is None
+
+
+def _stub_concepts(monkeypatch, concepts):
+    """Patch ``_all_concepts`` to return a synthetic list of namespaced
+    folders. Each entry is a SimpleNamespace with ``namespace`` and
+    ``name`` attributes — the only fields the bulk handlers read.
+    """
+    import saklas.io.selectors as _sel
+
+    fakes = [SimpleNamespace(namespace=ns, name=n) for ns, n in concepts]
+    monkeypatch.setattr(_sel, "_all_concepts", lambda: fakes)
+
+
+def _drain_workers(app):
+    """Synchronously execute the most recent ``run_worker`` call.
+
+    The TUI worker normally runs on a Textual thread; in tests we just
+    inline it. ``call_from_thread`` is patched to call directly so the
+    finish callback runs in the same thread.
+    """
+    for call in app.run_worker.call_args_list:
+        # ``run_worker(_worker, thread=True)`` — first positional is the
+        # callable. ``call_from_thread`` runs the finish closure inline.
+        target = call.args[0] if call.args else call.kwargs.get("worker")
+        if target is not None:
+            target()
+    app.run_worker.reset_mock()
+
+
+def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch):
+    app = _make_app()
+    # Two cached, one missing on disk for this model.
+    _stub_concepts(monkeypatch, [
+        ("alice", "honest.deceptive"),
+        ("alice", "warm.clinical"),
+        ("alice", "needs_extract"),
+    ])
+
+    cached_keys = {"alice/honest.deceptive", "alice/warm.clinical"}
+
+    def _autoload(canonical, *, variant="raw"):
+        # Simulate cache hit for the two pre-baked tensors; miss for the third.
+        if canonical in cached_keys:
+            app._session._profiles[canonical] = {0: object()}
+    app._session._try_autoload_vector = _autoload
+    app.run_worker = MagicMock()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+    app._refresh_left_panel = MagicMock()
+
+    app._handle_command("/steer alice/")
+    _drain_workers(app)
+
+    assert app._alphas == {
+        "alice/honest.deceptive": pytest.approx(0.5),
+        "alice/warm.clinical": pytest.approx(0.5),
+    }
+    # Default-off — user toggles in left panel.
+    assert app._enabled == {
+        "alice/honest.deceptive": False,
+        "alice/warm.clinical": False,
+    }
+    msgs = _msgs(app)
+    assert "Bulk steer 'alice/'" in msgs
+    assert "added 2 vector(s)" in msgs
+    assert "toggled off" in msgs
+    assert "Skipped 1" in msgs
+    assert "alice/needs_extract" in msgs
+    assert "saklas pack refresh alice -m" in msgs
+    # Each loaded vector got registered with the session.
+    assert app._session.steer.call_count == 2
+
+
+def test_handle_steer_namespace_empty_namespace_short_circuits(monkeypatch):
+    app = _make_app()
+    _stub_concepts(monkeypatch, [("default", "foo")])  # different ns
+    app.run_worker = MagicMock()
+
+    app._handle_command("/steer alice/")
+
+    assert "No concepts installed under 'alice/'" in _msgs(app)
+    app.run_worker.assert_not_called()
+    assert app._alphas == {}
+
+
+def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch):
+    app = _make_app()
+    _stub_concepts(monkeypatch, [
+        ("alice", "calm.angry"),
+        ("alice", "happy.sad"),
+    ])
+    app._session._profiles["alice/calm.angry"] = {0: object()}
+    app._session._profiles["alice/happy.sad"] = {0: object()}
+    app.run_worker = MagicMock()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+    app._apply_highlight_to_all = MagicMock()
+    app._refresh_trait_why = MagicMock()
+
+    app._handle_command("/probe alice/")
+    _drain_workers(app)
+
+    assert app._session.probe.call_count == 2
+    assert app._highlighting is True
+    # Seeded to the lexicographically last loaded probe — deterministic
+    # so tests don't flake on dict iteration order.
+    assert app._highlight_probe == "alice/happy.sad"
+    msgs = _msgs(app)
+    assert "Bulk probe 'alice/'" in msgs
+    assert "added 2 probe(s)" in msgs
+    assert "Ctrl+Y" in msgs
+
+
+def test_handle_unsteer_namespace_removes_only_matching_prefix():
+    app = _make_app()
+    # Mixed registry across two namespaces — only ``alice/`` should die.
+    app._alphas = {
+        "alice/foo": 0.5,
+        "alice/bar": 0.3,
+        "default/baz": 0.4,
+    }
+    app._enabled = {k: True for k in app._alphas}
+    app._refresh_left_panel = MagicMock()
+
+    app._handle_command("/unsteer alice/")
+
+    assert set(app._alphas.keys()) == {"default/baz"}
+    assert set(app._enabled.keys()) == {"default/baz"}
+    assert app._session.unsteer.call_count == 2
+    assert "Removed 2 vector(s) from 'alice/'" in _msgs(app)
+
+
+def test_handle_unsteer_namespace_empty_match_reports_clean():
+    app = _make_app()
+    app._alphas = {"default/baz": 0.4}
+    app._enabled = {"default/baz": True}
+
+    app._handle_command("/unsteer alice/")
+
+    assert "No active vectors under 'alice/'" in _msgs(app)
+    app._session.unsteer.assert_not_called()
+    assert app._alphas == {"default/baz": 0.4}
+
+
+def test_handle_unprobe_namespace_clears_highlight_when_seed_is_in_namespace():
+    app = _make_app()
+    app._session._monitor.probe_names = ["alice/calm", "alice/happy", "default/keep"]
+    app._highlight_probe = "alice/happy"
+    app._highlighting = True
+    app._apply_highlight_to_all = MagicMock()
+    app._refresh_trait_why = MagicMock()
+
+    # Mutate probe_names as ``unprobe`` would so ``set_active_probes``
+    # afterward observes the trimmed set.
+    def _unprobe(name):
+        app._session._monitor.probe_names = [
+            p for p in app._session._monitor.probe_names if p != name
+        ]
+    app._session.unprobe.side_effect = _unprobe
+
+    app._handle_command("/unprobe alice/")
+
+    assert app._session.unprobe.call_count == 2
+    assert app._session._monitor.probe_names == ["default/keep"]
+    # Highlight seed sat inside the namespace — gets dropped.
+    assert app._highlight_probe is None
+    assert app._highlighting is False
+    assert "Removed 2 probe(s) from 'alice/'" in _msgs(app)
+
+
+def test_handle_unprobe_namespace_keeps_highlight_when_seed_outside_namespace():
+    app = _make_app()
+    app._session._monitor.probe_names = ["alice/x", "default/keep"]
+    app._highlight_probe = "default/keep"
+    app._highlighting = True
+    app._apply_highlight_to_all = MagicMock()
+    app._refresh_trait_why = MagicMock()
+
+    def _unprobe(name):
+        app._session._monitor.probe_names = [
+            p for p in app._session._monitor.probe_names if p != name
+        ]
+    app._session.unprobe.side_effect = _unprobe
+
+    app._handle_command("/unprobe alice/")
+
+    # Seed wasn't in the removed namespace, so highlight state is preserved.
+    assert app._highlight_probe == "default/keep"
+    assert app._highlighting is True
+
+
+# ---- Shift+arrow alpha step ----
+
+
+# ---- Input history (↑/↓ recall) ----
+
+
+class _FakeInput:
+    """Stand-in for Textual ``Input`` exposing only what the recall
+    helpers touch — ``value`` and ``cursor_position``. Avoids mounting
+    a Textual app for unit-level coverage."""
+
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+        self.cursor_position = len(value)
+
+
+def _wire_fake_input(app, value: str = "") -> _FakeInput:
+    fake = _FakeInput(value)
+    app.query_one = MagicMock(return_value=fake)
+    return fake
+
+
+def test_push_input_history_dedupes_and_caps():
+    from saklas.tui.app import _INPUT_HISTORY_MAX
+
+    app = _make_app()
+
+    app._push_input_history("hello")
+    app._push_input_history("hello")  # exact repeat collapses
+    app._push_input_history("/steer 0.5 angry")
+    app._push_input_history("/steer 0.5 angry")  # exact repeat collapses
+    app._push_input_history("hello")  # ping-pong: re-records
+
+    assert app._input_history == ["hello", "/steer 0.5 angry", "hello"]
+
+    # Empty / whitespace-only input is a no-op.
+    app._push_input_history("")
+    app._push_input_history("   ")
+    assert app._input_history == ["hello", "/steer 0.5 angry", "hello"]
+
+    # Cap: overflow drops oldest, keeps newest.
+    overflow = [f"line{i}" for i in range(_INPUT_HISTORY_MAX + 50)]
+    for line in overflow:
+        app._push_input_history(line)
+    assert len(app._input_history) == _INPUT_HISTORY_MAX
+    assert app._input_history[-1] == overflow[-1]
+    assert app._input_history[0] == overflow[-_INPUT_HISTORY_MAX]
+
+
+def test_history_navigate_up_walks_back_and_stashes_draft():
+    app = _make_app()
+    app._input_history = ["one", "two", "three"]
+    inp = _wire_fake_input(app, value="draft-in-progress")
+
+    # First ↑: stash draft, jump to newest entry.
+    app._history_navigate(-1)
+    assert inp.value == "three"
+    assert inp.cursor_position == len("three")
+    assert app._history_index == 2
+    assert app._history_stash == "draft-in-progress"
+
+    app._history_navigate(-1)
+    assert inp.value == "two"
+    assert app._history_index == 1
+
+    app._history_navigate(-1)
+    assert inp.value == "one"
+    assert app._history_index == 0
+
+    # Past the oldest pins to entry 0 — bash semantics, no wrap.
+    app._history_navigate(-1)
+    assert inp.value == "one"
+    assert app._history_index == 0
+
+
+def test_history_navigate_down_restores_stash_at_bottom():
+    app = _make_app()
+    app._input_history = ["alpha", "beta"]
+    inp = _wire_fake_input(app, value="my draft")
+
+    # Walk up twice then back down twice — should hit the stash.
+    app._history_navigate(-1)  # → "beta"
+    app._history_navigate(-1)  # → "alpha"
+    assert inp.value == "alpha"
+
+    app._history_navigate(+1)  # → "beta"
+    assert inp.value == "beta"
+    assert app._history_index == 1
+
+    app._history_navigate(+1)  # → restore stash, clear index
+    assert inp.value == "my draft"
+    assert app._history_index is None
+    assert app._history_stash == ""
+
+
+def test_history_navigate_down_at_live_slot_is_noop():
+    app = _make_app()
+    app._input_history = ["something"]
+    inp = _wire_fake_input(app, value="fresh")
+
+    app._history_navigate(+1)
+    # No recall in flight — ↓ leaves the input alone.
+    assert inp.value == "fresh"
+    assert app._history_index is None
+
+
+def test_history_navigate_empty_history_is_noop():
+    app = _make_app()
+    inp = _wire_fake_input(app, value="x")
+
+    app._history_navigate(-1)
+    app._history_navigate(+1)
+    assert inp.value == "x"
+    assert app._history_index is None
+
+
+def test_user_submit_appends_to_history():
+    """End-to-end: messages flowing through ``UserSubmitted`` land in
+    the recall ring regardless of whether they're slash commands.
+    Downstream dispatch (generation worker / slash registry) is mocked
+    so the test stays at the unit level."""
+    from saklas.tui.chat_panel import ChatPanel
+
+    app = _make_app()
+    # Block both branches so the recall-push side-effect is the only
+    # observable behavior left to assert on.
+    app._start_generation = MagicMock()
+    app._handle_command = MagicMock()
+
+    app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted("hello world"))
+    app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted("/steer 0.5 angry"))
+    app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted("/steer 0.5 angry"))  # dedupe
+
+    assert app._input_history == ["hello world", "/steer 0.5 angry"]
+    # Slash commands still routed through the dispatcher; chat messages
+    # still kicked off generation.  The history push doesn't replace
+    # either downstream path.
+    app._start_generation.assert_called_once_with("hello world")
+    assert app._handle_command.call_count == 2
+
+
+def test_shift_arrow_uses_coarse_alpha_step():
+    """Holding shift with ←/→ nudges alpha by 0.1 instead of 0.01."""
+    from saklas.tui.app import _ALPHA_STEP_FINE, _ALPHA_STEP_COARSE
+
+    # Sanity: the constants encode the documented fine/coarse split.
+    assert _ALPHA_STEP_FINE == pytest.approx(0.01)
+    assert _ALPHA_STEP_COARSE == pytest.approx(0.1)
+
+    app = _make_app()
+    app._refresh_left_panel = MagicMock()
+    app._left_panel.get_selected = MagicMock(return_value={"name": "honest"})
+    app._alphas = {"honest": 0.0}
+
+    # Plain right arrow path: 0.01 step.
+    app.action_nav_right()
+    assert app._alphas["honest"] == pytest.approx(_ALPHA_STEP_FINE)
+
+    # Shift+right path: 0.1 step (10× coarser).
+    app._adjust_alpha(_ALPHA_STEP_COARSE)
+    assert app._alphas["honest"] == pytest.approx(0.11)
+
+    # Shift+left undoes the shift+right exactly.
+    app._adjust_alpha(-_ALPHA_STEP_COARSE)
+    assert app._alphas["honest"] == pytest.approx(_ALPHA_STEP_FINE)

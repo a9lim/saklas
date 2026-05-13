@@ -31,23 +31,32 @@ _ANGULAR_PERP_EPSILON: float = 1e-6
 def _angular_inplace(
     hidden: torch.Tensor,
     d_hat: torch.Tensor | None,
-    cos_t: float,
-    sin_t: float,
+    cos_t: float | torch.Tensor | None,
+    sin_t: float | torch.Tensor | None,
 ) -> None:
     """Rotate ``hidden`` in-place toward ``d_hat`` by the cached angle.
 
     The rotation lives in the 2D subspace spanned by each position's
     ``hidden[i]`` and the global direction ``d_hat``, with angle ``θ``
-    encoded by the Python scalars ``cos_t`` / ``sin_t``.  Norm is
-    preserved exactly: rotation is unitary in the (h_unit, e_perp)
-    basis, and we restore the original per-position magnitude.
+    encoded by ``cos_t`` / ``sin_t``.  Both may be Python floats (the
+    direct-call test path) or 0-dim tensors (the hook fast path under
+    ``torch.compile``: pinning the angle to a tensor input avoids
+    recompiles when α changes between generations and avoids constant-
+    folding the angle into a CUDA-graph capture).
 
-    No-op when ``d_hat is None`` (degenerate composed tensor) or when
-    ``sin_t == 0`` (θ=0; identity rotation).  Per-position positions
-    whose orthogonal component to ``d_hat`` falls below
-    :data:`_ANGULAR_PERP_EPSILON` are left untouched.
+    Norm is preserved exactly: rotation is unitary in the
+    ``(h_unit, e_perp)`` basis, and we restore the original per-position
+    magnitude.
+
+    No-op when ``d_hat is None`` (degenerate composed tensor —
+    :meth:`SteeringHook._refresh_angular_cache` sets this when α is
+    effectively zero, so the ``sin_t == 0`` Python guard the v2.1 entry
+    used to carry is unnecessary and would force a CPU sync if ``sin_t``
+    is a tensor).  Per-position positions whose orthogonal component to
+    ``d_hat`` falls below :data:`_ANGULAR_PERP_EPSILON` are left
+    untouched.
     """
-    if d_hat is None or sin_t == 0.0:
+    if d_hat is None or cos_t is None or sin_t is None:
         return
 
     h_f32 = hidden.to(torch.float32)
@@ -69,10 +78,15 @@ def _angular_inplace(
     rotated_unit = cos_t * h_unit + sin_t * d_perp_unit
     # Where the perpendicular is below threshold, the rotation is
     # ill-defined; preserve h_unit there (no rotation has effect when
-    # h is already on the steering axis).
+    # h is already on the steering axis).  We always run the
+    # ``torch.where`` rather than gate it on ``.any()`` — the gate would
+    # be a data-dependent host conditional, forcing a CPU sync and
+    # graph-breaking under ``torch.compile(mode="reduce-overhead")``.
+    # The unconditional ``where`` adds a single elementwise compare +
+    # blend per position, which is far cheaper than the sync the gate
+    # would cost.
     near_aligned = d_perp_norm < _ANGULAR_PERP_EPSILON
-    if near_aligned.any():
-        rotated_unit = torch.where(near_aligned, h_unit, rotated_unit)
+    rotated_unit = torch.where(near_aligned, h_unit, rotated_unit)
 
     hidden.copy_((rotated_unit * h_norm).to(hidden.dtype))
 
@@ -191,10 +205,20 @@ class SteeringHook:
         self.injection_mode: InjectionMode = injection_mode
         self.theta_max: float = theta_max
         # Angular fast-path cache (None unless angular + fast path).
+        # ``_cos_t`` / ``_sin_t`` are 0-dim tensors when the cache is
+        # warm (allocated lazily on the layer's device in
+        # ``_refresh_angular_cache``) so that ``torch.compile`` sees a
+        # single tensor input across recomposes — Python-scalar inputs
+        # would burn a guard per α and force recompile on every
+        # generation.  Allocated once via ``empty(())`` and refreshed
+        # in-place via ``copy_`` against a CPU staging tensor.  When
+        # the cache is cold (no fast-path steering active) the
+        # tensors stay as ``None`` and the hot path early-exits on
+        # ``self._d_hat is None``.
         self._d_hat: torch.Tensor | None = None
         self._theta: float = 0.0
-        self._cos_t: float = 1.0
-        self._sin_t: float = 0.0
+        self._cos_t: torch.Tensor | None = None
+        self._sin_t: torch.Tensor | None = None
         # Slow-path angular: per-group α-budget (Σ_i |α_i| × ||baked_i||)
         # parallel to ``composed_groups`` so the hot path can sum-then-
         # rotate without re-traversing the entries list.
@@ -365,13 +389,18 @@ class SteeringHook:
         from the parallel ``angular_strengths`` list so we don't
         re-traverse the entries.  Falls back to identity (no rotation)
         when either ``composed`` or the strength is degenerate.
+
+        ``_cos_t`` / ``_sin_t`` are 0-dim tensors on the layer's device
+        (allocated lazily on first non-degenerate refresh, reused via
+        in-place ``copy_`` thereafter).  Pinning them as tensor inputs
+        keeps the hook compatible with ``torch.compile`` and CUDA-graph
+        capture across α changes — Python scalars would force recompile
+        per generation.
         """
         composed = self.composed
         if composed is None or theta_strength <= 1e-12:
             self._d_hat = None
             self._theta = 0.0
-            self._cos_t = 1.0
-            self._sin_t = 0.0
             return
         c_f32 = composed.detach().to(torch.float32)
         c_norm_t = torch.linalg.vector_norm(c_f32)
@@ -380,8 +409,6 @@ class SteeringHook:
             # All α-weighted terms cancelled out; treat as no-op.
             self._d_hat = None
             self._theta = 0.0
-            self._cos_t = 1.0
-            self._sin_t = 0.0
             return
         # ``d_hat`` lives on the same device/dtype as ``composed`` so the
         # hot-path projection broadcasts cleanly against ``hidden``.
@@ -393,8 +420,28 @@ class SteeringHook:
         if ratio > 1.0:
             ratio = 1.0
         self._theta = ratio * self.theta_max
-        self._cos_t = math.cos(self._theta)
-        self._sin_t = math.sin(self._theta)
+        cos_v = math.cos(self._theta)
+        sin_v = math.sin(self._theta)
+        # Lazy alloc on the composed tensor's device; subsequent
+        # refreshes mutate in place so the tensor *address* the
+        # captured graph or compiled artifact saw stays valid.
+        # Locals so pyright narrows the post-alloc fill_ calls — the
+        # ``self.<attr>`` writes don't propagate the type narrowing
+        # back to the attribute reads.
+        cos_buf = self._cos_t
+        sin_buf = self._sin_t
+        if cos_buf is None or cos_buf.device != composed.device:
+            cos_buf = torch.empty(
+                (), device=composed.device, dtype=torch.float32,
+            )
+            sin_buf = torch.empty(
+                (), device=composed.device, dtype=torch.float32,
+            )
+            self._cos_t = cos_buf
+            self._sin_t = sin_buf
+        assert sin_buf is not None  # paired alloc above
+        cos_buf.fill_(cos_v)
+        sin_buf.fill_(sin_v)
 
     def hook_fn(self, module, input, output):
         # Fast path: single composed additive tensor, no ablation, no
@@ -592,6 +639,28 @@ class SteeringManager:
         self.ctx: TriggerContext = TriggerContext()
         self.injection_mode: InjectionMode = injection_mode
         self.theta_max: float = theta_max
+
+    def all_fast_path(self) -> bool:
+        """True iff every attached hook is in fast-path mode.
+
+        Fast path = single ``Trigger.BOTH`` additive group with no
+        ablation, collapsed by ``SteeringHook.recompose`` into a stable
+        ``self.composed`` tensor.  In this regime the hook fires
+        unconditional in-place ops with no read of the mutable
+        :class:`TriggerContext` per step — which is the precondition
+        for ``torch.compile(mode="reduce-overhead")`` graph capture and
+        for the StaticCache routing in :mod:`saklas.core.cuda_graphs`.
+
+        Slow path = trigger groups, ablation, or probe gates: hooks
+        consult ``ctx`` per fire so a captured graph can't represent the
+        per-step decision.  Empty manager (no hooks attached) returns
+        True — there's nothing to break, and unsteered generations are
+        the cheapest case.
+        """
+        for hook in self.hooks.values():
+            if hook.composed is None:
+                return False
+        return True
 
     def add_vector(
         self,

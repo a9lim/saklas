@@ -451,6 +451,91 @@ export const chatLog: ChatLogState = $state({
   pendingIndex: null,
 });
 
+// ============================================================ input history ===
+
+/** Cap on the recall ring.  Same order of magnitude as readline's
+ *  default ``HISTSIZE`` and the TUI's ``_INPUT_HISTORY_MAX``. */
+export const INPUT_HISTORY_MAX = 200;
+
+export interface InputHistoryState {
+  /** Submitted lines, oldest first.  Capped at ``INPUT_HISTORY_MAX`` —
+   *  oldest entries get dropped when the cap is exceeded. */
+  entries: string[];
+  /** Cursor into ``entries`` while ↑/↓ recall is in flight.  ``null``
+   *  means "live slot" — the textarea reflects whatever the user is
+   *  actively composing. */
+  index: number | null;
+  /** Whatever the user was typing the moment they first hit ↑.
+   *  ↓ past the newest entry restores it. */
+  stash: string;
+}
+
+/** In-memory only by design (per the user's chosen policy).  Reload
+ *  drops history; matches the TUI's process-scoped shape and avoids
+ *  leaking command lines into ``localStorage``. */
+export const inputHistory: InputHistoryState = $state({
+  entries: [],
+  index: null,
+  stash: "",
+});
+
+/** Append a freshly-submitted line.  De-dupes against the immediately
+ *  preceding entry (readline / bash semantics — ping-pong A→B→A still
+ *  records both A's, but A→A→A collapses to one).  Resets the recall
+ *  cursor so the next ↑ starts at the bottom of the ring. */
+export function pushInputHistory(text: string): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  const entries = inputHistory.entries;
+  const last = entries.length > 0 ? entries[entries.length - 1] : null;
+  if (last !== trimmed) {
+    const next = [...entries, trimmed];
+    inputHistory.entries = next.length > INPUT_HISTORY_MAX
+      ? next.slice(next.length - INPUT_HISTORY_MAX)
+      : next;
+  }
+  inputHistory.index = null;
+  inputHistory.stash = "";
+}
+
+/** Walk the recall ring by ``delta`` (-1 for ↑, +1 for ↓) and return
+ *  the string the textarea should now display, or ``null`` to leave
+ *  the textarea alone (top/bottom of an empty ring, or ↓ at the live
+ *  slot).
+ *
+ *  ``currentInput`` is what's currently in the textarea; on the first
+ *  ↑ it gets stashed so a ↓ past the newest entry can restore it. */
+export function navigateInputHistory(
+  delta: -1 | 1,
+  currentInput: string,
+): string | null {
+  const entries = inputHistory.entries;
+  if (entries.length === 0) return null;
+
+  if (inputHistory.index === null) {
+    if (delta > 0) return null; // ↓ at the live slot is a no-op.
+    inputHistory.stash = currentInput;
+    inputHistory.index = entries.length - 1;
+    return entries[inputHistory.index];
+  }
+
+  const newIdx = inputHistory.index + delta;
+  if (newIdx < 0) {
+    inputHistory.index = 0;
+    return entries[0];
+  }
+  if (newIdx >= entries.length) {
+    // Walked past the newest entry — restore the stash and reset the
+    // cursor so the next ↑ re-stashes fresh input.
+    inputHistory.index = null;
+    const stash = inputHistory.stash;
+    inputHistory.stash = "";
+    return stash;
+  }
+  inputHistory.index = newIdx;
+  return entries[newIdx];
+}
+
 export interface HighlightState {
   /** Probe name selected for primary tinting.  ``null`` disables
    * highlighting entirely (token backgrounds render transparent). */

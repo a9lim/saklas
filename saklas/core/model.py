@@ -264,7 +264,15 @@ def _resolve_dtype(dtype, device: str) -> torch.dtype:
     return dtype
 
 
-def load_model(model_id: str, quantize=None, device="auto", dtype=None):
+def load_model(
+    model_id: str,
+    quantize=None,
+    device="auto",
+    dtype=None,
+    *,
+    compile: bool = True,
+    compile_mode: str = "default",
+):
     """Load a HuggingFace causal LM and its tokenizer.
 
     Args:
@@ -273,9 +281,29 @@ def load_model(model_id: str, quantize=None, device="auto", dtype=None):
         device: "auto" (detect), "cuda", "mps", or "cpu".
         dtype: torch.dtype or string ("bfloat16"/"float16"/"float32"). None
             picks the device default — bf16 on CUDA/MPS, fp32 on CPU.
+        compile: When True (default), wrap ``model`` with ``torch.compile``
+            after load on CUDA — fuses the per-layer kernels and amortizes
+            launch overhead, typically 1.2–2× decode tok/s on small models.
+            Auto-skipped on MPS/CPU (compile is CUDA-tuned and regresses
+            elsewhere).  Pass ``False`` to disable for debugging or when a
+            specific architecture trips compile (e.g. dynamic-shape custom
+            modeling).
+        compile_mode: torch.compile mode string passed through.
+            ``"default"`` (default) does inductor kernel fusion without
+            graph capture — composes cleanly with HF's growing
+            ``DynamicCache``.  ``"reduce-overhead"`` adds internal
+            CUDA-graph capture but expects fixed shapes (paired with
+            :class:`transformers.StaticCache` in Phase B's
+            ``cuda_graphs`` path; using it here without static cache
+            would shape-recompile per decode step).
+            ``"max-autotune"`` runs Triton autotune (long first-call
+            latency, marginal gains for decode-shape workloads).
 
     Returns:
-        (model, tokenizer) tuple.
+        (model, tokenizer) tuple.  Compiled models still expose the
+        underlying ``transformers`` attribute graph through
+        ``OptimizedModule.__getattr__``, so ``get_layers`` and
+        ``get_model_info`` continue to work.
     """
     device = detect_device(device)
     resolved_dtype = _resolve_dtype(dtype, device)
@@ -437,6 +465,38 @@ def load_model(model_id: str, quantize=None, device="auto", dtype=None):
     mem_gb = _get_memory_gb(device)
     if mem_gb > 0:
         log.info("Memory used: %.2f GB", mem_gb)
+
+    # --- compile (CUDA-only auto-enable) ---
+    # Wrapping last so the compile artifact closes over weights that
+    # are already on-device, in their final dtype, and frozen.
+    # ``OptimizedModule`` forwards attribute access via ``__getattr__``
+    # so ``get_layers(model)`` / ``model.config`` keep working through
+    # the wrapper; the caller never has to know whether compile fired.
+    # Hooks added later via ``register_forward_hook`` on layer modules
+    # (which live under ``model._orig_mod``) compose cleanly: compile
+    # treats hooks as external state and recompiles only when the
+    # hook's *Python-scalar* inputs change.  Pinning the angle scalars
+    # to 0-dim tensors in :class:`SteeringHook._refresh_angular_cache`
+    # keeps a single compiled artifact across α changes between
+    # generations.
+    if compile and device == "cuda":
+        try:
+            import torch._dynamo as _dynamo  # noqa: F401  (probe-only)
+        except ImportError:
+            log.info("torch.compile unavailable (no _dynamo); skipping")
+        else:
+            log.info("Compiling model with torch.compile(mode=%r)", compile_mode)
+            # ``dynamic=None`` is PyTorch's automatic-shape mode —
+            # initial calls specialize, later calls recompile only on
+            # genuinely new shape patterns.  Right for the prefill/decode
+            # mix we run: prefill varies per prompt, decode is fixed.
+            model = torch.compile(model, mode=compile_mode, dynamic=None)
+    elif compile and device != "cuda":
+        log.info(
+            "compile=True but device=%s — skipping torch.compile "
+            "(supported only on CUDA)",
+            device,
+        )
 
     return model, tokenizer
 

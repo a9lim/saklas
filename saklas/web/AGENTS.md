@@ -104,6 +104,10 @@ Chat tokens: every per-token span is clickable regardless of whether a highlight
 
 Vector strip projection picker: the `⋮` menu's "project onto (~)…" / "project orthogonal (|)…" entries open an inline modal at `--z-modal` (above drawers) — text input autofocuses, Enter confirms, Escape / click-outside / cancel cancel. Replaces the v1 `window.prompt`. Re-clicking the same operator with an existing projection clears it (no dialog).
 
+## Input history (↑/↓ recall)
+
+Shell-style history on the chat textarea. Every line submitted via `doSend` lands in `inputHistory.entries` through `pushInputHistory` (chat messages and slash commands alike); ↑/↓ in `Chat.svelte::onKeydown` call `navigateInputHistory(±1, currentInput)`. Edge-only multi-line policy: ↑ recalls only when the cursor sits on the first line (`shouldRecallUp`); ↓ goes forward only on the last line (`shouldRecallDown`) and is a no-op when no recall is in flight, so multi-line editing inside the draft isn't hijacked. First ↑ stashes the in-progress draft; ↓ past the newest entry restores it. `INPUT_HISTORY_MAX = 200` caps the ring. **In-memory only** — no `localStorage` persistence, matches the TUI's process-scoped shape and avoids leaking command lines to disk. Mirrors `saklas/tui/app.py::_history_navigate` / `_push_input_history` semantics; bash-style dedupe (collapses immediate repeats, preserves ping-pong).
+
 ## A/B compare
 
 `abState.enabled` toggles two-column rendering. The shadow gen (unsteered) runs after the steered turn finishes via `_sendShadowGenerate(steeredIdx)`, which:

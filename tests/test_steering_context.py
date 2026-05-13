@@ -32,9 +32,24 @@ class _Stub(SaklasSession):
     """Construct a session without touching any model/tokenizer machinery."""
 
     def __init__(self, profiles: dict) -> None:  # type: ignore[override]
+        import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
         self._steering_override_stack = []
+        # Reentrant gen lock — _push_steering / _pop_steering acquire it
+        # so out-of-band steering scope mutations don't race a mid-step
+        # rebuild during generation (v2.2 fix).  Stub mode never runs
+        # generation, so the lock is uncontended; we still need it to
+        # exist as an attribute for the ``with self._gen_lock:`` block
+        # to bind.
+        self._gen_lock = threading.RLock()
+        # Phase guard the push/pop methods consult to reject callback
+        # reentry mid-gen — stubs are always idle.
+        from saklas.core.session import GenState
+        self._gen_phase = GenState.IDLE
+        # Internal-cleanup bypass for the phase guard; stubs never run
+        # gen so it stays False.
+        self._internal_steering_pop = False
         # Session-level defaults consulted by _resolve_steering_override
         # and _resolve_projection_metric when the LIFO has no overrides.
         # Mirror the v2.1 SaklasSession defaults so the stub flows through

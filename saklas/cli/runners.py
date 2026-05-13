@@ -106,6 +106,14 @@ def _make_session(args: argparse.Namespace):
         # toggling the rest of the v2.1 stack.
         dls = not bool(getattr(args, "no_dls", False))
     theta_max = getattr(args, "theta_max", None)
+    # ``--no-compile`` and ``--no-cuda-graphs`` opt out of v2.2's
+    # CUDA-side perf auto-enables.  YAML ``compile: false`` /
+    # ``cuda_graphs: false`` are folded onto ``args.no_compile`` /
+    # ``args.no_cuda_graphs`` upstream in ``_load_effective_config`` so
+    # the runner sees single booleans regardless of where the opt-out
+    # came from.
+    compile_enabled = not bool(getattr(args, "no_compile", False))
+    cuda_graphs_enabled = not bool(getattr(args, "no_cuda_graphs", False))
     return SaklasSession.from_pretrained(
         args.model, device=args.device, quantize=args.quantize,
         probes=probe_categories,
@@ -116,6 +124,8 @@ def _make_session(args: argparse.Namespace):
         extraction_method=extraction_method,
         projection_metric=projection_metric,
         dls=dls,
+        compile=compile_enabled,
+        cuda_graphs=cuda_graphs_enabled,
     )
 
 
@@ -178,6 +188,19 @@ def _load_effective_config(args: argparse.Namespace):
         and getattr(args, "projection_metric", None) is None
     ):
         args.projection_metric = composed.projection_metric
+    # YAML ``compile: false`` folds onto ``args.no_compile`` (the CLI
+    # opt-out).  YAML ``compile: true`` is a no-op since auto-enable is
+    # already the default — but accepting it makes round-tripping
+    # ``ConfigFile.to_yaml`` symmetric with the other knobs.  CLI flag
+    # always wins: ``--no-compile`` already sets ``args.no_compile=True``,
+    # which we leave alone.
+    if composed.compile is False and not bool(getattr(args, "no_compile", False)):
+        args.no_compile = True
+    if (
+        composed.cuda_graphs is False
+        and not bool(getattr(args, "no_cuda_graphs", False))
+    ):
+        args.no_cuda_graphs = True
     ensure_vectors_installed(composed, strict=getattr(args, "strict", False))
     return composed
 

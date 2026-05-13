@@ -107,6 +107,7 @@ def _build_registry() -> dict[str, SlashCommand]:
                 "  e.g. /steer 0.5 honest\n"
                 "       /steer 0.3 warm@after\n"
                 "       /steer 0.5 honest:sae\n"
+                "       /steer alice/                (bulk; default-off)\n"
                 "  For a new bipolar extraction, use /extract <pos> <neg>."
             ),
             min_args=1,
@@ -122,7 +123,7 @@ def _build_registry() -> dict[str, SlashCommand]:
         SlashCommand(
             name="/unsteer",
             handler=SaklasApp._handle_unsteer,
-            usage="Usage: /unsteer <name>",
+            usage="Usage: /unsteer <name>  |  /unsteer <ns>/  (bulk)",
             min_args=1,
             max_args=None,
         ),
@@ -131,7 +132,8 @@ def _build_registry() -> dict[str, SlashCommand]:
             handler=SaklasApp._handle_probe,
             usage=(
                 "Usage: /probe <concept>\n"
-                "       /probe <pos> . <neg>"
+                "       /probe <pos> . <neg>\n"
+                "       /probe <ns>/         (bulk add namespace)"
             ),
             min_args=1,
             max_args=None,
@@ -139,7 +141,7 @@ def _build_registry() -> dict[str, SlashCommand]:
         SlashCommand(
             name="/unprobe",
             handler=SaklasApp._handle_unprobe,
-            usage="Usage: /unprobe <name>",
+            usage="Usage: /unprobe <name>  |  /unprobe <ns>/  (bulk)",
             min_args=1,
             max_args=None,
         ),

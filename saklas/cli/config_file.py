@@ -22,6 +22,7 @@ _KNOWN_KEYS = {
     "extraction_method",
     "injection_mode", "theta_max",
     "projection_metric",
+    "compile", "cuda_graphs",
 }
 
 _VALID_EXTRACTION_METHODS = ("dim", "pca")
@@ -47,6 +48,8 @@ class ConfigFile:
     injection_mode: Optional[str] = None     # "angular" | "additive"; None = default
     theta_max: Optional[float] = None        # radians; None = default π/2
     projection_metric: Optional[str] = None  # "mahalanobis" | "euclidean"; None = default
+    compile: Optional[bool] = None           # CUDA torch.compile auto-enable; None = default (on)
+    cuda_graphs: Optional[bool] = None       # CUDA StaticCache + graph capture; None = default (on)
 
     @classmethod
     def load_default(cls) -> Optional["ConfigFile"]:
@@ -183,6 +186,25 @@ class ConfigFile:
                     f"(got {projection_metric!r})"
                 )
 
+        compile_v = data.get("compile")
+        if compile_v is not None and not isinstance(compile_v, bool):
+            # ``compile: false`` is the documented opt-out; reject ints,
+            # strings, etc. so a malformed YAML doesn't silently disable
+            # compile via ``bool("false") == True``.
+            raise ConfigFileError(
+                f"{path}: compile must be a boolean (got "
+                f"{type(compile_v).__name__} {compile_v!r}). Use "
+                f"``compile: true`` or ``compile: false``."
+            )
+
+        cuda_graphs_v = data.get("cuda_graphs")
+        if cuda_graphs_v is not None and not isinstance(cuda_graphs_v, bool):
+            raise ConfigFileError(
+                f"{path}: cuda_graphs must be a boolean (got "
+                f"{type(cuda_graphs_v).__name__} {cuda_graphs_v!r}). "
+                f"Use ``cuda_graphs: true`` or ``cuda_graphs: false``."
+            )
+
         return cls(
             model=data.get("model"),
             vectors=vectors,
@@ -195,6 +217,8 @@ class ConfigFile:
             injection_mode=injection_mode,
             theta_max=theta_max,
             projection_metric=projection_metric,
+            compile=compile_v,
+            cuda_graphs=cuda_graphs_v,
         )
 
 
@@ -211,7 +235,7 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
             "model", "thinking", "temperature",
             "top_p", "max_tokens", "system_prompt", "vectors",
             "extraction_method", "injection_mode", "theta_max",
-            "projection_metric",
+            "projection_metric", "compile", "cuda_graphs",
         ):
             v = getattr(c, f)
             if v is not None:

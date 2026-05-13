@@ -461,10 +461,19 @@ def _resolve_atom(
 
     ``alphas_key`` is the key under which this atom lands in
     ``Steering.alphas``: the canonical concept name from
-    ``resolve_pole``, suffixed with ``:<variant>`` when the variant is
-    anything other than ``raw``.  ``sign_flip`` is +1 or -1 per
-    ``resolve_pole``; callers multiply their user-supplied coefficient
-    by this flip.
+    ``resolve_pole``, prefixed with ``<namespace>/`` when the user
+    explicitly typed a namespace (so two installed packs sharing a
+    concept name — ``alice/foo`` vs ``bob/foo`` — stay distinct
+    through the registry-key path), and suffixed with ``:<variant>``
+    when the variant is anything other than ``raw``.  ``sign_flip``
+    is +1 or -1 per ``resolve_pole``; callers multiply their
+    user-supplied coefficient by this flip.
+
+    Bare references (no user-typed namespace) keep the canonical
+    name as the key — matches v2.0 behavior and lets cross-namespace
+    bare-pole collisions surface at parse time via
+    :class:`AmbiguousSelectorError` rather than silently picking
+    one.
     """
     from saklas.io.selectors import resolve_pole
 
@@ -473,6 +482,8 @@ def _resolve_atom(
         raw = f"{raw}:{atom.variant}"
     ns = atom.namespace if atom.namespace is not None else default_namespace
     canonical, sign, _match, variant = resolve_pole(raw, namespace=ns)
+    if atom.namespace is not None:
+        canonical = f"{atom.namespace}/{canonical}"
     return _with_variant(canonical, variant), sign
 
 

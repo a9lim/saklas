@@ -29,6 +29,9 @@
     sendStop,
     genStatus,
     openDrawer,
+    inputHistory,
+    pushInputHistory,
+    navigateInputHistory,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import {
@@ -68,6 +71,9 @@
   function doSend(): void {
     const text = input.trim();
     if (!text) return;
+    // Push to ↑/↓ recall before clearing — covers both chat messages
+    // and slash commands (every line typed in here is recallable).
+    pushInputHistory(text);
     const stateless = statelessNext;
     statelessNext = false;
     input = "";
@@ -81,6 +87,37 @@
     queueMicrotask(autosize);
   }
 
+  /** Edge-only multi-line policy: ↑ recalls history when the cursor
+   *  sits on the first line of the draft; ↓ goes forward only on the
+   *  last line.  In-between lines fall through to the textarea's
+   *  native cursor nav so multi-line editing isn't hijacked. */
+  function shouldRecallUp(ta: HTMLTextAreaElement): boolean {
+    const value = ta.value;
+    const cursor = ta.selectionStart ?? 0;
+    const firstNL = value.indexOf("\n");
+    return firstNL === -1 || cursor <= firstNL;
+  }
+
+  function shouldRecallDown(ta: HTMLTextAreaElement): boolean {
+    const value = ta.value;
+    const cursorEnd = ta.selectionEnd ?? value.length;
+    const lastNL = value.lastIndexOf("\n");
+    return lastNL === -1 || cursorEnd > lastNL;
+  }
+
+  function applyRecalled(text: string): void {
+    input = text;
+    // Defer cursor placement past the bind:value flush so the textarea
+    // reflects the new value before we set the selection.
+    queueMicrotask(() => {
+      const el = textareaRef;
+      if (el) {
+        el.setSelectionRange(el.value.length, el.value.length);
+        autosize();
+      }
+    });
+  }
+
   function onKeydown(ev: KeyboardEvent): void {
     if (ev.key === "Enter") {
       // Cmd/Ctrl-Enter always sends; bare Enter sends; Shift-Enter newline.
@@ -92,6 +129,21 @@
     if (ev.key === "Escape" && genStatus.active) {
       ev.preventDefault();
       sendStop();
+      return;
+    }
+    if (ev.key === "ArrowUp" || ev.key === "ArrowDown") {
+      const ta = textareaRef;
+      if (!ta) return;
+      const goingUp = ev.key === "ArrowUp";
+      if (goingUp ? !shouldRecallUp(ta) : !shouldRecallDown(ta)) return;
+      // ↓ at the live slot (no recall in flight) is a no-op — leave
+      // the keystroke for the textarea so it can move within an empty
+      // last line or trigger the browser's native end-of-input nudge.
+      if (!goingUp && inputHistory.index === null) return;
+      const recalled = navigateInputHistory(goingUp ? -1 : +1, input);
+      if (recalled === null) return;
+      ev.preventDefault();
+      applyRecalled(recalled);
     }
   }
 

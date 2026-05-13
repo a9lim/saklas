@@ -184,6 +184,101 @@ def test_mistral_regex_fix_skipped_for_non_mistral():
         )
 
 
+# ---------------------------------------------------------------------------
+# torch.compile auto-enable.  The compile path is wired in
+# ``load_model``: when ``compile=True`` (default) and ``device == "cuda"``,
+# the loaded model is wrapped with ``torch.compile``; on MPS/CPU compile
+# is silently skipped, and ``compile=False`` is the explicit opt-out
+# regardless of device.  Tests mock ``torch.compile`` so we never actually
+# compile (which would download dependencies and take seconds); we only
+# verify it was *invoked* with the right args.
+# ---------------------------------------------------------------------------
+
+
+def _run_load_with_compile(
+    *, device: str, compile: bool = True, compile_mode: str = "default",
+    model_type: str = "qwen3",
+):
+    """Run load_model with mocked transformers + ``torch.compile``.
+
+    Returns ``(compile_called, compile_kwargs, returned_model)``.
+    """
+    cfg = _FakeConfig(model_type)
+    compile_invocations: list[dict] = []
+    base_model = _FakeModel("sdpa")
+
+    def _fake_compile(model, **kwargs):
+        compile_invocations.append({"model": model, **kwargs})
+        # Return a sentinel marker so we can verify the wrapped object
+        # is what propagates back to the caller.
+        return SimpleNamespace(_compiled_marker=True, _orig_mod=model)
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
+        patch.object(torch, "compile", side_effect=_fake_compile) as mock_compile,
+    ):
+        mock_tok.from_pretrained.return_value = SimpleNamespace()
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_model.from_pretrained.return_value = base_model
+        ret_model, _tok = model_mod.load_model(
+            "fake/repo", device=device, compile=compile,
+            compile_mode=compile_mode,
+        )
+
+    return (mock_compile.called, compile_invocations, ret_model)
+
+
+def test_compile_auto_enabled_on_cuda():
+    """Default behavior: CUDA load wraps the model with torch.compile."""
+    called, invocations, model = _run_load_with_compile(device="cuda")
+    assert called, "torch.compile should fire on CUDA when compile=True"
+    assert len(invocations) == 1
+    inv = invocations[0]
+    assert inv["mode"] == "default", (
+        f"expected mode='default' (Phase A — kernel fusion without graph "
+        f"capture), got {inv.get('mode')!r}"
+    )
+    # The returned model is the compile wrapper, not the original.
+    assert getattr(model, "_compiled_marker", False) is True
+
+
+def test_compile_skipped_on_mps():
+    """MPS path: compile is silently skipped (compile is CUDA-tuned)."""
+    called, invocations, model = _run_load_with_compile(device="mps")
+    assert not called, "torch.compile must not fire on MPS"
+    assert invocations == []
+    # Original model returned unwrapped.
+    assert not hasattr(model, "_compiled_marker")
+
+
+def test_compile_skipped_on_cpu():
+    called, invocations, _ = _run_load_with_compile(device="cpu")
+    assert not called, "torch.compile must not fire on CPU"
+
+
+def test_compile_explicit_opt_out_on_cuda():
+    """compile=False is the documented escape hatch — even on CUDA, no
+    wrapping should occur.  Lets users debug architecture-specific
+    compile breakage without having to flip device flags."""
+    called, invocations, model = _run_load_with_compile(
+        device="cuda", compile=False,
+    )
+    assert not called, "compile=False must override the CUDA auto-enable"
+    assert not hasattr(model, "_compiled_marker")
+
+
+def test_compile_mode_propagates():
+    """compile_mode kwarg flows through to torch.compile unchanged.
+    Phase B (CUDA graphs via StaticCache) will pair with
+    ``compile_mode='reduce-overhead'``; this test guards the plumbing."""
+    _called, invocations, _ = _run_load_with_compile(
+        device="cuda", compile_mode="reduce-overhead",
+    )
+    assert invocations[0]["mode"] == "reduce-overhead"
+
+
 def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch):
     """``device='mps'`` on a host without an MPS backend (e.g. Linux CI)
     must not crash.  The CUDA branch already gates on

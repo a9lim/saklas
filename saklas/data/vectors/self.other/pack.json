@@ -1,0 +1,16 @@
+{
+  "name": "self.other",
+  "description": "Bipolar axis: self-referential (+) vs other-referential (-). Steer with negative alpha for the opposite pole.",
+  "format_version": 2,
+  "version": "1.0.0",
+  "license": "AGPL-3.0-or-later",
+  "tags": [
+    "social_stance"
+  ],
+  "recommended_alpha": 0.5,
+  "source": "bundled",
+  "files": {
+    "scenarios.json": "93e00778e26c3d6efdbe7b62c9923733e1a8e04a3fcef2916ab90699059ee602",
+    "statements.json": "005f1da7d71754d01f5a91ced2826e076973a14e88013d037fdf784ac76a13ca"
+  }
+}
