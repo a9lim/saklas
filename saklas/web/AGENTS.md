@@ -69,12 +69,20 @@ webui/src/
     ProbeStrip.svelte         # ●/○ select-for-highlight (whole-row click target) + name + right-aligned sparkline + value bar + α display + ✕ + always-visible per-layer reading strip
   drawers/
     {Extract,Load,SaveConversation,LoadConversation,Compare,
-     SystemPrompt,ModelInfo,Help,Export,Sweep,Pack,Merge,Clone,
+     SystemPrompt,ModelInfo,Help,Export,Pack,Merge,Clone,
      VectorPicker,ProbePicker,TokenDrilldown,
-     Correlation,LayerNorms}Drawer.svelte
+     Correlation,LayerNorms,NodeCompare,Transcript}Drawer.svelte
     _SearchableConceptList.svelte  # shared between picker drawers
     index.ts                  # barrel re-exports for App.svelte's switch
 ```
+
+**Sweep deprecation (v2.3).**  `SweepDrawer.svelte` and the standalone
+table view are gone — sweep results land as loom siblings under one
+shared user-turn anchor, viewable in the loom sidebar.  The CLI verb
+`/sweep` still exists as a deprecation alias for `/fan` and prints a
+banner.  Server route `POST /sweep` (SSE) remains; the result handler
+now attaches siblings instead of producing rows.  See
+`docs/plans/loom.md` "Hard breaks" for the v2.3 timing note.
 
 Adding a panel: write the .svelte file, wire any new state into `stores.svelte.ts`, mount from App.svelte's grid, `npm run build`, commit the regenerated `saklas/web/dist/`. Adding a drawer: write the .svelte file under `drawers/`, add the name to the `DrawerName` union in `lib/types.ts`, add a branch to App.svelte's drawer switch, re-export from `drawers/index.ts` if it should ship in the topbar tools menu.
 
@@ -134,6 +142,16 @@ The thinking checkbox is a strict binary. Initial `samplingState.thinking` is `f
 `panels/loom/LoomSidebar.svelte` is the collapsible left panel. Tree rendering is a flat DFS at depth-indented rows so nested recursive components don't stack frames. Decoration ring on each `LoomNode` follows Decision 10: `ringFor(node)` reads `highlightState.target` × `node.aggregate_readings[target]` and returns a reading value clamped to [-1, 1]; null when no probe is selected. The ring is the visual cue for "which branches the highlight probe lights up on" — independent of the dead-branch dim (`.node.dead { opacity: 0.3 }`) and the filter dim (`.tree-row.filtered-out { opacity: 0.5 }`) per Decision 18's three-channel separation.
 
 Esc inside the sidebar defocuses the active element (search input / context menu) rather than collapsing the panel — collapse is a topbar action only. Context menu covers all five core ops + decorations (star/note) + pin + select-for-compare + fan-out + compare-children (user nodes with ≥2 assistant children).
+
+**Focus on open.** `onMount → tick → asideEl.focus()` so `j`/`k`/`h`/`l`/`Enter` work the instant the user opens the sidebar from the topbar — without it the panel mounts unfocused and keyboard nav silently no-ops until they click a node.
+
+**Esc priority.** `App.svelte`'s global Esc handler is ordered open-loom-modal → drawer → stop-gen. Modal open → App returns without `preventDefault` so `LoomSidebar`'s own window-level Esc handler (`onWindowKey`) closes the modal (or its context menu). Drawer open → close drawer. Nothing open + gen active → `sendStop()`. The earlier order (stop-gen first) made Esc-during-stream-with-modal-open kill the stream instead of dismissing the modal — surprising for the n-way regen flow.
+
+**Mutation error toasts.** Every `loomEdit` / `loomBranch` / `loomDelete` / `loomNavigate` / `loomStar` / `loomNote` / `loomRegenerateActive` / `loomRegenerateFromUser` failure routes through `_captureLoomError(op, e)` which writes to `loomTree.error` AND pushes an error toast via `pushToast`. The persistent `loomTree.error` banner only renders inside the sidebar's empty-state branch — for trees with nodes the toast is the only surface, so silent 409s on edit-during-gen / network drops are gone.
+
+**Ambiguous prefix surfacing.** `resolveByPrefix(prefix)` (sidebar's navpicker modal + `TranscriptDrawer`'s export-anchor input) returns `{id, matches}`: a single unambiguous match populates `id`; multiple-prefix matches leave `id=null` and surface "ambiguous: N matches (01HZA8B2, 01HZA8B7, …)" inline rather than picking the first one in Map insertion order. Exact-id input short-circuits even when other ids share the prefix.
+
+**Modal validation keeps modal open.** `ModalState.error: string` is set via `setModalError(message)` from each `commitModal` branch on validation failure (fanout missing vector / unparseable alpha grid, navpicker miss/ambiguous, search miss). The modal renders the message in a `.modal-error` band below the input and stays open; only successful commits call `closeModal()`. Earlier path silently dismissed on bad input, eating the user's keystrokes.
 
 ## NodeCompareDrawer real-token rendering (v2.3)
 

@@ -73,15 +73,28 @@
   // via the sidebar's modal flow.  Browser Ctrl+B (bold) is suppressed
   // via ``preventDefault`` per Decision 9.
   async function onWindowKey(ev: KeyboardEvent) {
-    // Escape: stop in-flight gen, then close drawer if any.
+    // Escape priority (most-targeted close first):
+    //   1. open loom modal / menu — let the sidebar's own Esc handler
+    //      (LoomSidebar.svelte::onWindowKey) close it.  We DON'T
+    //      preventDefault here so its listener still fires.
+    //   2. open drawer — close it.
+    //   3. fall-through: stop in-flight gen.
+    //
+    // The earlier order (gen-stop first) made Esc-during-stream-with-
+    // modal-open stop the gen instead of closing the modal — surprising
+    // for the n-way regen flow where a user might want to back out of
+    // a follow-up modal without killing the stream.
     if (ev.key === "Escape") {
-      if (genStatus.active) {
-        sendStop();
-        ev.preventDefault();
+      if (loomUiState.modalRequest.kind !== null) {
         return;
       }
       if (drawerState.open !== null) {
         closeDrawer();
+        ev.preventDefault();
+        return;
+      }
+      if (genStatus.active) {
+        sendStop();
         ev.preventDefault();
         return;
       }

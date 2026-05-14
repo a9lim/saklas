@@ -19,7 +19,7 @@
   // Phase-5 hooks (not wired):
   //   * Pin to compare pane, fan-out grid, cross-branch diff.
 
-  import { tick } from "svelte";
+  import { onMount, tick } from "svelte";
   import {
     applyTreeFilter,
     autoRegenState,
@@ -265,6 +265,9 @@
     vector?: string;
     /** Phase-5: mode for the regen-with-modifier modal. */
     mode?: string;
+    /** Inline validation error.  Non-empty means commit failed; the
+     *  modal stays open with this message rendered below the input. */
+    error?: string;
   }
   let modal: ModalState = $state({
     kind: null,
@@ -273,6 +276,7 @@
     n: 1,
     vector: "",
     mode: "unsteered",
+    error: "",
   });
   let modalInput: HTMLInputElement | HTMLTextAreaElement | null = $state(null);
 
@@ -289,6 +293,7 @@
       n: initialN,
       vector: "",
       mode: "unsteered",
+      error: "",
     };
     await tick();
     modalInput?.focus();
@@ -303,7 +308,13 @@
       n: 1,
       vector: "",
       mode: "unsteered",
+      error: "",
     };
+  }
+
+  function setModalError(message: string): void {
+    // Clear input focus so the error reads; modal stays open.
+    modal = { ...modal, error: message };
   }
 
   async function commitModal(): Promise<void> {
@@ -328,18 +339,35 @@
         await loomNote(m.nodeId, m.text);
         break;
       case "navpicker": {
-        // Resolve a node by id-prefix or full id.
-        const target = resolveByPrefix(m.text);
-        if (target) await loomNavigate(target);
-        break;
+        // Resolve a node by id-prefix or full id.  Ambiguity keeps the
+        // modal open with a list of matches so the user can disambiguate
+        // rather than navigating to a random first match (Map insertion
+        // order leaks the bug otherwise).
+        const r = resolveByPrefix(m.text);
+        if (r.id) {
+          await loomNavigate(r.id);
+          break;
+        }
+        if (r.matches.length === 0) {
+          setModalError(`no node matches '${m.text}'`);
+          return;
+        }
+        const preview = r.matches.slice(0, 6).map((s) => s.slice(0, 8)).join(", ");
+        setModalError(
+          `ambiguous: ${r.matches.length} matches (${preview}` +
+            (r.matches.length > 6 ? ", …" : "") + ")",
+        );
+        return;
       }
       case "search": {
         const target = resolveBySearch(m.text);
         if (target) {
           focusedId = target;
           // Don't navigate — search jumps focus only.
+          break;
         }
-        break;
+        setModalError(`no text match for '${m.text}'`);
+        return;
       }
       case "fanout": {
         // Phase 5 fan-out: anchor on the user node, send one regen
@@ -348,9 +376,19 @@
         // active rack already carries the rest of the steering
         // context — we only need to overlay the swept vector's α
         // per call.
-        const alphas = parseAlphaList(m.text);
         const vector = (m.vector ?? "").trim();
-        if (!vector || alphas.length === 0) break;
+        if (!vector) {
+          setModalError("vector name required");
+          return;
+        }
+        const alphas = parseAlphaList(m.text);
+        if (alphas.length === 0) {
+          setModalError(
+            "couldn't parse alphas — try a comma list (0.0, 0.3, 0.7) " +
+            "or linspace(-1, 1, 5)",
+          );
+          return;
+        }
         const userId = m.nodeId;
         for (const alpha of alphas) {
           // Recipe override carries the per-row alpha for the swept
@@ -449,14 +487,25 @@
     return out;
   }
 
-  function resolveByPrefix(prefix: string): string | null {
+  interface PrefixResolution {
+    /** Single unambiguous match — caller can navigate immediately. */
+    id: string | null;
+    /** Every node id whose ulid starts with the prefix.  ``length > 1``
+     *  signals ambiguity; ``length == 0`` signals no match. */
+    matches: string[];
+  }
+
+  function resolveByPrefix(prefix: string): PrefixResolution {
     const p = prefix.trim();
-    if (!p) return null;
-    if (p === "root") return loomTree.root_id;
+    if (!p) return { id: null, matches: [] };
+    if (p === "root") return { id: loomTree.root_id, matches: [loomTree.root_id] };
+    const matches: string[] = [];
     for (const id of loomTree.nodes.keys()) {
-      if (id === p || id.startsWith(p)) return id;
+      if (id === p) return { id, matches: [id] };  // exact match wins
+      if (id.startsWith(p)) matches.push(id);
     }
-    return null;
+    if (matches.length === 1) return { id: matches[0], matches };
+    return { id: null, matches };
   }
 
   function resolveBySearch(query: string): string | null {
@@ -667,6 +716,14 @@
     // Re-fetch — useful if the user suspects drift.
     void refreshLoomTree();
   }
+
+  // Element ref + on-mount focus so j/k/h/l work the instant the
+  // user opens the sidebar — without it, the panel mounts unfocused
+  // and the keyboard nav silently no-ops until they click a node.
+  let asideEl: HTMLElement | null = $state(null);
+  onMount(() => {
+    void tick().then(() => asideEl?.focus());
+  });
 </script>
 
 <svelte:window onclick={onWindowClick} onkeydown={onWindowKey} />
@@ -678,6 +735,7 @@
   aria-label="Loom tree"
   onkeydown={onSidebarKey}
   tabindex="-1"
+  bind:this={asideEl}
 >
   <header class="loom-header">
     <span class="title">loom</span>
@@ -961,6 +1019,9 @@
         ></textarea>
         <p class="hint">⌘/Ctrl+Enter to commit</p>
       {/if}
+      {#if modal.error}
+        <p class="modal-error" role="alert">{modal.error}</p>
+      {/if}
     </div>
     <footer class="modal-footer">
       <button type="button" class="cancel" onclick={closeModal}>cancel</button>
@@ -1157,6 +1218,15 @@
   .hint {
     color: var(--fg-muted);
     font-size: var(--font-size-tiny);
+  }
+  .modal-error {
+    color: var(--err, #d83b3b);
+    font-size: var(--font-size-small);
+    margin-top: 0.5em;
+    background: var(--err-bg, rgba(216, 59, 59, 0.08));
+    border-left: 2px solid var(--err, #d83b3b);
+    padding: 0.4em 0.6em;
+    font-family: var(--font-mono);
   }
 
   .loom-menu {

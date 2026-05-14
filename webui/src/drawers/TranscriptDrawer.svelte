@@ -41,10 +41,21 @@
     exportLeafId = null;
     try {
       const id = exportTargetId.trim();
-      const resolved = id ? resolveByPrefix(id) : null;
-      if (id && !resolved) {
-        exportError = `no node matches prefix "${id}"`;
-        return;
+      let resolved: string | null = null;
+      if (id) {
+        const r = resolveByPrefix(id);
+        if (r.id) {
+          resolved = r.id;
+        } else if (r.matches.length === 0) {
+          exportError = `no node matches prefix "${id}"`;
+          return;
+        } else {
+          const preview = r.matches.slice(0, 6).map((s) => s.slice(0, 8)).join(", ");
+          exportError =
+            `ambiguous: ${r.matches.length} matches (${preview}` +
+            (r.matches.length > 6 ? ", …" : "") + ")";
+          return;
+        }
       }
       const r = await apiTree.transcriptExport(resolved);
       exportYaml = r.yaml;
@@ -81,14 +92,25 @@
     }
   }
 
-  function resolveByPrefix(prefix: string): string | null {
+  interface PrefixResolution {
+    /** Single unambiguous match — caller can use immediately. */
+    id: string | null;
+    /** All node ids whose ulid starts with the prefix; ``length > 1``
+     *  signals ambiguity. */
+    matches: string[];
+  }
+
+  function resolveByPrefix(prefix: string): PrefixResolution {
     const p = prefix.trim();
-    if (!p) return null;
-    if (p === "root") return loomTree.root_id;
+    if (!p) return { id: null, matches: [] };
+    if (p === "root") return { id: loomTree.root_id, matches: [loomTree.root_id] };
+    const matches: string[] = [];
     for (const id of loomTree.nodes.keys()) {
-      if (id === p || id.startsWith(p)) return id;
+      if (id === p) return { id, matches: [id] };
+      if (id.startsWith(p)) matches.push(id);
     }
-    return null;
+    if (matches.length === 1) return { id: matches[0], matches };
+    return { id: null, matches };
   }
 
   // -------------------------------------------------- import state ---

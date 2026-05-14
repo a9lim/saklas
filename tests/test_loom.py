@@ -398,6 +398,108 @@ def test_add_user_turn_no_dedup_when_text_differs():
 
 
 # ---------------------------------------------------------------------------
+# D15 — active-node send role table (decision 15 in docs/plans/loom.md)
+#
+# These tests verify the engine-side reject when the resolved parent for
+# a new user turn is itself a user node — the "user turn already waiting
+# for an assistant" case from the plan's send-semantics table.  The
+# reject lives in ``session._generate_core``, so we exercise it through
+# the session entry rather than the bare ``tree.add_user_turn`` (which
+# is allowed to land a user-under-user for the auto-regen seed path).
+# We monkey-patch the session shape minimally to avoid loading a model.
+# ---------------------------------------------------------------------------
+
+
+def _bind_check_user_send_target(tree: LoomTree):
+    """Return a callable bound to a stub session exposing only ``tree``.
+
+    ``SaklasSession._check_user_send_target`` only reaches into
+    ``self.tree``; binding the unbound method onto a minimal stub
+    sidesteps the model-load cost so we can unit-test D15.
+    """
+    from saklas.core.session import SaklasSession
+    stub = type("S", (), {"tree": tree})()
+    return SaklasSession._check_user_send_target.__get__(stub, type(stub))
+
+
+def test_d15_engine_check_rejects_leaf_user_send():
+    """A bare send when active is a leaf user raises per D15."""
+    t = LoomTree()
+    t.add_user_turn("waiting on assistant")
+    # active = u1, a leaf user node
+    check = _bind_check_user_send_target(t)
+    with pytest.raises(InvalidNodeOperationError, match="cannot send a new user turn"):
+        check(None)
+
+
+def test_d15_engine_check_rejects_interior_user_send():
+    """Same check fires for an interior user node."""
+    t = LoomTree()
+    u1 = t.add_user_turn("hi")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="hello")
+    u2 = t.add_user_turn("more")
+    a2 = t.begin_assistant(u2)
+    t.finalize_assistant(a2, text="world")
+    # Navigate back to an interior user node.
+    t.navigate(u1)
+    check = _bind_check_user_send_target(t)
+    with pytest.raises(InvalidNodeOperationError, match="cannot send a new user turn"):
+        check(None)
+
+
+def test_d15_engine_check_rejects_explicit_user_parent():
+    """``parent_node_id`` pointing at a user node also raises."""
+    t = LoomTree()
+    u1 = t.add_user_turn("hi")
+    # Active doesn't matter — explicit parent_node_id wins.
+    check = _bind_check_user_send_target(t)
+    with pytest.raises(InvalidNodeOperationError):
+        check(u1)
+
+
+def test_d15_engine_check_passes_for_assistant_leaf():
+    """Sending from a leaf assistant node is the today-flow — no reject."""
+    t = _seed_tree()
+    assert t.nodes[t.active_node_id].role == "assistant"
+    check = _bind_check_user_send_target(t)
+    check(None)  # no raise
+
+
+def test_d15_engine_check_passes_for_root():
+    """Sending from the synthetic root (fresh tree) — no reject."""
+    t = LoomTree()
+    assert t.active_node_id == t.root_id
+    check = _bind_check_user_send_target(t)
+    check(None)  # no raise
+
+
+def test_d15_engine_check_passes_for_interior_assistant():
+    """Active is an interior assistant (user navigated back) — no reject."""
+    t = LoomTree()
+    u1 = t.add_user_turn("hi")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="hello")
+    u2 = t.add_user_turn("more")
+    a2 = t.begin_assistant(u2)
+    t.finalize_assistant(a2, text="world")
+    t.navigate(a1)
+    check = _bind_check_user_send_target(t)
+    check(None)  # no raise
+
+
+def test_d15_engine_check_passes_for_explicit_grandparent():
+    """The regen flow: parent_node_id = user's parent (assistant) — no reject."""
+    t = LoomTree()
+    u1 = t.add_user_turn("hi")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="hello")
+    u2 = t.add_user_turn("more")
+    check = _bind_check_user_send_target(t)
+    check(a1)  # u2's parent is a1; regen passes a1 explicitly — no raise
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
@@ -411,6 +513,10 @@ def test_to_dict_round_trip(tmp_path: Path):
     t.save(path)
     raw = json.loads(path.read_text())
     assert raw["tree_format"] == TREE_FORMAT_VERSION
+    # D22 / plan ":600" — header carries saklas_version so future
+    # migrations can branch on the originating build.
+    import saklas as _saklas
+    assert raw["saklas_version"] == _saklas.__version__
     t2 = LoomTree.load(path)
     # Same structure.
     assert t2.root_id == t.root_id

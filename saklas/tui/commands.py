@@ -90,13 +90,17 @@ def _build_registry() -> dict[str, SlashCommand]:
         # unchanged for the common path.
         #
         # Phase 5 extension: trailing ``<mode>`` token (``unsteered`` /
-        # ``inverted`` / ``reseed`` / ``cool`` / ``hot``) flips the regen
-        # over to ``session.regen_with_modifier`` so users get the same
-        # recipe-override semantics as ``/auto-regen``.
+        # ``inverted`` / ``reseed`` / ``cool`` / ``hot``, or ``custom:
+        # <steering expression>``) flips the regen over to
+        # ``session.regen_with_modifier``.  Custom modes parse the
+        # expression into a Recipe partial up front so the worker can
+        # route through ``compose_modifier(Recipe)`` directly.
+        from saklas import Recipe
+
         raw = (raw or "").strip()
         tokens = raw.split() if raw else []
         n = 1
-        mode: str | None = None
+        mode: "str | Recipe | None" = None
         if tokens:
             try:
                 n = max(1, int(tokens[0]))
@@ -104,7 +108,14 @@ def _build_registry() -> dict[str, SlashCommand]:
                 app._chat_panel.add_system_message(f"/regen: bad N '{tokens[0]}'")
                 return
             if len(tokens) > 1:
-                mode = " ".join(tokens[1:])
+                mode_str = " ".join(tokens[1:])
+                if mode_str.lower().startswith("custom:"):
+                    recipe = app._parse_custom_auto_regen(mode_str)
+                    if recipe is None:
+                        return  # parse error already posted to chat
+                    mode = recipe
+                else:
+                    mode = mode_str
         if mode is not None:
             app._dispatch_loom_regen(n, mode=mode)
             return

@@ -258,10 +258,10 @@ class Recipe:
         )
         return Recipe(steering=format_expr(new))
 
-    def compose_modifier(self, mode: str) -> "Recipe":
+    def compose_modifier(self, mode: "str | Recipe") -> "Recipe":
         """Return a partial Recipe for the named auto-regen mode.
 
-        Recognized modes:
+        Recognized string modes:
 
         - ``"unsteered"``: steering wiped (empty expression).
         - ``"inverted"``: flips every term's α sign — see
@@ -270,9 +270,14 @@ class Recipe:
         - ``"cool"``: temperature 0.3; everything else inherits.
         - ``"hot"``: temperature 1.2; everything else inherits.
 
-        Custom modes go through :meth:`overlay` directly — pass a Recipe
-        partial instead of a string.  Unknown modes raise ``ValueError``.
+        A :class:`Recipe` instance passes through unchanged — that's the
+        ``custom`` path: callers (e.g. the TUI's ``/auto-regen custom:
+        <expr>``) parse the user's partial-recipe expression themselves
+        and hand the resulting Recipe in directly.  Unknown string modes
+        raise ``ValueError``.
         """
+        if isinstance(mode, Recipe):
+            return mode
         if mode == "unsteered":
             return Recipe(steering="")
         if mode == "inverted":
@@ -1033,8 +1038,14 @@ class LoomTree:
 
     def to_dict(self, *, include_tokens: bool = False) -> dict[str, Any]:
         with self._lock:
+            # ``saklas_version`` rides alongside ``tree_format`` so future
+            # migrations can branch on the originating build even when the
+            # schema number hasn't moved — same pattern packs use.  Imported
+            # lazily so a circular at module-load time stays impossible.
+            from saklas import __version__ as _saklas_version
             return {
                 "tree_format": TREE_FORMAT_VERSION,
+                "saklas_version": _saklas_version,
                 "model_id": self.model_id,
                 "session_id": self.session_id,
                 "name": self.name,

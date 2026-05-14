@@ -724,6 +724,21 @@ export async function refreshLoomTree(): Promise<void> {
   }
 }
 
+/** Capture mutation failures on ``loomTree.error`` AND a toast.
+ *
+ *  ``loomTree.error`` is the persistent banner inside the empty-state
+ *  branch of the sidebar; for trees with nodes that branch never
+ *  renders, so the toast is the only surface the user sees.  Fires
+ *  for every mutator path so 409s on edit-during-gen, network drops,
+ *  ambiguous prefix rejections, and any other server error reach the
+ *  user instead of vanishing silently.
+ */
+function _captureLoomError(op: string, e: unknown): void {
+  const msg = e instanceof Error ? e.message : String(e);
+  loomTree.error = msg;
+  pushToast(`${op}: ${msg}`, { kind: "error" });
+}
+
 /** Right-click ops + keyboard shortcuts route through these helpers.
  *  Each one fires the REST mutation and lets the server-emitted
  *  ``tree_mutated`` event sync the local store — no optimistic update
@@ -732,7 +747,7 @@ export async function loomNavigate(node_id: string): Promise<void> {
   try {
     await apiTree.navigate(node_id);
   } catch (e) {
-    loomTree.error = e instanceof Error ? e.message : String(e);
+    _captureLoomError("navigate", e);
   }
 }
 
@@ -740,7 +755,7 @@ export async function loomEdit(node_id: string, text: string): Promise<void> {
   try {
     await apiTree.edit(node_id, text);
   } catch (e) {
-    loomTree.error = e instanceof Error ? e.message : String(e);
+    _captureLoomError("edit", e);
   }
 }
 
@@ -752,7 +767,7 @@ export async function loomBranch(
     const r = await apiTree.branch(node_id, text);
     return r.node_id;
   } catch (e) {
-    loomTree.error = e instanceof Error ? e.message : String(e);
+    _captureLoomError("branch", e);
     return null;
   }
 }
@@ -761,7 +776,7 @@ export async function loomDelete(node_id: string): Promise<void> {
   try {
     await apiTree.delete(node_id);
   } catch (e) {
-    loomTree.error = e instanceof Error ? e.message : String(e);
+    _captureLoomError("delete", e);
   }
 }
 
@@ -769,7 +784,7 @@ export async function loomStar(node_id: string, on: boolean): Promise<void> {
   try {
     await apiTree.star(node_id, on);
   } catch (e) {
-    loomTree.error = e instanceof Error ? e.message : String(e);
+    _captureLoomError("star", e);
   }
 }
 
@@ -777,7 +792,7 @@ export async function loomNote(node_id: string, text: string): Promise<void> {
   try {
     await apiTree.note(node_id, text);
   } catch (e) {
-    loomTree.error = e instanceof Error ? e.message : String(e);
+    _captureLoomError("note", e);
   }
 }
 
@@ -800,11 +815,15 @@ export async function loomRegenerateActive(
   // The user turn (parent) carries the prompt text we need to replay.
   const parent = loomTree.nodes.get(parentId);
   if (!parent || parent.role !== "user") return;
-  await sendGenerate(parent.text, {
-    parent_node_id: parentId,
-    n,
-    recipe_override: opts.recipe_override ?? undefined,
-  });
+  try {
+    await sendGenerate(parent.text, {
+      parent_node_id: parentId,
+      n,
+      recipe_override: opts.recipe_override ?? undefined,
+    });
+  } catch (e) {
+    _captureLoomError("regenerate", e);
+  }
 }
 
 /** Regenerate under a specific user node (the "fan out" entry point —
@@ -817,11 +836,15 @@ export async function loomRegenerateFromUser(
   if (loomTree.rev <= 0) return;
   const user = loomTree.nodes.get(userNodeId);
   if (!user || user.role !== "user") return;
-  await sendGenerate(user.text, {
-    parent_node_id: userNodeId,
-    n: opts.n ?? 1,
-    recipe_override: opts.recipe_override ?? undefined,
-  });
+  try {
+    await sendGenerate(user.text, {
+      parent_node_id: userNodeId,
+      n: opts.n ?? 1,
+      recipe_override: opts.recipe_override ?? undefined,
+    });
+  } catch (e) {
+    _captureLoomError("regenerate", e);
+  }
 }
 
 // ============================================================ input history ===

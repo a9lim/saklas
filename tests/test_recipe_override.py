@@ -114,6 +114,18 @@ def test_compose_unknown_raises():
         Recipe().compose_modifier("foo")
 
 
+def test_compose_custom_recipe_passthrough():
+    """``compose_modifier`` with a Recipe arg returns it unchanged.
+
+    The custom-mode path: callers (TUI's ``/auto-regen custom: <expr>``)
+    parse the partial-recipe expression themselves and hand the Recipe
+    in; ``compose_modifier`` shouldn't try to interpret it as a string.
+    """
+    partial = Recipe(steering="0.5 calm", sampling=SamplingConfig(temperature=0.4))
+    out = Recipe(steering="0.3 honest", seed=42).compose_modifier(partial)
+    assert out is partial  # passes through, no copy
+
+
 def test_compose_custom_via_overlay():
     """Custom mode = pass a Recipe partial directly, no compose_modifier."""
     base = Recipe(steering="0.3 honest", seed=42)
@@ -122,6 +134,42 @@ def test_compose_custom_via_overlay():
     assert out.steering == "0.3 honest"
     assert out.sampling.temperature == pytest.approx(0.5)
     assert out.seed == 99
+
+
+def test_compose_modifier_routes_through_overlay_in_regen_with_modifier():
+    """End-to-end: regen_with_modifier accepts a Recipe partial as ``mode``.
+
+    Verifies the full custom-mode wiring: TUI parses ``custom: <expr>``
+    into a Recipe, hands it to ``session.regen_with_modifier(... mode=<Recipe>)``,
+    which routes through ``compose_modifier(Recipe) -> Recipe`` and overlays
+    onto the parent recipe.  No model load — uses _resolve_recipe_override
+    which is the pure-Python overlay path.
+    """
+    from saklas.core.session import SaklasSession
+    from saklas import LoomTree
+
+    class _StubSession:
+        def __init__(self):
+            self.tree = LoomTree()
+            uid = self.tree.add_user_turn("hi")
+            recipe = Recipe(steering="0.3 honest", seed=42)
+            aid = self.tree.begin_assistant(uid, recipe=recipe)
+            self.tree.finalize_assistant(aid, text="hello")
+            self.aid = aid
+
+    stub = _StubSession()
+    resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
+    custom = Recipe(sampling=SamplingConfig(temperature=0.4))
+    new_steering, new_sampling, new_thinking = resolve(
+        custom,
+        parent_node_id=stub.aid,
+        steering=None,
+        sampling=None,
+        thinking=None,
+    )
+    assert new_steering == "0.3 honest"
+    assert new_sampling is not None
+    assert new_sampling.temperature == pytest.approx(0.4)
 
 
 # ---------------------------------------------------------------------------

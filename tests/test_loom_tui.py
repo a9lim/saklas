@@ -461,6 +461,22 @@ def test_del_yes_removes_subtree():
     assert aid in app._session.tree.nodes
 
 
+def test_del_yes_surfaces_new_active_id():
+    """The chat-screen pre-navigates before delete; the message must
+    mention the new active id so the jump isn't silent."""
+    app = _make_app()
+    uid, aid = _seed_tree(app._session.tree)
+    extra = app._session.tree.branch(aid, "alt")
+    extra_parent_id = app._session.tree.get(extra).parent_id
+    app._handle_command("/del yes")
+    msg = _msgs(app)
+    # Active landed on the (former) parent of ``extra``; first 8 chars
+    # of that id appear in the deleted-N-nodes message.
+    assert extra_parent_id is not None
+    assert extra_parent_id[:8] in msg
+    assert "active now" in msg
+
+
 def test_star_toggles():
     app = _make_app()
     uid, aid = _seed_tree(app._session.tree)
@@ -771,6 +787,41 @@ def test_auto_regen_unknown_mode_rejects():
     app._handle_command("/auto-regen bogus")
     assert any("unknown mode" in m for m in app._chat_panel.messages)
     # Mode unchanged from default.
+    assert app._loom_auto_regen_mode == "unsteered"
+
+
+def test_auto_regen_custom_parses_into_recipe():
+    """`/auto-regen custom: <expr>` parses the expression into a Recipe.
+
+    The stashed value is a Recipe partial (not a raw string), so the
+    engine's ``compose_modifier(Recipe) -> Recipe`` passthrough handles
+    it without the ValueError the pre-fix path tripped on every gen.
+    """
+    app = _make_app()
+    app._handle_command("/auto-regen custom: 0.3 deer.wolf")
+    mode = app._loom_auto_regen_mode
+    assert isinstance(mode, Recipe)
+    assert mode.steering is not None
+    assert "0.3" in mode.steering
+    # Footer / status renders Recipe as "custom".
+    assert app._render_auto_regen_mode(mode) == "custom"
+
+
+def test_auto_regen_custom_parse_error_keeps_mode_unchanged():
+    """A bad ``custom:`` expression posts to chat and leaves mode alone."""
+    app = _make_app()
+    app._loom_auto_regen_mode = "inverted"
+    app._handle_command("/auto-regen custom: ::: gibberish :::")
+    assert any("custom parse error" in m or "expression"  in m
+               for m in app._chat_panel.messages)
+    assert app._loom_auto_regen_mode == "inverted"
+
+
+def test_auto_regen_custom_empty_expression():
+    """``/auto-regen custom:`` with nothing after the colon rejects."""
+    app = _make_app()
+    app._handle_command("/auto-regen custom:")
+    assert any("needs an expression" in m for m in app._chat_panel.messages)
     assert app._loom_auto_regen_mode == "unsteered"
 
 

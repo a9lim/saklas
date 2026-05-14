@@ -86,6 +86,8 @@ Single-file engine-side persistence for the loom tree. `save_tree(session_id, tr
 
 Wired into `SaklasSession.__init__` via a new `session_id: str | None = None` kwarg (resolves to the persistent default on `None`). After construction, `load_tree(session_id)` replaces the fresh `LoomTree` if a saved one exists. A `LoomMutated` event subscriber schedules a 1 s debounced save via `threading.Timer` (rescheduled on each mutation, fires on the timer thread). `SaklasSession.close()` / `__exit__` calls `_flush_persist()` synchronously so the final save lands before the process exits. Filesystem-unavailable startups (sandboxed tests, read-only `$HOME`) fall back to `session_id = ""` — persistence becomes a no-op without breaking the session.
 
+`tree.json` carries both `tree_format` (schema version, currently `1`) and `saklas_version` (the build that wrote it). The version field is informational — `from_dict` doesn't branch on it — but exists so future cross-version migrations can identify the originating build without churning the schema number. Matches the pack-format pattern.
+
 All paths honor `SAKLAS_HOME` via `saklas.io.paths.saklas_home()`.
 
 **v2.4 scope (deferred):**

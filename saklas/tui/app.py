@@ -20,7 +20,7 @@ from textual.widgets import Input
 from textual.timer import Timer
 from textual import events as _textual_events
 
-from saklas import SamplingConfig, Steering
+from saklas import Recipe, SamplingConfig, Steering
 from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking
@@ -213,7 +213,10 @@ class SaklasApp(App[None]):
         # consumes them; phase 4 only carries the strings so users can set
         # them up before phase 5 evaluator lands.
         self._loom_prune_expr: str | None = None
-        self._loom_auto_regen_mode: str = "unsteered"
+        # str for built-in modes (unsteered/inverted/reseed/cool/hot);
+        # Recipe for the custom-mode path ``/auto-regen custom: <expr>``.
+        # ``_render_auto_regen_mode`` renders either shape for display.
+        self._loom_auto_regen_mode: "str | Recipe" = "unsteered"
         # Phase 5: auto-regen on/off — when on, every primary
         # ``_generate_core`` completion fires a sibling regen with the
         # configured override.  Default-off; ``Ctrl+A`` toggles.  The
@@ -546,7 +549,8 @@ class SaklasApp(App[None]):
             "Loom:\n"
             "  /tree                       — open loom screen (Ctrl+L)\n"
             "  /regen [N] [mode]           — N siblings; mode ∈ unsteered/\n"
-            "                                inverted/reseed/cool/hot/custom\n"
+            "                                inverted/reseed/cool/hot or\n"
+            "                                'custom: <steering expr>'\n"
             "  /edit <text>                — in-place edit active\n"
             "  /branch [text]              — sibling w/ optional text\n"
             "  /nav <id-prefix>            — navigate by ulid\n"
@@ -1031,6 +1035,19 @@ class SaklasApp(App[None]):
         )
         steering = Steering(alphas=dict(alphas), thinking=use_thinking) if alphas else None
 
+        # When the active node is a user (regen flow after
+        # ``_rewind_active_assistant``), anchor the gen under the user's
+        # parent so ``add_user_turn``'s dedup lands the new assistant as
+        # a sibling rather than a child-of-user.  D15 rejects bare
+        # send-from-user; this branch is what tells the engine "I'm
+        # regenerating, dedup will land me on the right user node."
+        tree = self._session.tree
+        active_node = tree.nodes.get(tree.active_node_id)
+        regen_parent_id: str | None = None
+        if (active_node is not None and active_node.role == "user"
+                and active_node.parent_id is not None):
+            regen_parent_id = active_node.parent_id
+
         def _generate():
             try:
                 stream = self._session.generate_stream(
@@ -1039,6 +1056,7 @@ class SaklasApp(App[None]):
                     sampling=sampling,
                     stateless=False,
                     thinking=use_thinking,
+                    parent_node_id=regen_parent_id,
                 )
                 for event in stream:
                     self._ui_token_queue.put(
@@ -1204,7 +1222,7 @@ class SaklasApp(App[None]):
                 perplexity=ppl_mean,
                 prune_expr=self._loom_prune_expr,
                 auto_regen_mode=(
-                    self._loom_auto_regen_mode
+                    self._render_auto_regen_mode(self._loom_auto_regen_mode)
                     if (self._loom_auto_regen_on
                         and self._loom_auto_regen_mode != "unsteered")
                     else None
@@ -2043,7 +2061,7 @@ class SaklasApp(App[None]):
         chat.set_ab_mode(self._ab_mode)
         chat.add_system_message(
             f"A/B mode {'on' if self._ab_mode else 'off'} "
-            f"(auto-regen mode={self._loom_auto_regen_mode})"
+            f"(auto-regen mode={self._render_auto_regen_mode(self._loom_auto_regen_mode)})"
         )
         if not self._ab_mode or not was_off:
             return
@@ -2295,7 +2313,10 @@ class SaklasApp(App[None]):
 
         Requires explicit ``yes`` confirmation by default to avoid
         accidental wipes; ``Ctrl+D`` from the chat screen uses this
-        path too.
+        path too.  The active pointer pre-navigates to the parent
+        (because :meth:`LoomTree.delete_subtree` refuses to delete a
+        subtree containing the active node); the post-delete message
+        surfaces the new active id so the jump isn't silent.
         """
 
         from saklas.core.loom import (
@@ -2320,12 +2341,15 @@ class SaklasApp(App[None]):
                 return
             # Move active to parent so the delete is well-defined.
             tree.navigate(node.parent_id)
+            new_active_id = tree.active_node_id
             removed = tree.delete_subtree(target)
         except (UnknownNodeError, MutationDuringGenerationError,
                 InvalidNodeOperationError, LoomTreeError) as e:
             chat.add_system_message(f"/del failed: {e}")
             return
-        chat.add_system_message(f"deleted {removed} node(s).")
+        chat.add_system_message(
+            f"deleted {removed} node(s); active now {new_active_id[:8]}"
+        )
 
     def action_delete_subtree(self) -> None:
         """Ctrl+D — surface the `/del yes` confirm hint.
@@ -2521,14 +2545,17 @@ class SaklasApp(App[None]):
 
         self.run_worker(_worker, thread=True)
 
-    def _dispatch_loom_regen(self, n: int, *, mode: str | None = None) -> None:
+    def _dispatch_loom_regen(
+        self, n: int, *, mode: "str | Recipe | None" = None,
+    ) -> None:
         """`/regen N [mode]`: serialize an N-way regen with optional mode.
 
         Phase 1's engine already serializes via ``session.generate(...,
         n=N)``; phase 5 routes the optional ``mode`` argument through
-        ``session.regen_with_modifier``.  When a gen is already running
-        we defer through ``_pending_action`` like every other
-        interrupting slash command.
+        ``session.regen_with_modifier``.  ``mode`` accepts the built-in
+        strings or a :class:`Recipe` partial for the custom-mode path.
+        When a gen is already running we defer through
+        ``_pending_action`` like every other interrupting slash command.
         """
 
         chat = self._chat_panel
@@ -2541,7 +2568,9 @@ class SaklasApp(App[None]):
             return
         self._run_regen_n_worker(n)
 
-    def _run_regen_modifier_worker(self, n: int, mode: str) -> None:
+    def _run_regen_modifier_worker(
+        self, n: int, mode: "str | Recipe",
+    ) -> None:
         """Worker for `/regen N <mode>` — routes through ``regen_with_modifier``."""
         chat = self._chat_panel
         tree = self._session.tree
@@ -2560,6 +2589,8 @@ class SaklasApp(App[None]):
             chat.add_system_message("/regen: no user-parent to anchor regen under.")
             return
 
+        rendered = self._render_auto_regen_mode(mode)
+
         def _worker() -> None:
             try:
                 self._session.regen_with_modifier(
@@ -2569,12 +2600,12 @@ class SaklasApp(App[None]):
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self.call_from_thread(
                     self._chat_panel.add_system_message,
-                    f"/regen {mode} error: {msg}",
+                    f"/regen {rendered} error: {msg}",
                 )
             finally:
                 self.call_from_thread(
                     self._chat_panel.add_system_message,
-                    f"/regen × {n} ({mode}): done.",
+                    f"/regen × {n} ({rendered}): done.",
                 )
 
         self.run_worker(_worker, thread=True)
@@ -2599,6 +2630,17 @@ class SaklasApp(App[None]):
         # Move active to the user-parent so siblings attach correctly.
         self._rewind_active_assistant()
 
+        # After the rewind, active is a user node — passing
+        # ``parent_node_id=<user.parent_id>`` lets add_user_turn's dedup
+        # land the regen as a sibling under the existing user turn
+        # (avoiding D15's user-under-user reject).
+        tree = self._session.tree
+        active_node = tree.nodes.get(tree.active_node_id)
+        regen_parent_id: str | None = None
+        if (active_node is not None and active_node.role == "user"
+                and active_node.parent_id is not None):
+            regen_parent_id = active_node.parent_id
+
         from saklas import SamplingConfig
 
         def _worker() -> None:
@@ -2622,6 +2664,7 @@ class SaklasApp(App[None]):
                     sampling=sampling,
                     stateless=False,
                     n=n,
+                    parent_node_id=regen_parent_id,
                 )
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
@@ -2672,51 +2715,106 @@ class SaklasApp(App[None]):
 
     _AUTO_REGEN_MODES = ("unsteered", "inverted", "reseed", "cool", "hot")
 
+    @staticmethod
+    def _render_auto_regen_mode(mode: "str | Recipe") -> str:
+        """Display string for either a named-mode string or a custom Recipe.
+
+        Recipe partials render as ``"custom"`` for footer / status use;
+        the full canonical steering expression rides on the Recipe and
+        is reported in the chat-message on configure / fire.
+        """
+        if isinstance(mode, Recipe):
+            return "custom"
+        return mode
+
+    def _parse_custom_auto_regen(self, raw: str) -> "Recipe | None":
+        """Parse ``custom: <expr>`` into a Recipe partial.
+
+        ``<expr>`` is a steering expression (the shared grammar from
+        ``saklas.core.steering_expr``).  Returns a Recipe carrying the
+        canonical-form steering string; other Recipe fields (sampling,
+        thinking, seed) inherit from the parent on overlay.  Returns
+        ``None`` and posts an error to chat on parse failure — callers
+        treat ``None`` as "don't update mode."
+        """
+        from saklas.core.steering_expr import (
+            SteeringExprError, format_expr, parse_expr,
+        )
+        prefix = raw[len("custom:"):].strip()
+        chat = self._chat_panel
+        if not prefix:
+            chat.add_system_message(
+                "/auto-regen: custom mode needs an expression. "
+                "Example: /auto-regen custom: 0.3 honest + 0.5 calm"
+            )
+            return None
+        try:
+            parsed = parse_expr(prefix)
+        except (SteeringExprError, AmbiguousSelectorError, SaklasError) as e:
+            chat.add_system_message(f"/auto-regen custom parse error: {e}")
+            return None
+        # Round-trip through format_expr so the canonical text is what
+        # rides on the Recipe — round-trip-safe with replay.
+        return Recipe(steering=format_expr(parsed))
+
     def _handle_auto_regen(self, arg: str) -> None:
         """`/auto-regen [on|off|<mode>]` — configure the regen modifier.
 
         Phase 5 wiring: ``on`` / ``off`` toggle whether every primary
-        gen fires a sibling auto-regen; ``<mode>`` (``unsteered`` /
-        ``inverted`` / ``reseed`` / ``cool`` / ``hot``, or ``custom:
-        <partial recipe>``) sets the override.  Bare ``/auto-regen``
-        reports the current state.  ``Ctrl+A`` toggles on/off via
-        :meth:`action_ab_compare` (the keymap meaning is preserved per
-        plan decision 13).
+        gen fires a sibling auto-regen; ``<mode>`` sets the override.
+        Built-in modes (``unsteered`` / ``inverted`` / ``reseed`` /
+        ``cool`` / ``hot``) stash as strings; ``custom: <expression>``
+        parses the steering expression and stashes a :class:`Recipe`
+        partial.  Bare ``/auto-regen`` reports the current state.
+        ``Ctrl+A`` toggles on/off via :meth:`action_ab_compare` (the
+        keymap meaning is preserved per plan decision 13).
         """
 
         chat = self._chat_panel
         arg = arg.strip()
+        rendered = self._render_auto_regen_mode(self._loom_auto_regen_mode)
         if not arg:
             state = "on" if self._loom_auto_regen_on else "off"
             chat.add_system_message(
-                f"auto-regen: {state}, mode={self._loom_auto_regen_mode}"
+                f"auto-regen: {state}, mode={rendered}"
             )
             return
         low = arg.lower()
         if low == "on":
             self._loom_auto_regen_on = True
             chat.add_system_message(
-                f"auto-regen on (mode={self._loom_auto_regen_mode})"
+                f"auto-regen on (mode={rendered})"
             )
             return
         if low == "off":
             self._loom_auto_regen_on = False
             chat.add_system_message("auto-regen off")
             return
-        # Validate built-in modes; ``custom: ...`` accepts a partial
-        # recipe expression and rides through ``regen_with_modifier``
-        # under the str-mode dispatch (engine raises ValueError on
-        # unknown built-ins, so we surface that path directly).
-        if low not in self._AUTO_REGEN_MODES and not low.startswith("custom:"):
+        # Custom mode: parse the steering expression into a Recipe and
+        # stash typed so the engine's compose_modifier(Recipe) path
+        # picks it up without re-parsing.
+        if low.startswith("custom:"):
+            recipe = self._parse_custom_auto_regen(arg)
+            if recipe is None:
+                return  # error already posted
+            self._loom_auto_regen_mode = recipe
+            chat.add_system_message(
+                f"auto-regen mode set to: custom ({recipe.steering})"
+                + (" (auto-regen is currently off — /auto-regen on to enable)"
+                   if not self._loom_auto_regen_on else "")
+            )
+            return
+        # Built-in named mode.
+        if low not in self._AUTO_REGEN_MODES:
             chat.add_system_message(
                 "/auto-regen: unknown mode. Valid: "
                 + ", ".join(self._AUTO_REGEN_MODES)
-                + " or 'custom: <partial recipe>'"
+                + " or 'custom: <steering expression>'"
             )
             return
-        self._loom_auto_regen_mode = arg
+        self._loom_auto_regen_mode = low
         chat.add_system_message(
-            f"auto-regen mode set to: {arg}"
+            f"auto-regen mode set to: {low}"
             + (" (auto-regen is currently off — /auto-regen on to enable)"
                if not self._loom_auto_regen_on else "")
         )
@@ -2758,6 +2856,7 @@ class SaklasApp(App[None]):
         user_text = anchor_user.text
         parent_node_id = anchor_user.parent_id
 
+        rendered_mode = self._render_auto_regen_mode(mode)
         if row is None:
             # Worker-only path: matches the pre-streaming shape — useful
             # when there's no row to render into (e.g. fired from a
@@ -2769,13 +2868,13 @@ class SaklasApp(App[None]):
                     msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                     self.call_from_thread(
                         self._chat_panel.add_system_message,
-                        f"auto-regen ({mode}) error: {msg}",
+                        f"auto-regen ({rendered_mode}) error: {msg}",
                     )
                     return
                 new_id = self._session.tree.active_node_id
                 self.call_from_thread(
                     self._chat_panel.add_system_message,
-                    f"auto-regen ({mode}) → sibling {new_id[:8]}",
+                    f"auto-regen ({rendered_mode}) → sibling {new_id[:8]}",
                 )
 
             self.run_worker(_worker, thread=True)
@@ -2798,7 +2897,7 @@ class SaklasApp(App[None]):
         self._ab_shadow_row = row
         self._ui_gen_active = True
 
-        chat.add_system_message(f"auto-regen ({mode}) → streaming sibling…")
+        chat.add_system_message(f"auto-regen ({rendered_mode}) → streaming sibling…")
 
         def _stream_worker() -> None:
             try:

@@ -2554,10 +2554,12 @@ class SaklasSession:
 
         ``mode`` is either a built-in mode string (``"unsteered"``,
         ``"inverted"``, ``"reseed"``, ``"cool"``, ``"hot"``) or a partial
-        :class:`Recipe` carrying the override fields (``"custom"`` mode).
-        The override composes onto the parent node's recipe (or
-        ``base_recipe`` if given): None fields fall through to the
-        parent's setting.
+        :class:`Recipe` carrying the override fields (``"custom"`` mode —
+        callers parse their own partial-recipe expressions and hand the
+        resulting Recipe in directly; :meth:`Recipe.compose_modifier`
+        passes Recipe instances through unchanged).  The override
+        composes onto the parent node's recipe (or ``base_recipe`` if
+        given): None fields fall through to the parent's setting.
 
         Convenience entry point: auto-regen and the manual
         ``/regen N <mode>`` flow both call this.  Returns whatever
@@ -2584,10 +2586,9 @@ class SaklasSession:
         if anchor is None:
             anchor = Recipe()
 
-        if isinstance(mode, Recipe):
-            override = mode
-        else:
-            override = anchor.compose_modifier(str(mode))
+        # compose_modifier handles both str ("unsteered"/"inverted"/...)
+        # and Recipe (custom) — the dispatch lives on the dataclass.
+        override = anchor.compose_modifier(mode)
 
         overlaid = anchor.overlay(override)
 
@@ -2623,6 +2624,38 @@ class SaklasSession:
         )
 
     # -- History / loom tree --
+
+    def _check_user_send_target(self, parent_node_id: str | None) -> None:
+        """D15 — refuse sending a new user turn from a user-role node.
+
+        The plan's send-semantics table (``docs/plans/loom.md`` §"Active-
+        node send semantics") rejects sending a fresh user turn when the
+        resolved parent is itself a user node: the user node is already
+        waiting for an assistant.  Allowing it would corrupt the tree
+        shape (user-under-user) and break the v2 chat-message flatten.
+
+        Resolved parent = ``parent_node_id`` when passed, else the active
+        node.  Internal regen paths pass ``parent_node_id=<grandparent>``
+        explicitly so add_user_turn's dedup re-uses the existing user
+        sibling rather than triggering this reject.
+
+        Raises :class:`InvalidNodeOperationError` (HTTP 400) on violation.
+        """
+        target_parent_id = (
+            parent_node_id if parent_node_id is not None
+            else self.tree.active_node_id
+        )
+        parent_node = (
+            self.tree.nodes.get(target_parent_id)
+            if target_parent_id is not None else None
+        )
+        if parent_node is not None and parent_node.role == "user":
+            raise InvalidNodeOperationError(
+                f"cannot send a new user turn from a user node "
+                f"({target_parent_id}): the active turn is already "
+                f"waiting for an assistant.  Use /regen to redo the "
+                f"assistant, or navigate away first."
+            )
 
     def _loom_conflict_check(self, node_id: str, op: str) -> None:
         """Tree-mutation conflict checker — see :mod:`saklas.core.loom`.
@@ -3088,10 +3121,9 @@ class SaklasSession:
         if anchor is None:
             anchor = Recipe()
 
-        if isinstance(recipe_override, str):
-            override = anchor.compose_modifier(recipe_override)
-        else:
-            override = recipe_override
+        # compose_modifier handles both str modes and Recipe (custom)
+        # — Recipe instances pass through unchanged on that path.
+        override = anchor.compose_modifier(recipe_override)
         overlaid = anchor.overlay(override)
 
         # Override fields *win* over the caller's explicit kwargs when
@@ -3244,6 +3276,11 @@ class SaklasSession:
         assistant_node_id: str | None = None
         if not stateless:
             if isinstance(input, str):
+                # D15: reject "send a new user turn from a user node" before
+                # ``add_user_turn`` would corrupt the tree shape.  Regen
+                # paths pass ``parent_node_id=<grandparent>`` so this only
+                # fires on the genuinely-wrong shape.
+                self._check_user_send_target(parent_node_id)
                 # ``add_user_turn`` dedups against existing user-children with
                 # identical text — re-sending the same prompt regenerates
                 # under the existing user node rather than spawning a chain.
