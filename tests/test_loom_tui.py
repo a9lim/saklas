@@ -15,6 +15,7 @@ MagicMock session, and verify the dispatch routes correctly.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -118,7 +119,7 @@ def _make_app():
     return app
 
 
-def _msgs(app):
+def _msgs(app: SaklasApp) -> str:
     return "\n".join(app._chat_panel.messages)
 
 
@@ -428,6 +429,25 @@ def test_del_requires_yes_confirm():
     assert aid in app._session.tree.nodes
 
 
+def test_ctrl_d_alone_does_not_delete():
+    """Ctrl+D (``action_delete_subtree``) must NOT bypass the confirm
+    guard — it routes through ``_handle_del("")`` so the same usage
+    hint as ``/del`` fires.  The user has to type ``/del yes`` to
+    actually delete.  Regression: an earlier shape called
+    ``_handle_del("yes")`` and wiped the subtree on a stray keypress.
+    """
+    app = _make_app()
+    uid, aid = _seed_tree(app._session.tree)
+    extra = app._session.tree.branch(aid, "alt")
+    assert app._session.tree.active_node_id == extra
+    app.action_delete_subtree()
+    # No deletion.
+    assert extra in app._session.tree.nodes
+    assert aid in app._session.tree.nodes
+    # And the confirm hint surfaced in chat.
+    assert any("type '/del yes'" in m for m in app._chat_panel.messages)
+
+
 def test_del_yes_removes_subtree():
     app = _make_app()
     uid, aid = _seed_tree(app._session.tree)
@@ -468,19 +488,37 @@ def test_path_prints_summary():
     assert "hello" in out
 
 
-def test_transcript_export_writes_payload(tmp_path):
+def test_transcript_export_writes_payload(tmp_path: Path) -> None:
+    """`/transcript export` emits YAML (phase 5; pyyaml-parseable)."""
+    import yaml
     app = _make_app()
     uid, aid = _seed_tree(app._session.tree)
-    out = tmp_path / "transcript.json"
+    out = tmp_path / "transcript.yaml"
     app._handle_command(f"/transcript export {out}")
     assert out.exists()
-    payload = json.loads(out.read_text())
+    payload = yaml.safe_load(out.read_text())
     assert payload["saklas_transcript"] == 1
     assert any(t["role"] == "user" for t in payload["turns"])
     assert any(t["role"] == "assistant" for t in payload["turns"])
 
 
-def test_transcript_load_missing_file(tmp_path):
+def test_transcript_export_load_roundtrip(tmp_path: Path) -> None:
+    """`/transcript export` writes YAML that round-trips through Transcript.load."""
+    from saklas.core.transcript import Transcript
+    app = _make_app()
+    uid, aid = _seed_tree(app._session.tree)
+    out = tmp_path / "transcript.yaml"
+    app._handle_command(f"/transcript export {out}")
+    assert out.exists()
+    # Should parse via Transcript.load (which uses pyyaml).
+    transcript = Transcript.load(out)
+    assert transcript.model_id == "mock/mock"
+    roles = [t.role for t in transcript.turns]
+    assert "user" in roles
+    assert "assistant" in roles
+
+
+def test_transcript_load_missing_file(tmp_path: Path) -> None:
     """Phase 5: load surfaces a 'not a file' message when the path doesn't exist."""
     app = _make_app()
     missing = tmp_path / "nope.yaml"
@@ -489,7 +527,7 @@ def test_transcript_load_missing_file(tmp_path):
     assert "not a file" in msg
 
 
-def test_transcript_load_default_attaches_at_root(tmp_path):
+def test_transcript_load_default_attaches_at_root(tmp_path: Path) -> None:
     """Phase 5: `/transcript load <path>` runs `import_into(mode='default')`."""
     import saklas
     app = _make_app()
@@ -534,6 +572,77 @@ def test_transcript_load_unknown_flag_combo(tmp_path):
     path.write_text("saklas_transcript: 1\nturns: []\n")
     app._handle_command(f"/transcript load {path} --here --merge")
     assert any("at most one" in m for m in app._chat_panel.messages)
+
+
+def test_fire_auto_regen_streams_into_shadow_column():
+    """Phase-5 fix: non-unsteered auto-regen modes stream the modifier
+    output into the right (shadow) column via ``_ui_token_queue``
+    tagged ``is_shadow=True``, the same plumbing the unsteered A/B path
+    uses.  Mirrors :meth:`SaklasApp._start_shadow_generation`'s shape.
+    """
+    import threading
+    import time
+    from saklas import TokenEvent
+    app = _make_app()
+    # Active node has to be an assistant under a user turn so
+    # ``_fire_auto_regen`` can resolve the anchor user.
+    uid, aid = _seed_tree(app._session.tree)
+
+    # Auto-regen state: on, with a non-unsteered mode.
+    app._loom_auto_regen_on = True
+    app._loom_auto_regen_mode = "inverted"
+
+    # Stub the chat panel's shadow widget mount.  We only need an
+    # object with the highlight method; the worker pushes events into
+    # ``_ui_token_queue`` directly.
+    shadow_widget = MagicMock()
+    shadow_widget.apply_highlight = MagicMock()
+    app._chat_panel.start_shadow_message = MagicMock(return_value=shadow_widget)
+    row = MagicMock()
+
+    # Stub ``generate_stream`` to yield two token events synchronously.
+    fake_events = [
+        TokenEvent(text="hi", token_id=1, index=0, thinking=False,
+                   scores=None, perplexity=None),
+        TokenEvent(text=" there", token_id=2, index=1, thinking=False,
+                   scores=None, perplexity=None),
+    ]
+
+    def _fake_stream(*args, **kwargs):
+        # Confirm we routed through ``recipe_override`` (so the mode
+        # actually lands) and ``parent_node_id`` (so the new node is a
+        # sibling under the user-parent).
+        assert kwargs.get("recipe_override") == "inverted"
+        assert "parent_node_id" in kwargs
+        yield from fake_events
+
+    app._session.generate_stream = _fake_stream
+
+    # Synchronously run the worker the app would spawn so the test
+    # doesn't depend on Textual's worker thread machinery.
+    workers: list = []
+    def _run_worker(fn, **_kw):
+        t = threading.Thread(target=fn)
+        t.start()
+        workers.append(t)
+    app.run_worker = _run_worker
+
+    app._fire_auto_regen(row)
+
+    for t in workers:
+        t.join(timeout=5.0)
+
+    # Drain the queue and confirm shadow-tagged tokens landed.
+    items = []
+    while not app._ui_token_queue.empty():
+        items.append(app._ui_token_queue.get_nowait())
+    tok_items = [it for it in items if it[0] == "tok"]
+    assert len(tok_items) == 2, items
+    # Position 6 (the trailing flag in the tok tuple) is the
+    # ``is_shadow`` tag.
+    assert all(it[6] is True for it in tok_items)
+    # And the right column had its shadow widget mounted.
+    app._chat_panel.start_shadow_message.assert_called_once_with(row)
 
 
 def test_diff_unique_prefix_diffs_two_siblings():
@@ -708,7 +817,7 @@ def test_regen_n_dispatches_through_loom_helper():
     def _intercept(n):
         captured["n"] = n
     app._run_regen_n_worker = _intercept
-    app._dispatch_loom_regen = lambda n: _intercept(n)
+    app._dispatch_loom_regen = lambda n, *, mode=None: _intercept(n)
 
     app._handle_command("/regen 3")
     assert captured.get("n") == 3

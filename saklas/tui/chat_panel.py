@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import Any
 
 from rich.markup import escape as _rich_escape
 from textual.app import ComposeResult
@@ -61,7 +62,7 @@ class _AssistantMessage(Vertical):
     navigating the trait panel is a dict lookup instead of a rebuild.
     """
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._escaped_chat_text: str = ""
         self._escaped_thinking_text: str = ""
@@ -269,7 +270,7 @@ class _TurnRow(Horizontal):
     """
 
     def __init__(
-        self, kind: str, primary_child: Widget, shadow_child: Widget, **kwargs,
+        self, kind: str, primary_child: Widget, shadow_child: Widget, **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.add_class("turn-row")
@@ -308,11 +309,17 @@ class ChatPanel(Widget):
             super().__init__()
             self.text = text
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._log: VerticalScroll | None = None
         self._status_bar: Static | None = None
         self._ab_mode: bool = False
+        # In-memory mirror of system-message strings.  ``add_system_message``
+        # mounts a ``Static`` widget AND appends to this list so callers
+        # (tests, transcript export, future log search) can read the
+        # rendered system-message text without walking the widget tree.
+        # Append-only; ``clear_log`` resets.
+        self.messages: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
@@ -322,6 +329,20 @@ class ChatPanel(Widget):
     def on_mount(self) -> None:
         self._log = self.query_one("#chat-log", VerticalScroll)
         self._status_bar = self.query_one("#status-bar", Static)
+
+    # All ``log`` / ``status_bar`` access happens after Textual's mount
+    # lifecycle has run ``on_mount``, so the assertions below are
+    # invariants — they exist to narrow the Optional for type checkers,
+    # not as runtime preconditions.
+    @property
+    def _log_mounted(self) -> VerticalScroll:
+        assert self._log is not None, "ChatPanel._log accessed before on_mount"
+        return self._log
+
+    @property
+    def _status_bar_mounted(self) -> Static:
+        assert self._status_bar is not None, "ChatPanel._status_bar accessed before on_mount"
+        return self._status_bar
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -354,7 +375,7 @@ class ChatPanel(Widget):
 
     def _turn_rows(self) -> list[_TurnRow]:
         """All ``_TurnRow`` children of the log, in mount order."""
-        return [c for c in self._log.children if isinstance(c, _TurnRow)]
+        return [c for c in self._log_mounted.children if isinstance(c, _TurnRow)]
 
     def assistant_rows_pending_shadow(self) -> list[_TurnRow]:
         """Assistant rows whose shadow column still holds the placeholder
@@ -382,17 +403,19 @@ class ChatPanel(Widget):
 
     def clear_log(self) -> None:
         """Remove all messages from the chat log."""
-        self._log.remove_children()
+        self._log_mounted.remove_children()
+        self.messages.clear()
 
     def rewind(self) -> None:
         """Remove the last user turn-row and everything after it."""
-        children = list(self._log.children)
+        log = self._log_mounted
+        children = list(log.children)
         for i in range(len(children) - 1, -1, -1):
             child = children[i]
             if isinstance(child, _TurnRow) and child.kind == "user":
-                self._log.remove_children(children[i:])
+                log.remove_children(children[i:])
                 break
-        self._log.scroll_end(animate=False)
+        log.scroll_end(animate=False)
 
     def rewind_last_assistant(self) -> None:
         """Remove the last assistant turn-row only.
@@ -401,13 +424,14 @@ class ChatPanel(Widget):
         whole row goes — there's no useful intermediate state where we'd
         keep one column and drop the other.
         """
-        children = list(self._log.children)
+        log = self._log_mounted
+        children = list(log.children)
         for i in range(len(children) - 1, -1, -1):
             child = children[i]
             if isinstance(child, _TurnRow) and child.kind == "assistant":
                 child.remove()
                 break
-        self._log.scroll_end(animate=False)
+        log.scroll_end(animate=False)
 
     def add_user_message(self, text: str) -> _TurnRow:
         """Mount a user turn-row.  The same text is mirrored into both
@@ -422,8 +446,9 @@ class ChatPanel(Widget):
             shadow_child=_build_user_widget(text),
         )
         row.user_text = text
-        self._log.mount(row)
-        self._log.scroll_end(animate=False)
+        log = self._log_mounted
+        log.mount(row)
+        log.scroll_end(animate=False)
         return row
 
     def start_assistant_message(self) -> tuple[_TurnRow, _AssistantMessage]:
@@ -437,7 +462,7 @@ class ChatPanel(Widget):
         row = _TurnRow(
             kind="assistant", primary_child=widget, shadow_child=placeholder,
         )
-        self._log.mount(row)
+        self._log_mounted.mount(row)
         return row, widget
 
     def start_shadow_message(self, row: _TurnRow) -> _AssistantMessage:
@@ -455,11 +480,13 @@ class ChatPanel(Widget):
 
     def scroll_to_bottom(self) -> None:
         """Scroll the chat log to the bottom. Call once after a batch of token updates."""
-        self._log.scroll_end(animate=False)
+        self._log_mounted.scroll_end(animate=False)
 
     def add_system_message(self, text: str) -> None:
-        self._log.mount(Static(f"[dim]{text}[/]", classes="system-message"))
-        self._log.scroll_end(animate=False)
+        log = self._log_mounted
+        log.mount(Static(f"[dim]{text}[/]", classes="system-message"))
+        log.scroll_end(animate=False)
+        self.messages.append(text)
 
     def update_status(
         self,
@@ -469,9 +496,17 @@ class ChatPanel(Widget):
         tok_per_sec: float = 0.0,
         elapsed: float = 0.0,
         perplexity: float | None = None,
+        prune_expr: str | None = None,
+        auto_regen_mode: str | None = None,
     ) -> None:
-        """Update the status bar with generation stats."""
-        bar = self._status_bar
+        """Update the status bar with generation stats.
+
+        ``prune_expr`` (``app._loom_prune_expr``) and ``auto_regen_mode``
+        (``app._loom_auto_regen_mode`` when ``_loom_auto_regen_on`` and
+        the mode is not ``unsteered``) surface the otherwise-invisible
+        loom state in the chat footer.
+        """
+        bar = self._status_bar_mounted
         dot = "[ansi_green]●[/]" if generating else "[dim]○[/]"
         if max_tokens > 0 and (generating or gen_tokens > 0):
             t_full, t_empty = build_bar(gen_tokens, max_tokens, BAR_WIDTH)
@@ -487,4 +522,8 @@ class ChatPanel(Widget):
         parts: list[str] = [left]
         if perplexity is not None:
             parts.append(f"ppl {perplexity:.2f}")
+        if prune_expr:
+            parts.append(f"filter:{prune_expr}")
+        if auto_regen_mode:
+            parts.append(f"auto:{auto_regen_mode}")
         bar.update(" · ".join(parts))

@@ -79,3 +79,19 @@ Cross-model probe alignment via per-layer Procrustes.  `load_or_compute_neutral_
 ## datasource.py
 
 `DataSource` normalizes pairs from curated names, JSON, CSV, HF datasets, or raw lists.
+
+## session_store.py (v2.3 minimal)
+
+Single-file engine-side persistence for the loom tree. `save_tree(session_id, tree)` writes `~/.saklas/sessions/<session_id>/tree.json` via `write_json_atomic`; `load_tree(session_id)` returns `None` when the file is missing or the JSON is corrupt (degrades gracefully — a corrupt tree shouldn't kill session startup). `session_path(session_id)` resolves the directory; `default_session_id()` reads or mints a persistent anonymous ulid at `~/.saklas/sessions/.default`, so tree state survives across `saklas tui` / `saklas serve` restarts without the user opting in.
+
+Wired into `SaklasSession.__init__` via a new `session_id: str | None = None` kwarg (resolves to the persistent default on `None`). After construction, `load_tree(session_id)` replaces the fresh `LoomTree` if a saved one exists. A `LoomMutated` event subscriber schedules a 1 s debounced save via `threading.Timer` (rescheduled on each mutation, fires on the timer thread). `SaklasSession.close()` / `__exit__` calls `_flush_persist()` synchronously so the final save lands before the process exits. Filesystem-unavailable startups (sandboxed tests, read-only `$HOME`) fall back to `session_id = ""` — persistence becomes a no-op without breaking the session.
+
+All paths honor `SAKLAS_HOME` via `saklas.io.paths.saklas_home()`.
+
+**v2.4 scope (deferred):**
+- Per-node token blob split into `tokens/<node_id>.json` (the main `tree.json` stays small for navigation).
+- Named sessions via `saklas tui --session <name>` / `saklas serve --session <name>` (slug names; resume on collision).
+- `saklas session ls / resume / rm` CLI verbs.
+- 30-day auto-prune of anonymous unstarred sessions at process startup.
+
+See `docs/plans/loom.md`'s "Persistence" section for the full intended shape.

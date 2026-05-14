@@ -8,6 +8,7 @@ is real (loom + recipe stamping).
 from __future__ import annotations
 
 import types
+from typing import Any
 
 import pytest
 
@@ -28,18 +29,26 @@ class _SweepStub:
     runs verbatim.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.tree = LoomTree()
-        self.calls: list[dict] = []
+        self.calls: list[dict[str, Any]] = []
         self._gen_state = types.SimpleNamespace(
             stop_requested=types.SimpleNamespace(is_set=lambda: False),
         )
 
     def _generate_core(
-        self, prompt, *, steering=None, sampling=None, stateless=False,
-        raw=False, thinking=None, parent_node_id=None, on_token=None,
-        recipe_override=None,
-    ):
+        self,
+        prompt: str,
+        *,
+        steering: Any = None,
+        sampling: Any = None,
+        stateless: bool = False,
+        raw: bool = False,
+        thinking: Any = None,
+        parent_node_id: Any = None,
+        on_token: Any = None,
+        recipe_override: Any = None,
+    ) -> GenerationResult:
         # Echo the call args for assertions.
         self.calls.append({
             "prompt": prompt, "steering": steering,
@@ -105,6 +114,47 @@ def test_sweep_return_node_ids_returns_parallel_lists():
     assert len(node_ids) == 2
     for nid in node_ids:
         assert nid in stub.tree.nodes
+
+
+def test_sweep_explicit_return_node_ids_false_warns():
+    """Explicit ``return_node_ids=False`` emits a DeprecationWarning;
+    omitting the kwarg (sentinel default) does NOT.  v2.4 will flip
+    the default to the tuple shape.
+    """
+    import warnings
+
+    from saklas.core.session import SaklasSession
+
+    stub = _SweepStub()
+    sweep = SaklasSession.generate_sweep.__get__(stub, _SweepStub)
+
+    # Explicit False — warn.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = sweep(
+            "go", sweep={"honest.deceptive": [0.1]},
+            stateless=True, return_node_ids=False,
+        )
+    assert any(
+        issubclass(w.category, DeprecationWarning)
+        and "return_node_ids=False" in str(w.message)
+        for w in caught
+    )
+    # Return shape unchanged in v2.3 — bare list, not tuple.
+    assert isinstance(out, list)
+
+    # Default (sentinel) — no warning.
+    stub2 = _SweepStub()
+    sweep2 = SaklasSession.generate_sweep.__get__(stub2, _SweepStub)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out2 = sweep2(
+            "go", sweep={"honest.deceptive": [0.1]}, stateless=True,
+        )
+    assert not any(
+        issubclass(w.category, DeprecationWarning) for w in caught
+    )
+    assert isinstance(out2, list)
 
 
 def test_sweep_seed_schedule_is_deterministic():

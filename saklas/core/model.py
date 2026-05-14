@@ -2,10 +2,12 @@
 
 import logging
 import warnings
+from typing import cast
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 log = logging.getLogger(__name__)
 
@@ -266,13 +268,13 @@ def _resolve_dtype(dtype, device: str) -> torch.dtype:
 
 def load_model(
     model_id: str,
-    quantize=None,
-    device="auto",
-    dtype=None,
+    quantize: str | None = None,
+    device: str = "auto",
+    dtype: torch.dtype | str | None = None,
     *,
     compile: bool = True,
     compile_mode: str = "default",
-):
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """Load a HuggingFace causal LM and its tokenizer.
 
     Args:
@@ -498,7 +500,7 @@ def load_model(
             device,
         )
 
-    return model, tokenizer
+    return cast(PreTrainedModel, model), tokenizer
 
 
 def _get_memory_gb(device: str) -> float:

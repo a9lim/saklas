@@ -9,9 +9,11 @@ import re
 import threading
 import time
 from enum import IntEnum
+from types import TracebackType
 from typing import Any, Callable, Iterator, Literal, overload
 
 import torch
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas.core.errors import SaklasError, StaleSidecarError
 from saklas.core.events import (
@@ -47,6 +49,15 @@ from saklas.core.vectors import load_profile as _load_profile
 
 _log = logging.getLogger(__name__)
 
+# Sentinel used to distinguish "not passed" from explicit ``False`` on
+# ``generate_sweep(return_node_ids=...)``.  Pre-v2.4 the default is
+# preserved as ``False`` (returns bare list of results); v2.4 will
+# flip to always return the tuple.  Explicit ``False`` emits a
+# DeprecationWarning so callers migrate to either the default (which
+# will silently flip) or explicit ``True`` (the v2.4 shape, available
+# today).
+_RETURN_NODE_IDS_UNSET = object()
+
 # Hybrid linear-attention models (qwen3.6-27b, lfm2, etc.) carry a
 # recurrent state (``conv_states`` + ``recurrent_states``) per LA layer
 # alongside the dynamic K/V cache.  ``DynamicLayer.crop`` truncates K/V
@@ -80,15 +91,15 @@ def _install_la_cache_patch() -> bool:
 
     _orig_la_crop = LinearAttentionLayer.crop  # documented no-op upstream
 
-    def _save_la_snapshot(layer) -> None:
-        snap = {}
+    def _save_la_snapshot(layer: Any) -> None:
+        snap: dict[str, Any] = {}
         if getattr(layer, "is_conv_states_initialized", False):
             snap["conv"] = layer.conv_states.detach().clone()
         if getattr(layer, "is_recurrent_states_initialized", False):
             snap["recurrent"] = layer.recurrent_states.detach().clone()
         layer._saklas_la_snapshot = snap if snap else None
 
-    def _la_crop_with_restore(self, max_length: int):
+    def _la_crop_with_restore(self: Any, max_length: int) -> None:
         _orig_la_crop(self, max_length)
         snap = getattr(self, "_saklas_la_snapshot", None)
         if not snap:
@@ -106,7 +117,7 @@ def _install_la_cache_patch() -> bool:
             if "recurrent" in snap and getattr(self, "is_recurrent_states_initialized", False):
                 self.recurrent_states.copy_(snap["recurrent"])
 
-    def _hybrid_crop(self, max_length: int):
+    def _hybrid_crop(self: Any, max_length: int) -> None:
         DynamicLayer.crop(self, max_length)
         _la_crop_with_restore(self, max_length)
 
@@ -120,7 +131,7 @@ def _install_la_cache_patch() -> bool:
 _install_la_cache_patch()
 
 
-def _snapshot_la_layers(cache) -> None:
+def _snapshot_la_layers(cache: Any) -> None:
     """Walk a Cache's layers and snapshot any linear-attention state.
 
     Called from :meth:`SaklasSession.cache_prefix` right after the
@@ -356,7 +367,12 @@ class _SteeringContext:
         self._entered = True
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         if self._entered:
             self._session._pop_steering()
             self._entered = False
@@ -398,7 +414,7 @@ class SaklasSession:
         model_id: str,
         *,
         device: str = "auto",
-        dtype=None,
+        dtype: torch.dtype | str | None = None,
         quantize: str | None = None,
         probes: list[str] | None = None,
         system_prompt: str | None = None,
@@ -411,6 +427,7 @@ class SaklasSession:
         compile: bool = True,
         compile_mode: str | None = None,
         cuda_graphs: bool = True,
+        session_id: str | None = None,
     ) -> "SaklasSession":
         """Load a HF model + tokenizer and return a fully initialized session.
 
@@ -550,12 +567,13 @@ class SaklasSession:
             projection_metric=projection_metric,
             dls=dls,
             cuda_graphs=cuda_graphs,
+            session_id=session_id,
         )
 
     def __init__(
         self,
-        model,
-        tokenizer,
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizerBase,
         *,
         probes: list[str] | None = None,
         system_prompt: str | None = None,
@@ -566,6 +584,7 @@ class SaklasSession:
         projection_metric: str = "mahalanobis",
         dls: bool = True,
         cuda_graphs: bool = True,
+        session_id: str | None = None,
     ):
         self._model = model
         self._tokenizer = tokenizer
@@ -702,17 +721,91 @@ class SaklasSession:
         # ``_gen_state`` is the *generator's*.
         self._gen_phase: GenState = GenState.IDLE
 
+        # Session identity (v2.3, minimal): resolve to the persistent
+        # anonymous default when not passed.  The default-pointer file
+        # at ``~/.saklas/sessions/.default`` survives process restarts
+        # so the tree carries over.  Named sessions, ``saklas session
+        # ls/resume/rm`` verbs, and 30-day auto-prune are v2.4-scope.
+        from saklas.io.session_store import (
+            default_session_id as _default_session_id,
+            load_tree as _load_tree,
+            save_tree as _save_tree,
+        )
+        if session_id is None:
+            try:
+                session_id = _default_session_id()
+            except OSError:
+                # Filesystem unavailable (read-only $HOME, sandboxed
+                # tests) — fall back to an in-memory id so the rest of
+                # the session still works; persistence becomes a no-op.
+                session_id = ""
+        self.session_id: str = session_id
+
         # Conversation state lives in a :class:`LoomTree` (v2.3).  The
         # active path through the tree is what the model sees as context;
         # ``self.history`` is a derived property over ``tree.active_path``
         # for backward-compatibility with v2.2 callers that read the flat
         # list directly.  Generation routes through ``tree.add_user_turn``
         # / ``tree.begin_assistant`` / ``tree.finalize_assistant``.
-        self.tree: LoomTree = LoomTree(
-            events=self.events,
-            model_id=getattr(self._model_info, "model_id", None),
-            conflict_check=self._loom_conflict_check,
-        )
+        loaded_tree: "LoomTree | None" = None
+        if self.session_id:
+            try:
+                loaded_tree = _load_tree(self.session_id)
+            except Exception:
+                loaded_tree = None
+        if loaded_tree is not None:
+            # Rewire the loaded tree onto this session: it was loaded
+            # without an event bus and without the conflict-check hook,
+            # so we attach both here.  Carrying the persisted ``rev`` /
+            # ``active_node_id`` is the entire point of resume.
+            loaded_tree.attach_events(self.events)
+            loaded_tree.set_conflict_check(self._loom_conflict_check)
+            loaded_tree.session_id = self.session_id
+            # ``model_id`` from the file wins when present — that's
+            # the cross-session-resume identity check the v2.3
+            # persistence spec describes.  When the loaded id mismatches
+            # the live model, the surfaces are responsible for the
+            # warn-and-refuse (deferred to v2.4 surface plumbing).
+            if loaded_tree.model_id is None:
+                loaded_tree.model_id = getattr(
+                    self._model_info, "model_id", None,
+                )
+            self.tree: LoomTree = loaded_tree
+        else:
+            self.tree = LoomTree(
+                events=self.events,
+                model_id=getattr(self._model_info, "model_id", None),
+                session_id=self.session_id or None,
+                conflict_check=self._loom_conflict_check,
+            )
+
+        # Debounced persistence: every tree mutation bumps ``rev``,
+        # emits a ``LoomMutated`` event, and reschedules a 1s-delayed
+        # save.  The timer thread is independent of the gen thread so
+        # writes never block generation.  On close (or ``__exit__``)
+        # we flush any pending save synchronously.
+        self._persist_timer: "threading.Timer | None" = None
+        self._persist_lock = threading.Lock()
+        if self.session_id:
+            def _on_loom_mutated(event) -> None:
+                # Filter the synchronous bus to mutation events only.
+                # Importing LoomMutated locally avoids cycle risk.
+                from saklas.core.loom import LoomMutated as _LM
+                if not isinstance(event, _LM):
+                    return
+                with self._persist_lock:
+                    if self._persist_timer is not None:
+                        self._persist_timer.cancel()
+                    self._persist_timer = threading.Timer(
+                        1.0, self._flush_persist,
+                    )
+                    self._persist_timer.daemon = True
+                    self._persist_timer.start()
+
+            self._persist_save_fn = _save_tree
+            self.events.subscribe(_on_loom_mutated)
+        else:
+            self._persist_save_fn = None
         # Subtree root reserved by an in-flight generation (the user-parent
         # of the streaming assistant target).  None while idle; set by
         # ``_generate_core`` before token streaming begins, cleared in the
@@ -3414,6 +3507,17 @@ class SaklasSession:
                 ``n`` times under deterministically-derived per-sibling
                 seeds (see :func:`~saklas.core.loom.derive_seed_schedule`)
                 and returns ``list[GenerationResult]`` in sibling order.
+
+        Returns:
+            A single :class:`GenerationResult` when ``n == 1`` (the
+            default), or a ``list[GenerationResult]`` of sibling
+            results when ``n > 1``.  Callers that branch on shape
+            should check ``isinstance(result, list)``; library helpers
+            wanting one stable shape are encouraged to wrap a single
+            result in a list themselves rather than threading the
+            ``n`` argument through.  Plan-compliant with the v2.3 loom
+            shape ("single result or list of siblings"); the
+            polymorphic return is intentional and stable across v2.3.
         """
         if n < 1:
             raise ValueError(f"n must be >= 1, got {n}")
@@ -3616,7 +3720,7 @@ class SaklasSession:
         raw: bool = False,
         on_result: Callable[[int, GenerationResult, dict[str, float]], None] | None = None,
         parent_node_id: str | None = None,
-        return_node_ids: bool = False,
+        return_node_ids: "bool | object" = _RETURN_NODE_IDS_UNSET,
     ) -> "list[GenerationResult] | tuple[list[GenerationResult], list[str | None]]":
         """Sweep a single prompt across a Cartesian product of alpha values.
 
@@ -3638,11 +3742,40 @@ class SaklasSession:
         but exposed here so SSE consumers don't have to re-parse the
         expression.
 
+        ``return_node_ids`` toggles the legacy / current return shape.
+        Explicit ``False`` is deprecated: in v2.4 this method will
+        always return the ``(results, sibling_node_ids)`` tuple.
+        Callers that need the bare list today should explicitly opt in
+        via ``return_node_ids=False`` (this call) while updating to the
+        tuple shape; callers that need only the ids should pass
+        ``return_node_ids=True`` (the future-shape opt-in).  The
+        sentinel default keeps today's bare-list return until v2.4
+        flips it.
+
         Returns:
-            ``list[GenerationResult]`` in iteration order over the
-            product.  Each result's ``applied_steering`` carries the
-            canonical expression string for round-trip reproduction.
+            When ``return_node_ids`` is unset or ``False`` (v2.3
+            default): a ``list[GenerationResult]`` in iteration order
+            over the product.  When ``return_node_ids=True``: a tuple
+            ``(results, sibling_node_ids)`` where ``sibling_node_ids[i]``
+            is the assistant-node id finalized for ``results[i]`` (or
+            ``None`` under ``stateless=True``).  Each result's
+            ``applied_steering`` carries the canonical expression
+            string for round-trip reproduction.
         """
+        import warnings
+
+        if return_node_ids is _RETURN_NODE_IDS_UNSET:
+            return_node_ids = False
+        elif return_node_ids is False:
+            warnings.warn(
+                "generate_sweep(return_node_ids=False) is deprecated; "
+                "v2.4 will always return the (results, sibling_node_ids) "
+                "tuple.  Drop the explicit False to get the v2.3 default "
+                "(bare list) for now, or pass True to opt into the "
+                "future-stable tuple shape today.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if not isinstance(sweep, dict) or not sweep:
             raise ValueError("generate_sweep: sweep dict must be non-empty")
         for name, alphas in sweep.items():
@@ -3742,7 +3875,34 @@ class SaklasSession:
 
     # -- Lifecycle --
 
+    def _flush_persist(self) -> None:
+        """Flush any pending tree save synchronously.
+
+        Cancels the debounce timer (if any) and writes the current
+        ``tree.json`` via :func:`saklas.io.session_store.save_tree`.
+        Persistence errors are swallowed — losing a save on close is
+        recoverable (the prior good file remains atomically on disk),
+        and we don't want a transient IO error to mask the actual
+        shutdown path's exit code.
+        """
+        with self._persist_lock:
+            timer = self._persist_timer
+            self._persist_timer = None
+        if timer is not None:
+            timer.cancel()
+        if self._persist_save_fn is None or not self.session_id:
+            return
+        try:
+            self._persist_save_fn(self.session_id, self.tree)
+        except Exception:
+            # Logged at debug; swallowed otherwise — see docstring.
+            _log.debug(
+                "session-store flush failed for %r", self.session_id,
+                exc_info=True,
+            )
+
     def close(self) -> None:
+        self._flush_persist()
         self._steering.clear_all()
         self._profiles.clear()
 

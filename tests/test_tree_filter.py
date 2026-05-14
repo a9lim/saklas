@@ -4,7 +4,6 @@ from __future__ import annotations
 import pytest
 
 from saklas import (
-    FilterClause,
     FilterParseError,
     LoomTree,
     Recipe,
@@ -28,13 +27,13 @@ def test_parse_agg_op():
 
 
 @pytest.mark.parametrize("op", [">", ">=", "<", "<="])
-def test_parse_all_operators(op):
+def test_parse_all_operators(op: str) -> None:
     fc = parse_filter(f"agg:honest {op} 0")
     assert fc.clauses[0].op == op
 
 
 @pytest.mark.parametrize("agg", ["agg", "any", "last"])
-def test_parse_all_agg_ops(agg):
+def test_parse_all_agg_ops(agg: str) -> None:
     fc = parse_filter(f"{agg}:honest > 0.1")
     assert fc.clauses[0].agg == agg
 
@@ -74,9 +73,22 @@ def test_empty_raises():
         parse_filter("   ")
 
 
-def test_missing_prefix():
-    with pytest.raises(FilterParseError, match="missing 'agg:'"):
-        parse_filter("angry > 0.4")
+def test_bare_clause_defaults_to_agg():
+    """A bare ``<probe> <op> <num>`` clause defaults to ``agg:`` — the
+    plan calls ``agg`` the default and the parser used to reject the
+    prefix-less form (v2.3 fix).  Explicit prefixed forms keep working.
+    """
+    fc = parse_filter("angry.calm > 0.4")
+    assert len(fc.clauses) == 1
+    c = fc.clauses[0]
+    assert c.agg == "agg"
+    assert c.probe == "angry.calm"
+    assert c.op == ">"
+    assert c.threshold == 0.4
+
+    # Multi-clause: bare + explicit, mixed.
+    fc2 = parse_filter("angry.calm > 0.4, any:honest >= 0.2")
+    assert [c.agg for c in fc2.clauses] == ["agg", "any"]
 
 
 def test_unknown_agg_op():
@@ -112,7 +124,7 @@ def test_invalid_probe_name():
 class _SyntheticNode:
     """Tiny stand-in for LoomNode — only ``aggregate_readings`` is read."""
 
-    def __init__(self, readings):
+    def __init__(self, readings: dict[str, float]) -> None:
         self.id = "n0"
         self.aggregate_readings = readings
 

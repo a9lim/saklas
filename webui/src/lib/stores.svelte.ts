@@ -687,6 +687,13 @@ function applyTreeDelta(ev: {
     };
     loomTree.nodes.set(node.id, node);
   }
+  // ``active_node_id`` arrives null whenever the server-side
+  // ``LoomMutated`` event leaves it unset (the default for mutations
+  // that don't move the active pointer — edit, star, note, etc.).  The
+  // raw JSON serializer passes it through as null rather than omitting
+  // the key, so we treat both ``null`` and ``undefined`` as "unchanged"
+  // here.  Don't tighten this to "undefined only": the server contract
+  // and the live wire shape disagree, and ``null`` is the live shape.
   if (ev.active_node_id !== undefined && ev.active_node_id !== null) {
     loomTree.active_node_id = ev.active_node_id;
   }
@@ -1420,21 +1427,31 @@ function handleWsMessage(msg: WSServerMessage): void {
       void refreshCorrelation();
       applyPendingActions();
 
-      // Phase 5: auto-regen replaces the A/B shadow path.  When the
-      // auto-regen toggle is on, fire one regen with the configured
-      // override (mode-string or partial recipe).  The engine drops
-      // the result as a sibling under the same user-parent so the
-      // pinned-comparison pane picks it up automatically.  Legacy A/B
-      // shadow (when ``abState.enabled``) is preserved as a parallel
-      // fallback for surfaces that haven't migrated yet — both paths
-      // are gated independently so a user can have either or both.
-      if (
-        autoRegenState.enabled &&
-        loomTree.rev > 0 &&
-        loomTree.active_node_id
-      ) {
+      // v2.3: the legacy standalone A/B toggle is gone — auto-regen with
+      // ``mode === "unsteered"`` *is* the A/B shadow.  Branch on the
+      // resolved recipe-override:
+      //
+      //   * ``"unsteered"`` → fire the shadow-replay path
+      //     (``_sendShadowGenerate``).  Tokens land on the steered turn's
+      //     ``abPair`` so the chat's right column renders them in place.
+      //     Bit-identical to the pre-v2.3 A/B behaviour.
+      //
+      //   * any other override → fire a loom regen with the override.
+      //     The engine drops the result as a sibling under the same
+      //     user-parent; pin it so the chat's right column picks it up.
+      if (autoRegenState.enabled) {
         const override = currentRecipeOverride();
-        if (override !== null) {
+        if (
+          override === "unsteered" &&
+          steeredIdx !== null &&
+          chatLog.turns[steeredIdx]?.role === "assistant"
+        ) {
+          void _sendShadowGenerate(steeredIdx);
+        } else if (
+          override !== null &&
+          loomTree.rev > 0 &&
+          loomTree.active_node_id
+        ) {
           // Pin the new sibling so the chat's right column shows it.
           // We pin after the regen lands; ``done`` from the regen will
           // set ``loomTree.active_node_id`` to the new sibling.
@@ -1450,13 +1467,6 @@ function handleWsMessage(msg: WSServerMessage): void {
             }
           })();
         }
-      } else if (
-        abState.enabled &&
-        steeredIdx !== null &&
-        chatLog.turns[steeredIdx]?.role === "assistant"
-      ) {
-        // Legacy A/B path — unchanged so today's users see no regression.
-        void _sendShadowGenerate(steeredIdx);
       }
       return;
     }
@@ -1542,9 +1552,10 @@ export async function sendGenerate(
   if (loomTree.rev <= 0 && typeof input === "string") {
     chatLog.turns = [...chatLog.turns, { role: "user", text: input }];
   }
-  // Remember the input verbatim so the A/B path can replay it as the
-  // shadow gen.  Only meaningful when ``abState.enabled``; otherwise it's
-  // dead weight that's free to keep up to date.
+  // Remember the input verbatim so the auto-regen shadow path can replay
+  // it as an unsteered run.  Only meaningful when auto-regen is on with
+  // ``mode === "unsteered"``; otherwise it's dead weight that's free to
+  // keep up to date.
   const payload: WSClientMessage = {
     type: "generate",
     input,
@@ -1677,39 +1688,23 @@ export function ingestSweepEvent(ev: SweepEvent): void {
  * gen errors before the shadow fires, we never enter ``processingAb`` and
  * the abPair stays unset on that turn.
  */
+/** Transient routing state for the unsteered-shadow generation.
+ *
+ *  v2.3: the standalone ``abState.enabled`` toggle is gone — the legacy
+ *  "A/B" semantic has been folded into ``autoRegenState`` with
+ *  ``mode === "unsteered"`` as the default.  The remaining
+ *  ``processingAb`` / ``pendingTurnIdx`` fields are load-bearing for the
+ *  WS dispatcher (they route shadow tokens into the steered turn's
+ *  ``abPair`` instead of appending a fresh top-level turn). */
 export interface AbState {
-  enabled: boolean;
   pendingTurnIdx: number | null;
   processingAb: boolean;
 }
 
 export const abState: AbState = $state({
-  enabled: false,
   pendingTurnIdx: null,
   processingAb: false,
 });
-
-export function toggleAb(): void {
-  const wasOff = !abState.enabled;
-  abState.enabled = !abState.enabled;
-  // Toggling off does not abandon an in-flight shadow gen — the events
-  // route through to ``abPair`` regardless.  Toggling off only prevents
-  // the *next* steered gen from spawning a shadow.
-  if (!wasOff) return;
-  // Toggling on: replay the conversation through the unsteered agent
-  // for the most recent steered assistant turn that doesn't already
-  // carry an abPair.  Skip when a generation is in flight — the
-  // ``done`` handler will fire its own shadow when it lands.
-  if (genStatus.active) return;
-  for (let i = chatLog.turns.length - 1; i >= 0; i--) {
-    const t = chatLog.turns[i];
-    if (!t) continue;
-    if (t.role !== "assistant") continue;
-    if (t.abPair) break; // already has a shadow — nothing to fire
-    void _sendShadowGenerate(i);
-    break;
-  }
-}
 
 /** Build the conversation as a messages list to replay through the
  * unsteered shadow.  Walks ``chatLog.turns[0..steeredIdx-1]`` (excluding
@@ -1847,6 +1842,46 @@ interface PersistedSnapshotV2 {
     compareTarget: string | null;
     compareTwo: boolean;
   };
+}
+
+// ============================================================ toasts ====
+//
+// Lightweight advisory notifications.  No queueing or stacking story
+// beyond "render the latest few"; toasts are appended and the
+// ``Toaster`` component auto-dismisses each entry after its TTL fires.
+// Used for non-blocking surfaces like the localStorage budget warning;
+// fatal errors still flow through ``boot-failed`` / inline error UI.
+
+export interface Toast {
+  id: number;
+  kind: "info" | "warning" | "error";
+  message: string;
+  ttlMs: number;
+}
+
+export const toasts: { entries: Toast[] } = $state({ entries: [] });
+
+let _toastSeq = 0;
+
+export function pushToast(
+  message: string,
+  opts: { kind?: Toast["kind"]; ttlMs?: number } = {},
+): number {
+  const id = ++_toastSeq;
+  toasts.entries = [
+    ...toasts.entries,
+    {
+      id,
+      kind: opts.kind ?? "info",
+      message,
+      ttlMs: opts.ttlMs ?? 6000,
+    },
+  ];
+  return id;
+}
+
+export function dismissToast(id: number): void {
+  toasts.entries = toasts.entries.filter((t) => t.id !== id);
 }
 
 function safeLocalStorageGet(key: string): string | null {
@@ -2032,9 +2067,32 @@ function schedulePersist(): void {
         compareTwo: highlightState.compareTwo,
       },
     };
-    safeLocalStorageSet(key, JSON.stringify(snapshot));
+    const payload = JSON.stringify(snapshot);
+    // Soft ~5MB budget warning (plan §"Size management").  Each loom-
+    // tree rev bumps trigger a re-write of the whole snapshot, so a
+    // large tree can put real pressure on the localStorage quota.  The
+    // toast is advisory — we still write — and fires at most once per
+    // session so the user doesn't get spammed on every rev.
+    if (payload.length > _LOCALSTORAGE_SOFT_BUDGET && !_sizeWarned) {
+      _sizeWarned = true;
+      const mb = (payload.length / (1024 * 1024)).toFixed(1);
+      pushToast(
+        `Loom tree cache is ~${mb}MB in localStorage. Consider exporting and clearing — most browsers cap origin storage at 5–10MB.`,
+        { kind: "warning", ttlMs: 10000 },
+      );
+    }
+    safeLocalStorageSet(key, payload);
   }, 250);
 }
+
+/** ~5MB soft budget.  Browsers vary (Chrome ~10MB, Safari ~5MB) but
+ *  the warning is intentionally conservative so it fires before any
+ *  vendor hits its hard cap. */
+const _LOCALSTORAGE_SOFT_BUDGET = 5 * 1024 * 1024;
+
+/** Once-per-session latch so we don't toast on every rev bump after
+ *  the budget threshold is crossed.  Reset implicitly on page reload. */
+let _sizeWarned = false;
 
 /** Wire a $effect.root that watches the chat log + highlight slice and
  * debounces a save to localStorage.  Called from ``bootstrap`` after
@@ -2283,7 +2341,26 @@ export const autoRegenState: AutoRegenState = $state({
 });
 
 export function toggleAutoRegen(): void {
+  const wasOff = !autoRegenState.enabled;
   autoRegenState.enabled = !autoRegenState.enabled;
+  // Off → on with the "unsteered" mode: replay the conversation through
+  // the unsteered agent for the most recent steered assistant turn that
+  // doesn't already carry an ``abPair``.  Mirrors the pre-v2.3 A/B
+  // toggle's retroactive-shadow behaviour, so users who flip the toggle
+  // on after-the-fact see the right column populate immediately rather
+  // than waiting for the next send.  Other modes use the loom-regen
+  // path — they take effect on the next ``done`` event by design.
+  if (!wasOff) return;
+  if (genStatus.active) return; // ``done`` handler will fire its own
+  if (currentRecipeOverride() !== "unsteered") return;
+  for (let i = chatLog.turns.length - 1; i >= 0; i--) {
+    const t = chatLog.turns[i];
+    if (!t) continue;
+    if (t.role !== "assistant") continue;
+    if (t.abPair) break;
+    void _sendShadowGenerate(i);
+    break;
+  }
 }
 
 export function setAutoRegenMode(mode: AutoRegenMode): void {

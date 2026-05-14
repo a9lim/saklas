@@ -27,6 +27,7 @@
     clearTreeFilter,
     currentRecipeOverride,
     filterState,
+    highlightState,
     loomRegenerateFromUser,
     loomTree,
     loomNavigate,
@@ -104,6 +105,24 @@
     }
     return out;
   });
+
+  // ----------------------------------------- ring decoration --------
+
+  /** Per-node ring fill keyed off the currently-selected highlight
+   *  probe (Decision 10 in docs/plans/loom.md).  Returns the node's
+   *  aggregate reading for ``highlightState.target`` in [-1, 1], or
+   *  ``null`` when no probe is selected, the node has no aggregate
+   *  readings yet, or the selected probe is missing from this node's
+   *  reading map.  ``LoomNode`` renders the ring only when this value
+   *  is non-null. */
+  function ringFor(node: LoomNodeJSON): number | null {
+    const target = highlightState.target;
+    if (!target) return null;
+    const readings = node.aggregate_readings;
+    if (!readings) return null;
+    const v = readings[target];
+    return typeof v === "number" ? v : null;
+  }
 
   // ----------------------------------------- filter input ------------
 
@@ -505,8 +524,16 @@
       return;
     }
     if (k === "Escape") {
+      // v2.3: Esc inside the sidebar defocuses the active element /
+      // search input rather than collapsing the whole panel.  Most
+      // users hit Esc to back out of a focused control; auto-closing
+      // the sidebar surprised people who just wanted to dismiss a
+      // modal/menu/search.  The topbar's "loom" button still toggles
+      // the panel; only an open menu/modal short-circuits this branch
+      // (handled in ``onWindowKey``).
       ev.preventDefault();
-      toggleLoomSidebar();
+      const active = document.activeElement as HTMLElement | null;
+      active?.blur?.();
       return;
     }
   }
@@ -756,6 +783,7 @@
             focused={focusedId === row.node.id}
             dead={row.isDead}
             streaming={loomTree.pendingNodeId === row.node.id}
+            ring={ringFor(row.node)}
             onclick={(ev) => onNodeClick(row.node, ev)}
             oncontextmenu={(ev) => openMenu(ev, row.node.id)}
           />

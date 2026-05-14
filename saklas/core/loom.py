@@ -405,8 +405,17 @@ class LoomMutated:
     ``"star"``, ``"note"``, ``"reset"``, ``"add_user"``, ``"begin_assistant"``,
     ``"finalize_assistant"``.
 
-    Delta payload fields mirror the WS protocol described in
-    ``docs/plans/loom.md`` phase 2:
+    Delta payload fields carry ids only at the engine level — the
+    server WS layer (:mod:`saklas.server.saklas_api`'s
+    ``WS /saklas/v1/sessions/{id}/stream``) enriches each id into full
+    ``LoomNodeJSON`` payloads via :func:`_node_json` before forwarding
+    to clients, so the wire-level ``tree_mutated`` event matches the
+    shape described in ``docs/plans/loom.md`` phase 2.  In-process
+    subscribers (TUI, library callers) that already hold the tree
+    look the ids up themselves; the network hop is the only place that
+    needs the inlined node data.
+
+    Field semantics:
 
     - ``added``: newly-created node ids
     - ``removed``: dropped node ids (delete_subtree)

@@ -137,38 +137,29 @@
 
   // ------------------------------------- per-token hover alignment --
 
-  /** Map from anchor-side token index to the aligned counterpart on
-   * the primary diff (the 2nd column for N>=2 ids).  Used to
-   * cross-highlight tokens between the two columns. */
-  function alignByA(spans: DiffTokenSpanJSON[]): Map<number, DiffTokenSpanJSON> {
-    const m = new Map<number, DiffTokenSpanJSON>();
-    for (const sp of spans) {
-      if (sp.a_index >= 0) m.set(sp.a_index, sp);
-    }
-    return m;
-  }
-  function alignByB(spans: DiffTokenSpanJSON[]): Map<number, DiffTokenSpanJSON> {
-    const m = new Map<number, DiffTokenSpanJSON>();
-    for (const sp of spans) {
-      if (sp.b_index >= 0) m.set(sp.b_index, sp);
-    }
-    return m;
-  }
+  // Decision (option a): render the per-pane token spans directly from
+  // ``diff.per_token`` rather than re-splitting ``a_text`` / ``b_text``
+  // on whitespace.  The server's :func:`per_token_diff` walks the real
+  // model-tokenizer byte offsets, so its ``a_index`` / ``b_index`` keys
+  // only line up with the spans it emitted — never with a client-side
+  // whitespace split.  Iterating ``per_token`` gives us correct
+  // tokenization for free, plus the hover-cross-highlight is exact
+  // because each rendered span carries its own counterpart index.
+  //
+  // ``per_token`` may be empty (loaded transcripts that didn't persist
+  // token sequences, or pre-v2.3 nodes); in that case we fall back to
+  // the whitespace-split renderer so the diff stays visible — alignment
+  // tooltips just won't fire on the fallback path.
 
-  // For each diff we'll precompute alignment maps.  The primary diff
-  // (index 0) drives the cross-column highlight.
-  const primaryAlignA = $derived.by<Map<number, DiffTokenSpanJSON>>(() => {
-    const d = diffs[0];
-    return d?.kind === "ok"
-      ? alignByA(d.diff.per_token)
-      : new Map<number, DiffTokenSpanJSON>();
-  });
-  const primaryAlignB = $derived.by<Map<number, DiffTokenSpanJSON>>(() => {
-    const d = diffs[0];
-    return d?.kind === "ok"
-      ? alignByB(d.diff.per_token)
-      : new Map<number, DiffTokenSpanJSON>();
-  });
+  /** Anchor-side tokens (a_index >= 0) for one diff's per-token array.
+   *  Returns ``[]`` when the diff carries no per-token data. */
+  function panelTokensA(spans: DiffTokenSpanJSON[]): DiffTokenSpanJSON[] {
+    return spans.filter((sp) => sp.a_index >= 0);
+  }
+  /** Other-side tokens (b_index >= 0). */
+  function panelTokensB(spans: DiffTokenSpanJSON[]): DiffTokenSpanJSON[] {
+    return spans.filter((sp) => sp.b_index >= 0);
+  }
 
   function formatReadingDelta(r: DiffReadingDeltaJSON): string {
     const sign = r.delta >= 0 ? "+" : "";
@@ -187,11 +178,19 @@
   }
 
   function tokensFor(text: string): string[] {
-    // For per-token rendering we re-split the text by the same shape
-    // the engine uses (whitespace-token boundaries).  This isn't the
-    // actual model tokenization but it gives a per-word hover affordance
-    // matching the text-diff granularity.
+    // Fallback splitter for the per-pane render when ``per_token`` is
+    // empty (transcript-loaded nodes without token sequences).  Word-
+    // split has no alignment metadata, so cross-pane hover stays off
+    // on this path.
     return text.split(/(\s+)/);
+  }
+
+  function spanTooltip(sp: DiffTokenSpanJSON): string {
+    if (!sp.reading_deltas || sp.reading_deltas.length === 0) return "";
+    return sp.reading_deltas
+      .slice(0, 3)
+      .map((r) => `${r.name} ${formatReadingDelta(r)}`)
+      .join(" · ");
   }
 </script>
 
@@ -270,48 +269,50 @@
 
             <!-- Text diff: side-by-side or unified. -->
             {#if layout === "side-by-side"}
+              {@const tokensA = panelTokensA(d.per_token)}
+              {@const tokensB = panelTokensB(d.per_token)}
               <div class="text-grid">
                 <div class="text-pane">
                   <span class="pane-label">A</span>
                   <div class="text-body">
-                    {#each tokensFor(d.a_text) as part, idx (idx)}
-                      {@const aligned = primaryAlignA.get(idx)}
-                      <!-- svelte-ignore a11y_no_static_element_interactions -->
-                      <span
-                        class="tok"
-                        class:highlight-anchor={hoveredAnchorIdx === idx}
-                        title={aligned && aligned.reading_deltas.length > 0
-                          ? aligned.reading_deltas
-                              .slice(0, 3)
-                              .map((r) => `${r.name} ${formatReadingDelta(r)}`)
-                              .join(" · ")
-                          : ""}
-                        onmouseenter={() => (hoveredAnchorIdx = idx)}
-                        onmouseleave={() => (hoveredAnchorIdx = null)}
-                      >{part}</span>
-                    {/each}
+                    {#if tokensA.length > 0}
+                      {#each tokensA as sp (`a-${sp.a_index}`)}
+                        <!-- svelte-ignore a11y_no_static_element_interactions -->
+                        <span
+                          class="tok"
+                          class:highlight-anchor={hoveredAnchorIdx === sp.a_index}
+                          title={spanTooltip(sp)}
+                          onmouseenter={() => (hoveredAnchorIdx = sp.a_index)}
+                          onmouseleave={() => (hoveredAnchorIdx = null)}
+                        >{sp.a_text}</span>
+                      {/each}
+                    {:else}
+                      {#each tokensFor(d.a_text) as part, idx (idx)}
+                        <span class="tok">{part}</span>
+                      {/each}
+                    {/if}
                   </div>
                 </div>
                 <div class="text-pane">
                   <span class="pane-label">B{ids.length > 2 ? diffIdx + 1 : ""}</span>
                   <div class="text-body">
-                    {#each tokensFor(d.b_text) as part, idx (idx)}
-                      {@const aligned = primaryAlignB.get(idx)}
-                      {@const matched =
-                        diffIdx === 0 &&
-                        hoveredAnchorIdx !== null &&
-                        aligned?.a_index === hoveredAnchorIdx}
-                      <span
-                        class="tok"
-                        class:highlight-target={matched}
-                        title={aligned && aligned.reading_deltas.length > 0
-                          ? aligned.reading_deltas
-                              .slice(0, 3)
-                              .map((r) => `${r.name} ${formatReadingDelta(r)}`)
-                              .join(" · ")
-                          : ""}
-                      >{part}</span>
-                    {/each}
+                    {#if tokensB.length > 0}
+                      {#each tokensB as sp (`b-${sp.b_index}`)}
+                        {@const matched =
+                          sp.a_index >= 0 &&
+                          hoveredAnchorIdx !== null &&
+                          sp.a_index === hoveredAnchorIdx}
+                        <span
+                          class="tok"
+                          class:highlight-target={matched}
+                          title={spanTooltip(sp)}
+                        >{sp.b_text}</span>
+                      {/each}
+                    {:else}
+                      {#each tokensFor(d.b_text) as part, idx (idx)}
+                        <span class="tok">{part}</span>
+                      {/each}
+                    {/if}
                   </div>
                 </div>
               </div>

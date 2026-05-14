@@ -61,7 +61,7 @@ webui/src/
   panels/
     Topbar.svelte             # model + device + clear/rewind/regen + tools menu + stop
     StatusFooter.svelte       # ● gen N/M [bar] · t/s · elapsed · ppl
-    Chat.svelte               # thinking-collapsible, probe-tinted tokens, A/B split
+    Chat.svelte               # thinking-collapsible, probe-tinted tokens, auto-regen / pin split
     SamplingStrip.svelte      # T / P / K / max / seed / thinking / session-vs-one-shot
     SteeringRack.svelte       # one strip per loaded vector + canonical EXPR + "+ steer"
     VectorStrip.svelte        # ●/○ enable + α slider + α display + trigger pill + variant chip + ⋮ menu + ✕ + inline projection modal
@@ -86,7 +86,9 @@ Svelte 5's `$state` does NOT track plain `Map.set` / `Set.add` / inner-object pr
 
 ## Persistence
 
-`chatLog.turns` and `highlightState` (target / compareTarget / compareTwo) persist to `localStorage` under `saklas.chat.v1.<model_id>`. Saves debounced via `$effect.root` ~250 ms after mutations so token streams don't beat the disk. Restored after `refreshSession()` in `bootstrap` so the storage key resolves.
+`chatLog.turns` and `highlightState` (target / compareTarget / compareTwo) persist to `localStorage` under `saklas.chat.v2.<model_id>` (v2 is the loom-tree shape; v1 single-branch logs auto-migrate via `hydrateV1ChatAsLinearTree`). Saves debounced via `$effect.root` ~250 ms after mutations so token streams don't beat the disk. Restored after `refreshSession()` in `bootstrap` so the storage key resolves.
+
+**Size budget toast.** `schedulePersist` measures `JSON.stringify(payload).length` against `_LOCALSTORAGE_SOFT_BUDGET = 5 MB` per Decision 18 in `docs/plans/loom.md`. Above the threshold, `pushToast` fires a once-per-session advisory suggesting transcript export + tree clear. Write isn't hard-stopped; `_sizeWarned` guards against re-firing on every subsequent save. `Toaster.svelte` is the host (bottom-right, TTL-dismissed), mounted alongside `StatusFooter` in `App.svelte`.
 
 Server-restart guard: if the persisted snapshot has user turns but the fresh session reports `history_length === 0`, drop the snapshot. Replaying would lie about generation context (next gen would see empty server-side history).
 
@@ -108,7 +110,13 @@ Vector strip projection picker: the `⋮` menu's "project onto (~)…" / "projec
 
 Shell-style history on the chat textarea. Every line submitted via `doSend` lands in `inputHistory.entries` through `pushInputHistory` (chat messages and slash commands alike); ↑/↓ in `Chat.svelte::onKeydown` call `navigateInputHistory(±1, currentInput)`. Edge-only multi-line policy: ↑ recalls only when the cursor sits on the first line (`shouldRecallUp`); ↓ goes forward only on the last line (`shouldRecallDown`) and is a no-op when no recall is in flight, so multi-line editing inside the draft isn't hijacked. First ↑ stashes the in-progress draft; ↓ past the newest entry restores it. `INPUT_HISTORY_MAX = 200` caps the ring. **In-memory only** — no `localStorage` persistence, matches the TUI's process-scoped shape and avoids leaking command lines to disk. Mirrors `saklas/tui/app.py::_history_navigate` / `_push_input_history` semantics; bash-style dedupe (collapses immediate repeats, preserves ping-pong).
 
-## A/B compare
+## Auto-regen (replaces A/B in v2.3)
+
+The standalone A/B button is gone — Decision 13's "Ctrl+A toggles auto-regen" landed end-to-end. `Topbar.svelte`'s auto-regen toggle is the canonical entry, with a ⚙ popover for mode selection (`unsteered` / `inverted` / `reseed` / `cool` / `hot` / `custom: <partial recipe>`). `mode="unsteered"` is bit-identical to the old A/B flow.
+
+`Chat.svelte`'s `twoColumns` derived OR-folds `pinnedActive || autoRegenActive` — pin generalizes the right column and auto-regen drives it when nothing is pinned. The WS `done` handler in `stores.svelte.ts` branches by mode: `unsteered` → `_sendShadowGenerate(steeredIdx)` (legacy shadow path, untouched); any other override → `loomRegenerateActive(mode)` + auto-pin to the new sibling. `toggleAutoRegen` retroactively fires a shadow for the most recent assistant turn when flipped on with `mode === "unsteered"` (mirrors the old A/B retroactive fire).
+
+The legacy A/B compare flow follows:
 
 `abState.enabled` toggles two-column rendering. The shadow gen (unsteered) runs after the steered turn finishes via `_sendShadowGenerate(steeredIdx)`, which:
 
@@ -120,6 +128,16 @@ Toggling A/B from off→on while the chat already has steered turns immediately 
 ## Thinking semantics
 
 The thinking checkbox is a strict binary. Initial `samplingState.thinking` is `false` (not legacy `null` "auto"). Both `sendGenerate` and `_sendShadowGenerate` send `thinking: samplingState.thinking ?? false` so any null write that leaked through still serialises as explicit-off — the previous null path could leak through to the chat-template `enable_thinking=null` ambiguity and have the model think anyway.
+
+## Loom sidebar (v2.3)
+
+`panels/loom/LoomSidebar.svelte` is the collapsible left panel. Tree rendering is a flat DFS at depth-indented rows so nested recursive components don't stack frames. Decoration ring on each `LoomNode` follows Decision 10: `ringFor(node)` reads `highlightState.target` × `node.aggregate_readings[target]` and returns a reading value clamped to [-1, 1]; null when no probe is selected. The ring is the visual cue for "which branches the highlight probe lights up on" — independent of the dead-branch dim (`.node.dead { opacity: 0.3 }`) and the filter dim (`.tree-row.filtered-out { opacity: 0.5 }`) per Decision 18's three-channel separation.
+
+Esc inside the sidebar defocuses the active element (search input / context menu) rather than collapsing the panel — collapse is a topbar action only. Context menu covers all five core ops + decorations (star/note) + pin + select-for-compare + fan-out + compare-children (user nodes with ≥2 assistant children).
+
+## NodeCompareDrawer real-token rendering (v2.3)
+
+`drawers/NodeCompareDrawer.svelte` renders per-token spans by iterating `diff.per_token` directly — each entry carries `{a_text, b_text, a_index, b_index, reading_deltas}` from the server's real model tokenization, so reading-delta tooltips and cross-pane hover highlight (`hoveredAnchorIdx` ↔ `aligned?.a_index`) align exactly with token boundaries. The earlier word-split-via-`/(\s+)/` shape mis-indexed alignment maps; the whitespace split is retained only as a fallback for nodes loaded without tokens (transcripts). Multi-select renders N columns with per-pair diffs; cross-pane highlight is gated `diffIdx === 0` (B-vs-A only) since N>2 pairings don't fit one hover target.
 
 ## Out of scope (v2.0)
 

@@ -16,6 +16,7 @@
   import SteeringRack from "./panels/SteeringRack.svelte";
   import ProbeRack from "./panels/ProbeRack.svelte";
   import LoomSidebar from "./panels/loom/LoomSidebar.svelte";
+  import Toaster from "./lib/Toaster.svelte";
 
   import * as Drawers from "./drawers";
   import PackDrawer from "./drawers/PackDrawer.svelte";
@@ -242,6 +243,7 @@
     </main>
 
     <StatusFooter />
+    <Toaster />
   </div>
 {/if}
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
+from typing import Iterable
 
 import pytest
 
@@ -25,13 +26,13 @@ from saklas import (
 
 
 class _Monitor:
-    def __init__(self, probe_names=()):
+    def __init__(self, probe_names: Iterable[str] = ()) -> None:
         self.probe_names = list(probe_names)
-        self.profiles = {name: {0: f"prof:{name}"} for name in probe_names}
+        self.profiles = {name: {0: f"prof:{name}"} for name in self.probe_names}
 
 
 class _Config:
-    def __init__(self, system_prompt=None):
+    def __init__(self, system_prompt: str | None = None) -> None:
         self.system_prompt = system_prompt
 
 
@@ -41,20 +42,20 @@ class _StubSession:
     def __init__(
         self,
         *,
-        model_id="m1",
-        system_prompt=None,
-        probe_names=("angry.calm", "honest.deceptive"),
-        probe_hashes=None,
-    ):
+        model_id: str = "m1",
+        system_prompt: str | None = None,
+        probe_names: Iterable[str] = ("angry.calm", "honest.deceptive"),
+        probe_hashes: dict[str, str] | None = None,
+    ) -> None:
         self.model_id = model_id
         self.tree = LoomTree(model_id=model_id)
         self.config = _Config(system_prompt=system_prompt)
         self._monitor = _Monitor(probe_names=probe_names)
         self._probe_hash_cache = probe_hashes or {
-            name: f"hash_of_{name}" for name in probe_names
+            name: f"hash_of_{name}" for name in self._monitor.probe_names
         }
 
-    def _probe_hash(self, name):
+    def _probe_hash(self, name: str) -> str | None:
         return self._probe_hash_cache.get(name)
 
 
@@ -91,7 +92,9 @@ def test_schema_round_trip():
     assert t2.system_prompt == t.system_prompt
     assert len(t2.probes) == 2
     assert t2.probes[0].sha256 == "abc123"
-    assert t2.turns[1].recipe.steering == "0.3 honest.deceptive"
+    recipe = t2.turns[1].recipe
+    assert recipe is not None
+    assert recipe.steering == "0.3 honest.deceptive"
     assert t2.turns[1].readings["angry.calm"] == pytest.approx(-0.12)
 
 
@@ -105,7 +108,7 @@ def test_from_yaml_rejects_non_mapping_root():
         Transcript.from_yaml("- foo\n- bar\n")
 
 
-def test_save_load_round_trip(tmp_path):
+def test_save_load_round_trip(tmp_path: Path):
     t = Transcript(
         model_id="m", system_prompt=None, probes=[],
         turns=[
@@ -148,7 +151,7 @@ def test_from_path_walks_active_path():
 # ---------------------------------------------------------------------------
 
 
-def _simple_transcript(*, model_id="m1", with_assistant=True):
+def _simple_transcript(*, model_id: str = "m1", with_assistant: bool = True) -> Transcript:
     turns = [TranscriptTurn(role="user", text="hi")]
     if with_assistant:
         turns.append(TranscriptTurn(role="assistant", text="hello"))
@@ -165,8 +168,6 @@ def test_import_default_attaches_under_root():
     sess = _StubSession()
     t = _simple_transcript()
     leaf = t.import_into(sess, mode="default")
-    # Imported tail anchored under root.
-    leaf_node = sess.tree.get(leaf)
     # Walk up — should hit root_id without crossing any existing user node.
     chain = [n.id for n in sess.tree.path_to(leaf)]
     assert sess.tree.root_id in chain
@@ -199,6 +200,62 @@ def test_import_merge_finds_user_prefix():
     assert u0 in chain
 
 
+def test_import_merge_skip_walks_existing_prefix_no_dupes():
+    """Two-user-deep prefix merge: the imported tail must attach under
+    the deepest matched user (u2), and the matched-prefix users (u1, u2)
+    must NOT be re-attached as duplicates under it.
+
+    Active path: ``root -> u1 -> a1 -> u2 -> a2``
+    Transcript users: ``["u1_text", "u2_text", "u3_text"]`` (assistants
+    between the matched users are dropped on the floor, matching the
+    rest of the merge mode — the structural location is "already
+    represented in the path", so the alternate assistant text would
+    land at the wrong depth if attached under the merge anchor).
+    Post-merge u3 should attach as a descendant of u2 (the deepest
+    matched user), with no u1/u2 duplicates spawned under u2.
+    """
+    sess = _StubSession()
+    u1 = sess.tree.add_user_turn("u1_text")
+    a1 = sess.tree.begin_assistant(u1, recipe=Recipe())
+    sess.tree.finalize_assistant(a1, text="a1_text")
+    u2 = sess.tree.add_user_turn("u2_text", parent_id=a1)
+    a2 = sess.tree.begin_assistant(u2, recipe=Recipe())
+    sess.tree.finalize_assistant(a2, text="a2_text")
+
+    # Transcript: matched-prefix [u1, u2] plus a fresh u3 tail.  No
+    # assistants in the matched-prefix region — keeping the structure
+    # symmetric with the task description while still exercising the
+    # tail-attach path (an assistant follows u3 so we have a real
+    # leaf node to assert on).
+    t = Transcript(
+        model_id="m1", system_prompt=None, probes=[],
+        turns=[
+            TranscriptTurn(role="user", text="u1_text"),
+            TranscriptTurn(role="user", text="u2_text"),
+            TranscriptTurn(role="user", text="u3_text"),
+            TranscriptTurn(role="assistant", text="a3_text"),
+        ],
+    )
+    leaf = t.import_into(sess, mode="merge")
+
+    # u2's children: must contain a fresh user node "u3_text", with
+    # NO duplicate "u1_text" / "u2_text" user nodes — the pre-fix
+    # behaviour spawned those as children of the merge anchor when
+    # the skip-walk re-called ``add_user_turn`` on matched prefixes.
+    u2_children = sess.tree.children(u2)
+    user_child_texts = [c.text for c in u2_children if c.role == "user"]
+    assert "u3_text" in user_child_texts
+    assert "u1_text" not in user_child_texts
+    assert "u2_text" not in user_child_texts
+
+    # The leaf assistant ("a3_text") lives at depth ``root -> u1 ->
+    # a1 -> u2 -> u3_text -> a3_text`` — every matched-prefix node
+    # is in the ancestor chain.
+    chain = [n.id for n in sess.tree.path_to(leaf)]
+    assert u1 in chain
+    assert u2 in chain
+
+
 def test_import_merge_falls_back_to_root_when_no_match():
     sess = _StubSession()
     u0 = sess.tree.add_user_turn("different")
@@ -227,7 +284,7 @@ def test_guard_model_mismatch_warns_on_default():
     t = _simple_transcript(model_id="m2")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        leaf = t.import_into(sess, mode="default")
+        t.import_into(sess, mode="default")
     assert any("model" in str(w.message) for w in caught)
     # First imported node carries a banner note.
     notes = []

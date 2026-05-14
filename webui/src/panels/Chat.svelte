@@ -25,8 +25,6 @@
     setHighlightTarget,
     setCompareTarget,
     toggleCompareTwo,
-    abState,
-    toggleAb,
     unpinComparison,
     probeRack,
     sendGenerate,
@@ -173,13 +171,15 @@
 
   // ------------------------------------------------------------- A/B split --
 
-  /** True when AB is on AND we have any turn carrying an ``abPair``.  Even
-   * if no ab pair exists we still want to render two columns when the
-   * mode is on, so ``abVisible`` is just the toggle. */
-  const abEnabled = $derived(abState.enabled);
+  /** v2.3: the standalone A/B toggle is gone.  The right column renders
+   *  either a pinned sibling's path or — when auto-regen is on — the
+   *  most recent auto-generated shadow / sibling.  The
+   *  ``autoRegenState.enabled`` flag drives both branches; mode
+   *  ``"unsteered"`` is the bit-identical fold of the old A/B. */
+  const autoRegenActive = $derived(autoRegenState.enabled);
 
   /** Phase-5: the right column renders either the pinned sibling's
-   *  subtree path or — when pinning is off — the legacy A/B shadow.
+   *  subtree path or — when pinning is off — the auto-regen shadow.
    *  Auto-regen overwrites the pin with each new auto-generated
    *  sibling, so the same pane shows whichever sibling is "the other
    *  one" at this moment. */
@@ -215,11 +215,9 @@
     return out.reverse();
   });
 
-  /** The right column is visible when EITHER auto-regen is on, a node
-   *  is pinned, or legacy A/B is on. */
-  const twoColumns = $derived(
-    pinnedActive || autoRegenState.enabled || abEnabled,
-  );
+  /** The right column is visible when EITHER auto-regen is on (which
+   *  subsumes the v1.x A/B toggle) or a node is pinned for comparison. */
+  const twoColumns = $derived(pinnedActive || autoRegenActive);
 
   // ----------------------------------------------------------- per-turn UI --
 
@@ -442,14 +440,6 @@
       </label>
     {/if}
 
-    <button
-      type="button"
-      class="ctl-toggle"
-      class:active={abEnabled}
-      onclick={toggleAb}
-      title="A/B compare: render unsteered shadow alongside steered"
-      aria-pressed={abEnabled}
-    >A/B</button>
   </header>
 
   <div
@@ -673,27 +663,6 @@
   .ctl-select:disabled {
     opacity: 0.5;
     cursor: not-allowed;
-  }
-  .ctl-toggle {
-    margin-left: auto;
-    background: transparent;
-    color: var(--fg-dim);
-    border: 1px solid var(--border);
-    padding: 0.2em 0.6em;
-    font: inherit;
-    font-family: var(--font-mono);
-    cursor: pointer;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-  }
-  .ctl-toggle:hover {
-    border-color: var(--fg-muted);
-    color: var(--fg-strong);
-  }
-  .ctl-toggle.active {
-    color: var(--accent-blue);
-    border-color: var(--accent-blue);
-    background: rgba(88, 166, 255, 0.08);
   }
 
   .log {

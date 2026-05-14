@@ -25,6 +25,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Input, Static, Tree
+from textual.widgets.tree import TreeNode
 
 from saklas.core.loom import (
     InvalidNodeOperationError,
@@ -100,7 +101,7 @@ class _PromptOverlay(Vertical):
         yield Input(value=self.initial, id="loom-prompt-input")
 
 
-class LoomScreen(Screen):
+class LoomScreen(Screen[None]):
     """Tree-of-completions view.
 
     All structural mutations route through ``self.session.tree``; the
@@ -121,7 +122,7 @@ class LoomScreen(Screen):
         Binding("left", "up", "Up", show=False),
         Binding("l", "down", "Down", show=True),
         Binding("right", "down", "Down", show=False),
-        Binding("enter", "make_active_and_back", "Activate", show=True),
+        Binding("enter", "make_active_and_back", "Activate + back to chat", show=True),
         Binding("r", "regen", "Regen", show=True),
         Binding("e", "edit_node", "Edit", show=True),
         Binding("b", "branch_node", "Branch", show=True),
@@ -178,11 +179,11 @@ class LoomScreen(Screen):
         super().__init__()
         self._app: "SaklasApp" = app
         self._session = app._session
-        self._tree_widget: Tree | None = None
+        self._tree_widget: Tree[str] | None = None
         self._detail: Static | None = None
         # Map ulid → TreeNode reference so we can re-select after a mutation
         # without re-walking the textual tree.
-        self._node_index: dict[str, object] = {}
+        self._node_index: dict[str, TreeNode[str]] = {}
         # ulid currently highlighted in the Textual tree widget (vs the
         # session's ``active_node_id`` which is the *logical* active node).
         self._cursor_id: str | None = None
@@ -280,7 +281,9 @@ class LoomScreen(Screen):
                 pass
             return None
 
-    def _mount_subtree(self, parent_widget_node, node_id: str, active_id: str) -> None:
+    def _mount_subtree(
+        self, parent_widget_node: TreeNode[str], node_id: str, active_id: str,
+    ) -> None:
         tree = self._session.tree
         node = tree.get(node_id)
         match_ids = getattr(self, "_match_ids", None)
@@ -299,12 +302,12 @@ class LoomScreen(Screen):
         """Echo the active prune expression into the footer when one is set."""
         expr = getattr(self._app, "_loom_prune_expr", None)
         try:
-            footer = self.query_one(Footer)
+            # Existence-check the Footer widget; we don't need the reference
+            # itself because Textual's Footer doesn't expose first-class
+            # custom text — we surface state through ``sub_title`` instead.
+            self.query_one(Footer)
         except Exception:
             return
-        # Textual's Footer doesn't expose first-class custom text; we
-        # use the screen's sub_title so the chrome surfaces the prune
-        # state without fighting the binding row.
         if expr:
             self.sub_title = f"prune: {expr}"
         else:
@@ -351,13 +354,13 @@ class LoomScreen(Screen):
     # Tree-widget events
     # ------------------------------------------------------------------
 
-    def on_tree_node_selected(self, event) -> None:
+    def on_tree_node_selected(self, event: Tree.NodeSelected[str]) -> None:
         node_id = event.node.data
         if isinstance(node_id, str):
             self._cursor_id = node_id
             self._refresh_detail()
 
-    def on_tree_node_highlighted(self, event) -> None:
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted[str]) -> None:
         node_id = event.node.data
         if isinstance(node_id, str):
             self._cursor_id = node_id
@@ -553,7 +556,7 @@ class LoomScreen(Screen):
         if self._tree_widget is not None:
             self._tree_widget.focus()
 
-    def on_input_submitted(self, event) -> None:
+    def on_input_submitted(self, event: Input.Submitted) -> None:
         if self._overlay is None:
             return
         kind = self._overlay.kind

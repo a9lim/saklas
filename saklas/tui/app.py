@@ -10,6 +10,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Iterable, Literal, TYPE_CHECKING, overload
 
 import torch
 from textual.app import App, ComposeResult
@@ -17,6 +18,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Input
 from textual.timer import Timer
+from textual import events as _textual_events
 
 from saklas import SamplingConfig, Steering
 from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
@@ -29,6 +31,9 @@ from saklas.core.session import MIN_ELAPSED_FOR_RATE
 from saklas.tui.chat_panel import ChatPanel, _AssistantMessage, _TurnRow
 from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
 from saklas.tui.trait_panel import TraitPanel
+
+if TYPE_CHECKING:
+    from saklas.core.session import SaklasSession
 
 DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
@@ -95,7 +100,7 @@ def _split_bipolar(text: str) -> tuple[str, str | None]:
     return _unquote(text.strip()), None
 
 
-def _resolve_active_name(name: str, active) -> list[str]:
+def _resolve_active_name(name: str, active: "Iterable[str]") -> list[str]:
     """Resolve a user-typed name against a set of currently-active names.
 
     Direct hit returns a single-element list. Otherwise treats ``name``
@@ -121,7 +126,7 @@ def _resolve_active_name(name: str, active) -> list[str]:
     return matches
 
 
-class SaklasApp(App):
+class SaklasApp(App[None]):
     CSS_PATH = "styles.tcss"
     ENABLE_COMMAND_PALETTE = False
 
@@ -149,9 +154,9 @@ class SaklasApp(App):
 
     def __init__(
         self,
-        session,
-        **kwargs,
-    ):
+        session: "SaklasSession",
+        **kwargs: Any,
+    ) -> None:
         super().__init__(ansi_color=True, **kwargs)
         self._session = session
         # ``_messages`` was a direct reference to ``session._history`` in
@@ -203,7 +208,7 @@ class SaklasApp(App):
         # we can locate the row to fire its shadow into without a tree
         # walk per gen.
         self._row_for_widget: dict[int, _TurnRow] = {}
-        self._pending_action: tuple | None = None  # ("regenerate",) or ("submit", text)
+        self._pending_action: tuple[Any, ...] | None = None  # ("regenerate",) or ("submit", text)
         # Phase-4 loom: stashed prune expression + auto-regen mode.  Phase 5
         # consumes them; phase 4 only carries the strings so users can set
         # them up before phase 5 evaluator lands.
@@ -231,7 +236,7 @@ class SaklasApp(App):
         self._highlighting: bool = False
         self._highlight_probe: str | None = None
         self._default_seed: int | None = None
-        self._ui_token_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._ui_token_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
 
         self._gen_start_time: float = 0.0
         self._gen_token_count: int = 0
@@ -241,7 +246,7 @@ class SaklasApp(App):
         # scored steps; display is ``exp(sum/count)``.
         self._log_ppl_sum: float = 0.0
         self._ppl_count: int = 0
-        self._last_gen_state: tuple = (-1, -1.0, -1.0, False, -1)
+        self._last_gen_state: tuple[Any, ...] = (-1, -1.0, -1.0, False, -1)
         self._assistant_messages: list[_AssistantMessage] = []
 
         defaults = load_defaults()
@@ -287,19 +292,25 @@ class SaklasApp(App):
         return {name: alpha for name, alpha in self._alphas.items()
                 if self._enabled.get(name, True)}
 
-    def _vector_list_for_panel(self) -> list[dict]:
+    def _vector_list_for_panel(self) -> list[dict[str, Any]]:
         """Build the list[dict] format the left panel expects."""
         result = []
         for name, alpha in self._alphas.items():
             profile = self._session._profiles.get(name)
             if profile is None:
                 continue
+            # Bind ``profile`` to a default-arg so pyright keeps the
+            # narrowed-non-None type across the lambda capture (it
+            # otherwise widens to include None inside the closure).
             result.append({
                 "name": name,
                 "profile": profile,
                 "alpha": alpha,
                 "enabled": self._enabled.get(name, True),
-                "peak": max(profile, key=lambda k: float(profile[k].norm().item())),
+                "peak": max(
+                    profile,
+                    key=lambda k, p=profile: float(p[k].norm().item()),
+                ),
                 "n_active": len(profile),
             })
         return result
@@ -331,7 +342,7 @@ class SaklasApp(App):
 
     # -- Key Handling --
 
-    def on_key(self, event) -> None:
+    def on_key(self, event: _textual_events.Key) -> None:
         if isinstance(self.focused, Input):
             if event.key == "tab":
                 event.prevent_default()
@@ -534,20 +545,24 @@ class SaklasApp(App):
             "  /exit, /help\n"
             "Loom:\n"
             "  /tree                       — open loom screen (Ctrl+L)\n"
-            "  /regen [N] [mode]           — N siblings (Ctrl+R)\n"
-            "  /edit                       — in-place edit active (Ctrl+E)\n"
-            "  /branch                     — sibling w/ text (Ctrl+B)\n"
-            "  /nav <id-prefix>            — navigate by ulid (Ctrl+N)\n"
-            "  /del                        — drop subtree (Ctrl+D)\n"
+            "  /regen [N] [mode]           — N siblings; mode ∈ unsteered/\n"
+            "                                inverted/reseed/cool/hot/custom\n"
+            "  /edit <text>                — in-place edit active\n"
+            "  /branch [text]              — sibling w/ optional text\n"
+            "  /nav <id-prefix>            — navigate by ulid\n"
+            "  /del yes                    — drop subtree (confirm required)\n"
             "  /star, /note <text>         — decoration\n"
             "  /path                       — active path summary\n"
             "  /fan <vec> <alphas>         — canonical sweep (siblings)\n"
+            "  /sweep <vec> <alphas>       — deprecated alias for /fan\n"
             "  /prune <filter-expr>        — dim non-matching nodes\n"
             "  /auto-regen [on|off|mode]   — sibling regen modifier (Ctrl+A toggles)\n"
             "  /diff <id1> <id2> [--full]  — cross-branch text + readings diff\n"
             "  /diff --siblings            — diff active user-parent's kids\n"
-            "  /transcript export <path>   — save active path\n"
+            "  /transcript export <path>   — save active path (YAML)\n"
             "  /transcript load <path> [--here|--merge] [--strict]\n"
+            "  Ctrl+E/B/N/D open the loom screen; use /edit /branch /nav /del\n"
+            "  for inline equivalents.\n"
             "Keys: Tab focus · ←/→ alpha (±0.01) · Shift+←/→ ±0.1\n"
             "↑/↓ nav (panels) · ↑/↓ in chat input recalls history\n"
             "Enter toggle · Backspace remove · Ctrl+T think · Ctrl+R regen\n"
@@ -568,8 +583,22 @@ class SaklasApp(App):
         )
         self._refresh_left_panel()
 
+    @overload
     @staticmethod
-    def _parse_args(text: str, include_alpha: bool = False):
+    def _parse_args(
+        text: str, include_alpha: Literal[True],
+    ) -> tuple[str, str | None, float]: ...
+
+    @overload
+    @staticmethod
+    def _parse_args(
+        text: str, include_alpha: Literal[False] = False,
+    ) -> tuple[str, str | None]: ...
+
+    @staticmethod
+    def _parse_args(
+        text: str, include_alpha: bool = False,
+    ) -> tuple[str, str | None] | tuple[str, str | None, float]:
         """Parse /steer, /probe, /extract arguments.
 
         Accepted forms:
@@ -751,7 +780,7 @@ class SaklasApp(App):
         terms are accepted and routed through session-level materialization.
         """
         from saklas.core.steering_expr import (
-            ProjectedTerm, SteeringExprError, parse_expr,
+            AblationTerm, ProjectedTerm, SteeringExprError, parse_expr,
         )
 
         chat = self._chat_panel
@@ -793,6 +822,17 @@ class SaklasApp(App):
                 chat.add_system_message(
                     f"Projection terms aren't yet supported from /steer "
                     f"(got '{key}'); express them in the YAML config."
+                )
+                return
+            if isinstance(val, AblationTerm):
+                # Ablation terms (``!x``) are dispatched through a
+                # separate hook path than additive steering; the TUI's
+                # `/steer` surface only wires the additive side.  Reject
+                # cleanly with the same pattern as `ProjectedTerm` above
+                # rather than crash on ``float(AblationTerm)`` below.
+                chat.add_system_message(
+                    f"Ablation terms (!{key.lstrip('!')}) aren't supported "
+                    f"from /steer; express them in the YAML config."
                 )
                 return
             if isinstance(val, tuple):
@@ -1112,8 +1152,20 @@ class SaklasApp(App):
                     self._loom_auto_regen_on
                     and self._loom_auto_regen_mode != "unsteered"
                     and self._pending_action is None
+                    and widget is not None
                 ):
-                    self._fire_auto_regen()
+                    # Stream the modifier-regen output into the shadow
+                    # column the same way the ``unsteered`` branch does
+                    # for plain A/B — picks up the row associated with
+                    # the just-finished primary widget so the new
+                    # sibling renders live alongside its sibling.  Falls
+                    # through to the row-less form (system-message only)
+                    # if we can't find the row mapping.
+                    row = self._row_for_widget.get(id(widget))
+                    if row is not None:
+                        self._fire_auto_regen(row)
+                        break
+                    self._fire_auto_regen(None)
 
                 pending = self._pending_action
                 if pending is not None:
@@ -1130,8 +1182,13 @@ class SaklasApp(App):
             self._last_tok_per_sec = tok_per_sec
             self._last_elapsed = elapsed
 
+        # Dedupe tuple includes the loom-state extras (prune expr +
+        # active auto-regen mode) so the footer refreshes when either
+        # flips between polls, even when generation hasn't ticked.
         new_state = (self._gen_token_count, self._last_tok_per_sec,
-                     self._last_elapsed, generating, self._ppl_count)
+                     self._last_elapsed, generating, self._ppl_count,
+                     self._loom_prune_expr,
+                     self._loom_auto_regen_mode if self._loom_auto_regen_on else None)
         if new_state != self._last_gen_state:
             self._last_gen_state = new_state
             ppl_mean = (
@@ -1145,6 +1202,13 @@ class SaklasApp(App):
                 tok_per_sec=self._last_tok_per_sec,
                 elapsed=self._last_elapsed,
                 perplexity=ppl_mean,
+                prune_expr=self._loom_prune_expr,
+                auto_regen_mode=(
+                    self._loom_auto_regen_mode
+                    if (self._loom_auto_regen_on
+                        and self._loom_auto_regen_mode != "unsteered")
+                    else None
+                ),
             )
 
         if self._session._monitor and self._session._monitor.has_pending_data():
@@ -2264,8 +2328,15 @@ class SaklasApp(App):
         chat.add_system_message(f"deleted {removed} node(s).")
 
     def action_delete_subtree(self) -> None:
-        """Ctrl+D — delete the active subtree (with confirm hint)."""
-        self._handle_del("yes")
+        """Ctrl+D — surface the `/del yes` confirm hint.
+
+        The key alone never deletes; it routes through ``_handle_del("")``
+        so the user sees the same "type '/del yes' to delete" guard the
+        slash command emits. The loom screen's ``d`` binding owns the
+        modal-overlay confirm flow; this chat-screen path is the cheaper
+        UX of "print hint, let the user confirm by typing".
+        """
+        self._handle_del("")
 
     def _handle_star(self, _arg: str) -> None:
         chat = self._chat_panel
@@ -2650,16 +2721,21 @@ class SaklasApp(App):
                if not self._loom_auto_regen_on else "")
         )
 
-    def _fire_auto_regen(self) -> None:
+    def _fire_auto_regen(self, row: "_TurnRow | None" = None) -> None:
         """Post-gen hook: fire a sibling regen under the configured mode.
 
         Called from ``_poll_generation`` once a steered ``done`` lands
-        with auto-regen on.  Routes through
-        :meth:`SaklasSession.regen_with_modifier`; the resulting sibling
-        lands under the user-parent of the active assistant.  Surfacing
-        is a one-line system message linking the new sibling — the A/B
-        side-by-side column is owned by ``_ab_mode`` and renders only
-        when both flags align (the legacy "unsteered shadow" path).
+        with auto-regen on.  When ``row`` is provided, streams the
+        modifier-regen output live into ``row``'s shadow column —
+        mirroring :meth:`_start_shadow_generation`'s shape, so the right
+        column reflects whatever override mode is active (not just
+        ``unsteered``).  When ``row`` is ``None``, falls back to the
+        background-worker form that only emits a one-line system message
+        on completion.
+
+        The sibling lands under the user-parent of the active assistant
+        in both paths — the visual placement is the only thing that
+        differs.
         """
         if not self._loom_auto_regen_on:
             return
@@ -2672,23 +2748,83 @@ class SaklasApp(App):
             return
         mode = self._loom_auto_regen_mode
 
-        def _worker() -> None:
-            try:
-                self._session.regen_with_modifier(user_parent_id, mode, n=1)
-            except BaseException as e:
-                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+        # Resolve the anchor user node + parent the same way
+        # ``regen_with_modifier`` does so we can route through the
+        # streaming entry point and still land the new node as a sibling
+        # under the shared user-turn.
+        anchor_user = tree.nodes.get(user_parent_id)
+        if anchor_user is None or anchor_user.role != "user":
+            return
+        user_text = anchor_user.text
+        parent_node_id = anchor_user.parent_id
+
+        if row is None:
+            # Worker-only path: matches the pre-streaming shape — useful
+            # when there's no row to render into (e.g. fired from a
+            # corner where the widget isn't tracked).
+            def _worker() -> None:
+                try:
+                    self._session.regen_with_modifier(user_parent_id, mode, n=1)
+                except BaseException as e:
+                    msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+                    self.call_from_thread(
+                        self._chat_panel.add_system_message,
+                        f"auto-regen ({mode}) error: {msg}",
+                    )
+                    return
+                new_id = self._session.tree.active_node_id
                 self.call_from_thread(
                     self._chat_panel.add_system_message,
-                    f"auto-regen ({mode}) error: {msg}",
+                    f"auto-regen ({mode}) → sibling {new_id[:8]}",
                 )
-                return
-            new_id = self._session.tree.active_node_id
-            self.call_from_thread(
-                self._chat_panel.add_system_message,
-                f"auto-regen ({mode}) → sibling {new_id[:8]}",
-            )
 
-        self.run_worker(_worker, thread=True)
+            self.run_worker(_worker, thread=True)
+            return
+
+        # Streaming path: mount a shadow widget on the row's shadow
+        # column and pump tokens through ``_ui_token_queue`` with
+        # ``is_shadow=True`` so the existing poll machinery handles
+        # gen-stat counters and the post-shadow pending drain.
+        if self._ab_shadow_active:
+            return
+        chat = self._chat_panel
+        widget = chat.start_shadow_message(row)
+        self._row_for_widget[id(widget)] = row
+        self._assistant_messages.append(widget)
+        if self._highlighting:
+            widget.apply_highlight(True, self._highlight_probe)
+        self._current_assistant_widget = widget
+        self._ab_shadow_active = True
+        self._ab_shadow_row = row
+        self._ui_gen_active = True
+
+        chat.add_system_message(f"auto-regen ({mode}) → streaming sibling…")
+
+        def _stream_worker() -> None:
+            try:
+                stream = self._session.generate_stream(
+                    user_text,
+                    parent_node_id=parent_node_id,
+                    recipe_override=mode,
+                )
+                for event in stream:
+                    self._ui_token_queue.put(
+                        ("tok", event.text, event.thinking, event.scores,
+                         event.perplexity, widget, True),
+                    )
+                self._ui_token_queue.put(("finalize", widget, True))
+            except BaseException as e:
+                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+                self._ui_token_queue.put(("error", msg, True))
+            finally:
+                if self._session._device.type == "mps":
+                    try:
+                        torch.mps.synchronize()
+                    except Exception:
+                        pass
+                self._ui_token_queue.put(("done", True))
+
+        self.run_worker(_stream_worker, thread=True)
 
     def _handle_transcript(self, arg: str) -> None:
         """`/transcript export <path>` / `/transcript load <path> [flags]`.
@@ -2703,9 +2839,9 @@ class SaklasApp(App):
         which we catch and report.
         """
 
-        import json
         from pathlib import Path
         from saklas.tui.loom_helpers import build_transcript_payload
+        from saklas.core.transcript import _emit_yaml_minimal
 
         chat = self._chat_panel
         parts = arg.split(maxsplit=1)
@@ -2728,9 +2864,18 @@ class SaklasApp(App):
                     model_id=self._session._model_info.get("model_id"),
                     system_prompt=self._session.config.system_prompt,
                 )
-                # Phase 4 emits JSON (universal); phase 5 swaps to YAML
-                # to match the spec example once a yaml dep is in.
-                path.write_text(json.dumps(payload, indent=2))
+                # YAML matches the spec example in docs/plans/loom.md and
+                # round-trips through ``Transcript.load``.  Prefer pyyaml
+                # when available; fall back to the in-tree emitter for
+                # the flat transcript schema.
+                try:
+                    import yaml  # pyyaml is a saklas dep
+                    text = yaml.safe_dump(
+                        payload, sort_keys=False, default_flow_style=False,
+                    )
+                except ImportError:  # pragma: no cover — pyyaml is in pyproject
+                    text = _emit_yaml_minimal(payload)
+                path.write_text(text)
                 chat.add_system_message(
                     f"transcript export → {path} ({len(payload['turns'])} turns)"
                 )

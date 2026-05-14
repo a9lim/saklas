@@ -177,20 +177,39 @@ def _split_top_level(text: str) -> list[str]:
 
 
 def _parse_one_clause(raw: str) -> _Clause:
-    """Parse a single ``<agg>:<probe> <op> <num>`` clause."""
-    # Split on the first colon — ``agg:`` vs probe name.
-    if ":" not in raw:
-        raise FilterParseError(
-            f"clause {raw!r} missing 'agg:'/'any:'/'last:' prefix"
-        )
-    agg_part, _, rest = raw.partition(":")
-    agg_part = agg_part.strip()
-    if agg_part not in _AGG_OPS:
-        raise FilterParseError(
-            f"unknown agg op {agg_part!r}; expected one of "
-            f"{', '.join(_AGG_OPS)}"
-        )
-    agg: AggOp = agg_part  # type: ignore[assignment]
+    """Parse a single ``<agg>:<probe> <op> <num>`` clause.
+
+    The ``agg:`` prefix is optional — bare ``<probe> <op> <num>``
+    defaults to ``agg:`` (the per-node aggregate reading), matching
+    the plan docs' "agg is the default" wording.  Explicit ``agg:``
+    / ``any:`` / ``last:`` keep working unchanged.
+    """
+    # When the leading colon is followed by an ``agg:`` /``any:`` /
+    # ``last:`` token, route into the prefixed path; otherwise default
+    # to ``agg:`` and treat the whole clause as ``<probe> <op> <num>``.
+    agg: AggOp
+    rest: str
+    if ":" in raw:
+        head, _, tail = raw.partition(":")
+        head_stripped = head.strip()
+        if head_stripped in _AGG_OPS:
+            agg = head_stripped  # type: ignore[assignment]
+            rest = tail
+        else:
+            # Colon inside a probe name (e.g. ``deer.wolf:sae`` — not a
+            # legal probe shape here today but reserves the room) or
+            # an unknown prefix.  When the head doesn't match an agg
+            # op, treat it as malformed-prefix rather than silently
+            # defaulting — bare ``foo:bar`` is almost certainly a typo
+            # for an agg op.
+            raise FilterParseError(
+                f"unknown agg op {head_stripped!r}; expected one of "
+                f"{', '.join(_AGG_OPS)} (or drop the prefix to use "
+                f"'agg:' by default)"
+            )
+    else:
+        agg = "agg"
+        rest = raw
 
     # Find the comparison op — try two-char first.
     m = _COMPARE_OP_RE.search(rest)

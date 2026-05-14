@@ -182,7 +182,7 @@ class SaklasSession:
 
 `n > 1` is the engine-side primitive that fan-out uses. Each of the N runs creates its own sibling under `parent_node_id` (or the active node's parent if input is a user turn that already exists, or a fresh user node otherwise — exact semantics in the tests).
 
-**Deterministic seed schedule for N-way regen.** When `n > 1`, per-sibling seeds derive from the parent's seed via `seed_i = fnv1a64(parent_seed, i) & 0x7fff_ffff`. A fan-out from the same parent with the same N is reproducible across sessions and across machines — important for shared-transcript replay. When the parent recipe has no seed, the schedule resolves an entropy-derived base seed and records it in each sibling's `Recipe.seed`. Single regen (`n=1`) without an explicit seed uses fresh entropy as today.
+**Deterministic seed schedule for N-way regen.** When `n > 1`, per-sibling seeds derive from the parent's seed via a BLAKE2b-8-byte-digest avalanche on the packed `(parent_seed, i)` pair, masked to 31 bits. The implementation lives in `saklas.core.loom._mix_seed`; the doc-level "fnv1a64" wording was a planning placeholder. The substitution to BLAKE2b is deliberate — FNV-1a-64 over little-endian bytes is nearly linear for small `i` (the high bytes of small integers are zero, so consecutive indices differ in one input byte and FNV-1a's output barely scrambles them, producing correlated seeds within a single fan-out). BLAKE2b's 8-byte digest avoids that small-`i` collision pathology while keeping a single, fast hashlib call. A fan-out from the same parent with the same N is reproducible across sessions and across machines — important for shared-transcript replay. When the parent recipe has no seed, the schedule resolves an entropy-derived base seed and records it in each sibling's `Recipe.seed`. Single regen (`n=1`) without an explicit seed uses fresh entropy as today.
 
 #### Active-node send semantics
 
@@ -576,6 +576,18 @@ The fusion: regenerate takes a `recipe_override` parameter (a partial Recipe tha
 
 ## Persistence
 
+> **v2.3 status: minimal.** Single-file persistence shipped:
+> `~/.saklas/sessions/<session_id>/tree.json` via atomic write, plus a
+> persistent anonymous default session id at
+> `~/.saklas/sessions/.default` so the tree survives process restarts
+> without an explicit `--session` name. `SaklasSession(session_id=...)`
+> threads the id through `__init__` / `from_pretrained`; a debounced
+> 1s save fires on every `LoomMutated` event and `session.close()` /
+> `__exit__` flush synchronously. The rest of this section is deferred
+> to v2.4: per-node token blobs split into `tokens/<node_id>.json`,
+> named sessions via `--session <name>`, `saklas session ls/resume/rm`
+> CLI verbs, and 30-day auto-prune of anonymous unstarred sessions.
+
 ### Session identity
 
 Saklas today has no `session_id` concept — the TUI is one-shot, the Python API is ephemeral, the server has many concurrent sessions but no naming. Loom needs persistence, so:
@@ -669,7 +681,7 @@ These are the forks resolved during planning. New forks belong in this section a
 
 19. **Probe content hashes ride in `Recipe`.** Every entry in `Recipe.probes` is paired with an sha256 in `Recipe.probe_hashes`. Transcript replay catches probe drift via hash comparison; `--strict` refuses on mismatch.
 
-20. **Deterministic N-way seed schedule.** When `n > 1`, sibling seeds derive via `seed_i = fnv1a64(parent_seed, i) & 0x7fff_ffff`. Same parent + same N → same N siblings, byte-equal, across machines. Reproducibility for shared transcripts. Without a parent seed, the schedule resolves an entropy-derived base and records it.
+20. **Deterministic N-way seed schedule.** When `n > 1`, sibling seeds derive via a BLAKE2b-8-byte-digest avalanche over the packed `(parent_seed, i)` pair, masked to 31 bits — see `saklas.core.loom._mix_seed`. The doc-level "fnv1a64" wording was a planning placeholder; FNV-1a-64 was rejected during implementation because over little-endian bytes it's nearly linear for small `i` (the high bytes of small integers are zero, so consecutive indices barely scramble), producing correlated within-fan-out seeds. BLAKE2b avoids that. Same parent + same N → same N siblings, byte-equal, across machines. Reproducibility for shared transcripts. Without a parent seed, the schedule resolves an entropy-derived base and records it.
 
 21. **WS `tree_mutated` carries delta payloads, not just event types.** Each event includes the added / removed / updated node lists plus a monotonic `rev`. Clients apply in-place; full re-fetch is the missed-event fallback (detected via `rev` gap).
 

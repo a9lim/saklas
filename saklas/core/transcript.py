@@ -45,7 +45,6 @@ Guards:
 """
 from __future__ import annotations
 
-import dataclasses
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -378,11 +377,9 @@ class Transcript:
             return session.tree.root_id
         if mode == "here":
             return session.tree.active_node_id
-        if mode == "merge":
-            return self._find_merge_anchor(session)
-        raise TranscriptFormatError(
-            f"unknown import mode {mode!r}; valid: default, here, merge"
-        )
+        # mode == "merge" — ``ImportMode`` is a Literal of the three
+        # values above, so type-narrowing covers the universe.
+        return self._find_merge_anchor(session)
 
     def _find_merge_anchor(self, session: Any) -> str:
         """Walk the active path; return the deepest user-turn match.
@@ -422,7 +419,17 @@ class Transcript:
 
         When ``attach_parent`` is the merge anchor, the matching user-
         turn prefix is already in the tree — we skip that many ``user``
-        entries from ``self.turns`` and attach only the tail.
+        entries from ``self.turns`` plus the assistant turns interleaved
+        between them, and attach only the tail.  Skipped prefix nodes
+        are not re-attached anywhere: the matched user chain already
+        lives *above* ``attach_parent`` (the anchor is the deepest
+        matched user), so re-adding them under the anchor would spawn
+        duplicates as children of it.  Assistant turns interleaved with
+        matched-prefix users are dropped on the same principle — their
+        existing siblings on the tree's path are advisory, byte-equal
+        comparison is rare, but the structural location is "already in
+        the path" so attaching a copy under the merge anchor lands at
+        the wrong depth.
         """
         # Determine the prefix to skip when merging — count how many
         # leading user-turn entries on the transcript share text with
@@ -442,37 +449,33 @@ class Transcript:
         leaf_id = attach_parent
 
         # Track which user-turn we're at so we know when ``skip_count``
-        # is satisfied — only ``user`` turns count toward the skip.
+        # is satisfied — only ``user`` turns count toward the skip, but
+        # any non-user turns before the skip is satisfied are inside
+        # the matched-prefix region and skipped too.
         users_seen = 0
         first_imported_id: str | None = None
         for turn in self.turns:
-            if turn.role == "user":
-                users_seen += 1
-                if users_seen <= skip_count:
-                    # Skip ahead through the matched user prefix; the
-                    # attach_parent already covers it.  We *don't* skip
-                    # the assistant turns that follow — they're sibling
-                    # alternates, not replays.
-                    # Find the matching user node id under the current
-                    # parent to anchor subsequent attach.
-                    # The user-turn text matches the existing path so
-                    # ``add_user_turn``'s dedup will land on it; that's
-                    # the simplest way to walk forward.
-                    current_parent = tree.add_user_turn(
-                        turn.text, parent_id=current_parent,
-                    )
-                    leaf_id = current_parent
-                    continue
             if turn.role == "system":
                 # Schemas with explicit system turns are rare; treat
                 # them as user turns under the synthetic root to
                 # avoid altering established system-prompt semantics.
                 continue
             if turn.role == "user":
+                users_seen += 1
+                if users_seen <= skip_count:
+                    # Matched-prefix user: already represented in the
+                    # tree path from root to ``attach_parent``.  Skip
+                    # without writing — re-attaching here would create
+                    # a duplicate user node as a child of the anchor.
+                    continue
                 new_id = tree.add_user_turn(
                     turn.text, parent_id=current_parent, dedup_existing=False,
                 )
             else:  # assistant
+                if users_seen < skip_count:
+                    # Assistant interleaved inside the matched prefix
+                    # region — drop on the floor (see docstring).
+                    continue
                 new_id = tree.begin_assistant(
                     current_parent, recipe=turn.recipe,
                 )
@@ -513,7 +516,7 @@ def _emit_yaml_minimal(data: Any, indent: int = 0) -> str:
     isn't available; the regular code path uses pyyaml.
     """
     lines: list[str] = []
-    _emit_node(data, indent, lines, top=True)
+    _emit_node(data, indent, lines)
     return "\n".join(lines) + "\n"
 
 
@@ -533,7 +536,7 @@ def _scalar(v: Any) -> str:
     return s
 
 
-def _emit_node(data: Any, indent: int, lines: list[str], *, top: bool = False) -> None:
+def _emit_node(data: Any, indent: int, lines: list[str]) -> None:
     pad = "  " * indent
     if isinstance(data, dict):
         for k, v in data.items():
