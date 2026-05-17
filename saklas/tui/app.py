@@ -988,6 +988,16 @@ class SaklasApp(App[None]):
         else:
             self.exit()
 
+    def _wants_live_probe_scores(self) -> bool:
+        """Return True when streamed probe scores can affect the current UI."""
+        from saklas.tui.chat_panel import SURPRISE_PROBE
+
+        return bool(
+            self._highlighting
+            and self._highlight_probe not in (None, SURPRISE_PROBE)
+            and self._session._monitor.probe_names
+        )
+
     def _start_generation(self, user_text: str | None = None) -> None:
         """Kick off a generation.
 
@@ -1073,6 +1083,7 @@ class SaklasApp(App[None]):
                     stateless=False,
                     thinking=use_thinking,
                     parent_node_id=regen_parent_id,
+                    live_scores=self._wants_live_probe_scores(),
                 )
                 for event in stream:
                     self._ui_token_queue.put(
@@ -2299,6 +2310,7 @@ class SaklasApp(App[None]):
                     sampling=sampling,
                     stateless=True,
                     thinking=use_thinking,
+                    live_scores=self._wants_live_probe_scores(),
                 )
                 for event in stream:
                     self._ui_token_queue.put(
@@ -3022,6 +3034,7 @@ class SaklasApp(App[None]):
                     user_text,
                     parent_node_id=parent_node_id,
                     recipe_override=mode,
+                    live_scores=self._wants_live_probe_scores(),
                 )
                 for event in stream:
                     self._ui_token_queue.put(

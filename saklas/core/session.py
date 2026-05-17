@@ -546,15 +546,11 @@ class SaklasSession:
                 device_obj.type,
             )
 
-        # ``__init__`` re-runs the probe on its own.  We could plumb the
-        # result through to skip the duplicate StaticCache(max_cache_len=1)
-        # construction, but that put a private-flavored kwarg on the
-        # public constructor signature where direct-call users could
-        # set it (Codex review flagged this).  The probe is one cache
-        # allocation of one position — cost is dwarfed by the model
-        # weight load that already ran.  ``warn_once`` dedupes on
-        # ``id(model)`` so the user-visible logging fires exactly once
-        # regardless.
+        # ``__init__`` consults the same probe helper, but the helper now
+        # caches by the underlying module id (survives the torch.compile
+        # wrapper via ``_orig_mod``), so this second call is a dictionary
+        # lookup rather than another StaticCache(max_cache_len=1)
+        # allocation.
         return cls(
             model, tokenizer,
             probes=probes,
@@ -3640,6 +3636,7 @@ class SaklasSession:
         thinking: bool | None = None,
         parent_node_id: str | None = None,
         recipe_override: "Recipe | str | None" = None,
+        live_scores: bool = True,
     ) -> Iterator[TokenEvent]:
         """Streaming generation.  See :meth:`generate` for kwargs.
 
@@ -3654,6 +3651,10 @@ class SaklasSession:
         the allocation-free hot path), but after iteration completes
         the populated ``session.last_result.hidden_states`` is
         available for round-tripping through :meth:`score_hidden`.
+
+        ``live_scores=False`` skips inline per-token probe scoring for this
+        stream. Final aggregate/per-token readings are still computed during
+        generation finalization from the captured hidden states.
         """
         q: queue.SimpleQueue = queue.SimpleQueue()
         done = object()
@@ -3663,7 +3664,7 @@ class SaklasSession:
 
         def _push(text, is_thinking, tid, lp, top_alts, perplexity):
             scores: dict[str, float] | None = None
-            if self._monitor.probe_names:
+            if live_scores and self._monitor.probe_names:
                 latest_hidden = {
                     layer_idx: bucket[-1]
                     for layer_idx, bucket in self._capture._per_layer.items()

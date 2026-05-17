@@ -36,6 +36,7 @@ import torch
 
 from saklas.core.generation import (
     GenerationConfig,
+    _PenaltyState,
     _sampler_logprob_vector,
     build_chat_input,
     supports_thinking,
@@ -451,7 +452,9 @@ def _replay_branch_logprobs(
     presence_penalty = branch.sampling.presence_penalty
     frequency_penalty = branch.sampling.frequency_penalty
     use_penalties = presence_penalty != 0.0 or frequency_penalty != 0.0
-    completion_counts: dict[int, int] = {}
+    penalty_state = _PenaltyState(
+        max(len(forced_ids), 1), device, torch.float32,
+    ) if use_penalties else None
 
     bias_idx: torch.Tensor | None = None
     bias_val: torch.Tensor | None = None
@@ -496,7 +499,31 @@ def _replay_branch_logprobs(
             )
             past_key_values = None
             no_cache_mode = False
+            no_cache_buf: torch.Tensor | None = None
+            no_cache_len = int(current_input.shape[1])
             prefill = True
+
+            def _advance_current_input(next_token: torch.Tensor) -> None:
+                nonlocal current_input, no_cache_buf, no_cache_len
+                if not no_cache_mode:
+                    current_input = next_token
+                    return
+                if no_cache_buf is None:
+                    cap = int(current_input.shape[1]) + max(len(forced_ids), 1)
+                    no_cache_buf = torch.empty(
+                        (1, cap),
+                        dtype=current_input.dtype,
+                        device=current_input.device,
+                    )
+                    no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
+                    no_cache_len = int(current_input.shape[1])
+                if no_cache_len < no_cache_buf.shape[1]:
+                    no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
+                    no_cache_len += 1
+                    current_input = no_cache_buf[:, :no_cache_len]
+                else:  # pragma: no cover - cap covers prompt + forced ids
+                    current_input = torch.cat([current_input, next_token], dim=1)
+                    no_cache_len = int(current_input.shape[1])
 
             with torch.inference_mode():
                 for forced_idx, token_id in enumerate(forced_ids):
@@ -529,13 +556,11 @@ def _replay_branch_logprobs(
                     logits.nan_to_num_(nan=0.0, posinf=100.0, neginf=-100.0)
                     logits.clamp_(-100.0, 100.0)
 
-                    if use_penalties and completion_counts:
-                        ids = list(completion_counts.keys())
-                        counts = list(completion_counts.values())
-                        idx_t = torch.tensor(ids, dtype=torch.long, device=device)
-                        cnt_t = torch.tensor(counts, dtype=logits.dtype, device=device)
-                        logits[0, idx_t] -= (
-                            frequency_penalty * cnt_t + presence_penalty
+                    if penalty_state is not None:
+                        penalty_state.apply(
+                            logits,
+                            presence_penalty=presence_penalty,
+                            frequency_penalty=frequency_penalty,
                         )
                     if bias_idx is not None:
                         logits[0, bias_idx] += bias_val.to(logits.dtype)
@@ -552,16 +577,11 @@ def _replay_branch_logprobs(
                         visible_pos = len(branch.prompt_ids) + response_idx - 1
                         row_logps[visible_pos] = logp.detach().to("cpu")
 
-                    if use_penalties:
-                        completion_counts[token_id] = (
-                            completion_counts.get(token_id, 0) + 1
-                        )
+                    if penalty_state is not None:
+                        penalty_state.add(token_id)
 
                     next_token = torch.tensor([[int(token_id)]], dtype=torch.long, device=device)
-                    if no_cache_mode:
-                        current_input = torch.cat([current_input, next_token], dim=1)
-                    else:
-                        current_input = next_token
+                    _advance_current_input(next_token)
         finally:
             if end_capture is not None:
                 end_capture()

@@ -57,7 +57,7 @@ Selector grammar (shared): `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`,
 
 ## Extraction methods (v2.1)
 
-Two extractors share `_capture_diffs_for_pairs` (forward-pass capture) and `_share_bake_and_warn` (edge-drop + share-baking + diagnostics warning) in `saklas/core/vectors.py`; only the per-layer direction computation differs:
+Two extractors share `_capture_diffs_for_pairs` (forward-pass capture) and `_share_bake_and_warn` (DLS-retained share-baking + diagnostics warning) in `saklas/core/vectors.py`; only the per-layer direction computation differs:
 
 - `extract_difference_of_means` (default, `--method dim`): per-layer direction = `mean(diffs_per_layer[L])`. Score = `||direction||_M / ref_norm` when a `whitener` is wired (Mahalanobis bake, v2.1 default), `||direction||_2 / ref_norm` otherwise (Euclidean fallback). Sidecar `method` label `"difference_of_means"` (raw) / `"dim_sae"` (SAE feature space) plus a `bake` field `"mahalanobis"` / `"euclidean"`. Im & Li 2025 / AxBench 2025 motivation for DiM; Mahalanobis-flavored share allocation generalizes the metric off Euclidean magnitude onto the per-model activation distribution.
 - `extract_contrastive` (legacy, `--method pca`): per-layer direction = first principal component of the diffs (batched SVD). Score = explained-variance ratio (metric-invariant — Mahalanobis branch ignores the whitener). Sidecar label `"contrastive_pca"` / `"pca_center_sae"` with `bake: "euclidean"` — bit-identical to v2.0.x output.
@@ -226,6 +226,10 @@ All state under `~/.saklas/` (override via `SAKLAS_HOME`):
   models/<safe_model_id>/
     layer_means.safetensors            # probe-centering baseline
     layer_means.json                   # hash of neutral_statements.json
+    neutral_activations.safetensors    # 90 neutral prompts × layers, fp16 on disk
+    neutral_activations.json           # hash/metadata for neutral_activations
+    alignments/<safe_src>.safetensors  # optional cross-model Procrustes map
+    alignments/<safe_src>.json         # source/target ids + fit metadata
 ```
 
 - `pack.json.files` sha256 map verified on every `ConceptFolder.load`.
@@ -242,9 +246,12 @@ These gate `test_session.py::test_throughput` (steered ≥ 85% of vanilla tok/s)
 - **In-place ops**: `logits.div_()`, `logits.clamp_()`, `probs.div_()`, `hidden.add_()` / `mul_()` / `copy_()`.
 - **Top-p via `torch.topk`**, not full-vocab sort. `k = min(config.top_k or 1024, vocab)`; `top_k` is a hard cap applied before top-p (matches llama.cpp/Ollama).
 - **Norms use fp32** — fp16 sum-of-squares overflows at hidden_dim ≥ 2048. Applies to extraction-time direction norms **and** the per-position norms inside both injection paths.
-- **Shares baked at extraction, mode-specific at apply.** Stored direction = `unit_direction * ref_norm * (score / sum(scores))` over retained layers (first/last 2 dropped per `drop_edges=(2,2)` default — see `core/vectors.py`). Additive: per-layer `composed = user_alpha * _STEER_GAIN * baked_L`, share is automatic via magnitude. Angular: per-layer `effective_alpha_L = user_alpha * share_L` (share computed from `||baked_L||` at `apply_to_model` time), so cumulative `Σ_L θ_L` sums to `|α| * θ_max` regardless of layer count.
+- **Shares baked at extraction, mode-specific at apply.** Stored direction = `unit_direction * ref_norm * (score / sum(scores))` over the DLS-retained layer set (`--no-dls` / `--legacy` keeps all layers). Additive: per-layer `composed = user_alpha * _STEER_GAIN * baked_L`, share is automatic via magnitude. Angular: per-layer `effective_alpha_L = user_alpha * share_L` (share computed from `||baked_L||` at `apply_to_model` time), so cumulative `Σ_L θ_L` sums to `|α| * θ_max` regardless of layer count.
 - **Norm preservation is mode-specific.** Additive: explicit per-position rescale via `vector_norm` pre/post. Angular: rotation is exactly norm-preserving by construction (Givens in the `(h_unit, d_perp_unit)` plane), no rescale. Near-aligned positions (`||d_perp|| < 1e-6`) get a `torch.where` no-op fallback to avoid the `cos_t * h_unit + sin_t * 0` shrinkage pathology.
-- **Monitor capture is hook-driven, inline with generation.** `HiddenCapture` hooks union of probe layers for the run; `score_per_token` scores from captured tensors afterward — no second forward pass. Per-layer weight = `||baked||` (= share × ref_norm). Per-layer stacked cache — one matmul per layer scores all probes simultaneously; one `.cpu().tolist()` per measure regardless of probe count.
+- **Monitor capture is hook-driven, inline with generation.** `HiddenCapture` hooks union of probe layers for the run; `score_per_token` scores from captured tensors afterward — no second forward pass. `generate_stream(live_scores=False)` skips inline per-token `score_single_token` while keeping final scoring intact (used by the TUI unless probe highlighting is active). Per-layer weight = `||baked||` (= share × ref_norm). Per-layer stacked cache — one matmul per layer scores all probes simultaneously; one `.cpu().tolist()` per measure regardless of probe count.
+- **Repetition penalties are sparse-device state.** Generation and joint-logprob replay keep unique completion token ids + counts in preallocated device buffers and update counts in place; the loop must not rebuild `torch.tensor(list(counts))` each step.
+- **No-cache fallback avoids repeated sequence copies.** Architectures that ignore `past_key_values` still run O(N²) model forwards, but the accumulated token input grows inside one preallocated buffer/view rather than via per-step `torch.cat`.
+- **StaticCache probe results are cached.** `cuda_graphs.is_cuda_graphs_supported` caches by underlying module id, device, and dtype; `from_pretrained` can probe before `torch.compile`, and `__init__`'s later call is a cache hit through the compiled wrapper's `_orig_mod`.
 - **Steering hooks are transient** — composed before generation, removed after.
 - **Contrastive diffs in float32** — fp16 subtraction between close vectors loses precision.
 - **MPS discipline** — diffs kept on CPU (SVD runs there anyway), `torch.mps.empty_cache()` between extraction passes, `torch.device(target)` model loading to avoid unified-memory RSS spike.

@@ -278,6 +278,8 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
         # that doesn't consume alts.
         top_alts = None
         index = 0
+        scores = None
+        perplexity = None
 
     def _fake_stream(input, **kwargs):
         captured["input"] = input
@@ -301,9 +303,33 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
     assert "sampling" in kwargs
     assert "steering" in kwargs
     assert "thinking" in kwargs
+    assert kwargs["live_scores"] is False
     assert isinstance(kwargs["sampling"], saklas.SamplingConfig)
     # No steering registered → None.
     assert kwargs["steering"] is None
+
+
+def test_generate_worker_enables_live_scores_for_probe_highlight():
+    app = _make_app()
+    app._session._device = SimpleNamespace(type="cpu")
+    app._session._monitor.probe_names = ["happy.sad"]
+    app._highlighting = True
+    app._highlight_probe = "happy.sad"
+    captured = {}
+
+    def _fake_stream(input, **kwargs):
+        captured["kwargs"] = kwargs
+        return iter([])
+
+    app._session.generate_stream = _fake_stream
+    app._chat_panel.start_assistant_message = MagicMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
+    app.run_worker = lambda fn, thread=True: fn()
+
+    app._start_generation("hello")
+
+    assert captured["kwargs"]["live_scores"] is True
 
 
 def test_start_generation_inherits_highlight_state():

@@ -397,6 +397,43 @@ class GenerationState:
         self.response_text = None
 
 
+class _PenaltyState:
+    """Sparse device-side completion counts for repetition penalties."""
+
+    def __init__(self, max_tokens: int, device: torch.device, dtype: torch.dtype):
+        cap = max(max_tokens, 1)
+        self.ids = torch.empty(cap, dtype=torch.long, device=device)
+        self.counts = torch.zeros(cap, dtype=dtype, device=device)
+        self.positions: dict[int, int] = {}
+        self.length = 0
+
+    def apply(
+        self,
+        logits: torch.Tensor,
+        *,
+        presence_penalty: float,
+        frequency_penalty: float,
+    ) -> None:
+        if self.length == 0:
+            return
+        idx = self.ids[:self.length]
+        cnt = self.counts[:self.length]
+        logits[0, idx] -= frequency_penalty * cnt + presence_penalty
+
+    def add(self, token_id: int) -> None:
+        pos = self.positions.get(token_id)
+        if pos is None:
+            pos = self.length
+            if pos >= self.ids.numel():  # defensive; unique ids <= max tokens
+                return
+            self.positions[token_id] = pos
+            self.ids[pos] = token_id
+            self.counts[pos] = 1.0
+            self.length += 1
+            return
+        self.counts[pos].add_(1.0)
+
+
 # Hand-rolled LRU for build_chat_input results.  functools.lru_cache won't
 # work cleanly because (a) we'd need every kwarg hashable (the tokenizer
 # isn't reliably so across HF versions), and (b) the cached value is a
@@ -641,7 +678,9 @@ def generate_steered(
 
     # Penalty / bias / stop / logprobs setup
     use_penalties = presence_penalty != 0.0 or frequency_penalty != 0.0
-    completion_counts: dict[int, int] = {}
+    penalty_state = _PenaltyState(
+        config.max_new_tokens, device, torch.float32,
+    ) if use_penalties else None
     bias_idx: torch.Tensor | None = None
     bias_val: torch.Tensor | None = None
     if logit_bias:
@@ -690,6 +729,29 @@ def generate_steered(
     current_perplexity: float | None = None
     if on_token is not None:
         state.response_text = ""
+
+    no_cache_buf: torch.Tensor | None = None
+    no_cache_len = int(current_input.shape[1])
+
+    def _advance_current_input(next_token: torch.Tensor) -> None:
+        nonlocal current_input, no_cache_buf, no_cache_len
+        if not no_cache_mode:
+            current_input = next_token
+            return
+        if no_cache_buf is None:
+            cap = int(current_input.shape[1]) + max(config.max_new_tokens, 1)
+            no_cache_buf = torch.empty(
+                (1, cap), dtype=current_input.dtype, device=current_input.device,
+            )
+            no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
+            no_cache_len = int(current_input.shape[1])
+        if no_cache_len < no_cache_buf.shape[1]:
+            no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
+            no_cache_len += 1
+            current_input = no_cache_buf[:, :no_cache_len]
+        else:  # pragma: no cover - cap is prompt + max_new_tokens by construction
+            current_input = torch.cat([current_input, next_token], dim=1)
+            no_cache_len = int(current_input.shape[1])
 
     def _emit_token(text: str, is_thinking: bool, token_id: int,
                     logprob, top_alts, perplexity) -> None:
@@ -804,12 +866,12 @@ def generate_steered(
 
                 # Presence + frequency penalty (applied to raw logits,
                 # before temperature, per OpenAI semantics).
-                if use_penalties and completion_counts:
-                    ids = list(completion_counts.keys())
-                    counts = list(completion_counts.values())
-                    idx_t = torch.tensor(ids, dtype=torch.long, device=device)
-                    cnt_t = torch.tensor(counts, dtype=logits.dtype, device=device)
-                    logits[0, idx_t] -= frequency_penalty * cnt_t + presence_penalty
+                if penalty_state is not None:
+                    penalty_state.apply(
+                        logits,
+                        presence_penalty=presence_penalty,
+                        frequency_penalty=frequency_penalty,
+                    )
 
                 if bias_idx is not None:
                     logits[0, bias_idx] += bias_val.to(logits.dtype)
@@ -857,10 +919,7 @@ def generate_steered(
                         state.finish_reason = "stop"
                         break
                     generated_ids.append(token_id)
-                    if no_cache_mode:
-                        current_input = torch.cat([current_input, next_token], dim=1)
-                    else:
-                        current_input = next_token
+                    _advance_current_input(next_token)
                     if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
                             _emit_token(tokenizer.decode(pending_ids),
@@ -882,10 +941,7 @@ def generate_steered(
 
                 # Advance KV cache state (common to all non-EOS paths)
                 generated_ids.append(token_id)
-                if no_cache_mode:
-                    current_input = torch.cat([current_input, next_token], dim=1)
-                else:
-                    current_input = next_token
+                _advance_current_input(next_token)
 
                 # Handle thinking start delimiter (Gemma-style: model
                 # explicitly opens a thinking channel)
@@ -938,8 +994,8 @@ def generate_steered(
                 # Penalty bookkeeping: count all emitted completion tokens
                 # (thinking and response alike, matching OpenAI's treatment
                 # of the full completion sequence).
-                if use_penalties:
-                    completion_counts[token_id] = completion_counts.get(token_id, 0) + 1
+                if penalty_state is not None:
+                    penalty_state.add(token_id)
 
                 if on_token:
                     tok_str = token_table[token_id] if token_id < _vocab else ''

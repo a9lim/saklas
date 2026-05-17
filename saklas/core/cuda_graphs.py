@@ -8,15 +8,16 @@ decode loop, which lets ``torch.compile(mode="reduce-overhead")`` capture
 CUDA graphs internally for the inference-shape regions.
 
 This module owns *detection* and *fallback*: probing whether StaticCache
-construction succeeds on a given model + device, and exposing a single
-factory used by :mod:`saklas.core.generation` and
+construction succeeds on a given model + device, caching that answer, and
+exposing a single factory used by :mod:`saklas.core.generation` and
 :mod:`saklas.core.session`.  The actual cache pass-through (allocating,
 sizing, per-step ``cache_position``) happens at the call sites; we keep
 the policy in one place so the eager path stays uncluttered.
 
 Caller responsibilities:
-- Call :func:`is_cuda_graphs_supported` once per session at construction
-  time; cache the result on the session.
+- Call :func:`is_cuda_graphs_supported` during construction; it caches by
+  underlying module id (through ``torch.compile``'s ``_orig_mod`` wrapper),
+  device, and dtype, then the session stores the boolean result.
 - On supported sessions, build a fresh StaticCache via
   :func:`make_static_cache` per generation, sized to
   ``prompt_len + max_new_tokens + cache_position_offset``.
@@ -46,6 +47,22 @@ log = logging.getLogger(__name__)
 # rather than model_id since the user may run multiple sessions on different
 # weights of the same checkpoint.
 _warned_models: set[int] = set()
+_support_cache: dict[
+    tuple[int, str, torch.dtype | None], tuple[bool, str | None]
+] = {}
+
+
+def _support_cache_key(
+    model: "PreTrainedModel | torch.nn.Module",
+    device: torch.device | str,
+) -> tuple[int, str, torch.dtype | None]:
+    base = getattr(model, "_orig_mod", model)
+    dtype: torch.dtype | None = None
+    try:
+        dtype = next(base.parameters()).dtype  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 - probe path must stay best-effort
+        dtype = None
+    return id(base), str(device), dtype
 
 
 def is_cuda_graphs_supported(
@@ -75,10 +92,17 @@ def is_cuda_graphs_supported(
     if dev_type != "cuda" and not dev_str.startswith("cuda"):
         return False, f"device={dev_str!r} (CUDA-only)"
 
+    cache_key = _support_cache_key(model, device)
+    cached = _support_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         from transformers import StaticCache
     except ImportError:
-        return False, "transformers does not expose StaticCache (need >=4.40)"
+        result = False, "transformers does not expose StaticCache (need >=4.40)"
+        _support_cache[cache_key] = result
+        return result
 
     # Probe construction with a 1-token cache.  Catch broadly because
     # architecture-specific issues raise a wide variety of errors:
@@ -86,7 +110,11 @@ def is_cuda_graphs_supported(
     # mismatches, NotImplementedError on unsupported attention layouts.
     try:
         cfg = model.config  # type: ignore[union-attr]
-        dtype = next(model.parameters()).dtype if hasattr(model, "parameters") else torch.bfloat16
+        dtype = cache_key[2] or (
+            next(model.parameters()).dtype
+            if hasattr(model, "parameters")
+            else torch.bfloat16
+        )
         probe = StaticCache(
             cfg,  # type: ignore[arg-type]
             max_cache_len=1,
@@ -96,12 +124,21 @@ def is_cuda_graphs_supported(
         # Touch a layer to make sure the buffers actually allocated; some
         # configs accept the constructor but trip on first slice.
         if hasattr(probe, "layers") and len(probe.layers) == 0:
-            return False, "StaticCache built zero layer buffers"
+            result = False, "StaticCache built zero layer buffers"
+            _support_cache[cache_key] = result
+            return result
         del probe
     except Exception as e:
-        return False, f"StaticCache construction failed: {type(e).__name__}: {e}"
+        result = (
+            False,
+            f"StaticCache construction failed: {type(e).__name__}: {e}",
+        )
+        _support_cache[cache_key] = result
+        return result
 
-    return True, None
+    result = True, None
+    _support_cache[cache_key] = result
+    return result
 
 
 def make_static_cache(
