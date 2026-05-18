@@ -61,8 +61,20 @@ jobs:
           pip install dist/saklas-*.whl
           python -c "import saklas; print('version:', saklas.__version__)"
 
-  # NOTE: a webui-build job that runs `cd webui && npm run build` and then
-  # `git diff --exit-code saklas/web/dist/` would catch source-tree drift
-  # against the committed bundle.  Left as a follow-up — committed bundle
-  # is the v1.6 source of truth and editing webui/src/ without rebuilding
-  # is an explicit choice for now.
+  webui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - run: npm ci
+        working-directory: webui
+      - run: npm run check
+        working-directory: webui
+      - run: npm run build
+        working-directory: webui
+      - name: Verify committed web bundle is current
+        run: git diff --exit-code saklas/web/dist/

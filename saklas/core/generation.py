@@ -537,6 +537,7 @@ def generate_steered(
     cache_position_offset: int = 0,
     score_callback: Callable[[], dict[str, float]] | None = None,
     use_static_cache: bool = False,
+    forced_prefix: list[int] | None = None,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -580,6 +581,16 @@ def generate_steered(
     ``past_key_values is None``, we build a fresh StaticCache sized
     to ``input_ids.shape[1] + cache_position_offset +
     config.max_new_tokens``.
+
+    ``forced_prefix`` (logit fork) is a list of token ids to *force* for
+    the first ``len(forced_prefix)`` decode steps instead of using the
+    sampled token.  The sampler — including the ``multinomial`` draw —
+    still runs every step, so re-seeding with the original run's seed
+    keeps the RNG stream bit-identical through the fork point: only the
+    token fed back into the model changes.  Pass the exact raw decode
+    sequence (delimiters included) up to and including the fork token so
+    the thinking-state machine transitions identically.  ``None`` (the
+    default) is the normal free-sampling path with zero added cost.
 
     Returns list of generated token IDs.
     """
@@ -886,6 +897,33 @@ def generate_steered(
                     chosen_pos = torch.multinomial(cand_probs.unsqueeze(0), 1).reshape(1)
                 next_token = cand_ids.index_select(0, chosen_pos).reshape(1, 1)
 
+                # Forced-prefix replay (logit fork).  For the first
+                # ``len(forced_prefix)`` decode steps the sampled token is
+                # overridden with the caller-supplied id.  The multinomial
+                # draw above still ran, so re-seeding with the original
+                # seed keeps the RNG stream bit-identical through the fork
+                # point — only the token *fed back* into the model changes.
+                # ``chosen_pos`` is retargeted into the candidate pool so
+                # the logprob/top-alts capture below describes the forced
+                # token; an id outside the top-k pool (rare — forced ids
+                # were originally sampled, so almost always in-pool) falls
+                # back to a direct tensor build + full-softmax logprob.
+                forced_in_pool = True
+                if (forced_prefix is not None
+                        and len(generated_ids) < len(forced_prefix)):
+                    forced_id = forced_prefix[len(generated_ids)]
+                    hit = (cand_ids == forced_id).nonzero(as_tuple=False)
+                    if hit.numel() > 0:
+                        chosen_pos = hit[0, 0].reshape(1)
+                        next_token = cand_ids.index_select(
+                            0, chosen_pos,
+                        ).reshape(1, 1)
+                    else:
+                        forced_in_pool = False
+                        next_token = torch.tensor(
+                            [[forced_id]], device=device, dtype=cand_ids.dtype,
+                        )
+
                 if capture_sampler_stats:
                     cand_logp = cand_probs.clamp_min(
                         torch.finfo(torch.float32).tiny,
@@ -900,7 +938,12 @@ def generate_steered(
 
                 if logprobs is not None:
                     assert cand_logp is not None
-                    chosen_logprob = float(cand_logp[chosen_pos.item()].item())
+                    if forced_in_pool:
+                        chosen_logprob = float(cand_logp[chosen_pos.item()].item())
+                    else:
+                        chosen_logprob = float(torch.log_softmax(
+                            logits.float(), dim=-1,
+                        )[0, token_id].item())
                     if logprobs > 0:
                         tlv, tpos = cand_logp.topk(min(logprobs, cand_logp.numel()))
                         tli = cand_ids.index_select(0, tpos)

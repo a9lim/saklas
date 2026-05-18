@@ -12,8 +12,14 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from rich.markup import escape
 
 from saklas.core.loom import LoomNode, LoomTree
+
+if TYPE_CHECKING:
+    from saklas.core.loom_diff import DiffSpan
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +267,8 @@ def format_node_detail(tree: LoomTree, node_id: str) -> str:
         lines.append(f"edits     : {node.edit_count}")
     if node.finish_reason:
         lines.append(f"finish    : {node.finish_reason}")
+    if node.mean_logprob is not None:
+        lines.append(f"mean lp   : {node.mean_logprob:+.3f}")
     if node.applied_steering:
         lines.append(f"steering  : {node.applied_steering}")
     if node.recipe is not None:
@@ -299,7 +307,7 @@ def format_node_detail(tree: LoomTree, node_id: str) -> str:
             lines.append(f"  … {len(items) - 10} more")
     lines.append("")
     lines.append("--- text ---")
-    lines.append(node.text or "(empty)")
+    lines.append(escape(node.text) if node.text else "(empty)")
     return "\n".join(lines)
 
 
@@ -313,6 +321,8 @@ def _format_sibling_recipe_block(tree: LoomTree, node: LoomNode) -> list[str]:
     """
     from saklas.core.loom_diff import steering_delta
 
+    if node.parent_id is None:
+        return []
     sib_ids = [
         cid for cid in tree.child_ids(node.parent_id)
         if cid != node.id and tree.get(cid).role == "assistant"
@@ -339,6 +349,91 @@ def _format_sibling_recipe_block(tree: LoomTree, node: LoomNode) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Sibling comparison (`c` in the loom screen)
+# ---------------------------------------------------------------------------
+
+
+def _render_text_diff(spans: list["DiffSpan"]) -> str:
+    """Render a word-level diff (``loom_diff.DiffSpan`` list) as Rich markup.
+
+    Equal spans render plain; deletions strike-through red, insertions
+    green.  Span text is escaped so completion content can't inject
+    markup into the detail pane.
+    """
+    parts: list[str] = []
+    for span in spans:
+        text = escape(span.text)
+        if not text:
+            continue
+        if span.state == "equal":
+            parts.append(text)
+        elif span.state == "delete":
+            parts.append(f"[ansi_red strike]{text}[/]")
+        else:  # insert
+            parts.append(f"[ansi_green]{text}[/]")
+    return " ".join(parts) if parts else "[dim](identical text)[/]"
+
+
+def format_compare(session: Any, node_id: str) -> str:
+    """Render the loom screen's compare view for ``node_id``.
+
+    ``session`` is duck-typed — only ``.tree`` and ``.diff_nodes`` are
+    touched — so a stand-in works as well as a real ``SaklasSession``.
+
+    Walks the node's assistant siblings under the shared user-parent and
+    emits, per sibling: the steering delta, the top-5 probe-reading
+    deltas, and the word-level text diff — the TUI analog of the webui's
+    NodeCompare drawer.  Returns a short advisory string when the node
+    is not an assistant or has no assistant siblings.
+    """
+    from saklas.core.loom_diff import steering_delta
+
+    tree = session.tree
+    node = tree.get(node_id)
+    parent_id = node.parent_id
+    if node.role != "assistant" or parent_id is None:
+        return "[dim](compare — select an assistant node with siblings)[/]"
+
+    sib_ids = [
+        cid for cid in tree.child_ids(parent_id)
+        if cid != node_id and tree.get(cid).role == "assistant"
+    ]
+    if not sib_ids:
+        return "[dim](compare — this node has no assistant siblings)[/]"
+
+    def _expr(n: LoomNode) -> str:
+        if n.recipe is not None and n.recipe.steering is not None:
+            return n.recipe.steering
+        return n.applied_steering or ""
+
+    self_expr = _expr(node)
+    lines: list[str] = [
+        f"[b]compare[/b] {node_id[:8]} vs {len(sib_ids)} sibling(s)",
+        f"this : {escape(self_expr) or '(unsteered)'}",
+        "",
+    ]
+    for idx, sid in enumerate(sib_ids, 1):
+        sib = tree.get(sid)
+        diff = session.diff_nodes(sid, node_id)  # a=sibling, b=this node
+        delta = steering_delta(_expr(sib), self_expr) or "(identical steering)"
+        lines.append(f"[b]── sibling {idx} · {sid[:8]} ──[/b]")
+        lines.append(f"Δ steering : {escape(delta)}")
+        readings = [r for r in diff.readings if abs(r.delta) > 1e-9][:5]
+        if readings:
+            lines.append("Δ readings :")
+            for r in readings:
+                col = "ansi_green" if r.delta >= 0 else "ansi_red"
+                lines.append(
+                    f"  {r.name:<26} [{col}]{r.delta:+.4f}[/]"
+                    f"  ({r.a_value:+.3f} → {r.b_value:+.3f})"
+                )
+        lines.append("Δ text :")
+        lines.append(_render_text_diff(diff.text))
+        lines.append("")
+    return "\n".join(lines)
+
+
 __all__ = [
     "AlphaListError",
     "PrefixMatch",
@@ -347,4 +442,5 @@ __all__ = [
     "search_nodes",
     "format_path_summary",
     "format_node_detail",
+    "format_compare",
 ]

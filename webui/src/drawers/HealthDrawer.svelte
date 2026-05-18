@@ -158,7 +158,7 @@
   h2, h3 { margin: 0; color: var(--fg); letter-spacing: 0; }
   h2 { font-size: 1rem; }
   h3 { font-size: 0.92rem; margin-bottom: 0.7rem; }
-  button { border: 1px solid var(--accent); border-radius: var(--radius); background: rgba(225, 17, 7, 0.11); color: var(--accent); padding: 0.6rem 0.85rem; font-weight: 700; }
+  button { border: 1px solid var(--accent); border-radius: var(--radius); background: rgba(72, 138, 203, 0.11); color: var(--accent); padding: 0.6rem 0.85rem; font-weight: 700; }
   button:disabled { opacity: 0.55; cursor: wait; }
   .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.7rem; }
   .tile span { color: var(--fg-muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0; }

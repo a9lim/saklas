@@ -21,10 +21,9 @@
     closeDrawer,
     chatLog,
     loomTree,
-    refreshLoomTree,
+    sendFork,
     samplingState,
   } from "../lib/stores.svelte";
-  import { apiTree } from "../lib/api";
   import type { ChatTurn, TokenAltJSON, TokenScore } from "../lib/types";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
   import { HIGHLIGHT_SAT } from "../lib/tokens";
@@ -248,25 +247,30 @@
     }
   }
 
+  /** Logit fork — regenerate this node as a sibling with the clicked
+   *  token swapped for ``row``'s alternative.  Unlike the old branch
+   *  (which spliced a single token into otherwise-stale text), this
+   *  replays the node's raw decode prefix and *resamples* the
+   *  continuation conditioned on the swapped token, so everything
+   *  downstream of the fork is coherent.  Works for thinking tokens
+   *  too — the engine forces the thinking prefix and lets the model
+   *  close the channel itself. */
   async function branchFromAlt(row: RankRow): Promise<void> {
     branchError = null;
-    if (isThinking) {
-      branchError = "thinking-token branches are not supported";
-      return;
-    }
     const nodeId = loomNodeId;
-    const source = inspected?.tokens ?? [];
-    if (!nodeId || source.length === 0 || tokenIdx < 0) {
+    if (!nodeId) {
       branchError = "no loom assistant node is available for this token";
       return;
     }
-    const text = source
-      .map((t, i) => (i === tokenIdx ? row.text : t.text))
-      .join("");
+    if (token == null || token.rawIndex == null) {
+      branchError =
+        "this token has no raw-decode index — forking needs a node " +
+        "generated in this session (legacy / replayed turns can't fork)";
+      return;
+    }
     branchingRank = row.rank;
     try {
-      await apiTree.branch(nodeId, text);
-      await refreshLoomTree();
+      await sendFork(nodeId, token.rawIndex, row.id);
       closeDrawer();
     } catch (e) {
       branchError = e instanceof Error ? e.message : String(e);
@@ -450,7 +454,7 @@
                       class="mini"
                       disabled={row.chosen || branchingRank !== null}
                       onclick={() => branchFromAlt(row)}
-                      title="Create a sibling assistant branch with this token substituted"
+                      title="Fork a sibling branch: swap in this token and resample the continuation"
                     >
                       {branchingRank === row.rank ? "…" : "fork"}
                     </button>

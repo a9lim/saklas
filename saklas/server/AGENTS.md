@@ -37,6 +37,7 @@ Routes:
 - `GET /sessions/{id}/vectors/{name}/diagnostics` — 16-bucket `||baked||` histogram via `saklas.core.histogram.bucketize` + per-layer magnitudes, plus `diagnostics_by_layer` / `diagnostics_summary` (reused from `cli.runners._summarize_diagnostics`) when the profile carries them. Drives the WHY-histogram strip in the web UI's probe rack. 404 when the vector isn't registered on the session.
 - Probe management under `/sessions/{id}/probes` — list / defaults / activate / deactivate
 - `POST /sessions/{id}/probe` — one-shot scoring via `monitor.measure(model, tokenizer, layers, text)` under the session lock; no generation required
+- Loom tree under `/sessions/{id}/tree` — full tree GET, active-path GET, navigate/edit/branch/delete/star/note/reset mutations, `edge_label`, `filter`, branch `diff`, `joint_logprobs`, and transcript export/import. Mutations use the session's tree conflict checks, so edit/delete/reset return 409 when they would corrupt an in-flight generation.
 
 **Pack management (top-level, not under a session):**
 - `GET /saklas/v1/packs` — locally installed packs only, via `cache_ops.list_concepts(None, hf=False)`. Mirrors `saklas pack ls` but JSON-only; HF queries are the separate `/packs/search` route so the common UI rack-refresh case stays off the network.
@@ -44,8 +45,9 @@ Routes:
 - `POST /saklas/v1/packs` body `{target, as?, force?, statements_only?}` — wraps `cache_ops.install` in `asyncio.to_thread`. `target` accepts the same surface as `saklas pack install` (HF coord `ns/name[@rev]` or local folder path). `InstallConflict` → 409, `ValueError` → 400, missing target → 404.
 
 **Killer feature — `WS /saklas/v1/sessions/{id}/stream`**: bidirectional token+probe co-stream.
-- Client sends `{type: "generate", input, steering, sampling, thinking, stateless, raw}` or `{type: "stop"}`
-- Server emits `{type: "started", generation_id}`, `{type: "token", text, thinking, token_id}` per token, `{type: "done", result: {text, tokens, finish_reason, usage, per_token_probes: [{token_idx, probes}]}}`
+- Client sends `{type: "generate", input, steering, sampling, thinking, stateless, raw, parent_node_id?, n?}` or `{type: "stop"}`
+- **Logit fork**: a `generate` message with `{fork_node_id, fork_raw_index, fork_alt_token_id}` set routes to `session.fork_from_token` instead of `session.generate` — replays the source node's raw decode prefix, forces the alt token, resamples the continuation under the node's stamped recipe. `input`/`steering`/`sampling`/`n` are ignored on a fork message; all three fork fields must travel together (400 otherwise). The `token` event carries `raw_index` (the decode-step join key the fork slices on).
+- Server emits `{type: "started", generation_id, node_id?}`, `{type: "node_created", node}`, `{type: "tree_mutated", ...}`, `{type: "token", text, thinking, token_id, node_id?, per_layer_scores?}` per token, `{type: "done", node_id?, result: {text, tokens, finish_reason, usage, per_token_probes: [{token_idx, probes}]}}`
 - Per-token probes assembled post-stream from `session._last_per_token_scores` in the `done` event
 
 **Live traits SSE — `GET /saklas/v1/sessions/{id}/traits/stream`**: per-token probe scores in real time during any active generation. Uses inline per-token scoring (`TraitMonitor.score_single_token`) gated behind `session._trait_subscribers > 0`; zero overhead when no SSE clients are connected. Events: `start`, `token` (with `{idx, text, thinking, probes}`), `done` (with aggregate). Connection stays open across generations; multiple clients supported via `session._trait_queues` (list of `(loop, asyncio.Queue)` pairs, `threading.Lock`-protected).

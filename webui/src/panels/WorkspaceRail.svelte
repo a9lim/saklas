@@ -231,7 +231,7 @@
   .rail-btn:hover:not(:disabled),
   .rail-btn.active {
     background: var(--accent-subtle);
-    border-color: rgba(225, 17, 7, 0.42);
+    border-color: rgba(72, 138, 203, 0.42);
     color: var(--fg);
     transform: translateY(-1px);
   }

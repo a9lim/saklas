@@ -197,7 +197,7 @@
   .section-head span, .stat span { color: var(--fg-muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0; }
   .token-grid { display: flex; flex-wrap: wrap; gap: 0.25rem; align-content: flex-start; overflow: auto; padding-right: 0.25rem; }
   .token-grid button { position: relative; max-width: 11rem; border: 1px solid var(--border-dim); border-radius: var(--radius); background: rgba(255,255,255,0.025); color: var(--fg); padding: 0.35rem 0.45rem; overflow: hidden; }
-  .token-grid button.selected { border-color: var(--accent); background: rgba(225, 17, 7, 0.11); }
+  .token-grid button.selected { border-color: var(--accent); background: rgba(72, 138, 203, 0.11); }
   .spark { position: absolute; inset: auto auto 0 0; height: 2px; background: var(--accent-amber); opacity: 0.8; }
   code { position: relative; font-family: var(--font-mono); white-space: pre-wrap; }
   .stat { border: 1px solid var(--border-dim); border-radius: var(--radius); padding: 0.55rem; display: grid; gap: 0.2rem; background: rgba(255,255,255,0.025); }

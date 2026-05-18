@@ -289,8 +289,8 @@
   }
 
   .node-card.active {
-    border-color: rgba(225, 17, 7, 0.72);
-    box-shadow: inset 0 0 0 1px rgba(225, 17, 7, 0.22);
+    border-color: rgba(72, 138, 203, 0.72);
+    box-shadow: inset 0 0 0 1px rgba(72, 138, 203, 0.22);
   }
 
   .node-card strong {

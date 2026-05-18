@@ -32,7 +32,7 @@ Per-token highlighting lives on the chat tokens themselves, driven by a single h
 
 The dashboard speaks the existing `/saklas/v1/*` native API plus web-focused routes:
 
-1. **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. When probes are loaded the `token` event carries `scores` (`dict[str, float]` — the magnitude-weighted `score_single_token` aggregate, the same value the TUI tints live tokens with; the webui's inline highlight reads this so live highlighting matches the post-generation pass) and `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed — the per-layer heatmap the token drilldown drawer consumes). `done` carries `per_token_probes` assembled from `session._last_per_token_scores`. Drives chat tinting + click-token drilldown.
+1. **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. When probes are loaded the `token` event carries `scores` (`dict[str, float]` — the magnitude-weighted `score_single_token` aggregate, the same value the TUI tints live tokens with; the webui's inline highlight reads this so live highlighting matches the post-generation pass) and `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed — the per-layer heatmap the token drilldown drawer consumes). The `token` event also carries `raw_index` — the decode-step index of the token in the backing node's `raw_token_ids`, the join key the logit fork slices on. `done` carries `per_token_probes` assembled from `session._last_per_token_scores`. Drives chat tinting + click-token drilldown. **Logit fork**: a `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` regenerates an assistant node as a sibling with one token swapped (`TokenDrilldownDrawer`'s logits-tab `fork` button → `sendFork`) — the server replays the node's raw decode prefix and resamples the continuation, so the fork is a coherent counterfactual, not a single-token text splice.
 2. **GET `/saklas/v1/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix. Default pool unions registered steering vectors AND active probes (deduplicated by name). Drives the correlation drawer overlay.
 3. **GET `/saklas/v1/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + per-layer magnitudes + (optional) probe-quality metrics. Falls back to `session._monitor.profiles` when the name is a probe rather than a registered steering vector. Drives the layer-norms drawer overlay (and `saklas vector why` from the CLI).
 4. **GET `/saklas/v1/packs`** — locally installed packs, JSON shape. Drives the vector picker and probe picker.
@@ -70,7 +70,7 @@ webui/src/
     BranchCanvas.svelte       # active path + sibling/child lanes + fan/compare controls
     InspectorPanel.svelte     # runtime meters + sampling + steering/probe racks
     StatusFooter.svelte       # ● gen N/M [bar] · t/s · elapsed · ppl
-    Chat.svelte               # thinking-collapsible, live probe-tinted tokens, ⋮ actions menu, auto-regen / pin split
+    Chat.svelte               # thinking-collapsible, live probe-tinted tokens, inline conversation actions, auto-regen / pin split
     SamplingStrip.svelte      # T / P / K / max / seed / thinking + segmented apply-mode
     SteeringRack.svelte       # one strip per loaded vector + "+ add steering" + canonical expression
     VectorStrip.svelte        # ●/○ enable + pole-framed α slider + α display + trigger word + variant menu + ⋮ menu + ✕ + inline projection modal
@@ -132,7 +132,7 @@ Shell-style history on the chat textarea. Every line submitted via `doSend` land
 
 ## Auto-regen (replaces A/B in v2.3)
 
-The standalone A/B button is gone — Decision 13's "Ctrl+A toggles auto-regen" landed end-to-end. The auto-regen toggle + mode picker (`unsteered` / `inverted` / `reseed` / `cool` / `hot` / `custom: <partial recipe>`) live in `Chat.svelte`'s ⋮ actions menu (the webui overhaul moved the conversation actions off the topbar). `mode="unsteered"` is bit-identical to the old A/B flow.
+The standalone A/B button is gone — Decision 13's "Ctrl+A toggles auto-regen" landed end-to-end. The auto-regen toggle + mode picker (`unsteered` / `inverted` / `reseed` / `cool` / `hot` / `custom: <partial recipe>`) sit inline in `Chat.svelte`'s header alongside the clear / rewind / transcript actions (the webui overhaul moved the conversation actions off the topbar; v2.3 polish flattened the former ⋮ menu into an inline strip). `mode="unsteered"` is bit-identical to the old A/B flow.
 
 `Chat.svelte`'s `twoColumns` derived OR-folds `pinnedActive || autoRegenActive` — pin generalizes the right column and auto-regen drives it when nothing is pinned. The WS `done` handler in `stores.svelte.ts` branches by mode: `unsteered` → `_sendShadowGenerate(steeredIdx)` (legacy shadow path, untouched); any other override → `loomRegenerateActive(mode)` + auto-pin to the new sibling. `toggleAutoRegen` retroactively fires a shadow for the most recent assistant turn when flipped on with `mode === "unsteered"` (mirrors the old A/B retroactive fire).
 

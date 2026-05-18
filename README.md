@@ -8,12 +8,12 @@
 
 Saklas is a library for activation steering and trait probing on local HuggingFace models. You give it any concept, from "angry" to "bacterium", and it automatically generates contrastive pairs, extracts a direction from them, and then steers the model's hidden states along that direction when it's time to generate text. The model itself isn't touched, so you can change the steering strength as you go.
 
-Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. The main feature is a terminal UI with live steering controls and a built-in trait monitor that scores every generated token against any probe you care about, with live averages and sparklines so you can see where in a response a trait shifts. There's also an HTTP server that supports both OpenAI `/v1/*` and Ollama `/api/*` on the same port so Open WebUI, Enchanted, or any other OpenAI/Ollama client can talk to a steered model without changes. Persona cloning works on any text sample: point it at a corpus and it pulls out a voice and style vector without hand-labeled pairs.
+Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. It has three frontends over one engine: a mouse-first web interpretability cockpit, a keyboard-native terminal workbench, and a Python API. Both interactive UIs include live steering controls, branching conversation state, and a built-in trait monitor that scores generated tokens against any probe you care about. The HTTP server supports both OpenAI `/v1/*` and Ollama `/api/*` on the same port, so Open WebUI, Enchanted, or any other OpenAI/Ollama client can talk to a steered model without changes. Persona cloning works on any text sample: point it at a corpus and it pulls out a voice and style vector without hand-labeled pairs.
 
 Three ways to use it:
 
-- **`saklas tui <model>`**: Terminal UI
-- **`saklas serve <model>`**: HTTP server compatible with both OpenAI and Ollama, with an analytics dashboard mounted at `/` (pass `--no-web` for API-only mode)
+- **`saklas serve <model>`**: HTTP server compatible with both OpenAI and Ollama, with the web cockpit mounted at `/` (pass `--no-web` for API-only mode)
+- **`saklas tui <model>`**: Terminal workbench
 - **`SaklasSession`**: Python API
 
 It runs on CUDA and Apple Silicon MPS. The full TUI has been tested to run comfortably on a MacBook. CPU does work but it's slow. Tested on Qwen, Gemma, Ministral, gpt-oss, Llama, and GLM. A lot more architectures are wired up in `saklas/core/model.py:_LAYER_ACCESSORS` but have not been tested; if you try one, please let me know how it went.
@@ -28,7 +28,7 @@ If you notice any errors while using the program, please update to the most rece
 
 ## Credits
 
-The contrastive-pair approach comes from the Representation Engineering paper ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)). [repeng](https://github.com/vgel/repeng) by Theia Vogel is the well-known implementation in this space and is what most people might reach for. Saklas implements the same idea from a different angle: repeng is lean and more of a library, saklas is more of a TUI with monitoring and a chat server bundled in. Both are worth your time!
+The contrastive-pair approach comes from the Representation Engineering paper ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)). [repeng](https://github.com/vgel/repeng) by Theia Vogel is the well-known implementation in this space and is what most people might reach for. Saklas implements the same idea from a different angle: repeng is lean and more of a library, saklas is a full workbench with monitoring, branching chat, a web cockpit, a TUI, and a chat server bundled in. Both are worth your time!
 
 Since v2.1 the default extractor is difference-of-means (DiM) per [Im & Li, 2025](https://arxiv.org/abs/2502.02716), and the per-layer share allocation runs in the Mahalanobis metric (whitened against per-model activation covariance) instead of the v1.x Euclidean magnitude. The legacy v1.x stack (PCA extraction, additive steering, Euclidean shares and cosine) is available all together via `--legacy` on `tui`, `serve`, `vector extract`, and `vector compare`, or piecemeal via `--method pca`, `--steer-mode additive`, and `--metric euclidean` on the relevant verbs.
 
@@ -41,7 +41,7 @@ pip install saklas
 saklas tui google/gemma-3-4b-it
 ```
 
-The first run downloads the model and extracts the 26 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` toggles a two-column A/B view that runs an unsteered shadow alongside every steered turn.
+The first run downloads the model and extracts the 26 bundled probes. Try `/steer 0.4 angry`: that applies the built-in `angry.calm` vector at α = +0.4 and the model leans angry. `/steer 0.4 calm` gives you the same vector at α = −0.4. `Ctrl+Y` colors each generated token by how strongly the selected probe lit up on it. `Ctrl+A` toggles auto-regen: by default it opens a two-column comparison with an unsteered shadow, and `/auto-regen <mode>` can switch the comparison to inverted, reseeded, hot, cool, or custom recipe variants.
 
 As an API server:
 
@@ -68,7 +68,7 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it") as s:
 ```bash
 pip install saklas             # library and TUI
 pip install saklas[serve]      # adds FastAPI and uvicorn for the API server
-pip install saklas[web]        # same as serve, plus the analytics dashboard at /
+pip install saklas[web]        # same as serve, plus the web cockpit at /
 pip install saklas[gguf]       # adds the gguf package for llama.cpp interchange
 pip install saklas[research]   # adds datasets and pandas for dataset loading and DataFrames
 pip install saklas[notebook]   # adds plotly, pandas, and kaleido for Jupyter figure helpers
@@ -220,7 +220,7 @@ saklas tui mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
 saklas tui meta-llama/Llama-3.1-8B-Instruct -p affect register
 ```
 
-There are three panels: a vector registry on the left, chat in the center, and a trait monitor on the right. `Tab` cycles between panels, arrow keys navigate within each panel.
+There are three panels: a workbench/rack on the left, chat in the center, and a probe rack plus layer map on the right. `Tab` cycles between panels, arrow keys navigate within each panel, and `Ctrl+L` opens the full-screen loom tree when you want more room for branch navigation.
 
 ### Flags
 
@@ -241,15 +241,19 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | Key | Action |
 |---|---|
 | `Tab` / `Shift+Tab` | Cycle panel focus |
-| `Left` / `Right` | Adjust alpha |
+| `Left` / `Right` | Adjust alpha finely |
+| `Shift+Left` / `Shift+Right` | Adjust alpha coarsely |
 | `Up` / `Down` | Navigate vectors or probes |
 | `Enter` | Toggle vector on/off |
 | `Backspace` / `Delete` | Remove selected vector or probe |
 | `Ctrl+T` | Toggle thinking mode |
-| `Ctrl+A` | A/B side-by-side (toggle steered + unsteered shadow columns) |
+| `Ctrl+A` | Toggle auto-regen side-by-side comparison |
 | `Ctrl+R` | Regenerate last response |
 | `Ctrl+S` | Cycle trait sort mode |
 | `Ctrl+Y` / `Ctrl+Shift+Y` | Cycle per-token highlight: off → probe → surprise |
+| `Ctrl+L` | Open the loom tree screen |
+| `Ctrl+E` / `Ctrl+B` | Edit or branch the active loom node |
+| `Ctrl+N` / `Ctrl+D` | Navigate by prefix or request guarded subtree delete |
 | `[` / `]` | Adjust temperature |
 | `{` / `}` | Adjust top-p |
 | `Escape` | Stop generation |
@@ -268,7 +272,15 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | `/compare <a> [b]` | Cosine similarity (1-arg: ranked vs all; 2-arg: pairwise) |
 | `/extract <name>` | Extract to disk without registering |
 | `/extract <pos> . <neg>` | Same, bipolar form (only path for new bipolar extraction) |
-| `/regen` | Regenerate the last assistant turn |
+| `/regen [N] [mode]` | Regenerate the last assistant turn, optionally as N siblings or with a recipe override |
+| `/fan <vector> <alphas>` | Generate an alpha grid as loom siblings |
+| `/auto-regen [on\|off\|mode]` | Configure the side-by-side comparison modifier |
+| `/tree` | Open the loom tree screen |
+| `/edit <text>` / `/branch [text]` | Mutate or branch the active loom node |
+| `/nav <prefix>` / `/del yes` | Navigate by node prefix or delete the active subtree after confirmation |
+| `/prune <filter-expr>` | Dim non-matching loom nodes by aggregate probe readings |
+| `/diff <id1> <id2> [--full]` | Compare branch text and reading deltas |
+| `/diff --siblings` | Compare assistant siblings under the active user parent |
 | `/clear` | Clear conversation history |
 | `/rewind` | Undo last exchange |
 | `/sys <prompt>` | Set system prompt |
@@ -279,7 +291,7 @@ There are three panels: a vector registry on the left, chat in the center, and a
 | `/model` | Model + device + active state |
 | `/help` | List commands and keybindings |
 
-A footer at the bottom of the trait panel shows the top 5 layers and the live highest and lowest scored tokens for the selected probe.
+The right panel's layer map shows `||baked||` for the selected probe as a compact histogram across model layers. It is static for the selected profile; per-token probe activity lives in the chat highlight itself.
 
 The footer in the chat panel shows generation progress, live tok/s, elapsed, and the running perplexity of the token stream (geometric mean of the configured sampler distribution after temperature, top-k, and top-p renormalization).
 
@@ -399,19 +411,21 @@ pip install saklas[web]
 saklas serve google/gemma-3-4b-it
 ```
 
-Open `http://localhost:8000/`. The v2.0 dashboard is an interpretability cockpit: chat on the left, a stack of control rack panels on the right, status footer pinned to the bottom. Everything the TUI does is here through buttons and sliders, plus a few things the TUI structurally can't.
+Open `http://localhost:8000/`. The dashboard is an interpretability cockpit: workspace rail on the far left, optional loom tree sidebar, branch canvas plus chat in the center, an inspector/control rack on the right, and a status footer pinned to the bottom. Everything the TUI does is here through buttons, sliders, menus, and drawers, plus a few things the TUI structurally can't show at once. The visual system uses a dark "volcanic glass" theme with sharp geometry, magma-red primary actions, blue data/status accents, and dense scan-friendly panels.
 
-Per-token highlighting lives directly on the chat tokens: pick a probe in the highlight dropdown above the chat and tokens tint red or green by score. Compare two probes side-by-side via a two-stripe overlay. Every token is clickable regardless of highlight state; clicking opens a per-layer × per-probe heatmap drawer for that one token (thinking-block tokens drill into the thinking stream, response tokens into the response stream).
+Per-token highlighting lives directly on the chat tokens: pick a probe or `surprise (logprob)` from the probe rack and tokens tint by score. Compare two probes side-by-side via a two-stripe overlay. Every token is clickable regardless of highlight state; clicking opens a per-layer x per-probe heatmap drawer for that one token (thinking-block tokens drill into the thinking stream, response tokens into the response stream). The activation atlas drawer gives the same token x layer x probe view across the whole active conversation, plus captured top-token alternatives when enabled.
 
-The steering rack has one strip per loaded vector: ●/○ enable toggle, α slider with a 0 detent, signed α display, trigger pill, variant chip, ⋮ menu for projection, ablation, duplicate, or copy expression. Project-onto and project-orthogonal-to open an inline modal that takes a target concept name. The canonical steering expression renders below the rack and is paste-editable. Adding a vector goes through "+ steer": a picker that lists local concepts (mirrors TUI `/steer 0.5 honest`); advanced affordances (extract from pos/neg, load from a path) are in the picker's footer.
+The steering rack has one strip per loaded vector: enable toggle, alpha slider with a 0 detent, signed alpha display, trigger pill, variant chip, menu for projection, ablation, duplicate, or copy expression. Project-onto and project-orthogonal-to open an inline modal that takes a target concept name. The rack also has an explicit vector input plus `apply vector` button; type a concept name, hit Enter or click the button, and the vector is extracted/loaded and added to the rack. `browse` opens the vector picker, and the full recipe builder drawer exposes coefficients, variants, projections, ablations, and triggers in one dense editor. The canonical steering expression renders below the rack and is paste-editable.
 
 The probe rack is symmetric: one strip per active probe with a live sparkline, current value bar, signed value display, and an always-visible per-layer reading strip (one heatmap cell per covered layer, tinted by the probe's score at that layer for the most recent token). The whole row is the click target for highlight selection (●/○ toggles between selected and off). "+ probe" opens a probe picker that mirrors the steering picker.
 
-A/B compare runs an unsteered shadow alongside the steered conversation, with each turn rendered in two row-aligned columns (steered left, unsteered right). The TUI's `Ctrl+A` toggle and the webui's A/B button share the same flow: toggling on mid-conversation replays the steered conversation through the unsteered agent; past steered turns ride along as context, only the most recent user turn (and any subsequent ones) get a fresh unsteered response.
+The loom surfaces branching conversation state instead of hiding alternates in a flat log. The branch canvas shows the active path, siblings under the current parent, and children of the active node, with buttons for `regenerate N`, alpha-grid fan-out, sibling comparison, and child comparison. The loom sidebar adds tree navigation, edit, branch, delete, star/note, filter, pin, and transcript workflows. Branches carry the recipe that produced them, so steering experiments remain reproducible.
 
-The topbar's tools menu opens drawers for extract, load, compare, system prompt, model info, help, export, sweep launcher (with linspace alpha lists and a live result table), pack browse and install, vector merge, corpus-based clone, plus correlation matrix and layer norms overlays. Both span the union of registered steering vectors and active probes.
+Auto-regen generalizes the old A/B compare: the default mode still produces an unsteered shadow response, but the same topbar control can also invert steering, reseed, run hotter/cooler, or apply a custom partial recipe. Two-column chat rendering shows the primary path beside the pinned or auto-regenerated comparison path.
 
-Chat history and the highlight selection persist to `localStorage` per model, so a page reload comes back to where you left off.
+The workspace rail and topbar open drawers for experiment lab, activation atlas, recipe builder, advanced sampling, packs, session/auth, health, extract, load, compare, system prompt, model info, help, export, vector merge, corpus clone, transcript import/export, correlation matrix, and layer norms. Reference drawers span the union of registered steering vectors and active probes.
+
+The loom tree cache and highlight selection persist to `localStorage` per model for fast reloads, but the server tree remains authoritative after bootstrap. Chat input recall is intentionally in-memory only.
 
 The dashboard mounts by default on every `saklas serve`. Pass `--no-web` for API-only mode on a proxied or production deployment where `/` already belongs to something else.
 

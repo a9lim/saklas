@@ -338,8 +338,9 @@ def _resolve_options(
 
     from saklas.core.steering_expr import parse_expr
 
-    steer_raw = opts.get("steer") or body.get("steer")
+    steer_raw = opts["steer"] if "steer" in opts else body.get("steer")
     req_steering: "Steering | None" = None
+    explicit_clear = False
     if steer_raw is not None:
         if not isinstance(steer_raw, str):
             raise ValueError(
@@ -347,6 +348,7 @@ def _resolve_options(
                 "e.g. \"0.5 honest + 0.3 warm\""
             )
         text = steer_raw.strip()
+        explicit_clear = not text
         if text:
             req_steering = parse_expr(text)
 
@@ -358,7 +360,7 @@ def _resolve_options(
         thinking = bool(think_flag)
 
     merged_alphas: dict = {}
-    if default_steering is not None:
+    if default_steering is not None and not explicit_clear:
         merged_alphas.update(default_steering.alphas)
     if req_steering is not None:
         for k, v in req_steering.alphas.items():

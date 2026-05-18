@@ -114,7 +114,7 @@
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
   .sessions { display: grid; gap: 0.5rem; }
   article { display: grid; gap: 0.25rem; border: 1px solid var(--border-dim); border-radius: var(--radius); background: rgba(255,255,255,0.025); padding: 0.65rem; }
-  article.active { border-color: rgba(225, 17, 7, 0.55); background: rgba(225, 17, 7, 0.10); }
+  article.active { border-color: rgba(72, 138, 203, 0.55); background: rgba(72, 138, 203, 0.10); }
   strong { color: var(--accent); }
   code { color: var(--accent-amber); font-family: var(--font-mono); }
   article span { color: var(--fg-muted); }

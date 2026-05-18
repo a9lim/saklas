@@ -254,7 +254,7 @@
     border-left: 1px solid var(--border);
   }
   .segmented button.active {
-    background: rgba(225, 17, 7, 0.12);
+    background: rgba(72, 138, 203, 0.12);
     color: var(--accent);
   }
   .secondary {

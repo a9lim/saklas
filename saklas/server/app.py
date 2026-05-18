@@ -153,16 +153,19 @@ class _SamplingBase(BaseModel):
     ) -> "Steering | None":
         """Compose ``self.steering`` (expression string) over the server default.
 
-        The per-request expression overrides the default at the key level:
-        alphas for concepts named in both the default and the request come
-        from the request; alphas only in the default pass through. Returns
-        ``None`` when the composed result is empty and no ``thinking``
-        override was requested. Pole aliasing happens inside
-        ``session.steering()`` — the server does not resolve poles here.
+        ``None`` inherits the server default; an explicit empty string
+        clears it.  Non-empty per-request expressions override the default
+        at the key level: alphas for concepts named in both the default
+        and the request come from the request; alphas only in the default
+        pass through. Returns ``None`` when the composed result is empty
+        and no ``thinking`` override was requested. Pole aliasing happens
+        inside ``session.steering()`` — the server does not resolve poles
+        here.
         """
         from saklas.core.steering_expr import parse_expr
 
         req_steering: "Steering | None" = None
+        explicit_clear = self.steering is not None and not self.steering.strip()
         if self.steering is not None and self.steering.strip():
             req_steering = parse_expr(self.steering)
 
@@ -171,7 +174,7 @@ class _SamplingBase(BaseModel):
             thinking = req_steering.thinking
 
         merged_alphas: dict = {}
-        if default_steering is not None:
+        if default_steering is not None and not explicit_clear:
             merged_alphas.update(default_steering.alphas)
         if req_steering is not None:
             for k, v in req_steering.alphas.items():
@@ -719,4 +722,3 @@ def _register_routes(app: FastAPI) -> None:
             "usage": _usage_dict(result),
             "probe_readings": _probe_reading_dict(session),
         }
-

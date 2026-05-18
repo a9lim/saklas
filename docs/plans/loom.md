@@ -228,7 +228,7 @@ A/B compare's `abPair`-on-turn pattern goes away in the engine. The tree replace
 - Concurrency: edit during in-flight gen on the same reservation raises `MutationDuringGenerationError`; branch on the same reservation succeeds; delete subtree containing gen target raises; delete subtree disjoint from gen target succeeds; navigate-away during gen leaves the gen attached to its original target.
 - `delete_subtree` cascades and refuses to delete the active path's ancestor (forces navigate-away first).
 - `reset` (clear) drops everything; `rewind` navigates up one pair without deletion.
-- Regenerate via `session.generate(parent_node_id=..., n=...)` produces N siblings under the right parent; per-sibling seeds match the FNV-1a-64 schedule; recipe override (Q5 mechanism) overlays correctly.
+- Regenerate via `session.generate(parent_node_id=..., n=...)` produces N siblings under the right parent; per-sibling seeds match the BLAKE2b schedule in `derive_seed_schedule`; recipe override (Q5 mechanism) overlays correctly.
 - Save/load roundtrip preserves order of children, ulid stability, token-score fidelity, `rev`, and `model_id`.
 - Compat: `session.history` matches the active path's messages exactly; `session.rewind()` and `session.clear_history()` behave per the locked semantics.
 

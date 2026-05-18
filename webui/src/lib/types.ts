@@ -275,7 +275,7 @@ export interface WSSampling {
 
 export interface WSGenerateRequest {
   type: "generate";
-  input: string | unknown;
+  input?: string | unknown;
   steering?: string | null;
   sampling?: WSSampling | null;
   thinking?: boolean | null;
@@ -291,6 +291,13 @@ export interface WSGenerateRequest {
    *  auto-regen.  Accepted as a mode string (``"unsteered"`` etc) or a
    *  partial-recipe expression string.  Engine resolves the overlay. */
   recipe_override?: string | Record<string, unknown> | null;
+  /** Logit fork: regenerate an existing assistant node as a sibling with
+   *  one token swapped.  When ``fork_node_id`` is set the server ignores
+   *  ``input`` / ``steering`` / ``sampling`` / ``n`` and reuses the
+   *  node's stamped recipe; the three fields must travel together. */
+  fork_node_id?: string | null;
+  fork_raw_index?: number | null;
+  fork_alt_token_id?: number | null;
 }
 
 export interface WSStopRequest {
@@ -629,6 +636,11 @@ export interface TokenScore {
   /** Logit-pass: top-K alternatives captured at this position (descending
    *  by logprob).  Absent when ``return_top_k == 0`` or replayed. */
   topAlts?: TokenAltJSON[] | null;
+  /** Raw decode-step index of this token in the backing node's
+   *  ``raw_token_ids`` — the join key a logit fork slices on.  Absent on
+   *  legacy / transcript-loaded nodes (engine pre-dates raw-id capture),
+   *  in which case the token can't be forked. */
+  rawIndex?: number | null;
 }
 
 export interface ChatTurn {

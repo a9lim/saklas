@@ -1,8 +1,9 @@
 /* Centralized design tokens.
  *
  * Visual language is ported from a9l.im's "volcanic glass": obsidian
- * surfaces, thin HUD glass, a primary magma accent, and a secondary
- * blue for data/status work.
+ * surfaces and thin HUD glass.  The webui diverges from the site on the
+ * primary accent — it runs a single blue theme accent (the site's magma
+ * red is dropped) so every interactive affordance reads the same hue.
  *
  * Source of truth: a9lim.github.io/shared-tokens.js (the `dark` block
  * and `extended` palette) plus shared-base.css (motion tokens). The
@@ -33,15 +34,17 @@
   --fg-dim: #bfc1c6;
   --fg-muted: #8f929b;
   --fg-subtle: #a7aab1;
-  --text-on-accent: #fdfdff; /* white on the magma accent — kept for contrast */
+  --text-on-accent: #fdfdff; /* near-white on the blue accent — kept for contrast */
 
   /* Lines — site dark: border-strong / border, text @ 0.122 / 0.059 */
   --border: rgba(244, 245, 249, 0.12);
   --border-dim: rgba(244, 245, 249, 0.06);
 
-  /* Accents — site `accent` / `secondary` / `extended.*` */
-  --accent: #e11107; /* primary magma accent (site --accent) */
-  --accent-light: #e95142;
+  /* Accents — primary is blue; the rest are semantic role colors.
+   * --accent and --accent-blue are intentionally the same value so
+   * either handle resolves to the one theme hue. */
+  --accent: #488acb; /* primary blue accent */
+  --accent-light: #6ba3da;
   --accent-blue: #488acb;
   --accent-amber: #ca6800;
   --accent-green: #009f68;
@@ -49,8 +52,8 @@
   --accent-yellow: #998700;
   --accent-error: #da534f;
   --accent-purple: #9769dc;
-  --accent-subtle: rgba(225, 17, 7, 0.078); /* site --accent-subtle, accent @ 0.078 */
-  --accent-glow: rgba(225, 17, 7, 0.18); /* site --accent-glow, accent @ 0.18 — focus rings */
+  --accent-subtle: rgba(72, 138, 203, 0.10); /* accent @ 0.10 */
+  --accent-glow: rgba(72, 138, 203, 0.30); /* accent @ 0.30 — focus rings */
   --secondary-subtle: rgba(72, 138, 203, 0.13);
   --shadow-hover: 0 2px 4px #00000033, 0 4px 16px #0000003d, 0 8px 32px #00000028;
 

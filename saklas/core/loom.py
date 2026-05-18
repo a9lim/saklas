@@ -365,6 +365,16 @@ class LoomNode:
     # ``to_dict`` / ``from_dict`` for tree persistence + WS bridge.
     mean_logprob: float | None = None
     mean_surprise: float | None = None
+    # Raw decode-step token ids for an assistant node — the exact
+    # sequence the engine sampled, *including* the structural delimiters
+    # (`<think>` / `</think>` / channel markers) that ``tokens`` /
+    # ``thinking_tokens`` suppress, and with partial-UTF-8 bytes
+    # unmerged.  Stamped at :meth:`LoomTree.finalize_assistant` from the
+    # engine's ``generated_ids``.  This is the forceable prefix a logit
+    # fork replays; ``None`` for legacy / transcript-loaded nodes, where
+    # the fork affordance falls back to disabled.  Persisted in the token
+    # sidecar alongside ``tokens`` (bulky, per-decode-step granularity).
+    raw_token_ids: list[int] | None = None
 
     def to_dict(self, *, include_tokens: bool = False) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -388,6 +398,7 @@ class LoomNode:
         if include_tokens:
             out["tokens"] = self.tokens
             out["thinking_tokens"] = self.thinking_tokens
+            out["raw_token_ids"] = self.raw_token_ids
         return out
 
     @classmethod
@@ -413,6 +424,7 @@ class LoomNode:
             edit_count=int(data.get("edit_count", 0)),
             mean_logprob=data.get("mean_logprob"),
             mean_surprise=data.get("mean_surprise"),
+            raw_token_ids=data.get("raw_token_ids"),
         )
 
 
@@ -798,6 +810,7 @@ class LoomTree:
         finish_reason: str | None = None,
         mean_logprob: float | None = None,
         mean_surprise: float | None = None,
+        raw_token_ids: list[int] | None = None,
     ) -> None:
         """Mark an in-flight assistant node as complete.
 
@@ -807,6 +820,10 @@ class LoomTree:
         are excluded by construction).  ``None`` when logprob capture
         wasn't live (no on_token consumer + no logprobs request), which
         also covers replay-from-legacy-transcripts.
+
+        ``raw_token_ids`` is the engine's exact ``generated_ids`` decode
+        sequence (delimiters included) — the forceable prefix a logit
+        fork replays.  ``None`` leaves the node's prior value untouched.
         """
         with self._lock:
             node = self.nodes.get(node_id)
@@ -819,6 +836,8 @@ class LoomTree:
             node.finish_reason = finish_reason
             node.mean_logprob = mean_logprob
             node.mean_surprise = mean_surprise
+            if raw_token_ids is not None:
+                node.raw_token_ids = list(raw_token_ids)
             self.rev += 1
             self._emit(LoomMutated(
                 op="finalize_assistant", rev=self.rev,
@@ -1143,10 +1162,11 @@ class LoomTree:
             data = self.to_dict(include_tokens=False)
             token_nodes: dict[str, dict[str, Any]] = {}
             for node in self.nodes.values():
-                if node.tokens or node.thinking_tokens:
+                if node.tokens or node.thinking_tokens or node.raw_token_ids:
                     token_nodes[node.id] = {
                         "tokens": node.tokens or [],
                         "thinking_tokens": node.thinking_tokens or [],
+                        "raw_token_ids": node.raw_token_ids or [],
                     }
             token_payload = None
             if token_nodes:
@@ -1214,6 +1234,9 @@ class LoomTree:
                 raw["thinking_tokens"] = list(
                     node_tokens.get("thinking_tokens") or []
                 )
+                rti = node_tokens.get("raw_token_ids")
+                if rti:
+                    raw["raw_token_ids"] = list(rti)
         return cls.from_dict(data, events=events)
 
 

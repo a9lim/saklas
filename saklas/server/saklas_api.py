@@ -74,6 +74,10 @@ class ExtractRequest(BaseModel):
     name: str
     source: Any = None
     baseline: str | None = None
+    method: str | None = None
+    dls: bool | None = None
+    sae: str | None = None
+    sae_revision: str | None = None
     auto_register: bool = Field(True, alias="register")
 
     model_config = {"populate_by_name": True}
@@ -96,6 +100,7 @@ class WSSamplingParams(BaseModel):
     max_tokens: int | None = None
     seed: int | None = None
     stop: list[str] | None = None
+    logit_bias: dict[int, float] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     # Phase 1 logit pass: webui "show alts" toggle wires through this
@@ -130,6 +135,15 @@ class WSGenerateMessage(BaseModel):
     # temperature=1.5"``).  Resolved through ``session.regen_with_modifier``
     # when set; ignored when None.
     recipe_override: Any = None
+    # Logit fork (v2.3): regenerate an existing assistant node as a
+    # sibling with one token swapped.  When ``fork_node_id`` is set the
+    # handler ignores ``input`` / ``steering`` / ``sampling`` / ``n`` —
+    # ``session.fork_from_token`` reuses the node's stamped recipe and
+    # replays its raw decode sequence up to ``fork_raw_index``, forcing
+    # ``fork_alt_token_id`` there before sampling the continuation.
+    fork_node_id: str | None = None
+    fork_raw_index: int | None = None
+    fork_alt_token_id: int | None = None
 
 
 # --- Loom tree request bodies (phase 2) --------------------------------
@@ -367,6 +381,7 @@ def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         max_tokens=body.max_tokens,
         seed=body.seed,
         stop=stop,
+        logit_bias=body.logit_bias,
         presence_penalty=body.presence_penalty or 0.0,
         frequency_penalty=body.frequency_penalty or 0.0,
         return_top_k=body.return_top_k,
@@ -378,11 +393,14 @@ def _build_steering(
 ) -> "Steering | None":
     """Compose a request expression string over the server default Steering.
 
-    Per-request keys override the default at the key level.
+    ``None`` inherits the server default.  An explicit empty string is a
+    request for no steering, used by the web UI's unsteered shadow runs.
+    Non-empty request keys override the default at the key level.
     """
     from saklas.core.steering_expr import parse_expr
 
     req: "Steering | None" = None
+    explicit_clear = raw is not None and not raw.strip()
     if raw is not None and raw.strip():
         req = parse_expr(raw)
 
@@ -391,7 +409,7 @@ def _build_steering(
         thinking = req.thinking
 
     merged: dict[str, Any] = {}
-    if default_steering is not None:
+    if default_steering is not None and not explicit_clear:
         merged.update(default_steering.alphas)
     if req is not None:
         for k, v in req.alphas.items():
@@ -1339,6 +1357,10 @@ def register_saklas_routes(app: FastAPI) -> None:
                         canonical, profile = await asyncio.to_thread(
                             session.extract, source, req.baseline,
                             on_progress=progress_msgs.append,
+                            sae=req.sae,
+                            sae_revision=req.sae_revision,
+                            method=req.method,
+                            dls=req.dls,
                         )
                     except SaklasError as e:
                         import logging
@@ -1362,6 +1384,10 @@ def register_saklas_routes(app: FastAPI) -> None:
             canonical, profile = await asyncio.to_thread(
                 session.extract, source, req.baseline,
                 on_progress=progress_msgs.append,
+                sae=req.sae,
+                sae_revision=req.sae_revision,
+                method=req.method,
+                dls=req.dls,
             )
             if req.auto_register:
                 session.steer(req.name, profile)
@@ -2044,6 +2070,22 @@ async def _ws_handle_generate(
 
     parent_node_id = msg.parent_node_id
 
+    # Logit fork: when ``fork_node_id`` is set the worker calls
+    # ``session.fork_from_token`` instead of ``session.generate``.  All
+    # three fork fields must be present together.
+    is_fork = msg.fork_node_id is not None
+    if is_fork and (msg.fork_raw_index is None or msg.fork_alt_token_id is None):
+        await send_json({
+            "type": "error",
+            "message": (
+                "fork requires fork_node_id, fork_raw_index, and "
+                "fork_alt_token_id together"
+            ),
+            "code": "ValueError",
+            "status": 400,
+        })
+        return
+
     # Per-sibling seed schedule: when n>1, derive deterministic per-
     # sibling seeds from the request seed (or fresh entropy).  Single
     # streams (n=1) use the user's seed verbatim.
@@ -2130,6 +2172,16 @@ async def _ws_handle_generate(
                         {"id": int(a.id), "text": a.text, "logprob": float(a.logprob)}
                         for a in top_alts
                     ]
+                # Raw decode-step index of this emitted token — the join
+                # key a logit fork slices ``raw_token_ids`` on.  Read off
+                # ``emit_map`` (appended immediately before this callback
+                # fires).  Best-effort: a mocked session has no gen state.
+                try:
+                    emap = session._gen_state.emit_map
+                    if emap:
+                        event["raw_index"] = int(emap[-1][0])
+                except Exception:
+                    pass
                 # Inline probe scores for the live inspector + chat
                 # highlight.  Computed only when probes are loaded (covers
                 # the cost of N matmul + N CPU syncs against the latest
@@ -2190,18 +2242,29 @@ async def _ws_handle_generate(
                 _recipe_override=recipe_override,
             ):
                 try:
-                    gen_kwargs: dict[str, Any] = dict(
-                        steering=steering,
-                        sampling=_sampling,
-                        stateless=msg.stateless,
-                        raw=msg.raw,
-                        thinking=msg.thinking,
-                        on_token=_on_token,
-                        parent_node_id=parent_node_id,
-                    )
-                    if _recipe_override is not None:
-                        gen_kwargs["recipe_override"] = _recipe_override
-                    result = session.generate(msg.input, **gen_kwargs)
+                    if msg.fork_node_id is not None:
+                        # Fork: recipe / sampling / parent all come from
+                        # the source node inside ``fork_from_token``; the
+                        # WS-level steering/sampling/n fields are ignored.
+                        result = session.fork_from_token(
+                            msg.fork_node_id,
+                            int(msg.fork_raw_index),  # type: ignore[arg-type]
+                            int(msg.fork_alt_token_id),  # type: ignore[arg-type]
+                            on_token=_on_token,
+                        )
+                    else:
+                        gen_kwargs: dict[str, Any] = dict(
+                            steering=steering,
+                            sampling=_sampling,
+                            stateless=msg.stateless,
+                            raw=msg.raw,
+                            thinking=msg.thinking,
+                            on_token=_on_token,
+                            parent_node_id=parent_node_id,
+                        )
+                        if _recipe_override is not None:
+                            gen_kwargs["recipe_override"] = _recipe_override
+                        result = session.generate(msg.input, **gen_kwargs)
                     _result_holder.append(result)
                 except BaseException as e:
                     _error_holder.append(e)

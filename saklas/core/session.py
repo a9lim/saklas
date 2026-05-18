@@ -2530,6 +2530,87 @@ class SaklasSession:
             n=n,
         )
 
+    def fork_from_token(
+        self,
+        node_id: str,
+        raw_index: int,
+        alt_token_id: int,
+        *,
+        on_token: Callable[..., None] | None = None,
+    ) -> GenerationResult:
+        """Logit fork — regenerate ``node_id`` as a sibling with one token swapped.
+
+        Replays the assistant node's raw decode sequence up to
+        ``raw_index``, forces ``alt_token_id`` at that position, then
+        samples the continuation freely.  The node's recipe (steering /
+        sampling / seed / thinking) is reused verbatim, so the only thing
+        that changed is the single token — a clean counterfactual.  The
+        original seed is re-applied and the sampler still draws every
+        forced step, so the RNG stream is bit-identical through the fork
+        point; the divergence downstream is purely the model reacting to
+        the swapped token.
+
+        Lands as a sibling assistant node under the same user turn (the
+        dedup path :meth:`regen_with_modifier` uses).  Raises
+        :class:`InvalidNodeOperationError` when the node isn't a forkable
+        assistant — wrong role, no ``raw_token_ids`` (legacy or
+        transcript-loaded node), or ``raw_index`` out of range.
+        """
+        from dataclasses import replace as _replace
+
+        node = self.tree.get(node_id)
+        if node.role != "assistant":
+            raise InvalidNodeOperationError(
+                f"fork_from_token: {node_id!r} is a {node.role} node, "
+                f"not a forkable assistant"
+            )
+        raw = node.raw_token_ids
+        if not raw:
+            raise InvalidNodeOperationError(
+                f"fork_from_token: {node_id!r} has no raw token record "
+                f"(legacy or transcript-loaded node — not forkable)"
+            )
+        if not 0 <= raw_index < len(raw):
+            raise InvalidNodeOperationError(
+                f"fork_from_token: raw_index {raw_index} out of range "
+                f"[0, {len(raw)}) for {node_id!r}"
+            )
+        forced_prefix = [int(t) for t in raw[:raw_index]] + [int(alt_token_id)]
+
+        user_node = (
+            self.tree.nodes.get(node.parent_id) if node.parent_id else None
+        )
+        if user_node is None or user_node.role != "user":
+            raise InvalidNodeOperationError(
+                f"fork_from_token: {node_id!r} has no user parent to "
+                f"anchor the forked sibling under"
+            )
+
+        recipe = node.recipe
+        base_sampling = (
+            recipe.sampling
+            if (recipe is not None and recipe.sampling is not None)
+            else SamplingConfig()
+        )
+        # The forced prefix burns ``len(forced_prefix)`` decode steps
+        # before the continuation starts — extend the token budget by
+        # that much so a deep fork keeps the original continuation
+        # headroom rather than stopping just past the fork point.
+        base_max = base_sampling.max_tokens or self.config.max_new_tokens
+        fork_sampling = _replace(
+            base_sampling, max_tokens=len(forced_prefix) + base_max,
+        )
+
+        return self._generate_core(
+            user_node.text,
+            steering=recipe.steering if recipe is not None else None,
+            sampling=fork_sampling,
+            thinking=recipe.thinking if recipe is not None else None,
+            on_token=on_token,
+            parent_node_id=user_node.parent_id,
+            forced_prefix=forced_prefix,
+        )
+
     # -- History / loom tree --
 
     def _check_user_send_target(self, parent_node_id: str | None) -> None:
@@ -2938,6 +3019,7 @@ class SaklasSession:
         # ``_token_tap`` accumulator); both are ``None`` when no logprob
         # capture was live, so legacy paths land cleanly.
         if not stateless and assistant_node_id is not None:
+            self._stamp_raw_indices(assistant_node_id)
             self.tree.finalize_assistant(
                 assistant_node_id,
                 text=text,
@@ -2946,9 +3028,36 @@ class SaklasSession:
                 finish_reason=self._gen_state.finish_reason,
                 mean_logprob=mean_logprob,
                 mean_surprise=mean_surprise,
+                raw_token_ids=generated_ids,
             )
 
         return result
+
+    def _stamp_raw_indices(self, node_id: str) -> None:
+        """Stamp each emitted token row with its ``generated_ids`` index.
+
+        ``state.emit_map`` records ``(raw_index, is_thinking)`` per emitted
+        token in emission order; the node's ``tokens`` / ``thinking_tokens``
+        rows are in that same order, split by the thinking flag.  The
+        stamped ``raw_index`` is the join key a logit fork uses to slice
+        ``raw_token_ids`` at the clicked token — emitted-token coordinates
+        don't line up with raw decode steps once delimiters (suppressed)
+        and partial-UTF-8 runs (merged) enter the picture.
+        """
+        node = self.tree.nodes.get(node_id)
+        if node is None:
+            return
+        resp_rows = node.tokens or []
+        think_rows = node.thinking_tokens or []
+        r_i = t_i = 0
+        for raw_index, is_thinking in self._gen_state.emit_map:
+            if is_thinking:
+                if t_i < len(think_rows):
+                    think_rows[t_i]["raw_index"] = raw_index
+                    t_i += 1
+            elif r_i < len(resp_rows):
+                resp_rows[r_i]["raw_index"] = raw_index
+                r_i += 1
 
     def _generation_preamble(self, input, raw, thinking, stateless=False,
                              parent_node_id: str | None = None):
@@ -3173,6 +3282,7 @@ class SaklasSession:
         presence_penalty: float,
         frequency_penalty: float,
         lp_count: int | None,
+        forced_prefix: list[int] | None = None,
     ) -> tuple[list[int], float]:
         """Run the decode loop once capture and steering are installed."""
         cached_pkv = None
@@ -3213,6 +3323,7 @@ class SaklasSession:
             cache_position_offset=cache_position_offset,
             score_callback=gating_callback,
             use_static_cache=use_static_cache,
+            forced_prefix=forced_prefix,
         )
         elapsed = time.monotonic() - start
 
@@ -3235,6 +3346,7 @@ class SaklasSession:
         on_token: Callable[..., None] | None = None,
         parent_node_id: str | None = None,
         recipe_override: "Recipe | str | None" = None,
+        forced_prefix: list[int] | None = None,
     ) -> GenerationResult:
         """Shared generation implementation.
 
@@ -3410,6 +3522,7 @@ class SaklasSession:
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
                     lp_count=lp_count,
+                    forced_prefix=forced_prefix,
                 )
             finally:
                 self._gen_state.stop_requested.set()

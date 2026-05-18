@@ -1456,6 +1456,9 @@ function handleWsMessage(msg: WSServerMessage): void {
         // and no other on_token consumer is live (legacy default).
         logprob: msg.logprob ?? null,
         topAlts: msg.top_alts ?? null,
+        // Raw decode-step index — the join key the logit fork slices
+        // ``raw_token_ids`` on.  Rides the WS ``token`` event directly.
+        rawIndex: msg.raw_index ?? null,
       };
       // Seed the single-probe ``score`` for the selected highlight so the
       // inline tint paints immediately as the token streams in.  The
@@ -1717,6 +1720,30 @@ export async function sendGenerate(
     ...(opts.recipe_override !== undefined
       ? { recipe_override: opts.recipe_override }
       : {}),
+  };
+  const send = () => sock.send(JSON.stringify(payload));
+  if (sock.readyState === WebSocket.OPEN) send();
+  else sock.addEventListener("open", send, { once: true });
+}
+
+/** Logit fork — regenerate an existing assistant node as a sibling with
+ *  one token swapped.  The server reuses the source node's stamped
+ *  recipe (steering / sampling / seed / thinking) and replays its raw
+ *  decode sequence up to ``rawIndex``, forcing ``altTokenId`` there
+ *  before sampling the continuation.  Streams in like any regen: the
+ *  new sibling lands via the WS ``node_created`` / ``token`` / ``done``
+ *  events and becomes the active branch. */
+export async function sendFork(
+  nodeId: string,
+  rawIndex: number,
+  altTokenId: number,
+): Promise<void> {
+  const sock = await ensureWebSocket();
+  const payload: WSClientMessage = {
+    type: "generate",
+    fork_node_id: nodeId,
+    fork_raw_index: rawIndex,
+    fork_alt_token_id: altTokenId,
   };
   const send = () => sock.send(JSON.stringify(payload));
   if (sock.readyState === WebSocket.OPEN) send();

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -315,6 +316,135 @@ def test_format_node_detail_includes_recipe_and_readings():
     assert "angry.calm" in out
     assert "happy.sad" in out
     assert "hello" in out
+
+
+def test_format_node_detail_includes_mean_logprob():
+    tree = LoomTree()
+    uid = tree.add_user_turn("hi")
+    aid = tree.begin_assistant(uid)
+    tree.finalize_assistant(aid, text="hello", mean_logprob=-0.42)
+    out = format_node_detail(tree, aid)
+    assert "mean lp" in out
+    assert "-0.420" in out
+
+
+def test_format_node_detail_escapes_markup_in_text():
+    """Completion text can't inject Rich markup into the detail pane."""
+    tree = LoomTree()
+    uid = tree.add_user_turn("hi")
+    aid = tree.begin_assistant(uid)
+    tree.finalize_assistant(aid, text="see [bold]this[/bold]")
+    out = format_node_detail(tree, aid)
+    assert r"\[bold]" in out
+
+
+# ---------------------------------------------------------------------------
+# Loom-screen helpers — node labels, probe gutter, sibling compare
+# ---------------------------------------------------------------------------
+
+
+def test_node_label_marks_active_starred_and_edited():
+    from saklas.tui.loom_screen import _node_label
+
+    tree = LoomTree()
+    uid = tree.add_user_turn("hello there")
+    aid = tree.begin_assistant(uid)
+    tree.finalize_assistant(aid, text="an answer")
+    tree.star(aid, on=True)
+    tree.edit(aid, "an edited answer")
+    node = tree.get(aid)
+
+    active = _node_label(node, is_active=True)
+    assert "[b]" in active and aid[:8] in active
+    assert "★" in active
+    assert "✎" in active  # edit_count marker
+
+    dimmed = _node_label(node, dim=True)
+    assert dimmed.startswith("[dim]") and dimmed.endswith("[/dim]")
+
+
+def test_probe_gutter_signs_and_blank():
+    from saklas.tui.loom_screen import _probe_gutter
+
+    tree = LoomTree()
+    uid = tree.add_user_turn("hi")
+    aid = tree.begin_assistant(uid)
+    tree.finalize_assistant(
+        aid, text="x", aggregate_readings={"warm.clinical": 0.8},
+    )
+    node = tree.get(aid)
+    assert "ansi_green" in _probe_gutter(node, "warm.clinical")
+
+    tree2 = LoomTree()
+    u2 = tree2.add_user_turn("hi")
+    a2 = tree2.begin_assistant(u2)
+    tree2.finalize_assistant(
+        a2, text="x", aggregate_readings={"warm.clinical": -0.8},
+    )
+    assert "ansi_red" in _probe_gutter(tree2.get(a2), "warm.clinical")
+
+    # No probe selected, sentinel probe, or missing reading → blank.
+    assert _probe_gutter(node, None) == " "
+    assert _probe_gutter(node, "__surprise__") == " "
+    assert _probe_gutter(node, "angry.calm") == " "
+
+
+def _wire_real_diff(session: Any, tree: LoomTree) -> None:
+    """Point ``session.diff_nodes`` at the real loom_diff primitives."""
+    def _real_diff(a_id: str, b_id: str):
+        a = tree.get(a_id)
+        b = tree.get(b_id)
+        return saklas.NodeDiff(
+            a_id=a_id, b_id=b_id,
+            parent_id=a.parent_id if a.parent_id == b.parent_id else None,
+            text=saklas.text_diff(a.text or "", b.text or ""),
+            readings=saklas.readings_diff(
+                a.aggregate_readings or {}, b.aggregate_readings or {},
+            ),
+        )
+    session.diff_nodes = _real_diff
+
+
+def test_format_compare_renders_sibling_diff():
+    from saklas.tui.loom_helpers import format_compare
+
+    tree = LoomTree()
+    uid = tree.add_user_turn("hi")
+    aid = tree.begin_assistant(uid, recipe=Recipe(steering="0.3 honest"))
+    tree.finalize_assistant(aid, text="answer one", aggregate_readings={"calm": 0.5})
+    bid = tree.begin_assistant(uid, recipe=Recipe(steering="0.6 honest"))
+    tree.finalize_assistant(bid, text="answer two", aggregate_readings={"calm": 0.1})
+    session = SimpleNamespace(tree=tree)
+    _wire_real_diff(session, tree)
+
+    out = format_compare(session, bid)  # type: ignore[arg-type]
+    assert "compare" in out
+    assert aid[:8] in out          # the sibling is listed
+    assert "honest" in out         # steering delta term
+    assert "calm" in out           # reading delta
+    assert "two" in out            # word-level text diff
+
+
+def test_format_compare_no_siblings_is_advisory():
+    from saklas.tui.loom_helpers import format_compare
+
+    tree = LoomTree()
+    uid = tree.add_user_turn("hi")
+    aid = tree.begin_assistant(uid)
+    tree.finalize_assistant(aid, text="lonely")
+    session = SimpleNamespace(tree=tree)
+    out = format_compare(session, aid)  # type: ignore[arg-type]
+    assert "no assistant siblings" in out
+
+
+def test_format_compare_non_assistant_is_advisory():
+    from saklas.tui.loom_helpers import format_compare
+
+    tree = LoomTree()
+    uid = tree.add_user_turn("hi")
+    session = SimpleNamespace(tree=tree)
+    out = format_compare(session, uid)  # type: ignore[arg-type]
+    assert "assistant node" in out
 
 
 # ---------------------------------------------------------------------------

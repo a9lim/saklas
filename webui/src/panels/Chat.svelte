@@ -210,7 +210,6 @@
   }
 
   function clearChat(): void {
-    actionsMenuOpen = false;
     if (genStatus.active) {
       enqueuePending({ label: "clear", apply: () => void clearSessionHistory() });
     } else {
@@ -219,7 +218,6 @@
   }
 
   function rewindChat(): void {
-    actionsMenuOpen = false;
     if (genStatus.active) {
       enqueuePending({ label: "rewind", apply: () => void rewindSession() });
     } else {
@@ -241,24 +239,14 @@
 
   const canRegen = $derived(lastUserInput() !== null);
 
-  // ----- actions (⋮) menu -----
-
-  let actionsMenuOpen = $state(false);
-  let actionsMenuRef: HTMLDivElement | null = $state(null);
-
-  function onDocClick(ev: MouseEvent): void {
-    if (!actionsMenuOpen) return;
-    if (actionsMenuRef && !actionsMenuRef.contains(ev.target as Node)) {
-      actionsMenuOpen = false;
-    }
-  }
-  function onDocKey(ev: KeyboardEvent): void {
-    if (ev.key === "Escape" && actionsMenuOpen) actionsMenuOpen = false;
-  }
-
   function openTranscript(): void {
-    actionsMenuOpen = false;
     openDrawer("transcript");
+  }
+
+  function onAutoRegenModeChange(ev: Event): void {
+    setAutoRegenMode(
+      (ev.currentTarget as HTMLSelectElement).value as AutoRegenMode,
+    );
   }
 
   // ------------------------------------------------------------- A/B split --
@@ -389,12 +377,6 @@
     autosize();
     scrollToBottom();
     textareaRef?.focus();
-    document.addEventListener("click", onDocClick);
-    document.addEventListener("keydown", onDocKey);
-    return () => {
-      document.removeEventListener("click", onDocClick);
-      document.removeEventListener("keydown", onDocKey);
-    };
   });
 
   // ----------------------------------------------------------- token render --
@@ -617,68 +599,49 @@
     {/if}
 
     <!-- Conversation actions — clear / rewind / transcript / auto-regen
-         collapse into one ⋮ menu so the panel header stays quiet. -->
-    <div class="header-actions" bind:this={actionsMenuRef}>
-      <button
-        type="button"
-        class="kebab"
-        class:on={actionsMenuOpen}
-        aria-haspopup="menu"
-        aria-expanded={actionsMenuOpen}
-        aria-label="Conversation actions"
-        title="Conversation actions"
-        onclick={() => (actionsMenuOpen = !actionsMenuOpen)}
-      >⋮</button>
-      {#if actionsMenuOpen}
-        <div class="actions-menu" role="menu">
-          <button type="button" role="menuitem" onclick={clearChat}>
-            clear chat
-          </button>
-          <button type="button" role="menuitem" onclick={rewindChat}>
-            rewind last turn
-          </button>
-          <button type="button" role="menuitem" onclick={openTranscript}>
-            transcript…
-          </button>
-          <hr />
-          <label class="menu-check">
-            <input
-              type="checkbox"
-              checked={autoRegenState.enabled}
-              onchange={toggleAutoRegen}
-            />
-            <span>auto-regen</span>
-          </label>
-          {#if autoRegenState.enabled}
-            <label class="menu-row">
-              <span>mode</span>
-              <select
-                value={autoRegenState.mode}
-                onchange={(ev) =>
-                  setAutoRegenMode(
-                    (ev.currentTarget as HTMLSelectElement)
-                      .value as AutoRegenMode,
-                  )}
-              >
-                {#each AUTO_REGEN_MODES as opt (opt.value)}
-                  <option value={opt.value}>{opt.label}</option>
-                {/each}
-              </select>
-            </label>
-            {#if autoRegenState.mode === "custom"}
-              <input
-                type="text"
-                class="menu-input"
-                value={autoRegenState.custom}
-                oninput={(ev) =>
-                  setAutoRegenCustom(
-                    (ev.currentTarget as HTMLInputElement).value,
-                  )}
-                placeholder="seed=42, temperature=1.5"
-              />
-            {/if}
-          {/if}
-        </div>
+         sit inline at the end of the header so they're one click away. -->
+    <div class="header-actions">
+      <button type="button" class="hbtn" onclick={clearChat}>
+        clear chat
+      </button>
+      <button type="button" class="hbtn" onclick={rewindChat}>
+        rewind last turn
+      </button>
+      <button type="button" class="hbtn" onclick={openTranscript}>
+        transcript…
+      </button>
+      <label class="ctl ctl-inline">
+        <input
+          type="checkbox"
+          checked={autoRegenState.enabled}
+          onchange={toggleAutoRegen}
+        />
+        <span class="ctl-label">auto-regen</span>
+      </label>
+      {#if autoRegenState.enabled}
+        <select
+          class="ctl-select"
+          value={autoRegenState.mode}
+          onchange={onAutoRegenModeChange}
+          aria-label="Auto-regen mode"
+        >
+          {#each AUTO_REGEN_MODES as opt (opt.value)}
+            <option value={opt.value}>{opt.label}</option>
+          {/each}
+        </select>
+        {#if autoRegenState.mode === "custom"}
+          <input
+            type="text"
+            class="ctl-input"
+            value={autoRegenState.custom}
+            oninput={(ev) =>
+              setAutoRegenCustom(
+                (ev.currentTarget as HTMLInputElement).value,
+              )}
+            placeholder="seed=42, temperature=1.5"
+            aria-label="Custom auto-regen recipe"
+          />
+        {/if}
       {/if}
     </div>
   </header>
@@ -895,6 +858,9 @@
     cursor: pointer;
     user-select: none;
   }
+  .ctl-inline input {
+    accent-color: var(--accent-blue);
+  }
   .ctl-label {
     color: var(--fg-muted);
     text-transform: lowercase;
@@ -913,117 +879,47 @@
     cursor: not-allowed;
   }
 
-  /* Conversation-actions ⋮ menu — pushed to the right of the header. */
+  /* Conversation-actions strip — inline, pushed to the right edge of
+   * the header.  Wraps onto a second row on narrow layouts. */
   .header-actions {
-    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    flex-wrap: wrap;
     margin-left: auto;
   }
-  .kebab {
+  .hbtn {
     background: transparent;
     border: 1px solid var(--border);
     border-radius: var(--radius);
     color: var(--fg-dim);
-    padding: 0.1em 0.5em;
+    padding: 0.15em 0.55em;
     font: inherit;
     font-family: var(--font-mono);
-    line-height: 1.4;
+    font-size: var(--font-size-small);
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
       border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
-  .kebab:hover,
-  .kebab.on {
+  .hbtn:hover {
     background: var(--bg-elev);
-    border-color: var(--fg-muted);
-    color: var(--fg-strong);
-  }
-  .actions-menu {
-    position: absolute;
-    right: 0;
-    top: calc(100% + 4px);
-    min-width: 200px;
-    background: var(--surface-strong);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 0.25em 0;
-    z-index: var(--z-modal);
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
-    display: flex;
-    flex-direction: column;
-    gap: 0.1em;
-    animation: menu-in var(--dur) var(--ease-out);
-  }
-  @keyframes menu-in {
-    from {
-      opacity: 0;
-      transform: translateY(-4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  .actions-menu button[role="menuitem"] {
-    background: transparent;
-    border: 0;
-    text-align: left;
-    padding: 0.4em 0.8em;
-    color: var(--fg-strong);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--font-size-small);
-    cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-out);
-  }
-  .actions-menu button[role="menuitem"]:hover {
-    background: var(--bg-elev);
+    border-color: var(--accent-blue);
     color: var(--accent-blue);
   }
-  .actions-menu hr {
-    border: 0;
-    border-top: 1px solid var(--border-dim);
-    margin: 0.2em 0;
-  }
-  .menu-check,
-  .menu-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5em;
-    padding: 0.35em 0.8em;
-    color: var(--fg-dim);
-    font-size: var(--font-size-small);
-  }
-  .menu-check {
-    cursor: pointer;
-  }
-  .menu-check input {
-    accent-color: var(--accent-blue);
-  }
-  .menu-row select {
-    flex: 1 1 auto;
-    background: var(--bg-alt);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 0.1em 0.35em;
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--font-size-small);
-  }
-  .menu-input {
-    margin: 0 0.8em 0.4em;
+  .ctl-input {
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 0.25em 0.45em;
+    padding: 0.15em 0.45em;
     font: inherit;
     font-family: var(--font-mono);
     font-size: var(--font-size-small);
+    min-width: 14em;
   }
-  .menu-input:focus {
+  .ctl-input:focus {
     outline: none;
     border-color: var(--accent-blue);
   }
