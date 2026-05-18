@@ -465,11 +465,24 @@ class SaklasApp(App[None]):
             self._handle_command(text)
             return
         self._last_prompt = text
+        # Role-aware send: when the active loom node is a user turn the
+        # input seeds the *assistant* reply (answer-prefill) rather than
+        # appending a new user message.  Decide once, here — the pending
+        # tuple carries the target so a deferred dispatch can't re-resolve
+        # against a shifted active node.
+        prefill_target = self._prefill_target_node_id()
+        if prefill_target is None:
+            # Normal send — mount the user row now (chat_panel no longer
+            # mounts it; it can't know the active-node role).
+            self._chat_panel.add_user_message(text)
         if self._session.is_generating:
             # Queue the message — it will be submitted once the current
             # generation finishes (see _poll_generation).
-            self._pending_action = ("submit", text)
+            self._pending_action = ("submit", text, prefill_target)
             self._session.stop()
+            return
+        if prefill_target is not None:
+            self._start_prefill(prefill_target, text)
             return
         self._start_generation(text)
 
@@ -1005,6 +1018,9 @@ class SaklasApp(App[None]):
                 self._assistant_messages.append(widget)
                 self._row_for_widget[id(widget)] = row
         chat.scroll_to_bottom()
+        # Navigation may have landed the active node on a user turn —
+        # refresh the input placeholder so it signals prefill vs. send.
+        self._refresh_input_mode()
 
     def _do_rewind(self) -> None:
         if not self._messages:
@@ -1175,6 +1191,109 @@ class SaklasApp(App[None]):
 
         self.run_worker(_generate, thread=True)
 
+    def _prefill_target_node_id(self) -> str | None:
+        """Active node id when it's a user turn, else ``None``.
+
+        A user-role active node means the turn below it is the
+        assistant's — so a typed message composes the assistant reply
+        (answer-prefill) rather than a new user turn.  Returning ``None``
+        keeps the normal ``_start_generation`` path.
+        """
+        tree = self._session.tree
+        active = tree.nodes.get(tree.active_node_id)
+        if active is not None and active.role == "user":
+            return active.id
+        return None
+
+    def _refresh_input_mode(self) -> None:
+        """Sync the chat input's prefill-mode placeholder to the active node.
+
+        Called from every active-node transition funnel
+        (:meth:`_repaint_chat_from_active_path` for navigation, the
+        ``done`` sentinel in :meth:`_poll_generation` for post-gen) so the
+        placeholder tracks whether a typed message would prefill or send.
+        """
+        self._chat_panel.set_prefill_mode(
+            self._prefill_target_node_id() is not None
+        )
+
+    def _start_prefill(self, node_id: str, prefill_text: str) -> None:
+        """Answer-prefill — seed the assistant reply under user node
+        ``node_id`` with ``prefill_text``, then stream the continuation.
+
+        Routes through ``session.prefill_assistant``; the seeded prefix
+        and its continuation stream into a fresh assistant widget via the
+        same ``_ui_token_queue`` pipeline ``_start_generation`` uses, this
+        time fed by ``prefill_assistant``'s ``on_token`` callback rather
+        than a ``generate_stream`` iterator.  Steering rides from the
+        current rack; thinking is forced off engine-side (the text is the
+        start of the answer, not a thought).
+        """
+        self._ui_gen_active = True
+
+        self._gen_token_count = 0
+        self._last_tok_per_sec = 0.0
+        self._last_elapsed = 0.0
+        self._log_ppl_sum = 0.0
+        self._ppl_count = 0
+        self._gen_start_time = time.monotonic()
+
+        row, widget = self._chat_panel.start_assistant_message()
+        self._row_for_widget[id(widget)] = row
+        self._current_assistant_widget = widget
+        self._assistant_messages.append(widget)
+        if self._highlighting:
+            widget.apply_highlight(True, self._highlight_probe)
+
+        alphas = self._active_alphas()
+        # Prefill is always non-thinking — the text opens the answer, so
+        # the thinking channel is skipped (``prefill_assistant`` forces
+        # ``thinking=False`` regardless; the local Steering matches).
+        steering = (
+            Steering(alphas=dict(alphas), thinking=False) if alphas else None
+        )
+        sampling = SamplingConfig(
+            temperature=self._session.config.temperature,
+            top_p=self._session.config.top_p,
+            max_tokens=self._session.config.max_new_tokens,
+            seed=self._default_seed,
+            logprobs=0,
+        )
+
+        def _on_token(text, is_thinking, tid, lp, top_alts, perplexity):
+            # Mirrors the ``("tok", …)`` tuple ``_start_generation`` builds
+            # from a ``TokenEvent``.  ``prefill_assistant``'s on_token
+            # carries no probe scores (no streaming monitor hook on this
+            # path) — pass ``None``; ``_finalize_widget_highlight`` fills
+            # the canonical per-token scores in at finalize.
+            self._ui_token_queue.put(
+                ("tok", text, bool(is_thinking), None, perplexity, lp,
+                 widget, False),
+            )
+            self._gen_token_count += 1
+
+        def _prefill() -> None:
+            try:
+                self._session.prefill_assistant(
+                    node_id, prefill_text,
+                    steering=steering,
+                    sampling=sampling,
+                    on_token=_on_token,
+                )
+                self._ui_token_queue.put(("finalize", widget, False))
+            except BaseException as e:
+                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+                self._ui_token_queue.put(("error", msg, False))
+            finally:
+                if self._session._device.type == "mps":
+                    try:
+                        torch.mps.synchronize()
+                    except Exception:
+                        pass
+                self._ui_token_queue.put(("done", False))
+
+        self.run_worker(_prefill, thread=True)
+
     def _poll_generation(self) -> None:
         chat = self._chat_panel
         tokens_consumed = 0
@@ -1243,6 +1362,11 @@ class SaklasApp(App[None]):
                     if self._last_elapsed > MIN_ELAPSED_FOR_RATE:
                         self._last_tok_per_sec = self._gen_token_count / self._last_elapsed
                     self._gen_start_time = 0.0
+                if not is_shadow:
+                    # The finished turn moved the active node onto its new
+                    # assistant — refresh the input placeholder out of any
+                    # prefill mode it was in.
+                    self._refresh_input_mode()
 
                 # Shadow done: clear shadow flags, then fall through to
                 # pending-action drain so anything queued during the
@@ -2157,7 +2281,15 @@ class SaklasApp(App[None]):
                 chat.rewind_last_assistant()
                 self._start_generation()
             elif kind == "submit":
-                self._start_generation(pending[1])
+                # ``("submit", text, prefill_target)`` — phase 5 carries
+                # the role decision made at submit time so the deferred
+                # dispatch matches whatever the user-row mount did.  A
+                # legacy 2-tuple stash falls through to a normal send.
+                target = pending[2] if len(pending) > 2 else None
+                if target is not None:
+                    self._start_prefill(target, pending[1])
+                else:
+                    self._start_generation(pending[1])
             elif kind == "clear":
                 self._do_clear()
             elif kind == "rewind":

@@ -298,6 +298,14 @@ export interface WSGenerateRequest {
   fork_node_id?: string | null;
   fork_raw_index?: number | null;
   fork_alt_token_id?: number | null;
+  /** Answer-prefill: seed an assistant reply under a user node.  When
+   *  ``prefill_node_id`` is set the server ignores ``input`` and the
+   *  ``fork_*`` fields, tokenizes ``prefill_text`` into a forced decode
+   *  prefix, and lands the result as a sibling assistant under the user
+   *  node (``thinking`` forced off — the text is the start of the
+   *  answer).  ``steering`` / ``sampling`` / ``n`` ride through. */
+  prefill_node_id?: string | null;
+  prefill_text?: string | null;
 }
 
 export interface WSStopRequest {

@@ -1052,3 +1052,69 @@ def test_ab_compare_flips_auto_regen_on():
     app.action_ab_compare()
     assert app._ab_mode is False
     assert app._loom_auto_regen_on is False
+
+
+# ---------------------------------------------------------------------------
+# Role-aware send — answer-prefill on a user node
+# ---------------------------------------------------------------------------
+
+
+def test_prefill_target_is_user_node_when_user_active():
+    app = _make_app()
+    tree = app._session.tree
+    uid, _aid = _seed_tree(tree)
+    tree.navigate(uid)
+    assert app._prefill_target_node_id() == uid
+
+
+def test_prefill_target_is_none_when_assistant_active():
+    app = _make_app()
+    tree = app._session.tree
+    _uid, aid = _seed_tree(tree)
+    tree.navigate(aid)
+    assert app._prefill_target_node_id() is None
+
+
+def test_user_submitted_on_user_node_routes_to_prefill():
+    """A typed message on a user node prefills the assistant reply."""
+    app = _make_app()
+    tree = app._session.tree
+    uid, _aid = _seed_tree(tree)
+    tree.navigate(uid)
+    app._start_prefill = MagicMock()
+    app._start_generation = MagicMock()
+    app.on_chat_panel_user_submitted(SimpleNamespace(text="It is sunny"))
+    app._start_prefill.assert_called_once_with(uid, "It is sunny")
+    app._start_generation.assert_not_called()
+    # The prefill path must not optimistically mount a user row.
+    app._chat_panel.add_user_message.assert_not_called()
+
+
+def test_user_submitted_on_assistant_node_routes_to_generation():
+    """A typed message on an assistant node is a normal new user turn."""
+    app = _make_app()
+    tree = app._session.tree
+    _uid, aid = _seed_tree(tree)
+    tree.navigate(aid)
+    app._start_prefill = MagicMock()
+    app._start_generation = MagicMock()
+    app.on_chat_panel_user_submitted(SimpleNamespace(text="next question"))
+    app._start_generation.assert_called_once_with("next question")
+    app._start_prefill.assert_not_called()
+    app._chat_panel.add_user_message.assert_called_once_with("next question")
+
+
+def test_user_submitted_on_user_node_defers_prefill_target_in_pending():
+    """Mid-gen submit stashes the prefill target so the deferred dispatch
+    can't re-resolve against a shifted active node."""
+    app = _make_app()
+    tree = app._session.tree
+    uid, _aid = _seed_tree(tree)
+    tree.navigate(uid)
+    app._session.is_generating = True
+    app._session.stop = MagicMock()
+    app._start_prefill = MagicMock()
+    app.on_chat_panel_user_submitted(SimpleNamespace(text="seed it"))
+    assert app._pending_action == ("submit", "seed it", uid)
+    app._start_prefill.assert_not_called()
+    app._session.stop.assert_called_once()

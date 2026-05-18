@@ -1750,6 +1750,36 @@ export async function sendFork(
   else sock.addEventListener("open", send, { once: true });
 }
 
+/** Answer-prefill — seed an assistant reply under a user node.  The
+ *  server tokenizes ``text`` into a forced decode prefix, emits it as
+ *  the opening of the assistant turn, then samples the continuation.
+ *  The prefilled sibling streams in via the WS ``node_created`` /
+ *  ``token`` / ``done`` events and becomes the active branch.  Steering
+ *  and sampling ride from the current rack exactly like a normal
+ *  ``sendGenerate``; ``thinking`` is forced off server-side (the text is
+ *  the start of the answer, not a thought). */
+export async function sendPrefill(
+  nodeId: string,
+  text: string,
+  opts: { n?: number } = {},
+): Promise<void> {
+  const sock = await ensureWebSocket();
+  const steering = currentSteeringExpression();
+  const sampling = buildSamplingPayload();
+  genStatus.maxTokens = sampling?.max_tokens ?? samplingState.max_tokens;
+  const payload: WSClientMessage = {
+    type: "generate",
+    prefill_node_id: nodeId,
+    prefill_text: text,
+    steering: steering || null,
+    sampling,
+    ...(opts.n !== undefined ? { n: opts.n } : {}),
+  };
+  const send = () => sock.send(JSON.stringify(payload));
+  if (sock.readyState === WebSocket.OPEN) send();
+  else sock.addEventListener("open", send, { once: true });
+}
+
 export function sendStop(): void {
   if (
     wsConn.socket &&

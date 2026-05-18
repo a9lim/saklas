@@ -43,6 +43,12 @@ Navigation is cursor-based, one coherent model (the old screen had Tree-native c
 
 TUI regen paths (`_start_generation` post-`_rewind_active_assistant`, `_run_regen_n_worker`) pass `parent_node_id=<user.parent_id>` explicitly so the dedup at `add_user_turn` re-uses the existing user node rather than tripping D15. The helper lives on the session so other surfaces (HTTP, programmatic) get the same enforcement.
 
+## Role-aware send / answer-prefill
+
+When the active loom node is a *user* turn, the turn below it is the assistant's — so a typed chat message composes the assistant reply (answer-prefill) rather than a new user turn. `on_chat_panel_user_submitted` consults `_prefill_target_node_id()` (active node id when it's user-role, else `None`): non-`None` routes to `_start_prefill(node_id, text)`, which calls `session.prefill_assistant` and streams the seeded prefix + continuation through the same `_ui_token_queue` pipeline `_start_generation` uses — fed by `prefill_assistant`'s `on_token` callback rather than a `generate_stream` iterator (no live probe scores on this path; `_finalize_widget_highlight` fills canonical per-token scores at finalize). The decision is made once at submit time and carried in the `("submit", text, prefill_target)` pending tuple so a deferred dispatch can't re-resolve against a shifted active node.
+
+`chat_panel.on_input_submitted` no longer mounts the user row — it can't know the active-node role — it just posts `UserSubmitted`; `on_chat_panel_user_submitted` mounts it for normal sends and skips it for prefills. `chat_panel.set_prefill_mode(on)` flips the input placeholder between `Type a message...` and `Prefill the assistant's reply…`; `_refresh_input_mode()` syncs it to the active node from the two transition funnels (`_repaint_chat_from_active_path` for navigation, the `done` sentinel in `_poll_generation` for post-gen).
+
 ## Mid-gen interruption
 
 Any conflicting action (Ctrl+R, new message, any modifying slash command) stops current gen and defers via `_pending_action`; `_poll_generation` consumes the `("done",)` sentinel and calls `_dispatch_pending_action` (single-site try/except that resets state and surfaces errors via `add_system_message`). Panel focus uses index constants `_LEFT`/`_CHAT`/`_TRAIT`.

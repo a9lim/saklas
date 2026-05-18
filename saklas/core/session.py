@@ -2611,6 +2611,72 @@ class SaklasSession:
             forced_prefix=forced_prefix,
         )
 
+    def prefill_assistant(
+        self,
+        node_id: str,
+        text: str,
+        *,
+        steering: "str | Steering | None" = None,
+        sampling: SamplingConfig | None = None,
+        on_token: Callable[..., None] | None = None,
+    ) -> GenerationResult:
+        """Answer-prefill — seed the assistant reply under a user node.
+
+        Generates an assistant child of the user node ``node_id`` whose
+        response *begins* with ``text``, then samples the continuation
+        freely.  ``text`` is tokenized and handed to the engine as a
+        ``forced_prefix`` — the same logit primitive :meth:`fork_from_token`
+        rides — so the first ``len(forced_prefix)`` decode steps emit
+        exactly those ids before free sampling takes over.  The result
+        lands as a sibling assistant node under ``node_id`` (the dedup
+        path :meth:`fork_from_token` uses: anchor at the user node's
+        parent so ``add_user_turn`` re-uses the existing user turn).
+
+        Prefill is an *answer* prefill: ``text`` is the start of the
+        response, so the thinking channel is skipped entirely
+        (``thinking=False``).  Unlike a fork there's no source recipe to
+        inherit — ``steering`` / ``sampling`` are honored exactly as a
+        normal :meth:`generate` call.  The token budget is bumped by
+        ``len(forced_prefix)`` so the continuation keeps full headroom
+        rather than stopping just past the seeded span.
+
+        Raises :class:`InvalidNodeOperationError` when ``node_id`` isn't a
+        user node, or when ``text`` tokenizes to an empty sequence.
+        """
+        from dataclasses import replace as _replace
+
+        node = self.tree.get(node_id)
+        if node.role != "user":
+            raise InvalidNodeOperationError(
+                f"prefill_assistant: {node_id!r} is a {node.role} node, "
+                f"not a user node — prefill seeds the assistant reply "
+                f"that hangs off a user turn"
+            )
+        forced_prefix = list(
+            self._tokenizer.encode(text, add_special_tokens=False)
+        )
+        if not forced_prefix:
+            raise InvalidNodeOperationError(
+                f"prefill_assistant: {text!r} tokenized to an empty "
+                f"sequence — nothing to prefill"
+            )
+
+        base_sampling = sampling if sampling is not None else SamplingConfig()
+        base_max = base_sampling.max_tokens or self.config.max_new_tokens
+        prefill_sampling = _replace(
+            base_sampling, max_tokens=len(forced_prefix) + base_max,
+        )
+
+        return self._generate_core(
+            node.text,
+            steering=steering,
+            sampling=prefill_sampling,
+            thinking=False,
+            on_token=on_token,
+            parent_node_id=node.parent_id,
+            forced_prefix=forced_prefix,
+        )
+
     # -- History / loom tree --
 
     def _check_user_send_target(self, parent_node_id: str | None) -> None:

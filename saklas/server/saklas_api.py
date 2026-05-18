@@ -144,6 +144,15 @@ class WSGenerateMessage(BaseModel):
     fork_node_id: str | None = None
     fork_raw_index: int | None = None
     fork_alt_token_id: int | None = None
+    # Answer-prefill (v2.3): seed an assistant reply under a user node.
+    # When ``prefill_node_id`` is set the handler ignores ``input`` and
+    # the ``fork_*`` fields — ``session.prefill_assistant`` tokenizes
+    # ``prefill_text`` into a forced decode prefix, lands the result as a
+    # sibling assistant under the user node, and forces ``thinking=False``
+    # (the prefilled text is the start of the *answer*).  ``steering`` /
+    # ``sampling`` / ``n`` are honored as on a normal generate.
+    prefill_node_id: str | None = None
+    prefill_text: str | None = None
 
 
 # --- Loom tree request bodies (phase 2) --------------------------------
@@ -2086,6 +2095,27 @@ async def _ws_handle_generate(
         })
         return
 
+    # Answer-prefill: when ``prefill_node_id`` is set the worker calls
+    # ``session.prefill_assistant`` instead of ``session.generate``.  It
+    # needs ``prefill_text`` alongside it, and can't co-exist with a fork.
+    is_prefill = msg.prefill_node_id is not None
+    if is_prefill and (msg.prefill_text is None or msg.prefill_text == ""):
+        await send_json({
+            "type": "error",
+            "message": "prefill requires prefill_node_id and prefill_text together",
+            "code": "ValueError",
+            "status": 400,
+        })
+        return
+    if is_prefill and is_fork:
+        await send_json({
+            "type": "error",
+            "message": "a generate message cannot be both a fork and a prefill",
+            "code": "ValueError",
+            "status": 400,
+        })
+        return
+
     # Per-sibling seed schedule: when n>1, derive deterministic per-
     # sibling seeds from the request seed (or fresh entropy).  Single
     # streams (n=1) use the user's seed verbatim.
@@ -2250,6 +2280,19 @@ async def _ws_handle_generate(
                             msg.fork_node_id,
                             int(msg.fork_raw_index),  # type: ignore[arg-type]
                             int(msg.fork_alt_token_id),  # type: ignore[arg-type]
+                            on_token=_on_token,
+                        )
+                    elif msg.prefill_node_id is not None:
+                        # Prefill: anchor / parent come from the user node
+                        # inside ``prefill_assistant``; ``input`` is
+                        # ignored.  ``steering`` / ``sampling`` ride through
+                        # like a normal generate; ``thinking`` is forced
+                        # off (the prefill is an answer, not a thought).
+                        result = session.prefill_assistant(
+                            msg.prefill_node_id,
+                            str(msg.prefill_text),
+                            steering=steering,
+                            sampling=_sampling,
                             on_token=_on_token,
                         )
                     else:

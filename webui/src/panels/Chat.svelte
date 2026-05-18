@@ -36,6 +36,8 @@
     navigateInputHistory,
     clearSessionHistory,
     rewindSession,
+    sendPrefill,
+    loomRegenerateFromUser,
     enqueuePending,
     toggleAutoRegen,
     setAutoRegenMode,
@@ -79,7 +81,50 @@
     autosize();
   });
 
+  // --- Role-aware input -------------------------------------------------
+  // The selected loom node's role decides what the input box composes.
+  // On an assistant / root node you write the next *user* message (the
+  // normal chat flow).  On a *user* node the turn below it is the
+  // assistant's — so the input composes the assistant reply instead:
+  //   empty + send → generate a fresh assistant child (re-roll / fan)
+  //   text  + send → answer-prefill — seed the reply with that text
+  const activeNodeId = $derived(
+    loomTree.rev > 0 ? (loomTree.active_node_id ?? null) : null,
+  );
+  const activeNode = $derived(
+    activeNodeId ? (loomTree.nodes.get(activeNodeId) ?? null) : null,
+  );
+  const onUserNode = $derived(activeNode?.role === "user");
+  const inputPlaceholder = $derived(
+    onUserNode
+      ? "prefill the assistant's reply…  (empty + enter = generate fresh · shift-enter newline)"
+      : "message…  (enter to send · shift-enter newline · cmd/ctrl-enter also sends)",
+  );
+  /** Send-button caption tracks the role-aware action. */
+  const sendLabel = $derived(
+    onUserNode ? (input.trim() ? "prefill" : "generate") : "send",
+  );
+
   function doSend(): void {
+    // Role-aware branch: on a user node the input seeds the assistant
+    // reply rather than appending a new user turn.
+    if (onUserNode && activeNodeId) {
+      // Keep the raw value — a trailing space in a prefill is meaningful
+      // (it decides whether the continuation starts a fresh word).
+      const raw = input;
+      const trimmed = raw.trim();
+      input = "";
+      if (trimmed) {
+        pushInputHistory(trimmed);
+        void sendPrefill(activeNodeId, raw);
+      } else {
+        void loomRegenerateFromUser(activeNodeId);
+      }
+      scrolledUp = false;
+      queueScrollToBottom();
+      queueMicrotask(autosize);
+      return;
+    }
     const text = input.trim();
     if (!text) return;
     // Push to ↑/↓ recall before clearing — covers both chat messages
@@ -706,12 +751,13 @@
   <form class="input-row" onsubmit={(ev) => { ev.preventDefault(); doSend(); }}>
     <textarea
       class="input"
+      class:prefill-mode={onUserNode}
       bind:this={textareaRef}
       bind:value={input}
       onkeydown={onKeydown}
-      placeholder="message…  (enter to send · shift-enter newline · cmd/ctrl-enter also sends)"
+      placeholder={inputPlaceholder}
       rows="1"
-      aria-label="Chat input"
+      aria-label={onUserNode ? "Assistant prefill input" : "Chat input"}
     ></textarea>
     <div class="input-actions">
       <button
@@ -725,9 +771,11 @@
       <button
         type="submit"
         class="send"
-        disabled={!input.trim()}
-        title="Enter or Cmd/Ctrl-Enter"
-      >send</button>
+        disabled={!input.trim() && !onUserNode}
+        title={onUserNode
+          ? "On a user node: empty = generate a fresh reply, text = prefill the reply"
+          : "Enter or Cmd/Ctrl-Enter"}
+      >{sendLabel}</button>
       <button
         type="button"
         class="stop"
@@ -1125,6 +1173,16 @@
   .input:focus {
     outline: none;
     border-color: var(--accent-blue);
+  }
+  /* Prefill mode: the active loom node is a user turn, so this box
+     composes the assistant reply.  Tint the border to signal the role
+     shift before the user starts typing. */
+  .input.prefill-mode {
+    border-color: var(--accent-purple);
+    background: rgba(167, 139, 250, 0.06);
+  }
+  .input.prefill-mode:focus {
+    border-color: var(--accent-purple);
   }
   .input-actions {
     display: flex;

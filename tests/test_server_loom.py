@@ -211,6 +211,51 @@ class _StubSession:
                 self._active_gen_reservation = None
         return results[0] if n == 1 else results
 
+    # ----- answer-prefill entry point ----------------------------------
+    def prefill_assistant(self, node_id, text, *, steering=None,
+                          sampling=None, on_token=None):
+        """Stub answer-prefill.
+
+        Mirrors ``SaklasSession.prefill_assistant``'s tree shape: anchor
+        at the user node's parent so ``add_user_turn`` dedup re-uses the
+        existing user turn, then land an assistant child whose text opens
+        with ``text`` (the seeded prefix) followed by a synthetic
+        continuation token.
+        """
+        from saklas.core.loom import InvalidNodeOperationError
+        node = self.tree.get(node_id)
+        if node.role != "user":
+            raise InvalidNodeOperationError(
+                f"prefill_assistant: {node_id!r} is a {node.role} node"
+            )
+        user_id = self.tree.add_user_turn(node.text, parent_id=node.parent_id)
+        self._active_gen_reservation = user_id
+        assistant_id = self.tree.begin_assistant(user_id)
+        try:
+            if on_token is not None:
+                on_token(text, False, 2000, None, None)
+                on_token("-cont", False, 2001, None, None)
+            self.tree.append_token(
+                assistant_id, {"token_id": 2000, "text": text},
+            )
+            self.tree.append_token(
+                assistant_id, {"token_id": 2001, "text": "-cont"},
+            )
+            full = text + "-cont"
+            result = GenerationResult(
+                text=full, tokens=[2000, 2001], token_count=2,
+                tok_per_sec=10.0, elapsed=0.1, finish_reason="stop",
+            )
+            self.tree.finalize_assistant(
+                assistant_id, text=full, aggregate_readings={},
+                applied_steering=None, finish_reason="stop",
+            )
+            self._last_result = result
+            self.last_result = result
+        finally:
+            self._active_gen_reservation = None
+        return result
+
 
 @pytest.fixture
 def session_and_client():
@@ -629,3 +674,87 @@ class TestWebSocketLoom:
         # done frames carry distinct node_ids matching the two assistants.
         done_node_ids = {ev["node_id"] for ev in done_events}
         assert done_node_ids == set(assistant_ids)
+
+
+# ---------------------------------------------------------------------------
+# WS: answer-prefill
+# ---------------------------------------------------------------------------
+
+
+class TestPrefill:
+    def test_missing_text_400(self, session_and_client):
+        """prefill_node_id without prefill_text is rejected before dispatch."""
+        session, client = session_and_client
+        uid = session.tree.add_user_turn("seed me")
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "prefill_node_id": uid})
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["status"] == 400
+        assert "prefill" in msg["message"].lower()
+
+    def test_empty_text_400(self, session_and_client):
+        """An empty prefill_text is treated as 'no text' — same 400."""
+        session, client = session_and_client
+        uid = session.tree.add_user_turn("seed me")
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "prefill_node_id": uid,
+                "prefill_text": "",
+            })
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["status"] == 400
+
+    def test_conflicts_with_fork_400(self, session_and_client):
+        """A message can't be both a fork and a prefill."""
+        session, client = session_and_client
+        uid = session.tree.add_user_turn("seed me")
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "prefill_node_id": uid,
+                "prefill_text": "Sure",
+                "fork_node_id": "whatever",
+                "fork_raw_index": 0,
+                "fork_alt_token_id": 1,
+            })
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["status"] == 400
+
+    def test_creates_seeded_sibling(self, session_and_client):
+        """A valid prefill lands an assistant child opening with the text."""
+        session, client = session_and_client
+        uid = session.tree.add_user_turn("what's the weather?")
+        rev_before = session.tree.rev
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "prefill_node_id": uid,
+                "prefill_text": "It is sunny",
+            })
+            done = None
+            seen_tree_mut = False
+            while True:
+                msg = ws.receive_json()
+                t = msg["type"]
+                if t == "tree_mutated":
+                    seen_tree_mut = True
+                    assert msg["rev"] >= rev_before
+                elif t == "done":
+                    done = msg
+                    break
+
+        assert done is not None
+        assert seen_tree_mut
+        # The assistant landed under the prefill target user node.
+        assistant_children = [
+            nid for nid in session.tree.children_of[uid]
+            if session.tree.get(nid).role == "assistant"
+        ]
+        assert len(assistant_children) == 1
+        assistant = session.tree.get(assistant_children[0])
+        assert assistant.text.startswith("It is sunny")

@@ -506,9 +506,28 @@ class ChatPanel(Widget):
         if not text:
             return
         event.input.value = ""
-        if not text.startswith("/"):
-            self.add_user_message(text)
+        # The user-row mount is the app's call, not ours: on a user-role
+        # active loom node a typed message is an assistant prefill, not a
+        # new user turn, and only the app knows the active node's role.
+        # ``on_chat_panel_user_submitted`` mounts the row for normal sends.
         self.post_message(self.UserSubmitted(text))
+
+    def set_prefill_mode(self, on: bool) -> None:
+        """Flip the input placeholder between normal-send and prefill.
+
+        When the active loom node is a user turn a typed message seeds
+        the assistant reply (answer-prefill) rather than appending a new
+        user message; the placeholder is the signal the app updates as
+        navigation changes the active node's role.  Mirrors
+        :meth:`set_ab_mode`'s app-driven-flag shape.
+        """
+        try:
+            inp = self.query_one("#chat-input", Input)
+        except Exception:
+            return
+        inp.placeholder = (
+            "Prefill the assistant's reply…" if on else "Type a message..."
+        )
 
     # -- AB mode --
 
