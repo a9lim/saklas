@@ -82,11 +82,27 @@
     void load(selected);
   });
 
-  // Sorted-by-layer view of ``data.layers``.  The server already sorts
-  // ascending but we re-sort defensively because cheap.
-  const sortedLayers = $derived<{ layer: number; magnitude: number }[]>(
-    [...(data?.layers ?? [])].sort((a, b) => a.layer - b.layer),
-  );
+  // Full-range layer view: every layer 0..total_layers-1, with the
+  // profile's per-layer ``||baked||`` filled in where present and 0 for
+  // layers DLS dropped (or that never landed in the profile).  Showing
+  // the full strip lets the user *see* the discriminative-layer-select
+  // pattern rather than infer it from the gaps in a sparse row list —
+  // the dropped layers read as flat-zero bars between the active ones.
+  const sortedLayers = $derived.by<{ layer: number; magnitude: number }[]>(() => {
+    const present = new Map<number, number>();
+    for (const e of data?.layers ?? []) present.set(e.layer, e.magnitude);
+    const total = data?.total_layers ?? 0;
+    if (total <= 0) {
+      return [...present.entries()]
+        .map(([layer, magnitude]) => ({ layer, magnitude }))
+        .sort((a, b) => a.layer - b.layer);
+    }
+    const rows: { layer: number; magnitude: number }[] = [];
+    for (let i = 0; i < total; i++) {
+      rows.push({ layer: i, magnitude: present.get(i) ?? 0 });
+    }
+    return rows;
+  });
 
   const maxMagnitude = $derived(
     sortedLayers.reduce(

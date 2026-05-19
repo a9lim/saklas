@@ -391,7 +391,6 @@
     align-items: center;
     gap: var(--space-4) var(--space-5);
     padding: var(--space-3) var(--space-5);
-    background: var(--bg-alt);
     border-top: 1px solid var(--border);
     border-bottom: 1px solid var(--border);
     font-family: var(--font-mono);

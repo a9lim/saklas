@@ -72,10 +72,10 @@
     void loomTree.rev;
     if (label !== null) return;
     if (!parentId || !childId) return;
-    // Only fetch when the parent has ≥2 children — single-child
-    // edges have no delta to render and we save a request.
-    const siblings = loomTree.children_of.get(parentId) ?? [];
-    if (siblings.length < 2) return;
+    // Fetch for every edge: the steering-delta is a property of the
+    // edge into this child, not of the sibling set.  A steered node
+    // with no siblings still has a delta to show — the old ``≥2
+    // children`` guard hid the chip until a sibling was branched off.
     fetchEdgeLabel(parentId, childId);
   });
 </script>

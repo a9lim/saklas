@@ -77,8 +77,36 @@ export async function refreshSession(): Promise<void> {
     sessionState.info = info;
     sessionState.lastRefresh = Date.now();
     sessionState.error = null;
+    _hydrateSamplingFromInfo();
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/** Mirror the server's session.config defaults into the local
+ * ``samplingState``.  The local store was previously pre-seeded with its
+ * own constants (``max_tokens: 256`` etc.) which drifted away from the
+ * server's actual ``session.config.max_new_tokens`` (= 1024 by default),
+ * so the gen-status footer rendered ``gen N/256`` even when the engine
+ * was running against a 1024-token cap.  Sync once on every refresh so
+ * the displayed cap matches what generation actually used. */
+function _hydrateSamplingFromInfo(): void {
+  const cfg = sessionState.info?.config;
+  if (!cfg) return;
+  if (typeof cfg.max_tokens === "number" && Number.isFinite(cfg.max_tokens)) {
+    samplingState.max_tokens = cfg.max_tokens;
+  }
+  if (typeof cfg.temperature === "number") {
+    samplingState.temperature = cfg.temperature;
+  }
+  if (typeof cfg.top_p === "number") {
+    samplingState.top_p = cfg.top_p;
+  }
+  if (typeof cfg.top_k === "number") {
+    samplingState.top_k = cfg.top_k;
+  }
+  if (typeof cfg.system_prompt === "string") {
+    samplingState.system_prompt = cfg.system_prompt;
   }
 }
 
@@ -95,6 +123,7 @@ export async function patchSessionDefaults(
   const info = await apiSessions.patch(body);
   sessionState.info = info;
   sessionState.lastRefresh = Date.now();
+  _hydrateSamplingFromInfo();
 }
 
 export async function clearSessionHistory(): Promise<void> {
@@ -1527,6 +1556,15 @@ function handleWsMessage(msg: WSServerMessage): void {
         // only).  Null when capture wasn't live; the inline surprise
         // mode + loom edge-weighting null-guard on this directly.
         turn.meanLogprob = msg.result?.mean_logprob ?? null;
+      }
+      // Reconcile the live token counter against the server's
+      // authoritative ``token_count``.  The streaming ``token`` events
+      // may diverge from the engine's final count when (a) the WS dedupes
+      // / batches partial UTF-8 tokens, or (b) the server's actual
+      // ``max_new_tokens`` differs from the client's local view (e.g.
+      // before the first PATCH lands).  Trust the server on close.
+      if (typeof msg.result?.tokens === "number" && Number.isFinite(msg.result.tokens)) {
+        genStatus.tokensSoFar = msg.result.tokens;
       }
 
       const wasShadow = abState.processingAb;

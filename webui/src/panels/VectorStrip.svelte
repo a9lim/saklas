@@ -307,13 +307,14 @@
   {/if}
 
   <!-- Bipolar axis frame.  The negative pole sits left of the slider, the
-       positive right — dragging left/right now means something. -->
-  <div class="axis" class:mono={monopolar}>
-    {#if !monopolar}
-      <span class="pole neg" title="negative pole (drag left)">
-        {poles.negative}
-      </span>
-    {/if}
+       positive right — dragging left/right now means something.
+       Monopolar concepts render an empty left-pole slot rather than
+       collapsing the grid, so a mixed mono/bipolar rack keeps slider
+       starts + positive poles vertically aligned across rows. -->
+  <div class="axis">
+    <span class="pole neg" aria-hidden={monopolar}>
+      {#if !monopolar}{poles.negative}{/if}
+    </span>
     <Slider
       value={entry.alpha}
       min={monopolar ? 0 : -1}
@@ -531,7 +532,10 @@
     flex: 0 0 auto;
   }
 
-  /* The axis owns the strip's flexible width — poles + slider together. */
+  /* The axis owns the strip's flexible width — poles + slider together.
+   * Monopolar rows render an empty left-pole slot instead of collapsing
+   * the grid, so a mono row sits on the same column proportions as the
+   * bipolar rows around it and the slider starts at the same x. */
   .axis {
     display: grid;
     grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr);
@@ -539,9 +543,6 @@
     gap: var(--space-2);
     flex: 1 1 auto;
     min-width: 0;
-  }
-  .axis.mono {
-    grid-template-columns: minmax(60px, 2.6fr) minmax(2.5em, 1fr);
   }
   .pole {
     overflow: hidden;

@@ -21,7 +21,8 @@
 <style>
   .workbench {
     /* margin-top:auto pins the card to the column floor even when the
-     * tree above it is short (empty / error states don't flex-grow). */
+     * tree above it is short (empty / error states don't flex-grow).
+     * Flat — border-top is the separator, no own fill. */
     margin-top: auto;
     flex: 0 0 auto;
     display: flex;
@@ -29,7 +30,6 @@
     gap: var(--space-1);
     padding: var(--space-3) var(--space-4);
     border-top: 1px solid var(--border);
-    background: var(--bg-deep);
   }
 
   .sub {

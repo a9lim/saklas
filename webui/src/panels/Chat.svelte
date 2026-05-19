@@ -3,7 +3,7 @@
   // shape with the full feature set: thinking-collapsible per assistant
   // turn, per-token tinted spans driven by a top-bar highlight dropdown,
   // optional compare-two stripe overlay, click-token drilldown, send /
-  // stop / stateless toggle, and an A/B split-view container.
+  // stop, and an A/B split-view container.
   //
   // Single source of truth for state lives in ``lib/stores.svelte`` —
   // this file is presentation + local-only UI bits (textarea state,
@@ -59,19 +59,25 @@
 
   let input = $state("");
   let textareaRef: HTMLTextAreaElement | null = $state(null);
-  /** Per-call stateless override.  When on the next ``send`` is dispatched
-   * with ``stateless: true`` so the server never appends to history.
-   * Mirrors the TUI's ``◯/●`` indicator described in the plan. */
-  let statelessNext = $state(false);
 
-  /** Auto-grow the textarea between 1 and 6 rows (≈ 132px at 13px line-h). */
+  /** Auto-grow the textarea between 1 and 6 rows (≈ 132px at 13px line-h).
+   *  With ``box-sizing: border-box`` set in CSS, ``el.scrollHeight``
+   *  includes top/bottom padding — which is exactly what we want to write
+   *  back into ``style.height``, so a one-line draft sits flush with no
+   *  residual scrollbar.  The vertical scrollbar is suppressed unless the
+   *  content actually overflows the 6-row cap. */
   function autosize(): void {
     const el = textareaRef;
     if (!el) return;
     el.style.height = "auto";
     const rowHeight = 22; // mono line-height fudge — matches font-size-base
     const maxH = rowHeight * 6;
-    el.style.height = `${Math.min(el.scrollHeight, maxH)}px`;
+    const next = Math.min(el.scrollHeight, maxH);
+    el.style.height = `${next}px`;
+    // Only show the scrollbar once we've actually hit the cap.  Without
+    // this the browser's "always reserve a scrollbar gutter" heuristic
+    // paints a 1-2px up/down nub on single-line input.
+    el.style.overflowY = el.scrollHeight > maxH ? "auto" : "hidden";
   }
 
   $effect(() => {
@@ -131,12 +137,10 @@
     // Push to ↑/↓ recall before clearing — covers both chat messages
     // and slash commands (every line typed in here is recallable).
     pushInputHistory(text);
-    const stateless = statelessNext;
-    statelessNext = false;
     input = "";
     // Defer the actual send so the textarea clears before the WS round-
     // trip — feels less like the UI froze.
-    void sendGenerate(text, { stateless });
+    void sendGenerate(text);
     // Force-scroll to bottom on send regardless of where the user was.
     scrolledUp = false;
     queueScrollToBottom();
@@ -776,14 +780,6 @@
     ></textarea>
     <div class="input-actions">
       <button
-        type="button"
-        class="stateless"
-        class:on={statelessNext}
-        onclick={() => (statelessNext = !statelessNext)}
-        title="Stateless: send next message without appending to history"
-        aria-pressed={statelessNext}
-      >{statelessNext ? "●" : "◯"} stateless</button>
-      <button
         type="submit"
         class="send"
         disabled={!input.trim() && !onUserNode}
@@ -1187,7 +1183,13 @@
     font: inherit;
     font-family: var(--font-mono);
     resize: none;
-    min-height: 1.6em;
+    /* border-box lets autosize() write ``scrollHeight`` straight into
+     * ``style.height`` without a padding/border double-count — without
+     * this the one-line draft height was off by ~6px and the textarea's
+     * vertical scrollbar leaked through as a tiny up/down nub. */
+    box-sizing: border-box;
+    overflow-y: hidden;
+    min-height: 2.4em;
     max-height: 132px;
     line-height: 1.45;
   }
@@ -1236,13 +1238,5 @@
   }
   .input-actions .regen {
     color: var(--accent-blue);
-  }
-  .input-actions .stateless {
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-  }
-  .input-actions .stateless.on {
-    color: var(--accent-blue);
-    border-color: var(--accent);
   }
 </style>

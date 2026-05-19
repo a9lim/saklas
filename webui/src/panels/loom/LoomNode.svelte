@@ -139,14 +139,8 @@
   .node:hover {
     background: var(--bg-elev);
   }
-  .node:focus-visible {
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
-  }
   .node.focused {
     background: var(--accent-subtle);
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
   }
   .node.active {
     font-weight: var(--weight-medium);
@@ -198,15 +192,15 @@
     font-size: var(--text-xs);
   }
   /* Steering-delta chip — trailing, truncated so a long delta can't
-   * blow out the row or collide with the preview text. */
+   * blow out the row or collide with the preview text.  No own
+   * background: the chip inherits whatever the node row paints
+   * (transparent / hover / selected / streaming), so it always blends
+   * into the row's highlight state. */
   .steer {
     color: var(--accent-yellow);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
     padding: 0 var(--space-2);
-    border-radius: var(--radius);
     max-width: 11ch;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -229,14 +223,12 @@
   }
   /* Logit-pass: numeric ``mean_logprob`` badge.  Tabular-nums so the
      digits line up across siblings even when sort:surprise reorders
-     them; subdued color so the badge reads as metadata, not content. */
+     them; subdued color so the badge reads as metadata, not content.
+     Like .steer, no own background — inherits the row's highlight. */
   .weight {
     color: var(--fg-dim);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
     padding: 0 var(--space-2);
-    border-radius: var(--radius);
   }
 </style>

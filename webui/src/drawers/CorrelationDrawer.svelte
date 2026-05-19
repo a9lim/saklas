@@ -126,7 +126,6 @@
                     <HeatmapCell
                       value={v}
                       size={CELL_SIZE}
-                      showValue
                       title={cellTitle(a, b, v)}
                     />
                   </td>

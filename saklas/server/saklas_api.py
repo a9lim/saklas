@@ -1567,10 +1567,17 @@ def register_saklas_routes(app: FastAPI) -> None:
         # ``diagnostics`` is a Profile attribute; probe profiles are raw
         # ``dict[int, Tensor]`` and don't carry it.  ``getattr`` covers both.
         diagnostics = getattr(profile, "diagnostics", None)
+        # ``total_layers`` is the *model's* layer count, not the profile's
+        # — the layer-norms drawer in the web UI fills layers absent from
+        # the profile with zero so the user can read the DLS pattern.
+        # Using ``len(profile)`` here used to lie when DLS dropped layers
+        # (the drawer would stop at the profile's deepest layer instead
+        # of the model's true depth).
+        model_layers = int(session.model_info.get("num_layers") or len(profile))
         payload: dict[str, Any] = {
             "name": name,
             "model": session.model_id,
-            "total_layers": len(profile),
+            "total_layers": model_layers,
             "histogram": {
                 "buckets": HIST_BUCKETS,
                 "data": bucket_payload,

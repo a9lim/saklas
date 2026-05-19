@@ -1208,8 +1208,6 @@
     display: flex;
     flex-direction: column;
     height: 100%;
-    background: var(--bg-alt);
-    border-right: 1px solid var(--border);
     color: var(--fg);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
@@ -1217,13 +1215,14 @@
     overflow: hidden;
   }
 
+  /* Section bars are now flat — a border-bottom acts as the separator,
+   * no fill — matching the right-rack's section style. */
   .filter-bar {
     display: flex;
     gap: var(--space-2);
     align-items: center;
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--border);
-    background: var(--bg-deep);
   }
   .filter-input {
     flex: 1 1 auto;
@@ -1256,7 +1255,6 @@
     border-color: var(--accent);
   }
   .filter-help {
-    background: var(--bg-alt);
     border-bottom: 1px solid var(--border);
     padding: var(--space-3) var(--space-4);
     color: var(--fg-dim);
@@ -1290,7 +1288,6 @@
     align-items: center;
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--border);
-    background: var(--bg-deep);
     font-size: var(--text-xs);
     color: var(--fg-dim);
   }
@@ -1305,7 +1302,6 @@
     gap: var(--space-3);
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--border);
-    background: var(--accent-subtle);
     color: var(--accent);
     font-size: var(--text-xs);
   }
@@ -1335,7 +1331,6 @@
     gap: var(--space-3);
     padding: var(--space-2) var(--space-4);
     border-bottom: 1px solid var(--border);
-    background: var(--bg-deep);
   }
   .title {
     color: var(--accent-blue);
