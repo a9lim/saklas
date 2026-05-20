@@ -205,9 +205,12 @@
   /** Steering-delta label for the edge into ``node`` — read from the
    *  cache LoomEdge populates.  Rendered as a trailing chip on the node
    *  (it used to be an absolutely-positioned edge label that overlapped
-   *  the node text). */
+   *  the node text).  Assistant-only: user / system nodes don't carry
+   *  steering, so a delta against their steered parent collapses to
+   *  "negate the parent's expression" — misleading to render. */
   function steerLabelFor(node: LoomNodeJSON): string | null {
     if (!node.parent_id) return null;
+    if (node.role !== "assistant") return null;
     return edgeLabelCache.get(`${node.parent_id}|${node.id}`) ?? null;
   }
 
@@ -992,8 +995,8 @@
             <LoomEdge
               active={row.isActivePath}
               dead={row.isDead}
-              parentId={row.node.parent_id}
-              childId={row.node.id}
+              parentId={row.node.role === "assistant" ? row.node.parent_id : null}
+              childId={row.node.role === "assistant" ? row.node.id : null}
               weight={edgeWeightFor(row.node)}
             />
           {/if}
