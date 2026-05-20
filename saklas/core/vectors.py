@@ -24,7 +24,6 @@ log = logging.getLogger(__name__)
 # concept whose median is degenerate is the failure mode users care about.
 _DIAG_DEGENERATE_EVR = 0.95         # ~all variance in one direction
 _DIAG_DEGENERATE_INTRA_VAR = 0.01   # almost-identical pos/neg pairs
-_DIAG_LOW_ALIGNMENT = 0.2           # pairs disagree on direction
 
 # Skip the chat template for extraction when it adds more than this many
 # tokens of overhead (e.g. Ministral injects a ~500-token system prompt).
@@ -371,11 +370,17 @@ def _emit_diagnostics_warning(
 ) -> None:
     """Soft-warn when the median across layers looks degenerate.
 
-    Fires at most once per call.  Threshold pair (a) catches one-sided /
-    repetitive pair sets (high EVR, near-zero intra variance); threshold
-    (b) catches incoherent pair sets (low inter-pair alignment).  Both
-    leave the extracted profile usable — the warning is informational,
-    not a block.
+    Catches one-sided / repetitive pair sets — high EVR (one direction
+    explains nearly all variance) combined with near-zero intra-pair
+    variance (all pos/neg pairs end up at the same activation point).
+    The extracted profile is still usable; the warning is
+    informational, not a block.
+
+    The diagnostics themselves (``evr``, ``intra_pair_variance_mean``,
+    ``inter_pair_alignment``, ``diff_principal_projection``) are
+    always computed and persisted to the sidecar regardless of whether
+    this warning fires — use ``saklas vector why <concept>`` to
+    inspect them.
     """
     if not diagnostics:
         return
@@ -396,17 +401,11 @@ def _emit_diagnostics_warning(
         for d in diagnostics.values()
         if "intra_pair_variance_mean" in d
     ]
-    aligns = [
-        d["inter_pair_alignment"]
-        for d in diagnostics.values()
-        if "inter_pair_alignment" in d
-    ]
     if not evrs:
         return
 
     med_evr = _median(evrs)
     med_intra = _median(intras) if intras else float("inf")
-    med_align = _median(aligns) if aligns else 1.0
 
     label = concept_label or "probe"
     if med_evr > _DIAG_DEGENERATE_EVR and med_intra < _DIAG_DEGENERATE_INTRA_VAR:
@@ -415,16 +414,6 @@ def _emit_diagnostics_warning(
             f"(median EVR={med_evr:.2f}, intra-pair variance={med_intra:.4f}); "
             f"contrastive pairs may be too similar. Diversify the negative "
             f"pole and re-extract for a stronger direction.",
-            UserWarning,
-            stacklevel=3,
-        )
-    elif med_align < _DIAG_LOW_ALIGNMENT:
-        warnings.warn(
-            f"{label}: pair directions disagree "
-            f"(median inter-pair alignment={med_align:.2f}); "
-            f"the principal component still extracts but pairs point in "
-            f"conflicting directions. Review statements.json for "
-            f"semantically orthogonal pairs.",
             UserWarning,
             stacklevel=3,
         )

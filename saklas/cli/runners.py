@@ -106,14 +106,16 @@ def _make_session(args: argparse.Namespace):
         # toggling the rest of the v2.1 stack.
         dls = not bool(getattr(args, "no_dls", False))
     theta_max = getattr(args, "theta_max", None)
-    # ``--no-compile`` and ``--no-cuda-graphs`` opt out of v2.2's
-    # CUDA-side perf auto-enables.  YAML ``compile: false`` /
-    # ``cuda_graphs: false`` are folded onto ``args.no_compile`` /
-    # ``args.no_cuda_graphs`` upstream in ``_load_effective_config`` so
-    # the runner sees single booleans regardless of where the opt-out
-    # came from.
-    compile_enabled = not bool(getattr(args, "no_compile", False))
-    cuda_graphs_enabled = not bool(getattr(args, "no_cuda_graphs", False))
+    # ``--compile`` and ``--cuda-graphs`` opt *in* to the CUDA-side
+    # perf path.  Defaults are off — compile's per-token speedup is
+    # variable (~1.2–3× when it works, ~equal otherwise), the
+    # ~25–50s upfront cost rarely pays off on interactive workloads,
+    # and torch 2.12's inductor has known codegen bugs on newer
+    # architectures (Gemma-4, Qwen3.5).  YAML ``compile: true`` /
+    # ``cuda_graphs: true`` are folded onto ``args.compile`` /
+    # ``args.cuda_graphs`` in ``_load_effective_config``.
+    compile_enabled = bool(getattr(args, "compile", False))
+    cuda_graphs_enabled = bool(getattr(args, "cuda_graphs", False))
     # Phase 1 logit pass: session-level default for top-K alternatives
     # capture.  Per-call ``SamplingConfig.return_top_k > 0`` overrides;
     # K=0 inherits this value through ``_generate_core``.  argparse
@@ -194,19 +196,18 @@ def _load_effective_config(args: argparse.Namespace):
         and getattr(args, "projection_metric", None) is None
     ):
         args.projection_metric = composed.projection_metric
-    # YAML ``compile: false`` folds onto ``args.no_compile`` (the CLI
-    # opt-out).  YAML ``compile: true`` is a no-op since auto-enable is
-    # already the default — but accepting it makes round-tripping
-    # ``ConfigFile.to_yaml`` symmetric with the other knobs.  CLI flag
-    # always wins: ``--no-compile`` already sets ``args.no_compile=True``,
-    # which we leave alone.
-    if composed.compile is False and not bool(getattr(args, "no_compile", False)):
-        args.no_compile = True
+    # YAML ``compile: true`` folds onto ``args.compile`` (the CLI
+    # opt-in).  YAML ``compile: false`` is the default, so it's a
+    # no-op — but accepting it makes round-tripping symmetric with
+    # other knobs.  CLI flag always wins: ``--compile`` already sets
+    # ``args.compile=True``, which we leave alone.
+    if composed.compile is True and not bool(getattr(args, "compile", False)):
+        args.compile = True
     if (
-        composed.cuda_graphs is False
-        and not bool(getattr(args, "no_cuda_graphs", False))
+        composed.cuda_graphs is True
+        and not bool(getattr(args, "cuda_graphs", False))
     ):
-        args.no_cuda_graphs = True
+        args.cuda_graphs = True
     # Phase 1 logit pass: YAML ``return_top_k:`` wins when CLI
     # ``--top-k-alts`` is unset, matching the rest of the v2.1 stack.
     if (
@@ -283,15 +284,24 @@ def _setup_steering_vectors(
 
 
 def _warmup_session(session) -> None:
-    """Run a tiny stateless generation so the first real request is fast."""
+    """Run a stateless generation so the first real request is fast.
+
+    The model loader's compile probe (``_compile_with_probe``) already
+    specializes the compiled artifact on a 2-token prefill + 1-token
+    decode, which catches compile-time failures.  This warmup is the
+    layer above: it runs a realistic prompt so dynamo's automatic
+    shape promotion fires on a typical-length prefill before the user
+    types anything.  Without it, the first interactive prompt would
+    trigger a 0.2–0.5s recompile on each new prefill length.
+    """
     import time as _time
     from saklas.core.sampling import SamplingConfig
     print("Warming up generation kernels...", flush=True)
     try:
         start = _time.monotonic()
         session.generate(
-            "Hi",
-            sampling=SamplingConfig(max_tokens=1),
+            "Please respond briefly.",
+            sampling=SamplingConfig(max_tokens=32),
             stateless=True,
         )
         print(f"  warmed in {_time.monotonic() - start:.1f}s")
@@ -320,6 +330,7 @@ def _run_tui(args: argparse.Namespace) -> None:
     _print_model_info(session)
 
     _setup_steering_vectors(session, getattr(args, "config_vectors", None))
+    _warmup_session(session)
 
     from saklas.tui.app import SaklasApp
     app = SaklasApp(session=session)

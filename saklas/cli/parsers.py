@@ -148,27 +148,28 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
              "``--projection-metric``, and ``--no-dls``.",
     )
     p.add_argument(
-        "--no-compile", dest="no_compile", action="store_true",
-        help="Disable ``torch.compile``.  v2.2+ auto-enables compile on "
-             "CUDA for kernel fusion (typically 1.2–1.5× decode tok/s on "
-             "small models); on MPS/CPU compile is already a no-op.  "
-             "Pass this to debug architecture-specific compile breakage "
-             "or when running benchmarks against the eager baseline.  "
-             "YAML equivalent: ``compile: false``.",
+        "--compile", dest="compile", action="store_true",
+        help="Enable ``torch.compile`` on CUDA.  Off by default — the "
+             "compile path is intermittently broken on torch 2.12 for "
+             "newer architectures (Gemma-4, Qwen3.5 hit inductor "
+             "codegen bugs), and on interactive workloads the ~25–50s "
+             "compile cost rarely pays off against the 1.2–3× per-token "
+             "speedup it delivers when it works.  Pass this for "
+             "sustained workloads (long-running serve, batch eval) "
+             "where the upfront cost amortizes.  On MPS/CPU compile is "
+             "already a no-op.  YAML equivalent: ``compile: true``.",
     )
     p.add_argument(
-        "--no-cuda-graphs", dest="no_cuda_graphs", action="store_true",
-        help="Disable ``transformers.StaticCache`` + CUDA-graph capture "
-             "(Phase B, v2.2+).  When on, generation routes through "
-             "fixed-shape K/V buffers so the compile-mode "
-             "``reduce-overhead`` path can capture decode CUDA graphs "
-             "internally — typically an additional 1.5–2.5× decode "
-             "tok/s on small models on top of plain compile.  "
+        "--cuda-graphs", dest="cuda_graphs", action="store_true",
+        help="Enable ``transformers.StaticCache`` + CUDA-graph capture "
+             "for additional decode speedup (1.5–2.5× on small models "
+             "on top of plain ``--compile``).  Off by default for the "
+             "same reason as ``--compile``.  Requires ``--compile`` to "
+             "be useful — when on, ``torch.compile(mode=\"reduce-"
+             "overhead\")`` captures decode CUDA graphs internally.  "
              "Auto-skipped on MPS/CPU and on architectures whose "
              "StaticCache constructor fails (logged once at session "
-             "init).  Pass this when debugging cache-related issues "
-             "or benchmarking against the DynamicCache baseline.  "
-             "YAML equivalent: ``cuda_graphs: false``.",
+             "init).  YAML equivalent: ``cuda_graphs: true``.",
     )
 
 

@@ -423,9 +423,9 @@ class SaklasSession:
         extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
         dls: bool = True,
-        compile: bool = True,
+        compile: bool = False,
         compile_mode: str | None = None,
-        cuda_graphs: bool = True,
+        cuda_graphs: bool = False,
         return_top_k: int = 0,
     ) -> "SaklasSession":
         """Load a HF model + tokenizer and return a fully initialized session.
@@ -453,24 +453,27 @@ class SaklasSession:
         baseline along ``d̂``.  Replaces the v2.0–v2.1 ``edge_drop``
         heuristic (gone in v2.1); ``--legacy`` flips this to ``False``.
 
-        ``compile`` (default ``True``) auto-enables ``torch.compile`` on
-        CUDA — kernel fusion via inductor, typically 1.2–1.5× decode
-        tok/s on small models.  Auto-skipped on MPS/CPU.  Pass ``False``
-        to debug architecture-specific compile issues; the angular hook
-        scalars are tensor-pinned (v2.2) so a single compiled artifact
-        survives α changes between generations.
+        ``compile`` (default ``False``) opts in to ``torch.compile`` on
+        CUDA — kernel fusion via inductor, typically 1.2–3× decode
+        tok/s on small models when it succeeds.  Off by default: torch
+        2.12's inductor has known codegen bugs on newer architectures
+        (Gemma-4, Qwen3.5 hit ``TypeError: Pointer argument must be
+        either uint64`` in the static_cuda_launcher / regular Triton
+        launcher); the loader's probe catches these but still costs
+        ~25–100s upfront, which rarely amortizes on interactive
+        workloads.  Pass ``True`` for sustained workloads (long-running
+        serve, batch eval) where the per-token win pays back the
+        compile cost.  Auto-skipped on MPS/CPU.
 
-        ``cuda_graphs`` (default ``True``, Phase B v2.2) auto-enables
+        ``cuda_graphs`` (default ``False``) opts in to
         ``transformers.StaticCache`` + ``torch.compile(mode=
         "reduce-overhead")`` on CUDA-supported architectures.  Static
         K/V buffers across decode steps mean inductor can capture CUDA
-        graphs internally — typical 1.5–2.5× decode tok/s on small
-        models *on top of* the kernel-fusion win from ``compile=True``.
-        Auto-skipped on MPS/CPU and on architectures whose StaticCache
-        construction fails (probed at session init; the fallback reason
-        is logged once).  Pass ``False`` to use DynamicCache (the v2.1
-        path) — useful when debugging cache-related issues or when a
-        specific architecture has subtle StaticCache quirks.
+        graphs internally — an additional 1.5–2.5× decode tok/s on top
+        of the kernel-fusion win from ``compile=True``.  Off by default
+        for the same reason as ``compile``; setting this without
+        ``compile=True`` has no effect.  Auto-skipped on MPS/CPU and on
+        architectures whose StaticCache construction fails.
 
         ``compile_mode`` (default ``None`` → auto-select) overrides the
         torch.compile mode.  When None, the session picks
@@ -522,23 +525,16 @@ class SaklasSession:
                 "reduce-overhead" if cg_supported else "default"
             )
 
-        # Apply compile manually with the resolved mode.  Keeps the
-        # device gating, dynamo availability check, and skip-on-non-cuda
-        # log behavior aligned with what ``load_model`` would have
-        # produced if we'd let it own the compile call.
+        # Apply compile manually with the resolved mode.  Routes through
+        # ``_compile_with_probe`` so an architecture-specific inductor /
+        # Triton bug surfaces at load time as a caught warning + eager
+        # fallback, rather than as a segfault on the user's first token.
         if compile and device_obj.type == "cuda":
-            try:
-                import torch._dynamo  # noqa: F401
-            except ImportError:
-                _log.info("torch.compile unavailable (no _dynamo); skipping")
-            else:
-                _log.info(
-                    "Compiling model with torch.compile(mode=%r)",
-                    effective_compile_mode,
-                )
-                model = torch.compile(
-                    model, mode=effective_compile_mode, dynamic=None,
-                )
+            from saklas.core.model import _compile_with_probe
+            model = _compile_with_probe(
+                model, tokenizer, device_obj,
+                mode=effective_compile_mode,
+            )
         elif compile:
             _log.info(
                 "compile=True but device=%s — skipping torch.compile "
@@ -578,7 +574,7 @@ class SaklasSession:
         extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
         dls: bool = True,
-        cuda_graphs: bool = True,
+        cuda_graphs: bool = False,
         return_top_k: int = 0,
     ):
         self._model = model
