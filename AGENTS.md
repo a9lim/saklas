@@ -24,7 +24,8 @@ Deep internals live in subtree `AGENTS.md` files — Claude Code auto-loads each
 ```bash
 pip install -e ".[dev]"                         # editable + pytest
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
-pip install -e ".[cuda]"                        # bitsandbytes + flash-attn (Linux/CUDA)
+pip install -e ".[cuda]"                        # bitsandbytes + kernels (Linux/CUDA)
+pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
 pip install -e ".[sae]"                         # SAELens-backed SAE extraction
 saklas tui <model_id> [--steer-mode {angular,additive}] [--theta-max RAD]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]

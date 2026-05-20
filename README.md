@@ -87,6 +87,7 @@ pip install saklas[gguf]       # adds the gguf package for llama.cpp interchange
 pip install saklas[research]   # adds datasets and pandas for dataset loading and DataFrames
 pip install saklas[notebook]   # adds plotly, pandas, and kaleido for Jupyter figure helpers
 pip install saklas[sae]        # adds sae-lens for SAE-backed extraction
+pip install saklas[cuda]       # adds bitsandbytes and HF kernels for CUDA acceleration
 ```
 
 This requires Python 3.11+ and PyTorch 2.2+. It should run on Linux, macOS, and Windows. CUDA or Apple Silicon MPS is recommended for anything interactive.

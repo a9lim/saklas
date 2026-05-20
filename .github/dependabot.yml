@@ -18,4 +18,5 @@ updates:
       - dependency-name: "transformers"
       - dependency-name: "accelerate"
       - dependency-name: "bitsandbytes"
+      - dependency-name: "kernels"
       - dependency-name: "flash-attn"
