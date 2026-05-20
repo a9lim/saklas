@@ -3583,6 +3583,37 @@ class SaklasSession:
                         }
                         for a in top_alts
                     ]
+                # Per-token probe scoring lives here so the persisted node
+                # row carries the same ``probes`` + ``per_layer_scores`` the
+                # live WS ``token`` event ships.  Without this, the webui
+                # rehydrates a tree across a page refresh with tokens but
+                # no scores — highlight tint and the token-drilldown heatmap
+                # silently go blank for historical turns.  The WS handler
+                # reads these back off the row rather than recomputing.
+                if self._monitor.probe_names:
+                    latest_hidden_for_persist = {
+                        layer_idx: bucket[-1]
+                        for layer_idx, bucket in self._capture._per_layer.items()
+                        if bucket
+                    }
+                    if latest_hidden_for_persist:
+                        agg = self._monitor.score_single_token(
+                            latest_hidden_for_persist,
+                        )
+                        if agg:
+                            token_row["probes"] = {
+                                p: round(float(v), 6) for p, v in agg.items()
+                            }
+                        per_layer = self._monitor.score_single_token_per_layer(
+                            latest_hidden_for_persist,
+                        )
+                        if per_layer:
+                            token_row["per_layer_scores"] = {
+                                str(layer): {
+                                    p: round(float(v), 6) for p, v in metrics.items()
+                                }
+                                for layer, metrics in per_layer.items()
+                            }
                 self.tree.append_token(
                     assistant_node_id,
                     token_row,
@@ -3620,10 +3651,16 @@ class SaklasSession:
         # not wiring _token_tap=None when stop_list is set — the tokenizer-
         # decode + stop-match in generation.py only runs under on_token.
         _has_trait_consumer = bool(self._trait_queues and self._monitor.probe_names)
+        # The tap also writes per-token ``probes`` / ``per_layer_scores``
+        # onto the loom row when probes are loaded and the gen is loom-
+        # attached — required so a webui refresh can rehydrate highlight
+        # tints and the token-drilldown heatmap from the server tree.
+        _persists_probe_row = bool(not stateless and self._monitor.probe_names)
         _need_tap = (
             on_token is not None
             or logprobs_list is not None
             or _has_trait_consumer
+            or _persists_probe_row
             or stop_list is not None
         )
         _effective_tap = _token_tap if _need_tap else None

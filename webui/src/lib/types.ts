@@ -416,6 +416,31 @@ export interface WSErrorEvent {
 
 /** Wire-shape mirror of saklas.core.loom.LoomNode.  Optional fields are
  * absent on the wire when null/empty server-side to keep payloads slim. */
+/** One token-row inside a node's ``tokens`` / ``thinking_tokens`` array.
+ *  Server-side ``TokenScoreDict`` is loose (``dict[str, Any]``); the
+ *  fields below are the ones :meth:`session._token_tap` stamps and the
+ *  ones the webui knows how to consume.  All optional because the engine
+ *  legitimately omits some on certain paths (e.g. ``top_alts`` only when
+ *  ``return_top_k > 0``; ``probes`` / ``per_layer_scores`` only when the
+ *  monitor has probes loaded; ``raw_index`` is stamped at finalize and
+ *  absent for legacy / transcript-loaded nodes). */
+export interface LoomTokenRowJSON {
+  token_id?: number;
+  text?: string;
+  logprob?: number | null;
+  perplexity?: number | null;
+  top_alts?: { id: number; text: string; logprob: number }[];
+  raw_index?: number | null;
+  /** Per-token magnitude-weighted aggregate probe score
+   *  (``score_single_token``), persisted at append time.  Drives the
+   *  highlight tint when the user rehydrates a tree across page refresh. */
+  probes?: Record<string, number>;
+  /** Per-layer × per-probe heatmap (``score_single_token_per_layer``),
+   *  keyed by stringified layer index.  Drives the token-drilldown
+   *  drawer's heatmap on rehydrated turns. */
+  per_layer_scores?: Record<string, Record<string, number>>;
+}
+
 export interface LoomNodeJSON {
   id: string;
   parent_id: string | null;
@@ -443,6 +468,19 @@ export interface LoomNodeJSON {
    *  the loom sidebar's surprise edge-weighting and the
    *  ``sort:surprise`` / ``sort:confidence`` filter grammar. */
   mean_logprob?: number | null;
+  /** Per-token response-span rows captured during streaming.  Present
+   *  when the server serializes the tree with ``include_tokens=True``
+   *  (the webui tree GET path).  Absent on legacy / transcript-loaded
+   *  nodes that never streamed under the v2.4 token-row schema. */
+  tokens?: LoomTokenRowJSON[] | null;
+  /** Per-token thinking-span rows.  Same shape as ``tokens``; populated
+   *  only when the engine emitted thinking content for the node. */
+  thinking_tokens?: LoomTokenRowJSON[] | null;
+  /** Raw decode-step ids the engine sampled, including suppressed
+   *  delimiters and unmerged partial-UTF-8 bytes.  The forceable prefix
+   *  a logit fork replays from; ``null`` on legacy / transcript-loaded
+   *  nodes, in which case the fork affordance falls back to disabled. */
+  raw_token_ids?: number[] | null;
 }
 
 /** Full tree dump returned by GET /sessions/{id}/tree.
@@ -783,6 +821,15 @@ export interface PendingAction {
   awaitsGen: boolean;
   rebuild: ((newText: string) => PendingAction) | null;
   createdAt: number;
+  /** Predicted active-node role after this action drains.  Drives the
+   *  input box's role-aware placeholder + send-button label: a queued
+   *  ``commit_user`` (this field = ``true``) flips the next message into
+   *  prefill / commit-assistant mode even though the live active node
+   *  hasn't moved yet.  ``null`` for actions that don't change the
+   *  active node (rack mutations, sampling tweaks).  ``false`` for
+   *  actions that land an assistant or root active node (send, prefill,
+   *  commit_assistant, regen, /clear). */
+  endsOnUserNode?: boolean | null;
 }
 
 // ----------------------------------------------------- drawers --

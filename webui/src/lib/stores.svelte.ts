@@ -47,6 +47,7 @@ import type {
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
+import { SURPRISE_TARGET } from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
 
 export * from "./stores/drawers.svelte";
@@ -326,7 +327,11 @@ export interface ProbeRackState {
 
 export const probeRack: ProbeRackState = $state({
   entries: new SvelteMap(),
-  sortMode: "value",
+  // Alphabetical by default — matches the TUI's ``TraitPanel._sort_mode
+  // = "name"`` initial state.  Sort by live value / change is a
+  // dropdown opt-in (value is interesting when probes are firing but
+  // unstable as a default — order shifts every token).
+  sortMode: "name",
   active: [],
 });
 
@@ -569,11 +574,33 @@ function recomputeActivePath(): void {
   loomTree.activePath = reversed.reverse();
 }
 
+/** Snake_case server token row → camelCase client ``TokenScore``.  Used
+ *  by both the rehydration path (``nodeToTurn``) and the live ``token``
+ *  WS handler; keeping a single converter means the rehydrated tokens
+ *  are bit-identical to the live-streamed shape so the highlight / click
+ *  / fork affordances behave the same way. */
+function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): TokenScore {
+  const out: TokenScore = {
+    text: row.text ?? "",
+    thinking: false,
+  };
+  if (row.token_id !== undefined) out.tokenId = row.token_id;
+  if (row.logprob !== undefined) out.logprob = row.logprob;
+  if (row.top_alts) out.topAlts = row.top_alts;
+  if (row.raw_index !== undefined) out.rawIndex = row.raw_index;
+  if (row.probes) out.probes = row.probes;
+  if (row.per_layer_scores) out.perLayerScores = row.per_layer_scores;
+  return out;
+}
+
 /** Project a LoomNodeJSON to a ChatTurn for Chat.svelte consumption.
- *  Leaves token streams untouched — the WS handler builds those on the
- *  in-flight turn from per-token events. */
+ *  Hydrates ``tokens`` / ``thinkingTokens`` from the server-serialized
+ *  per-token rows when the server included them (tree GET / tree_mutated
+ *  with ``include_tokens=True``).  Without this, a force-refresh would
+ *  produce token-less turns and the inline highlight / token-drilldown
+ *  click target would silently break for historical messages. */
 function nodeToTurn(n: LoomNodeJSON): ChatTurn {
-  return {
+  const turn: ChatTurn = {
     role: n.role,
     text: n.text ?? "",
     nodeId: n.id,
@@ -581,6 +608,22 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
     aggregateReadings: n.aggregate_readings ?? undefined,
     finishReason: n.finish_reason ?? undefined,
   };
+  if (n.tokens && n.tokens.length > 0) {
+    turn.tokens = n.tokens.map((r) => {
+      const s = tokenRowToScore(r);
+      s.thinking = false;
+      return s;
+    });
+  }
+  if (n.thinking_tokens && n.thinking_tokens.length > 0) {
+    turn.thinkingTokens = n.thinking_tokens.map((r) => {
+      const s = tokenRowToScore(r);
+      s.thinking = true;
+      return s;
+    });
+    turn.thinking = true;
+  }
+  return turn;
 }
 
 /** Per-node cache of streamed per-token score data.
@@ -688,24 +731,36 @@ function syncChatLogFromTree(): void {
       prev.appliedSteering = node.applied_steering ?? prev.appliedSteering ?? null;
       prev.aggregateReadings = node.aggregate_readings ?? prev.aggregateReadings;
       prev.finishReason = node.finish_reason ?? prev.finishReason;
-      // Restore cached per-token scores if this reused turn lost them
-      // (positional fallback from a different node).
+      // Restore per-token scores if this reused turn lost them
+      // (positional fallback from a different node, or first-paint
+      // hydration from a localStorage snapshot that pre-dates the
+      // per-token persistence).  Server-shipped node tokens win over
+      // the in-memory cache — they're authoritative and include the
+      // ``probes`` + ``per_layer_scores`` the cache may not have.
       if ((prev.tokens?.length ?? 0) === 0) {
-        const cached = tokenScoreCache.get(nid);
-        if (cached) {
-          prev.tokens = cached.tokens;
-          prev.thinkingTokens = cached.thinkingTokens;
+        const fromNode = nodeToTurn(node);
+        if (fromNode.tokens || fromNode.thinkingTokens) {
+          prev.tokens = fromNode.tokens;
+          prev.thinkingTokens = fromNode.thinkingTokens;
+        } else {
+          const cached = tokenScoreCache.get(nid);
+          if (cached) {
+            prev.tokens = cached.tokens;
+            prev.thinkingTokens = cached.thinkingTokens;
+          }
         }
       }
       turn = prev;
     } else {
       turn = nodeToTurn(node);
-      // Re-attach streamed per-token scores cached from a prior visit so
-      // the inline highlight survives branch navigation.
-      const cached = tokenScoreCache.get(nid);
-      if (cached) {
-        turn.tokens = cached.tokens;
-        turn.thinkingTokens = cached.thinkingTokens;
+      // Cache fallback for branch nav across nodes the server hasn't
+      // serialized with tokens (legacy / transcript-loaded).
+      if (!turn.tokens && !turn.thinkingTokens) {
+        const cached = tokenScoreCache.get(nid);
+        if (cached) {
+          turn.tokens = cached.tokens;
+          turn.thinkingTokens = cached.thinkingTokens;
+        }
       }
     }
     if (loomTree.pendingNodeId === nid) pendingIdx = out.length;
@@ -970,7 +1025,13 @@ export interface HighlightState {
 }
 
 export const highlightState: HighlightState = $state({
-  target: null,
+  // Surprise mode by default — the logit-pass tint works without any
+  // probes loaded, so it's the one mode that's meaningful out of the
+  // box.  Mirrors the TUI's ``_highlight_probe = SURPRISE_PROBE`` +
+  // ``_highlighting = True`` init.  ``localStorage`` overrides per
+  // model on hydrate, so a user who flipped to a probe + reloaded
+  // still sees their last choice.
+  target: SURPRISE_TARGET,
   compareTarget: null,
   compareTwo: false,
   smoothBlend: false,
@@ -1271,6 +1332,21 @@ function enqueueOrApply(label: string, apply: () => void): void {
  *  items waiting their turn.  Used by every submission helper below. */
 export function isPendingBusy(): boolean {
   return genStatus.active || pendingActions.queue.length > 0;
+}
+
+/** Predict the post-queue active-node-is-user-role flag.  Walks the
+ *  queue tail-first and returns the first non-null ``endsOnUserNode``;
+ *  returns ``null`` when no queued item changes the role (e.g. the
+ *  queue is empty or only carries rack mutations).  Drives the chat
+ *  input's role-aware placeholder + send-button label so a queued
+ *  ``commit user`` flips the next submission into prefill /
+ *  commit-assistant mode without waiting for the queue to drain. */
+export function predictedQueueEndOnUserNode(): boolean | null {
+  for (let i = pendingActions.queue.length - 1; i >= 0; i--) {
+    const e = pendingActions.queue[i].endsOnUserNode;
+    if (e !== undefined && e !== null) return e;
+  }
+  return null;
 }
 
 // ============================================================ WS ========
@@ -1758,7 +1834,9 @@ export interface SendGenerateOpts {
 
 /** Build a :class:`PendingAction` for a queued chat send.  The
  *  ``rebuild`` factory preserves ``opts`` across an ↑-pull-and-edit so
- *  the slot's parent_node_id / steering override / n stay attached. */
+ *  the slot's parent_node_id / steering override / n stay attached.
+ *  ``endsOnUserNode=false`` — a send lands a user turn then an assistant
+ *  reply, so the post-drain active node is always assistant. */
 function buildSendPending(
   text: string, opts: SendGenerateOpts,
 ): PendingAction {
@@ -1770,6 +1848,7 @@ function buildSendPending(
     awaitsGen: true,
     rebuild: (newText: string) => buildSendPending(newText, opts),
     createdAt: Date.now(),
+    endsOnUserNode: false,
   };
 }
 
@@ -1891,16 +1970,29 @@ export async function sendFork(
 }
 
 function buildPrefillPending(
-  nodeId: string, text: string, opts: { n?: number },
+  nodeId: string | "active@drain",
+  text: string,
+  opts: { n?: number },
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
     label: "prefill",
     text,
-    apply: () => sendPrefillNow(nodeId, text, opts),
+    apply: () => {
+      // Deferred resolution: when the parent user node was itself queued
+      // (queue-role-aware dispatch), the literal id at enqueue time was
+      // a sentinel — read the active node fresh at drain time, by which
+      // point the previous drained action has landed the right user node.
+      const parent = nodeId === "active@drain"
+        ? loomTree.active_node_id
+        : nodeId;
+      if (!parent) return;
+      return sendPrefillNow(parent, text, opts);
+    },
     awaitsGen: true,
     rebuild: (newText: string) => buildPrefillPending(nodeId, newText, opts),
     createdAt: Date.now(),
+    endsOnUserNode: false,
   };
 }
 
@@ -1916,7 +2008,7 @@ function buildPrefillPending(
  *  Queues behind in-flight gens / earlier pending items; the in-flight
  *  gen is not interrupted. */
 export async function sendPrefill(
-  nodeId: string,
+  nodeId: string | "active@drain",
   text: string,
   opts: { n?: number; replaceSlot?: number | null } = {},
 ): Promise<void> {
@@ -1930,12 +2022,19 @@ export async function sendPrefill(
         apply: item.apply,
         awaitsGen: item.awaitsGen,
         rebuild: item.rebuild,
+        endsOnUserNode: item.endsOnUserNode,
       },
       { replaceSlot: replaceSlot ?? null },
     );
     return;
   }
-  return sendPrefillNow(nodeId, text, opts);
+  // Immediate fire: resolve the sentinel against the live active node;
+  // an empty resolution is a no-op (nothing to anchor under).
+  const resolved = nodeId === "active@drain"
+    ? loomTree.active_node_id
+    : nodeId;
+  if (!resolved) return;
+  return sendPrefillNow(resolved, text, opts);
 }
 
 async function sendPrefillNow(
@@ -1962,17 +2061,27 @@ async function sendPrefillNow(
 
 function buildCommitPending(
   role: "user" | "assistant",
-  parentNodeId: string | null,
+  parentNodeId: string | null | "active@drain",
   text: string,
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
     label: role === "assistant" ? "commit assistant" : "commit user",
     text,
-    apply: () => sendCommitNow(role, parentNodeId, text),
+    apply: () => {
+      // Deferred resolution for queue-role-aware dispatch: a commit
+      // queued behind another that creates its own user node needs to
+      // hang under that not-yet-existing node — read the active node
+      // fresh at drain time.
+      const parent = parentNodeId === "active@drain"
+        ? loomTree.active_node_id
+        : parentNodeId;
+      return sendCommitNow(role, parent, text);
+    },
     awaitsGen: true,
     rebuild: (newText: string) => buildCommitPending(role, parentNodeId, newText),
     createdAt: Date.now(),
+    endsOnUserNode: role === "user",
   };
 }
 
@@ -1989,7 +2098,7 @@ function buildCommitPending(
  *  Queues behind in-flight gens / earlier pending items. */
 export async function sendCommit(
   role: "user" | "assistant",
-  parentNodeId: string | null,
+  parentNodeId: string | null | "active@drain",
   text: string,
   opts: { replaceSlot?: number | null } = {},
 ): Promise<void> {
@@ -2002,12 +2111,19 @@ export async function sendCommit(
         apply: item.apply,
         awaitsGen: item.awaitsGen,
         rebuild: item.rebuild,
+        endsOnUserNode: item.endsOnUserNode,
       },
       { replaceSlot: opts.replaceSlot ?? null },
     );
     return;
   }
-  return sendCommitNow(role, parentNodeId, text);
+  // Immediate fire: resolve the sentinel against the live active node.
+  // ``role === "user"`` accepts a null parent (server falls through to
+  // the live active); ``role === "assistant"`` requires a real id.
+  const resolved = parentNodeId === "active@drain"
+    ? loomTree.active_node_id
+    : parentNodeId;
+  return sendCommitNow(role, resolved, text);
 }
 
 async function sendCommitNow(
@@ -2415,10 +2531,13 @@ function schedulePersist(): void {
   }, 250);
 }
 
-/** ~5MB soft budget.  Browsers vary (Chrome ~10MB, Safari ~5MB) but
- *  the warning is intentionally conservative so it fires before any
- *  vendor hits its hard cap. */
-const _LOCALSTORAGE_SOFT_BUDGET = 5 * 1024 * 1024;
+/** 1 GB soft budget — effectively "never toast".  The toast was the only
+ *  in-app surface that flagged cache size; muting it means the user no
+ *  longer sees a warning before the browser's hard quota kicks in.
+ *  ``safeLocalStorageSet`` still try/catches the resulting
+ *  ``QuotaExceededError`` silently when that happens (write drops, next
+ *  refresh refetches the server tree). */
+const _LOCALSTORAGE_SOFT_BUDGET = 1024 * 1024 * 1024;
 
 /** Once-per-session latch so we don't toast on every rev bump after
  *  the budget threshold is crossed.  Reset implicitly on page reload. */

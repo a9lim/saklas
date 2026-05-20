@@ -43,6 +43,48 @@ _KIND_LABELS: dict[str, str] = {
     "fan": "/fan",
 }
 
+# Sentinel used in a PendingItem payload to defer parent-node resolution
+# until drain time.  When a queued commit / prefill should hang under a
+# node that another earlier-queued action will create (e.g. a
+# ``commit_user`` followed by a ``commit_assistant``), capturing the
+# live active id at submit time would point at the wrong node — this
+# sentinel tells the dispatcher to read ``session.tree.active_node_id``
+# fresh, by which point the earlier queue items have landed.
+ACTIVE_AT_DRAIN = "__active@drain__"
+
+# Per-kind prediction of the active-node role *after* the item drains.
+# Drives the queue-aware input placeholder: a queued ``commit_user``
+# (value ``True``) flips the next submission into prefill mode without
+# waiting for the queue to drain.  Items missing from this map are
+# treated as "no role change" — rack mutations, /steer, /probe, etc.
+_KIND_ENDS_ON_USER_NODE: dict[str, bool] = {
+    "submit": False,           # send → assistant
+    "commit_user": True,       # user turn lands → active = user
+    "commit_assistant": False, # assistant turn lands → active = assistant
+    "regenerate": False,       # new assistant sibling
+    "rewind": True,            # rewinds to the previous user turn
+    "clear": False,            # resets to root (system, not user)
+    "regen_n": False,          # N assistant siblings
+    "fan": False,              # alpha-grid siblings, all assistant
+}
+
+# Kinds whose dispatched action is fully synchronous on the UI thread —
+# no worker, no done sentinel.  ``_drain_next_pending`` chain-drains
+# through them inline rather than blocking for a ``done`` that will
+# never arrive.  Kinds NOT in this set must either (a) fire a worker
+# that runs a generation (the gen's own ``done`` advances the drain),
+# or (b) fire a worker that explicitly enqueues ``("done", False)``
+# in its finally block (the commit / extract pattern).  This was the
+# root cause of the "queue stuck after commit" bug — commits ran on
+# workers without enqueuing a done sentinel, leaving the drain loop
+# stalled until the next genuine generation ``done``.
+_KIND_CHAIN_INLINE: frozenset[str] = frozenset({
+    "clear",
+    "rewind",
+    "steer",
+    "probe",
+})
+
 
 @dataclass(frozen=True)
 class PendingItem:
@@ -694,7 +736,7 @@ class ChatPanel(Widget):
         # than a subtle highlight.  Height grows with content up to a
         # CSS-side cap.
         yield ChatInput(
-            placeholder="Type a message…  (⌃J or ⇧⏎ for newline)",
+            placeholder="message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline",
             id="chat-input",
             show_line_numbers=False,
             highlight_cursor_line=False,
@@ -771,10 +813,13 @@ class ChatPanel(Widget):
             inp = self.query_one("#chat-input", ChatInput)
         except Exception:
             return
+        # Same `<verb>…  <bind list>` shape as the GUI's Chat.svelte
+        # placeholder; terminals can't surface modifier-only keydown so
+        # the TUI lacks the commit-key-held variants the GUI shows.
         inp.placeholder = (
-            "Prefill the assistant's reply…  (⌃J or ⇧⏎ for newline)"
+            "prefill reply…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
             if on
-            else "Type a message…  (⌃J or ⇧⏎ for newline)"
+            else "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
         )
 
     # -- AB mode --

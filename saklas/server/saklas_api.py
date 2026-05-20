@@ -482,11 +482,16 @@ def _result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
 def _tree_to_json(session: SaklasSession) -> dict[str, Any]:
     """Serialize the session's loom tree to JSON.
 
-    Thin wrapper over :meth:`LoomTree.to_dict` — ``include_tokens=False``
-    so the wire payload stays small (per-node token blobs are persisted
-    side-by-side, not embedded in the tree document).
+    Thin wrapper over :meth:`LoomTree.to_dict` with ``include_tokens=True``
+    so a webui force-refresh can rehydrate per-token spans (highlight
+    tints, click-to-drilldown, surprise mode, fork affordance) from the
+    server tree.  Per-token blobs ride the per-node ``tokens`` /
+    ``thinking_tokens`` arrays — bulky on long conversations but the
+    only way the inline highlight survives a tab reload (the client's
+    in-memory ``tokenScoreCache`` is wiped, and the on-disk save sidecar
+    is not in the wire path).
     """
-    return session.tree.to_dict(include_tokens=False)
+    return session.tree.to_dict(include_tokens=True)
 
 
 def _active_path_json(session: SaklasSession) -> dict[str, Any]:
@@ -520,10 +525,12 @@ def _node_json(session: SaklasSession, node_id: str) -> dict[str, Any]:
 
     The child-id list isn't on ``LoomNode`` itself (the tree owns the
     structure map), but surfaces routinely want it alongside the node
-    payload — so we attach it here.
+    payload — so we attach it here.  ``include_tokens=True`` mirrors
+    :func:`_tree_to_json` so ``tree_mutated`` deltas carry the same
+    per-token shape the initial tree GET ships.
     """
     node = session.tree.get(node_id)
-    out = node.to_dict(include_tokens=False)
+    out = node.to_dict(include_tokens=True)
     out["children"] = list(session.tree.children_of.get(node_id, []))
     return out
 
@@ -2333,38 +2340,33 @@ async def _ws_handle_generate(
                 except Exception:
                     pass
                 # Inline probe scores for the live inspector + chat
-                # highlight.  Computed only when probes are loaded (covers
-                # the cost of N matmul + N CPU syncs against the latest
-                # captured hidden state).  Falls through silently when no
-                # capture exists yet (e.g. extremely short generations
-                # where the hook never fires).
-                #
-                # ``scores`` is the magnitude-weighted aggregate per probe
-                # (same value ``score_single_token`` feeds the TUI's live
-                # highlight) — the webui tints tokens with this so live
+                # highlight.  ``scores`` is the magnitude-weighted aggregate
+                # per probe — the webui tints tokens with this so live
                 # highlighting matches the post-generation pass.
                 # ``per_layer_scores`` is the per-layer heatmap the token
                 # drilldown drawer needs.
+                #
+                # Both are computed and persisted onto the loom row by
+                # ``session._token_tap`` (engine-side) before this WS
+                # callback fires; we read them back off the row rather
+                # than recomputing.  Single source of truth: the persisted
+                # row is what a webui refresh rehydrates from, so the live
+                # stream and the rehydrated tree match by construction.
                 try:
-                    monitor = session._monitor
-                    if monitor.probe_names:
-                        latest_hidden = {
-                            layer_idx: bucket[-1]
-                            for layer_idx, bucket in session._capture._per_layer.items()
-                            if bucket
-                        }
-                        if latest_hidden:
-                            agg = monitor.score_single_token(latest_hidden)
-                            if agg:
-                                event["scores"] = {
-                                    p: round(float(v), 6) for p, v in agg.items()
-                                }
-                            per_layer = monitor.score_single_token_per_layer(latest_hidden)
-                            if per_layer:
-                                event["per_layer_scores"] = {
-                                    str(layer): {p: round(float(v), 6) for p, v in metrics.items()}
-                                    for layer, metrics in per_layer.items()
-                                }
+                    node = (
+                        session.tree.nodes.get(node_id) if node_id else None
+                    )
+                    rows = (
+                        node.thinking_tokens if is_thinking else node.tokens
+                    ) if node is not None else None
+                    last = rows[-1] if rows else None
+                    if last is not None:
+                        probes_blob = last.get("probes")
+                        if probes_blob:
+                            event["scores"] = probes_blob
+                        per_layer_blob = last.get("per_layer_scores")
+                        if per_layer_blob:
+                            event["per_layer_scores"] = per_layer_blob
                 except Exception:
                     # Inspector data is best-effort — never let a failure
                     # here break the streaming token path.

@@ -26,6 +26,10 @@ from saklas.io.probes_bootstrap import load_defaults
 from saklas.core.results import ResultCollector
 from saklas.core.session import MIN_ELAPSED_FOR_RATE
 from saklas.tui.chat_panel import (
+    ACTIVE_AT_DRAIN,
+    SURPRISE_PROBE,
+    _KIND_CHAIN_INLINE,
+    _KIND_ENDS_ON_USER_NODE,
     ChatInput,
     ChatPanel,
     PendingItem,
@@ -206,7 +210,12 @@ class SaklasApp(App[None]):
         self._alphas: dict[str, float] = {}
         self._enabled: dict[str, bool] = {}
         self._supports_thinking: bool = supports_thinking(session._tokenizer)
-        self._thinking: bool = self._supports_thinking
+        # Thinking defaults to off on both surfaces — the explicit
+        # binary toggle (``⌃T``) is the user's affirmative opt-in, matching
+        # the GUI's ``samplingState.thinking = false`` default.  Previous
+        # behaviour ("default on whenever supported") silently consumed
+        # extra tokens for thinking traces the user hadn't asked for.
+        self._thinking: bool = False
 
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
@@ -287,8 +296,12 @@ class SaklasApp(App[None]):
 
         self._focused_panel_idx: int = 1  # Start with chat focused
 
-        self._highlighting: bool = False
-        self._highlight_probe: str | None = None
+        # Highlight defaults to surprise mode on both surfaces — the
+        # logit-pass tint works without any probes loaded, so it's the
+        # one mode that's meaningful out of the box.  Mirrors the GUI's
+        # ``highlightState.target = SURPRISE_TARGET`` default.
+        self._highlighting: bool = True
+        self._highlight_probe: str | None = SURPRISE_PROBE
         self._default_seed: int | None = None
         self._ui_token_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
 
@@ -381,6 +394,10 @@ class SaklasApp(App[None]):
         self._trait_panel = self.query_one("#trait-panel", TraitPanel)
         self._panels = [self._left_panel, self._chat_panel, self._trait_panel]
         self._refresh_gen_config()
+        # Seed the persistent HL readout from the initial highlight state
+        # (surprise by default — see __init__).  No widgets are mounted
+        # yet, so this is purely the panel-line refresh.
+        self._apply_highlight_to_all()
 
         if self._session._monitor:
             self._trait_panel.set_active_probes(set(self._session._monitor.probe_names))
@@ -543,8 +560,20 @@ class SaklasApp(App[None]):
             # care of it via ``_start_generation`` → row-mount on first
             # token.  Mounting now would visually anchor the user turn
             # to the wrong assistant reply.
+            #
+            # Queue role-awareness: if the queue predicts a post-drain
+            # user node (e.g. a queued ``commit_user``) but the live
+            # active isn't one yet, the user is composing a prefill
+            # against a not-yet-existing node.  Stamp ``ACTIVE_AT_DRAIN``
+            # so the dispatcher resolves the parent fresh when the item
+            # fires, by which point the earlier queue items have landed.
+            queued_target: str | None
+            if prefill_target is None and self._predicted_on_user_node():
+                queued_target = ACTIVE_AT_DRAIN
+            else:
+                queued_target = prefill_target
             self._enqueue_pending(
-                PendingItem("submit", text, (prefill_target,)),
+                PendingItem("submit", text, (queued_target,)),
                 replace_slot=replace_slot,
             )
             return
@@ -870,6 +899,11 @@ class SaklasApp(App[None]):
                 # AmbiguousVariantError / UnknownVariantError are KeyError/ValueError
                 # subclasses — either branch lands here. Surface cleanly.
                 self.call_from_thread(self._steer_status, f"{type(e).__name__}: {e}")
+            finally:
+                # Advance the queue drain so a queued ``/extract`` doesn't
+                # stall subsequent items — extract runs on a worker, not
+                # through the gen loop, so no natural ``done`` arrives.
+                self._ui_token_queue.put(("done", False))
 
         self.run_worker(_worker, thread=True)
 
@@ -1303,17 +1337,45 @@ class SaklasApp(App[None]):
             return active.id
         return None
 
+    def _predicted_queue_end_on_user_node(self) -> bool | None:
+        """Walk the queue tail-first, return the first per-kind prediction.
+
+        ``None`` when no queued item changes the active-node role (empty
+        queue, or items like ``/steer`` / ``/probe`` that don't touch the
+        tree).  ``True`` / ``False`` when a queued item lands a user /
+        non-user node — the next submission's input mode should reflect
+        the post-drain role rather than the live one.
+        """
+        for item in reversed(self._pending_queue):
+            ends = _KIND_ENDS_ON_USER_NODE.get(item.kind)
+            if ends is not None:
+                return ends
+        return None
+
+    def _predicted_on_user_node(self) -> bool:
+        """Queue-aware ``_prefill_target_node_id() is not None``.
+
+        When the queue predicts a role change, return that prediction;
+        otherwise fall through to the live active node.  Drives the
+        placeholder via :meth:`_refresh_input_mode` so a queued
+        ``commit_user`` flips the input to prefill mode immediately.
+        """
+        predicted = self._predicted_queue_end_on_user_node()
+        if predicted is not None:
+            return predicted
+        return self._prefill_target_node_id() is not None
+
     def _refresh_input_mode(self) -> None:
-        """Sync the chat input's prefill-mode placeholder to the active node.
+        """Sync the chat input's prefill-mode placeholder to the queue-
+        aware active node.
 
         Called from every active-node transition funnel
         (:meth:`_repaint_chat_from_active_path` for navigation, the
-        ``done`` sentinel in :meth:`_poll_generation` for post-gen) so the
-        placeholder tracks whether a typed message would prefill or send.
+        ``done`` sentinel in :meth:`_poll_generation` for post-gen) and
+        from :meth:`_enqueue_pending` / :meth:`_remove_pending_slot` so
+        the placeholder also tracks queue mutations.
         """
-        self._chat_panel.set_prefill_mode(
-            self._prefill_target_node_id() is not None
-        )
+        self._chat_panel.set_prefill_mode(self._predicted_on_user_node())
 
     def _start_prefill(self, node_id: str, prefill_text: str) -> None:
         """Answer-prefill — seed the assistant reply under user node
@@ -1443,9 +1505,17 @@ class SaklasApp(App[None]):
         """
         user_node_id = self._prefill_target_node_id()
         if self._is_busy:
+            # Queue role-awareness mirrors the submit handler: a queued
+            # commit landing under a not-yet-existing user node (from
+            # an earlier queued ``commit_user``) stamps ``ACTIVE_AT_DRAIN``
+            # so the dispatcher resolves the parent fresh at drain time.
             if user_node_id is not None:
                 item = PendingItem(
                     "commit_assistant", text, (user_node_id,),
+                )
+            elif self._predicted_on_user_node():
+                item = PendingItem(
+                    "commit_assistant", text, (ACTIVE_AT_DRAIN,),
                 )
             else:
                 item = PendingItem("commit_user", text)
@@ -1482,6 +1552,11 @@ class SaklasApp(App[None]):
         even on a slow-tokenize text.  On failure (e.g. active is itself
         a user node) we surface a system message and skip the mount via
         a post-mount remove.
+
+        The worker enqueues a ``("done", False)`` sentinel in its
+        finally block — without it the pending-queue drain loop stalls
+        after a queued commit, because commits don't run a generation
+        and therefore don't produce a natural ``done`` event.
         """
         row = self._chat_panel.add_user_message(text)
 
@@ -1499,6 +1574,10 @@ class SaklasApp(App[None]):
                         pass
                     self._chat_panel.add_system_message(f"commit failed: {msg}")
                 self.call_from_thread(_rollback)
+            finally:
+                # Advance the queue drain — commits don't stream so no
+                # natural ``done`` arrives via the gen worker.
+                self._ui_token_queue.put(("done", False))
 
         self.run_worker(_commit, thread=True)
 
@@ -1509,6 +1588,10 @@ class SaklasApp(App[None]):
         (no streaming) and routes through ``session.append_assistant_turn``
         on a worker thread.  Highlight goes plain — authored turns carry
         no per-token scores.
+
+        Worker enqueues ``("done", False)`` in finally so the pending-
+        queue drain advances; see :meth:`_start_commit_user` for the
+        rationale.
         """
         row, widget = self._chat_panel.add_finalized_assistant(text)
         self._row_for_widget[id(widget)] = row
@@ -1529,6 +1612,8 @@ class SaklasApp(App[None]):
                         pass
                     self._chat_panel.add_system_message(f"commit failed: {msg}")
                 self.call_from_thread(_rollback)
+            finally:
+                self._ui_token_queue.put(("done", False))
 
         self.run_worker(_commit, thread=True)
 
@@ -2628,7 +2713,10 @@ class SaklasApp(App[None]):
         the queue.  Out-of-range values fall back to append.
 
         After mutation the chat panel's :class:`PendingStrip` is
-        refreshed so the visible list stays in sync.
+        refreshed so the visible list stays in sync, and the input-mode
+        placeholder is re-derived so a queued role-shifting item
+        (``commit_user`` / ``rewind``) flips the next submission's mode
+        immediately.
         """
         q = self._pending_queue
         if (
@@ -2639,6 +2727,7 @@ class SaklasApp(App[None]):
         else:
             q.append(item)
         self._refresh_pending_strip()
+        self._refresh_input_mode()
 
     def _remove_pending_slot(self, slot: int) -> None:
         """Drop a pulled slot from the queue (empty-input re-submit / cancel)."""
@@ -2646,6 +2735,7 @@ class SaklasApp(App[None]):
         if 0 <= slot < len(q):
             del q[slot]
             self._refresh_pending_strip()
+            self._refresh_input_mode()
 
     def _refresh_pending_strip(self) -> None:
         """Push the queue + pulled-slot into the chat panel's strip.
@@ -2659,31 +2749,45 @@ class SaklasApp(App[None]):
         )
 
     def _drain_next_pending(self) -> bool:
-        """Pop and dispatch the head of the pending queue.
+        """Drain queued items in FIFO until an async kind takes over.
 
-        Returns ``True`` when an item ran, ``False`` when the queue
-        was empty.  Called from :meth:`_poll_generation`'s ``done``
-        branch — one item per ``done`` keeps the FIFO contract clean
-        across worker-spawning items (each kicks its own gen, the new
-        ``done`` re-enters here for the next item).
+        Returns ``True`` when at least one item ran, ``False`` when the
+        queue was empty.  Called from :meth:`_poll_generation`'s
+        ``done`` branch (and recursively from itself via the chain
+        loop).
 
-        Keeps :attr:`_pulled_slot` accounting honest across the pop:
+        Kinds in :data:`_KIND_CHAIN_INLINE` (``clear`` / ``rewind`` /
+        ``steer`` / ``probe``) are fully synchronous — drain through
+        them inline so a chain of slash commands doesn't stall waiting
+        for a ``done`` that will never fire.  Every other kind either
+        kicks a generation (its own ``done`` re-enters here) or fires
+        a worker that enqueues ``("done", False)`` in its finally
+        block (the commit / extract pattern).  Without this loop a
+        queued commit_user left the rest of the queue stuck — root
+        cause of the "queue stuck after commit" bug.
+
+        Keeps :attr:`_pulled_slot` accounting honest across each pop:
         if the user pulled slot 0 we cancel the pull (the slot they
         were editing is now being dispatched); if they pulled a
         later slot we decrement the index so they keep tracking the
         same item.
         """
-        if not self._pending_queue:
-            return False
-        if self._pulled_slot is not None:
-            if self._pulled_slot == 0:
-                self._cancel_pull()
-            else:
-                self._pulled_slot -= 1
-        item = self._pending_queue.pop(0)
-        self._refresh_pending_strip()
-        self._dispatch_pending_action(item)
-        return True
+        drained = False
+        while self._pending_queue:
+            if self._pulled_slot is not None:
+                if self._pulled_slot == 0:
+                    self._cancel_pull()
+                else:
+                    self._pulled_slot -= 1
+            item = self._pending_queue.pop(0)
+            self._refresh_pending_strip()
+            self._dispatch_pending_action(item)
+            drained = True
+            if item.kind not in _KIND_CHAIN_INLINE:
+                # Async kind — let its own done sentinel drive the
+                # next drain so the worker isn't raced.
+                break
+        return drained
 
     @property
     def _is_busy(self) -> bool:
@@ -2716,11 +2820,16 @@ class SaklasApp(App[None]):
                 # Phase 5 carries the role decision made at submit time
                 # so the deferred dispatch matches whatever the user-row
                 # mount did.  ``payload[0]`` is the optional
-                # ``prefill_target`` node id.  Mount the user row here
+                # ``prefill_target`` node id, or ``ACTIVE_AT_DRAIN`` when
+                # the queue role-aware path stamped it for late binding
+                # (parent created by an earlier-queued action; resolve
+                # the live active here).  Mount the user row here
                 # (deferred from queueing) so the row appears alongside
                 # the new assistant reply rather than floating above the
                 # previous in-flight one.
                 target = payload[0] if payload else None
+                if target == ACTIVE_AT_DRAIN:
+                    target = self._prefill_target_node_id()
                 if target is not None:
                     self._start_prefill(target, text)
                 else:
@@ -2734,8 +2843,18 @@ class SaklasApp(App[None]):
                 self._start_commit_user(text)
             elif kind == "commit_assistant":
                 # Ctrl+Enter from a user node, queued behind in-flight
-                # gen.  ``payload[0]`` is the user node id.
-                self._start_commit_assistant(payload[0], text)
+                # gen.  ``payload[0]`` is the user node id, or
+                # ``ACTIVE_AT_DRAIN`` for queue role-aware deferral.
+                parent = payload[0]
+                if parent == ACTIVE_AT_DRAIN:
+                    parent = self._prefill_target_node_id()
+                if parent is None:
+                    # Predicted user node never landed (earlier queued
+                    # item failed or was cancelled).  Fall through to
+                    # commit_user so the text isn't silently dropped.
+                    self._start_commit_user(text)
+                else:
+                    self._start_commit_assistant(parent, text)
             elif kind == "clear":
                 self._do_clear()
             elif kind == "rewind":

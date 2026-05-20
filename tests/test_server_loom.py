@@ -362,7 +362,9 @@ class TestTreeGet:
         session, client = session_and_client
         # Add a user turn so structure has more than just root.
         uid = session.tree.add_user_turn("hello")
-        expected = session.tree.to_dict(include_tokens=False)
+        # Tree GET ships ``include_tokens=True`` (webui rehydration
+        # requirement); compare against that same shape.
+        expected = session.tree.to_dict(include_tokens=True)
         resp = client.get("/saklas/v1/sessions/default/tree")
         assert resp.status_code == 200
         data = resp.json()
@@ -371,6 +373,50 @@ class TestTreeGet:
         ids = {n["id"] for n in data["nodes"]}
         assert uid in ids
         assert data["children_of"][session.tree.root_id] == [uid]
+
+    def test_ships_per_token_rows(self, session_and_client):
+        """Tree GET serializes ``tokens`` / ``thinking_tokens`` so the
+        webui can rehydrate inline highlight tints + token-drilldown
+        click targets after a force-refresh.  Regression guard against
+        flipping ``include_tokens`` back to ``False`` (which would
+        silently break highlight on historical turns)."""
+        session, client = session_and_client
+        u1 = session.tree.add_user_turn("hi")
+        a1 = session.tree.begin_assistant(u1)
+        # Two response tokens carrying the same per-token shape the
+        # engine's ``_token_tap`` stamps: token_id + text + logprob +
+        # the probe / per-layer blobs the highlight tint depends on.
+        session.tree.append_token(a1, {
+            "token_id": 100,
+            "text": "he",
+            "logprob": -1.5,
+            "probes": {"calm": 0.42},
+            "per_layer_scores": {"5": {"calm": 0.38}, "10": {"calm": 0.45}},
+        })
+        session.tree.append_token(a1, {
+            "token_id": 101,
+            "text": "llo",
+            "logprob": -0.9,
+            "probes": {"calm": 0.39},
+        })
+        session.tree.finalize_assistant(
+            a1, text="hello", aggregate_readings={"calm": 0.40},
+        )
+
+        resp = client.get("/saklas/v1/sessions/default/tree")
+        assert resp.status_code == 200
+        data = resp.json()
+        assistant_node = next(n for n in data["nodes"] if n["id"] == a1)
+        assert assistant_node["tokens"] is not None
+        assert len(assistant_node["tokens"]) == 2
+        first = assistant_node["tokens"][0]
+        assert first["text"] == "he"
+        assert first["token_id"] == 100
+        assert first["logprob"] == -1.5
+        assert first["probes"] == {"calm": 0.42}
+        assert first["per_layer_scores"] == {
+            "5": {"calm": 0.38}, "10": {"calm": 0.45},
+        }
 
     def test_active_path_shape(self, session_and_client):
         session, client = session_and_client

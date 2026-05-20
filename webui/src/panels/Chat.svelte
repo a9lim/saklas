@@ -47,6 +47,8 @@
     enqueuePending,
     pendingActions,
     cancelPendingAction,
+    predictedQueueEndOnUserNode,
+    isPendingBusy,
     toggleAutoRegen,
     setAutoRegenMode,
     setAutoRegenCustom,
@@ -108,7 +110,18 @@
   const activeNode = $derived(
     activeNodeId ? (loomTree.nodes.get(activeNodeId) ?? null) : null,
   );
-  const onUserNode = $derived(activeNode?.role === "user");
+  const liveOnUserNode = $derived(activeNode?.role === "user");
+  // Queue-aware role: a queued ``commit user`` lands a user node before
+  // this submission gets to run, so the next message should already be
+  // in prefill / commit-assistant mode.  Walks the queue tail-first;
+  // falls back to the live active node when nothing in the queue
+  // changes the role.  ``pendingActions.queue.length`` is touched so
+  // the derived re-runs on queue mutations.
+  const onUserNode = $derived.by(() => {
+    void pendingActions.queue.length;
+    const predicted = predictedQueueEndOnUserNode();
+    return predicted === null ? liveOnUserNode : predicted;
+  });
 
   // --- Commit modifier (Ctrl / Cmd / Option) ----------------------------
   // Any of Ctrl, Cmd (⌘), or Option (⌥) held flips the input into
@@ -129,14 +142,18 @@
    *  Used by both the disabled gate and tryCommit's early return. */
   const canCommit = $derived(commitMode && input.trim() !== "");
 
+  /** Four-state placeholder, same `<verb>…  <bind list>` shape across
+   *  TUI and GUI.  Verb names the action that bare `⏎` (or `⌃⏎` in
+   *  commit mode) will perform; the trailing key list is the minimum
+   *  cheatsheet for the bindings that change behavior. */
   const inputPlaceholder = $derived(
     commitMode
       ? (onUserNode
-          ? "commit as the assistant turn (no generation)…"
-          : "commit as a user turn (no generation)…")
+          ? "commit assistant…  ⌃⏎ send · ⇧⏎ newline"
+          : "commit user…  ⌃⏎ send · ⇧⏎ newline")
       : (onUserNode
-          ? "prefill the assistant's reply…  (⏎ on empty = generate fresh · ⌃⏎ / ⌘⏎ / ⌥⏎ = commit as full turn · ⇧⏎ newline)"
-          : "message…  (⏎ to send · ⌃⏎ / ⌘⏎ / ⌥⏎ = commit, no generation · ⇧⏎ newline)"),
+          ? "prefill reply…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
+          : "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"),
   );
   /** Send-button caption tracks the role-aware action; any held commit
    *  modifier overrides both prefill and send with a "commit" register. */
@@ -166,11 +183,20 @@
       }
       return true;  // consumed
     }
+    // When the queue holds an action that flips the active role (e.g. a
+    // queued ``commit user`` puts us in predicted-prefill mode), the
+    // live ``activeNodeId`` doesn't yet point at the parent the new
+    // commit should hang under.  Pass the ``"active@drain"`` sentinel
+    // so the pending action resolves the parent at drain time — by
+    // which point the earlier queue items have landed the right node.
+    const parent = isPendingBusy()
+      ? ("active@drain" as const)
+      : activeNodeId;
     if (onUserNode) {
-      if (!activeNodeId) return true;
+      if (!parent) return true;
       pushInputHistory(text);
       input = "";
-      void sendCommit("assistant", activeNodeId, text, { replaceSlot });
+      void sendCommit("assistant", parent, text, { replaceSlot });
     } else {
       // Active node is root/assistant.  Pass it as the parent so the
       // server anchors the new user node under it (active-node fall-
@@ -178,7 +204,7 @@
       // mid-flight active-node swap).
       pushInputHistory(text);
       input = "";
-      void sendCommit("user", activeNodeId, text, { replaceSlot });
+      void sendCommit("user", parent, text, { replaceSlot });
     }
     scrolledUp = false;
     queueScrollToBottom();
@@ -193,20 +219,27 @@
     if (commit && tryCommit()) return;
     // Role-aware branch: on a user node the input seeds the assistant
     // reply rather than appending a new user turn.
-    if (onUserNode && activeNodeId) {
+    if (onUserNode && (activeNodeId || isPendingBusy())) {
       // Keep the raw value — a trailing space in a prefill is meaningful
       // (it decides whether the continuation starts a fresh word).
       const raw = input;
       const trimmed = raw.trim();
       const replaceSlot = consumePulledSlot();
       input = "";
+      // Deferred resolution when busy (see tryCommit for the rationale).
+      const target = isPendingBusy()
+        ? ("active@drain" as const)
+        : activeNodeId!;
       if (trimmed) {
         pushInputHistory(trimmed);
-        void sendPrefill(activeNodeId, raw, { replaceSlot });
+        void sendPrefill(target, raw, { replaceSlot });
       } else if (replaceSlot !== null) {
         // Empty prefill on a pulled slot cancels the queued item.
         cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
-      } else {
+      } else if (activeNodeId) {
+        // Empty + not pulled + live user node → re-roll the assistant.
+        // We can't re-roll a not-yet-existing queued user node, so this
+        // branch is gated to live ids only.
         void loomRegenerateFromUser(activeNodeId);
       }
       scrolledUp = false;
@@ -386,6 +419,9 @@
         apply: () => void clearSessionHistory(),
         awaitsGen: false,
         rebuild: null,
+        // /clear resets to the synthetic root (system role) — not a
+        // user node, so the next submission goes through "message" mode.
+        endsOnUserNode: false,
       });
     } else {
       void clearSessionHistory();
@@ -404,6 +440,9 @@
         apply: () => void regen(input),
         awaitsGen: true,
         rebuild: null,
+        // Regen rewinds to the user node then sends — lands a new
+        // assistant sibling, so the post-drain active is assistant.
+        endsOnUserNode: false,
       });
     } else {
       void regen(input);
@@ -957,8 +996,8 @@
         class="send"
         disabled={!input.trim() && (commitMode || !onUserNode)}
         title={onUserNode
-          ? "On a user node: empty = generate a fresh reply, text = prefill the reply · ⌃ / ⌘ / ⌥-click = commit as the full assistant turn (no generation)"
-          : "⏎ to send · ⌃ / ⌘ / ⌥-click = commit as a user turn (no generation) · ⇧⏎ newline"}
+          ? "⏎ prefill reply (empty = generate fresh) · ⌃-click commit assistant · ⇧⏎ newline"
+          : "⏎ send · ⌃-click commit user · ⇧⏎ newline"}
       >{sendLabel}</button>
       <button
         type="button"

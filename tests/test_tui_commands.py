@@ -1578,3 +1578,157 @@ def test_apply_highlight_to_all_preserves_surprise_sentinel():
     # Sentinel survived; trait-panel selection was ignored under
     # surprise mode.
     assert app._highlight_probe == SURPRISE_PROBE
+
+
+# ---------------------------------------------------------------------------
+# Queue role-awareness — predicted active-node role flips the input mode
+# ---------------------------------------------------------------------------
+
+
+def test_predicted_on_user_node_falls_through_to_live_when_queue_empty():
+    """No queued items → predicted equals live."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    # Live active is the synthetic root (system) — not a user node.
+    assert app._prefill_target_node_id() is None
+    assert app._predicted_on_user_node() is False
+
+    # A queued ``/steer`` doesn't shift the role, so prediction still
+    # mirrors live.
+    app._pending_queue = [PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",))]
+    assert app._predicted_on_user_node() is False
+
+
+def test_predicted_on_user_node_reflects_queued_commit_user():
+    """A queued ``commit_user`` predicts the next submission as prefill."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    # Live active is root — not a user node.
+    assert app._predicted_on_user_node() is False
+
+    # Queue a commit_user — the next item should land in prefill mode.
+    app._pending_queue = [PendingItem("commit_user", "hi")]
+    assert app._predicted_on_user_node() is True
+
+    # Add a commit_assistant on top — final role flips back to assistant.
+    app._pending_queue.append(PendingItem("commit_assistant", "hello", ("uid",)))
+    assert app._predicted_on_user_node() is False
+
+
+def test_predicted_walks_past_no_change_kinds():
+    """Items with no role mapping (``/steer``, ``/probe``) are walked past
+    so a queued ``commit_user`` followed by ``/steer`` still predicts
+    user mode."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("commit_user", "hi"),
+        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
+        PendingItem("probe", "/probe calm", ("calm",)),
+    ]
+    assert app._predicted_on_user_node() is True
+
+
+def test_enqueue_pending_refreshes_input_mode():
+    """Enqueueing a role-shifting item updates the placeholder
+    immediately — no need to wait for the queue to drain."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    set_prefill_mode = MagicMock()
+    app._chat_panel.set_prefill_mode = set_prefill_mode
+
+    app._enqueue_pending(PendingItem("commit_user", "hi"))
+    # Last call reflects the queue-aware mode.
+    set_prefill_mode.assert_called_with(True)
+
+    app._enqueue_pending(PendingItem("commit_assistant", "hello", ("uid",)))
+    set_prefill_mode.assert_called_with(False)
+
+
+def test_remove_pending_slot_refreshes_input_mode():
+    """Cancelling the queued role-shifter restores live mode."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [PendingItem("commit_user", "hi")]
+    set_prefill_mode = MagicMock()
+    app._chat_panel.set_prefill_mode = set_prefill_mode
+
+    app._remove_pending_slot(0)
+    # After removal, prediction falls back to live (root, not user).
+    set_prefill_mode.assert_called_with(False)
+
+
+# ---------------------------------------------------------------------------
+# Pending-queue drain chaining — sync kinds chain inline, async kinds break
+# ---------------------------------------------------------------------------
+
+
+def test_drain_next_pending_chains_through_sync_kinds():
+    """A run of sync slash kinds (/clear /steer /probe /rewind) drains
+    all in one call — the old single-item drain would have left them
+    stuck waiting for a ``done`` that never arrives."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
+        PendingItem("probe", "/probe calm", ("calm",)),
+        PendingItem("clear", "/clear"),
+    ]
+    _wire_fake_input(app, value="")
+    dispatched: list[str] = []
+    app._dispatch_pending_action = MagicMock(
+        side_effect=lambda item: dispatched.append(item.kind),
+    )
+
+    app._drain_next_pending()
+    # All three drained in one call — chain-inline behavior.
+    assert dispatched == ["steer", "probe", "clear"]
+    assert app._pending_queue == []
+
+
+def test_drain_next_pending_breaks_at_first_async_kind():
+    """Drain chains through sync kinds but breaks at the first kind
+    that runs a worker / kicks a gen — that one's own ``done`` will
+    advance the queue, so chaining past it would race the worker."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("clear", "/clear"),                # sync — chain
+        PendingItem("commit_user", "hi"),              # async — break here
+        PendingItem("submit", "next"),                 # stays queued
+    ]
+    _wire_fake_input(app, value="")
+    dispatched: list[str] = []
+    app._dispatch_pending_action = MagicMock(
+        side_effect=lambda item: dispatched.append(item.kind),
+    )
+
+    app._drain_next_pending()
+    # Only the first two ran; submit waits for commit_user's done.
+    assert dispatched == ["clear", "commit_user"]
+    assert [p.kind for p in app._pending_queue] == ["submit"]
+
+
+def test_drain_next_pending_handles_pure_async_chain():
+    """When the head is async, drain pops exactly one — matches the
+    pre-existing single-item semantics every gen-bearing kind
+    depends on."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("submit", "first"),
+        PendingItem("submit", "second"),
+    ]
+    _wire_fake_input(app, value="")
+    app._dispatch_pending_action = MagicMock()
+
+    app._drain_next_pending()
+    assert [p.text for p in app._pending_queue] == ["second"]
