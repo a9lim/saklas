@@ -701,13 +701,24 @@ def generate_steered(
     completion_text = ""  # accumulated non-thinking emitted text, for stop matching
     state.finish_reason = "length"  # default: loop exhausted
 
-    # Thinking state tracking
-    if thinking:
-        think_start_id, think_end_id, response_start_id, starts_in_thinking = (
-            _detect_think_delimiters(tokenizer)
-        )
-    else:
-        think_start_id = think_end_id = response_start_id = None
+    # Thinking state tracking.  Always detect delimiters even when the
+    # user opted out of thinking — channel-based formats (gpt-oss) have
+    # no ``enable_thinking`` template switch to suppress the analysis
+    # channel, so the model unconditionally emits
+    # ``<|channel|>analysis<|message|>…<|end|><|start|>assistant<|channel|>final<|message|>…``
+    # and without the state machine engaged those delimiters plus the
+    # analysis content land verbatim in the response text.
+    # ``enable_thinking`` models (Qwen/Gemma) are unaffected: with
+    # ``thinking=False`` the template doesn't open a thinking section,
+    # so the start delimiter never appears and the machine stays in
+    # IDLE.  ``starts_in_thinking`` is forced off when ``thinking=False``
+    # because the cached probe always renders with ``enable_thinking=True``
+    # — the actual runtime prompt under ``thinking=False`` wouldn't open
+    # a thinking section, so we mustn't start the machine mid-thinking.
+    think_start_id, think_end_id, response_start_id, starts_in_thinking = (
+        _detect_think_delimiters(tokenizer)
+    )
+    if not thinking:
         starts_in_thinking = False
     # Hoisted: true iff channel-based format (gpt-oss) where EOS acts as
     # a channel separator inside thinking/preamble rather than terminating.
@@ -718,9 +729,11 @@ def generate_steered(
         else _ThinkState.IDLE
     )
     # Mirror the internal tstate onto the public ThinkingState enum.
-    # Outside the thinking machine (no thinking requested, or no delimiters
-    # detected) we go straight to RESPONSE.
-    if thinking and think_end_id is not None:
+    # No delimiters detected → straight to RESPONSE; otherwise track the
+    # machine.  Note: even with ``thinking=False`` the machine engages
+    # for channel-based formats (gpt-oss) so the analysis is correctly
+    # classified rather than leaking into the response.
+    if think_end_id is not None:
         state.thinking_state = (
             ThinkingState.THINKING
             if starts_in_thinking
