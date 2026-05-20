@@ -6,13 +6,15 @@
  *   - one corner radius (--radius, 2px) — sharp, matches a9l.im
  *   - type comes from the --text-* scale; spacing from --space-*
  *   - weight comes from --weight-*
- *   - the blue --accent is the only chrome hue; green / amber / red /
- *     yellow / purple are reserved for state + data, never decoration
+ *   - the yellow --accent is the only chrome hue — selection, focus,
+ *     primary actions.  Blue / green / amber / red / purple are reserved
+ *     for state + data, never decoration.  --accent-yellow keeps its
+ *     state-colour identity and happens to coincide with --accent.
  *   - no texture: no film grain, no glass blur — flat opaque surfaces
  *
  * Colour values mirror a9l.im's dark palette (shared-tokens.js dark
- * block); the webui runs blue-accent-only.  When the site palette
- * changes, propagate: shared-tokens.js dark block → these vars.
+ * block).  When the site palette changes, propagate: shared-tokens.js
+ * dark block → these vars.
  */
 
 :root {
@@ -20,13 +22,15 @@
   --radius: 2px;
   --radius-pill: 999px;
 
-  /* ---- Surfaces — a flat elevation ladder, deepest → highest ------- */
+  /* ---- Surfaces — a flat elevation ladder, deepest → highest -------
+   * Mid-tiers track a9l.im's dark canvas/panelSolid/elevated; the rail
+   * floor and modal ceiling extrapolate one notch in each direction. */
   --bg-deep: #04050a;       /* rail — the floor */
-  --bg: #07080c;            /* app canvas */
-  --bg-alt: #0e0f14;        /* panel tier */
+  --bg: #06070b;            /* app canvas — a9l.im dark.canvas */
+  --bg-alt: #0e0f14;        /* panel tier — a9l.im dark.panelSolid */
   --surface: #0e0f14;       /* alias of --bg-alt; panels, cards */
-  --bg-elev: #181920;       /* elevated: inputs, strips, hover targets */
-  --surface-strong: #181920;/* alias of --bg-elev */
+  --bg-elev: #191a1f;       /* elevated — a9l.im dark.elevated */
+  --surface-strong: #191a1f;/* alias of --bg-elev */
   --surface-hi: #232430;    /* highest: modals, popovers, menus */
 
   /* Translucent wash laid over any surface tier on hover. */
@@ -40,26 +44,33 @@
   --fg-dim: #bfc1c6;        /* secondary */
   --fg-subtle: #a7aab1;     /* tertiary */
   --fg-muted: #8f929b;      /* labels, hints, disabled */
-  --text-on-accent: #fdfdff;
+  --text-on-accent: #06070b;/* dark canvas — sits on white --accent */
 
   /* ---- The one border --------------------------------------------- */
   --border: rgba(244, 245, 249, 0.09);
 
   /* ---- Accent + semantic colours ----------------------------------
-   * --accent (blue) is the only chrome hue — selection, focus, primary
-   * actions.  The rest are state-only: use them for text / fills /
-   * data / left-edge status bars, never as resting box outlines. */
-  --accent: #488acb;
+   * --accent (white) is the only chrome hue — selection, focus,
+   * primary actions.  All five colour channels (blue / green / amber
+   * / red / yellow / purple) are state-only: text / fills / data /
+   * left-edge status bars, never resting box outlines.  Chrome reads
+   * as a monochrome lift; hue is reserved for meaning.
+   *
+   * --accent-subtle / --accent-glow alphas are tuned for white-on-
+   * dark: the 0.12 / 0.30 weights that work for a saturated hue
+   * over-saturate as a grey wash, so they drop to 0.08 / 0.18 —
+   * brighter than --bg-hover (0.05) but recognizably accent-pitched. */
+  --accent: #f4f5f9;
   --accent-blue: #488acb;
-  --accent-light: #6ba3da;
+  --accent-light: #ffffff;
   --accent-amber: #ca6800;
   --accent-green: #009f68;
   --accent-red: #da534f;
   --accent-yellow: #998700;
   --accent-error: #da534f;
   --accent-purple: #9769dc;
-  --accent-subtle: rgba(72, 138, 203, 0.12);   /* accent fill wash */
-  --accent-glow: rgba(72, 138, 203, 0.30);     /* focus ring + accent hover */
+  --accent-subtle: rgba(244, 245, 249, 0.08);  /* accent fill wash */
+  --accent-glow: rgba(244, 245, 249, 0.18);    /* focus ring + accent hover */
 
   /* Highlight palette — driven by tokens.ts ``scoreToRgb`` at runtime,
    * kept here as named handles for future skin overrides. */

@@ -75,7 +75,7 @@
     width: 12px;
     height: 12px;
     border-radius: 50%;
-    background: var(--accent-blue);
+    background: var(--accent);
     border: 1px solid var(--bg-deep);
     cursor: pointer;
     transition: transform var(--dur-fast) var(--ease-out);
@@ -84,7 +84,7 @@
     width: 12px;
     height: 12px;
     border-radius: 50%;
-    background: var(--accent-blue);
+    background: var(--accent);
     border: 1px solid var(--bg-deep);
     cursor: pointer;
   }

@@ -517,7 +517,7 @@
     background: transparent;
     border: 0;
     padding: 0 var(--space-1);
-    color: var(--accent-blue);
+    color: var(--accent);
     font-size: var(--text);
     line-height: 1;
     flex: 0 0 auto;
@@ -589,7 +589,7 @@
     border-color: var(--fg-muted);
   }
   .variant-chip {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
 
   .variant-wrap {
@@ -621,10 +621,10 @@
   }
   .variant-menu button:hover {
     background: var(--bg-elev);
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .variant-menu button.active {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
 
   .projection-tag {
@@ -689,7 +689,7 @@
   }
   .menu button:hover:not(:disabled) {
     background: var(--bg-elev);
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .menu button:disabled {
     color: var(--fg-muted);
@@ -771,7 +771,7 @@
     border-color: var(--fg-muted);
   }
   .projection-btn.confirm {
-    color: var(--accent-blue);
+    color: var(--accent);
     border-color: var(--accent);
   }
   .projection-btn.confirm:hover:not(:disabled) {

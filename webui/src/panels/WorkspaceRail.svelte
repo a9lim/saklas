@@ -258,6 +258,6 @@
   }
   .flyout button:hover {
     background: var(--bg-elev);
-    color: var(--accent-blue);
+    color: var(--accent);
   }
 </style>

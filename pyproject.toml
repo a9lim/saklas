@@ -60,9 +60,9 @@ Issues = "https://github.com/a9lim/saklas/issues"
 Releases = "https://github.com/a9lim/saklas/releases"
 
 [project.optional-dependencies]
-bnb = ["bitsandbytes>=0.43"]
 flash = ["flash-attn>=2.5"]
-cuda = ["bitsandbytes>=0.43", "flash-attn>=2.5"]
+cuda = ["bitsandbytes>=0.43", "kernels>=0.12"]
+cuda-experimental = ["bitsandbytes>=0.43", "kernels>=0.12", "flash-attn>=2.5"]
 dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6.9", "pyright>=1.1.400"]
 hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]

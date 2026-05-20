@@ -562,12 +562,18 @@ class TestTreeDelete:
         # Active node untouched
         assert session.tree.active_node_id == u2
 
-    def test_delete_ancestor_of_active_400(self, session_and_client):
+    def test_delete_containing_active_repoints_active(self, session_and_client):
+        # Deleting a subtree that contains the active node used to 400.
+        # The engine now repoints the active pointer to the surviving
+        # parent (root → fresh start) and the route returns 200.
         session, client = session_and_client
         u1 = session.tree.add_user_turn("a")
-        # active is u1 itself — deleting it deletes the active node
+        # active is u1 itself — deleting it removes the active node.
         resp = client.delete(f"/saklas/v1/sessions/default/tree/{u1}")
-        assert resp.status_code == 400
+        assert resp.status_code == 200
+        assert resp.json()["removed"] == 1
+        assert not session.tree.has(u1)
+        assert session.tree.active_node_id == session.tree.root_id
 
     def test_delete_409_during_reservation(self, session_and_client):
         session, client = session_and_client

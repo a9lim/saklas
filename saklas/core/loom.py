@@ -935,20 +935,20 @@ class LoomTree:
     def delete_subtree(self, node_id: str) -> int:
         """Drop the subtree rooted at ``node_id``.
 
-        Refuses to delete an ancestor of the active node (forces
-        navigate-away first) and refuses (via the conflict checker)
-        when the subtree intersects an in-flight generation's
-        reservation.  Returns the count of nodes removed.
+        When the active node sits inside the deleted subtree (including
+        the case ``node_id == active_node_id``), the active pointer is
+        re-seated on the surviving parent — the nearest ancestor that
+        isn't being removed.  If that parent is the root, the user
+        lands on the empty root, which is the natural "fresh start"
+        state.  Refuses the root delete outright; refuses (via the
+        conflict checker) when the subtree intersects an in-flight
+        generation's reservation.  Returns the count of nodes removed.
         """
         with self._lock:
             if node_id == self.root_id:
                 raise InvalidNodeOperationError("cannot delete the root")
             if node_id not in self.nodes:
                 raise UnknownNodeError(node_id)
-            if self.is_ancestor_of(node_id, self.active_node_id) or node_id == self.active_node_id:
-                raise InvalidNodeOperationError(
-                    "cannot delete a subtree containing the active node — navigate away first"
-                )
             self._conflict_check(node_id, "delete_subtree")
 
             # Collect every node in the subtree (DFS) plus the root.
@@ -960,6 +960,16 @@ class LoomTree:
                 stack.extend(self.children_of.get(cur, []))
 
             parent_id = self.nodes[node_id].parent_id
+            # The subtree root is non-root, so it has a parent — that
+            # parent is the survivor the active pointer falls back to
+            # when active is inside the doomed set.
+            removed_set = set(to_remove)
+            active_moved_to: str | None = None
+            if self.active_node_id in removed_set:
+                # parent_id is non-None because node_id != root_id.
+                self.active_node_id = parent_id  # type: ignore[assignment]
+                active_moved_to = parent_id
+
             if parent_id is not None:
                 self.children_of[parent_id] = [
                     c for c in self.children_of.get(parent_id, []) if c != node_id
@@ -972,6 +982,7 @@ class LoomTree:
             self._emit(LoomMutated(
                 op="delete", rev=self.rev,
                 removed=tuple(to_remove),
+                active_node_id=active_moved_to,
             ))
             return len(to_remove)
 

@@ -1130,7 +1130,7 @@
     user-select: none;
   }
   .ctl-inline input {
-    accent-color: var(--accent-blue);
+    accent-color: var(--accent);
   }
   .ctl-label {
     color: var(--fg-muted);
@@ -1177,7 +1177,7 @@
   .hbtn:hover:not(:disabled) {
     background: var(--bg-elev);
     border-color: var(--accent);
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .hbtn:disabled {
     color: var(--fg-muted);

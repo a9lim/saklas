@@ -285,14 +285,45 @@ def test_delete_subtree_removes_node_and_descendants():
     assert len(t.nodes) == pre - 1
 
 
-def test_delete_subtree_ancestor_of_active_refused():
+def test_delete_subtree_containing_active_repoints_active():
+    # Deleting the active node itself: active falls back to its parent.
     t = _seed_tree()
-    # Active is the assistant a1; its user-parent is an ancestor.
-    user_parent = t.nodes[t.active_node_id].parent_id
-    with pytest.raises(InvalidNodeOperationError):
-        t.delete_subtree(user_parent)
-    with pytest.raises(InvalidNodeOperationError):
-        t.delete_subtree(t.active_node_id)
+    a1 = t.active_node_id
+    u1 = t.nodes[a1].parent_id
+    assert u1 is not None
+    pre = len(t.nodes)
+    n = t.delete_subtree(a1)
+    assert n == 1
+    assert a1 not in t.nodes
+    assert t.active_node_id == u1
+    assert len(t.nodes) == pre - 1
+
+    # Deleting an ancestor of the active node: active falls back through
+    # the doomed set to the surviving parent (here, the root → fresh
+    # start).
+    t = _seed_tree()
+    a1 = t.active_node_id
+    u1 = t.nodes[a1].parent_id
+    assert u1 is not None
+    n = t.delete_subtree(u1)
+    assert n == 2  # u1 + a1
+    assert u1 not in t.nodes
+    assert a1 not in t.nodes
+    assert t.active_node_id == t.root_id
+
+
+def test_delete_subtree_off_active_path_leaves_active_alone():
+    # Sanity: deletes that don't touch the active path mustn't perturb
+    # the active pointer.
+    t = LoomTree()
+    u1 = t.add_user_turn("x")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="A")
+    a2 = t.branch(a1, "B", make_active=False)
+    t.navigate(a1)
+    n = t.delete_subtree(a2)
+    assert n == 1
+    assert t.active_node_id == a1
 
 
 def test_delete_root_refused():

@@ -421,7 +421,7 @@
     font-weight: var(--weight-medium);
   }
   .cat-header.open .cat-name {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .cat-count {
     color: var(--fg-muted);
@@ -494,7 +494,7 @@
 
   .add-btn {
     background: var(--accent-subtle);
-    color: var(--accent-blue);
+    color: var(--accent);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);

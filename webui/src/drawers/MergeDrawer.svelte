@@ -312,7 +312,7 @@
   .head h2 {
     margin: 0;
     font-size: var(--text);
-    color: var(--accent-blue);
+    color: var(--accent);
     letter-spacing: 0;
     text-transform: lowercase;
   }
@@ -458,7 +458,7 @@
     color: var(--fg-dim);
   }
   .hint code {
-    color: var(--accent-blue);
+    color: var(--accent);
     background: var(--bg-deep);
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius);

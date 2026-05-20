@@ -126,11 +126,11 @@
     gap: var(--space-3);
     min-width: 0;
   }
-  /* Match SteeringRack's title — bold accent-blue so the two racks look
+  /* Match SteeringRack's title — bold accent so the two racks look
    * like siblings, not strangers. */
   .title {
     font-weight: var(--weight-bold);
-    color: var(--accent-blue);
+    color: var(--accent);
     font-size: var(--text-sm);
     letter-spacing: 0;
     text-transform: uppercase;
@@ -205,7 +205,7 @@
   .add {
     flex: 1 1 100%;
     background: var(--accent-subtle);
-    color: var(--accent-blue);
+    color: var(--accent);
     border: 1px solid var(--border);
     padding: var(--space-3) var(--space-5);
     border-radius: var(--radius);
