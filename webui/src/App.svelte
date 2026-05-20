@@ -385,7 +385,7 @@
     border-bottom: 1px solid var(--border);
   }
   .drawer-title {
-    color: var(--accent-blue);
+    color: var(--accent);
     font-size: var(--text);
     text-transform: lowercase;
     letter-spacing: 0;
@@ -448,12 +448,12 @@
     background: var(--bg-elev);
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius);
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .retry {
     margin-top: var(--space-5);
     background: var(--bg-elev);
-    color: var(--accent-blue);
+    color: var(--accent);
     border: 1px solid var(--border);
     padding: var(--space-3) var(--space-6);
     border-radius: var(--radius);

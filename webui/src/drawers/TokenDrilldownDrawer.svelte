@@ -610,7 +610,7 @@
     border-color: var(--fg-muted);
   }
   .branch-toggle button.active {
-    color: var(--accent-blue);
+    color: var(--accent);
     border-color: var(--accent);
     background: var(--accent-subtle);
   }
@@ -639,7 +639,7 @@
     border-color: var(--fg-muted);
   }
   .tab-strip button.active {
-    color: var(--accent-blue);
+    color: var(--accent);
     border-color: var(--accent);
     background: var(--accent-subtle);
   }
@@ -779,7 +779,7 @@
     word-break: break-all;
   }
   /* Chosen row gets a soft tint + a heavier color so it reads at a
-     glance.  Reuses the same accent-blue rationale as the branch toggle's
+     glance.  Reuses the same accent rationale as the branch toggle's
      active state. */
   .logits-table tr.chosen td {
     background: var(--accent-subtle);
@@ -811,7 +811,7 @@
   .link-btn {
     background: transparent;
     border: 1px solid var(--border);
-    color: var(--accent-blue);
+    color: var(--accent);
     font: inherit;
     font-family: var(--font-mono);
     cursor: pointer;

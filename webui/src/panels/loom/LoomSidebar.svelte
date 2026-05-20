@@ -1336,7 +1336,7 @@
     border-bottom: 1px solid var(--border);
   }
   .title {
-    color: var(--accent-blue);
+    color: var(--accent);
     font-weight: var(--weight-bold);
     letter-spacing: 0;
     font-size: var(--text-sm);

@@ -716,7 +716,7 @@
     border-bottom: 1px solid var(--border);
   }
   .title {
-    color: var(--accent-blue);
+    color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
     flex: 0 0 auto;
@@ -797,7 +797,7 @@
     color: var(--accent-yellow);
   }
   .col-tag {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .col-preview {
     margin: 0;
@@ -828,7 +828,7 @@
     flex-wrap: wrap;
   }
   .diff-title {
-    color: var(--accent-blue);
+    color: var(--accent);
     font-size: var(--text-sm);
   }
   .recipe-delta {
@@ -857,7 +857,7 @@
     overflow-y: auto;
   }
   .pane-label {
-    color: var(--accent-blue);
+    color: var(--accent);
     font-size: var(--text-xs);
     text-transform: lowercase;
     letter-spacing: 0;
@@ -928,7 +928,7 @@
     gap: var(--space-4);
   }
   .ss-label {
-    color: var(--accent-blue);
+    color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
     font-size: var(--text-xs);
@@ -974,8 +974,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* Anchor row inherits the blue from .tok.highlight-anchor / .msg.user
+   * so the "this is the baseline" cue reads consistently with the rest
+   * of the anchor=blue scheme — independent of --accent-subtle's chrome
+   * hue. */
   .ss-table tr.anchor td {
-    background: var(--accent-subtle);
+    background: rgba(72, 138, 203, 0.12);
   }
   .ss-table tr.anchor td.ss-tag {
     color: var(--accent-blue);

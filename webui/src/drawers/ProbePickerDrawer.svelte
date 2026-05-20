@@ -133,7 +133,7 @@
     border-bottom: 1px solid var(--border);
   }
   .title {
-    color: var(--accent-blue);
+    color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
   }
@@ -166,7 +166,7 @@
     line-height: 1.4;
   }
   .hint code {
-    color: var(--accent-blue);
+    color: var(--accent);
     background: var(--bg-alt);
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius);

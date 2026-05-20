@@ -353,7 +353,7 @@
     border-bottom: 1px solid var(--border);
   }
   .title {
-    color: var(--accent-blue);
+    color: var(--accent);
     letter-spacing: 0;
   }
   .close {
@@ -419,7 +419,7 @@
     font-weight: var(--weight-medium);
   }
   .custom.open .custom-name {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .custom-hint {
     flex: 1 1 auto;
@@ -495,7 +495,7 @@
   }
   .radio input,
   .check input {
-    accent-color: var(--accent-blue);
+    accent-color: var(--accent);
   }
 
   .validation {
@@ -559,6 +559,6 @@
     transition: color var(--dur) var(--ease-out);
   }
   .disk-link:hover {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
 </style>

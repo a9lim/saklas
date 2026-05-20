@@ -495,7 +495,7 @@
 
   /* Checkbox sits flush with its label. */
   input[type="checkbox"] {
-    accent-color: var(--accent-blue);
+    accent-color: var(--accent);
     cursor: pointer;
   }
   input[type="checkbox"]:disabled {
@@ -535,7 +535,7 @@
   .sys-btn:hover:not(:disabled) {
     background: var(--bg-elev);
     border-color: var(--fg-muted);
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .sys-btn:disabled {
     color: var(--fg-muted);

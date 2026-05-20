@@ -297,7 +297,7 @@
   .head h2 {
     margin: 0;
     font-size: var(--text);
-    color: var(--accent-blue);
+    color: var(--accent);
     letter-spacing: 0;
     text-transform: lowercase;
   }
@@ -498,7 +498,7 @@
     width: 0.85em;
     height: 0.85em;
     border-radius: 50%;
-    border: 1px solid var(--accent-blue);
+    border: 1px solid var(--accent);
     border-right-color: transparent;
     animation: spin 0.7s linear infinite;
     display: inline-block;

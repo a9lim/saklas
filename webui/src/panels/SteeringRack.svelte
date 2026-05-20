@@ -100,7 +100,7 @@
   }
   .title {
     font-weight: var(--weight-bold);
-    color: var(--accent-blue);
+    color: var(--accent);
     letter-spacing: 0;
     font-size: var(--text-sm);
     text-transform: uppercase;
@@ -156,7 +156,7 @@
   .add-steering {
     width: 100%;
     background: var(--accent-subtle);
-    color: var(--accent-blue);
+    color: var(--accent);
     border: 1px solid var(--border);
     min-height: 2.1rem;
     padding: var(--space-4) var(--space-5);

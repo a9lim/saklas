@@ -90,7 +90,7 @@ Gotchas:
 
 ## Destructive-op confirm
 
-`/del` requires `/del yes` to delete the active subtree; bare `/del` prints the hint. `Ctrl+D` routes through the same guard (`action_delete_subtree` → `_handle_del("")`) — no instant delete. The loom-screen `d` binding opens a `_PromptOverlay` requiring a typed `yes`. `_handle_del` pre-navigates to the parent before `delete_subtree` (the engine refuses to delete a subtree containing the active node) and surfaces the new active id. The loom-screen `d` flow operates on the cursor and does not pre-navigate.
+`/del` requires `/del yes` to delete the active subtree; bare `/del` prints the hint. `Ctrl+D` routes through the same guard (`action_delete_subtree` → `_handle_del("")`) — no instant delete. The loom-screen `d` binding opens a `_PromptOverlay` requiring a typed `yes`. Both surfaces call `delete_subtree` directly: when the doomed subtree contains the active node the engine re-seats the active pointer on the surviving parent (root → fresh start) and emits the new `active_node_id` on the mutation event. `_handle_del` surfaces the new id in the post-delete system message; the chat-screen path still refuses up front when the active node is the root (nothing to delete).
 
 ## Persistence and chat repaint
 

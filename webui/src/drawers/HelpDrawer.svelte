@@ -228,7 +228,7 @@ variant  := raw | sae | sae-<release>
     border-bottom: 1px solid var(--border);
   }
   .title {
-    color: var(--accent-blue);
+    color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
   }
@@ -284,7 +284,7 @@ variant  := raw | sae | sae-<release>
     font-size: var(--text-xs);
   }
   code {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
   .grammar {
     background: var(--bg-deep);

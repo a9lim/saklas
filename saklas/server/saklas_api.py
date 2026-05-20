@@ -912,9 +912,12 @@ def register_saklas_routes(app: FastAPI) -> None:
     async def tree_delete(session_id: str, node_id: str):
         """Subtree delete.
 
-        400 for ancestor-of-active or root delete; 409 when the subtree
-        intersects an in-flight generation's reservation; 404 on unknown
-        id. Returns ``{removed: <count>}``.
+        400 for the root delete; 409 when the subtree intersects an
+        in-flight generation's reservation; 404 on unknown id.  When
+        the active node sits inside the deleted subtree, the engine
+        re-seats the active pointer on the surviving parent and emits
+        the new ``active_node_id`` on the mutation event.  Returns
+        ``{removed: <count>}``.
         """
         _resolve_session_id(session, session_id)
         removed = session.tree.delete_subtree(node_id)

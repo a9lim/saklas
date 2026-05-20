@@ -3248,9 +3248,10 @@ class SaklasApp(App[None]):
 
         Requires explicit ``yes`` confirmation by default to avoid
         accidental wipes; ``Ctrl+D`` from the chat screen uses this
-        path too.  The active pointer pre-navigates to the parent
-        (because :meth:`LoomTree.delete_subtree` refuses to delete a
-        subtree containing the active node); the post-delete message
+        path too.  :meth:`LoomTree.delete_subtree` repoints the active
+        pointer to the surviving parent when the doomed subtree
+        contains the active node (root case → fresh start), so this
+        path is a straight-through call; the post-delete message
         surfaces the new active id so the jump isn't silent.
         """
 
@@ -3266,22 +3267,18 @@ class SaklasApp(App[None]):
                 "/del: type '/del yes' to delete the active subtree."
             )
             return
-        target = self._session.tree.active_node_id
-        # We can't delete the active node itself; navigate up first if so.
+        tree = self._session.tree
+        target = tree.active_node_id
+        if target == tree.root_id:
+            chat.add_system_message("/del: nothing to delete (at root).")
+            return
         try:
-            tree = self._session.tree
-            node = tree.get(target)
-            if node.parent_id is None or node.parent_id == tree.root_id:
-                chat.add_system_message("/del: nothing to delete (at root).")
-                return
-            # Move active to parent so the delete is well-defined.
-            tree.navigate(node.parent_id)
-            new_active_id = tree.active_node_id
             removed = tree.delete_subtree(target)
         except (UnknownNodeError, MutationDuringGenerationError,
                 InvalidNodeOperationError, LoomTreeError) as e:
             chat.add_system_message(f"/del failed: {e}")
             return
+        new_active_id = tree.active_node_id
         chat.add_system_message(
             f"deleted {removed} node(s); active now {new_active_id[:8]}"
         )

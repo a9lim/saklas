@@ -402,7 +402,7 @@
   .head h2 {
     margin: 0;
     font-size: var(--text);
-    color: var(--accent-blue);
+    color: var(--accent);
     letter-spacing: 0;
     text-transform: lowercase;
   }

@@ -202,7 +202,7 @@
     flex: 0 0 auto;
   }
   .strip.selected .select-glyph {
-    color: var(--accent-blue);
+    color: var(--accent);
   }
 
   /* Bipolar axis — grid mirrors VectorStrip.axis exactly so the two

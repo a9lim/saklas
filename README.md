@@ -6,12 +6,6 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 
-<p align="center">
-  <video src="https://github.com/a9lim/saklas/raw/main/docs/demo.mp4" controls muted playsinline width="720">
-    Demo video at <a href="docs/demo.mp4">docs/demo.mp4</a>.
-  </video>
-</p>
-
 Saklas is a library for activation steering and probing on local HuggingFace models. You give it any concept, from "angry" to "bacterium", and it automatically generates contrastive pairs, extracts a direction from them, and then steers the model's hidden states along that direction when it's time to generate text. The model itself isn't touched, so you can change the steering strength as you go.
 
 Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. It has three frontends:
