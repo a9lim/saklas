@@ -7,7 +7,23 @@
   // real to report.
 
   import Bar from "../lib/charts/Bar.svelte";
-  import { genStatus, geometricMeanPpl } from "../lib/stores.svelte";
+  import {
+    genStatus,
+    geometricMeanPpl,
+    pendingActions,
+  } from "../lib/stores.svelte";
+
+  // Pending-queue badge — counts the items waiting in the FIFO queue.
+  // Under the v2.x queue semantics, drain is automatic on every WS
+  // ``done`` event; the per-bubble ``×`` in the chat-side
+  // PendingBubbles strip handles cancellation, so there's no "apply
+  // now" button here anymore.  The badge stays as a status readout.
+  const pendingCount = $derived(pendingActions.queue.length);
+  const pendingTitle = $derived(
+    pendingCount === 1
+      ? "1 item queued; drains automatically on the next done event"
+      : `${pendingCount} items queued; drain automatically on each done event`,
+  );
 
   // Live elapsed counter — ticks while gen is active, freezes on done so
   // the user can still read the final timing after the generation lands.
@@ -71,20 +87,28 @@
       <span class="text muted">{genStatus.finishReason}</span>
     {/if}
   {/if}
+
+  {#if pendingCount > 0}
+    <span class="pending-badge" title={pendingTitle}>
+      {pendingCount} queued
+    </span>
+  {/if}
 </footer>
 
 <style>
+  /* Embedded in the chat column, directly above the input row — a thin
+   * status line.  Horizontal padding is zero so it aligns with the log
+   * and input box; the hairline above separates it from the log. */
   .status-footer {
     display: flex;
     align-items: center;
-    gap: 0.5em;
-    padding: 0.3em 1em;
-    background: var(--bg-deep);
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
     border-top: 1px solid var(--border);
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     font-family: var(--font-mono);
-    min-height: 24px;
+    min-height: 22px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -107,5 +131,19 @@
   .bar-wrap {
     display: inline-flex;
     align-items: center;
+  }
+
+  /* Pending-queue badge — status readout pushed to the right edge.
+   * Display-only; per-item cancel lives on the PendingBubbles strip
+   * above the composer. */
+  .pending-badge {
+    margin-left: auto;
+    background: rgba(242, 184, 75, 0.12);
+    color: var(--accent-amber);
+    border: 1px solid var(--border);
+    padding: var(--space-1) var(--space-4);
+    border-radius: var(--radius);
+    font-size: var(--text-sm);
+    font-family: var(--font-ui);
   }
 </style>

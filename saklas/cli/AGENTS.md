@@ -1,39 +1,61 @@
 # cli/
 
-Five-verb root parser (`tui`/`serve`/`pack`/`vector`/`config`) split across:
-- `cli/main.py` — entry point, `_build_root_parser`, `_load_effective_config`, `_warmup_session`
-- `cli/parsers.py` — every `_build_X_parser`
-- `cli/runners.py` — every `_run_X`
-- `cli/config_file.py` — `ConfigFile` + `effective()` / `resolve_poles()` / `to_yaml()`
+Six-verb root parser (`tui`/`serve`/`pack`/`vector`/`experiment`/`config`) split across:
+- `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
+- `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`
+- `cli/runners.py` — every `_run_X` plus the shared helpers below
+- `cli/config_file.py` — `ConfigFile` dataclass + `compose` / `apply_flag_overrides` / `ensure_vectors_installed`
+- `cli/output.py` — text/JSON formatters for `pack ls` / `pack search`
+
+`main()` dispatches via `_COMMAND_RUNNERS[cmd]`. Bare `saklas` (or a bare verb with no subverb) prints help and exits 0, not argparse's exit 2.
 
 ## Verb nesting
 
-- `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via `_PACK_BUILDERS` / `_PACK_RUNNERS` tables
-- `vector` = computation (extract/merge/clone/compare/why) via `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`
+- `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via `_PACK_VERBS` / `_PACK_BUILDERS` / `_PACK_RUNNERS`
+- `vector` = computation (extract/merge/clone/compare/why/transfer) via `_VECTOR_VERBS` / `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`
+- `experiment` = repeatable research runs (`fan`, `transcript run`) via `_EXPERIMENT_VERBS` / `_EXPERIMENT_BUILDERS`; `_run_experiment` hand-dispatches the two verbs
 - `config` = show / validate
 
 ## Config loading
 
-`_load_effective_config(args)` is the shared entry point every subcommand that takes `-c` calls. Composes `~/.saklas/config.yaml` + explicit `-c` files and stamps `args.config_vectors` (a steering expression string, or `None`) / `args.temperature` / `args.top_p` / `args.max_tokens` / `args.method` (extraction) / `args.injection_mode` / `args.theta_max` in place. The `vectors:` YAML key is a single steering expression — parsed through `saklas.core.steering_expr.parse_expr` which resolves bare poles (`wolf → deer.wolf @ -0.5`) via `io.selectors.resolve_pole`. `ConfigFile.load` validates the expression at load time and stores the raw string; re-parsing happens on consumption.
+`_load_effective_config(args)` (in `runners.py`) is the shared entry point every subcommand that takes `-c` calls. It composes `~/.saklas/config.yaml` + explicit `-c` files via `ConfigFile.effective(extras, include_default=True)`, runs `apply_flag_overrides` for CLI-supplied values, then stamps in place: `args.model` (if YAML supplied it), `args.temperature`, `args.top_p`, `args.thinking`, `args.system_prompt`, `args.max_tokens`, `args.config_vectors`, plus YAML-only knobs `args.method` / `args.injection_mode` / `args.theta_max` / `args.projection_metric` / `args.no_compile` / `args.no_cuda_graphs` / `args.top_k_alts` — each only when the matching CLI flag is unset (CLI wins). Finally calls `ensure_vectors_installed`.
 
-## Warmup
+`ConfigFile.load` parses the YAML, warns on unknown keys, and validates the `vectors:` value (a single steering expression string) through `saklas.core.steering_expr.parse_expr` at load time, storing the raw text. Re-parsing into a `Steering` happens on consumption. `compose` overrides field-by-field, later configs winning; `vectors` overrides wholesale (no concatenation). Known keys: `model`, `vectors`, `thinking`, `temperature`, `top_p`, `max_tokens`, `system_prompt`, `extraction_method`, `injection_mode`, `theta_max`, `projection_metric`, `compile`, `cuda_graphs`, `return_top_k`.
 
-`_warmup_session` issues a single-token `session.generate(sampling=SamplingConfig(max_tokens=1), stateless=True)` — no `session.config` mutation.
+`ensure_vectors_installed` walks the raw expression via `referenced_selectors`, auto-installing HF-namespaced concepts and materializing `default/` ones; `strict=True` raises on any unresolvable reference instead of warning.
+
+## Session construction + warmup
+
+`_make_session(args)` builds the `SaklasSession` via `from_pretrained`, resolving probe categories, injection mode, projection metric, DLS, compile, and CUDA-graph settings off `args`. It enforces the `--legacy` conflict checks (mutually exclusive with `--steer-mode`, `--projection-metric`, `--no-dls`). `_warmup_session` runs a single-token `session.generate("Hi", sampling=SamplingConfig(max_tokens=1), stateless=True)` so the first real request is fast (`serve` only).
 
 ## Flags
 
-- `tui` / `serve`: `--steer-mode {angular,additive}` (default `angular`), `--theta-max RAD` (default π/2 ≈ 1.5708), and `--projection-metric {mahalanobis,euclidean}` (default `mahalanobis`, since v2.1) flow into `SaklasSession.from_pretrained` via `_make_session` and stamp the session-level injection mode + runtime projection metric. All three default to `None` on argparse; YAML `injection_mode:`, `theta_max:`, and `projection_metric:` win when the matching CLI flag is unset; session defaults (angular / π/2 / mahalanobis) win otherwise.
-- `serve`: `--host/-H`, `--port/-P`, `--steer/-S EXPR`, `--cors/-C`, `--api-key/-k`, plus `-c/--config`. `--steer` takes one steering expression string (the shared grammar); combine multiple terms with `+`/`-`.
-- `vector extract`: `--method {dim,pca}` (default `dim`) selects the per-layer extractor. Tensor filenames diverge: `--method dim` writes to `<safe_model>.safetensors` (canonical); `--method pca` writes to `<safe_model>_pca.safetensors` (legacy). Both can coexist on disk; the steering grammar's `:pca` variant addresses the legacy tensor.
-- `vector compare`: `--metric {euclidean,mahalanobis}` (default `mahalanobis` since v2.1). Mahalanobis path requires `~/.saklas/models/<id>/{layer_means,neutral_activations}.safetensors` to exist on disk; `LayerWhitener.from_cache(model_id)` raises a `WhitenerError` with a populating-command hint when the cache is missing (this is fatal — `compare --metric mahalanobis` doesn't silently fall back to Euclidean since that would hide the missing cache). `--ridge-scale FLOAT` (default 1.0) tunes the ridge multiplier on the regularized covariance.
-- `vector merge`: positional `expression` argument — a steering expression such as `"0.3 ns/a + 0.4 ns/b"` or `"0.5 ns/a~ns/b"` for projection-removal. The comma-separated legacy form is gone.
-- `--no-dls` (v2.1): disables the discriminative-layer-selection mask at extraction time. `--legacy` already implies this; passing both errors out at parse time. The mask itself lives in `saklas.core.vectors.compute_dls_mask` and is evaluated against the cached `layer_means`; without `layer_means` (e.g. `probes=[]` sessions whose neutrals haven't been computed yet) the helper silently keeps all layers. See `saklas/core/AGENTS.md` for the algorithm.
-- `--legacy` (v2.0 backcompat preset): on `tui`/`serve` flips `injection_mode="additive"`, `extraction_method="pca"`, `projection_metric="euclidean"`, and `dls=False` (all passed through to `SaklasSession.from_pretrained`); on `vector extract` flips `--method pca`; on `vector compare` flips `--metric euclidean` (overriding the v2.1 mahalanobis default). Mutually exclusive with the per-flag controls on the same verb (combination errors at parse time before model load — `--legacy + --steer-mode`, `--legacy + --projection-metric`, `--legacy + --no-dls`, `--legacy + --method`, `--legacy + --metric` all reject). `_resolve_legacy_method(args)` (in `runners.py`) is the shared helper for the conflict check on `vector extract`.
-- `pack ls` is local-only; `pack search` is the HF-remote verb.
-- `pack rm` replaces `uninstall`; `pack ls` replaces `list`.
+`tui` and `serve` share model-loading args (`model`, `-q/--quantize`, `-d/--device`, `-p/--probes`), the injection block (`_add_injection_args`), the logit block (`_add_logit_args`), and config args (`_add_config_args`: `-c/--config` repeatable, `-s/--strict`).
 
-## SAE flags
+- Injection block (`tui`/`serve`/`experiment fan`/`transcript run`): `--steer-mode {angular,additive}`, `--theta-max RAD`, `--projection-metric {mahalanobis,euclidean}`, `--no-dls`, `--legacy`, `--no-compile`, `--no-cuda-graphs`. All argparse-default to `None`/`False`; YAML fills unset values, session defaults (angular / π/2 / mahalanobis / DLS on / compile + cuda-graphs auto-on) win otherwise.
+- Logit block: `--top-k-alts N` (0–256, default unset → session default 0). Sets the session-level `SamplingConfig.return_top_k`.
+- `tui`: `model` is optional (a `-c` config with `model:` can supply it); `--max-tokens` default 1024.
+- `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (default 8000), `-S/--steer EXPR`, `-C/--cors ORIGIN` (repeatable), `-k/--api-key` (falls back to `$SAKLAS_API_KEY`), `--no-web` (skip the dashboard mount at `/`).
+- `vector extract`: positional `concept` (one concept or two poles), `-m/--model`, `-f/--force`, `--method {dim,pca}` (default `dim`; `pca` writes the legacy `_pca` filename suffix), `--legacy` (≡ `--method pca`, mutually exclusive with `--method`), `--sae RELEASE`, `--sae-revision REV`. `--method`/`--legacy` resolve through `_resolve_legacy_method`.
+- `vector merge`: positional `name` + `expression` (a steering expression, e.g. `"0.3 ns/a + 0.5 ns/a~ns/b"`), `-f/--force`, `-s/--strict`, `-m/--model`.
+- `vector clone`: positional `corpus_path`, required `-N/--name`, `-m/--model`, `-n/--n-pairs` (default 90), `--seed`, `-f/--force`.
+- `vector compare`: positional `concepts` (1+ selectors), required `-m/--model`, `-v/--verbose`, `-j/--json`, `--metric {euclidean,mahalanobis}` (default `mahalanobis`), `--ridge-scale FLOAT` (default 1.0, mahalanobis only), `--legacy` (≡ `--metric euclidean`). 1-arg mode ranks all installed against the target, 2-arg is pairwise, 3+ prints an N×N matrix. The mahalanobis path loads `LayerWhitener.from_cache(model_id)` up front; a missing whitener cache is fatal (no silent Euclidean fallback).
+- `vector why`: positional `concept`, required `-m/--model`, `-j/--json`. Prints a per-layer `||baked||` histogram (16 buckets) plus diagnostics when the sidecar carries them.
+- `vector transfer`: positional `concept`, required `--from SRC_MODEL` / `--to TGT_MODEL`, `-f/--force`, `-j/--json`. Fits/loads a Procrustes alignment and writes a transferred tensor at the target's `from-<safe_src>` variant.
+- `experiment fan`: positional `model` + `prompt`, required repeatable `-g/--grid CONCEPT=ALPHAS`, `-S/--base-steering EXPR`, `--max-tokens` (default 256), `-j/--json`. Runs the alpha grid through `session.generate_sweep`; JSON mode emits `RunSet.to_dict()`.
+- `experiment transcript run`: positional `path` + optional `model` (falls back to the transcript's embedded `model_id`), `--max-tokens` (default 256). Replays each user turn and reports per-turn readings drift. `transcript` is not a top-level verb.
+- `pack install`: `target`, `-s/--statements-only`, `-a/--as NS/NAME`, `-f/--force`.
+- `pack refresh`: `selector` (or the literal `neutrals`), `-m/--model`.
+- `pack clear`: `selector`, `-m/--model`, `-y/--yes` (required for broad selectors), `--variant {raw,sae,all}` (default `all`).
+- `pack rm`: `selector`, `-y/--yes` (required for broad selectors).
+- `pack ls`: optional `selector`, `-j/--json`, `-v/--verbose` — local-only, no HF query.
+- `pack search`: optional `query`, `-j/--json`, `-v/--verbose` — the HF-remote verb.
+- `pack push`: `selector`, `-a/--as OWNER/NAME`, `-p/--private`, `-m/--model`, `-s/--statements-only`, `-n/--no-statements`, `-t/--tag-version`, `-d/--dry-run`, `-f/--force`, `--variant {raw,sae,all}` (default `raw` — SAE variants carry stronger provenance, so sharing them is opt-in).
+- `pack export gguf`: `selector`, `-m/--model`, `-o/--output`, `--model-hint`.
+- `config show`: `-c/--config` (extra YAML), `-m/--model` (override), `--no-default` (skip `~/.saklas/config.yaml`). `config validate`: positional `file` — exit 0 valid, 2 invalid.
 
-`vector extract` accepts `--sae RELEASE` (required value — no implicit default, since SAELens ships many releases per base model) and `--sae-revision REV` (optional HF revision pin). Written tensor lands at `<concept>/<safe_model>_sae-<release>.safetensors`; returned canonical name from `session.extract` carries a `:sae-<release>` suffix so subsequent `session.steering` calls address the SAE variant uniquely.
+`--legacy` is a single-flag preset: on `tui`/`serve` it forces `injection_mode="additive"`, `extraction_method="pca"`, `projection_metric="euclidean"`, `dls=False`; on `vector extract` it forces `--method pca`; on `vector compare` it forces `--metric euclidean`. Conflicting per-flag controls on the same verb error at parse/runner time before model load.
 
-`pack push --variant {raw,sae,all}` defaults to `raw` — SAE variants carry stronger provenance requirements (release + revision + per-layer sae_ids), so sharing them is opt-in. `pack clear --variant {raw,sae,all}` defaults to `all` — clearing a stale extraction should wipe every flavor unless scoped.
+## Error handling
+
+`@_saklas_error_exit` wraps the top-level runners (not `tui`): any escaping `SaklasError` prints `user_message()` to stderr and exits with `min(2, status // 100)`.

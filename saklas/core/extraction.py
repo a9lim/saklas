@@ -6,11 +6,10 @@ local ``statements.json`` (reused by default) → generate scenarios → save
 save under ``default/<c>/``; user concepts under ``local/<c>/``.
 
 Dependencies are passed structurally (not as a back-reference to the
-session) via three runtime-checkable Protocols — :class:`ModelHandle`,
-:class:`PackWriter`, :class:`VectorRegistry` — plus an :class:`EventBus`
-for ``VectorExtracted`` emission.  ``SaklasSession`` implements all three
-protocols implicitly, so construction reads as
-``ExtractionPipeline(self, self, self, self.events)``.
+session) via two runtime-checkable Protocols — :class:`ModelHandle` and
+:class:`PackWriter` — plus an :class:`EventBus` for ``VectorExtracted``
+emission.  ``SaklasSession`` implements both protocols implicitly, so
+construction reads as ``ExtractionPipeline(self, self, self.events)``.
 
 The session gates re-entry against ``GenState.IDLE`` before forwarding;
 the pipeline itself does not touch generation state.  See ``Phase 7`` of
@@ -171,20 +170,6 @@ class PackWriter(Protocol):
         ...
 
 
-@runtime_checkable
-class VectorRegistry(Protocol):
-    """Optional registry the pipeline writes back to.
-
-    The current pipeline does not auto-register profiles into the session
-    registry — callers do that explicitly via ``session.steer(name, profile)``.
-    The protocol is wired in for parity with the plan, and so future
-    callers can ask the pipeline to populate a registry directly.
-    """
-
-    def __contains__(self, name: str) -> bool: ...
-    def add(self, name: str, profile: Profile) -> None: ...
-
-
 # ----------------------------------------------------------------------
 # Pipeline.
 # ----------------------------------------------------------------------
@@ -198,18 +183,16 @@ class ExtractionPipeline:
     See module docstring for the audit reference.
     """
 
-    __slots__ = ("_handle", "_packs", "_registry", "_events")
+    __slots__ = ("_handle", "_packs", "_events")
 
     def __init__(
         self,
         model_handle: ModelHandle,
         pack_writer: PackWriter,
-        registry: VectorRegistry,
         events: EventBus,
     ) -> None:
         self._handle = model_handle
         self._packs = pack_writer
-        self._registry = registry
         self._events = events
 
     # -- public entry point ------------------------------------------------

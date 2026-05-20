@@ -1,7 +1,7 @@
 """Plotly-based notebook helpers for saklas results.
 
 Bundles four figure functions and a DataFrame coercion helper that turn the
-existing structured types (``Profile``, ``ResultCollector``,
+existing structured types (``Profile``, ``RunSet``, ``ResultCollector``,
 ``ProbeReadings``) into interactive plotly figures suitable for Jupyter,
 HTML reports, and PNG export via kaleido.
 
@@ -15,7 +15,7 @@ Public surface:
 * :func:`plot_probe_correlation` — N×N magnitude-weighted cosine heatmap
 * :func:`plot_layer_norms` — per-layer ``||baked||`` bar chart
 * :func:`plot_trait_history` — per-probe ``per_generation`` timeline
-* :func:`to_dataframe` — coerce a ``ResultCollector`` or list of results to ``pd.DataFrame``
+* :func:`to_dataframe` — coerce a ``RunSet``, ``ResultCollector``, or list of results to ``pd.DataFrame``
 """
 from __future__ import annotations
 

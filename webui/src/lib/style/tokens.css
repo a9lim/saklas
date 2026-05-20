@@ -1,58 +1,121 @@
-/* Centralized design tokens.  Imported once from App.svelte (later phase);
- * every panel and drawer reads these custom properties instead of hardcoding
- * the GitHub-dark palette inline.  Swap palette = edit this file. */
+/* Centralized design tokens — saklas webui.
+ *
+ * One flat, dark theme.  After the 2026-05 consolidation the rules are:
+ *   - surfaces separate by background SHADE, not by outline
+ *   - exactly one border: a faint uniform hairline (--border)
+ *   - one corner radius (--radius, 2px) — sharp, matches a9l.im
+ *   - type comes from the --text-* scale; spacing from --space-*
+ *   - weight comes from --weight-*
+ *   - the blue --accent is the only chrome hue; green / amber / red /
+ *     yellow / purple are reserved for state + data, never decoration
+ *   - no texture: no film grain, no glass blur — flat opaque surfaces
+ *
+ * Colour values mirror a9l.im's dark palette (shared-tokens.js dark
+ * block); the webui runs blue-accent-only.  When the site palette
+ * changes, propagate: shared-tokens.js dark block → these vars.
+ */
 
 :root {
-  /* Surfaces */
-  --bg: #0d1117;
-  --bg-alt: #161b22;
-  --bg-deep: #010409;
-  --bg-elev: #21262d;
+  /* ---- Geometry ---------------------------------------------------- */
+  --radius: 2px;
+  --radius-pill: 999px;
 
-  /* Text */
-  --fg: #e6edf3;
-  --fg-strong: #c9d1d9;
-  --fg-dim: #8b949e;
-  --fg-muted: #6e7681;
-  --fg-subtle: #7d8590;
+  /* ---- Surfaces — a flat elevation ladder, deepest → highest ------- */
+  --bg-deep: #04050a;       /* rail — the floor */
+  --bg: #07080c;            /* app canvas */
+  --bg-alt: #0e0f14;        /* panel tier */
+  --surface: #0e0f14;       /* alias of --bg-alt; panels, cards */
+  --bg-elev: #181920;       /* elevated: inputs, strips, hover targets */
+  --surface-strong: #181920;/* alias of --bg-elev */
+  --surface-hi: #232430;    /* highest: modals, popovers, menus */
 
-  /* Lines */
-  --border: #30363d;
-  --border-dim: #21262d;
+  /* Translucent wash laid over any surface tier on hover. */
+  --bg-hover: rgba(244, 245, 249, 0.05);
+  /* The 1px seam between layout zones. */
+  --grid-line: #04050a;
 
-  /* Accents */
-  --accent-green: #7ee787;
-  --accent-blue: #58a6ff;
-  --accent-red: #f85149;
-  --accent-yellow: #d29922;
-  --accent-error: #ff7b72;
-  --accent-purple: #d2a8ff;
+  /* ---- Text ladder ------------------------------------------------- */
+  --fg: #f4f5f9;            /* primary */
+  --fg-strong: #d8dbe0;     /* slightly recessed body */
+  --fg-dim: #bfc1c6;        /* secondary */
+  --fg-subtle: #a7aab1;     /* tertiary */
+  --fg-muted: #8f929b;      /* labels, hints, disabled */
+  --text-on-accent: #fdfdff;
+
+  /* ---- The one border --------------------------------------------- */
+  --border: rgba(244, 245, 249, 0.09);
+
+  /* ---- Accent + semantic colours ----------------------------------
+   * --accent (blue) is the only chrome hue — selection, focus, primary
+   * actions.  The rest are state-only: use them for text / fills /
+   * data / left-edge status bars, never as resting box outlines. */
+  --accent: #488acb;
+  --accent-blue: #488acb;
+  --accent-light: #6ba3da;
+  --accent-amber: #ca6800;
+  --accent-green: #009f68;
+  --accent-red: #da534f;
+  --accent-yellow: #998700;
+  --accent-error: #da534f;
+  --accent-purple: #9769dc;
+  --accent-subtle: rgba(72, 138, 203, 0.12);   /* accent fill wash */
+  --accent-glow: rgba(72, 138, 203, 0.30);     /* focus ring + accent hover */
 
   /* Highlight palette — driven by tokens.ts ``scoreToRgb`` at runtime,
-   * but kept here as named handles for future skin overrides. */
+   * kept here as named handles for future skin overrides. */
   --highlight-pos: #00ff00;
   --highlight-neg: #ff0000;
+  /* score / HIGHLIGHT_SAT clamps to [-1, 1] before mapping to RGB. */
+  --highlight-sat: 0.5;
 
-  /* Typography */
-  --font-mono: -apple-system, "SF Mono", Menlo, Consolas, monospace;
-  --font-size-base: 13px;
-  --font-size-small: 11px;
-  --font-size-tiny: 10px;
+  /* ---- One overlay shadow — drawers, modals, popovers, toasts ------ */
+  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.55);
 
-  /* Geometry — unitless, multiplied to px in component styles.
-   * 24 mirrors the TUI's BAR_WIDTH constant. */
+  /* ---- Type scale — px, base is 13px ------------------------------- */
+  --text-2xs: 9px;          /* layer ticks, micro-labels */
+  --text-xs: 10px;          /* fine print, sparkline captions */
+  --text-sm: 11px;          /* secondary labels, hints, chips */
+  --text: 13px;             /* base — body, controls */
+  --text-md: 15px;          /* emphasised rows, section titles */
+  --text-lg: 18px;          /* drawer / panel headings */
+  --text-xl: 22px;          /* big numbers, boot heading */
+
+  /* ---- Weight ------------------------------------------------------ */
+  --weight-normal: 400;
+  --weight-medium: 600;
+  --weight-bold: 700;
+
+  /* ---- Spacing scale ----------------------------------------------- */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 24px;
+  --space-8: 32px;
+  /* Named spacing aliases kept for ergonomics. */
+  --row-gap: var(--space-3);
+  --panel-pad: var(--space-4);
+
+  /* ---- Motion — ported from a9l.im/shared-base.css ----------------- */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-smooth: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --dur-fast: 0.12s;
+  --dur: 0.2s;
+  --dur-slow: 0.3s;
+
+  /* ---- Fonts ------------------------------------------------------- */
+  --font-ui: "Recursive", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-mono: "Recursive", "SF Mono", Menlo, Consolas, monospace;
+
+  /* ---- TUI-ported geometry knobs — 24 mirrors BAR_WIDTH ------------ */
   --bar-width: 24;
   --bar-px: 24px;
   --bar-height: 8px;
-  --row-gap: 0.4em;
-  --panel-pad: 0.5em;
 
-  /* Highlighting saturation — score / HIGHLIGHT_SAT clamps to [-1, 1]
-   * before mapping to RGB.  Exposed as a CSS var so a debug skin can
-   * raise it to 1.0 (full-range) without touching JS. */
-  --highlight-sat: 0.5;
-
-  /* Z-layers */
+  /* ---- Z-layers ---------------------------------------------------- */
   --z-drawer: 50;
   --z-modal: 100;
 }

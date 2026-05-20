@@ -107,8 +107,8 @@
           spellcheck="false"
         />
         <span class="sub">
-          accepts a folder (concept directory) or a single safetensors/gguf
-          file — same surface ``session.load_profile`` consumes.
+          accepts a folder (concept directory) or a single safetensors or
+          gguf file. This is the same surface ``session.load_profile`` consumes.
         </span>
       </label>
 
@@ -152,26 +152,26 @@
     min-height: 0;
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 16px;
+    padding: var(--space-6);
     border-bottom: 1px solid var(--border);
   }
   .title {
     color: var(--accent-blue);
     text-transform: lowercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
   }
   .close {
     background: transparent;
     border: 0;
     color: var(--fg-dim);
     cursor: pointer;
-    padding: 0.25em 0.4em;
+    padding: var(--space-2) var(--space-3);
   }
   .close:hover {
     color: var(--accent-red);
@@ -179,64 +179,64 @@
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: 16px;
+    padding: var(--space-6);
     display: flex;
     flex-direction: column;
-    gap: 0.75em;
+    gap: var(--space-5);
     min-height: 0;
   }
   .hint {
     margin: 0;
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     line-height: 1.4;
   }
   .form {
     display: flex;
     flex-direction: column;
-    gap: 0.65em;
+    gap: var(--space-4);
   }
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.25em;
+    gap: var(--space-2);
   }
   .label {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     text-transform: lowercase;
   }
   .input {
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);
-    padding: 0.4em 0.5em;
+    padding: var(--space-3) var(--space-3);
     font: inherit;
     font-family: var(--font-mono);
   }
   .input:focus {
     outline: none;
-    border-color: var(--accent-blue);
+    border-color: var(--accent);
   }
   .sub {
     color: var(--fg-muted);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
   }
   .validation {
     color: var(--accent-yellow);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
   }
   .error {
     color: var(--accent-error);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
     word-break: break-word;
   }
   .success {
     color: var(--accent-green);
     margin: 0;
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .success code {
     color: var(--accent-green);
@@ -244,15 +244,15 @@
   .footer {
     display: flex;
     justify-content: flex-end;
-    gap: 0.5em;
-    padding: 16px;
+    gap: var(--space-3);
+    padding: var(--space-6);
     border-top: 1px solid var(--border);
   }
   .btn {
     background: var(--bg-alt);
     color: var(--fg-strong);
     border: 1px solid var(--border);
-    padding: 0.4em 0.9em;
+    padding: var(--space-3) var(--space-5);
     font: inherit;
     font-family: var(--font-mono);
     cursor: pointer;
@@ -263,14 +263,19 @@
   }
   .btn:disabled {
     color: var(--fg-muted);
-    border-color: var(--border-dim);
+    border-color: var(--border);
     cursor: not-allowed;
   }
   .btn.primary {
-    color: var(--accent-blue);
-    border-color: var(--accent-blue);
+    background: var(--accent);
+    color: var(--text-on-accent);
+    border-color: var(--accent);
   }
   .btn.primary:hover:not(:disabled) {
-    background: rgba(88, 166, 255, 0.1);
+    background: var(--accent-light);
+    border-color: var(--accent-light);
+  }
+  .btn.primary:disabled {
+    background: var(--bg-elev);
   }
 </style>

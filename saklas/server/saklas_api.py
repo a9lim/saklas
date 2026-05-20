@@ -30,7 +30,7 @@ import json
 import time
 import uuid
 from dataclasses import replace as _replace
-from typing import Any
+from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -39,8 +39,9 @@ from pydantic import BaseModel, Field
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking
 from saklas.io.probes_bootstrap import load_defaults
+from saklas.core.loom import LoomMutated
 from saklas.core.profile import Profile
-from saklas.core.results import GenerationResult
+from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
@@ -73,6 +74,10 @@ class ExtractRequest(BaseModel):
     name: str
     source: Any = None
     baseline: str | None = None
+    method: str | None = None
+    dls: bool | None = None
+    sae: str | None = None
+    sae_revision: str | None = None
     auto_register: bool = Field(True, alias="register")
 
     model_config = {"populate_by_name": True}
@@ -95,8 +100,17 @@ class WSSamplingParams(BaseModel):
     max_tokens: int | None = None
     seed: int | None = None
     stop: list[str] | None = None
+    logit_bias: dict[int, float] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # Phase 1 logit pass: webui "show alts" toggle wires through this
+    # field. 0 (default) inherits the session-level
+    # ``return_top_k`` set at startup via ``--top-k-alts`` / YAML;
+    # K > 0 overrides per-request, so a webui session can flip alts
+    # capture on/off without re-loading the model.  Clamped at the
+    # SamplingConfig layer to ``[0, 256]``; pydantic accepts the int
+    # and forwards as-is.
+    return_top_k: int = 0
 
 
 class WSGenerateMessage(BaseModel):
@@ -109,6 +123,115 @@ class WSGenerateMessage(BaseModel):
     thinking: bool | None = None
     stateless: bool = True
     raw: bool = False
+    # Loom (v2.3): attach the generated assistant node under a specific
+    # tree node, and fan out ``n`` siblings on the same user-parent.
+    # ``parent_node_id=None`` falls through to the active node; ``n=1``
+    # preserves the v2.2 single-stream protocol.
+    parent_node_id: str | None = None
+    n: int = 1
+    # Loom phase 5: optional recipe-override modifier.  Either a built-in
+    # mode string (``"unsteered"``/``"inverted"``/``"reseed"``/``"cool"``/
+    # ``"hot"``) or a free-form partial recipe expression (``"seed=42,
+    # temperature=1.5"``).  Resolved through ``session.regen_with_modifier``
+    # when set; ignored when None.
+    recipe_override: Any = None
+    # Logit fork (v2.3): regenerate an existing assistant node as a
+    # sibling with one token swapped.  When ``fork_node_id`` is set the
+    # handler ignores ``input`` / ``steering`` / ``sampling`` / ``n`` —
+    # ``session.fork_from_token`` reuses the node's stamped recipe and
+    # replays its raw decode sequence up to ``fork_raw_index``, forcing
+    # ``fork_alt_token_id`` there before sampling the continuation.
+    fork_node_id: str | None = None
+    fork_raw_index: int | None = None
+    fork_alt_token_id: int | None = None
+    # Answer-prefill (v2.3): seed an assistant reply under a user node.
+    # When ``prefill_node_id`` is set the handler ignores ``input`` and
+    # the ``fork_*`` fields — ``session.prefill_assistant`` tokenizes
+    # ``prefill_text`` into a forced decode prefix, lands the result as a
+    # sibling assistant under the user node, and forces ``thinking=False``
+    # (the prefilled text is the start of the *answer*).  ``steering`` /
+    # ``sampling`` / ``n`` are honored as on a normal generate.
+    prefill_node_id: str | None = None
+    prefill_text: str | None = None
+    # Commit (Ctrl+Enter on either surface): land a turn under
+    # ``parent_node_id`` without running a decode.  ``commit_role="user"``
+    # routes to ``session.append_user_turn`` (active node must not be
+    # user); ``commit_role="assistant"`` routes to
+    # ``session.append_assistant_turn`` (parent must be a user node, the
+    # text becomes the whole turn).  Mutually exclusive with prefill and
+    # fork; ``input`` / ``steering`` / ``sampling`` / ``thinking`` / ``n``
+    # are ignored.  Both fields must travel together.
+    commit_role: Literal["user", "assistant"] | None = None
+    commit_text: str | None = None
+
+
+# --- Loom tree request bodies (phase 2) --------------------------------
+
+class TreeNavigateRequest(BaseModel):
+    node_id: str
+
+
+class TreeEditRequest(BaseModel):
+    node_id: str
+    text: str
+
+
+class TreeBranchRequest(BaseModel):
+    node_id: str
+    text: str = ""
+    role: str | None = None
+
+
+class TreeStarRequest(BaseModel):
+    node_id: str
+    on: bool = True
+
+
+class TreeNoteRequest(BaseModel):
+    node_id: str
+    text: str
+
+
+class TreeTranscriptRequest(BaseModel):
+    node_id: str | None = None
+
+
+class TreeTranscriptLoadRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/tree/transcript/load`` (phase 5).
+
+    ``yaml`` is the full transcript YAML produced by the export route.
+    ``mode`` chooses the attach point: ``"default"`` attaches as a fresh
+    branch off root, ``"here"`` attaches at the active node, ``"merge"``
+    walks for the deepest user-turn match and attaches the divergent
+    tail there.  ``strict`` refuses the load on any probe-hash drift.
+    """
+
+    yaml: str
+    mode: str = "default"
+    strict: bool = False
+
+
+class TreeDiffRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/tree/diff`` (phase 5)."""
+
+    a_id: str
+    b_id: str
+
+
+class JointLogprobsRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/tree/joint_logprobs``
+    (logit-pass Phase 5 of ``docs/plans/logit-pass.md``).
+
+    Lazy / on-demand cross-evaluation between two sibling assistant
+    nodes — fired only when ``NodeCompareDrawer`` asks for it.  Results
+    cache on the session for the session lifetime, keyed by sorted
+    ``(a_id, b_id)`` so ``(A, B)`` and ``(B, A)`` requests share an
+    entry; the response is re-oriented to match the request's
+    a/b ordering before serialization.
+    """
+
+    a_id: str
+    b_id: str
 
 
 class InstallPackRequest(BaseModel):
@@ -156,21 +279,20 @@ class CloneVectorRequest(BaseModel):
     baseline: str | None = None
 
 
-class SweepRequest(BaseModel):
-    """Body for ``POST /saklas/v1/sessions/{id}/sweep``.
+class ExperimentFanRequest(BaseModel):
+    """Body for ``POST /saklas/v1/sessions/{id}/experiments/fan``.
 
-    ``sweep`` maps concept name → list of alpha values.  Cartesian
-    product across concepts becomes one generation per row.
+    ``grid`` maps concept name to alpha values.  The Cartesian product
+    becomes sibling assistant nodes under one shared user turn.
     ``base_steering`` (optional) is a steering expression string
-    composed underneath each swept term so callers can hold a
+    composed underneath each grid term so callers can hold a
     fixed-alpha context while sweeping another concept.
     """
     prompt: Any
-    sweep: dict[str, list[float]]
+    grid: dict[str, list[float]]
     base_steering: str | None = None
     sampling: WSSamplingParams | None = None
     thinking: bool | None = None
-    stateless: bool = True
     raw: bool = False
 
 
@@ -278,8 +400,10 @@ def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         max_tokens=body.max_tokens,
         seed=body.seed,
         stop=stop,
+        logit_bias=body.logit_bias,
         presence_penalty=body.presence_penalty or 0.0,
         frequency_penalty=body.frequency_penalty or 0.0,
+        return_top_k=body.return_top_k,
     )
 
 
@@ -288,11 +412,14 @@ def _build_steering(
 ) -> "Steering | None":
     """Compose a request expression string over the server default Steering.
 
-    Per-request keys override the default at the key level.
+    ``None`` inherits the server default.  An explicit empty string is a
+    request for no steering, used by the web UI's unsteered shadow runs.
+    Non-empty request keys override the default at the key level.
     """
     from saklas.core.steering_expr import parse_expr
 
     req: "Steering | None" = None
+    explicit_clear = raw is not None and not raw.strip()
     if raw is not None and raw.strip():
         req = parse_expr(raw)
 
@@ -301,7 +428,7 @@ def _build_steering(
         thinking = req.thinking
 
     merged: dict[str, Any] = {}
-    if default_steering is not None:
+    if default_steering is not None and not explicit_clear:
         merged.update(default_steering.alphas)
     if req is not None:
         for k, v in req.alphas.items():
@@ -335,7 +462,7 @@ def _coerce_pair_source(source: Any) -> Any:
     return pairs
 
 
-def _result_to_json(result: GenerationResult | None) -> dict[str, Any]:
+def _result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
     if result is None:
         return {}
     prompt_tokens = getattr(result, "prompt_tokens", 0) or 0
@@ -350,6 +477,170 @@ def _result_to_json(result: GenerationResult | None) -> dict[str, Any]:
             "total_tokens": prompt_tokens + completion,
         },
     }
+
+
+def _tree_to_json(session: SaklasSession) -> dict[str, Any]:
+    """Serialize the session's loom tree to JSON.
+
+    Thin wrapper over :meth:`LoomTree.to_dict` with ``include_tokens=True``
+    so a webui force-refresh can rehydrate per-token spans (highlight
+    tints, click-to-drilldown, surprise mode, fork affordance) from the
+    server tree.  Per-token blobs ride the per-node ``tokens`` /
+    ``thinking_tokens`` arrays — bulky on long conversations but the
+    only way the inline highlight survives a tab reload (the client's
+    in-memory ``tokenScoreCache`` is wiped, and the on-disk save sidecar
+    is not in the wire path).
+    """
+    return session.tree.to_dict(include_tokens=True)
+
+
+def _active_path_json(session: SaklasSession) -> dict[str, Any]:
+    """Active path as a chat-message list paired with node ids.
+
+    Returns ``{"active_node_id", "rev", "messages": [...], "node_ids": [...]}``
+    where ``messages`` is the v2 chat-message shape (skipping the synthetic
+    root) and ``node_ids`` is the parallel list of loom-tree node ids in
+    the same order. Surfaces that need both the chat-render and the
+    tree-navigation can read them off one fetch.
+    """
+    tree = session.tree
+    path = tree.active_path()
+    messages: list[dict[str, str]] = []
+    node_ids: list[str] = []
+    for node in path:
+        if node.id == tree.root_id:
+            continue
+        messages.append({"role": node.role, "content": node.text})
+        node_ids.append(node.id)
+    return {
+        "active_node_id": tree.active_node_id,
+        "rev": tree.rev,
+        "messages": messages,
+        "node_ids": node_ids,
+    }
+
+
+def _node_json(session: SaklasSession, node_id: str) -> dict[str, Any]:
+    """Serialize a single node to JSON, including its child-id list.
+
+    The child-id list isn't on ``LoomNode`` itself (the tree owns the
+    structure map), but surfaces routinely want it alongside the node
+    payload — so we attach it here.  ``include_tokens=True`` mirrors
+    :func:`_tree_to_json` so ``tree_mutated`` deltas carry the same
+    per-token shape the initial tree GET ships.
+    """
+    node = session.tree.get(node_id)
+    out = node.to_dict(include_tokens=True)
+    out["children"] = list(session.tree.children_of.get(node_id, []))
+    return out
+
+
+def _transcript_yaml(session: SaklasSession, leaf_id: str | None) -> str:
+    """Render the path ending at ``leaf_id`` (or active) as transcript YAML.
+
+    Schema follows the example in ``docs/plans/loom.md`` phase 5 (probe
+    sha256 stubbed empty for phase 2):
+
+        saklas_transcript: 1
+        model_id: <id>
+        system_prompt: <text>
+        probes:
+          - name: <probe>
+            sha256: ""
+        turns:
+          - role: user
+            text: ...
+          - role: assistant
+            text: ...
+            recipe: {...}
+            readings: {...}
+    """
+    tree = session.tree
+    target = leaf_id if leaf_id is not None else tree.active_node_id
+    path = tree.path_to(target)
+
+    system_prompt = ""
+    cfg_sys = getattr(session.config, "system_prompt", None)
+    if cfg_sys:
+        system_prompt = str(cfg_sys)
+
+    monitor = getattr(session, "_monitor", None)
+    probe_names: list[str] = []
+    if monitor is not None:
+        try:
+            probe_names = sorted(monitor.probe_names)
+        except Exception:
+            probe_names = []
+
+    lines: list[str] = []
+    lines.append("saklas_transcript: 1")
+    lines.append(f"model_id: {_yaml_scalar(session.model_id)}")
+    lines.append(f"system_prompt: {_yaml_scalar(system_prompt)}")
+    lines.append("probes:")
+    if not probe_names:
+        lines.append("  []")
+    else:
+        for name in probe_names:
+            lines.append(f"  - name: {_yaml_scalar(name)}")
+            # Phase 2 stub — phase 5 fills with hash of baked tensor bytes.
+            lines.append("    sha256: \"\"")
+    lines.append("turns:")
+    any_turn = False
+    for node in path:
+        if node.id == tree.root_id:
+            continue
+        any_turn = True
+        lines.append(f"  - role: {node.role}")
+        lines.append(f"    text: {_yaml_scalar(node.text)}")
+        if node.recipe is not None:
+            recipe_dict = node.recipe.to_dict()
+            lines.append("    recipe:")
+            for k, v in recipe_dict.items():
+                lines.append(f"      {k}: {_yaml_inline(v)}")
+        if node.aggregate_readings:
+            lines.append("    readings:")
+            for k, v in sorted(node.aggregate_readings.items()):
+                lines.append(f"      {k}: {float(v):.6f}")
+    if not any_turn:
+        lines.append("  []")
+    return "\n".join(lines) + "\n"
+
+
+def _yaml_scalar(value: Any) -> str:
+    """Render a single scalar for the transcript-YAML emitter.
+
+    Strings are double-quoted with escapes so multi-line / unicode / null
+    bodies round-trip cleanly through any YAML 1.2 loader. Non-strings
+    fall through to :func:`_yaml_inline`.
+    """
+    if isinstance(value, str):
+        escaped = (
+            value.replace("\\", "\\\\")
+                 .replace("\"", "\\\"")
+                 .replace("\n", "\\n")
+                 .replace("\r", "\\r")
+                 .replace("\t", "\\t")
+        )
+        return f"\"{escaped}\""
+    return _yaml_inline(value)
+
+
+def _yaml_inline(value: Any) -> str:
+    """JSON-flavored inline rendering for nested recipe scalars.
+
+    JSON is a strict subset of YAML 1.2, so emitting nested dicts /
+    lists / numbers / null via :func:`json.dumps` is valid YAML and
+    sidesteps writing a full YAML emitter.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    if isinstance(value, str):
+        return _yaml_scalar(value)
+    return json.dumps(value)
 
 
 def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict[str, Any]]:
@@ -544,6 +835,408 @@ def register_saklas_routes(app: FastAPI) -> None:
         session.rewind()
         return JSONResponse(status_code=204, content=None)
 
+    # ----- loom tree (v2.3 phase 2) --------------------------------------
+
+    @app.get("/saklas/v1/sessions/{session_id}/tree")
+    def get_tree(session_id: str):
+        """Full tree as JSON.
+
+        Same shape :meth:`LoomTree.to_dict` produces. Surfaces hydrate
+        their state from this on bootstrap and reconcile via the WS
+        ``tree_mutated`` delta stream after.
+        """
+        _resolve_session_id(session, session_id)
+        return _tree_to_json(session)
+
+    @app.get("/saklas/v1/sessions/{session_id}/tree/active")
+    def get_tree_active(session_id: str):
+        """Active path: chat messages + parallel node-id list.
+
+        Cheaper than the full tree for surfaces that only need the
+        currently-rendered conversation. The node-id list is parallel to
+        ``messages`` so a click on message ``i`` maps to ``node_ids[i]``.
+        """
+        _resolve_session_id(session, session_id)
+        return _active_path_json(session)
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/navigate")
+    async def tree_navigate(session_id: str, req: TreeNavigateRequest):
+        """Re-point the active node.
+
+        Free relative to in-flight generation (per the concurrency
+        invariant in the plan): the gen continues attached to its
+        original target, the user simply sees a different active path.
+        """
+        _resolve_session_id(session, session_id)
+        session.tree.navigate(req.node_id)
+        return _active_path_json(session)
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/edit")
+    async def tree_edit(session_id: str, req: TreeEditRequest):
+        """In-place text replacement.
+
+        409 when the node is in the reservation of an in-flight
+        generation (mapped via ``SaklasError.user_message``); 404 on
+        unknown id; 400 on root-edit or other invalid ops.
+        """
+        _resolve_session_id(session, session_id)
+        session.tree.edit(req.node_id, req.text)
+        return _node_json(session, req.node_id)
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/branch")
+    async def tree_branch(session_id: str, req: TreeBranchRequest):
+        """Always-sibling — create a new node next to ``node_id``.
+
+        Allowed during in-flight generation; the new sibling sits on the
+        same user-parent as the gen target without disturbing it.
+        Returns ``{node_id, node, active_path}`` so the caller can place
+        the new node and (if it became active) re-render the chat
+        without a follow-up fetch.
+        """
+        _resolve_session_id(session, session_id)
+        # Cast role through the Literal-narrowing layer the tree owns.
+        role_arg = req.role  # type: ignore[assignment]
+        new_id = session.tree.branch(
+            req.node_id, req.text, role=role_arg,
+        )
+        return {
+            "node_id": new_id,
+            "node": _node_json(session, new_id),
+            "active_path": _active_path_json(session),
+        }
+
+    @app.delete("/saklas/v1/sessions/{session_id}/tree/{node_id}")
+    async def tree_delete(session_id: str, node_id: str):
+        """Subtree delete.
+
+        400 for ancestor-of-active or root delete; 409 when the subtree
+        intersects an in-flight generation's reservation; 404 on unknown
+        id. Returns ``{removed: <count>}``.
+        """
+        _resolve_session_id(session, session_id)
+        removed = session.tree.delete_subtree(node_id)
+        return {"removed": removed}
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/star")
+    async def tree_star(session_id: str, req: TreeStarRequest):
+        """Toggle a node's ``starred`` flag.
+
+        Decoration-only; never raises a concurrency conflict.
+        """
+        _resolve_session_id(session, session_id)
+        session.tree.star(req.node_id, req.on)
+        return _node_json(session, req.node_id)
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/note")
+    async def tree_note(session_id: str, req: TreeNoteRequest):
+        """Set a node's free-text ``notes`` annotation.
+
+        Decoration-only; never raises a concurrency conflict.
+        """
+        _resolve_session_id(session, session_id)
+        session.tree.annotate(req.node_id, req.text)
+        return _node_json(session, req.node_id)
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/reset", status_code=204)
+    async def tree_reset(session_id: str):
+        """Drop the entire tree and rebuild a fresh root.
+
+        Equivalent to ``session.clear_history()``; 409 when a generation
+        is in flight (per the concurrency invariant — ``reset`` cannot
+        race the gen path because the gen path owns the streaming target
+        in the tree itself).
+        """
+        _resolve_session_id(session, session_id)
+        async with session.lock:
+            session.clear_history()
+        return JSONResponse(status_code=204, content=None)
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/transcript")
+    def tree_transcript(session_id: str, req: TreeTranscriptRequest):
+        """Render the path ending at ``node_id`` (or active) as transcript YAML.
+
+        Phase 5 producer: uses :meth:`Transcript.from_path` so probe
+        sha256 hashes are real and the YAML round-trips through
+        :meth:`Transcript.from_yaml` cleanly.  Returns
+        ``{"yaml": "<text>", "node_id": "<leaf-of-rendered-path>"}``.
+        """
+        from saklas.core.transcript import Transcript
+
+        _resolve_session_id(session, session_id)
+        leaf = req.node_id if req.node_id is not None else session.tree.active_node_id
+        # Validate the id before touching the renderer so the 404 lands
+        # cleanly through the existing ``SaklasError`` handler.
+        session.tree.get(leaf)
+        transcript = Transcript.from_path(leaf, session)
+        return {"yaml": transcript.to_yaml(), "node_id": leaf}
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/transcript/load")
+    async def tree_transcript_load(
+        session_id: str, req: TreeTranscriptLoadRequest,
+    ):
+        """Import a transcript YAML into the live session tree (phase 5).
+
+        Wraps :meth:`Transcript.from_yaml` + :meth:`Transcript.import_into`.
+        Modes are ``"default"`` / ``"here"`` / ``"merge"``; ``strict``
+        refuses on probe-hash drift.  Returns
+        ``{"leaf_id": "<id>", "rev": <int>, "guards": [...]}``.
+
+        Guards (model mismatch, system-prompt mismatch, probe drift) are
+        also stamped on the imported branch's root node as ``notes`` so
+        the surfaces can show a banner there.  Returning them in the body
+        too saves the client one fetch.
+        """
+        from saklas.core.transcript import (
+            Transcript,
+            TranscriptError,
+            TranscriptFormatError,
+        )
+
+        _resolve_session_id(session, session_id)
+        mode = req.mode or "default"
+        if mode not in ("default", "here", "merge"):
+            raise HTTPException(
+                400, f"unknown import mode {mode!r}; valid: default, here, merge",
+            )
+        try:
+            transcript = Transcript.from_yaml(req.yaml)
+        except TranscriptFormatError as e:
+            raise HTTPException(400, f"invalid transcript: {e}")
+        import warnings
+
+        captured: list[str] = []
+
+        def _on_warning(
+            message,
+            category,
+            filename,
+            lineno,
+            file=None,
+            line=None,
+        ):
+            captured.append(str(message))
+
+        async with session.lock:
+            with warnings.catch_warnings():
+                warnings.showwarning = _on_warning  # type: ignore[assignment]
+                try:
+                    leaf_id = await asyncio.to_thread(
+                        transcript.import_into,
+                        session,
+                        mode=mode,
+                        strict=req.strict,
+                    )
+                except TranscriptError as e:
+                    raise HTTPException(400, str(e))
+        return {
+            "leaf_id": leaf_id,
+            "rev": session.tree.rev,
+            "guards": captured,
+        }
+
+    @app.get("/saklas/v1/sessions/{session_id}/tree/edge_label")
+    def tree_edge_label(session_id: str, parent_id: str, child_id: str):
+        """Steering-delta label for the parent → child edge (phase 5).
+
+        Returns ``{"label": "<text>"}`` — empty string when the two
+        recipes are identical.  Both nodes must exist; the label is
+        computed from the canonical ``applied_steering`` strings on the
+        parent's and child's recipes (parent's may be ``None`` when it's
+        a user turn, in which case the delta is "from-nothing").
+        """
+        from saklas.core.loom_diff import steering_delta
+
+        _resolve_session_id(session, session_id)
+        parent = session.tree.get(parent_id)
+        child = session.tree.get(child_id)
+        parent_expr = parent.applied_steering
+        if parent_expr is None and parent.recipe is not None:
+            parent_expr = parent.recipe.steering
+        child_expr = child.applied_steering
+        if child_expr is None and child.recipe is not None:
+            child_expr = child.recipe.steering
+        return {"label": steering_delta(parent_expr, child_expr)}
+
+    @app.get("/saklas/v1/sessions/{session_id}/tree/filter")
+    def tree_filter(session_id: str, expr: str = ""):
+        """Apply a filter-grammar expression and return matching node ids.
+
+        Grammar in :mod:`saklas.core.tree_filter` — comma-AND'd
+        ``agg:|any:|last:<probe> <op> <threshold>`` clauses.  Empty
+        ``expr`` returns every node id (clears the filter).  Bad
+        expressions land as 400 via :class:`FilterParseError`.
+        """
+        from saklas.core.tree_filter import FilterParseError
+
+        _resolve_session_id(session, session_id)
+        text = (expr or "").strip()
+        if not text:
+            return {"expr": "", "matching_node_ids": []}
+        try:
+            matches = session.tree.filter_by_expr(text)
+        except FilterParseError as e:
+            raise HTTPException(400, str(e))
+        return {"expr": text, "matching_node_ids": sorted(matches)}
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/diff")
+    def tree_diff(session_id: str, req: TreeDiffRequest):
+        """Cross-branch diff between two assistant nodes (phase 5).
+
+        Returns a JSON view of :class:`NodeDiff` (text spans + readings
+        deltas) augmented with the parent-recipe steering delta and any
+        per-token deltas available from the session's
+        ``last_per_token_scores`` — the per-token table is only present
+        for the most-recently-generated assistant so callers shouldn't
+        rely on it.
+        """
+        from saklas.core.loom_diff import per_token_diff, steering_delta
+
+        _resolve_session_id(session, session_id)
+        diff = session.diff_nodes(req.a_id, req.b_id)
+        a_node = session.tree.get(req.a_id)
+        b_node = session.tree.get(req.b_id)
+
+        # Steering-delta against the shared parent's expression — only
+        # meaningful for sibling diffs (parent_id present).
+        parent_expr: str | None = None
+        if diff.parent_id is not None:
+            parent = session.tree.nodes.get(diff.parent_id)
+            if parent is not None:
+                parent_expr = parent.applied_steering
+                if parent_expr is None and parent.recipe is not None:
+                    parent_expr = parent.recipe.steering
+
+        a_expr = a_node.applied_steering or (
+            a_node.recipe.steering if a_node.recipe else None
+        )
+        b_expr = b_node.applied_steering or (
+            b_node.recipe.steering if b_node.recipe else None
+        )
+
+        # Per-token diff: only when both nodes carry token sequences.
+        # Tokens may be absent on serialized-only nodes (loaded transcripts).
+        a_tok_strs: list[str] = []
+        if a_node.tokens:
+            a_tok_strs = [t.get("text", "") for t in a_node.tokens]
+        b_tok_strs: list[str] = []
+        if b_node.tokens:
+            b_tok_strs = [t.get("text", "") for t in b_node.tokens]
+        per_token_spans: list[dict[str, Any]] = []
+        if a_tok_strs and b_tok_strs:
+            spans = per_token_diff(a_tok_strs, b_tok_strs)
+            for sp in spans:
+                per_token_spans.append({
+                    "a_index": sp.a_index,
+                    "b_index": sp.b_index,
+                    "a_text": sp.a_text,
+                    "b_text": sp.b_text,
+                    "aligned": sp.aligned,
+                    "reading_deltas": [
+                        {
+                            "name": rd.name,
+                            "delta": round(float(rd.delta), 6),
+                            "a_value": round(float(rd.a_value), 6),
+                            "b_value": round(float(rd.b_value), 6),
+                        }
+                        for rd in sp.reading_deltas
+                    ],
+                })
+
+        return {
+            "a_id": diff.a_id,
+            "b_id": diff.b_id,
+            "parent_id": diff.parent_id,
+            "a_text": a_node.text,
+            "b_text": b_node.text,
+            "a_applied_steering": a_expr,
+            "b_applied_steering": b_expr,
+            "parent_applied_steering": parent_expr,
+            "steering_delta": steering_delta(a_expr, b_expr),
+            "parent_to_a_delta": (
+                steering_delta(parent_expr, a_expr)
+                if parent_expr is not None or a_expr is not None
+                else ""
+            ),
+            "parent_to_b_delta": (
+                steering_delta(parent_expr, b_expr)
+                if parent_expr is not None or b_expr is not None
+                else ""
+            ),
+            "text": [
+                {"state": sp.state, "text": sp.text}
+                for sp in diff.text
+            ],
+            "readings": [
+                {
+                    "name": rd.name,
+                    "delta": round(float(rd.delta), 6),
+                    "a_value": round(float(rd.a_value), 6),
+                    "b_value": round(float(rd.b_value), 6),
+                }
+                for rd in diff.readings
+            ],
+            "per_token": per_token_spans,
+        }
+
+    @app.post("/saklas/v1/sessions/{session_id}/tree/joint_logprobs")
+    async def tree_joint_logprobs(session_id: str, req: JointLogprobsRequest):
+        """Cross-evaluation between two sibling assistant nodes.
+
+        Logit-pass Phase 5 of ``docs/plans/logit-pass.md``.  Force-replays
+        each branch under the node's stamped recipe, steering hooks, probe
+        gates, penalties, logit bias, and sampler transform, then returns
+        per-aligned-position records carrying both branches' chosen-token
+        logprobs *and* the cross-branch evaluation (what each side would
+        have given the other's chosen token at the same byte-aligned
+        position).
+
+        Cache shape:
+        * Stored on ``session._joint_logprob_cache: dict[tuple[str,
+          str], JointLogprobs]`` keyed by sorted ``(a_id, b_id)`` so
+          the symmetric pair shares an entry.
+        * Invalidated by tree edits/deletes/finalize events in
+          ``SaklasSession``; navigate/star/note leave it intact.
+
+        Held under ``acquire_session_lock`` because the forward passes
+        compete for the same model with any concurrent generation;
+        request queues FIFO at the lock rather than 409ing.
+        """
+        from saklas.core.joint_logprobs import (
+            compute_joint_logprobs,
+            _cache_key,
+            reorient_for_request,
+        )
+
+        _resolve_session_id(session, session_id)
+        if req.a_id == req.b_id:
+            raise HTTPException(400, "a_id and b_id must differ")
+        if req.a_id not in session.tree.nodes:
+            raise HTTPException(404, f"unknown node id: {req.a_id}")
+        if req.b_id not in session.tree.nodes:
+            raise HTTPException(404, f"unknown node id: {req.b_id}")
+
+        # New sessions create this cache in SaklasSession; keep the lazy
+        # fallback for older test doubles and external session shims.
+        cache_obj: Any = getattr(session, "_joint_logprob_cache", None)
+        if cache_obj is None:
+            cache_obj = {}
+            session._joint_logprob_cache = cache_obj  # type: ignore[attr-defined]
+        cache: dict[tuple[str, str], Any] = cache_obj
+
+        key = _cache_key(req.a_id, req.b_id)
+        hit = cache.get(key)
+        if hit is None:
+            async with acquire_session_lock(session):
+                # Double-check under lock — another request may have
+                # populated the cache while we waited.
+                hit = cache.get(key)
+                if hit is None:
+                    hit = await asyncio.to_thread(
+                        compute_joint_logprobs, session, req.a_id, req.b_id,
+                    )
+                    cache[key] = hit
+        return reorient_for_request(hit, req.a_id, req.b_id).to_dict()
+
     # ----- vectors -------------------------------------------------------
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors")
@@ -554,6 +1247,103 @@ def register_saklas_routes(app: FastAPI) -> None:
                 _profile_to_json(name, profile)
                 for name, profile in sorted(session.vectors.items())
             ],
+        }
+
+    @app.get("/saklas/v1/sessions/{session_id}/vectors/pairwise")
+    def pairwise_compare(session_id: str, a: str, b: str):
+        """Cross-layer cosine matrix between two named vectors / probes.
+
+        Query: ``?a=<name>&b=<name>``.  Each cell ``matrix[i][j]`` is the
+        raw cosine similarity between vector ``a``'s layer ``layers_a[i]``
+        and vector ``b``'s layer ``layers_b[j]``.  Output:
+
+            {
+              "a": "honest",
+              "b": "warm",
+              "layers_a": [0, 5, ...],
+              "layers_b": [0, 5, ...],
+              "matrix": [[1.0, 0.41, ...], [0.13, 0.92, ...], ...],
+              "model": "google/gemma-3-4b-it",
+            }
+
+        Pool unions ``session.vectors`` and ``monitor.probe_names`` (same
+        as :func:`correlation_matrix`) so probes that were never
+        registered as steering vectors still resolve.  Cosines are
+        layer-pairwise (no magnitude weighting, no Mahalanobis whitening)
+        — the matrix is the structural signal the webui pairwise-compare
+        heatmap reads, distinct from the aggregate scalar that
+        :meth:`Profile.cosine_similarity` returns.  Near-zero layer norms
+        land as ``None`` so the client can render them as empty cells.
+
+        Registered *before* ``GET /vectors/{name}`` so the literal path
+        wins the routing match — Starlette matches in registration order
+        and ``pairwise`` would otherwise be swallowed by ``{name}``.
+        """
+        from saklas import Profile
+
+        _resolve_session_id(session, session_id)
+
+        pool: dict[str, "Profile"] = dict(session.vectors)
+        try:
+            probe_profiles = session._monitor.profiles
+            for probe_name in session._monitor.probe_names:
+                if probe_name in pool:
+                    continue
+                tensors = probe_profiles.get(probe_name)
+                if tensors is None:
+                    continue
+                pool[probe_name] = Profile(tensors)
+        except Exception:
+            pass
+
+        missing = [n for n in (a, b) if n not in pool]
+        if missing:
+            raise HTTPException(404, f"names not loaded: {missing}")
+
+        prof_a, prof_b = pool[a], pool[b]
+        layers_a = sorted(prof_a.keys())
+        layers_b = sorted(prof_b.keys())
+
+        # Precompute fp32 vectors + norms so the inner loop is a single
+        # dot per cell.  ``None`` for near-zero norms — propagates to the
+        # cell so the client can render an empty / dimmed square instead
+        # of NaN or a meaningless cosine.
+        import torch as _torch
+        vecs_a: list[tuple["_torch.Tensor", float]] = []
+        for L in layers_a:
+            v = prof_a[L].float()
+            n = float(v.norm().item())
+            vecs_a.append((v, n))
+        vecs_b: list[tuple["_torch.Tensor", float]] = []
+        for L in layers_b:
+            v = prof_b[L].float()
+            n = float(v.norm().item())
+            vecs_b.append((v, n))
+
+        matrix: list[list[float | None]] = []
+        for va, na in vecs_a:
+            row: list[float | None] = []
+            for vb, nb in vecs_b:
+                if na < 1e-12 or nb < 1e-12:
+                    row.append(None)
+                    continue
+                # Different hidden dims would be a model-mismatch bug —
+                # surface as None rather than raising so a misconfigured
+                # pool still renders the cells that *do* line up.
+                if va.shape != vb.shape:
+                    row.append(None)
+                    continue
+                cos = float(_torch.dot(va, vb).item()) / (na * nb)
+                row.append(round(cos, 6))
+            matrix.append(row)
+
+        return {
+            "a": a,
+            "b": b,
+            "layers_a": layers_a,
+            "layers_b": layers_b,
+            "matrix": matrix,
+            "model": getattr(session, "model_id", None),
         }
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}")
@@ -690,6 +1480,10 @@ def register_saklas_routes(app: FastAPI) -> None:
                         canonical, profile = await asyncio.to_thread(
                             session.extract, source, req.baseline,
                             on_progress=progress_msgs.append,
+                            sae=req.sae,
+                            sae_revision=req.sae_revision,
+                            method=req.method,
+                            dls=req.dls,
                         )
                     except SaklasError as e:
                         import logging
@@ -713,6 +1507,10 @@ def register_saklas_routes(app: FastAPI) -> None:
             canonical, profile = await asyncio.to_thread(
                 session.extract, source, req.baseline,
                 on_progress=progress_msgs.append,
+                sae=req.sae,
+                sae_revision=req.sae_revision,
+                method=req.method,
+                dls=req.dls,
             )
             if req.auto_register:
                 session.steer(req.name, profile)
@@ -883,10 +1681,17 @@ def register_saklas_routes(app: FastAPI) -> None:
         # ``diagnostics`` is a Profile attribute; probe profiles are raw
         # ``dict[int, Tensor]`` and don't carry it.  ``getattr`` covers both.
         diagnostics = getattr(profile, "diagnostics", None)
+        # ``total_layers`` is the *model's* layer count, not the profile's
+        # — the layer-norms drawer in the web UI fills layers absent from
+        # the profile with zero so the user can read the DLS pattern.
+        # Using ``len(profile)`` here used to lie when DLS dropped layers
+        # (the drawer would stop at the profile's deepest layer instead
+        # of the model's true depth).
+        model_layers = int(session.model_info.get("num_layers") or len(profile))
         payload: dict[str, Any] = {
             "name": name,
             "model": session.model_id,
-            "total_layers": len(profile),
+            "total_layers": model_layers,
             "histogram": {
                 "buckets": HIST_BUCKETS,
                 "data": bucket_payload,
@@ -953,160 +1758,60 @@ def register_saklas_routes(app: FastAPI) -> None:
             readings = {k: v for k, v in readings.items() if k in requested}
         return {"readings": {k: float(v) for k, v in readings.items()}}
 
-    # ----- Sweep: alpha grid over a single prompt --------------------------
+    # ----- Experiments ------------------------------------------------------
 
-    @app.post("/saklas/v1/sessions/{session_id}/sweep")
-    async def run_sweep(session_id: str, req: SweepRequest, request: Request):
-        """SSE-streamed alpha sweep.
-
-        One result per Cartesian-product element across ``sweep[concept]``
-        alpha lists.  Held under ``acquire_session_lock`` for the full
-        sweep so concurrent endpoints queue FIFO (the sweep can be
-        long-running, the lock's 5-minute timeout still applies).
-
-        Emits ``data: {"type": "started", "sweep_id", "total"}``,
-        then ``data: {"type": "result", "idx", "alpha_values", "result"}``
-        per completion (result subset: text, finish_reason, usage,
-        applied_steering, readings means), then
-        ``data: {"type": "done", "sweep_id", "summary"}``.
-        """
+    @app.post("/saklas/v1/sessions/{session_id}/experiments/fan")
+    async def run_experiment_fan(session_id: str, req: ExperimentFanRequest):
+        """Run an alpha grid as loom siblings and return a RunSet summary."""
         _resolve_session_id(session, session_id)
 
-        # Pre-validate the sweep dict so the SSE start event reports
-        # ``total`` accurately and so a bad request fails before any
-        # gen acquires the lock.  ``generate_sweep`` would raise the
-        # same way, but the SSE caller never sees the exception cleanly.
-        if not req.sweep:
-            raise HTTPException(400, "sweep dict must be non-empty")
-        for name, alphas in req.sweep.items():
+        if not req.grid:
+            raise HTTPException(400, "grid must be non-empty")
+        for name, alphas in req.grid.items():
             if not alphas:
-                raise HTTPException(400, f"sweep['{name}'] must be non-empty")
-
-        total = 1
-        for alphas in req.sweep.values():
-            total *= len(alphas)
-        sweep_id = uuid.uuid4().hex[:8]
+                raise HTTPException(400, f"grid['{name}'] must be non-empty")
         sampling_cfg = _build_sampling(req.sampling)
 
-        # Drive ``generate_sweep`` in a worker thread; bridge per-result
-        # events to the asyncio queue this handler reads.
-        loop = asyncio.get_running_loop()
-        result_queue: asyncio.Queue[tuple[Any, Any]] = asyncio.Queue()
-        DONE = object()
-        ERROR = object()
-
-        def _emit_result(idx: int, result: Any, alpha_values: dict[str, float]) -> None:
-            # Subset the result to keep SSE payloads small; full hidden
-            # states / per-token logprobs aren't useful for a sweep
-            # consumer and can be reloaded out-of-band by replaying
-            # ``applied_steering``.
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
+            runset = await asyncio.to_thread(
+                session.generate_sweep,
+                req.prompt,
+                req.grid,
+                base_steering=req.base_steering,
+                sampling=sampling_cfg,
+                thinking=req.thinking,
+                stateless=False,
+                raw=req.raw,
+            )
+        rows = []
+        for idx, result in enumerate(runset):
             readings_summary: dict[str, float] = {}
-            try:
-                for probe_name, r in (getattr(result, "readings", {}) or {}).items():
-                    pg = getattr(r, "per_generation", None)
-                    val = pg[-1] if pg else getattr(r, "mean", 0.0)
-                    readings_summary[probe_name] = round(float(val), 6)
-            except Exception:
-                pass
-            payload = {
+            for probe_name, r in (getattr(result, "readings", {}) or {}).items():
+                pg = getattr(r, "per_generation", None)
+                val = pg[-1] if pg else getattr(r, "mean", 0.0)
+                readings_summary[probe_name] = round(float(val), 6)
+            rows.append({
                 "idx": idx,
-                "alpha_values": {k: float(v) for k, v in alpha_values.items()},
+                "alpha_values": runset.grid[idx] if idx < len(runset.grid) else {},
+                "node_id": runset.node_ids[idx] if idx < len(runset.node_ids) else None,
                 "result": {
-                    "text": getattr(result, "text", ""),
-                    "token_count": int(getattr(result, "token_count", 0)),
-                    "tok_per_sec": float(getattr(result, "tok_per_sec", 0.0)),
-                    "elapsed": float(getattr(result, "elapsed", 0.0)),
-                    "finish_reason": getattr(result, "finish_reason", "stop"),
-                    "applied_steering": getattr(result, "applied_steering", None),
+                    "text": result.text,
+                    "token_count": result.token_count,
+                    "tok_per_sec": result.tok_per_sec,
+                    "elapsed": result.elapsed,
+                    "finish_reason": result.finish_reason,
+                    "applied_steering": result.applied_steering,
                     "readings": readings_summary,
                 },
-            }
-            try:
-                loop.call_soon_threadsafe(result_queue.put_nowait, ("result", payload))
-            except Exception:
-                pass
-
-        def _worker() -> None:
-            try:
-                session.generate_sweep(
-                    req.prompt,
-                    req.sweep,
-                    base_steering=req.base_steering,
-                    sampling=sampling_cfg,
-                    thinking=req.thinking,
-                    stateless=req.stateless,
-                    raw=req.raw,
-                    on_result=_emit_result,
-                )
-                loop.call_soon_threadsafe(result_queue.put_nowait, (DONE, None))
-            except Exception as exc:
-                loop.call_soon_threadsafe(result_queue.put_nowait, (ERROR, exc))
-
-        async def event_generator():
-            async with acquire_session_lock(session) as acquired:
-                if not acquired:
-                    yield (
-                        f"data: {json.dumps({'type': 'error', 'message': 'session locked'})}"
-                        "\n\n"
-                    )
-                    return
-
-                yield (
-                    f"data: {json.dumps({'type': 'started', 'sweep_id': sweep_id, 'total': total})}"
-                    "\n\n"
-                )
-
-                fut = asyncio.get_running_loop().run_in_executor(None, _worker)
-                completed = 0
-                start = time.monotonic()
-                total_tokens = 0
-                try:
-                    while True:
-                        if await request.is_disconnected():
-                            session.stop()
-                            break
-                        try:
-                            tag, payload = await asyncio.wait_for(
-                                result_queue.get(), timeout=15.0,
-                            )
-                        except asyncio.TimeoutError:
-                            yield ": heartbeat\n\n"
-                            continue
-                        if tag == "result":
-                            completed += 1
-                            total_tokens += int(payload["result"].get("token_count", 0))
-                            yield (
-                                f"data: {json.dumps({'type': 'result', **payload})}"
-                                "\n\n"
-                            )
-                            continue
-                        if tag is DONE:
-                            elapsed = time.monotonic() - start
-                            tps = (total_tokens / elapsed) if elapsed > 0 else 0.0
-                            yield (
-                                f"data: {json.dumps({'type': 'done', 'sweep_id': sweep_id, 'summary': {'completed': completed, 'total': total, 'total_tokens': total_tokens, 'tok_per_sec': round(tps, 2), 'elapsed': round(elapsed, 3)}})}"
-                                "\n\n"
-                            )
-                            break
-                        if tag is ERROR:
-                            yield (
-                                f"data: {json.dumps({'type': 'error', 'message': str(payload)})}"
-                                "\n\n"
-                            )
-                            break
-                finally:
-                    # Wait for the worker to fully wind down so the gen
-                    # lock isn't released mid-generation.
-                    try:
-                        await fut
-                    except Exception:
-                        pass
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
+            })
+        return {
+            "kind": runset.kind,
+            "total": len(runset),
+            "node_ids": runset.node_ids,
+            "rows": rows,
+        }
 
     # ----- Live traits SSE stream ------------------------------------------
 
@@ -1248,6 +1953,103 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         reader_task = asyncio.create_task(_reader())
 
+        # Loom: subscribe to ``LoomMutated`` for the connection's
+        # lifetime and forward as ``tree_mutated`` frames.  Also tag
+        # ``begin_assistant`` events into ``node_created`` so the client
+        # can pre-allocate render slots before token frames arrive.  Held
+        # in a queue + forwarder task so the EventBus callback (which
+        # runs on the gen thread) never touches the WS directly.
+        loop = asyncio.get_running_loop()
+        tree_event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # ``websocket.send_json`` is not safe for concurrent callers —
+        # starlette serializes per-call but two tasks can interleave
+        # bytes on the wire and corrupt the frame sequence.  This lock
+        # is the single send-side serializer the connection uses; both
+        # the generate-handler and the tree-forwarder acquire it before
+        # every send.
+        ws_send_lock = asyncio.Lock()
+
+        async def _send_json(payload: Any) -> None:
+            async with ws_send_lock:
+                await websocket.send_json(payload)
+
+        def _on_loom_event(event: object) -> None:
+            if not isinstance(event, LoomMutated):
+                return
+            try:
+                tree = session.tree
+                added_nodes = [
+                    _node_json(session, nid)
+                    for nid in event.added
+                    if tree.has(nid)
+                ]
+            except Exception:
+                added_nodes = []
+            mutated_payload: dict[str, Any] = {
+                "type": "tree_mutated",
+                "op": event.op,
+                "rev": event.rev,
+                "added": added_nodes,
+                "removed": list(event.removed),
+                "updated": [
+                    _node_json(session, nid)
+                    for nid in event.updated
+                    if session.tree.has(nid)
+                ],
+                "active_node_id": event.active_node_id,
+            }
+            try:
+                loop.call_soon_threadsafe(
+                    tree_event_queue.put_nowait, mutated_payload,
+                )
+            except Exception:
+                pass
+            # ``begin_assistant`` and ``branch`` both materialize a new
+            # node — surface a separate ``node_created`` event with the
+            # parent + role so the client can allocate a render slot
+            # without waiting for the assistant text to start streaming.
+            if event.op in ("begin_assistant", "branch", "add_user"):
+                for nid in event.added:
+                    try:
+                        node = session.tree.get(nid)
+                    except Exception:
+                        continue
+                    node_payload = {
+                        "type": "node_created",
+                        "node_id": nid,
+                        "parent_id": node.parent_id,
+                        "role": node.role,
+                        "rev": event.rev,
+                    }
+                    try:
+                        loop.call_soon_threadsafe(
+                            tree_event_queue.put_nowait, node_payload,
+                        )
+                    except Exception:
+                        pass
+
+        loom_unsub = session.events.subscribe(_on_loom_event)
+
+        async def _tree_forwarder():
+            """Forward tree-mutated / node-created events as WS frames.
+
+            Runs as a dedicated task for the connection's lifetime so
+            tree mutations from any source (this WS, a REST route on a
+            different connection, the gen loop) reach the client without
+            interleaving with the per-turn token loop.
+            """
+            try:
+                while True:
+                    payload = await tree_event_queue.get()
+                    try:
+                        await _send_json(payload)
+                    except Exception:
+                        return
+            except asyncio.CancelledError:
+                return
+
+        forwarder_task = asyncio.create_task(_tree_forwarder())
+
         try:
             while True:
                 msg = await incoming.get()
@@ -1261,7 +2063,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                     try:
                         parsed = WSGenerateMessage(**msg)
                     except Exception as e:
-                        await websocket.send_json({
+                        await _send_json({
                             "type": "error",
                             "message": f"invalid generate message: {e}",
                             "code": "ValidationError",
@@ -1269,13 +2071,13 @@ def register_saklas_routes(app: FastAPI) -> None:
                         continue
                     await _ws_handle_generate(
                         websocket, session, parsed,
-                        app.state.default_steering, incoming,
+                        app.state.default_steering, incoming, _send_json,
                     )
                 elif mtype == "stop":
                     # Idle-state stop: nothing in flight.
                     continue
                 else:
-                    await websocket.send_json({
+                    await _send_json({
                         "type": "error",
                         "message": f"unknown message type: {mtype!r}",
                         "code": "UnknownMessageType",
@@ -1289,7 +2091,7 @@ def register_saklas_routes(app: FastAPI) -> None:
             return
         except Exception as e:
             try:
-                await websocket.send_json({
+                await _send_json({
                     "type": "error",
                     "message": str(e),
                     "code": type(e).__name__,
@@ -1300,6 +2102,18 @@ def register_saklas_routes(app: FastAPI) -> None:
                 except Exception:
                     pass
         finally:
+            # Drop the loom subscription before tearing down the reader
+            # so the EventBus stops dispatching into a queue nobody
+            # reads.
+            try:
+                loom_unsub()
+            except Exception:
+                pass
+            forwarder_task.cancel()
+            try:
+                await forwarder_task
+            except (asyncio.CancelledError, Exception):
+                pass
             # Reader holds the only ``receive_json()`` call on the WS.
             # Cancel + await so the cancellation propagates fully before
             # the connection tears down.
@@ -1316,30 +2130,41 @@ async def _ws_handle_generate(
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
     incoming: asyncio.Queue[Any],
+    send_json: Callable[[Any], Awaitable[None]],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
-    Concurrency design: the synchronous ``session.generate`` is run in a
-    worker thread via ``asyncio.to_thread``.  Its ``on_token`` callback
-    is invoked on the worker thread; it bridges into the asyncio loop by
-    calling ``loop.call_soon_threadsafe(queue.put_nowait, event)``.  The
-    main coroutine races two tasks: one pulls ``TokenEvent``s from a
-    local queue and forwards them as ``{type: "token", ...}`` frames;
-    the other pulls client frames from the shared ``incoming`` queue
+    Concurrency design: the synchronous ``session.generate_stream`` is
+    driven from a worker thread via ``asyncio.to_thread``.  Its
+    ``on_token`` callback is invoked on the worker thread; it bridges
+    into the asyncio loop by calling
+    ``loop.call_soon_threadsafe(queue.put_nowait, event)``.  The main
+    coroutine races two tasks: one pulls ``TokenEvent``s from a local
+    queue and forwards them as ``{type: "token", ...}`` frames; the
+    other pulls client frames from the shared ``incoming`` queue
     (populated by the connection's single reader task) so an in-flight
     ``{type: "stop"}`` can call ``session.stop()`` without blocking on
     the token loop.
 
     ``asyncio.wait(..., FIRST_COMPLETED)`` is used in a loop: whenever
-    the incoming task returns a stop frame we signal the session and keep
-    draining tokens until the worker joins; whenever the queue delivers
-    a sentinel we finish.  The WS stays open across generate turns — a
-    client can submit ``{type: "generate", ...}`` again after ``done``,
-    and the perpetual reader keeps feeding the shared queue between
-    turns so we never have two ``receive_json()`` calls in flight.
+    the incoming task returns a stop frame we signal the session and
+    keep draining tokens until the worker joins; whenever the queue
+    delivers a sentinel we finish.  The WS stays open across generate
+    turns — a client can submit ``{type: "generate", ...}`` again after
+    ``done``, and the perpetual reader keeps feeding the shared queue
+    between turns so we never have two ``receive_json()`` calls in
+    flight.
+
+    **Loom (v2.3)**: ``parent_node_id`` attaches the assistant node
+    under a specific tree node; ``n>1`` fans out N siblings serially
+    (per decision 7 in the plan — N-way gen is serial in v1).  Each
+    sibling produces its own ``started`` / token-stream / ``done``
+    triplet, all tagged with the assistant node id.  ``tree_mutated``
+    and ``node_created`` events ride the connection-level subscription
+    in ``session_stream``; this handler only emits the per-sibling
+    ``started`` / ``token`` / ``done`` frames.
     """
     loop = asyncio.get_running_loop()
-    generation_id = uuid.uuid4().hex[:12]
 
     sampling = _build_sampling(msg.sampling)
     try:
@@ -1355,7 +2180,7 @@ async def _ws_handle_generate(
         # shouldn't kill the connection — send the error frame and let
         # the client try again on the same WS.
         status, message = e.user_message()
-        await websocket.send_json({
+        await send_json({
             "type": "error",
             "message": message,
             "code": type(e).__name__,
@@ -1363,153 +2188,488 @@ async def _ws_handle_generate(
         })
         return
 
-    token_queue: asyncio.Queue[Any] = asyncio.Queue()
-    _SENTINEL = object()
+    n = msg.n if msg.n and msg.n > 0 else 1
+    if n < 1:
+        await send_json({
+            "type": "error",
+            "message": f"n must be >= 1, got {n}",
+            "code": "ValueError",
+            "status": 400,
+        })
+        return
 
-    def _on_token(
-        text: str,
-        is_thinking: bool,
-        tid: int | None,
-        lp: float | None,
-        top: list[tuple[str, float]] | None,
-        perplexity: float | None = None,
-    ) -> None:
-        event: dict[str, Any] = {
-            "type": "token",
-            "text": text,
-            "thinking": bool(is_thinking),
-            "token_id": int(tid) if tid is not None else None,
-        }
-        # Per-layer × per-probe heatmap data for the inspector panel.
-        # Computed inline only when probes are loaded (covers the cost
-        # of N matmul + N CPU syncs against the latest captured hidden
-        # state).  Falls through silently when no capture exists yet
-        # (e.g. extremely short generations where the hook never fires).
-        try:
-            monitor = session._monitor
-            if monitor.probe_names:
-                latest_hidden = {
-                    layer_idx: bucket[-1]
-                    for layer_idx, bucket in session._capture._per_layer.items()
-                    if bucket
-                }
-                if latest_hidden:
-                    per_layer = monitor.score_single_token_per_layer(latest_hidden)
-                    if per_layer:
-                        event["per_layer_scores"] = {
-                            str(layer): {p: round(float(v), 6) for p, v in metrics.items()}
-                            for layer, metrics in per_layer.items()
-                        }
-        except Exception:
-            # Inspector data is best-effort — never let a failure here
-            # break the streaming token path.
-            pass
-        loop.call_soon_threadsafe(token_queue.put_nowait, event)
+    parent_node_id = msg.parent_node_id
 
-    result_holder: list[GenerationResult] = []
-    error_holder: list[BaseException] = []
+    # Logit fork: when ``fork_node_id`` is set the worker calls
+    # ``session.fork_from_token`` instead of ``session.generate``.  All
+    # three fork fields must be present together.
+    is_fork = msg.fork_node_id is not None
+    if is_fork and (msg.fork_raw_index is None or msg.fork_alt_token_id is None):
+        await send_json({
+            "type": "error",
+            "message": (
+                "fork requires fork_node_id, fork_raw_index, and "
+                "fork_alt_token_id together"
+            ),
+            "code": "ValueError",
+            "status": 400,
+        })
+        return
 
-    def _worker():
-        try:
-            result = session.generate(
-                msg.input,
-                steering=steering,
-                sampling=sampling,
-                stateless=msg.stateless,
-                raw=msg.raw,
-                thinking=msg.thinking,
-                on_token=_on_token,
-            )
-            result_holder.append(result)
-        except BaseException as e:
-            error_holder.append(e)
-        finally:
-            loop.call_soon_threadsafe(token_queue.put_nowait, _SENTINEL)
+    # Answer-prefill: when ``prefill_node_id`` is set the worker calls
+    # ``session.prefill_assistant`` instead of ``session.generate``.  It
+    # needs ``prefill_text`` alongside it, and can't co-exist with a fork.
+    is_prefill = msg.prefill_node_id is not None
+    if is_prefill and (msg.prefill_text is None or msg.prefill_text == ""):
+        await send_json({
+            "type": "error",
+            "message": "prefill requires prefill_node_id and prefill_text together",
+            "code": "ValueError",
+            "status": 400,
+        })
+        return
+    if is_prefill and is_fork:
+        await send_json({
+            "type": "error",
+            "message": "a generate message cannot be both a fork and a prefill",
+            "code": "ValueError",
+            "status": 400,
+        })
+        return
 
-    # Acquire the session lock for the full generation lifetime so
-    # concurrent WS clients serialize FIFO instead of overlapping.
-    async with session.lock:
-        await websocket.send_json({"type": "started", "generation_id": generation_id})
-
-        worker_task = asyncio.create_task(asyncio.to_thread(_worker))
-
-        # Race two queue reads — token frames from the worker and client
-        # frames from the connection's perpetual reader.  Neither side
-        # ever calls ``websocket.receive_json()`` directly, so the
-        # underlying ``recv_in_progress`` flag is owned by the reader
-        # task alone for the connection's lifetime.
-        done = False
-        try:
-            while not done:
-                token_get = asyncio.create_task(token_queue.get())
-                client_get = asyncio.create_task(incoming.get())
-                finished, _pending = await asyncio.wait(
-                    {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
-                )
-                if client_get in finished:
-                    incoming_msg = client_get.result()
-                    # ``_DISCONNECT`` / reader-error sentinels: signal
-                    # the worker to wind down; let the outer loop
-                    # propagate the disconnect on the next iteration.
-                    if isinstance(incoming_msg, dict):
-                        if incoming_msg.get("type") == "stop":
-                            try:
-                                session.stop()
-                            except Exception:
-                                pass
-                        elif "_reader_error" in incoming_msg:
-                            try:
-                                session.stop()
-                            except Exception:
-                                pass
-                            # Re-enqueue so the outer dispatch loop
-                            # surfaces the error after we wind down.
-                            await incoming.put(incoming_msg)
-                        else:
-                            # Out-of-band frame during a generation —
-                            # re-enqueue so the outer loop sees it after
-                            # this turn finishes.  Most likely an early
-                            # ``{type: "generate"}`` from a client that
-                            # didn't wait for ``done``.
-                            await incoming.put(incoming_msg)
-                    else:
-                        # Disconnect sentinel from the reader.
-                        try:
-                            session.stop()
-                        except Exception:
-                            pass
-                        await incoming.put(incoming_msg)
-                else:
-                    client_get.cancel()
-                if token_get in finished:
-                    item = token_get.result()
-                    if item is _SENTINEL:
-                        done = True
-                    else:
-                        await websocket.send_json(item)
-                else:
-                    token_get.cancel()
-        finally:
-            # Drain any residual events the worker pushed between sentinel
-            # and join — should be none because the sentinel is last, but
-            # cheap insurance.
-            await worker_task
-
-        if error_holder and not result_holder:
-            exc = error_holder[0]
-            await websocket.send_json({
+    # Commit (Ctrl+Enter on either surface): land a turn under
+    # ``parent_node_id`` without running a decode.  Short-circuits the
+    # n-way fan-out / streaming worker entirely — one mutation, one
+    # ``done`` event, no token frames.  Mutually exclusive with prefill
+    # and fork (rejected above by symmetry).
+    is_commit = msg.commit_role is not None
+    if is_commit:
+        if msg.commit_text is None or msg.commit_text == "":
+            await send_json({
                 "type": "error",
-                "message": str(exc),
-                "code": type(exc).__name__,
+                "message": "commit requires commit_role and commit_text together",
+                "code": "ValueError",
+                "status": 400,
+            })
+            return
+        if msg.commit_role not in ("user", "assistant"):
+            await send_json({
+                "type": "error",
+                "message": (
+                    f"commit_role must be 'user' or 'assistant', "
+                    f"got {msg.commit_role!r}"
+                ),
+                "code": "ValueError",
+                "status": 400,
+            })
+            return
+        if is_fork or is_prefill:
+            await send_json({
+                "type": "error",
+                "message": (
+                    "a generate message cannot mix commit with fork or prefill"
+                ),
+                "code": "ValueError",
+                "status": 400,
+            })
+            return
+        if msg.commit_role == "assistant" and parent_node_id is None:
+            await send_json({
+                "type": "error",
+                "message": (
+                    "commit_role='assistant' requires parent_node_id "
+                    "(the user node the authored turn hangs off)"
+                ),
+                "code": "ValueError",
+                "status": 400,
             })
             return
 
-        result = result_holder[0] if result_holder else None
-        result_json = _result_to_json(result)
-        if result is not None:
-            result_json["per_token_probes"] = _per_token_probes(
-                session, getattr(result, "token_count", 0) or 0,
-            )
-        else:
-            result_json["per_token_probes"] = []
-        await websocket.send_json({"type": "done", "result": result_json})
+        generation_id = uuid.uuid4().hex[:12]
+        commit_text = str(msg.commit_text)
+        await send_json({
+            "type": "started",
+            "generation_id": generation_id,
+            "node_id": None,
+            "sibling_index": 0,
+            "sibling_count": 1,
+        })
+        async with session.lock:
+            try:
+                if msg.commit_role == "user":
+                    new_id = await asyncio.to_thread(
+                        session.append_user_turn,
+                        parent_node_id,
+                        commit_text,
+                    )
+                else:
+                    # ``parent_node_id`` is non-None here (validated above
+                    # for the assistant role); narrow for the type-checker.
+                    assert parent_node_id is not None
+                    new_id = await asyncio.to_thread(
+                        session.append_assistant_turn,
+                        parent_node_id,
+                        commit_text,
+                    )
+            except SaklasError as e:
+                status, message = e.user_message()
+                await send_json({
+                    "type": "error",
+                    "message": message,
+                    "code": type(e).__name__,
+                    "status": status,
+                    "node_id": None,
+                    "sibling_index": 0,
+                })
+                return
+        await send_json({
+            "type": "done",
+            "result": {
+                "kind": "commit",
+                "role": msg.commit_role,
+                "text": commit_text,
+                "node_id": new_id,
+                "finish_reason": "stop",
+                "per_token_probes": [],
+                "mean_logprob": None,
+                "mean_surprise": None,
+            },
+            "node_id": new_id,
+            "sibling_index": 0,
+            "sibling_count": 1,
+        })
+        return
+
+    # Per-sibling seed schedule: when n>1, derive deterministic per-
+    # sibling seeds from the request seed (or fresh entropy).  Single
+    # streams (n=1) use the user's seed verbatim.
+    from saklas.core.loom import derive_seed_schedule
+    base_seed = sampling.seed if sampling is not None else None
+    seeds: list[int | None]
+    if n == 1:
+        seeds = [base_seed]
+    else:
+        seeds = list(derive_seed_schedule(base_seed, n))  # type: ignore[arg-type]
+
+    # Acquire the session lock for the full N-way batch lifetime so
+    # concurrent WS clients serialize FIFO instead of overlapping.
+    # ``session.generate_stream`` itself uses the threading ``_gen_lock``
+    # to gate the actual generation, but the async-level lock is what
+    # queues HTTP/WS endpoints fairly.
+    async with session.lock:
+        for sibling_idx, seed_i in enumerate(seeds):
+            generation_id = uuid.uuid4().hex[:12]
+
+            # Per-sibling sampling override carrying the derived seed.
+            if n == 1 and seed_i is None:
+                per_sibling_sampling = sampling
+            else:
+                from dataclasses import replace as _dc_replace
+                base_sc = sampling if sampling is not None else SamplingConfig()
+                per_sibling_sampling = _dc_replace(base_sc, seed=seed_i)
+
+            token_queue: asyncio.Queue[Any] = asyncio.Queue()
+            _SENTINEL = object()
+            # The tree assigns the assistant node id at ``begin_assistant``
+            # time inside ``_generate_core``; we don't know it before the
+            # gen starts.  The on_token callback reads the live active
+            # node off the tree (which is set to the streaming assistant
+            # node for the lifetime of the gen).
+            current_node_holder: list[str | None] = [None]
+
+            def _on_token(
+                text: str,
+                is_thinking: bool,
+                tid: int | None,
+                lp: float | None,
+                top_alts: list[Any] | None,
+                perplexity: float | None = None,
+                _node_holder: list[str | None] = current_node_holder,
+            ) -> None:
+                # Resolve the streaming assistant node id once per token;
+                # cheap (one attribute read) and avoids racing the tree
+                # mutation that adds the assistant node before the first
+                # token fires.
+                node_id = _node_holder[0]
+                if node_id is None:
+                    try:
+                        candidate = session.tree.active_node_id
+                        # Defensive coerce: tests may pass a Mock-shaped
+                        # ``session`` whose ``tree.active_node_id`` is
+                        # not a string.  Treat anything non-string as
+                        # "no node" so the JSON encoder doesn't choke.
+                        if isinstance(candidate, str):
+                            node_id = candidate
+                            _node_holder[0] = candidate
+                    except Exception:
+                        node_id = None
+                event: dict[str, Any] = {
+                    "type": "token",
+                    "text": text,
+                    "thinking": bool(is_thinking),
+                    "token_id": int(tid) if tid is not None else None,
+                    "node_id": node_id,
+                }
+                # Phase 1 logit pass: surface chosen-token logprob + top-K
+                # alternatives on the wire so webui drilldown / inline
+                # surprise / NodeCompare can render distributional info
+                # without a second fetch. Both fields are None when the
+                # engine didn't capture them (no on_token consumer + no
+                # logprobs / return_top_k request); subscribers ``?? null``-
+                # guard so legacy / unconfigured streams pass through
+                # cleanly. ``top_alts`` items are TokenAlt dataclasses;
+                # serialize each to ``{id, text, logprob}`` for JSON.
+                if lp is not None:
+                    event["logprob"] = float(lp)
+                if top_alts:
+                    event["top_alts"] = [
+                        {"id": int(a.id), "text": a.text, "logprob": float(a.logprob)}
+                        for a in top_alts
+                    ]
+                # Raw decode-step index of this emitted token — the join
+                # key a logit fork slices ``raw_token_ids`` on.  Read off
+                # ``emit_map`` (appended immediately before this callback
+                # fires).  Best-effort: a mocked session has no gen state.
+                try:
+                    emap = session._gen_state.emit_map
+                    if emap:
+                        event["raw_index"] = int(emap[-1][0])
+                except Exception:
+                    pass
+                # Inline probe scores for the live inspector + chat
+                # highlight.  ``scores`` is the magnitude-weighted aggregate
+                # per probe — the webui tints tokens with this so live
+                # highlighting matches the post-generation pass.
+                # ``per_layer_scores`` is the per-layer heatmap the token
+                # drilldown drawer needs.
+                #
+                # Both are computed and persisted onto the loom row by
+                # ``session._token_tap`` (engine-side) before this WS
+                # callback fires; we read them back off the row rather
+                # than recomputing.  Single source of truth: the persisted
+                # row is what a webui refresh rehydrates from, so the live
+                # stream and the rehydrated tree match by construction.
+                try:
+                    node = (
+                        session.tree.nodes.get(node_id) if node_id else None
+                    )
+                    rows = (
+                        node.thinking_tokens if is_thinking else node.tokens
+                    ) if node is not None else None
+                    last = rows[-1] if rows else None
+                    if last is not None:
+                        probes_blob = last.get("probes")
+                        if probes_blob:
+                            event["scores"] = probes_blob
+                        per_layer_blob = last.get("per_layer_scores")
+                        if per_layer_blob:
+                            event["per_layer_scores"] = per_layer_blob
+                except Exception:
+                    # Inspector data is best-effort — never let a failure
+                    # here break the streaming token path.
+                    pass
+                loop.call_soon_threadsafe(token_queue.put_nowait, event)
+
+            result_holder: list[GenerationResult | RunSet] = []
+            error_holder: list[BaseException] = []
+
+            # Recipe-override (phase 5): accept either a mode string or a
+            # partial-recipe expression.  We pass it through ``generate``
+            # so the engine resolves the overlay against the parent's
+            # recipe; ``session.regen_with_modifier`` is the matching
+            # higher-level wrapper but the WS path already has the
+            # required context.
+            recipe_override = msg.recipe_override
+
+            def _worker(
+                _sampling=per_sibling_sampling,
+                _on_token=_on_token,
+                _result_holder=result_holder,
+                _error_holder=error_holder,
+                _token_queue=token_queue,
+                _sentinel=_SENTINEL,
+                _recipe_override=recipe_override,
+            ):
+                try:
+                    if msg.fork_node_id is not None:
+                        # Fork: recipe / sampling / parent all come from
+                        # the source node inside ``fork_from_token``; the
+                        # WS-level steering/sampling/n fields are ignored.
+                        result = session.fork_from_token(
+                            msg.fork_node_id,
+                            int(msg.fork_raw_index),  # type: ignore[arg-type]
+                            int(msg.fork_alt_token_id),  # type: ignore[arg-type]
+                            on_token=_on_token,
+                        )
+                    elif msg.prefill_node_id is not None:
+                        # Prefill: anchor / parent come from the user node
+                        # inside ``prefill_assistant``; ``input`` is
+                        # ignored.  ``steering`` / ``sampling`` ride through
+                        # like a normal generate; ``thinking`` is forced
+                        # off (the prefill is an answer, not a thought).
+                        result = session.prefill_assistant(
+                            msg.prefill_node_id,
+                            str(msg.prefill_text),
+                            steering=steering,
+                            sampling=_sampling,
+                            on_token=_on_token,
+                        )
+                    else:
+                        gen_kwargs: dict[str, Any] = dict(
+                            steering=steering,
+                            sampling=_sampling,
+                            stateless=msg.stateless,
+                            raw=msg.raw,
+                            thinking=msg.thinking,
+                            on_token=_on_token,
+                            parent_node_id=parent_node_id,
+                        )
+                        if _recipe_override is not None:
+                            gen_kwargs["recipe_override"] = _recipe_override
+                        result = session.generate(msg.input, **gen_kwargs)
+                    _result_holder.append(result)
+                except BaseException as e:
+                    _error_holder.append(e)
+                finally:
+                    loop.call_soon_threadsafe(_token_queue.put_nowait, _sentinel)
+
+            await send_json({
+                "type": "started",
+                "generation_id": generation_id,
+                # ``node_id`` is filled in lazily by the first token
+                # event (the assistant node is created inside
+                # ``_generate_core``); ``started`` includes the request-
+                # level context the client needs to allocate state.
+                "node_id": None,
+                "sibling_index": sibling_idx,
+                "sibling_count": n,
+            })
+
+            worker_task = asyncio.create_task(asyncio.to_thread(_worker))
+
+            # Race two queue reads — token frames from the worker and
+            # client frames from the connection's perpetual reader.
+            # Neither side ever calls ``websocket.receive_json()``
+            # directly, so the underlying ``recv_in_progress`` flag is
+            # owned by the reader task alone for the connection's
+            # lifetime.
+            done = False
+            stop_signaled = False
+            try:
+                while not done:
+                    token_get = asyncio.create_task(token_queue.get())
+                    client_get = asyncio.create_task(incoming.get())
+                    finished, _pending = await asyncio.wait(
+                        {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if client_get in finished:
+                        incoming_msg = client_get.result()
+                        # ``_DISCONNECT`` / reader-error sentinels:
+                        # signal the worker to wind down; let the outer
+                        # loop propagate the disconnect on the next
+                        # iteration.
+                        if isinstance(incoming_msg, dict):
+                            if incoming_msg.get("type") == "stop":
+                                try:
+                                    session.stop()
+                                except Exception:
+                                    pass
+                                stop_signaled = True
+                            elif "_reader_error" in incoming_msg:
+                                try:
+                                    session.stop()
+                                except Exception:
+                                    pass
+                                stop_signaled = True
+                                # Re-enqueue so the outer dispatch loop
+                                # surfaces the error after we wind down.
+                                await incoming.put(incoming_msg)
+                            else:
+                                # Out-of-band frame during a generation —
+                                # re-enqueue so the outer loop sees it
+                                # after this turn finishes.  Most likely
+                                # an early ``{type: "generate"}`` from a
+                                # client that didn't wait for ``done``.
+                                await incoming.put(incoming_msg)
+                        else:
+                            # Disconnect sentinel from the reader.
+                            try:
+                                session.stop()
+                            except Exception:
+                                pass
+                            stop_signaled = True
+                            await incoming.put(incoming_msg)
+                    else:
+                        client_get.cancel()
+                    if token_get in finished:
+                        item = token_get.result()
+                        if item is _SENTINEL:
+                            done = True
+                        else:
+                            await send_json(item)
+                    else:
+                        token_get.cancel()
+            finally:
+                # Drain any residual events the worker pushed between
+                # sentinel and join — should be none because the
+                # sentinel is last, but cheap insurance.
+                await worker_task
+
+            if error_holder and not result_holder:
+                exc = error_holder[0]
+                await send_json({
+                    "type": "error",
+                    "message": str(exc),
+                    "code": type(exc).__name__,
+                    "node_id": current_node_holder[0],
+                    "sibling_index": sibling_idx,
+                })
+                # On error inside a sibling, abort the remaining fan-out
+                # rather than continuing with stale state.
+                return
+
+            result = result_holder[0] if result_holder else None
+            result_json = _result_to_json(result)
+            if result is not None:
+                result_json["per_token_probes"] = _per_token_probes(
+                    session, getattr(result, "token_count", 0) or 0,
+                )
+            else:
+                result_json["per_token_probes"] = []
+            # Phase 1 logit pass: stamp the per-turn logprob rollup on the
+            # ``done`` event so subscribers (loom sidebar's sort-by-surprise,
+            # webui chat-header summary) don't need to re-fetch the node.
+            # Source of truth is the finalized loom node, populated by
+            # :meth:`LoomTree.finalize_assistant` upstream of this branch.
+            # Stateless gens / pre-logit-pass replays land with ``None``
+            # which the wire layer passes through transparently.
+            mean_logprob_out: float | None = None
+            mean_surprise_out: float | None = None
+            finalized_node_id = current_node_holder[0]
+            if finalized_node_id is not None:
+                try:
+                    node = session.tree.nodes.get(finalized_node_id)
+                    if node is not None:
+                        mean_logprob_out = node.mean_logprob
+                        mean_surprise_out = node.mean_surprise
+                except Exception:
+                    # Defensive: tree access during shutdown / mocked
+                    # session edge cases. Default-None values keep the
+                    # wire payload well-formed.
+                    pass
+            result_json["mean_logprob"] = mean_logprob_out
+            result_json["mean_surprise"] = mean_surprise_out
+            await send_json({
+                "type": "done",
+                "result": result_json,
+                "node_id": current_node_holder[0],
+                "sibling_index": sibling_idx,
+                "sibling_count": n,
+            })
+
+            # Mid-batch stop honors the plan's decision (#7 / phase 1
+            # spec): "stop_requested cancels the currently-streaming
+            # sibling. Remaining queued siblings are skipped, not
+            # started."
+            if stop_signaled:
+                break

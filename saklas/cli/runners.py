@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
-from saklas.cli.parsers import _PACK_VERBS, _VECTOR_VERBS
+from saklas.cli.parsers import _EXPERIMENT_VERBS, _PACK_VERBS, _VECTOR_VERBS
 from saklas.core.errors import SaklasError
 
 if TYPE_CHECKING:
@@ -114,6 +114,11 @@ def _make_session(args: argparse.Namespace):
     # came from.
     compile_enabled = not bool(getattr(args, "no_compile", False))
     cuda_graphs_enabled = not bool(getattr(args, "no_cuda_graphs", False))
+    # Phase 1 logit pass: session-level default for top-K alternatives
+    # capture.  Per-call ``SamplingConfig.return_top_k > 0`` overrides;
+    # K=0 inherits this value through ``_generate_core``.  argparse
+    # default ``None`` falls back to 0 here (no alts).
+    return_top_k = getattr(args, "top_k_alts", None) or 0
     return SaklasSession.from_pretrained(
         args.model, device=args.device, quantize=args.quantize,
         probes=probe_categories,
@@ -126,6 +131,7 @@ def _make_session(args: argparse.Namespace):
         dls=dls,
         compile=compile_enabled,
         cuda_graphs=cuda_graphs_enabled,
+        return_top_k=return_top_k,
     )
 
 
@@ -201,6 +207,13 @@ def _load_effective_config(args: argparse.Namespace):
         and not bool(getattr(args, "no_cuda_graphs", False))
     ):
         args.no_cuda_graphs = True
+    # Phase 1 logit pass: YAML ``return_top_k:`` wins when CLI
+    # ``--top-k-alts`` is unset, matching the rest of the v2.1 stack.
+    if (
+        composed.return_top_k is not None
+        and getattr(args, "top_k_alts", None) is None
+    ):
+        args.top_k_alts = composed.return_top_k
     ensure_vectors_installed(composed, strict=getattr(args, "strict", False))
     return composed
 
@@ -319,9 +332,11 @@ def _run_serve(args: argparse.Namespace) -> None:
         import fastapi  # noqa: F401
         import uvicorn
     except ImportError:
+        # fastapi + uvicorn are base dependencies since v3.x; this only
+        # fires when they've been uninstalled out from under saklas.
         print(
             "Server dependencies not installed. Run:\n"
-            "  pip install saklas[serve]",
+            "  pip install --upgrade saklas",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1433,10 +1448,186 @@ def _run_vector(args: argparse.Namespace) -> None:
     runner(args)
 
 
+@_saklas_error_exit
+def _run_experiment(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas experiment <verb>``."""
+    cmd = getattr(args, "experiment_cmd", None)
+    if cmd is None:
+        print("usage: saklas experiment <verb> [...]")
+        print()
+        width = max(len(v) for v, _ in _EXPERIMENT_VERBS)
+        for v, desc in _EXPERIMENT_VERBS:
+            print(f"  {v:<{width}}  {desc}")
+        sys.exit(0)
+    if cmd == "fan":
+        _run_experiment_fan(args)
+        return
+    if cmd == "transcript":
+        _run_experiment_transcript(args)
+        return
+    print(f"unknown experiment verb {cmd!r}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _run_experiment_transcript(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas experiment transcript <verb>``."""
+    cmd = getattr(args, "transcript_cmd", None)
+    if cmd is None:
+        print("usage: saklas experiment transcript <verb> [...]")
+        print()
+        print("  run  Replay a transcript on the current session")
+        sys.exit(0)
+    if cmd == "run":
+        _run_transcript_run(args)
+        return
+    print(f"unknown experiment transcript verb {cmd!r}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _parse_grid_terms(raw_terms: list[str]) -> dict[str, list[float]]:
+    from saklas.tui.loom_helpers import AlphaListError, parse_alpha_list
+
+    grid: dict[str, list[float]] = {}
+    for raw in raw_terms:
+        if "=" not in raw:
+            print(
+                f"experiment fan: grid term must be CONCEPT=ALPHAS, got {raw!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        name, alpha_text = raw.split("=", 1)
+        name = name.strip()
+        if not name:
+            print("experiment fan: grid concept cannot be empty", file=sys.stderr)
+            sys.exit(2)
+        try:
+            alphas = parse_alpha_list(alpha_text)
+        except AlphaListError as e:
+            print(f"experiment fan: {name}: {e}", file=sys.stderr)
+            sys.exit(2)
+        if not alphas:
+            print(f"experiment fan: {name}: alpha list is empty", file=sys.stderr)
+            sys.exit(2)
+        grid[name] = [float(a) for a in alphas]
+    return grid
+
+
+def _run_experiment_fan(args: argparse.Namespace) -> None:
+    import json as _json
+
+    _load_effective_config(args)
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    grid = _parse_grid_terms(args.grid)
+    runset = session.generate_sweep(
+        args.prompt,
+        grid,
+        base_steering=args.base_steering,
+        stateless=False,
+    )
+    if args.json_output:
+        print(_json.dumps(runset.to_dict(), indent=2))
+        return
+    print(f"experiment fan: {len(runset)} run(s)")
+    for idx, result in enumerate(runset):
+        node_id = runset.node_ids[idx] if idx < len(runset.node_ids) else None
+        row = runset.grid[idx] if idx < len(runset.grid) else {}
+        row_str = ", ".join(f"{k}={v:+.3f}" for k, v in row.items())
+        node_str = f" node={node_id[:8]}" if node_id else ""
+        print(
+            f"{idx:>3}: {row_str}{node_str} "
+            f"tokens={result.token_count} finish={result.finish_reason}"
+        )
+
+
+def _run_transcript_run(args: argparse.Namespace) -> None:
+    from saklas.core.transcript import (
+        Transcript, TranscriptError,
+    )
+
+    transcript_path = Path(args.path)
+    if not transcript_path.is_file():
+        print(f"transcript run: {transcript_path}: file not found", file=sys.stderr)
+        sys.exit(2)
+    try:
+        transcript = Transcript.load(transcript_path)
+    except TranscriptError as e:
+        print(f"transcript run: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    _load_effective_config(args)
+    if not args.model:
+        if transcript.model_id:
+            args.model = transcript.model_id
+        else:
+            print(
+                "transcript run: model required (pass <model> or include "
+                "`model_id` in the transcript)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    # Import via ``default`` so the transcript lands as a fresh branch
+    # under the synthetic root; replay walks the imported branch and
+    # reports drift inline.
+    try:
+        leaf_id = transcript.import_into(
+            session, mode="default", strict=args.strict,
+        )
+    except TranscriptError as e:
+        print(f"transcript run: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"transcript: {len(transcript.turns)} turns loaded "
+          f"(leaf: {leaf_id[:8]})")
+    print()
+    for idx, turn in enumerate(transcript.turns):
+        if turn.role != "user":
+            continue
+        print(f"--- replay turn {idx} ---")
+        print(f"user: {turn.text[:80]}")
+        # Look ahead for the assistant turn this user prompt produced.
+        expected = None
+        if idx + 1 < len(transcript.turns) and transcript.turns[idx + 1].role == "assistant":
+            expected = transcript.turns[idx + 1]
+        try:
+            recipe = expected.recipe if expected is not None else None
+            steering = recipe.steering if recipe is not None else None
+            sampling = recipe.sampling if recipe is not None else None
+            result = session.generate(
+                turn.text,
+                steering=steering,
+                sampling=sampling,
+                stateless=True,
+            )
+        except Exception as e:
+            print(f"  replay failed: {e}")
+            continue
+        print(f"assistant: {result.text[:120]}")
+        if expected is not None and expected.readings:
+            actual = {n: r.mean for n, r in result.readings.items()}
+            deltas = []
+            for name, expected_v in expected.readings.items():
+                actual_v = actual.get(name, 0.0)
+                deltas.append((name, actual_v - expected_v, expected_v, actual_v))
+            deltas.sort(key=lambda x: abs(x[1]), reverse=True)
+            print("  readings drift (top 5):")
+            for name, d, ev, av in deltas[:5]:
+                print(f"    {name:<32}  Δ {d:+.4f}  (expected {ev:+.4f} → got {av:+.4f})")
+        print()
+
+
 _COMMAND_RUNNERS = {
-    "tui":    _run_tui,
-    "serve":  _run_serve,
-    "pack":   _run_pack,
-    "vector": _run_vector,
-    "config": _run_config,
+    "tui":        _run_tui,
+    "serve":      _run_serve,
+    "pack":       _run_pack,
+    "vector":     _run_vector,
+    "config":     _run_config,
+    "experiment": _run_experiment,
 }

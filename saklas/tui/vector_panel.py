@@ -25,6 +25,10 @@ class LeftPanel(Widget):
         self._top_p: float = 0.9
         self._max_tokens: int = 1024
         self._system_prompt: str | None = None
+        # Current per-token highlight mode: "off" / "surprise" / a probe
+        # name. Surfaced as the persistent HL line in the GENERATION
+        # block so the Ctrl+Y cycle has an always-visible readout.
+        self._highlight_mode: str = "off"
 
     def on_mount(self) -> None:
         self._vectors_header = self.query_one("#vectors-header", Static)
@@ -53,7 +57,7 @@ class LeftPanel(Widget):
                       id="vectors-header", classes="section-header")
         yield VerticalScroll(Static("", id="vector-content"), id="vector-scroll")
         yield Static(
-            "[dim]⌫ remove · ↩ toggle · ←/→ alpha[/]",
+            "[dim]⌫ remove · ⏎ toggle · ←/→ alpha · ⇧←/→ coarse[/]",
             id="vector-hints",
         )
         # Generation section
@@ -64,6 +68,9 @@ class LeftPanel(Widget):
         yield Static(
             "[dim]⇥ focus panels · ⎋ stop gen\n"
             "⌃R regen · ⌃A A/B · ⌃T think\n"
+            "⌃Y highlight · ⌃L loom\n"
+            "⌃B branch · ⌃N nav · ⌃D delete\n"
+            "/fan grid · /diff compare · /prune filter\n"
             "⌃Q quit\n"
             "── ⇥ to side panel first ──\n"
             "↑/↓ navigate\n"
@@ -88,6 +95,15 @@ class LeftPanel(Widget):
         self._system_prompt = system_prompt
         self._thinking = thinking
         self._render_gen_config()
+
+    def update_highlight(self, mode: str) -> None:
+        """Set the highlight-mode readout and re-render the GENERATION
+        block.  ``mode`` is ``"off"`` / ``"surprise"`` / a probe name.
+        Guarded against pre-mount calls — ``_gen_config_widget`` only
+        exists after ``on_mount``."""
+        self._highlight_mode = mode
+        if hasattr(self, "_gen_config_widget"):
+            self._render_gen_config()
 
     def select_next(self) -> None:
         if self._vectors:
@@ -188,6 +204,18 @@ class LeftPanel(Widget):
         lines.append(
             f"Sys   [dim]{sys_str}[/]{_pad(sys_prefix, '/sys')}[dim]/sys[/]"
         )
+
+        # HL: current per-token highlight mode (Ctrl+Y cycles it). Probe
+        # names can run long (e.g. high_context.low_context) — truncate
+        # to the same 15-char budget as the Sys prompt preview.
+        hl = self._highlight_mode
+        hl_str = hl[:15] + "..." if len(hl) > 15 else hl
+        hl_prefix = f"HL    {hl_str}"
+        hl_body = f"[dim]{hl_str}[/]" if hl == "off" else hl_str
+        lines.append(
+            f"HL    {hl_body}{_pad(hl_prefix, '⌃Y')}[dim]⌃Y[/]"
+        )
+
         lines.append("[dim]type /help for commands[/]")
 
         gen.update("\n".join(lines))

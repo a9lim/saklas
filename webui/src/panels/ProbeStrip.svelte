@@ -1,21 +1,16 @@
 <script lang="ts">
-  // One row in the probe rack — selection indicator + name + sparkline +
-  // value bar + value + ✕, with a horizontal per-layer reading strip
-  // rendered directly beneath.  The row body is the click target for
-  // toggling the highlight selection: click anywhere on the row to
-  // select this probe as the chat-token highlight; click the same row
-  // again to deselect (highlight off).  ✕ stops propagation so removal
-  // doesn't accidentally toggle selection on the way out.
+  // One row in the probe rack — visual shape mirrors VectorStrip so the
+  // two racks read as one family: ``[●] [neg-pole | bar | pos-pole] [val]
+  // [sparkline] [✕]``.  The bipolar bar fills outward from a center tick
+  // — same axis direction the steering slider uses, so a probe reading
+  // "more happy" and a steering term pushing toward happy point the same
+  // way on screen.  The whole row body is the click target for toggling
+  // the highlight selection.  A per-layer heatmap renders directly
+  // beneath; that stays a webui-only addition (TUI exposes it via /why).
   //
-  // Visual frame matches VectorStrip: flex layout, 32px min-height,
-  // 0.85em font, 0.25em padding, 0.4em gap.  Same "● / ○" glyph as the
-  // vector's enable button, recoloured to the highlight-blue accent so
-  // a glance distinguishes "this term is steering" (green) from "this
-  // probe is the highlight" (blue).
-  //
-  // Mirrors saklas/tui/trait_panel.py for the row visual rhythm; the
-  // layer strip is a webui-only addition (the TUI's per-layer view
-  // lives in `/why`).
+  // Selection ●/○ glyph reuses the highlight-blue accent so a glance
+  // distinguishes "this term is steering" (green) from "this probe is
+  // the highlight" (blue).
 
   import Bar from "../lib/charts/Bar.svelte";
   import Sparkline from "../lib/charts/Sparkline.svelte";
@@ -26,6 +21,7 @@
     probeRack,
     setHighlightTarget,
   } from "../lib/stores.svelte";
+  import { polesOf } from "../lib/concepts";
 
   interface Props {
     name: string;
@@ -39,6 +35,11 @@
   const current = $derived(entry?.current ?? 0);
   const sparkline = $derived(entry?.sparkline ?? []);
   const isHighlight = $derived(highlightState.target === name);
+
+  // Bipolar / monopolar axis — same grammar VectorStrip reads.  A
+  // monopolar probe collapses to a single positive pole on the right.
+  const poles = $derived(polesOf(name));
+  const monopolar = $derived(poles.negative === null);
 
   // Layer keys sorted ascending (numeric).  The wire shape is zero-
   // padded ints keyed as strings; Number() coerces cleanly for any
@@ -99,20 +100,31 @@
     <span
       class="select-glyph"
       aria-hidden="true"
-      title={isHighlight ? "Selected — click to deselect" : "Click to select for highlighting"}
+      title={isHighlight ? "Selected (click to deselect)" : "Click to select for highlighting"}
     >{isHighlight ? "●" : "○"}</span>
 
-    <span class="name" title={name}>{name}</span>
-
-    <span class="spacer" aria-hidden="true"></span>
-
-    <Sparkline points={sparkline} width={56} height={14} />
-
-    <Bar value={current} max={1} width={96} height={8} />
+    <!-- Bipolar axis frame, identical shape to VectorStrip's .axis: the
+         negative pole sits left of the bar, the positive right.  A
+         monopolar probe renders an empty left-pole slot so the bar +
+         positive-pole line up horizontally with bipolar rows in the same
+         rack. -->
+    <div class="axis">
+      <span class="pole neg" aria-hidden={monopolar}>
+        {#if !monopolar}{poles.negative}{/if}
+      </span>
+      <div class="bar-cell" aria-hidden="true">
+        <Bar value={current} max={1} width={160} height={8} bipolar={!monopolar} />
+      </div>
+      <span class="pole pos" title={`positive pole (${poles.positive})`}>
+        {poles.positive}
+      </span>
+    </div>
 
     <span class="value" class:pos={current > 0} class:neg={current < 0}>
       {current >= 0 ? "+" : ""}{current.toFixed(2)}
     </span>
+
+    <Sparkline points={sparkline} width={56} height={14} />
 
     <button
       type="button"
@@ -125,7 +137,7 @@
 
   <div class="layers" aria-label="Per-layer readings for {name}">
     {#if layerKeys.length === 0}
-      <div class="layers-status">no data — generate a token first</div>
+      <div class="layers-status">no data yet, generate a token first</div>
     {:else}
       <span class="endcap" aria-hidden="true">L{Number(layerKeys[0])}</span>
       <div class="cells">
@@ -148,14 +160,14 @@
   /* Match VectorStrip's outer frame so steering and probe rows read as
    * one visual family — same border, radius, background, font-size. */
   .strip {
-    border: 1px solid var(--border-dim);
-    border-radius: 3px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
     background: var(--bg-alt);
-    transition: border-color 0.1s ease;
-    font-size: 0.85em;
+    transition: border-color var(--dur-fast) var(--ease-out);
+    font-size: var(--text-sm);
   }
   .strip.selected {
-    border-color: var(--accent-blue);
+    border-color: var(--accent);
   }
 
   /* Row body — flex / 32px / 0.4em gap / 0.25em·0.4em padding to match
@@ -164,9 +176,9 @@
   .row {
     display: flex;
     align-items: center;
-    gap: 0.4em;
+    gap: var(--space-3);
     min-height: 32px;
-    padding: 0.25em 0.4em;
+    padding: var(--space-2) var(--space-3);
     cursor: pointer;
     user-select: none;
   }
@@ -174,7 +186,7 @@
     background: var(--bg-elev);
   }
   .row:focus-visible {
-    outline: 1px solid var(--accent-blue);
+    outline: 1px solid var(--accent);
     outline-offset: -1px;
   }
 
@@ -184,34 +196,53 @@
    * highlighted" blue). */
   .select-glyph {
     color: var(--fg-muted);
-    font-size: 1em;
+    font-size: var(--text);
     line-height: 1;
-    padding: 0 0.2em;
+    padding: 0 var(--space-1);
     flex: 0 0 auto;
   }
   .strip.selected .select-glyph {
     color: var(--accent-blue);
   }
 
-  .name {
-    flex: 0 1 auto;
-    min-width: 5em;
-    max-width: 14em;
+  /* Bipolar axis — grid mirrors VectorStrip.axis exactly so the two
+   * racks share the same column proportions.  Monopolar keeps the same
+   * three columns and renders an empty left-pole slot so the bar and
+   * positive pole still sit in the same horizontal positions as the
+   * bipolar rows above and below it in the rack. */
+  .axis {
+    display: grid;
+    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr);
+    align-items: center;
+    gap: var(--space-2);
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .pole {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-size: var(--text-sm);
+  }
+  .pole.neg {
+    color: var(--fg-muted);
+    text-align: right;
+  }
+  .pole.pos {
     color: var(--fg-strong);
+    text-align: left;
   }
-  /* Eats the available row width so the sparkline + bar + value + ✕
-   * cluster pins to the right edge — keeps the readings group aligned
-   * across rows regardless of name length. */
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0.4em;
+
+  /* Bar lives in the axis middle slot — fluid width via :global so the
+   * SVG stretches to fill the column rather than forcing the row to
+   * exactly 160px-wide. */
+  .bar-cell {
+    min-width: 0;
   }
-  .strip.selected .name {
-    color: var(--accent-blue);
-    font-weight: bold;
+  .bar-cell :global(.bar) {
+    width: 100%;
+    height: 8px;
+    display: block;
   }
 
   .value {
@@ -233,10 +264,10 @@
     background: transparent;
     border: 0;
     color: var(--fg-muted);
-    font-size: 0.95em;
+    font-size: var(--text);
     line-height: 1;
-    padding: 0.1em 0.35em;
-    border-radius: 2px;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius);
     flex: 0 0 auto;
   }
   .icon:hover:not(:disabled) {
@@ -250,16 +281,16 @@
   .layers {
     display: flex;
     align-items: center;
-    gap: 0.4em;
-    padding: 0.3em 0.4em 0.4em 0.4em;
-    border-top: 1px solid var(--border-dim);
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3) var(--space-3) var(--space-3);
+    border-top: 1px solid var(--border);
     overflow-x: auto;
     white-space: nowrap;
   }
   .layers-status {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
-    padding: 0.1em 0;
+    font-size: var(--text-sm);
+    padding: var(--space-1) 0;
   }
   .cells {
     display: flex;
@@ -268,7 +299,7 @@
   }
   .endcap {
     color: var(--fg-dim);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     flex: 0 0 auto;
   }

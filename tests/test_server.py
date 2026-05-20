@@ -740,6 +740,23 @@ class TestNativeSteeringField:
         kw = session.generate.call_args[1]
         assert kw["steering"].alphas == {"myvec": 0.7}
 
+    def test_empty_steering_clears_server_default(self):
+        from saklas.server import create_app
+        from saklas.core.steering import Steering
+        session = _mock_session()
+        session.generate.return_value = GenerationResult(
+            text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
+        )
+        app = create_app(session, default_steering=Steering(alphas={"base": 0.2}))
+        c = TestClient(app)
+        resp = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "steering": "",
+        })
+        assert resp.status_code == 200
+        kw = session.generate.call_args[1]
+        assert kw["steering"] is None
+
     def test_thinking_field_default_is_none_auto(self, session_and_client):
         session, client = session_and_client
         session.generate.return_value = GenerationResult(

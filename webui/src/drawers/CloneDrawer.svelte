@@ -229,7 +229,7 @@
       <span class="label">baseline <em>optional</em></span>
       <input
         type="text"
-        placeholder="(reserved — not used today)"
+        placeholder="(reserved, not used today)"
         bind:value={baseline}
         autocomplete="off"
         spellcheck="false"
@@ -246,7 +246,7 @@
         {#if running}
           <div class="log-head">
             <span class="spinner" aria-hidden="true"></span>
-            <span>cloning, please wait — clone has no per-step progress.</span>
+            <span>cloning, please wait; clone has no per-step progress.</span>
           </div>
         {/if}
         <ol class="log-lines">
@@ -285,29 +285,29 @@
     height: 100%;
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
   }
   .head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.6em 1em;
+    padding: var(--space-4) var(--space-5);
     border-bottom: 1px solid var(--border);
   }
   .head h2 {
     margin: 0;
-    font-size: 1em;
+    font-size: var(--text);
     color: var(--accent-blue);
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     text-transform: lowercase;
   }
   .close {
     background: transparent;
     border: 0;
     color: var(--fg-dim);
-    font-size: 1em;
+    font-size: var(--text);
     line-height: 1;
-    padding: 0.25em 0.4em;
+    padding: var(--space-2) var(--space-3);
     cursor: pointer;
   }
   .close:hover {
@@ -317,44 +317,44 @@
   .body {
     flex: 1;
     overflow-y: auto;
-    padding: 0.8em 1em;
+    padding: var(--space-5) var(--space-5);
     display: flex;
     flex-direction: column;
-    gap: 0.7em;
+    gap: var(--space-4);
     min-height: 0;
   }
 
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.25em;
+    gap: var(--space-2);
   }
   .label {
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     text-transform: lowercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
   }
   .label em {
     color: var(--fg-muted);
     font-style: normal;
-    margin-left: 0.5em;
+    margin-left: var(--space-3);
   }
   input[type="text"],
   input[type="number"] {
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0.45em 0.6em;
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     box-sizing: border-box;
     width: 100%;
   }
   input:focus {
-    outline: 1px solid var(--accent-blue);
-    border-color: var(--accent-blue);
+    outline: 1px solid var(--accent);
+    border-color: var(--accent);
   }
   input:disabled {
     opacity: 0.55;
@@ -363,7 +363,7 @@
 
   .row {
     display: flex;
-    gap: 0.6em;
+    gap: var(--space-4);
   }
   .grow {
     flex: 1 1 0;
@@ -374,19 +374,19 @@
   }
   .seed-row {
     display: flex;
-    gap: 0.3em;
+    gap: var(--space-2);
   }
   .dice {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--fg);
-    padding: 0 0.5em;
-    border-radius: 4px;
+    padding: 0 var(--space-3);
+    border-radius: var(--radius);
     cursor: pointer;
-    font-size: 1em;
+    font-size: var(--text);
   }
   .dice:hover:not(:disabled) {
-    border-color: var(--accent-blue);
+    border-color: var(--accent);
   }
   .dice:disabled {
     opacity: 0.5;
@@ -394,31 +394,31 @@
 
   .muted {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
   }
   .error {
     color: var(--accent-error);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
     word-break: break-word;
   }
 
   .log {
-    border: 1px solid var(--border-dim);
-    border-radius: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
     background: var(--bg-deep);
-    padding: 0.5em 0.7em;
+    padding: var(--space-3) var(--space-4);
     max-height: 18em;
     overflow-y: auto;
   }
   .log-head {
     display: flex;
     align-items: center;
-    gap: 0.5em;
+    gap: var(--space-3);
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
-    margin-bottom: 0.4em;
+    font-size: var(--text-sm);
+    margin-bottom: var(--space-3);
   }
   .log-lines {
     list-style: none;
@@ -426,12 +426,12 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.15em;
+    gap: var(--space-1);
   }
   .log-line {
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     display: flex;
-    gap: 0.5em;
+    gap: var(--space-3);
   }
   .log-line .log-ts {
     color: var(--fg-muted);
@@ -450,24 +450,24 @@
 
   .foot {
     border-top: 1px solid var(--border);
-    padding-top: 0.6em;
+    padding-top: var(--space-4);
     margin-top: auto;
     display: flex;
     justify-content: flex-end;
-    gap: 0.5em;
+    gap: var(--space-3);
   }
   .primary {
-    background: var(--accent-blue);
-    color: var(--bg-deep);
-    border: 1px solid var(--accent-blue);
-    padding: 0.35em 1em;
-    border-radius: 3px;
+    background: var(--accent);
+    color: var(--text-on-accent);
+    border: 1px solid var(--accent);
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
-    gap: 0.4em;
+    gap: var(--space-3);
   }
   .primary:hover:not(:disabled) {
     filter: brightness(1.1);
@@ -480,10 +480,10 @@
     background: transparent;
     border: 1px solid var(--border);
     color: var(--fg-dim);
-    padding: 0.35em 0.9em;
-    border-radius: 3px;
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
   }
   .secondary:hover:not(:disabled) {
@@ -498,7 +498,7 @@
     width: 0.85em;
     height: 0.85em;
     border-radius: 50%;
-    border: 1.5px solid var(--accent-blue);
+    border: 1px solid var(--accent-blue);
     border-right-color: transparent;
     animation: spin 0.7s linear infinite;
     display: inline-block;

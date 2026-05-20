@@ -1,64 +1,82 @@
 <script lang="ts">
-  // Shared list shell for the vector + probe picker drawers.  Renders a
-  // search box, a scrollable filtered list of locally installed concepts,
-  // and an "extract on the fly" affordance when the typed query doesn't
-  // match any local row.
+  // Shared catalog list for the steering + probe pickers.  Presents the
+  // installed concepts the way the catalog is actually organised — grouped
+  // into the seven fixed categories, each row framed as its bipolar axis
+  // (``calm ◄──●──► angry``) with a non-interactive slider preview parked
+  // at the concept's recommended α.
   //
-  // Calls ``apiPacks.list()`` on mount so the rows have description /
-  // tags / source — the shared store keeps name-only entries.  We keep
-  // the full rows local to the picker so we don't bloat the global state
-  // (mirrors PackDrawer's local-list approach).
+  // See docs/plans/webui-overhaul.md §"The picker".  Calls
+  // ``apiPacks.list()`` on mount for the description / tags / source rows
+  // (the shared store keeps name-only entries).
   //
-  // The picker reports user intent through three callbacks:
-  //   - ``onPick(row)``: a row was clicked
-  //   - ``onExtractFly(query)``: the typed query has no local match and
-  //     the user clicked "extract on the fly"
-  //   - ``onClear()`` is implicit — the parent owns close behavior.
-  //
-  // Visuals match the PackDrawer row idiom (mono row with name + source,
-  // optional description, tag chips on the bottom row).
+  // ``query`` is bindable so the parent can react to the no-match case —
+  // the steering picker pre-fills its custom-extraction name field with
+  // whatever the user typed when nothing in the catalog matches.
 
   import { onMount } from "svelte";
+  import { SvelteSet, SvelteMap } from "svelte/reactivity";
   import { ApiError, apiPacks } from "../lib/api";
+  import Slider from "../lib/Slider.svelte";
   import type { LocalPackInfo } from "../lib/types";
+  import {
+    CATEGORY_LABELS,
+    CATEGORY_ORDER,
+    DEFAULT_EXPANDED,
+    categoryOf,
+    polesOf,
+    recommendedAlpha,
+    type Category,
+  } from "../lib/concepts";
 
   interface Props {
-    /** Header label above the search box ("add steering vector" etc).
-     * Decorative only — the parent owns the drawer header. */
+    /** Search-box placeholder. */
     placeholder?: string;
-    /** Disable the "extract on the fly" affordance — used by the probe
-     * picker, where extracting a brand-new concept isn't the point. */
-    allowExtractFly?: boolean;
-    /** "Add to rack" / "Activate" — the primary verb shown on each row. */
+    /** Primary verb shown on each row ("add" / "watch"). */
     actionLabel: string;
-    /** Optional secondary hint shown below the search box when no rows
-     * match (e.g. "install a pack via Tools > Packs"). */
+    /** Show the per-row strength slider + α readout.  False for the
+     * probe picker — a probe observes, it has no steering strength. */
+    showStrength?: boolean;
+    /** Secondary hint shown when no packs are installed at all. */
     emptyHint?: string;
-    /** The submit callback.  Receives the picked row. */
-    onPick: (row: LocalPackInfo) => void;
-    /** When the user clicks "extract on the fly" with a typed query that
-     * doesn't match any local row.  Receives the raw query string. */
-    onExtractFly?: (query: string) => void;
-    /** Names already in flight (showing a spinner on their row).  Empty
-     * by default. */
+    /** Row clicked — receives the row and its recommended α. */
+    onPick: (row: LocalPackInfo, alpha: number) => void;
+    /** Names already in flight (spinner on their row). */
     busy?: ReadonlySet<string>;
+    /** Current search string — bindable so the parent can read it. */
+    query?: string;
+    /** Number of catalog rows matching ``query`` — bindable readout so the
+     * steering picker can flow the no-match case into custom extraction. */
+    matchCount?: number;
+    /** Own the vertical scroll internally (probe picker).  False lets the
+     * parent scroll the whole body (steering picker, where the catalog
+     * shares space with the custom-extraction section). */
+    scroll?: boolean;
+    /** Focus the search box on mount.  Default true. */
+    autofocusSearch?: boolean;
   }
 
-  const {
-    placeholder = "type a concept name…",
-    allowExtractFly = true,
+  let {
+    placeholder = "search concepts…",
     actionLabel,
+    showStrength = true,
     emptyHint,
     onPick,
-    onExtractFly,
     busy,
+    query = $bindable(""),
+    matchCount = $bindable(0),
+    scroll = true,
+    autofocusSearch = true,
   }: Props = $props();
 
   let rows: LocalPackInfo[] = $state([]);
   let loading = $state(false);
   let error: string | null = $state(null);
-  let query = $state("");
   let searchInputRef: HTMLInputElement | null = $state(null);
+
+  // Per-category expansion.  Searching overrides this — every section with
+  // a match renders open so a query never hides a hit behind a collapsed
+  // header.  State is intentionally not persisted (cheap to re-open).
+  const expanded = new SvelteSet<Category>(DEFAULT_EXPANDED);
 
   async function load(): Promise<void> {
     loading = true;
@@ -67,11 +85,8 @@
       const r = await apiPacks.list();
       rows = (r.packs as unknown as LocalPackInfo[]) ?? [];
     } catch (e) {
-      if (e instanceof ApiError) {
-        error = `${e.status}: ${e.message}`;
-      } else {
-        error = e instanceof Error ? e.message : String(e);
-      }
+      error = e instanceof ApiError ? `${e.status}: ${e.message}`
+        : e instanceof Error ? e.message : String(e);
     } finally {
       loading = false;
     }
@@ -79,7 +94,13 @@
 
   onMount(() => {
     void load();
-    queueMicrotask(() => searchInputRef?.focus());
+    // ``preventScroll`` keeps the browser from scrolling the drawer's
+    // ancestors to bring the input into view — the drawer enters mid-
+    // animation at ``translateX(100%)``, so without this the focus call
+    // bumps the layout's ``scrollLeft`` and the chat/rack content visibly
+    // shifts left then snaps back when the slide-in completes.
+    if (autofocusSearch)
+      queueMicrotask(() => searchInputRef?.focus({ preventScroll: true }));
   });
 
   function rowKey(r: LocalPackInfo): string {
@@ -101,52 +122,96 @@
     return false;
   }
 
-  // Filtered rows — case-insensitive substring match across name /
-  // namespace / qualified selector / description / tags.
-  const filtered = $derived.by(() => {
+  const searching = $derived(query.trim().length > 0);
+
+  // Filtered rows grouped by category, each group name-sorted.  Iterated
+  // in the fixed CATEGORY_ORDER (+ "other" last) at render time.
+  const grouped = $derived.by(() => {
     const q = query.trim();
-    return rows.filter((r) => rowMatches(r, q));
+    const m = new Map<Category, LocalPackInfo[]>();
+    for (const r of rows) {
+      if (!rowMatches(r, q)) continue;
+      const c = categoryOf(r.tags);
+      const list = m.get(c);
+      if (list) list.push(r);
+      else m.set(c, [r]);
+    }
+    for (const list of m.values()) {
+      list.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return m;
   });
 
-  // True when the typed query has no exact-name match anywhere in the
-  // local list — gates the "extract on the fly" affordance below the
-  // search box.
-  const hasExactMatch = $derived.by(() => {
-    const q = query.trim();
-    if (!q) return true;
-    return rows.some(
-      (r) =>
-        r.name.toLowerCase() === q.toLowerCase() ||
-        rowKey(r).toLowerCase() === q.toLowerCase(),
-    );
+  const sections = $derived.by(() => {
+    const order: Category[] = [...CATEGORY_ORDER, "other"];
+    return order
+      .filter((c) => (grouped.get(c)?.length ?? 0) > 0)
+      .map((c) => ({ cat: c, items: grouped.get(c) as LocalPackInfo[] }));
   });
+
+  const totalMatches = $derived(
+    sections.reduce((n, s) => n + s.items.length, 0),
+  );
+
+  // Mirror the match count out to the bindable so the parent can react.
+  $effect(() => {
+    matchCount = totalMatches;
+  });
+
+  function toggle(cat: Category): void {
+    if (expanded.has(cat)) expanded.delete(cat);
+    else expanded.add(cat);
+  }
+
+  function isOpen(cat: Category): boolean {
+    return searching || expanded.has(cat);
+  }
+
+  // Per-row draft α — the user can set the strength on the slider
+  // *before* committing, then [add] drops it on the rack at that value.
+  // Lazily seeded from the pack's recommended α on first read.
+  const drafts = new SvelteMap<string, number>();
+
+  function draftAlpha(row: LocalPackInfo): number {
+    const key = rowKey(row);
+    const d = drafts.get(key);
+    return d ?? recommendedAlpha(row);
+  }
+
+  function setDraft(row: LocalPackInfo, v: number): void {
+    drafts.set(rowKey(row), v);
+  }
+
+  function formatAlpha(a: number): string {
+    if (a === 0) return "0.00";
+    return `${a > 0 ? "+" : "-"}${Math.abs(a).toFixed(2)}`;
+  }
+
+  function alphaColor(a: number): string {
+    if (a > 0) return "var(--accent-green)";
+    if (a < 0) return "var(--accent-red)";
+    return "var(--fg-muted)";
+  }
 
   function onKeydown(ev: KeyboardEvent): void {
-    if (ev.key === "Enter") {
-      ev.preventDefault();
-      const q = query.trim();
-      if (!q) return;
-      // Pick the first filtered row when one matches; else try the
-      // extract-on-the-fly path if allowed.
-      if (filtered.length > 0) {
-        onPick(filtered[0]);
-        return;
-      }
-      if (allowExtractFly && onExtractFly) {
-        onExtractFly(q);
-      }
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    // Enter adds the single match when the query narrows to exactly one.
+    if (totalMatches === 1) {
+      const r = sections[0].items[0];
+      onPick(r, draftAlpha(r));
     }
   }
 </script>
 
-<div class="picker">
+<div class="picker" class:flow={!scroll}>
   <div class="search-row">
     <input
       type="search"
       class="search"
       bind:this={searchInputRef}
       bind:value={query}
-      placeholder={placeholder}
+      {placeholder}
       autocomplete="off"
       spellcheck="false"
       onkeydown={onKeydown}
@@ -156,7 +221,7 @@
       class="refresh"
       onclick={() => void load()}
       disabled={loading}
-      title="re-fetch local packs"
+      title="re-fetch installed packs"
       aria-label="Refresh"
     >{loading ? "…" : "↻"}</button>
   </div>
@@ -166,66 +231,89 @@
   {/if}
 
   {#if loading && rows.length === 0}
-    <p class="muted">loading local packs…</p>
+    <p class="muted">loading concepts…</p>
   {:else if rows.length === 0}
-    <p class="muted">no packs installed locally{emptyHint ? ` — ${emptyHint}` : ""}.</p>
-  {:else if filtered.length === 0}
-    <div class="no-match">
-      <p class="muted">no local match for "{query}".</p>
-      {#if allowExtractFly && onExtractFly}
-        <button
-          type="button"
-          class="fly"
-          onclick={() => onExtractFly?.(query.trim())}
-          disabled={!query.trim()}
-          title="run extract — server short-circuits on cache hit"
-        >
-          extract '{query.trim() || "…"}' on the fly
-        </button>
-      {:else if emptyHint}
-        <p class="hint">{emptyHint}</p>
-      {/if}
-    </div>
+    <p class="muted">
+      no packs installed locally{emptyHint ? `, ${emptyHint}` : ""}.
+    </p>
+  {:else if sections.length === 0}
+    <p class="muted">no concept matches "{query.trim()}".</p>
   {:else}
-    <ul class="rows" role="listbox">
-      {#each filtered as row (rowKey(row))}
-        {@const sel = rowKey(row)}
-        {@const inFlight = busy?.has(row.name) || busy?.has(sel) || false}
-        <li>
+    <div class="catalog">
+      {#each sections as { cat, items } (cat)}
+        {@const open = isOpen(cat)}
+        <section class="category">
           <button
             type="button"
-            class="row"
-            disabled={inFlight}
-            onclick={() => onPick(row)}
-            title="{actionLabel}: {sel}"
+            class="cat-header"
+            class:open
+            aria-expanded={open}
+            onclick={() => toggle(cat)}
+            disabled={searching}
           >
-            <div class="row-top">
-              <span class="row-name">{row.name}</span>
-              <span class="row-meta">
-                <span class="row-ns">{row.namespace}</span>
-                <span class="row-sep">·</span>
-                <span class="row-source">{row.source ?? "—"}</span>
-              </span>
-            </div>
-            {#if row.description}
-              <p class="row-desc">{row.description}</p>
-            {/if}
-            <div class="row-bot">
-              {#if Array.isArray(row.tags) && row.tags.length}
-                <span class="chips">
-                  {#each row.tags.slice(0, 6) as tag (tag)}
-                    <span class="chip">{tag}</span>
-                  {/each}
-                </span>
-              {/if}
-              <span class="row-action">
-                {inFlight ? "…" : actionLabel}
-              </span>
-            </div>
+            <span class="caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+            <span class="cat-name">{CATEGORY_LABELS[cat]}</span>
+            <span class="cat-count">{items.length}</span>
           </button>
-        </li>
+
+          {#if open}
+            <ul class="rows" role="list" aria-label={CATEGORY_LABELS[cat]}>
+              {#each items as row (rowKey(row))}
+                {@const sel = rowKey(row)}
+                {@const inFlight =
+                  busy?.has(row.name) || busy?.has(sel) || false}
+                {@const poles = polesOf(row.name)}
+                {@const mono = poles.negative === null}
+                {@const a = draftAlpha(row)}
+                <li
+                  class="row"
+                  class:compact={!showStrength}
+                  title={row.description
+                    ? `${sel}: ${row.description}`
+                    : sel}
+                >
+                  {#if showStrength}
+                    <span class="pole neg">{poles.negative ?? ""}</span>
+                    <Slider
+                      value={a}
+                      min={mono ? 0 : -1}
+                      max={1}
+                      step={0.05}
+                      disabled={inFlight}
+                      ariaLabel="strength for {row.name}"
+                      oninput={(v) => setDraft(row, v)}
+                    />
+                    <span class="pole pos">{poles.positive}</span>
+                    <span class="alpha" style:color={alphaColor(a)}>
+                      {formatAlpha(a)}
+                    </span>
+                  {:else}
+                    <span class="concept">
+                      {#if !mono}
+                        <span class="pole neg">{poles.negative}</span>
+                        <span class="axis-sep" aria-hidden="true">↔</span>
+                      {/if}
+                      <span class="pole pos">{poles.positive}</span>
+                    </span>
+                  {/if}
+                  <button
+                    type="button"
+                    class="add-btn"
+                    disabled={inFlight}
+                    onclick={() => onPick(row, a)}
+                    title={showStrength
+                      ? `${actionLabel} ${sel} at α ${formatAlpha(a)}`
+                      : `${actionLabel} ${sel}`}
+                  >
+                    {inFlight ? "…" : actionLabel}
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </section>
       {/each}
-    </ul>
+    </div>
   {/if}
 </div>
 
@@ -233,13 +321,13 @@
   .picker {
     display: flex;
     flex-direction: column;
-    gap: 0.5em;
+    gap: var(--space-3);
     min-height: 0;
     flex: 1 1 auto;
   }
   .search-row {
     display: flex;
-    gap: 0.4em;
+    gap: var(--space-3);
     align-items: stretch;
   }
   .search {
@@ -247,25 +335,28 @@
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0.45em 0.6em;
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
+    transition: border-color var(--dur) var(--ease-out);
   }
   .search:focus {
-    outline: 1px solid var(--accent-blue);
-    border-color: var(--accent-blue);
+    outline: none;
+    border-color: var(--accent);
   }
   .refresh {
     flex: 0 0 auto;
     background: transparent;
     border: 1px solid var(--border);
     color: var(--fg-dim);
-    padding: 0 0.7em;
-    border-radius: 4px;
+    padding: 0 var(--space-4);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     cursor: pointer;
+    transition: color var(--dur) var(--ease-out),
+      border-color var(--dur) var(--ease-out);
   }
   .refresh:hover:not(:disabled) {
     border-color: var(--fg-muted);
@@ -276,131 +367,159 @@
     cursor: progress;
   }
 
-  .rows {
-    list-style: none;
-    margin: 0;
-    padding: 0;
+  .picker.flow {
+    flex: 0 0 auto;
+  }
+  .catalog {
     display: flex;
     flex-direction: column;
-    gap: 0.35em;
+    gap: var(--space-1);
     overflow-y: auto;
     min-height: 0;
     flex: 1 1 auto;
+    padding-right: var(--space-1);
   }
-  .row {
-    display: block;
+  /* Parent-scroll mode: let the catalog grow to its natural height. */
+  .picker.flow .catalog {
+    overflow: visible;
+    flex: 0 0 auto;
+  }
+  .category {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .cat-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
     width: 100%;
     text-align: left;
-    background: var(--bg-deep);
-    color: var(--fg);
-    border: 1px solid var(--border-dim);
-    border-radius: 4px;
-    padding: 0.5em 0.7em;
-    font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    padding: var(--space-3) var(--space-1) var(--space-2);
+    color: var(--fg-muted);
     cursor: pointer;
+    transition: color var(--dur) var(--ease-out);
   }
-  .row:hover:not(:disabled) {
-    border-color: var(--accent-blue);
-    background: var(--bg-alt);
+  .cat-header:hover:not(:disabled) {
+    color: var(--fg-strong);
   }
-  .row:disabled {
+  .cat-header:disabled {
+    cursor: default;
+  }
+  .caret {
+    font-size: var(--text-xs);
+    color: var(--fg-muted);
+  }
+  .cat-name {
+    flex: 1 1 auto;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .cat-header.open .cat-name {
+    color: var(--accent-blue);
+  }
+  .cat-count {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .rows {
+    list-style: none;
+    margin: 0;
+    padding: var(--space-2) 0 var(--space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  /* Pole · slider · pole · α readout · add.  The bipolar axis frames the
+   * row; the slider is live so the strength is set before committing. */
+  .row {
+    display: grid;
+    grid-template-columns:
+      minmax(2.6em, 1fr) minmax(70px, 2.4fr) minmax(2.6em, 1fr) auto auto;
+    align-items: center;
+    gap: var(--space-3);
+    background: var(--bg-deep);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+    font-family: var(--font-mono);
+    font-size: var(--text);
+    transition: border-color var(--dur) var(--ease-out);
+  }
+  .row:hover {
+    border-color: var(--accent);
+  }
+  /* Probe picker — no strength slider, just the concept axis + action. */
+  .row.compact {
+    grid-template-columns: 1fr auto;
+  }
+  .concept {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .axis-sep {
+    color: var(--fg-muted);
+    flex: 0 0 auto;
+  }
+
+  .pole {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--text-sm);
+  }
+  .pole.neg {
+    color: var(--fg-muted);
+    text-align: right;
+  }
+  .pole.pos {
+    color: var(--fg-strong);
+  }
+
+  .alpha {
+    font-variant-numeric: tabular-nums;
+    font-size: var(--text-sm);
+    min-width: 3.4em;
+    text-align: right;
+  }
+
+  .add-btn {
+    background: var(--accent-subtle);
+    color: var(--accent-blue);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease-out);
+  }
+  .add-btn:hover:not(:disabled) {
+    background: var(--accent-glow);
+  }
+  .add-btn:disabled {
     opacity: 0.55;
     cursor: progress;
   }
-  .row-top {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.6em;
-  }
-  .row-name {
-    color: var(--accent-green);
-    font-weight: 600;
-  }
-  .row-meta {
-    color: var(--fg-muted);
-    font-size: var(--font-size-small);
-    display: inline-flex;
-    gap: 0.35em;
-  }
-  .row-sep {
-    color: var(--fg-muted);
-  }
-  .row-ns,
-  .row-source {
-    color: var(--fg-dim);
-  }
-  .row-desc {
-    color: var(--fg-strong);
-    margin: 0.3em 0 0 0;
-    font-size: 0.9em;
-  }
-  .row-bot {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 0.5em;
-    margin-top: 0.4em;
-    flex-wrap: wrap;
-  }
-  .chips {
-    display: inline-flex;
-    flex-wrap: wrap;
-    gap: 0.25em;
-  }
-  .chip {
-    background: var(--bg-alt);
-    color: var(--fg-dim);
-    border: 1px solid var(--border-dim);
-    border-radius: 999px;
-    padding: 0.05em 0.55em;
-    font-size: var(--font-size-tiny);
-  }
-  .row-action {
-    color: var(--accent-blue);
-    font-size: var(--font-size-small);
-    text-transform: lowercase;
-    letter-spacing: 0.04em;
-  }
 
-  .no-match {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4em;
-    padding: 0.5em 0.2em;
-  }
-  .fly {
-    background: transparent;
-    color: var(--accent-blue);
-    border: 1px solid var(--accent-blue);
-    border-radius: 3px;
-    padding: 0.4em 0.7em;
-    font-family: var(--font-mono);
-    font-size: var(--font-size-small);
-    cursor: pointer;
-    align-self: flex-start;
-  }
-  .fly:hover:not(:disabled) {
-    background: rgba(88, 166, 255, 0.12);
-  }
-  .fly:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
   .muted {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
-    margin: 0;
-  }
-  .hint {
-    color: var(--fg-muted);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-sm);
     margin: 0;
   }
   .error {
     color: var(--accent-error);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
     word-break: break-word;
   }

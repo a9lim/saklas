@@ -9,26 +9,23 @@
   // name.  Live re-sort is cheap — activeProbeNames() returns a fresh
   // array per access from the rack store and the strip list keys on
   // probe name so DOM nodes survive reorders.
+  //
+  // Transcript highlight / compare-two controls live in Chat.svelte —
+  // highlighting is about reading the transcript, so that is their one
+  // home (docs/plans/webui-overhaul.md §"Panel & drawer notes").
 
   import ProbeStrip from "./ProbeStrip.svelte";
   import {
     activeProbeNames,
-    highlightState,
     openDrawer,
     probeRack,
-    setCompareTarget,
-    setHighlightTarget,
     setProbeSortMode,
-    toggleCompareTwo,
   } from "../lib/stores.svelte";
   import type { ProbeSortMode } from "../lib/types";
 
   // Computed derivations — Svelte 5 runes track both the underlying state
   // and the function call's read of it via $derived's argument.
   const sortMode = $derived(probeRack.sortMode);
-  const compareTwo = $derived(highlightState.compareTwo);
-  const target = $derived(highlightState.target);
-  const compareTarget = $derived(highlightState.compareTarget);
 
   // activeProbeNames() reads probeRack.active + entries + sortMode, all
   // $state-tracked, so this $derived re-runs on any of those changes.
@@ -39,16 +36,6 @@
     setProbeSortMode(value);
   }
 
-  function onHighlightChange(ev: Event): void {
-    const v = (ev.currentTarget as HTMLSelectElement).value;
-    setHighlightTarget(v === "" ? null : v);
-  }
-
-  function onCompareChange(ev: Event): void {
-    const v = (ev.currentTarget as HTMLSelectElement).value;
-    setCompareTarget(v === "" ? null : v);
-  }
-
   function onAddProbe(): void {
     openDrawer("probe_picker");
   }
@@ -56,7 +43,9 @@
 
 <section class="rack" aria-label="Probe rack">
   <header class="header">
-    <span class="title">PROBES</span>
+    <div class="header-text">
+      <span class="title">PROBES</span>
+    </div>
     <label class="sort">
       <span class="sort-label">sort</span>
       <select
@@ -72,52 +61,17 @@
     </label>
   </header>
 
-  <div class="highlight-bar">
-    <label class="hl-field">
-      <span class="hl-label">highlight</span>
-      <select
-        class="hl-select"
-        value={target ?? ""}
-        onchange={onHighlightChange}
-        aria-label="Highlight target probe"
-      >
-        <option value="">(off)</option>
-        {#each sortedProbes as probe (probe)}
-          <option value={probe}>{probe}</option>
-        {/each}
-      </select>
-    </label>
-
-    <label class="compare-toggle" title="Show a second probe as a stripe overlay">
-      <input
-        type="checkbox"
-        checked={compareTwo}
-        onchange={toggleCompareTwo}
-      />
-      <span>compare two</span>
-    </label>
-
-    {#if compareTwo}
-      <label class="hl-field">
-        <span class="hl-label">vs</span>
-        <select
-          class="hl-select"
-          value={compareTarget ?? ""}
-          onchange={onCompareChange}
-          aria-label="Compare target probe"
-        >
-          <option value="">(off)</option>
-          {#each sortedProbes as probe (probe)}
-            <option value={probe}>{probe}</option>
-          {/each}
-        </select>
-      </label>
-    {/if}
-  </div>
-
-  <div class="strips" role="list">
+  <div class="strips" class:is-empty={sortedProbes.length === 0} role="list">
     {#if sortedProbes.length === 0}
-      <div class="empty">no active probes — click + add probe</div>
+      <div class="empty">
+        <p class="empty-copy">
+          Probes watch concepts activate as the model generates.
+          They read the model's state without changing it.
+        </p>
+        <button type="button" class="add empty-add" onclick={onAddProbe}>
+          + add probe
+        </button>
+      </div>
     {:else}
       {#each sortedProbes as probe (probe)}
         <div role="listitem">
@@ -127,29 +81,34 @@
     {/if}
   </div>
 
-  <div class="actions">
-    <button
-      type="button"
-      class="add primary"
-      onclick={onAddProbe}
-      title="Pick a concept to monitor — TUI-style /probe"
-    >
-      + probe
-    </button>
-  </div>
+  {#if sortedProbes.length > 0}
+    <div class="actions">
+      <button
+        type="button"
+        class="add"
+        onclick={onAddProbe}
+        title="Pick a concept to monitor (TUI /probe)"
+      >
+        + add probe
+      </button>
+    </div>
+  {/if}
 </section>
 
 <style>
-  /* Three-row internal grid: header + highlight bar (auto), scrollable
-   * strips (1fr), actions row (auto).  Steers symmetric with SteeringRack. */
+  /* A flat section of the inspector panel — no border box, no own
+   * background; it reads as the lower half of one flat panel, divided
+   * from the steering section above by that section's border-bottom.
+   * Fixed chrome + one scrollable middle, matching SteeringRack.  The
+   * inspector constrains this rack, then only .strips may scroll. */
   .rack {
-    display: grid;
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
-    gap: 0.4em;
-    padding: var(--panel-pad);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-5);
+    background: transparent;
+    height: 100%;
+    max-height: 100%;
     min-height: 0;
     overflow: hidden;
   }
@@ -158,120 +117,104 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    border-bottom: 1px solid var(--border-dim);
-    padding-bottom: 0.3em;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: var(--space-3);
+  }
+  .header-text {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
   }
   /* Match SteeringRack's title — bold accent-blue so the two racks look
    * like siblings, not strangers. */
   .title {
-    font-weight: bold;
+    font-weight: var(--weight-bold);
     color: var(--accent-blue);
-    font-size: 0.85em;
-    letter-spacing: 0.08em;
+    font-size: var(--text-sm);
+    letter-spacing: 0;
     text-transform: uppercase;
   }
   .sort {
     display: inline-flex;
     align-items: center;
-    gap: 0.4em;
+    gap: var(--space-3);
   }
   .sort-label {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
-  .sort-select,
-  .hl-select {
-    background: var(--bg-alt);
+  .sort-select {
+    background: var(--bg-elev);
     color: var(--fg-strong);
     border: 1px solid var(--border);
-    padding: 0.15em 0.35em;
-    border-radius: 3px;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius);
     font: inherit;
-    font-size: 0.85em;
-  }
-  .sort-select:focus-visible,
-  .hl-select:focus-visible {
-    outline: 1px solid var(--accent-blue);
-    outline-offset: 0;
+    font-size: var(--text-sm);
   }
 
-  .highlight-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.6em;
-    flex-wrap: wrap;
-    padding: 0.2em 0;
-  }
-  .hl-field {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35em;
-  }
-  .hl-label {
-    color: var(--fg-muted);
-    font-size: var(--font-size-small);
-  }
-  .compare-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3em;
-    color: var(--fg-dim);
-    font-size: var(--font-size-small);
-    cursor: pointer;
-  }
-  .compare-toggle input {
-    accent-color: var(--accent-blue);
-  }
-
-  /* Strips own the scroll inside the rack — with 24 auto-loaded probes
+  /* Strips own the scroll inside the rack — with 26 auto-loaded probes
    * the list overflows the rack viewport, but the actions row stays
    * anchored at the bottom. */
   .strips {
     display: flex;
     flex-direction: column;
-    gap: 0.25em;
-    min-height: 0;
+    gap: var(--space-2);
+    flex: 1 1 0;
+    min-height: 2.4rem;
+    max-height: 100%;
     overflow-y: auto;
-    padding-right: 0.2em;
+    padding-right: var(--space-1);
   }
+  .strips.is-empty {
+    align-items: center;
+    justify-content: center;
+  }
+  /* First-run teaching state — names the steer-vs-observe distinction the
+   * two racks otherwise blur. */
   .empty {
-    color: var(--fg-muted);
-    font-size: var(--font-size-small);
-    padding: 0.6em 0.4em;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-5) var(--space-4);
     text-align: center;
-    border: 1px dashed var(--border-dim);
-    border-radius: 3px;
+  }
+  .empty-copy {
+    margin: 0;
+    color: var(--fg-dim);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    max-width: 30ch;
+  }
+  .add.empty-add {
+    flex: 0 0 auto;
+    min-width: 14em;
   }
 
   /* Anchored at the bottom — same border-top + padding as SteeringRack
    * so the two racks read as visual siblings. */
   .actions {
+    flex: 0 0 auto;
     display: flex;
-    gap: 0.4em;
-    border-top: 1px solid var(--border-dim);
-    padding-top: 0.4em;
+    gap: var(--space-3);
+    border-top: 1px solid var(--border);
+    padding-top: var(--space-3);
   }
   .add {
     flex: 1 1 100%;
-    background: transparent;
-    color: var(--fg-strong);
+    background: var(--accent-subtle);
+    color: var(--accent-blue);
     border: 1px solid var(--border);
-    padding: 0.3em 0.6em;
-    border-radius: 3px;
-    font-size: 0.85em;
+    padding: var(--space-3) var(--space-5);
+    border-radius: var(--radius);
+    font-size: var(--text-sm);
     line-height: 1.3;
     cursor: pointer;
+    transition: background var(--dur) var(--ease-out);
   }
   .add:hover {
-    background: var(--bg-elev);
-    border-color: var(--accent-blue);
-    color: var(--accent-blue);
-  }
-  .add.primary {
-    color: var(--accent-blue);
-    border-color: var(--accent-blue);
-  }
-  .add.primary:hover {
-    background: rgba(88, 166, 255, 0.1);
+    background: var(--accent-glow);
   }
 </style>

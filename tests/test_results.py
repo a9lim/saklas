@@ -6,16 +6,24 @@ from pathlib import Path
 
 import pytest
 import torch
-from saklas.core.results import ProbeReadings, GenerationResult, TokenEvent, ResultCollector
+from saklas.core.results import (
+    ProbeReadings,
+    GenerationResult,
+    RunSet,
+    TokenEvent,
+    ResultCollector,
+)
 
 
 class TestPublicAPI:
     def test_imports(self):
         from saklas import SaklasSession, DataSource, ResultCollector
+        from saklas import RunSet
         from saklas import GenerationResult, TokenEvent, ProbeReadings
         assert SaklasSession is not None
         assert DataSource is not None
         assert ResultCollector is not None
+        assert RunSet is not None
         assert GenerationResult is not None
         assert TokenEvent is not None
         assert ProbeReadings is not None
@@ -106,19 +114,24 @@ class TestTokenEvent:
         """All extension fields default to ``None`` / unset — old callers unaffected."""
         event = TokenEvent(text="x", token_id=0, index=0)
         assert event.logprob is None
-        assert event.top_logprobs is None
+        assert event.top_alts is None
         assert event.finish_reason is None
         assert event.scores is None
         assert event.perplexity is None
 
     def test_logprobs_carried_through(self):
-        """Populated logprob fields land on the dataclass as given."""
+        """Populated logprob + top_alts (phase 1 logit pass) land on the
+        dataclass as given. ``top_alts`` is ``list[TokenAlt]`` post-pass
+        replacing the legacy ``top_logprobs: list[tuple[int, float]]``."""
+        from saklas import TokenAlt
+        alts = [TokenAlt(id=0, text=" a", logprob=-0.2),
+                TokenAlt(id=1, text=" b", logprob=-2.3)]
         event = TokenEvent(
             text="x", token_id=0, index=0,
-            logprob=-1.5, top_logprobs=[(0, -0.2), (1, -2.3)],
+            logprob=-1.5, top_alts=alts,
         )
         assert event.logprob == -1.5
-        assert event.top_logprobs == [(0, -0.2), (1, -2.3)]
+        assert event.top_alts == alts
 
     def test_scores_and_perplexity(self):
         event = TokenEvent(
@@ -225,6 +238,46 @@ class TestResultCollector:
         rows = collector.results
         rows.append({"injected": True})
         assert len(collector.results) == 1
+
+
+class TestRunSet:
+    def _make_result(self, text: str = "Hello") -> GenerationResult:
+        return GenerationResult(
+            text=text, tokens=[1, 2], token_count=2,
+            tok_per_sec=10.0, elapsed=0.2, readings={}, vectors={},
+        )
+
+    def test_single_run_delegates_common_attrs(self):
+        runset = RunSet([self._make_result("one")], node_ids=["n1"])
+        assert runset.first.text == "one"
+        assert runset.text == "one"
+        assert runset.node_id == "n1"
+
+    def test_to_collector_preserves_grid_and_node_ids(self):
+        runset = RunSet(
+            [self._make_result("a"), self._make_result("b")],
+            node_ids=["n1", "n2"],
+            grid=[{"alpha": 0.1}, {"alpha": 0.2}],
+            kind="fan",
+        )
+        rows = runset.to_collector().results
+        assert rows[0]["node_id"] == "n1"
+        assert rows[0]["alpha"] == 0.1
+        assert rows[1]["node_id"] == "n2"
+        assert rows[1]["alpha"] == 0.2
+
+    def test_to_dict(self):
+        runset = RunSet(
+            [self._make_result("a")],
+            node_ids=["n1"],
+            grid=[{"concept": "happy.sad"}],
+            kind="fan",
+        )
+        d = runset.to_dict()
+        assert d["kind"] == "fan"
+        assert d["node_ids"] == ["n1"]
+        assert d["grid"] == [{"concept": "happy.sad"}]
+        assert d["results"][0]["text"] == "a"
 
 
 def test_generation_result_hidden_states_default_none():

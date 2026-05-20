@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 from saklas.core.profile import Profile
-from saklas.core.results import GenerationResult, TokenEvent
+from saklas.core.results import GenerationResult, RunSet, TokenEvent
 
 _HAS_GPU = torch.cuda.is_available() or torch.backends.mps.is_available()
 pytestmark = [
@@ -96,7 +96,8 @@ class TestLifecycle:
 class TestGeneration:
     def test_generate_unsteered(self, session):
         result = session.generate("Say hello in one word.")
-        assert isinstance(result, GenerationResult)
+        assert isinstance(result, RunSet)
+        assert isinstance(result.first, GenerationResult)
         assert len(result.text) > 0
         assert result.token_count > 0
         assert result.tok_per_sec > 0
@@ -107,7 +108,8 @@ class TestGeneration:
         result = session.generate([
             {"role": "user", "content": "Say hello in one word."},
         ])
-        assert isinstance(result, GenerationResult)
+        assert isinstance(result, RunSet)
+        assert isinstance(result.first, GenerationResult)
         assert len(result.text) > 0
 
     def test_generate_appends_to_history(self, session):
@@ -133,7 +135,7 @@ class TestGeneration:
     def test_last_result(self, session):
         session.clear_history()
         result = session.generate("Hello.")
-        assert session.last_result is result
+        assert session.last_result is result.first
 
     def test_ab_comparison(self, session):
         """A/B test: same prompt, with and without steering."""

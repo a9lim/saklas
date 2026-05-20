@@ -121,20 +121,62 @@ Widget {
     padding: 0 1;
 }
 
+/* Pending-queue strip — ghosted summary above the chat input.  Hugs the
+ * status bar; the dim text + yellow ``pending N`` counter mirrors the
+ * GUI's pending bubbles.  ``.hidden`` collapses the strip to zero height
+ * when the queue is empty so the layout is unchanged in the common
+ * idle case. */
+#pending-strip {
+    height: 1;
+    background: ansi_default;
+    color: ansi_default;
+    padding: 0 1;
+    text-overflow: ellipsis;
+    overflow: hidden;
+}
+
+/* ChatInput (TextArea subclass): single visible row by default, grows
+ * with content up to a small cap so the chat log stays the focus of the
+ * screen.  ``height: auto`` lets the widget hug its content; the
+ * min/max bound the visible rows.  ``dock: bottom`` pins it under the
+ * status bar.  Background/border match the surrounding ansi theme so
+ * the multi-line variant blends in the same way the old single-line
+ * Input did.
+ *
+ * TextArea ships with a non-trivial default theme — most importantly a
+ * ``$surface`` background on the widget and a ``$boost`` background on
+ * the cursor's current line.  Under the saklas ansi theme those resolve
+ * to opaque dark fills that read as a black band inside the rounded
+ * border.  Force them both to ``ansi_default`` so the input blends with
+ * the terminal background.  ``highlight_cursor_line=False`` on the
+ * widget itself suppresses the per-line highlight, but the CSS override
+ * is kept as a defence in depth (theme switches may otherwise leak
+ * through).
+ */
 #chat-input {
-    height: 3;
+    height: auto;
+    min-height: 3;
+    max-height: 10;
     dock: bottom;
     border: solid ansi_default;
     background: ansi_default;
     color: ansi_default;
 }
 
-/* Override Textual's default focus border */
 #chat-input:focus {
     border: solid ansi_default;
+    background: ansi_default;
 }
 
-#chat-input > .input--selection {
+#chat-input > .text-area--cursor-line {
+    background: ansi_default;
+}
+
+/* TextArea exposes its selection style through ``.text-area--selection``
+ * (vs the old ``Input.input--selection``).  Keep the inverted look so
+ * a selection stays visible against the ansi background.
+ */
+#chat-input > .text-area--selection {
     background: ansi_white;
     color: ansi_black;
 }

@@ -131,6 +131,31 @@ def test_warn_once_dedupes_per_model(caplog):
     )
 
 
+def test_support_probe_cache_survives_compile_wrapper(monkeypatch):
+    """from_pretrained probes before torch.compile; __init__ sees wrapper.
+
+    The second support check should hit the cached result through
+    ``_orig_mod`` instead of constructing another StaticCache probe.
+    """
+    import transformers
+
+    cg._support_cache.clear()
+    calls: list[object] = []
+
+    class _FakeStaticCache:
+        def __init__(self, config, *, max_cache_len, device, dtype):
+            calls.append((config, max_cache_len, device, dtype))
+            self.layers = [object()]
+
+    monkeypatch.setattr(transformers, "StaticCache", _FakeStaticCache, raising=False)
+    model = _FakeModel()
+
+    assert cg.is_cuda_graphs_supported(model, "cuda") == (True, None)
+    wrapper = SimpleNamespace(_orig_mod=model)
+    assert cg.is_cuda_graphs_supported(wrapper, "cuda") == (True, None)
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # CLI + YAML opt-out plumbing.
 # ---------------------------------------------------------------------------

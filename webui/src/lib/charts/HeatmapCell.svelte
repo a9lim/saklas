@@ -60,7 +60,7 @@
     align-items: center;
     justify-content: center;
     cursor: help;
-    font-size: 9px;
+    font-size: var(--text-2xs);
     color: var(--fg);
     /* Slight border so adjacent cells don't visually merge into one
      * bigger color block — kept hairline so the color dominates. */

@@ -11,6 +11,7 @@ from typing import Callable
 
 import torch
 
+from saklas.core.results import TokenAlt
 from saklas.core.triggers import TriggerContext
 
 
@@ -315,6 +316,54 @@ class GenerationConfig:
     system_prompt: str | None = None
 
 
+def _sampler_candidates(
+    logits: torch.Tensor,
+    config: GenerationConfig,
+    topk_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(token_ids, probs)`` for the configured sampler.
+
+    ``logits`` is the post-steering, post-penalty ``[1, V]`` tensor for the
+    next token. The returned probabilities are exactly the distribution the
+    sampler draws from after temperature, top-k, and top-p renormalization.
+    Greedy decoding is represented as a one-token distribution with p=1.
+    """
+    if config.temperature <= 0:
+        token = logits.argmax(dim=-1).reshape(1).to(dtype=torch.long)
+        prob = torch.ones(1, device=logits.device, dtype=torch.float32)
+        return token, prob
+
+    scaled = logits.float() / config.temperature
+    top_logits, top_idx = scaled.topk(topk_k, dim=-1, sorted=True)
+    probs = top_logits.softmax(dim=-1)
+    cumprobs = probs.cumsum(dim=-1)
+    mask = (cumprobs - probs) >= config.top_p
+    probs[mask] = 0.0
+    probs[:, :1].clamp_(min=1e-8)
+    probs.div_(probs.sum(dim=-1, keepdim=True))
+
+    row_probs = probs[0]
+    valid = row_probs > 0
+    return top_idx[0][valid].to(dtype=torch.long), row_probs[valid].to(dtype=torch.float32)
+
+
+def _sampler_logprob_vector(
+    logits: torch.Tensor,
+    config: GenerationConfig,
+    topk_k: int,
+) -> torch.Tensor:
+    """Full-vocab logprob vector for the configured sampler distribution."""
+    ids, probs = _sampler_candidates(logits, config, topk_k)
+    out = torch.full(
+        (logits.shape[-1],),
+        float("-inf"),
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    out[ids] = probs.clamp_min(torch.finfo(torch.float32).tiny).log()
+    return out
+
+
 class GenerationState:
     """Shared mutable state for controlling generation from the TUI."""
 
@@ -346,6 +395,43 @@ class GenerationState:
         self.thinking_state = ThinkingState.IDLE
         self.emit_map = []
         self.response_text = None
+
+
+class _PenaltyState:
+    """Sparse device-side completion counts for repetition penalties."""
+
+    def __init__(self, max_tokens: int, device: torch.device, dtype: torch.dtype):
+        cap = max(max_tokens, 1)
+        self.ids = torch.empty(cap, dtype=torch.long, device=device)
+        self.counts = torch.zeros(cap, dtype=dtype, device=device)
+        self.positions: dict[int, int] = {}
+        self.length = 0
+
+    def apply(
+        self,
+        logits: torch.Tensor,
+        *,
+        presence_penalty: float,
+        frequency_penalty: float,
+    ) -> None:
+        if self.length == 0:
+            return
+        idx = self.ids[:self.length]
+        cnt = self.counts[:self.length]
+        logits[0, idx] -= frequency_penalty * cnt + presence_penalty
+
+    def add(self, token_id: int) -> None:
+        pos = self.positions.get(token_id)
+        if pos is None:
+            pos = self.length
+            if pos >= self.ids.numel():  # defensive; unique ids <= max tokens
+                return
+            self.positions[token_id] = pos
+            self.ids[pos] = token_id
+            self.counts[pos] = 1.0
+            self.length += 1
+            return
+        self.counts[pos].add_(1.0)
 
 
 # Hand-rolled LRU for build_chat_input results.  functools.lru_cache won't
@@ -451,22 +537,26 @@ def generate_steered(
     cache_position_offset: int = 0,
     score_callback: Callable[[], dict[str, float]] | None = None,
     use_static_cache: bool = False,
+    forced_prefix: list[int] | None = None,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
 
-    *on_token(text, is_thinking, token_id, logprob, top_logprobs, perplexity)*
+    *on_token(text, is_thinking, token_id, logprob, top_alts, perplexity)*
     is called for each emitted token. ``perplexity`` is ``exp`` of the
-    Shannon entropy of the pre-temperature, post-steering next-token
-    distribution (bounded above by ``vocab_size``; ≈1 when the model is
+    Shannon entropy of the configured sampler distribution after
+    temperature, top-k, and top-p renormalization (≈1 when the sampler is
     near-certain). For multi-token UTF-8 sequences (buffered partials),
     *token_id* is ``-1`` and logprob is None; ``perplexity`` carries the
     flushing step's value.
 
-    ``logprobs`` is None (disabled) or the number of top logprobs to include
-    per token (0 = only the chosen token's logprob).  ``stop`` is a list of
-    strings that terminate generation when any appears in the completion
-    text.  ``seed`` seeds the RNG for deterministic sampling.
+    ``logprobs`` is None (disabled) or the number of top alternatives to
+    include per token (0 = only the chosen token's logprob).  When
+    captured, ``top_alts`` is a ``list[TokenAlt]`` carrying decoded
+    ``(id, text, logprob)`` triples — consumers don't need to retokenize
+    to render the alternatives.  ``stop`` is a list of strings that
+    terminate generation when any appears in the completion text.
+    ``seed`` seeds the RNG for deterministic sampling.
 
     Sets ``state.finish_reason`` on exit: "stop" (EOS/external), "length"
     (max tokens), "stop_sequence" (stop string matched).
@@ -491,6 +581,16 @@ def generate_steered(
     ``past_key_values is None``, we build a fresh StaticCache sized
     to ``input_ids.shape[1] + cache_position_offset +
     config.max_new_tokens``.
+
+    ``forced_prefix`` (logit fork) is a list of token ids to *force* for
+    the first ``len(forced_prefix)`` decode steps instead of using the
+    sampled token.  The sampler — including the ``multinomial`` draw —
+    still runs every step, so re-seeding with the original run's seed
+    keeps the RNG stream bit-identical through the fork point: only the
+    token fed back into the model changes.  Pass the exact raw decode
+    sequence (delimiters included) up to and including the fork token so
+    the thinking-state machine transitions identically.  ``None`` (the
+    default) is the normal free-sampling path with zero added cost.
 
     Returns list of generated token IDs.
     """
@@ -589,7 +689,9 @@ def generate_steered(
 
     # Penalty / bias / stop / logprobs setup
     use_penalties = presence_penalty != 0.0 or frequency_penalty != 0.0
-    completion_counts: dict[int, int] = {}
+    penalty_state = _PenaltyState(
+        config.max_new_tokens, device, torch.float32,
+    ) if use_penalties else None
     bias_idx: torch.Tensor | None = None
     bias_val: torch.Tensor | None = None
     if logit_bias:
@@ -639,18 +741,69 @@ def generate_steered(
     if on_token is not None:
         state.response_text = ""
 
+    no_cache_buf: torch.Tensor | None = None
+    no_cache_len = int(current_input.shape[1])
+
+    def _advance_current_input(next_token: torch.Tensor) -> None:
+        nonlocal current_input, no_cache_buf, no_cache_len
+        if not no_cache_mode:
+            current_input = next_token
+            return
+        if no_cache_buf is None:
+            cap = int(current_input.shape[1]) + max(config.max_new_tokens, 1)
+            no_cache_buf = torch.empty(
+                (1, cap), dtype=current_input.dtype, device=current_input.device,
+            )
+            no_cache_buf[:, :current_input.shape[1]].copy_(current_input)
+            no_cache_len = int(current_input.shape[1])
+        if no_cache_len < no_cache_buf.shape[1]:
+            no_cache_buf[:, no_cache_len:no_cache_len + 1].copy_(next_token)
+            no_cache_len += 1
+            current_input = no_cache_buf[:, :no_cache_len]
+        else:  # pragma: no cover - cap is prompt + max_new_tokens by construction
+            current_input = torch.cat([current_input, next_token], dim=1)
+            no_cache_len = int(current_input.shape[1])
+
     def _emit_token(text: str, is_thinking: bool, token_id: int,
-                    logprob, top_logprobs, perplexity) -> None:
+                    logprob, top_alts, perplexity) -> None:
         if not is_thinking and state.response_text is not None:
             state.response_text += text
         if on_token is not None:
-            on_token(text, is_thinking, token_id, logprob, top_logprobs, perplexity)
+            on_token(text, is_thinking, token_id, logprob, top_alts, perplexity)
+
+    def _decode_alt(tid: int) -> str:
+        """Decode a single alt token id to text, preferring the cached
+        token_table (already built once for the chosen-token rendering
+        path) and falling back to ``tokenizer.decode`` for partial-UTF-8
+        ids whose table entry is None. Only fires K times per step when
+        top-K capture is live, so the slower fallback is in the noise."""
+        if token_table is not None and 0 <= tid < _vocab:
+            cached = token_table[tid]
+            if cached is not None:
+                return cached
+        return tokenizer.decode([tid])
 
     try:
         with torch.inference_mode():
             for _ in range(config.max_new_tokens):
                 if state.stop_requested.is_set():
                     state.finish_reason = "stop"
+                    # Stop fired while still inside a thinking phase:
+                    # anchor ``thinking_end_idx`` at the current position
+                    # so :meth:`SaklasSession._finalize_generation` doesn't
+                    # decode the unfinished thoughts as the response text.
+                    # Without this, ``response_ids = generated_ids[0:]``
+                    # would land the entire thinking dump on the loom
+                    # node's ``text`` field — the TUI's live view hides
+                    # the bug (it builds the response from ``on_token``
+                    # directly), but the webui re-renders ``node.text``
+                    # after ``tree_mutated finalize_assistant`` arrives.
+                    if tstate in (
+                        _ThinkState.PREAMBLE,
+                        _ThinkState.THINKING,
+                        _ThinkState.RESPONSE_PREAMBLE,
+                    ):
+                        state.thinking_end_idx = len(generated_ids)
                     break
 
                 # Update the shared TriggerContext read by steering hooks.
@@ -740,64 +893,80 @@ def generate_steered(
 
                 # Presence + frequency penalty (applied to raw logits,
                 # before temperature, per OpenAI semantics).
-                if use_penalties and completion_counts:
-                    ids = list(completion_counts.keys())
-                    counts = list(completion_counts.values())
-                    idx_t = torch.tensor(ids, dtype=torch.long, device=device)
-                    cnt_t = torch.tensor(counts, dtype=logits.dtype, device=device)
-                    logits[0, idx_t] -= frequency_penalty * cnt_t + presence_penalty
+                if penalty_state is not None:
+                    penalty_state.apply(
+                        logits,
+                        presence_penalty=presence_penalty,
+                        frequency_penalty=frequency_penalty,
+                    )
 
                 if bias_idx is not None:
                     logits[0, bias_idx] += bias_val.to(logits.dtype)
 
-                # Full-vocab log-softmax in fp32 — feeds both perplexity
-                # (every step) and chosen/top logprobs (on demand).
-                #
-                # Gated: when no caller consumes per-token info (no on_token
-                # callback and logprobs disabled), skip the fp32 softmax + the
-                # entropy .item() sync entirely.  Sentinel ``current_perplexity =
-                # float("nan")`` is propagated to ``_emit_token`` for the
-                # otherwise-degenerate partial-flush path so downstream
-                # destructuring stays type-stable.  The session-side
-                # ``_token_tap`` only gets installed when at least one of
-                # logprobs / user on_token / trait-queue scoring is live, so
-                # this gate fires for the v3-style stateless prefill workload
-                # that pegged this block on the profile.
                 chosen_logprob: float | None = None
-                top_lp_pairs: list[tuple[int, float]] | None = None
-                if on_token is not None or logprobs is not None:
-                    lp = torch.log_softmax(logits.float(), dim=-1)
-                    # Shannon entropy in nats → perplexity via exp.
-                    entropy_nats = float((-lp.exp() * lp).sum().item())
+                top_alts: list[TokenAlt] | None = None
+                capture_sampler_stats = on_token is not None or logprobs is not None
+                cand_ids, cand_probs = _sampler_candidates(logits, config, topk_k)
+                if config.temperature <= 0:
+                    chosen_pos = torch.zeros(1, device=device, dtype=torch.long)
+                else:
+                    chosen_pos = torch.multinomial(cand_probs.unsqueeze(0), 1).reshape(1)
+                next_token = cand_ids.index_select(0, chosen_pos).reshape(1, 1)
+
+                # Forced-prefix replay (logit fork).  For the first
+                # ``len(forced_prefix)`` decode steps the sampled token is
+                # overridden with the caller-supplied id.  The multinomial
+                # draw above still ran, so re-seeding with the original
+                # seed keeps the RNG stream bit-identical through the fork
+                # point — only the token *fed back* into the model changes.
+                # ``chosen_pos`` is retargeted into the candidate pool so
+                # the logprob/top-alts capture below describes the forced
+                # token; an id outside the top-k pool (rare — forced ids
+                # were originally sampled, so almost always in-pool) falls
+                # back to a direct tensor build + full-softmax logprob.
+                forced_in_pool = True
+                if (forced_prefix is not None
+                        and len(generated_ids) < len(forced_prefix)):
+                    forced_id = forced_prefix[len(generated_ids)]
+                    hit = (cand_ids == forced_id).nonzero(as_tuple=False)
+                    if hit.numel() > 0:
+                        chosen_pos = hit[0, 0].reshape(1)
+                        next_token = cand_ids.index_select(
+                            0, chosen_pos,
+                        ).reshape(1, 1)
+                    else:
+                        forced_in_pool = False
+                        next_token = torch.tensor(
+                            [[forced_id]], device=device, dtype=cand_ids.dtype,
+                        )
+
+                if capture_sampler_stats:
+                    cand_logp = cand_probs.clamp_min(
+                        torch.finfo(torch.float32).tiny,
+                    ).log()
+                    entropy_nats = float((-(cand_probs * cand_logp)).sum().item())
                     current_perplexity = math.exp(entropy_nats)
                 else:
-                    lp = None
+                    cand_logp = None
                     current_perplexity = float("nan")
 
-                if config.temperature <= 0:
-                    # Greedy
-                    next_token = logits.argmax(dim=-1, keepdim=True)
-                else:
-                    # Temperature + top-p (nucleus) sampling
-                    logits.div_(config.temperature)
-                    top_logits, top_idx = logits.topk(topk_k, dim=-1, sorted=True)
-                    probs = top_logits.softmax(dim=-1)
-                    cumprobs = probs.cumsum(dim=-1)
-                    mask = (cumprobs - probs) >= config.top_p
-                    probs[mask] = 0.0
-                    probs[:, :1].clamp_(min=1e-8)
-                    probs.div_(probs.sum(dim=-1, keepdim=True))
-
-                    token_idx = torch.multinomial(probs, 1)
-                    next_token = top_idx.gather(-1, token_idx)
-
-                token_id = next_token.item()
+                token_id = int(next_token.item())
 
                 if logprobs is not None:
-                    chosen_logprob = lp[0, token_id].item()
+                    assert cand_logp is not None
+                    if forced_in_pool:
+                        chosen_logprob = float(cand_logp[chosen_pos.item()].item())
+                    else:
+                        chosen_logprob = float(torch.log_softmax(
+                            logits.float(), dim=-1,
+                        )[0, token_id].item())
                     if logprobs > 0:
-                        tlv, tli = lp[0].topk(min(logprobs, _vocab))
-                        top_lp_pairs = [(int(i), float(v)) for i, v in zip(tli.tolist(), tlv.tolist())]
+                        tlv, tpos = cand_logp.topk(min(logprobs, cand_logp.numel()))
+                        tli = cand_ids.index_select(0, tpos)
+                        top_alts = [
+                            TokenAlt(id=int(i), text=_decode_alt(int(i)), logprob=float(v))
+                            for i, v in zip(tli.tolist(), tlv.tolist())
+                        ]
 
                 if token_id in eos_ids:
                     # Channel-based models (gpt-oss) use EOS tokens as
@@ -809,10 +978,7 @@ def generate_steered(
                         state.finish_reason = "stop"
                         break
                     generated_ids.append(token_id)
-                    if no_cache_mode:
-                        current_input = torch.cat([current_input, next_token], dim=1)
-                    else:
-                        current_input = next_token
+                    _advance_current_input(next_token)
                     if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
                             _emit_token(tokenizer.decode(pending_ids),
@@ -834,10 +1000,7 @@ def generate_steered(
 
                 # Advance KV cache state (common to all non-EOS paths)
                 generated_ids.append(token_id)
-                if no_cache_mode:
-                    current_input = torch.cat([current_input, next_token], dim=1)
-                else:
-                    current_input = next_token
+                _advance_current_input(next_token)
 
                 # Handle thinking start delimiter (Gemma-style: model
                 # explicitly opens a thinking channel)
@@ -890,8 +1053,8 @@ def generate_steered(
                 # Penalty bookkeeping: count all emitted completion tokens
                 # (thinking and response alike, matching OpenAI's treatment
                 # of the full completion sequence).
-                if use_penalties:
-                    completion_counts[token_id] = completion_counts.get(token_id, 0) + 1
+                if penalty_state is not None:
+                    penalty_state.add(token_id)
 
                 if on_token:
                     tok_str = token_table[token_id] if token_id < _vocab else ''
@@ -928,14 +1091,14 @@ def generate_steered(
                                 if trimmed:
                                     state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                                     _emit_token(trimmed, emit_thinking, emit_id,
-                                                chosen_logprob, top_lp_pairs,
+                                                chosen_logprob, top_alts,
                                                 current_perplexity)
                                 state.finish_reason = "stop_sequence"
                                 break
                             completion_text = new_text
                         state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                         _emit_token(emit_text, emit_thinking, emit_id,
-                                    chosen_logprob, top_lp_pairs,
+                                    chosen_logprob, top_alts,
                                     current_perplexity)
 
         # Flush any remaining buffered partial tokens.  No fresh forward

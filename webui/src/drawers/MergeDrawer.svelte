@@ -4,8 +4,8 @@
   //
   // Expression is live-validated in the browser using parseExpression
   // (mirrors the server parser).  On submit, POST /vectors/merge wraps
-  // saklas.io.merge.merge_into_pack server-side; the response carries
-  // the canonical name + profile, which we drop into the rack.
+  // saklas.io.merge.merge_into_pack server-side; the response is the
+  // same VectorInfo shape GET /vectors/{name} returns.
   //
   // Variant picker covers raw / sae / sae-<release>.  The merge endpoint
   // body shape is { name, expression } only — no variant field on the
@@ -127,7 +127,7 @@
         name: name.trim(),
         expression: expression.trim(),
       });
-      addVectorToRack(r.canonical ?? r.profile?.name ?? name.trim());
+      addVectorToRack(r.name ?? name.trim());
       closeDrawer();
     } catch (e) {
       if (e instanceof ApiError) {
@@ -180,7 +180,7 @@
       <span class="label">expression</span>
       <textarea
         rows="4"
-        placeholder={`0.5 honest + 0.3 warm~confident\n— or paste any canonical steering expression.`}
+        placeholder={`0.5 honest + 0.3 warm~confident\nor paste any canonical steering expression.`}
         bind:value={expression}
         spellcheck="false"
         autocomplete="off"
@@ -198,7 +198,7 @@
           {#each unknownTerms as t, i}
             <code>{t}</code>{#if i < unknownTerms.length - 1},{" "}{/if}
           {/each}
-          — server will resolve from installed packs.
+          (server will resolve them from installed packs).
         </p>
       {/if}
     </label>
@@ -300,29 +300,29 @@
     height: 100%;
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
   }
   .head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.6em 1em;
+    padding: var(--space-4) var(--space-5);
     border-bottom: 1px solid var(--border);
   }
   .head h2 {
     margin: 0;
-    font-size: 1em;
+    font-size: var(--text);
     color: var(--accent-blue);
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     text-transform: lowercase;
   }
   .close {
     background: transparent;
     border: 0;
     color: var(--fg-dim);
-    font-size: 1em;
+    font-size: var(--text);
     line-height: 1;
-    padding: 0.25em 0.4em;
+    padding: var(--space-2) var(--space-3);
     cursor: pointer;
   }
   .close:hover {
@@ -332,24 +332,24 @@
   .body {
     flex: 1;
     overflow-y: auto;
-    padding: 0.8em 1em;
+    padding: var(--space-5) var(--space-5);
     display: flex;
     flex-direction: column;
-    gap: 0.7em;
+    gap: var(--space-4);
     min-height: 0;
   }
 
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.25em;
+    gap: var(--space-2);
   }
   .label,
   .variant legend {
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     text-transform: lowercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     padding: 0;
   }
   input[type="text"],
@@ -357,10 +357,10 @@
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0.45em 0.6em;
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     box-sizing: border-box;
     width: 100%;
   }
@@ -370,48 +370,48 @@
   }
   input[type="text"]:focus,
   textarea:focus {
-    outline: 1px solid var(--accent-blue);
-    border-color: var(--accent-blue);
+    outline: 1px solid var(--accent);
+    border-color: var(--accent);
   }
 
   .variant {
-    border: 1px solid var(--border-dim);
-    border-radius: 4px;
-    padding: 0.5em 0.7em;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
     margin: 0;
     display: flex;
     flex-wrap: wrap;
-    gap: 0.4em 1em;
+    gap: var(--space-3) var(--space-5);
     align-items: center;
   }
   .variant legend {
-    padding: 0 0.3em;
+    padding: 0 var(--space-2);
   }
   .radio {
     display: inline-flex;
     align-items: center;
-    gap: 0.3em;
+    gap: var(--space-2);
     color: var(--fg);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .release-input {
     width: 12em;
-    padding: 0.2em 0.4em;
-    font-size: var(--font-size-small);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-sm);
   }
   .apply-variant {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--fg-dim);
-    padding: 0.25em 0.6em;
-    border-radius: 3px;
+    padding: var(--space-2) var(--space-4);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
   }
   .apply-variant:hover:not(:disabled) {
     color: var(--fg);
-    border-color: var(--accent-blue);
+    border-color: var(--accent);
   }
   .apply-variant:disabled {
     opacity: 0.45;
@@ -421,18 +421,18 @@
   .preview {
     margin: 0;
     color: var(--fg-strong);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .preview code {
     color: var(--accent-green);
     background: var(--bg-deep);
-    padding: 0.05em 0.3em;
-    border-radius: 2px;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius);
   }
   .warn {
     margin: 0;
     color: var(--accent-yellow);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .warn code {
     color: inherit;
@@ -440,17 +440,17 @@
   .error {
     margin: 0;
     color: var(--accent-error);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     word-break: break-word;
   }
   .muted {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
   }
   .hint summary {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
     list-style: revert;
   }
@@ -460,30 +460,30 @@
   .hint code {
     color: var(--accent-blue);
     background: var(--bg-deep);
-    padding: 0.05em 0.3em;
-    border-radius: 2px;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius);
   }
 
   .foot {
     border-top: 1px solid var(--border);
-    padding-top: 0.6em;
+    padding-top: var(--space-4);
     margin-top: auto;
     display: flex;
     justify-content: flex-end;
-    gap: 0.5em;
+    gap: var(--space-3);
   }
   .primary {
-    background: var(--accent-blue);
-    color: var(--bg-deep);
-    border: 1px solid var(--accent-blue);
-    padding: 0.35em 1em;
-    border-radius: 3px;
+    background: var(--accent);
+    color: var(--text-on-accent);
+    border: 1px solid var(--accent);
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
-    gap: 0.4em;
+    gap: var(--space-3);
   }
   .primary:hover:not(:disabled) {
     filter: brightness(1.1);
@@ -496,10 +496,10 @@
     background: transparent;
     border: 1px solid var(--border);
     color: var(--fg-dim);
-    padding: 0.35em 0.9em;
-    border-radius: 3px;
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
   }
   .secondary:hover {
@@ -510,7 +510,7 @@
     width: 0.7em;
     height: 0.7em;
     border-radius: 50%;
-    border: 1.5px solid var(--bg-deep);
+    border: 1px solid var(--bg-deep);
     border-right-color: transparent;
     animation: spin 0.7s linear infinite;
     display: inline-block;

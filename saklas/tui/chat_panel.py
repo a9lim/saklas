@@ -2,19 +2,228 @@
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any
 
 from rich.markup import escape as _rich_escape
+from textual import events as _textual_events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Static, Input, Collapsible
+from textual.widgets import Static, TextArea, Collapsible
 from textual.widget import Widget
 from textual.message import Message
 
 from saklas.tui.utils import BAR_WIDTH, build_bar
 
+
+# --- Pending queue (mid-gen submissions) ----------------------------------
+#
+# Both the TUI and the GUI defer chat sends, commits, and interrupting
+# slash commands while a generation is in flight rather than tearing the
+# current stream down to make room.  The TUI side lives here so the
+# ``PendingStrip`` widget can render directly off the dataclass without an
+# adapter layer; ``SaklasApp`` owns the list and dispatches each item once
+# the next ``done`` lands.
+
+# Short tag rendered at the head of each pending row.  Keys must match the
+# ``kind`` strings used by ``SaklasApp._dispatch_pending_action``.
+_KIND_LABELS: dict[str, str] = {
+    "submit": "msg",
+    "commit_user": "commit",
+    "commit_assistant": "commit",
+    "regenerate": "regen",
+    "rewind": "/rewind",
+    "clear": "/clear",
+    "quit": "/quit",
+    "steer": "/steer",
+    "probe": "/probe",
+    "extract": "/extract",
+    "regen_n": "/regen",
+    "fan": "/fan",
+}
+
+# Sentinel used in a PendingItem payload to defer parent-node resolution
+# until drain time.  When a queued commit / prefill should hang under a
+# node that another earlier-queued action will create (e.g. a
+# ``commit_user`` followed by a ``commit_assistant``), capturing the
+# live active id at submit time would point at the wrong node — this
+# sentinel tells the dispatcher to read ``session.tree.active_node_id``
+# fresh, by which point the earlier queue items have landed.
+ACTIVE_AT_DRAIN = "__active@drain__"
+
+# Per-kind prediction of the active-node role *after* the item drains.
+# Drives the queue-aware input placeholder: a queued ``commit_user``
+# (value ``True``) flips the next submission into prefill mode without
+# waiting for the queue to drain.  Items missing from this map are
+# treated as "no role change" — rack mutations, /steer, /probe, etc.
+_KIND_ENDS_ON_USER_NODE: dict[str, bool] = {
+    "submit": False,           # send → assistant
+    "commit_user": True,       # user turn lands → active = user
+    "commit_assistant": False, # assistant turn lands → active = assistant
+    "regenerate": False,       # new assistant sibling
+    "rewind": True,            # rewinds to the previous user turn
+    "clear": False,            # resets to root (system, not user)
+    "regen_n": False,          # N assistant siblings
+    "fan": False,              # alpha-grid siblings, all assistant
+}
+
+# Kinds whose dispatched action is fully synchronous on the UI thread —
+# no worker, no done sentinel.  ``_drain_next_pending`` chain-drains
+# through them inline rather than blocking for a ``done`` that will
+# never arrive.  Kinds NOT in this set must either (a) fire a worker
+# that runs a generation (the gen's own ``done`` advances the drain),
+# or (b) fire a worker that explicitly enqueues ``("done", False)``
+# in its finally block (the commit / extract pattern).  This was the
+# root cause of the "queue stuck after commit" bug — commits ran on
+# workers without enqueuing a done sentinel, leaving the drain loop
+# stalled until the next genuine generation ``done``.
+_KIND_CHAIN_INLINE: frozenset[str] = frozenset({
+    "clear",
+    "rewind",
+    "steer",
+    "probe",
+})
+
+
+@dataclass(frozen=True)
+class PendingItem:
+    """One mid-generation submission deferred until the next ``done``.
+
+    Attributes
+    ----------
+    kind:
+        Dispatch tag consumed by
+        :meth:`SaklasApp._dispatch_pending_action`.  Values mirror the
+        legacy single-tuple ``_pending_action`` shapes one-for-one.
+    text:
+        Verbatim text the user typed (or the canonical re-typeable form
+        for slash-triggered items, e.g. ``"/steer 0.5 angry"``).  Drives
+        the strip display and the up-arrow pull-and-edit path — when the
+        user pulls an item back into the chat input the text shown here
+        is what they see.
+    payload:
+        Kind-specific extras: ``("submit", text, prefill_target)`` becomes
+        ``payload=(prefill_target,)``, ``("commit_assistant", text,
+        user_node_id)`` becomes ``payload=(user_node_id,)``, etc.  Empty
+        tuple when the kind has no extra args.
+    """
+
+    kind: str
+    text: str = ""
+    payload: tuple[Any, ...] = field(default_factory=tuple)
+
+    @property
+    def label(self) -> str:
+        """Short bracketed tag — ``msg``, ``commit``, ``/steer``, …"""
+        return _KIND_LABELS.get(self.kind, self.kind)
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    """Single-line ellipsised display form for the pending strip.
+
+    Newlines fold to ``⏎`` so a multi-line message reads as one strip
+    row; the ellipsis honors a hard char cap so a long pasted block
+    can't push the row to the full window width.
+    """
+    flat = text.replace("\n", " ⏎ ")
+    if len(flat) <= max_chars:
+        return flat
+    return flat[: max_chars - 1] + "…"
+
+
+class PendingStrip(Static):
+    """Ghosted single-line summary above the chat input.
+
+    Renders the current ``PendingItem`` queue as a compact dim listing —
+    ``pending 3 · [msg] what do you think? · [/steer] /steer 0.5 angry · …``.
+    Hidden via the ``.hidden`` CSS class when the queue is empty so the
+    strip takes zero rows in the common no-pending case.
+
+    The slot currently pulled into the input (``pulled_slot`` arg) is
+    highlighted with a leading ``✎`` marker and undimmed text so the
+    user can see at a glance which queued item is being edited.
+
+    Per-item cancel is keyboard-only and lives on the chat input side:
+    pull the item with ``↑``, clear with ``Ctrl+U``, ``Enter`` (the
+    empty-input replace path removes the slot).  The strip itself is
+    display-only — keeping it non-focusable means the existing
+    ``Tab`` panel cycle is unchanged.
+    """
+
+    DEFAULT_CSS = ""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(id="pending-strip", **kwargs)
+        self.add_class("hidden")
+        self._queue: list[PendingItem] = []
+
+    def update_queue(
+        self, queue: list[PendingItem], *, pulled_slot: int | None = None,
+    ) -> None:
+        """Replace the rendered queue.  Hides the strip when empty.
+
+        ``pulled_slot`` (when in range) marks the item the user is
+        currently editing via the ↑-pull-and-edit path: that entry
+        renders with a leading ``✎`` and undimmed text so the editing
+        state is visible without an extra row.
+        """
+        self._queue = list(queue)
+        if not self._queue:
+            self.add_class("hidden")
+            self.update("")
+            return
+        self.remove_class("hidden")
+        n = len(self._queue)
+        parts: list[str] = [f"[ansi_yellow]pending {n}[/ansi_yellow]"]
+        for i, item in enumerate(self._queue):
+            label_esc = _rich_escape(item.label)
+            text_esc = _rich_escape(_truncate(item.text, 48))
+            if i == pulled_slot:
+                # Undimmed + ✎ marker so the user can see at a glance
+                # which queued item is being edited.
+                parts.append(
+                    f"[ansi_yellow]✎ {label_esc}[/ansi_yellow] {text_esc}"
+                )
+            else:
+                parts.append(
+                    f"[dim][ansi_blue]{label_esc}[/ansi_blue] {text_esc}[/dim]"
+                )
+        self.update(" · ".join(parts))
+
 _HIGHLIGHT_SAT = 0.5
 _HIGHLIGHT_CACHE_MAX = 4
+
+# Logit-pass: sentinel ``_highlight_probe`` value that selects the
+# inline surprise highlight (tokens tinted by chosen-token logprob).
+# Distinct from any real probe name — probe names are slugged
+# ``[a-z0-9._-]`` so the double-underscore form can't collide.  Same
+# string as ``webui/src/lib/tokens.ts::SURPRISE_TARGET`` to keep the
+# two surfaces in sync.
+SURPRISE_PROBE = "__surprise__"
+
+
+def _surprise_score(logprob: float | None) -> float:
+    """Map a chosen-token logprob to a positive ``[0, ~0.5]`` tint score
+    suitable for ``_build_highlight_markup``'s saturation mapping.
+
+        tint = 1 - exp(logprob) = 1 - probability   # [0, 1)
+        score = tint * _HIGHLIGHT_SAT               # so 1.0 saturates green
+
+    ``logprob`` is the log of a probability so it's always ≤ 0 —
+    ``exp(logprob)`` lands in (0, 1] and ``tint`` lands in [0, 1).
+    None / non-finite logprobs return 0 (no tint).
+    """
+    if logprob is None:
+        return 0.0
+    # Defensive bounds: logprob is the log of a probability so it must be
+    # ≤ 0.  Anything outside that range (NaN, inf, accidental positive)
+    # falls through to "no tint" rather than poisoning the markup.
+    if not (-float("inf") < logprob <= 0.0):
+        return 0.0
+    tint = 1.0 - math.exp(logprob)
+    return tint * _HIGHLIGHT_SAT
 
 
 def _build_highlight_markup(
@@ -61,7 +270,7 @@ class _AssistantMessage(Vertical):
     navigating the trait panel is a dict lookup instead of a rebuild.
     """
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._escaped_chat_text: str = ""
         self._escaped_thinking_text: str = ""
@@ -77,9 +286,20 @@ class _AssistantMessage(Vertical):
         self._thinking_markup_cache: OrderedDict[str, str] = OrderedDict()
         self._response_probe_scores: dict[str, list[float]] = {}
         self._thinking_probe_scores: dict[str, list[float]] = {}
+        # Logit-pass: parallel per-token logprob lists feed the
+        # ``SURPRISE_PROBE`` markup path.  Indexed in lock-step with the
+        # streamed-token lists; missing entries are None (the surprise
+        # score helper renders no tint for those positions).
+        self._response_logprobs: list[float | None] = []
+        self._thinking_logprobs: list[float | None] = []
 
         self._highlight_on: bool = False
         self._highlight_probe: str | None = None
+
+        # Finalized content staged before the content Statics are wired.
+        # Textual mounts asynchronously, so ``set_static_content`` (the
+        # loom-repaint path) stashes here and ``on_mount`` applies it.
+        self._pending_static: dict[str, Any] | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("[bold ansi_green]Assistant:[/]")
@@ -91,6 +311,9 @@ class _AssistantMessage(Vertical):
         self._thinking_block = self.query_one("#thinking-block", Collapsible)
         self._thinking_view = self.query_one("#thinking-view", Static)
         self._response_view = self.query_one("#response-view", Static)
+        if self._pending_static is not None:
+            self._apply_static(self._pending_static)
+            self._pending_static = None
 
     # -- Streaming --
 
@@ -113,6 +336,77 @@ class _AssistantMessage(Vertical):
         tb = self._thinking_block
         if tb is not None and not tb.collapsed and not tb.has_class("hidden"):
             tb.collapsed = True
+
+    # -- Static (finalized) content --
+
+    def set_static_content(
+        self,
+        response_text: str,
+        thinking_text: str = "",
+        *,
+        response_tokens: list[str] | None = None,
+        thinking_tokens: list[str] | None = None,
+        response_logprobs: list[float | None] | None = None,
+        thinking_logprobs: list[float | None] | None = None,
+    ) -> None:
+        """Populate a finalized assistant message in one shot.
+
+        Used when repainting the chat log along a navigated loom path —
+        the node's text is already complete, so there's no streaming.
+        Per-token strings / logprobs are optional: when present they let
+        surprise-mode highlighting survive a navigation; per-probe scores
+        aren't persisted on loom nodes, so probe highlight stays plain.
+        Deferred to ``on_mount`` when the content widgets aren't wired
+        yet (Textual mounts asynchronously).
+        """
+        payload: dict[str, Any] = {
+            "response_text": response_text,
+            "thinking_text": thinking_text,
+            "response_tokens": list(response_tokens or []),
+            "thinking_tokens": list(thinking_tokens or []),
+            "response_logprobs": list(response_logprobs or []),
+            "thinking_logprobs": list(thinking_logprobs or []),
+        }
+        if self._response_view is None:
+            self._pending_static = payload
+        else:
+            self._apply_static(payload)
+
+    def _apply_static(self, payload: dict[str, Any]) -> None:
+        resp_tokens = payload["response_tokens"]
+        think_tokens = payload["thinking_tokens"]
+        # Prefer per-token text so the escaped body matches the highlight
+        # token list exactly (loaded trees carry no tokens — fall back to
+        # the node's canonical text).
+        if resp_tokens:
+            self._escaped_chat_text = "".join(_rich_escape(t) for t in resp_tokens)
+        else:
+            self._escaped_chat_text = _rich_escape(payload["response_text"])
+        if think_tokens:
+            self._escaped_thinking_text = "".join(
+                _rich_escape(t) for t in think_tokens
+            )
+        else:
+            self._escaped_thinking_text = _rich_escape(payload["thinking_text"])
+        self._streamed_response_tokens = list(resp_tokens)
+        self._streamed_thinking_tokens = list(think_tokens)
+        self.response_token_strs = list(resp_tokens)
+        self.thinking_token_strs = list(think_tokens)
+        self._response_logprobs = list(payload["response_logprobs"])
+        self._thinking_logprobs = list(payload["thinking_logprobs"])
+        self._response_probe_scores = {}
+        self._thinking_probe_scores = {}
+        self._response_markup_cache.clear()
+        self._thinking_markup_cache.clear()
+        tb = self._thinking_block
+        if tb is not None:
+            if payload["thinking_text"] or think_tokens:
+                tb.remove_class("hidden")
+                tb.collapsed = True
+            else:
+                tb.add_class("hidden")
+        self._render_response()
+        self._render_thinking()
 
     # -- Highlight data --
 
@@ -164,20 +458,55 @@ class _AssistantMessage(Vertical):
             else:
                 self._render_response()
 
+    def append_token_logprob(
+        self, logprob: float | None, is_thinking: bool,
+    ) -> None:
+        """Append one token's chosen-token logprob (logit-pass).
+
+        Mirrors ``append_token_score``: appends to the per-side logprob
+        list, invalidates the surprise-mode markup cache (only the
+        ``SURPRISE_PROBE`` key — leaving probe-keyed cache entries
+        intact), and re-renders if the user is currently sitting in
+        surprise highlight.
+        """
+        target = self._thinking_logprobs if is_thinking else self._response_logprobs
+        target.append(logprob)
+        cache = (
+            self._thinking_markup_cache if is_thinking else self._response_markup_cache
+        )
+        cache.pop(SURPRISE_PROBE, None)
+        if self._highlight_on and self._highlight_probe == SURPRISE_PROBE:
+            if is_thinking:
+                self._render_thinking()
+            else:
+                self._render_response()
+
     def _get_response_markup(self, probe: str) -> str | None:
         cached = self._response_markup_cache.get(probe)
         if cached is not None:
             self._response_markup_cache.move_to_end(probe)
             return cached
-        scores = self._response_probe_scores.get(probe)
-        if scores is None:
-            return None
         # Prefer the live-streamed token list (always current) over the
         # finalize-time canonical list, which set_token_data fills only at end.
         token_strs = self.response_token_strs or self._streamed_response_tokens
-        markup = _build_highlight_markup(
-            token_strs, scores, strip_leading_whitespace=True,
-        )
+        if probe == SURPRISE_PROBE:
+            # Logit-pass: tint by ``surprise_score(logprob)``.  Empty
+            # logprob list short-circuits to None so the renderer falls
+            # through to plain-text and the user sees raw text instead of
+            # uniform-no-tint markup.
+            if not self._response_logprobs:
+                return None
+            scores = [_surprise_score(lp) for lp in self._response_logprobs]
+            markup = _build_highlight_markup(
+                token_strs, scores, strip_leading_whitespace=True,
+            )
+        else:
+            scores = self._response_probe_scores.get(probe)
+            if scores is None:
+                return None
+            markup = _build_highlight_markup(
+                token_strs, scores, strip_leading_whitespace=True,
+            )
         self._response_markup_cache[probe] = markup
         if len(self._response_markup_cache) > _HIGHLIGHT_CACHE_MAX:
             self._response_markup_cache.popitem(last=False)
@@ -188,11 +517,17 @@ class _AssistantMessage(Vertical):
         if cached is not None:
             self._thinking_markup_cache.move_to_end(probe)
             return cached
-        scores = self._thinking_probe_scores.get(probe)
-        if scores is None:
-            return None
         token_strs = self.thinking_token_strs or self._streamed_thinking_tokens
-        markup = _build_highlight_markup(token_strs, scores)
+        if probe == SURPRISE_PROBE:
+            if not self._thinking_logprobs:
+                return None
+            scores = [_surprise_score(lp) for lp in self._thinking_logprobs]
+            markup = _build_highlight_markup(token_strs, scores)
+        else:
+            scores = self._thinking_probe_scores.get(probe)
+            if scores is None:
+                return None
+            markup = _build_highlight_markup(token_strs, scores)
         self._thinking_markup_cache[probe] = markup
         if len(self._thinking_markup_cache) > _HIGHLIGHT_CACHE_MAX:
             self._thinking_markup_cache.popitem(last=False)
@@ -269,7 +604,7 @@ class _TurnRow(Horizontal):
     """
 
     def __init__(
-        self, kind: str, primary_child: Widget, shadow_child: Widget, **kwargs,
+        self, kind: str, primary_child: Widget, shadow_child: Widget, **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.add_class("turn-row")
@@ -301,6 +636,69 @@ class _TurnRow(Horizontal):
         return self._shadow
 
 
+class ChatInput(TextArea):
+    """Multi-line chat input on top of ``TextArea``.
+
+    Differs from the underlying widget in two ways:
+
+    - **Enter submits.** Bare ``Enter`` posts a :class:`Submitted`
+      message and clears the buffer.  ``Shift+Enter`` inserts a literal
+      newline (TextArea's default ``Enter`` behavior moved one key over).
+    - **Cursor-aware history pass-through.** ``↑``/``↓`` only walk the
+      input-history ring when the cursor is on the first/last row of
+      the buffer; mid-buffer they fall through to TextArea's cursor
+      navigation.  The history walk itself lives in
+      ``SaklasApp._history_navigate`` — we just gate the event here.
+
+    Submission goes through a widget-local ``Submitted`` message so the
+    enclosing :class:`ChatPanel` re-posts it as ``UserSubmitted`` (the
+    same contract callers depend on for prefill / commit dispatch).
+    """
+
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # When ``True``, bare ``Enter`` on an empty buffer still emits
+        # ``Submitted("")`` rather than swallowing the keypress.  The
+        # app flips this on while a pending slot is pulled so the
+        # empty-Enter cancel gesture reaches
+        # :meth:`SaklasApp.on_chat_panel_user_submitted`, which uses
+        # the empty-text + pulled-slot pair to remove the queued
+        # item.
+        self.allow_empty_submit: bool = False
+
+    async def _on_key(self, event: _textual_events.Key) -> None:
+        # Bare Enter submits; ``shift+enter`` and ``ctrl+j`` both insert
+        # a literal newline.  Two newline keys because ``shift+enter`` is
+        # the natural chat-UI convention but it only reaches the app on
+        # terminals that speak the CSI-u / kitty keyboard protocol
+        # (Ghostty, Kitty, WezTerm) — stock macOS Terminal.app and
+        # iTerm2 silently collapse it to bare ``enter``.  ``ctrl+j``
+        # sends a literal LF (0x0A) which Textual's ``KEY_ALIASES``
+        # routes as a separate key from ``enter`` (CR, 0x0D) on every
+        # terminal, so it's the reliable cross-terminal fallback.
+        # Anything else hands off to ``TextArea._on_key`` (printable
+        # chars, etc.).
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            text = self.text.strip()
+            if text or self.allow_empty_submit:
+                self.load_text("")
+                self.post_message(self.Submitted(text))
+            return
+        if event.key in ("shift+enter", "ctrl+j"):
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            return
+        await super()._on_key(event)
+
+
 class ChatPanel(Widget):
 
     class UserSubmitted(Message):
@@ -308,29 +706,121 @@ class ChatPanel(Widget):
             super().__init__()
             self.text = text
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._log: VerticalScroll | None = None
         self._status_bar: Static | None = None
         self._ab_mode: bool = False
+        # In-memory mirror of system-message strings.  ``add_system_message``
+        # mounts a ``Static`` widget AND appends to this list so callers
+        # (tests, transcript export, future log search) can read the
+        # rendered system-message text without walking the widget tree.
+        # Append-only; ``clear_log`` resets.
+        self.messages: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
         yield Static("", id="status-bar")
-        yield Input(placeholder="Type a message...", id="chat-input")
+        # Pending-queue strip — single-line summary of mid-gen
+        # submissions waiting for the next ``done``.  Hidden when the
+        # queue is empty.  Mounted between the status bar and the input
+        # so it lives in the same "below the log" footer region the
+        # user already reads for state.
+        yield PendingStrip()
+        # Multi-line chat input.  ``show_line_numbers=False`` keeps the
+        # editor chrome out; ``soft_wrap=True`` is the TextArea default
+        # (long lines wrap visually without changing the underlying
+        # newlines).  ``highlight_cursor_line=False`` disables the
+        # always-on "boost"-coloured background under the cursor line —
+        # under the ansi theme that read as an opaque black band rather
+        # than a subtle highlight.  Height grows with content up to a
+        # CSS-side cap.
+        yield ChatInput(
+            placeholder="message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline",
+            id="chat-input",
+            show_line_numbers=False,
+            highlight_cursor_line=False,
+        )
 
     def on_mount(self) -> None:
         self._log = self.query_one("#chat-log", VerticalScroll)
         self._status_bar = self.query_one("#status-bar", Static)
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    @property
+    def pending_strip(self) -> PendingStrip:
+        return self.query_one(PendingStrip)
+
+    def update_pending(
+        self, queue: list[PendingItem], *, pulled_slot: int | None = None,
+    ) -> None:
+        """Forward queue updates to the strip.  Safe before mount.
+
+        ``pulled_slot`` marks the queue position the user is currently
+        editing via the ↑-pull-and-edit path so the strip renders
+        that entry with the editing marker.
+        """
+        try:
+            self.pending_strip.update_queue(queue, pulled_slot=pulled_slot)
+        except Exception:
+            # Pre-mount: ``query_one`` raises ``NoMatches``.  The strip
+            # is freshly empty on mount, so a missed update is a no-op.
+            pass
+
+    # All ``log`` / ``status_bar`` access happens after Textual's mount
+    # lifecycle has run ``on_mount``, so the assertions below are
+    # invariants — they exist to narrow the Optional for type checkers,
+    # not as runtime preconditions.
+    @property
+    def _log_mounted(self) -> VerticalScroll:
+        assert self._log is not None, "ChatPanel._log accessed before on_mount"
+        return self._log
+
+    @property
+    def _status_bar_mounted(self) -> Static:
+        assert self._status_bar is not None, "ChatPanel._status_bar accessed before on_mount"
+        return self._status_bar
+
+    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         text = event.value.strip()
-        if not text:
+        # ChatInput already cleared its buffer; just re-post under the
+        # canonical ChatPanel message.  The user-row mount is the app's
+        # call, not ours: on a user-role active loom node a typed message
+        # is an assistant prefill, not a new user turn, and only the app
+        # knows the active node's role.  ``on_chat_panel_user_submitted``
+        # mounts the row for normal sends.  An empty text reaches us
+        # only when ``ChatInput.allow_empty_submit`` is true — the
+        # cancel-pulled-slot gesture; the app routes it to slot
+        # removal.
+        try:
+            inp = self.query_one("#chat-input", ChatInput)
+            allow_empty = inp.allow_empty_submit
+        except Exception:
+            allow_empty = False
+        if not text and not allow_empty:
             return
-        event.input.value = ""
-        if not text.startswith("/"):
-            self.add_user_message(text)
         self.post_message(self.UserSubmitted(text))
+
+    def set_prefill_mode(self, on: bool) -> None:
+        """Flip the input placeholder between normal-send and prefill.
+
+        When the active loom node is a user turn a typed message seeds
+        the assistant reply (answer-prefill) rather than appending a new
+        user message; the placeholder is the signal the app updates as
+        navigation changes the active node's role.  Mirrors
+        :meth:`set_ab_mode`'s app-driven-flag shape.
+        """
+        try:
+            inp = self.query_one("#chat-input", ChatInput)
+        except Exception:
+            return
+        # Same `<verb>…  <bind list>` shape as the GUI's Chat.svelte
+        # placeholder; terminals can't surface modifier-only keydown so
+        # the TUI lacks the commit-key-held variants the GUI shows.
+        inp.placeholder = (
+            "prefill reply…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
+            if on
+            else "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
+        )
 
     # -- AB mode --
 
@@ -354,7 +844,7 @@ class ChatPanel(Widget):
 
     def _turn_rows(self) -> list[_TurnRow]:
         """All ``_TurnRow`` children of the log, in mount order."""
-        return [c for c in self._log.children if isinstance(c, _TurnRow)]
+        return [c for c in self._log_mounted.children if isinstance(c, _TurnRow)]
 
     def assistant_rows_pending_shadow(self) -> list[_TurnRow]:
         """Assistant rows whose shadow column still holds the placeholder
@@ -382,17 +872,19 @@ class ChatPanel(Widget):
 
     def clear_log(self) -> None:
         """Remove all messages from the chat log."""
-        self._log.remove_children()
+        self._log_mounted.remove_children()
+        self.messages.clear()
 
     def rewind(self) -> None:
         """Remove the last user turn-row and everything after it."""
-        children = list(self._log.children)
+        log = self._log_mounted
+        children = list(log.children)
         for i in range(len(children) - 1, -1, -1):
             child = children[i]
             if isinstance(child, _TurnRow) and child.kind == "user":
-                self._log.remove_children(children[i:])
+                log.remove_children(children[i:])
                 break
-        self._log.scroll_end(animate=False)
+        log.scroll_end(animate=False)
 
     def rewind_last_assistant(self) -> None:
         """Remove the last assistant turn-row only.
@@ -401,13 +893,14 @@ class ChatPanel(Widget):
         whole row goes — there's no useful intermediate state where we'd
         keep one column and drop the other.
         """
-        children = list(self._log.children)
+        log = self._log_mounted
+        children = list(log.children)
         for i in range(len(children) - 1, -1, -1):
             child = children[i]
             if isinstance(child, _TurnRow) and child.kind == "assistant":
                 child.remove()
                 break
-        self._log.scroll_end(animate=False)
+        log.scroll_end(animate=False)
 
     def add_user_message(self, text: str) -> _TurnRow:
         """Mount a user turn-row.  The same text is mirrored into both
@@ -422,8 +915,9 @@ class ChatPanel(Widget):
             shadow_child=_build_user_widget(text),
         )
         row.user_text = text
-        self._log.mount(row)
-        self._log.scroll_end(animate=False)
+        log = self._log_mounted
+        log.mount(row)
+        log.scroll_end(animate=False)
         return row
 
     def start_assistant_message(self) -> tuple[_TurnRow, _AssistantMessage]:
@@ -437,7 +931,40 @@ class ChatPanel(Widget):
         row = _TurnRow(
             kind="assistant", primary_child=widget, shadow_child=placeholder,
         )
-        self._log.mount(row)
+        self._log_mounted.mount(row)
+        return row, widget
+
+    def add_finalized_assistant(
+        self,
+        response_text: str,
+        thinking_text: str = "",
+        *,
+        response_tokens: list[str] | None = None,
+        thinking_tokens: list[str] | None = None,
+        response_logprobs: list[float | None] | None = None,
+        thinking_logprobs: list[float | None] | None = None,
+    ) -> tuple[_TurnRow, _AssistantMessage]:
+        """Mount a fully-rendered (non-streaming) assistant turn-row.
+
+        Counterpart to ``start_assistant_message`` for the loom-repaint
+        path — the node's text is complete, so the widget is populated
+        in one shot rather than token-by-token.  Returns ``(row, widget)``
+        so the caller can keep the same widget / row bookkeeping it does
+        for streamed turns.
+        """
+        widget = _AssistantMessage(classes="assistant-message")
+        widget.set_static_content(
+            response_text, thinking_text,
+            response_tokens=response_tokens,
+            thinking_tokens=thinking_tokens,
+            response_logprobs=response_logprobs,
+            thinking_logprobs=thinking_logprobs,
+        )
+        placeholder = _build_shadow_placeholder()
+        row = _TurnRow(
+            kind="assistant", primary_child=widget, shadow_child=placeholder,
+        )
+        self._log_mounted.mount(row)
         return row, widget
 
     def start_shadow_message(self, row: _TurnRow) -> _AssistantMessage:
@@ -455,11 +982,13 @@ class ChatPanel(Widget):
 
     def scroll_to_bottom(self) -> None:
         """Scroll the chat log to the bottom. Call once after a batch of token updates."""
-        self._log.scroll_end(animate=False)
+        self._log_mounted.scroll_end(animate=False)
 
     def add_system_message(self, text: str) -> None:
-        self._log.mount(Static(f"[dim]{text}[/]", classes="system-message"))
-        self._log.scroll_end(animate=False)
+        log = self._log_mounted
+        log.mount(Static(f"[dim]{text}[/]", classes="system-message"))
+        log.scroll_end(animate=False)
+        self.messages.append(text)
 
     def update_status(
         self,
@@ -469,9 +998,17 @@ class ChatPanel(Widget):
         tok_per_sec: float = 0.0,
         elapsed: float = 0.0,
         perplexity: float | None = None,
+        prune_expr: str | None = None,
+        auto_regen_mode: str | None = None,
     ) -> None:
-        """Update the status bar with generation stats."""
-        bar = self._status_bar
+        """Update the status bar with generation stats.
+
+        ``prune_expr`` (``app._loom_prune_expr``) and ``auto_regen_mode``
+        (``app._loom_auto_regen_mode`` when ``_loom_auto_regen_on`` and
+        the mode is not ``unsteered``) surface the otherwise-invisible
+        loom state in the chat footer.
+        """
+        bar = self._status_bar_mounted
         dot = "[ansi_green]●[/]" if generating else "[dim]○[/]"
         if max_tokens > 0 and (generating or gen_tokens > 0):
             t_full, t_empty = build_bar(gen_tokens, max_tokens, BAR_WIDTH)
@@ -487,4 +1024,8 @@ class ChatPanel(Widget):
         parts: list[str] = [left]
         if perplexity is not None:
             parts.append(f"ppl {perplexity:.2f}")
+        if prune_expr:
+            parts.append(f"filter:{prune_expr}")
+        if auto_regen_mode:
+            parts.append(f"auto:{auto_regen_mode}")
         bar.update(" · ".join(parts))

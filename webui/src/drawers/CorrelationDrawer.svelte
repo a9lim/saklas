@@ -126,7 +126,6 @@
                     <HeatmapCell
                       value={v}
                       size={CELL_SIZE}
-                      showValue
                       title={cellTitle(a, b, v)}
                     />
                   </td>
@@ -156,7 +155,7 @@
     background: var(--bg);
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     border-left: 1px solid var(--border);
   }
 
@@ -164,38 +163,38 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 0.6em;
-    padding: 0.6em 0.8em;
-    border-bottom: 1px solid var(--border-dim);
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-4);
+    border-bottom: 1px solid var(--border);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: 0.2em;
+    gap: var(--space-1);
     min-width: 0;
   }
   .label {
     color: var(--fg-muted);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0;
   }
   .coord {
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .actions {
     display: flex;
-    gap: 0.4em;
+    gap: var(--space-2);
     align-items: center;
   }
   .refresh {
     background: transparent;
     color: var(--fg-strong);
     border: 1px solid var(--border);
-    padding: 0.15em 0.6em;
+    padding: var(--space-1) var(--space-4);
     font: inherit;
-    font-size: 0.85em;
+    font-size: var(--text-sm);
     text-transform: lowercase;
     cursor: pointer;
   }
@@ -211,9 +210,9 @@
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
-    padding: 0 0.5em;
+    padding: 0 var(--space-3);
     font: inherit;
-    font-size: 1.1em;
+    font-size: var(--text-md);
     cursor: pointer;
     line-height: 1.4;
   }
@@ -226,12 +225,12 @@
     flex: 1 1 auto;
     overflow: auto;
     min-height: 0;
-    padding: 0.6em 0.8em;
+    padding: var(--space-4) var(--space-4);
   }
   .empty {
     color: var(--fg-muted);
     font-style: italic;
-    padding: 1em 0;
+    padding: var(--space-5) 0;
     line-height: 1.4;
   }
   .empty.err {
@@ -242,7 +241,7 @@
   .grid-scroll {
     overflow: auto;
     max-height: 100%;
-    border: 1px solid var(--border-dim);
+    border: 1px solid var(--border);
     background: var(--bg-alt);
   }
   .grid {
@@ -267,9 +266,9 @@
     left: 0;
     z-index: 1;
     text-align: right;
-    padding: 0 0.5em 0 0.4em;
+    padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
     border-right: 1px solid var(--border);
     white-space: nowrap;
   }
@@ -279,15 +278,15 @@
     left: 0;
     z-index: 3;
     color: var(--fg-muted);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
     text-align: left;
-    padding: 0.2em 0.5em;
+    padding: var(--space-1) var(--space-3);
     border-right: 1px solid var(--border);
     border-bottom: 1px solid var(--border);
   }
   .grid .col-label {
     color: var(--fg-dim);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
     padding: 0;
     height: 7em;
     vertical-align: bottom;
@@ -300,17 +299,17 @@
     transform: rotate(-60deg);
     transform-origin: left bottom;
     white-space: nowrap;
-    padding-bottom: 0.4em;
+    padding-bottom: var(--space-2);
   }
   .grid .cell-td {
     line-height: 0;
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--border-dim);
-    padding: 0.4em 0.8em;
+    border-top: 1px solid var(--border);
+    padding: var(--space-2) var(--space-4);
     color: var(--fg-muted);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
   }
   .hint {
     line-height: 1.4;

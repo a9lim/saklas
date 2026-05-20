@@ -61,7 +61,7 @@ def _stub_session(model_id: str) -> SaklasSession:
     session._dls = True
     session._layer_means = {}
     # Pipeline normally constructed in __init__; stub skips that, wire one in.
-    session._extraction = ExtractionPipeline(session, session, session, session.events)
+    session._extraction = ExtractionPipeline(session, session, session.events)
     return session
 
 

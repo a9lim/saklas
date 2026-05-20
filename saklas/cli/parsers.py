@@ -30,7 +30,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         "-p", "--probes",
         nargs="*",
         default=None,
-        help="Probe categories: all, none, affect, epistemic, alignment, register, social_stance, cultural (default: all)",
+        help="Probe categories: all, none, affect, epistemic, alignment, register, social_stance, cultural, identity (default: all)",
     )
 
 
@@ -39,6 +39,28 @@ def _add_config_args(p: argparse.ArgumentParser) -> None:
                    help="Load setup YAML (repeatable; later overrides earlier)")
     p.add_argument("-s", "--strict", action="store_true",
                    help="With -c: fail hard on missing vectors")
+
+
+def _add_logit_args(p: argparse.ArgumentParser) -> None:
+    """Logit-capture options shared between ``tui`` and ``serve``.
+
+    Phase 1 of the logit pass: ``--top-k-alts`` sets the session-level
+    default for ``SamplingConfig.return_top_k`` — the number of top-K
+    alternatives the engine decodes per generated token (with text). K=0
+    (the default) means "logprob only", a near-free addition on top of
+    the existing log_softmax in the loom path. K>0 enables the
+    distributional surfaces (drilldown logits tab, inline surprise tint,
+    NodeCompareDrawer logit columns); ~60 KB/turn on the wire at K=8.
+    Per-call ``SamplingConfig.return_top_k > 0`` overrides; K=0 inherits.
+    YAML equivalent: ``return_top_k:`` int in ``[0, 256]``.
+    """
+    p.add_argument(
+        "--top-k-alts", dest="top_k_alts", type=int, default=None, metavar="N",
+        help="Session default for top-K alternatives capture (0–256). "
+             "0 (default) = chosen-token logprob only; N>0 ships top-N "
+             "decoded alternatives per token for distributional surfaces. "
+             "Unset = inherit YAML ``return_top_k:`` / session default.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +85,11 @@ _VECTOR_VERBS: list[tuple[str, str]] = [
     ("compare",   "Cosine similarity between steering vectors"),
     ("why",       "Show which layers contribute most to a steering vector"),
     ("transfer",  "Transfer a probe from one model to another via Procrustes"),
+]
+
+_EXPERIMENT_VERBS: list[tuple[str, str]] = [
+    ("fan",        "Run an alpha grid as one experiment"),
+    ("transcript", "Replay or inspect saved transcript paths"),
 ]
 
 
@@ -159,6 +186,7 @@ def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-tokens", type=int, default=1024,
                         help="Default max generation tokens")
     _add_injection_args(parser)
+    _add_logit_args(parser)
     _add_config_args(parser)
 
 
@@ -176,6 +204,7 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
                         help="Skip the analytics dashboard mount at / "
                              "(API-only mode for production / proxied deployments)")
     _add_injection_args(parser)
+    _add_logit_args(parser)
     _add_config_args(parser)
 
 
@@ -454,6 +483,108 @@ def _build_config_parser(parser: argparse.ArgumentParser) -> None:
     validate.add_argument("file", help="Path to YAML config file")
 
 
+# --- experiment subtree --------------------------------------------------
+
+def _build_experiment_fan(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="HuggingFace model ID or local path")
+    p.add_argument("prompt", help="Prompt to fan out")
+    p.add_argument(
+        "-g", "--grid",
+        action="append",
+        required=True,
+        metavar="CONCEPT=ALPHAS",
+        help=(
+            "Alpha grid term, repeatable. Example: "
+            "happy.sad=-0.4,0,0.4"
+        ),
+    )
+    p.add_argument(
+        "-S", "--base-steering",
+        default=None,
+        metavar="EXPR",
+        help="Fixed steering expression composed under each grid row",
+    )
+    p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+    p.add_argument("-d", "--device", default="auto")
+    p.add_argument("-p", "--probes", nargs="*", default=None)
+    p.add_argument("--max-tokens", type=int, default=256)
+    p.add_argument("-j", "--json", dest="json_output", action="store_true")
+    _add_injection_args(p)
+    _add_logit_args(p)
+    _add_config_args(p)
+
+
+def _build_experiment_transcript_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas experiment transcript`` — replay saved tree paths.
+
+    Phase 5 ships ``run`` only; future verbs (``ls``, ``diff``) compose
+    on top of the same schema.
+    """
+    sub = parser.add_subparsers(dest="transcript_cmd", required=False, metavar="VERB")
+
+    run = sub.add_parser(
+        "run",
+        help="Replay a transcript on the current session and report readings",
+        description=(
+            "Load a YAML transcript, replay each user turn with the recorded "
+            "recipe, and report per-turn readings against the recorded ones."
+        ),
+    )
+    run.add_argument("path", help="Path to a saklas_transcript YAML file")
+    # Override the model arg shape so transcript replay can fall back to
+    # the embedded ``model_id`` header (the common case) instead of
+    # forcing the user to repeat it on the command line.  When the
+    # transcript also lacks ``model_id`` the runner fails with a clear
+    # message; that's caught early so we don't load a model just to
+    # complain about it after.
+    run.add_argument(
+        "model",
+        nargs="?",
+        default=None,
+        help="HuggingFace model ID or local path (defaults to transcript's `model_id`)",
+    )
+    run.add_argument(
+        "-q", "--quantize",
+        choices=["4bit", "8bit"],
+        default=None,
+        help="Quantization mode (default: bf16/fp16)",
+    )
+    run.add_argument(
+        "-d", "--device",
+        default="auto",
+        help="Device: auto (detect), cuda, mps, or cpu (default: auto)",
+    )
+    run.add_argument(
+        "-p", "--probes",
+        nargs="*",
+        default=None,
+        help="Probe categories (default: all)",
+    )
+    run.add_argument(
+        "--max-tokens", type=int, default=256,
+        help="Default max generation tokens per replay turn",
+    )
+    _add_injection_args(run)
+    _add_config_args(run)
+    # ``--strict`` reuses the ``-s/--strict`` flag added by
+    # ``_add_config_args`` — same name, but here it gates "refuse on
+    # probe drift" instead of "fail hard on missing vectors".  Both
+    # interpretations share the spirit of the flag.
+
+
+_EXPERIMENT_BUILDERS = {
+    "fan": _build_experiment_fan,
+    "transcript": _build_experiment_transcript_parser,
+}
+
+
+def _build_experiment_parser(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="experiment_cmd", required=False, metavar="VERB")
+    for verb, desc in _EXPERIMENT_VERBS:
+        child = sub.add_parser(verb, help=desc, description=desc)
+        _EXPERIMENT_BUILDERS[verb](child)
+
+
 def _build_root_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="saklas",
@@ -501,5 +632,12 @@ def _build_root_parser() -> argparse.ArgumentParser:
         description="Inspect/validate config",
     )
     _build_config_parser(cfg)
+
+    experiment = sub.add_parser(
+        "experiment",
+        help="Run and replay experiment trees",
+        description="Run and replay experiment trees",
+    )
+    _build_experiment_parser(experiment)
 
     return root

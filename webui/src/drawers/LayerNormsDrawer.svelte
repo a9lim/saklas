@@ -82,11 +82,27 @@
     void load(selected);
   });
 
-  // Sorted-by-layer view of ``data.layers``.  The server already sorts
-  // ascending but we re-sort defensively because cheap.
-  const sortedLayers = $derived<{ layer: number; magnitude: number }[]>(
-    [...(data?.layers ?? [])].sort((a, b) => a.layer - b.layer),
-  );
+  // Full-range layer view: every layer 0..total_layers-1, with the
+  // profile's per-layer ``||baked||`` filled in where present and 0 for
+  // layers DLS dropped (or that never landed in the profile).  Showing
+  // the full strip lets the user *see* the discriminative-layer-select
+  // pattern rather than infer it from the gaps in a sparse row list —
+  // the dropped layers read as flat-zero bars between the active ones.
+  const sortedLayers = $derived.by<{ layer: number; magnitude: number }[]>(() => {
+    const present = new Map<number, number>();
+    for (const e of data?.layers ?? []) present.set(e.layer, e.magnitude);
+    const total = data?.total_layers ?? 0;
+    if (total <= 0) {
+      return [...present.entries()]
+        .map(([layer, magnitude]) => ({ layer, magnitude }))
+        .sort((a, b) => a.layer - b.layer);
+    }
+    const rows: { layer: number; magnitude: number }[] = [];
+    for (let i = 0; i < total; i++) {
+      rows.push({ layer: i, magnitude: present.get(i) ?? 0 });
+    }
+    return rows;
+  });
 
   const maxMagnitude = $derived(
     sortedLayers.reduce(
@@ -188,7 +204,7 @@
     background: var(--bg);
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     border-left: 1px solid var(--border);
   }
 
@@ -196,33 +212,33 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 0.6em;
-    padding: 0.6em 0.8em;
-    border-bottom: 1px solid var(--border-dim);
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-4);
+    border-bottom: 1px solid var(--border);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: 0.2em;
+    gap: var(--space-1);
     min-width: 0;
   }
   .label {
     color: var(--fg-muted);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0;
   }
   .coord {
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .close {
     background: transparent;
     color: var(--fg-muted);
     border: 1px solid var(--border);
-    padding: 0 0.5em;
+    padding: 0 var(--space-3);
     font: inherit;
-    font-size: 1.1em;
+    font-size: var(--text-md);
     cursor: pointer;
     line-height: 1.4;
   }
@@ -234,40 +250,40 @@
   .picker-row {
     display: flex;
     align-items: center;
-    gap: 0.6em;
-    padding: 0.5em 0.8em;
-    border-bottom: 1px dashed var(--border-dim);
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border);
   }
   .picker {
     display: flex;
     align-items: center;
-    gap: 0.5em;
+    gap: var(--space-3);
     flex: 1 1 auto;
   }
   .picker-label {
     color: var(--fg-muted);
-    font-size: 0.85em;
+    font-size: var(--text-sm);
   }
   .picker select {
     background: var(--bg-alt);
     color: var(--fg);
     border: 1px solid var(--border);
-    padding: 0.2em 0.4em;
+    padding: var(--space-1) var(--space-2);
     font: inherit;
-    font-size: 0.85em;
+    font-size: var(--text-sm);
     flex: 1 1 auto;
   }
   .picker select:focus {
-    outline: 1px solid var(--accent-blue);
+    outline: 1px solid var(--accent);
     outline-offset: -1px;
   }
   .stoplight {
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
     text-transform: lowercase;
-    letter-spacing: 0.08em;
-    padding: 0.1em 0.5em;
+    letter-spacing: 0;
+    padding: var(--space-1) var(--space-3);
     border: 1px solid var(--border);
-    border-radius: 2px;
+    border-radius: var(--radius);
     color: var(--fg-dim);
   }
   .stoplight.solid {
@@ -287,12 +303,12 @@
     flex: 1 1 auto;
     overflow: auto;
     min-height: 0;
-    padding: 0.6em 0.8em;
+    padding: var(--space-4) var(--space-4);
   }
   .empty {
     color: var(--fg-muted);
     font-style: italic;
-    padding: 1em 0;
+    padding: var(--space-5) 0;
     line-height: 1.4;
   }
   .empty.err {
@@ -304,12 +320,12 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
   }
   .row {
     display: flex;
     align-items: center;
-    gap: 0.6em;
+    gap: var(--space-4);
   }
   .layer {
     color: var(--fg-muted);
@@ -327,10 +343,10 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--border-dim);
-    padding: 0.4em 0.8em;
+    border-top: 1px solid var(--border);
+    padding: var(--space-2) var(--space-4);
     color: var(--fg-muted);
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
   }
   .hint {
     line-height: 1.4;

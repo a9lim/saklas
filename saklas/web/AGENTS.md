@@ -1,130 +1,110 @@
 # web/
 
-Static dashboard mounted at `/` by default when `saklas serve` runs. Opt out with `--no-web`. Library callers using `create_app(..., web=False)` directly default-off — only the CLI presumes the casual-user UX.
+Static Svelte 5 + Vite dashboard mounted at `/` by `saklas serve`. CLI default is on (`--no-web` opts out); `create_app(..., web=False)` is the library default so embedded API surfaces don't pick up the dashboard.
 
 ## Layout
 
 ```
 saklas/web/
-  __init__.py        # public re-exports: register_web_routes, dist_path
-  routes.py          # the actual mount logic + SPA fallback
+  __init__.py        # re-exports: register_web_routes, dist_path
+  routes.py          # mount logic + SPA fallback
   dist/              # COMMITTED build artifact, ships in the wheel
     index.html
     assets/index.css
     assets/saklas.js
 ```
 
-The Svelte 5 + Vite source lives at the repo's `webui/` directory (peer of `saklas/`). `cd webui && npm run build` emits to `saklas/web/dist/` directly — no intermediate copy step. CI gating on source-vs-dist drift is wired but disabled by default in `.github/workflows/ci.yml` because the committed bundle is the source of truth.
+The Svelte source lives at the repo's `webui/` directory (peer of `saklas/`). `cd webui && npm run build` emits straight to `saklas/web/dist/` — no intermediate copy. The committed bundle is the source of truth; CI source-vs-dist drift gating is wired but disabled by default.
 
 ## Mount
 
-`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` for the bundled CSS/JS, registers `GET /` to return `index.html`, and a catch-all `GET /{full_path:path}` that serves real files when present and falls back to `index.html` for SPA-owned routes. `server.create_app` registers the dashboard last so the catch-all doesn't shadow `/v1/*`, `/api/*`, `/saklas/v1/*`. CLI default is `web=True`; the library default is `web=False` so embedded API surfaces don't pick up the dashboard accidentally.
+`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` (content-hashed, safe to cache hard), registers `GET /` → `index.html`, and a catch-all `GET /{full_path:path}` that serves allowlisted top-level dist files (favicon, etc.) and otherwise falls back to `index.html` for SPA routing. The catch-all is registered last by `create_app` so it never shadows `/v1/*`, `/api/*`, `/saklas/v1/*`. `full_path` is only ever used as a dict key, never a path component — `..` traversal is structurally impossible.
 
-`dist_path()` resolves the bundled assets through `importlib.resources` so it works for both editable and wheel installs. `WebUINotBuilt` is raised on mount when the dist directory is empty — only fires in source-tree installs that haven't run `npm run build` yet.
-
-## What the dashboard is
-
-v2.0 reframed the dashboard from "chat with diagnostics on the side" to a mouse-first interpretability cockpit. Three concerns must be answerable at any moment without leaving the main view: what am I telling the model (input + system prompt + sampling), how am I steering it (vector rack), what is it doing internally (probe rack + per-token tinting + correlation + layer norms + ppl).
-
-Per-token highlighting now lives on the chat tokens themselves, driven by a single highlight-probe dropdown with an optional two-stripe compare-two mode. The v1.6 always-on per-token × per-layer × per-probe heatmap is gone; the deep drilldown is opt-in via clicking a single token (`token_drilldown` drawer).
+`dist_path()` resolves through `importlib.resources` (editable + wheel). `WebUINotBuilt` is raised on mount when the dist directory is empty — only fires in source installs that haven't run `npm run build`.
 
 ## Wire protocol
 
-The dashboard speaks the existing `/saklas/v1/*` native API plus six routes added in v2.0:
+The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py`):
 
-1. **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. The `token` event carries optional `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed) when probes are loaded; `done` carries `per_token_probes` assembled from `session._last_per_token_scores`. Drives chat tinting + click-token drilldown.
-2. **GET `/saklas/v1/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix. Default pool unions registered steering vectors AND active probes (deduplicated by name). Drives the correlation drawer overlay.
-3. **GET `/saklas/v1/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + per-layer magnitudes + (optional) probe-quality metrics. Falls back to `session._monitor.profiles` when the name is a probe rather than a registered steering vector. Drives the layer-norms drawer overlay (and `saklas vector why` from the CLI).
-4. **GET `/saklas/v1/packs`** — locally installed packs, JSON shape. Drives the vector picker and probe picker.
-5. **GET `/saklas/v1/packs/search?q=…`** — HF Hub proxy. Drives the Pack drawer's search tab.
-6. **POST `/saklas/v1/packs`** — install pack from HF coord or local folder.
-7. **POST `/saklas/v1/sessions/{id}/vectors/merge`** — register a merged-expression vector.
-8. **POST `/saklas/v1/sessions/{id}/vectors/clone`** — corpus-based clone, SSE progress branch on `Accept: text/event-stream`.
-
-POST `/sweep` (the alpha-grid SSE) and the `traits/stream` SSE existed before v2.0 and remain.
+- **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. With probes loaded, the `token` event carries `scores` (`dict[str, float]`, the magnitude-weighted `score_single_token` aggregate the TUI also tints with), `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed, feeds the token-drilldown heatmap), and `raw_index` (decode-step index into the backing node's `raw_token_ids`). `done` carries `per_token_probes`. A `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` is the **logit fork** — replays the node's raw decode prefix with one token swapped, resampling the continuation as a sibling. A `generate` with `prefill_node_id`/`prefill_text` is **answer-prefill** — seeds an assistant reply under a *user* node. A `generate` with `commit_role`/`commit_text` is **commit (no-generation send)** — `commit_role="user"` lands a user turn under `parent_node_id`/active node; `commit_role="assistant"` lands an authored assistant turn under the user node `parent_node_id` (required), with `commit_text` as the whole turn. Short-circuits the streaming machinery: one `started` (node_id=null) + one `done` (`result.kind="commit"`, `result.node_id`, `result.role`, `result.text`), no token frames. Mutually exclusive with fork and prefill. Driven from `Chat.svelte` by `Ctrl+Enter` / `Cmd+Enter` (also `Ctrl`/`Cmd`-click on the send button); live `ctrlHeld` window listener swaps the send-button label between `send`/`prefill` and `commit user`/`commit assistant` while the modifier is held.
+- **GET `/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix; default pool unions steering vectors + active probes.
+- **GET `/sessions/{id}/vectors/pairwise?a=…&b=…`** — cross-layer cosine matrix between two named vectors / probes. Distinct from `correlation`: one pair, two-axis matrix indexed by layer rather than by name; backs the pairwise-compare analysis drawer. Registered *before* `GET /vectors/{name}` so the literal path wins the routing match.
+- **GET `/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + per-layer magnitudes; falls back to monitor profiles when `name` is a probe.
+- **GET `/packs`**, **GET `/packs/search?q=…`**, **POST `/packs`** — installed packs, HF Hub search proxy, install.
+- **POST `/sessions/{id}/vectors/merge`**, **POST `/sessions/{id}/vectors/clone`** (SSE progress on `Accept: text/event-stream`), **POST `/sessions/{id}/extract`** (SSE).
+- **POST `/sessions/{id}/experiments/fan`** — alpha grid as loom siblings, JSON `RunSet` summary.
+- **Loom tree** under `/sessions/{id}/tree` — `tree`/`tree/active` GETs; `navigate`/`edit`/`branch`/`delete`/`star`/`note`/`reset` mutations; `edge_label`, `filter`, `diff`, `joint_logprobs`; `transcript` export/import.
+- **GET `/sessions/{id}/traits/stream`** — live per-token probe SSE.
 
 ## Source layout
 
 ```
 webui/src/
   main.ts                     # bootstrap: mounts <App /> via Svelte 5 mount()
-  App.svelte                  # shell — topbar / two-column main / status footer / drawer host
+  App.svelte                  # shell + drawer switch; NARROW_DRAWERS size class
   lib/
     api.ts                    # typed REST + WS + SSE clients
-    stores.svelte.ts          # Svelte 5 runes-based shared state (SvelteMap-backed)
-    types.ts                  # every shared interface
+    stores.svelte.ts          # runes-based shared state + cross-cutting WS/tree state
+    stores/                   # split slices: drawers, inputHistory, toasts (.svelte.ts)
+    types.ts                  # shared interfaces; DrawerName union
     expression.ts             # parse/serialize the steering grammar
+    concepts.ts               # concept-catalog helpers (category / poles / recommended α)
     tokens.ts                 # HIGHLIGHT_SAT + scoreToRgb + twoStripeStyle
     charts.ts                 # bucketize() port of saklas.core.histogram
     charts/{Bar,Sparkline,Histogram,HeatmapCell}.svelte
+    Slider.svelte             # shared range slider
+    Toaster.svelte            # toast host (bottom-right, TTL-dismissed)
     style/{tokens.css,global.css}
   panels/
-    Topbar.svelte             # model + device + clear/rewind/regen + tools menu + stop
-    StatusFooter.svelte       # ● gen N/M [bar] · t/s · elapsed · ppl
-    Chat.svelte               # thinking-collapsible, probe-tinted tokens, A/B split
-    SamplingStrip.svelte      # T / P / K / max / seed / thinking / session-vs-one-shot
-    SteeringRack.svelte       # one strip per loaded vector + canonical EXPR + "+ steer"
-    VectorStrip.svelte        # ●/○ enable + α slider + α display + trigger pill + variant chip + ⋮ menu + ✕ + inline projection modal
-    ProbeRack.svelte          # highlight + compare-two dropdowns + sort + "+ probe"
-    ProbeStrip.svelte         # ●/○ select-for-highlight (whole-row click target) + name + right-aligned sparkline + value bar + α display + ✕ + always-visible per-layer reading strip
+    WorkspaceRail.svelte      # left rail: category fly-outs
+    InspectorPanel.svelte     # right rack: steering + probe racks (full column height)
+    WorkbenchCard.svelte      # active-workbench card (model + device); bottom of threads column
+    StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + pending-queue count badge; mounted inside Chat above the input row
+    PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row
+    Chat.svelte               # thinking-collapsible, probe-tinted tokens, inline actions (clear/save/load/transcript), status footer, pending bubbles
+    SamplingStrip.svelte      # T / P / K / max / pres / freq / seed / thinking / alts + advanced/system-prompt buttons; foot of the threads column, below WorkbenchCard
+    SteeringRack.svelte       # vector strips + "+ add steering" + canonical expression
+    VectorStrip.svelte        # enable + α slider + trigger + variant + projection modal
+    ProbeRack.svelte          # probe strips + sort + "+ add probe"
+    ProbeStrip.svelte         # select-for-highlight + sparkline + per-layer reading strip
+    loom/{LoomSidebar,LoomNode,LoomEdge}.svelte  # permanent "threads" column
   drawers/
-    {Extract,Load,SaveConversation,LoadConversation,Compare,
-     SystemPrompt,ModelInfo,Help,Export,Sweep,Pack,Merge,Clone,
-     VectorPicker,ProbePicker,TokenDrilldown,
-     Correlation,LayerNorms}Drawer.svelte
-    _SearchableConceptList.svelte  # shared between picker drawers
+    {Load,SaveConversation,LoadConversation,Compare,SystemPrompt,
+     Help,Export,Pack,Merge,Clone,VectorPicker,ProbePicker,TokenDrilldown,
+     ExperimentLab,ActivationAtlas,RecipeBuilder,AdvancedSampling,Health,
+     SessionAdmin,Correlation,LayerNorms,NodeCompare,Transcript}Drawer.svelte
+    _SearchableConceptList.svelte  # shared categorized catalog for both pickers
     index.ts                  # barrel re-exports for App.svelte's switch
 ```
 
-Adding a panel: write the .svelte file, wire any new state into `stores.svelte.ts`, mount from App.svelte's grid, `npm run build`, commit the regenerated `saklas/web/dist/`. Adding a drawer: write the .svelte file under `drawers/`, add the name to the `DrawerName` union in `lib/types.ts`, add a branch to App.svelte's drawer switch, re-export from `drawers/index.ts` if it should ship in the topbar tools menu.
+(`lib/stores.ts` is a dead legacy file — not imported anywhere; ignore it.)
+
+Adding a panel: write the `.svelte`, wire state into the smallest matching `lib/stores/` slice (or `stores.svelte.ts` for cross-cutting WS/tree/chat state), mount from `App.svelte`, `npm run build`, commit the regenerated `dist/`. Adding a drawer: write it under `drawers/`, add the name to the `DrawerName` union in `lib/types.ts` (and to `NARROW_DRAWERS` in `App.svelte` for forms/pickers), add an `App.svelte` switch branch, re-export from `drawers/index.ts`, and add it to a `WorkspaceRail.svelte` category fly-out.
+
+## Pending queue
+
+Submissions during an in-flight gen (or behind earlier queued items) defer rather than racing the WS — same semantics as the TUI. `sendGenerate` / `sendCommit` / `sendPrefill` check `isPendingBusy()` (gen active OR `pendingActions.queue.length > 0`) and, when busy, append a `PendingAction` (defined in `lib/types.ts`) carrying a `rebuild` factory the `↑`-pull-and-edit path uses to re-encode the same kind/role/target with new text. Instant mutations from the chat header (`/clear`, regen) and the rack/sampling sites also queue via `enqueuePending` with `awaitsGen: false` so the drain chains through them without waiting on a `done` that never fires.
+
+The WS `done` / `error` handlers call `drainNextPendingAction()` — one item per event — instead of the old v1 `applyPendingActions` (which drained everything at once). `PendingBubbles.svelte` renders the live queue above the input as dim chips; the per-bubble `×` calls `cancelPendingAction(id)` to remove a single slot. The bubble whose slot the user is currently editing via ↑ gets the `.editing` class — brighter amber background, thicker border, full-strength text, and a leading `✎` marker — driven off `inputHistory.pulledSlot`. The StatusFooter shows a `N queued` readout but no "apply now" button — under the FIFO model there's no skip-ahead semantics.
+
+Up-arrow walks the combined ring `[editable pending (most-recent first), input history (newest first)]`. Pulling a queued item sets `inputHistory.pulledSlot`; Chat.svelte forwards that to `sendGenerate` / `sendCommit` / `sendPrefill` as `replaceSlot` so a re-edited send lands at its original slot. `Esc` while pulled cancels the edit (slot stays, input restores the stash); empty `Enter` while pulled removes the slot — keyboard equivalent of the `×` button. Non-editable items (`rebuild === null`, e.g. queued `/clear` and regen) sit in the queue but the up-arrow walks past them.
 
 ## Reactivity gotcha
 
-Svelte 5's `$state` does NOT track plain `Map.set` / `Set.add` / inner-object property writes inside collections. Cross-component state collections in `stores.svelte.ts` use `SvelteMap` / `SvelteSet` from `svelte/reactivity`. Inner-object mutations (e.g. `e.alpha = 0.5`) on map values are still untracked, so every rack mutator reassigns via `entries.set(name, {...e, alpha})` — applies to vectorRack and probeRack alike.
-
-`updateProbeFromScores` (driven by every WS `token` event) is the hot path that depends on this — bare `entry.current = val` would freeze probe sparklines at zero throughout a generation.
+Svelte 5's `$state` does NOT track `Map.set` / `Set.add` / inner-object property writes inside collections. Cross-component collections in `stores.svelte.ts` use `SvelteMap` / `SvelteSet` from `svelte/reactivity`. Inner-object mutations on map values are still untracked, so every rack mutator reassigns: `entries.set(name, {...e, alpha})` — vectorRack and probeRack alike. `updateProbeFromScores` (driven by every WS `token` event) is the hot path here — a bare `entry.current = val` would freeze probe sparklines at zero through a whole generation.
 
 ## Persistence
 
-`chatLog.turns` and `highlightState` (target / compareTarget / compareTwo) persist to `localStorage` under `saklas.chat.v1.<model_id>`. Saves debounced via `$effect.root` ~250 ms after mutations so token streams don't beat the disk. Restored after `refreshSession()` in `bootstrap` so the storage key resolves.
+The server loom tree is authoritative. The browser keeps a first-paint cache of the latest `LoomTreeJSON` plus `highlightState` in `localStorage` under `saklas.chat.v2.<model_id>`; v1 flat `ChatTurn[]` logs auto-migrate. Saves are debounced ~250 ms after mutations. `refreshLoomTree()` overwrites the cache with server state once the tree endpoint responds. `schedulePersist` measures payload size against a 5 MB soft budget and fires a once-per-session advisory toast (suggesting transcript export + tree clear) above it — the write isn't hard-stopped. `pendingIndex` is force-cleared on restore so an in-flight turn from a killed tab can't ghost the UI.
 
-Server-restart guard: if the persisted snapshot has user turns but the fresh session reports `history_length === 0`, drop the snapshot. Replaying would lie about generation context (next gen would see empty server-side history).
+## Per-token highlighting
 
-`pendingIndex` is force-cleared on restore so an in-flight turn from a killed tab doesn't ghost the UI.
+Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match (and match the TUI). Clicking any token opens the `token_drilldown` drawer with the per-layer × per-probe heatmap regardless of whether a highlight probe is selected.
 
-## Steering / probe pickers
+## Out of scope
 
-The picker drawers (`VectorPickerDrawer`, `ProbePickerDrawer`) mirror the TUI's `/steer 0.5 honest` ergonomics: the user picks a concept name from `GET /packs`, the server's extract endpoint short-circuits to the cached profile when the model already has it, the rack lands. `addVectorToRack` defaults α to 0.5 (matches `DEFAULT_COEFF` in `saklas.core.steering_expr`). The picker's footer keeps the advanced affordances — extract from pos/neg, load from disk path.
-
-## Click semantics
-
-Probe rows: clicking anywhere on the row body (not the ✕) toggles highlight selection — first click anchors the probe as the chat-token highlight target, click again on the same row to deselect. ✕ is `stopPropagation`'d so removal doesn't trip toggle on the way out. The row uses `role="button"` + `aria-pressed` so the toggle is keyboard-reachable (Enter/Space).
-
-Chat tokens: every per-token span is clickable regardless of whether a highlight probe is selected — the click opens `token_drilldown` with `{turnIdx, tokenIdx, isThinking}`. The `isThinking` flag routes the drilldown to `turn.thinkingTokens` vs `turn.tokens` so clicks inside the thinking-collapsible body resolve to the right token row. With no highlight target, tokens render bare but the hover outline still gives a click affordance.
-
-Vector strip projection picker: the `⋮` menu's "project onto (~)…" / "project orthogonal (|)…" entries open an inline modal at `--z-modal` (above drawers) — text input autofocuses, Enter confirms, Escape / click-outside / cancel cancel. Replaces the v1 `window.prompt`. Re-clicking the same operator with an existing projection clears it (no dialog).
-
-## Input history (↑/↓ recall)
-
-Shell-style history on the chat textarea. Every line submitted via `doSend` lands in `inputHistory.entries` through `pushInputHistory` (chat messages and slash commands alike); ↑/↓ in `Chat.svelte::onKeydown` call `navigateInputHistory(±1, currentInput)`. Edge-only multi-line policy: ↑ recalls only when the cursor sits on the first line (`shouldRecallUp`); ↓ goes forward only on the last line (`shouldRecallDown`) and is a no-op when no recall is in flight, so multi-line editing inside the draft isn't hijacked. First ↑ stashes the in-progress draft; ↓ past the newest entry restores it. `INPUT_HISTORY_MAX = 200` caps the ring. **In-memory only** — no `localStorage` persistence, matches the TUI's process-scoped shape and avoids leaking command lines to disk. Mirrors `saklas/tui/app.py::_history_navigate` / `_push_input_history` semantics; bash-style dedupe (collapses immediate repeats, preserves ping-pong).
-
-## A/B compare
-
-`abState.enabled` toggles two-column rendering. The shadow gen (unsteered) runs after the steered turn finishes via `_sendShadowGenerate(steeredIdx)`, which:
-
-1. Builds a messages list from `chatLog.turns[0..steeredIdx-1]` via `_buildShadowMessages` — past steered assistant turns ride along as context, the trailing user turn is what the unsteered model responds to.
-2. Sends `input: <messages list>` + `stateless: true` over the WS so the server's `prior=[]` (stateless) and the messages list is the *only* context — no contamination from server-side history.
-
-Toggling A/B from off→on while the chat already has steered turns immediately fires a shadow for the most recent assistant turn that doesn't have an `abPair` (skipped if a generation is in flight — the `done` handler will fire its own shadow). This is the "play the conversation back to the unsteered agent" flow: previously A/B only worked when regenerating the first turn.
-
-## Thinking semantics
-
-The thinking checkbox is a strict binary. Initial `samplingState.thinking` is `false` (not legacy `null` "auto"). Both `sendGenerate` and `_sendShadowGenerate` send `thinking: samplingState.thinking ?? false` so any null write that leaked through still serialises as explicit-off — the previous null path could leak through to the chat-template `enable_thinking=null` ambiguity and have the model think anyway.
-
-## Out of scope (v2.0)
-
-- Multi-session UI (server URL-paths support it; the client assumes `default`).
-- Auth UI for `SAKLAS_API_KEY` — the underlying Bearer middleware applies; no dedicated UI surface.
-- Mobile / touch-first responsive layout. Saklas is a desktop research tool; min-width 1280px.
-- Combobox autocomplete on the projection-target picker — the modal takes a free-form name; no live name-completion against the loaded-vector list.
+- True multi-session switching — server URL-paths support it; the client still assumes `default`. `SessionAdminDrawer` inspects the collection and sets an in-memory bearer key but is not a session router.
+- Persistent credential management — the bearer key stays in memory for the page session, never written to `localStorage`.
+- Mobile / touch-first layout — desktop research tool, min-width 1280px.
+- Combobox autocomplete on the projection-target picker (free-form name input).
 - Pagination on HF pack search (capped at 20 results).

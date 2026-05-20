@@ -24,7 +24,13 @@ def _make_app():
     """
     app = object.__new__(SaklasApp)
     session = MagicMock()
-    session._history = []
+    # v2.3 loom: conversation lives in ``session.tree`` (LoomTree).
+    # We install a real LoomTree so the regen/rewind path's
+    # navigate/edit calls work; ``session.history`` is the derived
+    # view the TUI's ``_messages`` property reads.
+    from saklas import LoomTree as _LoomTree
+    session.tree = _LoomTree()
+    session.history = []
     session._profiles = {}
     session._model_info = {"model_id": "mock/mock", "model_type": "mock"}
     session._device = SimpleNamespace(type="cpu")
@@ -46,7 +52,8 @@ def _make_app():
     session.gen_state = saklas.GenState.IDLE
 
     app._session = session
-    app._messages = session._history
+    # ``app._messages`` is now a property derived from ``session.history``
+    # under v2.3 loom; the v2.2 shared-list assignment is no longer needed.
     app._device_str = "cpu"
     app._alphas = {}
     app._enabled = {}
@@ -59,7 +66,12 @@ def _make_app():
     app._ab_shadow_active = False
     app._ab_shadow_row = None
     app._row_for_widget = {}
-    app._pending_action = None
+    # Pending-queue replaces the legacy single-slot ``_pending_action``.
+    # ``_pulled_slot`` tracks an in-progress ↑-pull-and-edit; default
+    # None means "no slot pulled."  Tests that need a populated queue
+    # mutate ``_pending_queue`` directly.
+    app._pending_queue = []
+    app._pulled_slot = None
     app._ui_gen_active = False
     app._focused_panel_idx = 1
     app._highlighting = False
@@ -84,6 +96,13 @@ def _make_app():
     chat = MagicMock()
     chat.messages = []
     chat.add_system_message = lambda msg: chat.messages.append(msg)
+    # ``_repaint_chat_from_active_path`` (loom navigation / ``/load``)
+    # unpacks the ``(row, widget)`` tuple ``add_finalized_assistant``
+    # returns — give the default mock a real tuple so the repaint path
+    # doesn't trip over MagicMock's empty ``__iter__``.
+    chat.add_finalized_assistant = MagicMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
     app._chat_panel = chat
 
     trait = MagicMock()
@@ -204,45 +223,43 @@ def test_model_info():
 
 
 def test_save_load_roundtrip(tmp_path, monkeypatch):
-    # Redirect saklas_home() → tmp_path via env var.
+    """/save serializes the full loom tree; /load swaps it back in."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     app = _make_app()
-    app._session._history.extend([
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "hello"},
-    ])
-    app._alphas["foo"] = 0.5
-    app._session._profiles["foo"] = {0: None}  # so load restores it
-    app._enabled["foo"] = True
-    app._default_seed = 7
+    # Seed a small tree: user "hi" → assistant "hello".
+    uid = app._session.tree.add_user_turn("hi")
+    aid = app._session.tree.begin_assistant(uid)
+    app._session.tree.finalize_assistant(aid, text="hello")
+
     app._handle_command("/save convtest")
-
-    saved = (tmp_path / "conversations" / "convtest.json")
+    saved = tmp_path / "conversations" / "convtest.json"
     assert saved.exists()
+    assert "saved tree" in _msgs(app)
 
-    # Wipe state and load.
+    # Fresh app — load the saved tree back.
     app2 = _make_app()
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    app2._session._profiles["foo"] = {0: None}
-    app2._refresh_left_panel = MagicMock()
-
-    # chat_panel mocks used by _do_clear.
-    app2._chat_panel.clear_log = MagicMock()
-    app2._session.clear_history = MagicMock(
-        side_effect=lambda: app2._session._history.clear()
-    )
-
     app2._handle_command("/load convtest")
-    assert app2._alphas.get("foo") == 0.5
-    assert app2._default_seed == 7
+    assert "loaded tree" in _msgs(app2)
+
+    # The loaded tree carries the saved nodes (full tree, every branch).
+    texts = {n.text for n in app2._session.tree.nodes.values()}
+    assert "hi" in texts
+    assert "hello" in texts
+
+
+def test_load_missing_file_reports():
+    """/load on a name with no saved file reports cleanly."""
+    app = _make_app()
+    app._handle_command("/load does-not-exist")
+    assert "no saved tree" in _msgs(app)
 
 
 def test_help_mentions_new_bindings():
     app = _make_app()
     app._handle_command("/help")
     msg = _msgs(app)
-    assert "Ctrl+A" in msg
-    assert "Ctrl+S" in msg
+    assert "⌃A" in msg
+    assert "⌃S" in msg
     assert "/alpha" in msg
     assert "/unsteer" in msg
     assert "/save" in msg
@@ -267,8 +284,14 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
         thinking = False
         token_id = 1
         logprob = None
-        top_logprobs = None
+        # Phase 1 logit pass: renamed ``top_logprobs`` → ``top_alts``
+        # (now carries decoded ``TokenAlt`` triples instead of id/lp
+        # pairs).  Stub keeps it None — this test exercises a code path
+        # that doesn't consume alts.
+        top_alts = None
         index = 0
+        scores = None
+        perplexity = None
 
     def _fake_stream(input, **kwargs):
         captured["input"] = input
@@ -292,16 +315,41 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
     assert "sampling" in kwargs
     assert "steering" in kwargs
     assert "thinking" in kwargs
+    assert kwargs["live_scores"] is False
     assert isinstance(kwargs["sampling"], saklas.SamplingConfig)
     # No steering registered → None.
     assert kwargs["steering"] is None
+
+
+def test_generate_worker_enables_live_scores_for_probe_highlight():
+    app = _make_app()
+    app._session._device = SimpleNamespace(type="cpu")
+    app._session._monitor.probe_names = ["happy.sad"]
+    app._highlighting = True
+    app._highlight_probe = "happy.sad"
+    captured = {}
+
+    def _fake_stream(input, **kwargs):
+        captured["kwargs"] = kwargs
+        return iter([])
+
+    app._session.generate_stream = _fake_stream
+    app._chat_panel.start_assistant_message = MagicMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
+    app.run_worker = lambda fn, thread=True: fn()
+
+    app._start_generation("hello")
+
+    assert captured["kwargs"]["live_scores"] is True
 
 
 def test_start_generation_inherits_highlight_state():
     """Fresh assistant widgets spawn with ``_highlight_on=False``; the
     app must push its current highlight state onto the widget at
     generation start so streamed tokens render highlighted from the
-    first emit (regression: required Ctrl+Y off/on cycle post-gen).
+    first emit (regression: required a Ctrl+Y mode-cycle round trip
+    post-gen).
     """
     app = _make_app()
     app._session._device = SimpleNamespace(type="cpu")
@@ -885,7 +933,7 @@ def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch):
     msgs = _msgs(app)
     assert "Bulk probe 'alice/'" in msgs
     assert "added 2 probe(s)" in msgs
-    assert "Ctrl+Y" in msgs
+    assert "⌃Y" in msgs
 
 
 def test_handle_unsteer_namespace_removes_only_matching_prefix():
@@ -972,14 +1020,50 @@ def test_handle_unprobe_namespace_keeps_highlight_when_seed_outside_namespace():
 # ---- Input history (↑/↓ recall) ----
 
 
+class _FakeDocument:
+    """Minimal stand-in for ``textual.document.Document`` — enough of
+    the TextArea-side API for the input-history helpers to land cursor
+    placement and read line counts.  Lines are split on ``\\n`` so an
+    empty buffer reads as a single empty line (matches Textual)."""
+
+    def __init__(self, text: str = "") -> None:
+        self._lines = text.split("\n") if text else [""]
+
+    @property
+    def line_count(self) -> int:
+        return len(self._lines)
+
+    def get_line(self, row: int) -> str:
+        return self._lines[row]
+
+    def _set(self, text: str) -> None:
+        self._lines = text.split("\n") if text else [""]
+
+
 class _FakeInput:
-    """Stand-in for Textual ``Input`` exposing only what the recall
-    helpers touch — ``value`` and ``cursor_position``. Avoids mounting
-    a Textual app for unit-level coverage."""
+    """Stand-in for the :class:`ChatInput` (TextArea subclass) exposing
+    only the recall-helper surface: ``text`` (full buffer), ``load_text``
+    (replace), ``cursor_location`` (``(row, col)``), and ``document``
+    (line count + per-line access).  Avoids mounting a Textual app for
+    unit-level coverage of ``_history_navigate`` + ``_set_input_text``.
+    """
 
     def __init__(self, value: str = "") -> None:
-        self.value = value
-        self.cursor_position = len(value)
+        self._document = _FakeDocument(value)
+        last_row = self._document.line_count - 1
+        last_col = len(self._document.get_line(last_row))
+        self.cursor_location: tuple[int, int] = (last_row, last_col)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self._document._lines)
+
+    @property
+    def document(self) -> _FakeDocument:
+        return self._document
+
+    def load_text(self, text: str) -> None:
+        self._document._set(text)
 
 
 def _wire_fake_input(app, value: str = "") -> _FakeInput:
@@ -1022,22 +1106,22 @@ def test_history_navigate_up_walks_back_and_stashes_draft():
 
     # First ↑: stash draft, jump to newest entry.
     app._history_navigate(-1)
-    assert inp.value == "three"
-    assert inp.cursor_position == len("three")
+    assert inp.text == "three"
+    assert inp.cursor_location == (0, len("three"))
     assert app._history_index == 2
     assert app._history_stash == "draft-in-progress"
 
     app._history_navigate(-1)
-    assert inp.value == "two"
+    assert inp.text == "two"
     assert app._history_index == 1
 
     app._history_navigate(-1)
-    assert inp.value == "one"
+    assert inp.text == "one"
     assert app._history_index == 0
 
     # Past the oldest pins to entry 0 — bash semantics, no wrap.
     app._history_navigate(-1)
-    assert inp.value == "one"
+    assert inp.text == "one"
     assert app._history_index == 0
 
 
@@ -1049,14 +1133,14 @@ def test_history_navigate_down_restores_stash_at_bottom():
     # Walk up twice then back down twice — should hit the stash.
     app._history_navigate(-1)  # → "beta"
     app._history_navigate(-1)  # → "alpha"
-    assert inp.value == "alpha"
+    assert inp.text == "alpha"
 
     app._history_navigate(+1)  # → "beta"
-    assert inp.value == "beta"
+    assert inp.text == "beta"
     assert app._history_index == 1
 
     app._history_navigate(+1)  # → restore stash, clear index
-    assert inp.value == "my draft"
+    assert inp.text == "my draft"
     assert app._history_index is None
     assert app._history_stash == ""
 
@@ -1068,7 +1152,7 @@ def test_history_navigate_down_at_live_slot_is_noop():
 
     app._history_navigate(+1)
     # No recall in flight — ↓ leaves the input alone.
-    assert inp.value == "fresh"
+    assert inp.text == "fresh"
     assert app._history_index is None
 
 
@@ -1078,7 +1162,7 @@ def test_history_navigate_empty_history_is_noop():
 
     app._history_navigate(-1)
     app._history_navigate(+1)
-    assert inp.value == "x"
+    assert inp.text == "x"
     assert app._history_index is None
 
 
@@ -1107,6 +1191,237 @@ def test_user_submit_appends_to_history():
     assert app._handle_command.call_count == 2
 
 
+# ---------------------------------------------------------------------------
+# Pending queue + ↑/↓ pull-and-edit
+# ---------------------------------------------------------------------------
+
+
+def test_history_navigate_walks_pending_then_history():
+    """``↑`` walks the queue (most-recent first) before falling into
+    committed input history.  Pending positions land on
+    ``_pulled_slot``; history positions land on ``_history_index``."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._input_history = ["older"]
+    app._pending_queue = [
+        PendingItem("submit", "first queued"),
+        PendingItem("submit", "second queued"),
+    ]
+    inp = _wire_fake_input(app, value="composing")
+
+    # First ↑ — most-recent pending.
+    app._history_navigate(-1)
+    assert inp.text == "second queued"
+    assert app._pulled_slot == 1
+    assert app._history_index is None
+    assert app._history_stash == "composing"
+    assert inp.allow_empty_submit is True
+
+    # Second ↑ — earlier pending.
+    app._history_navigate(-1)
+    assert inp.text == "first queued"
+    assert app._pulled_slot == 0
+    assert inp.allow_empty_submit is True
+
+    # Third ↑ — falls into history.
+    app._history_navigate(-1)
+    assert inp.text == "older"
+    assert app._pulled_slot is None
+    assert app._history_index == 0
+    assert inp.allow_empty_submit is False
+
+    # Fourth ↑ — clamps at the oldest history entry.
+    app._history_navigate(-1)
+    assert inp.text == "older"
+
+
+def test_history_navigate_down_returns_through_pending_to_live():
+    """``↓`` walks back through pending and restores the stash at live."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("submit", "alpha"),
+        PendingItem("submit", "beta"),
+    ]
+    inp = _wire_fake_input(app, value="composing")
+
+    app._history_navigate(-1)  # → "beta" (slot 1)
+    app._history_navigate(-1)  # → "alpha" (slot 0)
+    assert app._pulled_slot == 0
+
+    app._history_navigate(+1)  # → "beta" (slot 1)
+    assert inp.text == "beta"
+    assert app._pulled_slot == 1
+
+    app._history_navigate(+1)  # → restore stash
+    assert inp.text == "composing"
+    assert app._pulled_slot is None
+    assert app._history_index is None
+    assert inp.allow_empty_submit is False
+
+
+def test_pulled_pending_resubmit_replaces_slot_in_place():
+    """``Enter`` after editing a pulled slot replaces *that* slot rather
+    than appending to the queue tail — slot-preserving edit."""
+    from saklas.tui.chat_panel import ChatPanel, PendingItem
+
+    app = _make_app()
+    app._session.is_generating = True  # busy so submit enqueues
+    app._pending_queue = [
+        PendingItem("submit", "a"),
+        PendingItem("submit", "b"),
+        PendingItem("submit", "c"),
+    ]
+    _wire_fake_input(app, value="")
+    # Simulate the user having pulled slot 1 ("b") via ↑↑.
+    app._pulled_slot = 1
+
+    app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted("B prime"))
+
+    # Slot 1 replaced; order preserved.
+    assert [p.text for p in app._pending_queue] == ["a", "B prime", "c"]
+    # Pull state cleared.
+    assert app._pulled_slot is None
+
+
+def test_pulled_pending_empty_enter_removes_slot():
+    """Empty ``Enter`` while a slot is pulled removes that slot —
+    keyboard equivalent of the GUI's per-bubble ``×``."""
+    from saklas.tui.chat_panel import ChatPanel, PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("submit", "keep me"),
+        PendingItem("submit", "cancel me"),
+    ]
+    _wire_fake_input(app, value="")
+    app._pulled_slot = 1
+
+    app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted(""))
+
+    assert [p.text for p in app._pending_queue] == ["keep me"]
+    assert app._pulled_slot is None
+
+
+def test_pulled_pending_esc_cancels_pull_without_removing():
+    """``Esc`` while pulled cancels the *edit* — the slot stays in the
+    queue, the input restores its pre-pull stash."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [PendingItem("submit", "queued")]
+    inp = _wire_fake_input(app, value="composing")
+
+    app._history_navigate(-1)  # pull slot 0
+    assert app._pulled_slot == 0
+    assert inp.text == "queued"
+
+    app.action_stop_generation()  # no gen running → cancel pull
+    assert app._pulled_slot is None
+    assert inp.text == "composing"
+    assert app._pending_queue == [PendingItem("submit", "queued")]
+    assert inp.allow_empty_submit is False
+
+
+def test_drain_next_pending_decrements_pulled_slot():
+    """When the queue head drains during a pull, the pulled-slot index
+    shifts so the user keeps tracking the same item."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("submit", "head"),
+        PendingItem("submit", "middle"),
+        PendingItem("submit", "tail"),
+    ]
+    _wire_fake_input(app, value="")
+    app._pulled_slot = 2  # user is editing "tail"
+    # Block the dispatch so we only see the slot accounting.
+    app._dispatch_pending_action = MagicMock()
+
+    app._drain_next_pending()
+    assert [p.text for p in app._pending_queue] == ["middle", "tail"]
+    assert app._pulled_slot == 1  # still on "tail" — index slid down
+
+
+def test_drain_next_pending_cancels_pull_when_head_was_pulled():
+    """When the user pulled slot 0, the drain pops that very item —
+    cancel the pull so the stale ``_pulled_slot`` doesn't outlive the
+    queue mutation."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("submit", "about to fire"),
+        PendingItem("submit", "next up"),
+    ]
+    inp = _wire_fake_input(app, value="draft")
+    app._history_stash = "draft"
+    app._pulled_slot = 0
+    app._dispatch_pending_action = MagicMock()
+
+    app._drain_next_pending()
+    assert [p.text for p in app._pending_queue] == ["next up"]
+    assert app._pulled_slot is None
+    # Pull cancelled — input restored from stash.
+    assert inp.text == "draft"
+
+
+def test_pending_strip_markup_round_trips_through_rich():
+    """Direct check that ``PendingStrip`` builds well-formed Rich
+    markup for every pending kind, including the pulled-slot
+    highlight and item text containing brackets / newlines.  Catches
+    a v2.x regression where ``[[`` was used as a literal-bracket
+    escape and tripped ``MarkupError: auto closing tag ('[/]') has
+    nothing to close`` when the strip first re-rendered."""
+    from rich.console import Console
+    from rich.text import Text
+    from saklas.tui.chat_panel import PendingItem, PendingStrip
+    import io
+
+    # Side-step Textual's mount lifecycle by calling the markup
+    # builder via Static.update with a captured update target.
+    strip = object.__new__(PendingStrip)
+    captured: list[str] = []
+    strip.update = lambda s: captured.append(s)  # type: ignore[method-assign]
+    strip.add_class = lambda _c: None  # type: ignore[method-assign]
+    strip.remove_class = lambda _c: None  # type: ignore[method-assign]
+    strip._queue = []
+
+    items = [
+        PendingItem("submit", "what do you think?"),
+        PendingItem("clear", "/clear"),
+        PendingItem("steer", "/steer 0.5 angry"),
+        PendingItem("submit", "with [brackets] and \\backslashes"),
+        PendingItem("submit", "multi\nline\nmessage"),
+    ]
+    for slot in [None, 0, 2, len(items) - 1]:
+        PendingStrip.update_queue(strip, items, pulled_slot=slot)
+        # Parsing through Text.from_markup raises MarkupError on bad
+        # markup — the assertion is "no raise."
+        Console(file=io.StringIO(), force_terminal=True).print(
+            Text.from_markup(captured[-1])
+        )
+
+
+def test_slash_command_during_gen_enqueues_canonical_text():
+    """Mid-gen ``/clear`` enqueues a :class:`PendingItem` carrying the
+    full slash text so the user can pull and edit it via ↑.  The
+    in-flight gen is not stopped — queue model preserves tokens."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._session.is_generating = True
+    app._session.stop = MagicMock()
+
+    app._handle_command("/clear")
+
+    assert app._pending_queue == [PendingItem("clear", "/clear")]
+    app._session.stop.assert_not_called()
+
+
 def test_shift_arrow_uses_coarse_alpha_step():
     """Holding shift with ←/→ nudges alpha by 0.1 instead of 0.01."""
     from saklas.tui.app import _ALPHA_STEP_FINE, _ALPHA_STEP_COARSE
@@ -1131,3 +1446,289 @@ def test_shift_arrow_uses_coarse_alpha_step():
     # Shift+left undoes the shift+right exactly.
     app._adjust_alpha(-_ALPHA_STEP_COARSE)
     assert app._alphas["honest"] == pytest.approx(_ALPHA_STEP_FINE)
+
+
+# ---- Logit-pass: highlight mode cycle (Ctrl+Y) ----
+
+
+def test_highlight_cycle_off_to_probe_to_surprise():
+    """Ctrl+Y walks {off → probe → surprise → off} with a probe loaded.
+
+    The cycle defers to the trait-panel selection for the ``probe``
+    slot so navigating the right rack still drives WHICH probe lights
+    up — Ctrl+Y only switches between "off / a probe / surprise".
+    """
+    from saklas.tui.chat_panel import SURPRISE_PROBE
+
+    app = _make_app()
+    # Pretend a probe is loaded and trait-panel-selected.
+    app._trait_panel.get_selected_probe = MagicMock(return_value="angry.calm")
+    app._apply_highlight_to_all = MagicMock()
+
+    # Start at off.
+    assert app._highlighting is False
+
+    # off → probe.  The cycle no longer emits a chat message — mode is
+    # surfaced by the persistent HL line in the left panel instead — so
+    # the assertions track ``_highlighting`` / ``_highlight_probe``.
+    app.action_cycle_highlight_mode()
+    assert app._highlighting is True
+    assert app._highlight_probe == "angry.calm"
+
+    # probe → surprise
+    app.action_cycle_highlight_mode()
+    assert app._highlighting is True
+    assert app._highlight_probe == SURPRISE_PROBE
+
+    # surprise → off
+    app.action_cycle_highlight_mode()
+    assert app._highlighting is False
+
+
+def test_highlight_cycle_backward_walks_reverse():
+    """Ctrl+Shift+Y walks the cycle backward from any state."""
+    from saklas.tui.chat_panel import SURPRISE_PROBE
+
+    app = _make_app()
+    app._trait_panel.get_selected_probe = MagicMock(return_value="warm.clinical")
+    app._apply_highlight_to_all = MagicMock()
+
+    # off → surprise (backward)
+    app.action_cycle_highlight_mode_back()
+    assert app._highlight_probe == SURPRISE_PROBE
+    assert app._highlighting is True
+
+    # surprise → probe (backward)
+    app.action_cycle_highlight_mode_back()
+    assert app._highlight_probe == "warm.clinical"
+
+    # probe → off (backward)
+    app.action_cycle_highlight_mode_back()
+    assert app._highlighting is False
+
+
+def test_left_panel_highlight_line_renders():
+    """``LeftPanel.update_highlight`` puts an ``HL`` line in the
+    GENERATION block: ``off`` dimmed, probe names verbatim, long names
+    truncated to the 15-char preview budget."""
+    from saklas.tui.vector_panel import LeftPanel
+
+    panel = LeftPanel(model_info={})
+    captured: list[str] = []
+    panel._gen_config_widget = SimpleNamespace(update=captured.append)
+
+    panel.update_highlight("off")
+    assert "HL" in captured[-1] and "off" in captured[-1]
+
+    panel.update_highlight("angry.calm")
+    assert "angry.calm" in captured[-1]
+
+    panel.update_highlight("surprise")
+    assert "surprise" in captured[-1]
+
+    # Long probe names truncate like the Sys-prompt preview.
+    panel.update_highlight("high_context.low_context")
+    assert "high_context.lo..." in captured[-1]
+    assert "high_context.low_context" not in captured[-1]
+
+
+def test_highlight_cycle_skips_probe_when_none_selectable():
+    """With no probes loaded, ``probe`` slot is skipped so the cycle
+    collapses to {off ↔ surprise} rather than getting stuck."""
+    from saklas.tui.chat_panel import SURPRISE_PROBE
+
+    app = _make_app()
+    # No trait-panel selection and no stored seed — probe slot has
+    # nothing to anchor to.
+    app._trait_panel.get_selected_probe = MagicMock(return_value=None)
+    app._apply_highlight_to_all = MagicMock()
+    app._highlight_probe = None
+
+    # off → (probe-skip) → surprise
+    app.action_cycle_highlight_mode()
+    assert app._highlight_probe == SURPRISE_PROBE
+    assert app._highlighting is True
+
+    # surprise → off
+    app.action_cycle_highlight_mode()
+    assert app._highlighting is False
+
+    # Backward direction also skips cleanly.
+    app.action_cycle_highlight_mode_back()
+    assert app._highlight_probe == SURPRISE_PROBE
+
+
+def test_apply_highlight_to_all_preserves_surprise_sentinel():
+    """Trait-panel arrow keys must not clobber the SURPRISE_PROBE
+    sentinel back to a probe — that latent bug from the Phase 3 pass
+    would have flipped surprise mode off the moment the user moved
+    in the right rack."""
+    from saklas.tui.chat_panel import SURPRISE_PROBE
+
+    app = _make_app()
+    # Trait panel has a different probe selected — without the
+    # surprise-guard this would clobber the sentinel.
+    app._trait_panel.get_selected_probe = MagicMock(return_value="angry.calm")
+    app._highlight_probe = SURPRISE_PROBE
+    app._highlighting = True
+    app._assistant_messages = []  # no widgets to apply to
+
+    app._apply_highlight_to_all()
+
+    # Sentinel survived; trait-panel selection was ignored under
+    # surprise mode.
+    assert app._highlight_probe == SURPRISE_PROBE
+
+
+# ---------------------------------------------------------------------------
+# Queue role-awareness — predicted active-node role flips the input mode
+# ---------------------------------------------------------------------------
+
+
+def test_predicted_on_user_node_falls_through_to_live_when_queue_empty():
+    """No queued items → predicted equals live."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    # Live active is the synthetic root (system) — not a user node.
+    assert app._prefill_target_node_id() is None
+    assert app._predicted_on_user_node() is False
+
+    # A queued ``/steer`` doesn't shift the role, so prediction still
+    # mirrors live.
+    app._pending_queue = [PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",))]
+    assert app._predicted_on_user_node() is False
+
+
+def test_predicted_on_user_node_reflects_queued_commit_user():
+    """A queued ``commit_user`` predicts the next submission as prefill."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    # Live active is root — not a user node.
+    assert app._predicted_on_user_node() is False
+
+    # Queue a commit_user — the next item should land in prefill mode.
+    app._pending_queue = [PendingItem("commit_user", "hi")]
+    assert app._predicted_on_user_node() is True
+
+    # Add a commit_assistant on top — final role flips back to assistant.
+    app._pending_queue.append(PendingItem("commit_assistant", "hello", ("uid",)))
+    assert app._predicted_on_user_node() is False
+
+
+def test_predicted_walks_past_no_change_kinds():
+    """Items with no role mapping (``/steer``, ``/probe``) are walked past
+    so a queued ``commit_user`` followed by ``/steer`` still predicts
+    user mode."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("commit_user", "hi"),
+        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
+        PendingItem("probe", "/probe calm", ("calm",)),
+    ]
+    assert app._predicted_on_user_node() is True
+
+
+def test_enqueue_pending_refreshes_input_mode():
+    """Enqueueing a role-shifting item updates the placeholder
+    immediately — no need to wait for the queue to drain."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    set_prefill_mode = MagicMock()
+    app._chat_panel.set_prefill_mode = set_prefill_mode
+
+    app._enqueue_pending(PendingItem("commit_user", "hi"))
+    # Last call reflects the queue-aware mode.
+    set_prefill_mode.assert_called_with(True)
+
+    app._enqueue_pending(PendingItem("commit_assistant", "hello", ("uid",)))
+    set_prefill_mode.assert_called_with(False)
+
+
+def test_remove_pending_slot_refreshes_input_mode():
+    """Cancelling the queued role-shifter restores live mode."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [PendingItem("commit_user", "hi")]
+    set_prefill_mode = MagicMock()
+    app._chat_panel.set_prefill_mode = set_prefill_mode
+
+    app._remove_pending_slot(0)
+    # After removal, prediction falls back to live (root, not user).
+    set_prefill_mode.assert_called_with(False)
+
+
+# ---------------------------------------------------------------------------
+# Pending-queue drain chaining — sync kinds chain inline, async kinds break
+# ---------------------------------------------------------------------------
+
+
+def test_drain_next_pending_chains_through_sync_kinds():
+    """A run of sync slash kinds (/clear /steer /probe /rewind) drains
+    all in one call — the old single-item drain would have left them
+    stuck waiting for a ``done`` that never arrives."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
+        PendingItem("probe", "/probe calm", ("calm",)),
+        PendingItem("clear", "/clear"),
+    ]
+    _wire_fake_input(app, value="")
+    dispatched: list[str] = []
+    app._dispatch_pending_action = MagicMock(
+        side_effect=lambda item: dispatched.append(item.kind),
+    )
+
+    app._drain_next_pending()
+    # All three drained in one call — chain-inline behavior.
+    assert dispatched == ["steer", "probe", "clear"]
+    assert app._pending_queue == []
+
+
+def test_drain_next_pending_breaks_at_first_async_kind():
+    """Drain chains through sync kinds but breaks at the first kind
+    that runs a worker / kicks a gen — that one's own ``done`` will
+    advance the queue, so chaining past it would race the worker."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("clear", "/clear"),                # sync — chain
+        PendingItem("commit_user", "hi"),              # async — break here
+        PendingItem("submit", "next"),                 # stays queued
+    ]
+    _wire_fake_input(app, value="")
+    dispatched: list[str] = []
+    app._dispatch_pending_action = MagicMock(
+        side_effect=lambda item: dispatched.append(item.kind),
+    )
+
+    app._drain_next_pending()
+    # Only the first two ran; submit waits for commit_user's done.
+    assert dispatched == ["clear", "commit_user"]
+    assert [p.kind for p in app._pending_queue] == ["submit"]
+
+
+def test_drain_next_pending_handles_pure_async_chain():
+    """When the head is async, drain pops exactly one — matches the
+    pre-existing single-item semantics every gen-bearing kind
+    depends on."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._pending_queue = [
+        PendingItem("submit", "first"),
+        PendingItem("submit", "second"),
+    ]
+    _wire_fake_input(app, value="")
+    app._dispatch_pending_action = MagicMock()
+
+    app._drain_next_pending()
+    assert [p.text for p in app._pending_queue] == ["second"]

@@ -21,22 +21,21 @@ from saklas.core.extraction import (
     ExtractionPipeline,
     ModelHandle,
     PackWriter,
-    VectorRegistry,
 )
 
 
 # ----------------------------------------------------------------------
-# Minimal duck-typed handle that satisfies all three Protocols at once.
+# Minimal duck-typed handle that satisfies both Protocols at once.
 # Tracks every model-side / generator-side call so tests can assert the
 # pipeline took the expected path.
 # ----------------------------------------------------------------------
 
 
 class _StubHandle:
-    """Single object satisfying ModelHandle + PackWriter + VectorRegistry.
+    """Single object satisfying ModelHandle + PackWriter.
 
     Mirrors the session's natural shape: the pipeline is constructed
-    against ``handle, handle, handle, events`` so the structural
+    against ``handle, handle, events`` so the structural
     protocols line up one-to-one with concrete attrs/methods.
     """
 
@@ -107,14 +106,6 @@ class _StubHandle:
     def _update_local_pack_files(self, folder):
         self.update_pack_calls += 1
 
-    # VectorRegistry surface --------------------------------------------
-
-    def __contains__(self, name):
-        return name in self._profiles
-
-    def add(self, name, profile):
-        self.added[name] = profile
-
 
 def _fake_extract(monkeypatch, *, response=None):
     """Replace both ``extract_contrastive`` and ``extract_difference_of_means``
@@ -159,20 +150,18 @@ class TestProtocolShape:
     """Runtime-checkable Protocols accept the implicit session implementation."""
 
     def test_session_satisfies_modelhandle(self, tmp_path, monkeypatch):
-        # SaklasSession's natural shape passes isinstance against all three
+        # SaklasSession's natural shape passes isinstance against both
         # protocols.  Validates the `runtime_checkable` decoration on each.
         handle = _StubHandle(tmp_path)
         assert isinstance(handle, ModelHandle)
         assert isinstance(handle, PackWriter)
-        assert isinstance(handle, VectorRegistry)
 
     def test_pipeline_constructs_against_stub(self, tmp_path):
         handle = _StubHandle(tmp_path)
-        pipeline = ExtractionPipeline(handle, handle, handle, EventBus())
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
         # Hold the references the plan promised.
         assert pipeline._handle is handle
         assert pipeline._packs is handle
-        assert pipeline._registry is handle
 
 
 class TestTensorCacheShortCircuit:
@@ -204,7 +193,7 @@ class TestTensorCacheShortCircuit:
         ).write(folder)
 
         handle = _StubHandle(tmp_path)
-        pipeline = ExtractionPipeline(handle, handle, handle, EventBus())
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
 
         name, profile = pipeline.extract("honest.deceptive")
 
@@ -248,7 +237,7 @@ class TestForceStatementsRegenerates:
         ).write(folder)
 
         handle = _StubHandle(tmp_path)
-        pipeline = ExtractionPipeline(handle, handle, handle, EventBus())
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
 
         name, profile = pipeline.extract("honest.deceptive", force_statements=True)
 
@@ -275,7 +264,7 @@ class TestExplicitScenariosBypass:
         invalidate()
 
         handle = _StubHandle(tmp_path)
-        pipeline = ExtractionPipeline(handle, handle, handle, EventBus())
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
 
         name, profile = pipeline.extract(
             "honest.deceptive",
@@ -335,7 +324,7 @@ class TestVectorExtractedEvent:
         from saklas.core.events import VectorExtracted
         bus.subscribe(lambda e: seen.append(e) if isinstance(e, VectorExtracted) else None)
 
-        pipeline = ExtractionPipeline(handle, handle, handle, bus)
+        pipeline = ExtractionPipeline(handle, handle, bus)
         pipeline.extract("honest.deceptive")
 
         assert len(seen) == 1

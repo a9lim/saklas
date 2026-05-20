@@ -1,18 +1,24 @@
-"""DataFrame coercions for ``ResultCollector`` and bare result lists.
+"""DataFrame coercions for ``RunSet``, ``ResultCollector``, and bare lists.
 
 Thin wrapper layer over the existing structured types — keeps the
 notebook's plot functions decoupled from how the user collected their
-results (programmatic ``ResultCollector``, hand-built list, JSONL on
-disk, or already a DataFrame).
+results (``RunSet``, programmatic ``ResultCollector``, hand-built list,
+JSONL on disk, or already a DataFrame).
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, TypeAlias, Union
 
 if TYPE_CHECKING:
     import pandas as pd
 
-    from saklas.core.results import GenerationResult, ResultCollector
+    from saklas.core.results import GenerationResult, ResultCollector, RunSet
+
+
+DataFrameSource: TypeAlias = (
+    "Union[RunSet, ResultCollector, list[GenerationResult], "
+    "list[dict[str, Any]], pd.DataFrame]"
+)
 
 
 def _require_pandas() -> Any:
@@ -27,12 +33,14 @@ def _require_pandas() -> Any:
 
 
 def to_dataframe(
-    source: "Union[ResultCollector, list[GenerationResult], list[dict[str, Any]], pd.DataFrame]",
+    source: DataFrameSource,
 ) -> "pd.DataFrame":
     """Coerce the common result containers into a flat pandas DataFrame.
 
     Accepted shapes:
 
+    * :class:`saklas.core.results.RunSet` — delegates to its own
+      ``to_dataframe`` so ``grid`` and ``node_ids`` are preserved.
     * :class:`saklas.core.results.ResultCollector` — delegates to its own
       ``to_dataframe`` (the single source of truth for column naming).
     * ``list[GenerationResult]`` — wraps each through a transient
@@ -54,7 +62,10 @@ def to_dataframe(
     # ResultCollector: delegate to its own to_dataframe so column naming
     # stays in one place.  Imported here (not at module top) so users
     # without pandas don't pay an import-time cost.
-    from saklas.core.results import GenerationResult, ResultCollector
+    from saklas.core.results import GenerationResult, ResultCollector, RunSet
+
+    if isinstance(source, RunSet):
+        return source.to_dataframe()
 
     if isinstance(source, ResultCollector):
         return source.to_dataframe()
@@ -67,7 +78,7 @@ def to_dataframe(
             return pd.DataFrame(source)
         if isinstance(first, GenerationResult):
             # Route through a transient collector so column names match
-            # what users get from session.generate_batch flows.
+            # manual collection. RunSet takes the richer path above.
             rc = ResultCollector()
             for r in source:
                 if not isinstance(r, GenerationResult):
@@ -81,6 +92,6 @@ def to_dataframe(
 
     raise TypeError(
         f"to_dataframe: unsupported source type {type(source).__name__}; "
-        f"expected ResultCollector, list[GenerationResult], "
+        f"expected RunSet, ResultCollector, list[GenerationResult], "
         f"list[dict], or pd.DataFrame"
     )

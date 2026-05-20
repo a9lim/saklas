@@ -23,6 +23,7 @@ _KNOWN_KEYS = {
     "injection_mode", "theta_max",
     "projection_metric",
     "compile", "cuda_graphs",
+    "return_top_k",
 }
 
 _VALID_EXTRACTION_METHODS = ("dim", "pca")
@@ -50,6 +51,12 @@ class ConfigFile:
     projection_metric: Optional[str] = None  # "mahalanobis" | "euclidean"; None = default
     compile: Optional[bool] = None           # CUDA torch.compile auto-enable; None = default (on)
     cuda_graphs: Optional[bool] = None       # CUDA StaticCache + graph capture; None = default (on)
+    # Session-level default for SamplingConfig.return_top_k — the number
+    # of top-K alternatives the engine decodes (with text) per generated
+    # token.  ``None`` means "use session default" (which is 0 — chosen
+    # logprob only).  Per-call SamplingConfig.return_top_k > 0 overrides;
+    # K=0 inherits this session-level value.  Phase 1 logit pass.
+    return_top_k: Optional[int] = None
 
     @classmethod
     def load_default(cls) -> Optional["ConfigFile"]:
@@ -205,6 +212,22 @@ class ConfigFile:
                 f"Use ``cuda_graphs: true`` or ``cuda_graphs: false``."
             )
 
+        return_top_k_v = data.get("return_top_k")
+        if return_top_k_v is not None:
+            # Reject bool sneaking through as int (``return_top_k: false``
+            # would silently set 0 without this guard; the user almost
+            # certainly meant a number).
+            if isinstance(return_top_k_v, bool) or not isinstance(return_top_k_v, int):
+                raise ConfigFileError(
+                    f"{path}: return_top_k must be an integer in [0, 256] "
+                    f"(got {type(return_top_k_v).__name__} {return_top_k_v!r})"
+                )
+            if return_top_k_v < 0 or return_top_k_v > 256:
+                raise ConfigFileError(
+                    f"{path}: return_top_k out of range [0, 256] "
+                    f"(got {return_top_k_v!r})"
+                )
+
         return cls(
             model=data.get("model"),
             vectors=vectors,
@@ -219,6 +242,7 @@ class ConfigFile:
             projection_metric=projection_metric,
             compile=compile_v,
             cuda_graphs=cuda_graphs_v,
+            return_top_k=return_top_k_v,
         )
 
 
@@ -236,6 +260,7 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
             "top_p", "max_tokens", "system_prompt", "vectors",
             "extraction_method", "injection_mode", "theta_max",
             "projection_metric", "compile", "cuda_graphs",
+            "return_top_k",
         ):
             v = getattr(c, f)
             if v is not None:

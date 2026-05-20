@@ -1,11 +1,16 @@
 <script lang="ts">
   // Hand-rolled horizontal bar.  Positive = green, negative = red,
-  // mirroring the TUI build_bar shape but in pixel-width SVG (aliased
-  // against the GitHub-dark accent palette in tokens.css).
+  // mirroring the TUI build_bar shape but in pixel-width SVG.
   //
   // ``value`` and ``max`` are unitless; ``width`` is the rendered max
   // width in pixels (defaults to BAR_WIDTH * 6 ≈ the TUI's 24-glyph
   // bar at typical web character cell width).
+  //
+  // ``bipolar`` flips the bar to a center-zero shape: fills rightward
+  // from the midline for positive values, leftward for negative, with a
+  // thin midline tick.  Matches the steering slider's axis so a bipolar
+  // probe row reads "neg ◄──█──► pos" in the same direction the user
+  // moves the steering slider.
 
   interface Props {
     value: number;
@@ -19,6 +24,10 @@
     /** Override the bar fill color.  Defaults to the appropriate accent
      * based on sign of value. */
     color?: string;
+    /** Render as a center-zero bar (fills from midline outward).  Off
+     * by default — the existing unipolar shape is preserved for all
+     * non-probe callers. */
+    bipolar?: boolean;
   }
 
   let {
@@ -28,12 +37,22 @@
     height = 8,
     showBaseline = false,
     color,
+    bipolar = false,
   }: Props = $props();
 
   const filled = $derived.by(() => {
     if (max <= 0 || !Number.isFinite(max)) return 0;
     const ratio = Math.min(1, Math.abs(value) / max);
-    return Math.round(ratio * width);
+    return Math.round(ratio * (bipolar ? width / 2 : width));
+  });
+
+  /** x-coordinate where the fill rectangle starts.  Unipolar bars start
+   * at 0; bipolar negative bars start at ``mid - filled`` so they grow
+   * leftward from center. */
+  const fillX = $derived.by(() => {
+    if (!bipolar) return 0;
+    const mid = width / 2;
+    return value < 0 ? mid - filled : mid;
   });
 
   const fill = $derived.by(() => {
@@ -53,14 +72,26 @@
   aria-hidden="true"
 >
   <rect x="0" y="0" {width} {height} class="track" />
-  <rect x="0" y="0" width={filled} {height} fill={fill} class="fill" />
+  <rect x={fillX} y="0" width={filled} {height} fill={fill} class="fill" />
+  {#if bipolar}
+    <!-- Center tick so users can read sign at a glance even when value
+         is exactly 0 (no fill rectangle to anchor the eye). -->
+    <line
+      x1={width / 2}
+      x2={width / 2}
+      y1="0"
+      y2={height}
+      stroke="var(--border)"
+      stroke-width="1"
+    />
+  {/if}
   {#if showBaseline}
     <line
       x1="0"
       x2={width}
       y1={height}
       y2={height}
-      stroke="var(--border-dim)"
+      stroke="var(--border)"
       stroke-width="0.5"
     />
   {/if}
@@ -75,6 +106,6 @@
     fill: var(--bg-elev);
   }
   .fill {
-    transition: width 0.15s ease-out;
+    transition: width var(--dur) var(--ease-out);
   }
 </style>

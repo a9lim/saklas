@@ -42,6 +42,17 @@ class SamplingConfig:
     # layers, CPU, detached). False keeps the fast path bit-identical to
     # today — HiddenCapture stays on probe-layer union.
     return_hidden: bool = False
+    # Loom-path knob for top-K alternatives capture (saklas-native; the
+    # OpenAI route uses ``logprobs`` instead and the two compose under
+    # ``max`` inside ``_generate_core``).  ``0`` means logprob-only —
+    # chosen-token logprob is captured whenever the engine already runs
+    # log_softmax (any ``on_token`` consumer or an explicit ``logprobs``
+    # request), so K=0 is the minimal-additive-cost default for the loom
+    # path. ``K > 0`` additionally captures the top-K alternatives with
+    # decoded text per :class:`TokenAlt`.  Clamped to ``[0, 256]`` in
+    # ``__post_init__`` — beyond 256 is data nobody can act on and bytes
+    # nobody wants on the wire.
+    return_top_k: int = 0
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
@@ -50,6 +61,17 @@ class SamplingConfig:
         # it's a real runtime guard against lists slipping through.
         if self.stop is not None and not isinstance(self.stop, tuple):  # pyright: ignore[reportUnnecessaryIsInstance]
             object.__setattr__(self, "stop", tuple(self.stop))
+        # Clamp return_top_k into the supported range. We do this rather
+        # than raise because the field is exposed through both Python
+        # (kwarg) and YAML/CLI surfaces; clamping silently keeps the
+        # downstream engine math safe (slicing with a too-large K would
+        # ValueError on torch.topk) and matches the rest of the
+        # SamplingConfig discipline of preferring graceful coercion to
+        # raises at construction.
+        if self.return_top_k < 0:
+            object.__setattr__(self, "return_top_k", 0)
+        elif self.return_top_k > 256:
+            object.__setattr__(self, "return_top_k", 256)
 
     # Default sentinels used by merged_with — matches the dataclass defaults.
     _DEFAULTS = {
@@ -64,6 +86,7 @@ class SamplingConfig:
         "frequency_penalty": 0.0,
         "logprobs": None,
         "return_hidden": False,
+        "return_top_k": 0,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

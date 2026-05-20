@@ -49,6 +49,8 @@ dependencies = [
     "safetensors>=0.7.0",
     "textual>=0.50",
     "pyyaml>=6.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.44.0",
 ]
 
 [project.urls]
@@ -61,15 +63,13 @@ Releases = "https://github.com/a9lim/saklas/releases"
 bnb = ["bitsandbytes>=0.43"]
 flash = ["flash-attn>=2.5"]
 cuda = ["bitsandbytes>=0.43", "flash-attn>=2.5"]
-dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6.9", "pyright>=1.1.400", "fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
-serve = ["fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6.9", "pyright>=1.1.400"]
 hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
 pandas = ["pandas>=3.0.2"]
 research = ["datasets>=2.0", "pandas>=3.0.2"]
 sae = ["sae-lens>=6.0,<7.0"]
 notebook = ["plotly>=5.0", "pandas>=3.0.2", "kaleido>=0.2"]
-web = ["fastapi>=0.110", "uvicorn[standard]>=0.44.0"]
 
 [project.scripts]
 saklas = "saklas.cli.main:main"

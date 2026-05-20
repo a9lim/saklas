@@ -14,6 +14,33 @@
  * align across surfaces. */
 export const HIGHLIGHT_SAT = 0.5;
 
+/** Sentinel ``highlightState.target`` value that selects the inline
+ *  surprise mode (logit-pass).  Picked to be unmistakably distinct from
+ *  any real probe name (probes are slugged ``[a-z0-9._-]``); ``__``-bracketed
+ *  reserves the namespace without colliding.  Imported by both
+ *  ``Chat.svelte`` and any future TUI parity pass. */
+export const SURPRISE_TARGET = "__surprise__";
+
+/** Map a chosen-token logprob to a positive-scale score suitable for
+ *  ``scoreToRgb``.
+ *
+ *  Logic:
+ *    tint = 1 - exp(logprob) = 1 - probability   # [0, 1)
+ *
+ *  Then scaled by ``HIGHLIGHT_SAT`` so the full surprise range
+ *  ``[0, 1]`` lands in ``scoreToRgb``'s positive-saturation band and
+ *  reuses the existing diverging probe color scale (positive half only).
+ *  Returns ``undefined`` when logprob is null / not finite. */
+export function surpriseScore(
+  logprob: number | null | undefined,
+): number | undefined {
+  if (logprob == null || !Number.isFinite(logprob)) return undefined;
+  // ``logprob`` is the log of a probability so it's always ≤ 0 —
+  // ``exp(logprob)`` is in (0, 1] and ``tint`` lands in [0, 1).
+  const tint = 1 - Math.exp(logprob);
+  return tint * HIGHLIGHT_SAT;
+}
+
 /** Map a probe score in [-1, +1] (higher saturation = stronger color)
  * to a CSS rgb() string.  Returns ``"transparent"`` when score is
  * effectively zero or null/undefined.

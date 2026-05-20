@@ -109,7 +109,7 @@
       if (e instanceof ApiError) {
         if (e.status === 503) {
           searchError =
-            "huggingface_hub not installed on the server — `pip install -e \".[serve]\"` and restart.";
+            "huggingface_hub isn't installed on the server. Run `pip install -e \".[serve]\"` and restart.";
         } else if (e.status === 502) {
           searchError = `HF transport error: ${e.message}`;
         } else {
@@ -144,7 +144,7 @@
       if (e instanceof ApiError) {
         if (e.status === 503) {
           installError =
-            "huggingface_hub not installed on the server — `pip install -e \".[serve]\"` and restart.";
+            "huggingface_hub isn't installed on the server. Run `pip install -e \".[serve]\"` and restart.";
         } else if (e.status === 502) {
           installError = `HF transport error: ${e.message}`;
         } else if (e.status === 409) {
@@ -390,29 +390,29 @@
     height: 100%;
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
   }
   .head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.6em 1em;
+    padding: var(--space-4) var(--space-5);
     border-bottom: 1px solid var(--border);
   }
   .head h2 {
     margin: 0;
-    font-size: 1em;
+    font-size: var(--text);
     color: var(--accent-blue);
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     text-transform: lowercase;
   }
   .close {
     background: transparent;
     border: 0;
     color: var(--fg-dim);
-    font-size: 1em;
+    font-size: var(--text);
     line-height: 1;
-    padding: 0.25em 0.4em;
+    padding: var(--space-2) var(--space-3);
     cursor: pointer;
   }
   .close:hover {
@@ -429,9 +429,9 @@
     background: transparent;
     border: 0;
     color: var(--fg-dim);
-    padding: 0.5em 1em;
+    padding: var(--space-3) var(--space-5);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     cursor: pointer;
     border-bottom: 2px solid transparent;
   }
@@ -439,22 +439,22 @@
     color: var(--fg);
   }
   .tabs button.active {
-    color: var(--accent-blue);
-    border-bottom-color: var(--accent-blue);
+    color: var(--accent);
+    border-bottom-color: var(--accent);
     background: var(--bg-alt);
   }
 
   .body {
     flex: 1;
     overflow-y: auto;
-    padding: 0.6em 1em;
+    padding: var(--space-4) var(--space-5);
     min-height: 0;
   }
 
   .installed {
     display: grid;
     grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
-    gap: 0.8em;
+    gap: var(--space-5);
     height: 100%;
   }
   .list-pane,
@@ -464,26 +464,26 @@
   }
   .preview {
     background: var(--bg-deep);
-    border: 1px solid var(--border-dim);
-    border-radius: 4px;
-    padding: 0.6em 0.8em;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-4) var(--space-5);
   }
   .preview h3 {
-    margin: 0 0 0.3em 0;
-    font-size: 0.95em;
+    margin: 0 0 var(--space-2) 0;
+    font-size: var(--text);
     color: var(--accent-green);
   }
   .preview-desc {
     color: var(--fg-strong);
-    margin: 0 0 0.6em 0;
-    font-size: 0.9em;
+    margin: 0 0 var(--space-4) 0;
+    font-size: var(--text-sm);
   }
   .preview dl {
     margin: 0;
     display: grid;
     grid-template-columns: max-content 1fr;
-    gap: 0.2em 0.7em;
-    font-size: var(--font-size-small);
+    gap: var(--space-1) var(--space-4);
+    font-size: var(--text-sm);
   }
   .preview dt {
     color: var(--fg-muted);
@@ -496,7 +496,7 @@
   }
   .model-list {
     margin: 0;
-    padding-left: 1em;
+    padding-left: var(--space-5);
   }
 
   .rows {
@@ -505,7 +505,7 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.4em;
+    gap: var(--space-3);
   }
   .row {
     display: block;
@@ -513,29 +513,29 @@
     text-align: left;
     background: var(--bg-deep);
     color: var(--fg);
-    border: 1px solid var(--border-dim);
-    border-radius: 4px;
-    padding: 0.5em 0.7em;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     cursor: pointer;
   }
   .row:hover {
-    border-color: var(--border);
+    border-color: var(--accent);
     background: var(--bg-alt);
   }
   .row.selected {
-    border-color: var(--accent-blue);
+    border-color: var(--accent);
     background: var(--bg-alt);
   }
   .row-top {
     display: flex;
     justify-content: space-between;
-    gap: 0.6em;
+    gap: var(--space-4);
   }
   .row-name {
     color: var(--accent-green);
-    font-weight: 600;
+    font-weight: var(--weight-medium);
   }
   .row-source,
   .row-alpha,
@@ -543,19 +543,19 @@
   .row-tags,
   .row-files {
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .row-desc {
     color: var(--fg-strong);
-    margin: 0.3em 0 0 0;
-    font-size: 0.9em;
+    margin: var(--space-2) 0 0 0;
+    font-size: var(--text-sm);
   }
   .row-bot {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    gap: 0.5em;
-    margin-top: 0.4em;
+    gap: var(--space-3);
+    margin-top: var(--space-3);
     flex-wrap: wrap;
   }
   .row-status {
@@ -565,7 +565,7 @@
   .search {
     display: flex;
     flex-direction: column;
-    gap: 0.6em;
+    gap: var(--space-4);
   }
   .query {
     display: block;
@@ -576,33 +576,34 @@
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0.45em 0.6em;
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
   }
   .query input:focus {
-    outline: 1px solid var(--accent-blue);
-    border-color: var(--accent-blue);
+    outline: 1px solid var(--accent);
+    border-color: var(--accent);
   }
   .search-row {
     cursor: default;
   }
   .install {
-    background: transparent;
-    color: var(--accent-blue);
-    border: 1px solid var(--accent-blue);
-    padding: 0.25em 0.7em;
-    border-radius: 3px;
+    background: var(--accent);
+    color: var(--text-on-accent);
+    border: 1px solid var(--accent);
+    padding: var(--space-2) var(--space-4);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
-    gap: 0.4em;
+    gap: var(--space-3);
   }
   .install:hover:not(:disabled) {
-    background: rgba(88, 166, 255, 0.12);
+    background: var(--accent-light);
+    border-color: var(--accent-light);
   }
   .install:disabled {
     opacity: 0.55;
@@ -612,7 +613,7 @@
     width: 0.7em;
     height: 0.7em;
     border-radius: 50%;
-    border: 1.5px solid var(--accent-blue);
+    border: 1px solid var(--text-on-accent);
     border-right-color: transparent;
     animation: spin 0.7s linear infinite;
     display: inline-block;
@@ -625,19 +626,19 @@
 
   .foot {
     border-top: 1px solid var(--border);
-    padding: 0.5em 1em;
+    padding: var(--space-3) var(--space-5);
     display: flex;
     justify-content: flex-end;
-    gap: 0.5em;
+    gap: var(--space-3);
   }
   .secondary {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--fg-dim);
-    padding: 0.35em 0.9em;
-    border-radius: 3px;
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius);
     font-family: var(--font-mono);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     cursor: pointer;
   }
   .secondary:hover {
@@ -647,17 +648,17 @@
 
   .muted {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
   }
   .notice {
     color: var(--accent-green);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
   }
   .error {
     color: var(--accent-error);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     margin: 0;
     word-break: break-word;
   }

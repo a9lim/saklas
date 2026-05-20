@@ -50,7 +50,7 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
   }
   .row {
     display: flex;
@@ -71,7 +71,7 @@
   }
   .empty {
     color: var(--fg-muted);
-    font-size: var(--font-size-small);
-    padding: 0.4em;
+    font-size: var(--text-sm);
+    padding: var(--space-3);
   }
 </style>

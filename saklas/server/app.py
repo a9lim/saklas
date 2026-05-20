@@ -153,16 +153,19 @@ class _SamplingBase(BaseModel):
     ) -> "Steering | None":
         """Compose ``self.steering`` (expression string) over the server default.
 
-        The per-request expression overrides the default at the key level:
-        alphas for concepts named in both the default and the request come
-        from the request; alphas only in the default pass through. Returns
-        ``None`` when the composed result is empty and no ``thinking``
-        override was requested. Pole aliasing happens inside
-        ``session.steering()`` — the server does not resolve poles here.
+        ``None`` inherits the server default; an explicit empty string
+        clears it.  Non-empty per-request expressions override the default
+        at the key level: alphas for concepts named in both the default
+        and the request come from the request; alphas only in the default
+        pass through. Returns ``None`` when the composed result is empty
+        and no ``thinking`` override was requested. Pole aliasing happens
+        inside ``session.steering()`` — the server does not resolve poles
+        here.
         """
         from saklas.core.steering_expr import parse_expr
 
         req_steering: "Steering | None" = None
+        explicit_clear = self.steering is not None and not self.steering.strip()
         if self.steering is not None and self.steering.strip():
             req_steering = parse_expr(self.steering)
 
@@ -171,7 +174,7 @@ class _SamplingBase(BaseModel):
             thinking = req_steering.thinking
 
         merged_alphas: dict = {}
-        if default_steering is not None:
+        if default_steering is not None and not explicit_clear:
             merged_alphas.update(default_steering.alphas)
         if req_steering is not None:
             for k, v in req_steering.alphas.items():
@@ -349,6 +352,13 @@ def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
         return None
     tok = session._tokenizer
     content = []
+    # Inner ``top`` is now ``list[TokenAlt]`` (id/text/logprob triples
+    # decoded by the engine at top-K capture time); the previous
+    # ``list[tuple[int, float]]`` pair shape was retired with the phase 1
+    # logit pass so we no longer re-tokenize the alt ids here.  The
+    # chosen-token text still goes through ``tok.decode`` because the
+    # engine emits its id via ``result.tokens`` without the streaming
+    # text representation alongside.
     for tid, lp, top in result.logprobs:
         tok_str = tok.decode([tid])
         content.append({
@@ -356,9 +366,9 @@ def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
             "logprob": lp,
             "bytes": _token_bytes(tok_str),
             "top_logprobs": [
-                {"token": tok.decode([i]), "logprob": alt_lp,
-                 "bytes": _token_bytes(tok.decode([i]))}
-                for i, alt_lp in top
+                {"token": alt.text, "logprob": alt.logprob,
+                 "bytes": _token_bytes(alt.text)}
+                for alt in top
             ],
         })
     return {"content": content}
@@ -368,6 +378,10 @@ def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
     """OpenAI /v1/completions logprobs shape (flat, token-parallel arrays).
 
     https://platform.openai.com/docs/api-reference/completions/object#completions/object-logprobs
+
+    Inner ``top`` is ``list[TokenAlt]`` post-phase-1 logit pass — alt
+    text comes off the dataclass rather than a redundant tokenizer
+    decode.
     """
     if result.logprobs is None:
         return None
@@ -381,7 +395,7 @@ def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
         tok_str = tok.decode([tid])
         tokens.append(tok_str)
         token_logprobs.append(lp)
-        top_logprobs.append({tok.decode([i]): alt_lp for i, alt_lp in top})
+        top_logprobs.append({alt.text: alt.logprob for alt in top})
         text_offset.append(offset)
         offset += len(tok_str)
     return {
@@ -708,4 +722,3 @@ def _register_routes(app: FastAPI) -> None:
             "usage": _usage_dict(result),
             "probe_readings": _probe_reading_dict(session),
         }
-

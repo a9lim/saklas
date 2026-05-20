@@ -2,52 +2,60 @@
 
 import logging
 import warnings
+from typing import cast
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 log = logging.getLogger(__name__)
 
-# MPS lacks the histogram kernel for integer tensors, which breaks
-# torch.histc (used by MoE routing in transformers' grouped_mm path).
-# The fix matches what transformers does for CPU: cast to float first.
-_orig_histc = torch.histc
+_ORIG_HISTC = None
+_ORIG_LDEXP = None
 
 
 def _histc_mps_safe(input, bins=100, min=0, max=0, *, out=None):
+    assert _ORIG_HISTC is not None
     if input.device.type == "mps" and not input.is_floating_point():
         input = input.float()
-    return _orig_histc(input, bins=bins, min=min, max=max, out=out)
-
-
-torch.histc = _histc_mps_safe
-
-# MPS has no torch.ldexp kernel as of PyTorch 2.11. transformers'
-# MXFP4 weight dequant (`convert_moe_packed_tensors` for gpt-oss
-# experts) calls torch.ldexp on whatever device the checkpoint is
-# loading to; on Apple Silicon this raises
-# ``DispatchStub: missing kernel for mps`` mid-load and aborts.
-# Round-trip through CPU when the input lives on MPS, no-op on
-# CPU/CUDA. ``out=`` is honored — `convert_moe_packed_tensors`
-# uses it for in-place dequant.
-_orig_ldexp = torch.ldexp
+    return _ORIG_HISTC(input, bins=bins, min=min, max=max, out=out)
 
 
 def _ldexp_mps_safe(input, other, *, out=None):
+    assert _ORIG_LDEXP is not None
     if hasattr(input, "device") and input.device.type == "mps":
         in_cpu = input.cpu()
         other_cpu = other.cpu() if hasattr(other, "device") else other
-        res = _orig_ldexp(in_cpu, other_cpu)
+        res = _ORIG_LDEXP(in_cpu, other_cpu)
         if out is not None:
             out.copy_(res.to(out.device))
             return out
         return res.to(input.device)
-    return _orig_ldexp(input, other, out=out) if out is not None \
-        else _orig_ldexp(input, other)
+    return _ORIG_LDEXP(input, other, out=out) if out is not None \
+        else _ORIG_LDEXP(input, other)
 
 
-torch.ldexp = _ldexp_mps_safe
+def patch_torch_for_mps() -> bool:
+    """Install MPS-only torch workarounds lazily and idempotently.
+
+    The patches are process-global because PyTorch exposes these as module
+    functions, but saklas now installs them only when an MPS model load is
+    actually requested.
+    """
+    global _ORIG_HISTC, _ORIG_LDEXP
+    installed = False
+    if getattr(torch.histc, "_saklas_mps_safe", False) is False:
+        _ORIG_HISTC = torch.histc
+        _histc_mps_safe._saklas_mps_safe = True  # type: ignore[attr-defined]
+        torch.histc = _histc_mps_safe
+        installed = True
+    if getattr(torch.ldexp, "_saklas_mps_safe", False) is False:
+        _ORIG_LDEXP = torch.ldexp
+        _ldexp_mps_safe._saklas_mps_safe = True  # type: ignore[attr-defined]
+        torch.ldexp = _ldexp_mps_safe
+        installed = True
+    return installed
 
 def _MODEL_LAYERS(m): return m.model.layers
 def _TRANSFORMER_H(m): return m.transformer.h
@@ -266,13 +274,13 @@ def _resolve_dtype(dtype, device: str) -> torch.dtype:
 
 def load_model(
     model_id: str,
-    quantize=None,
-    device="auto",
-    dtype=None,
+    quantize: str | None = None,
+    device: str = "auto",
+    dtype: torch.dtype | str | None = None,
     *,
     compile: bool = True,
     compile_mode: str = "default",
-):
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """Load a HuggingFace causal LM and its tokenizer.
 
     Args:
@@ -306,6 +314,8 @@ def load_model(
         ``get_model_info`` continue to work.
     """
     device = detect_device(device)
+    if device == "mps":
+        patch_torch_for_mps()
     resolved_dtype = _resolve_dtype(dtype, device)
     log.info("Device: %s", device)
 
@@ -498,7 +508,7 @@ def load_model(
             device,
         )
 
-    return model, tokenizer
+    return cast(PreTrainedModel, model), tokenizer
 
 
 def _get_memory_gb(device: str) -> float:

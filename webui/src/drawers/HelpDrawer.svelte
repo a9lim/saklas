@@ -54,11 +54,68 @@
             <td>
               <kbd>{modKey}</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd>
             </td>
-            <td>regenerate last response (reserved — not yet wired)</td>
+            <td>regenerate last response (reserved, not yet wired)</td>
           </tr>
           <tr>
             <td>click token</td>
             <td>open per-layer × per-probe drilldown for that token</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="block">
+      <h3>loom tree</h3>
+      <p class="prose">
+        the single-letter keys fire while the loom sidebar is focused;
+        the <kbd>{modKey}</kbd>-combos act on the active node from
+        anywhere.
+      </p>
+      <table class="kb">
+        <tbody>
+          <tr>
+            <td><kbd>j</kbd> / <kbd>k</kbd></td>
+            <td>focus the previous / next sibling</td>
+          </tr>
+          <tr>
+            <td><kbd>h</kbd> / <kbd>l</kbd></td>
+            <td>focus the parent / first child</td>
+          </tr>
+          <tr>
+            <td><kbd>Enter</kbd></td>
+            <td>activate the focused node</td>
+          </tr>
+          <tr>
+            <td><kbd>s</kbd></td>
+            <td>star / unstar the focused node</td>
+          </tr>
+          <tr>
+            <td><kbd>n</kbd></td>
+            <td>add or edit a note</td>
+          </tr>
+          <tr>
+            <td><kbd>/</kbd></td>
+            <td>search node text</td>
+          </tr>
+          <tr>
+            <td><kbd>{modKey}</kbd> + <kbd>R</kbd></td>
+            <td>regenerate the active node</td>
+          </tr>
+          <tr>
+            <td><kbd>{modKey}</kbd> + <kbd>E</kbd></td>
+            <td>edit the active node's text</td>
+          </tr>
+          <tr>
+            <td><kbd>{modKey}</kbd> + <kbd>B</kbd></td>
+            <td>branch a new sibling</td>
+          </tr>
+          <tr>
+            <td><kbd>{modKey}</kbd> + <kbd>N</kbd></td>
+            <td>navigate by node-id prefix</td>
+          </tr>
+          <tr>
+            <td><kbd>{modKey}</kbd> + <kbd>D</kbd></td>
+            <td>delete the active node's subtree</td>
           </tr>
         </tbody>
       </table>
@@ -104,7 +161,7 @@ variant  := raw | sae | sae-<release>
           </tr>
           <tr>
             <td><code>!</code></td>
-            <td>mean-ablate — does not compose with projection</td>
+            <td>mean-ablate; does not compose with projection</td>
           </tr>
           <tr>
             <td><code>~</code></td>
@@ -134,7 +191,7 @@ variant  := raw | sae | sae-<release>
           flip sign automatically; <code>ns/concept</code> disambiguates.
         </li>
         <li>
-          dotted bipolar names (<code>happy.sad</code>) are first-class —
+          dotted bipolar names (<code>happy.sad</code>) are first-class;
           <code>.</code> and <code>_</code> are the only allowed
           punctuation in concept identifiers.
         </li>
@@ -161,26 +218,26 @@ variant  := raw | sae | sae-<release>
     min-height: 0;
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 16px;
+    padding: var(--space-6);
     border-bottom: 1px solid var(--border);
   }
   .title {
     color: var(--accent-blue);
     text-transform: lowercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
   }
   .close {
     background: transparent;
     border: 0;
     color: var(--fg-dim);
     cursor: pointer;
-    padding: 0.25em 0.4em;
+    padding: var(--space-2) var(--space-3);
   }
   .close:hover {
     color: var(--accent-red);
@@ -188,29 +245,29 @@ variant  := raw | sae | sae-<release>
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: 16px;
+    padding: var(--space-6);
     display: flex;
     flex-direction: column;
-    gap: 1em;
+    gap: var(--space-5);
     min-height: 0;
   }
   .block h3 {
-    margin: 0 0 0.4em;
+    margin: 0 0 var(--space-3);
     color: var(--accent-green);
-    font-size: var(--font-size-base);
+    font-size: var(--text);
     text-transform: lowercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
   }
   .kb {
     border-collapse: collapse;
     width: 100%;
     color: var(--fg-strong);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
   }
   .kb td {
-    padding: 0.25em 0.4em;
+    padding: var(--space-2) var(--space-3);
     vertical-align: top;
-    border-bottom: 1px solid var(--border-dim);
+    border-bottom: 1px solid var(--border);
   }
   .kb td:first-child {
     color: var(--fg-dim);
@@ -221,10 +278,10 @@ variant  := raw | sae | sae-<release>
     background: var(--bg-elev);
     border: 1px solid var(--border);
     color: var(--fg-strong);
-    padding: 0 0.35em;
-    border-radius: 2px;
+    padding: 0 var(--space-2);
+    border-radius: var(--radius);
     font-family: inherit;
-    font-size: var(--font-size-tiny);
+    font-size: var(--text-xs);
   }
   code {
     color: var(--accent-blue);
@@ -232,48 +289,50 @@ variant  := raw | sae | sae-<release>
   .grammar {
     background: var(--bg-deep);
     border: 1px solid var(--border);
-    padding: 0.5em 0.6em;
-    margin: 0.4em 0;
+    padding: var(--space-3) var(--space-4);
+    margin: var(--space-3) 0;
     color: var(--fg-strong);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     line-height: 1.4;
     overflow-x: auto;
     white-space: pre;
   }
   .prose {
-    margin: 0.3em 0;
+    margin: var(--space-2) 0;
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     line-height: 1.4;
   }
   .prose-list {
-    margin: 0.3em 0 0;
+    margin: var(--space-2) 0 0;
     padding-left: 1.2em;
     color: var(--fg-dim);
-    font-size: var(--font-size-small);
+    font-size: var(--text-sm);
     line-height: 1.5;
   }
   .footer {
     display: flex;
     justify-content: flex-end;
-    gap: 0.5em;
-    padding: 16px;
+    gap: var(--space-3);
+    padding: var(--space-6);
     border-top: 1px solid var(--border);
   }
   .btn {
     background: var(--bg-alt);
     color: var(--fg-strong);
     border: 1px solid var(--border);
-    padding: 0.4em 0.9em;
+    padding: var(--space-3) var(--space-5);
     font: inherit;
     font-family: var(--font-mono);
     cursor: pointer;
   }
   .btn.primary {
-    color: var(--accent-blue);
-    border-color: var(--accent-blue);
+    background: var(--accent);
+    color: var(--text-on-accent);
+    border-color: var(--accent);
   }
   .btn.primary:hover {
-    background: rgba(88, 166, 255, 0.1);
+    background: var(--accent-light);
+    border-color: var(--accent-light);
   }
 </style>

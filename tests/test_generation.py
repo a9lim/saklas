@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import torch
 
-from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
+from saklas.core.generation import (
+    GenerationConfig,
+    GenerationState,
+    _PenaltyState,
+    generate_steered,
+)
 from saklas.core.session import SaklasSession
 
 
@@ -52,6 +57,17 @@ class _StopModel:
         return SimpleNamespace(logits=logits, past_key_values=object())
 
 
+class _NoCacheModel(_StopModel):
+    def __init__(self):
+        super().__init__()
+        self._tokens = [0, 1, 3]
+
+    def __call__(self, **_kwargs):
+        out = super().__call__(**_kwargs)
+        out.past_key_values = None
+        return out
+
+
 def test_stop_sequence_trimmed_text_is_final_result_text():
     model = _StopModel()
     tokenizer = _StopTokenizer()
@@ -90,3 +106,38 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
         stateless=True,
     )
     assert result.text == "Hello"
+
+
+def test_penalty_state_applies_sparse_counts_on_device():
+    logits = torch.zeros(1, 8)
+    state = _PenaltyState(max_tokens=4, device=logits.device, dtype=torch.float32)
+    state.add(2)
+    state.add(5)
+    state.add(2)
+
+    state.apply(logits, presence_penalty=0.5, frequency_penalty=0.25)
+
+    assert logits[0, 2].item() == -1.0
+    assert logits[0, 5].item() == -0.75
+    assert logits[0, 1].item() == 0.0
+
+
+def test_no_cache_fallback_does_not_cat_each_step(monkeypatch):
+    model = _NoCacheModel()
+    tokenizer = _StopTokenizer()
+    state = GenerationState()
+
+    def _forbid_cat(*_args, **_kwargs):
+        raise AssertionError("no-cache fallback should use the preallocated buffer")
+
+    monkeypatch.setattr(torch, "cat", _forbid_cat)
+    generated_ids = generate_steered(
+        model,
+        tokenizer,
+        torch.tensor([[0, 0]]),
+        GenerationConfig(max_new_tokens=3, temperature=0.0),
+        state,
+    )
+
+    assert generated_ids == [0, 1]
+    assert state.finish_reason == "stop"

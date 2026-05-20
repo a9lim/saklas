@@ -2,10 +2,25 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
     import torch
+
+
+@dataclass(frozen=True)
+class TokenAlt:
+    """One alternative the model considered at a given position.
+
+    Captured at decode time when ``SamplingConfig.return_top_k > 0`` (or
+    when OpenAI ``logprobs`` is set to a positive int).  ``logprob`` is the
+    post-sampler, post-temperature natural-log probability under the same
+    distribution the chosen token was drawn from — that's the calibrated
+    quantity for "how surprising was this token to the configured sampler."
+    """
+    id: int
+    text: str
+    logprob: float
 
 
 @dataclass
@@ -34,9 +49,15 @@ class GenerationResult:
     vectors: dict[str, float] = field(default_factory=dict)
     prompt_tokens: int = 0
     finish_reason: str = "stop"
-    # Per-completion-token (token_id, logprob, top_logprobs) — populated
-    # only when logprobs were requested. top_logprobs is list[(id, logprob)].
-    logprobs: list[tuple[int, float, list[tuple[int, float]]]] | None = None
+    # Per-completion-token ``(token_id, logprob, top_alts)`` — populated
+    # only when chosen-logprob capture is live (any ``on_token`` consumer
+    # or an explicit logprobs request). ``top_alts`` is a list of
+    # :class:`TokenAlt` carrying ``(id, text, logprob)`` triples; empty
+    # list when no top-K alternatives were requested (``return_top_k == 0``
+    # and OpenAI ``logprobs`` was set to 0). Inner-tuple shape replaces the
+    # legacy ``list[tuple[int, float]]`` pair shape; renderers that consume
+    # this field read ``alt.text`` directly rather than re-decoding.
+    logprobs: list[tuple[int, float, list[TokenAlt]]] | None = None
     # Steering expression applied to this generation, stringified via
     # :func:`saklas.core.steering_expr.format_expr` for round-trip
     # reproduction.  ``None`` when no steering was active.  Receipts /
@@ -66,6 +87,86 @@ class GenerationResult:
         }
 
 
+class RunSet(list[GenerationResult]):
+    """Ordered set of generation results plus experiment metadata.
+
+    ``RunSet`` is intentionally list-like: existing batch/sweep callers
+    can still iterate, index, and take ``len(...)``.  Single-run callers
+    get one stable shape too, while ``.first`` and the small ``__getattr__``
+    compatibility shim keep common ``session.generate(...).text`` code
+    readable during the transition.
+    """
+
+    def __init__(
+        self,
+        results: Iterable[GenerationResult] = (),
+        *,
+        node_ids: Iterable[str | None] | None = None,
+        grid: Iterable[dict[str, Any]] | None = None,
+        kind: str = "generation",
+    ) -> None:
+        super().__init__(results)
+        self.node_ids: list[str | None] = (
+            list(node_ids) if node_ids is not None else [None] * len(self)
+        )
+        if len(self.node_ids) < len(self):
+            self.node_ids.extend([None] * (len(self) - len(self.node_ids)))
+        self.grid: list[dict[str, Any]] = (
+            [dict(row) for row in grid] if grid is not None else [{} for _ in self]
+        )
+        if len(self.grid) < len(self):
+            self.grid.extend({} for _ in range(len(self) - len(self.grid)))
+        self.kind = kind
+
+    @property
+    def results(self) -> list[GenerationResult]:
+        return list(self)
+
+    @property
+    def first(self) -> GenerationResult:
+        if not self:
+            raise IndexError("RunSet is empty")
+        return self[0]
+
+    @property
+    def node_id(self) -> str | None:
+        return self.node_ids[0] if self.node_ids else None
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate common single-run attribute access to ``.first``.
+
+        This keeps old ``session.generate(...).text`` snippets working
+        while the public shape settles on an always-run-set return.
+        """
+        try:
+            first = self.first
+        except IndexError as e:
+            raise AttributeError(name) from e
+        return getattr(first, name)
+
+    def to_collector(self) -> "ResultCollector":
+        collector = ResultCollector()
+        for idx, result in enumerate(self):
+            tags: dict[str, Any] = {"run_idx": idx}
+            if idx < len(self.node_ids) and self.node_ids[idx] is not None:
+                tags["node_id"] = self.node_ids[idx]
+            if idx < len(self.grid):
+                tags.update(self.grid[idx])
+            collector.add(result, **tags)
+        return collector
+
+    def to_dataframe(self) -> Any:
+        return self.to_collector().to_dataframe()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "node_ids": list(self.node_ids),
+            "grid": [dict(row) for row in self.grid],
+            "results": [result.to_dict() for result in self],
+        }
+
+
 @dataclass
 class TokenEvent:
     """Single token yielded during streaming generation."""
@@ -74,16 +175,21 @@ class TokenEvent:
     index: int
     thinking: bool = False
     logprob: float | None = None
-    top_logprobs: list[tuple[int, float]] | None = None
+    # Top-K alternatives the model considered at this position. ``None``
+    # when no top-K was requested (``return_top_k == 0`` and OpenAI
+    # ``logprobs`` was None or 0). Replaces the legacy
+    # ``top_logprobs: list[tuple[int, float]]`` pair shape — entries now
+    # carry decoded text so consumers don't re-tokenize.
+    top_alts: list[TokenAlt] | None = None
     finish_reason: str | None = None
     # Per-probe cosine similarities computed inline against the latest
     # captured hidden state. Populated by ``generate_stream`` only when
     # the session has active probes; otherwise None.
     scores: dict[str, float] | None = None
-    # Perplexity of the pre-temperature, post-steering next-token
-    # distribution — ``exp`` of full-vocab Shannon entropy in nats.
-    # Bounded above by ``vocab_size``; a confident prediction approaches
-    # 1. Consumers take ``log`` to recover entropy-nats for averaging.
+    # Perplexity of the configured sampler distribution after temperature,
+    # top-k, and top-p renormalization — ``exp`` of Shannon entropy in nats.
+    # Bounded above by sampler support size; a confident prediction
+    # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
 
 

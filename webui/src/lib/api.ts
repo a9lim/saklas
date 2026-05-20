@@ -10,23 +10,31 @@ import type {
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
+  ExperimentFanRequest,
+  ExperimentFanResponse,
   ExtractRequest,
   ExtractResponse,
+  FilterMatchesJSON,
   InstallPackRequest,
   InstallPackResponse,
+  JointLogprobRowJSON,
+  JointLogprobsJSON,
   LoadVectorRequest,
+  LoomNodeJSON,
+  LoomTreeJSON,
   MergeVectorRequest,
   MergeVectorResponse,
+  NodeDiffJSON,
   PackListResponse,
   PackSearchResponse,
+  PairwiseCompareResponse,
   ProbeDefaultsResponse,
   ProbeListResponse,
   ScoreProbeRequest,
   ScoreProbeResponse,
   SessionInfo,
-  SweepEvent,
-  SweepRequest,
   TraitsEvent,
+  TranscriptLoadResponseJSON,
   VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
@@ -41,23 +49,31 @@ export type {
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
+  ExperimentFanRequest,
+  ExperimentFanResponse,
   ExtractRequest,
   ExtractResponse,
+  FilterMatchesJSON,
   InstallPackRequest,
   InstallPackResponse,
+  JointLogprobRowJSON,
+  JointLogprobsJSON,
   LoadVectorRequest,
+  LoomNodeJSON,
+  LoomTreeJSON,
   MergeVectorRequest,
   MergeVectorResponse,
+  NodeDiffJSON,
   PackListResponse,
   PackSearchResponse,
+  PairwiseCompareResponse,
   ProbeDefaultsResponse,
   ProbeListResponse,
   ScoreProbeRequest,
   ScoreProbeResponse,
   SessionInfo,
-  SweepEvent,
-  SweepRequest,
   TraitsEvent,
+  TranscriptLoadResponseJSON,
   VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
@@ -292,6 +308,17 @@ export const apiVectors = {
     const q = names && names.length ? `?names=${encodeURIComponent(names.join(","))}` : "";
     return request(`${SESSION_BASE(id)}/correlation${q}`);
   },
+  /** Cross-layer cosine matrix between two named vectors / probes —
+   *  backs the pairwise-compare drawer.  Distinct from ``correlation``:
+   *  one pair, two-axis matrix indexed by layer rather than by name. */
+  pairwise(
+    a: string,
+    b: string,
+    id: string = SESSION,
+  ): Promise<PairwiseCompareResponse> {
+    const q = new URLSearchParams({ a, b }).toString();
+    return request(`${SESSION_BASE(id)}/vectors/pairwise?${q}`);
+  },
 };
 
 // ============================================================= probes ==
@@ -338,29 +365,6 @@ export const apiPacks = {
   },
   install(req: InstallPackRequest): Promise<InstallPackResponse> {
     return request(PACKS_BASE, jsonBody(req));
-  },
-};
-
-// ============================================================== sweep ==
-
-export const apiSweep = {
-  /** Returns the SSE Response — call ``consumeSse`` on ``response.body``
-   * to iterate events.  Sweep is always SSE because the JSON branch
-   * doesn't exist server-side. */
-  async start(req: SweepRequest, id: string = SESSION): Promise<Response> {
-    const r = await fetch(`${SESSION_BASE(id)}/sweep`, {
-      method: "POST",
-      headers: authHeaders({
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-      }),
-      body: JSON.stringify(req),
-    });
-    if (!r.ok) {
-      const { text, json } = await parseBody(r);
-      throw new ApiError(r.status, `${SESSION_BASE(id)}/sweep`, text, json);
-    }
-    return r;
   },
 };
 
@@ -449,6 +453,190 @@ export async function apiCloneStream(
   return final;
 }
 
+// ============================================================== tree ==
+//
+// Loom tree REST surface (v2.3, phase 2).  All routes 404 on servers
+// that don't yet ship the loom layer — callers should catch ApiError
+// with status 404 and fall back to non-loom behaviour.
+
+export const apiTree = {
+  /** Full tree dump.  Cheap enough to fetch on every reconcile. */
+  get(id: string = SESSION): Promise<LoomTreeJSON> {
+    return request(`${SESSION_BASE(id)}/tree`);
+  },
+  /** Just the active path — what the chat panel needs to render the
+   *  conversation linearly.  Less data than the full tree.  Server
+   *  shape: ``{active_node_id, rev, messages, node_ids}`` (parallel
+   *  arrays). */
+  active(id: string = SESSION): Promise<{
+    active_node_id: string;
+    rev: number;
+    messages: { role: string; content: string }[];
+    node_ids: string[];
+  }> {
+    return request(`${SESSION_BASE(id)}/tree/active`);
+  },
+  navigate(
+    node_id: string,
+    id: string = SESSION,
+  ): Promise<{
+    active_node_id: string;
+    rev: number;
+    messages: { role: string; content: string }[];
+    node_ids: string[];
+  }> {
+    return request(`${SESSION_BASE(id)}/tree/navigate`, jsonBody({ node_id }));
+  },
+  edit(
+    node_id: string,
+    text: string,
+    id: string = SESSION,
+  ): Promise<LoomNodeJSON> {
+    return request(
+      `${SESSION_BASE(id)}/tree/edit`,
+      jsonBody({ node_id, text }),
+    );
+  },
+  branch(
+    node_id: string,
+    text: string,
+    id: string = SESSION,
+  ): Promise<{
+    node_id: string;
+    node: LoomNodeJSON;
+    active_path: {
+      active_node_id: string;
+      rev: number;
+      messages: { role: string; content: string }[];
+      node_ids: string[];
+    };
+  }> {
+    return request(
+      `${SESSION_BASE(id)}/tree/branch`,
+      jsonBody({ node_id, text }),
+    );
+  },
+  delete(
+    node_id: string,
+    id: string = SESSION,
+  ): Promise<{ removed: number }> {
+    return request<{ removed: number }>(
+      `${SESSION_BASE(id)}/tree/${encodeURIComponent(node_id)}`,
+      { method: "DELETE" },
+    );
+  },
+  star(
+    node_id: string,
+    on: boolean,
+    id: string = SESSION,
+  ): Promise<LoomNodeJSON> {
+    return request(
+      `${SESSION_BASE(id)}/tree/star`,
+      jsonBody({ node_id, on }),
+    );
+  },
+  note(
+    node_id: string,
+    text: string,
+    id: string = SESSION,
+  ): Promise<LoomNodeJSON> {
+    return request(
+      `${SESSION_BASE(id)}/tree/note`,
+      jsonBody({ node_id, text }),
+    );
+  },
+  /** Steering-delta label for the parent→child edge (phase 5).
+   *  Empty string when the two recipes are identical. */
+  edgeLabel(
+    parent_id: string,
+    child_id: string,
+    id: string = SESSION,
+  ): Promise<{ label: string }> {
+    const q = new URLSearchParams({ parent_id, child_id });
+    return request(`${SESSION_BASE(id)}/tree/edge_label?${q.toString()}`);
+  },
+  /** Apply a filter-grammar expression server-side and get the
+   *  matching node id list back.  Empty ``expr`` returns []. */
+  filter(
+    expr: string,
+    id: string = SESSION,
+  ): Promise<FilterMatchesJSON> {
+    const q = new URLSearchParams({ expr });
+    return request(`${SESSION_BASE(id)}/tree/filter?${q.toString()}`);
+  },
+  /** Cross-branch diff between two assistant nodes (phase 5).  Returns
+   *  the engine's :class:`NodeDiff` plus per-token spans + steering
+   *  delta labels. */
+  diff(
+    a_id: string,
+    b_id: string,
+    id: string = SESSION,
+  ): Promise<NodeDiffJSON> {
+    return request(
+      `${SESSION_BASE(id)}/tree/diff`,
+      jsonBody({ a_id, b_id }),
+    );
+  },
+  /** Export the path ending at ``node_id`` (or the active node when
+   *  ``null``) as transcript YAML. */
+  transcriptExport(
+    node_id: string | null,
+    id: string = SESSION,
+  ): Promise<{ yaml: string; node_id: string }> {
+    return request(
+      `${SESSION_BASE(id)}/tree/transcript`,
+      jsonBody({ node_id }),
+    );
+  },
+  /** Import a transcript YAML into the tree under one of three
+   *  modes.  Returns the leaf node id, the new rev, and any guard
+   *  warnings (model / system-prompt / probe drift). */
+  transcriptLoad(
+    yaml: string,
+    mode: "default" | "here" | "merge",
+    strict: boolean,
+    id: string = SESSION,
+  ): Promise<TranscriptLoadResponseJSON> {
+    return request(
+      `${SESSION_BASE(id)}/tree/transcript/load`,
+      jsonBody({ yaml, mode, strict }),
+    );
+  },
+  /** Logit-pass Phase 5: cross-evaluation between two sibling assistant
+   *  nodes.  Server force-replays each branch under its stamped recipe
+   *  and returns per-aligned-position rows with both self- and
+   *  cross-evaluation logprobs, rank-1-change flag, and a top-K-truncated
+   *  approx KL.
+   *
+   *  Lazy / on-demand per Decision 9 — server caches the result keyed by
+   *  sorted ``(a_id, b_id)`` until a tree edit/delete/finalize mutation
+   *  invalidates the cache. */
+  jointLogprobs(
+    a_id: string,
+    b_id: string,
+    id: string = SESSION,
+  ): Promise<JointLogprobsJSON> {
+    return request(
+      `${SESSION_BASE(id)}/tree/joint_logprobs`,
+      jsonBody({ a_id, b_id }),
+    );
+  },
+};
+
+// ======================================================= experiments ==
+
+export const apiExperiments = {
+  fan(
+    body: ExperimentFanRequest,
+    id: string = SESSION,
+  ): Promise<ExperimentFanResponse> {
+    return request(
+      `${SESSION_BASE(id)}/experiments/fan`,
+      jsonBody(body),
+    );
+  },
+};
+
 // =========================================================== traits ====
 
 /** Open the live traits SSE stream.  Returns the underlying ``Response``
@@ -468,7 +656,7 @@ export async function apiTraitsStream(id: string = SESSION): Promise<Response> {
 
 export interface SseEvent {
   /** SSE ``event:`` field — defaults to ``"message"`` per the spec when
-   * absent (which is also the wire format the sweep / traits endpoints use). */
+   * absent (which is also the wire format traits streaming uses). */
   event: string;
   /** Parsed JSON if the data line was JSON, otherwise the raw string. */
   data: unknown;
@@ -482,8 +670,7 @@ export interface SseEvent {
  * ``Response`` — the latter is the more ergonomic call site.  Yields one
  * event per blank-line-delimited frame; tolerates missing ``event:`` lines
  * by defaulting to ``"message"``; tries ``JSON.parse(data)`` and falls
- * back to the raw string on failure (the sweep stream uses bare ``data:``
- * frames with JSON inside, the extract stream uses named events). */
+ * back to the raw string on failure. */
 export async function* consumeSse(
   source: Response | ReadableStream<Uint8Array>,
 ): AsyncGenerator<SseEvent, void, void> {

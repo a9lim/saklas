@@ -2,7 +2,7 @@
 
 Wrapper-loop approach — each prompt acquires the gen-lock, runs through
 ``_generate_core``, releases.  Tests cover ordering, sweep grid shape,
-``applied_steering`` round-trip, and the SSE sweep endpoint.
+``applied_steering`` round-trip, and the experiment fan endpoint.
 
 CPU-only.  Mock ``_generate_core`` so we exercise the wrapper logic
 without spinning up a real model.
@@ -10,14 +10,13 @@ without spinning up a real model.
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from saklas.core.results import GenerationResult
+from saklas.core.results import GenerationResult, RunSet
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +50,11 @@ def _stub_generate_core(session, *, capture: list):
     """
     counter = {"n": 0}
 
-    def _fake(input, *, steering=None, sampling=None, stateless=False, raw=False, thinking=None, on_token=None):
+    def _fake(input, *, steering=None, sampling=None, stateless=False, raw=False, thinking=None, on_token=None, **kwargs):
+        # ``kwargs`` swallows additions to ``_generate_core``'s signature
+        # (v2.3 added ``parent_node_id`` and ``recipe_override``) so this
+        # stub doesn't churn every time the core gains a new optional
+        # keyword.
         idx = counter["n"]
         counter["n"] += 1
         capture.append({"input": input, "steering": steering})
@@ -227,7 +230,7 @@ class TestGenerateSweep:
 
 
 # ---------------------------------------------------------------------------
-# Server: POST /saklas/v1/sessions/{id}/sweep — SSE shape + lifecycle.
+# Server: POST /saklas/v1/sessions/{id}/experiments/fan.
 # ---------------------------------------------------------------------------
 
 
@@ -274,25 +277,30 @@ def _mock_session_for_server():
 
 
 @pytest.fixture
-def sweep_client():
+def fan_client():
     from saklas.server import create_app
 
     session = _mock_session_for_server()
 
-    # Stub generate_sweep to fire on_result synchronously then return.
+    # Stub generate_sweep to return the standardized RunSet shape.
     def _fake_sweep(prompt, sweep, *, base_steering=None, sampling=None,
-                   thinking=None, stateless=True, raw=False, on_result=None):
+                   thinking=None, stateless=True, raw=False, on_result=None,
+                   parent_node_id=None, **kwargs):
         results: list = []
+        node_ids: list = []
+        grid: list[dict[str, float]] = []
         idx = 0
         # Simple linearization: walk the first concept's alphas.
         first_name, first_alphas = next(iter(sweep.items()))
         for alpha in first_alphas:
             r = _make_result(f"out_{idx}", applied=f"{alpha} {first_name}")
             results.append(r)
+            node_ids.append(f"NODE_{idx}")
+            grid.append({first_name: float(alpha)})
             if on_result is not None:
                 on_result(idx, r, {first_name: alpha})
             idx += 1
-        return results
+        return RunSet(results, node_ids=node_ids, grid=grid, kind="fan")
 
     session.generate_sweep = _fake_sweep
     session.stop = MagicMock()
@@ -301,62 +309,46 @@ def sweep_client():
     return session, TestClient(app)
 
 
-class TestSweepEndpoint:
-    def test_sweep_emits_started_results_done(self, sweep_client) -> None:
-        session, client = sweep_client
+class TestExperimentFanEndpoint:
+    def test_fan_returns_rows_and_node_ids(self, fan_client) -> None:
+        _session, client = fan_client
 
         body = {
             "prompt": "describe a sunset",
-            "sweep": {"happy.sad": [-0.4, 0.0, 0.4]},
+            "grid": {"happy.sad": [-0.4, 0.0, 0.4]},
         }
-        with client.stream(
-            "POST",
-            "/saklas/v1/sessions/default/sweep",
+        r = client.post(
+            "/saklas/v1/sessions/default/experiments/fan",
             json=body,
-        ) as r:
-            assert r.status_code == 200
-            assert r.headers["content-type"].startswith("text/event-stream")
+        )
+        assert r.status_code == 200
+        payload = r.json()
+        assert payload["kind"] == "fan"
+        assert payload["total"] == 3
+        assert payload["node_ids"] == ["NODE_0", "NODE_1", "NODE_2"]
 
-            payloads: list[dict] = []
-            for line in r.iter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                payloads.append(json.loads(line[len("data: "):]))
-
-        # Expected sequence: 1 started + 3 results + 1 done = 5 events.
-        types = [p["type"] for p in payloads]
-        assert types == ["started", "result", "result", "result", "done"]
-
-        # started includes total = product of alpha-list lengths.
-        assert payloads[0]["total"] == 3
-        assert "sweep_id" in payloads[0]
-
-        # Each result carries idx + alpha_values + the result subset.
+        rows = payload["rows"]
         for i in range(3):
-            ev = payloads[1 + i]
-            assert ev["idx"] == i
-            assert "happy.sad" in ev["alpha_values"]
-            assert "applied_steering" in ev["result"]
+            row = rows[i]
+            assert row["idx"] == i
+            assert "happy.sad" in row["alpha_values"]
+            assert row["node_id"] == f"NODE_{i}"
+            assert "applied_steering" in row["result"]
 
-        # done includes summary.
-        assert payloads[-1]["sweep_id"] == payloads[0]["sweep_id"]
-        assert payloads[-1]["summary"]["completed"] == 3
-        assert payloads[-1]["summary"]["total"] == 3
-
-    def test_sweep_empty_dict_returns_400(self, sweep_client) -> None:
-        session, client = sweep_client
-        body = {"prompt": "x", "sweep": {}}
-        r = client.post("/saklas/v1/sessions/default/sweep", json=body)
+    def test_fan_empty_grid_returns_400(self, fan_client) -> None:
+        _session, client = fan_client
+        body = {"prompt": "x", "grid": {}}
+        r = client.post("/saklas/v1/sessions/default/experiments/fan", json=body)
         assert r.status_code == 400
 
-    def test_sweep_empty_alpha_list_returns_400(self, sweep_client) -> None:
-        session, client = sweep_client
-        body = {"prompt": "x", "sweep": {"a": []}}
-        r = client.post("/saklas/v1/sessions/default/sweep", json=body)
+    def test_fan_empty_alpha_list_returns_400(self, fan_client) -> None:
+        _session, client = fan_client
+        body = {"prompt": "x", "grid": {"a": []}}
+        r = client.post("/saklas/v1/sessions/default/experiments/fan", json=body)
         assert r.status_code == 400
 
-    def test_sweep_unknown_session_returns_404(self, sweep_client) -> None:
-        session, client = sweep_client
-        body = {"prompt": "x", "sweep": {"a": [0.0]}}
-        r = client.post("/saklas/v1/sessions/missing/sweep", json=body)
+    def test_fan_unknown_session_returns_404(self, fan_client) -> None:
+        _session, client = fan_client
+        body = {"prompt": "x", "grid": {"a": [0.0]}}
+        r = client.post("/saklas/v1/sessions/missing/experiments/fan", json=body)
         assert r.status_code == 404
