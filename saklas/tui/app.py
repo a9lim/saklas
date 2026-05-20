@@ -20,7 +20,7 @@ from textual import events as _textual_events
 from saklas import Recipe, SamplingConfig, Steering
 from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
 from saklas.core.errors import SaklasError
-from saklas.core.generation import supports_thinking
+from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_defaults
 from saklas.core.results import ResultCollector
@@ -210,12 +210,21 @@ class SaklasApp(App[None]):
         self._alphas: dict[str, float] = {}
         self._enabled: dict[str, bool] = {}
         self._supports_thinking: bool = supports_thinking(session._tokenizer)
+        # Forced-thinking families (gpt-oss / Mistral-3 Reasoning /
+        # Qwen3-Thinking) have no ``enable_thinking`` template switch,
+        # so ``thinking=False`` is a no-op at the prompt layer.  We
+        # surface this in the vector panel and the ⌃T handler.
+        self._thinking_optional: bool = thinking_is_optional(session._tokenizer)
         # Thinking defaults to off on both surfaces — the explicit
         # binary toggle (``⌃T``) is the user's affirmative opt-in, matching
         # the GUI's ``samplingState.thinking = false`` default.  Previous
         # behaviour ("default on whenever supported") silently consumed
         # extra tokens for thinking traces the user hadn't asked for.
-        self._thinking: bool = False
+        # For forced-thinking models the value is locked True since the
+        # toggle cannot reach the prompt anyway.
+        self._thinking: bool = (
+            self._supports_thinking and not self._thinking_optional
+        )
 
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
@@ -1157,7 +1166,18 @@ class SaklasApp(App[None]):
             self._session.config.max_new_tokens,
             self._session.config.system_prompt,
             thinking=self._thinking if self._supports_thinking else None,
+            thinking_forced=(
+                self._supports_thinking and not self._thinking_optional
+            ),
         )
+
+    def _thinking_status_str(self) -> str:
+        """One-line human-readable thinking state for ``/model`` output."""
+        if not self._supports_thinking:
+            return "not supported"
+        if not self._thinking_optional:
+            return "always on (model always thinks)"
+        return f"{'ON' if self._thinking else 'OFF'} (⌃T)"
 
     # -- Clipboard --
 
@@ -2590,7 +2610,7 @@ class SaklasApp(App[None]):
             f"Arch: {info.get('model_type', 'unknown')}  "
             f"Device: {self._device_str}  "
             f"Layers: {len(self._session._layers)}",
-            f"Thinking supported: {self._supports_thinking}  active: {self._thinking}",
+            f"Thinking: {self._thinking_status_str()}",
             f"Active vectors: {list(self._alphas.keys()) or '(none)'}",
             f"Active probes: {list(self._session._monitor.probe_names) if self._session._monitor else '(none)'}",
             f"Seed: {self._default_seed}",
@@ -2902,6 +2922,9 @@ class SaklasApp(App[None]):
     def action_toggle_thinking(self) -> None:
         if not self._supports_thinking:
             self._chat_panel.add_system_message("This model does not support thinking mode.")
+            return
+        if not self._thinking_optional:
+            self._chat_panel.add_system_message("This model always thinks.")
             return
         self._thinking = not self._thinking
         self._refresh_gen_config()

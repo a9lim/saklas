@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from saklas.core.generation import (
@@ -131,13 +132,14 @@ def test_no_cache_fallback_does_not_cat_each_step(monkeypatch):
         raise AssertionError("no-cache fallback should use the preallocated buffer")
 
     monkeypatch.setattr(torch, "cat", _forbid_cat)
-    generated_ids = generate_steered(
-        model,
-        tokenizer,
-        torch.tensor([[0, 0]]),
-        GenerationConfig(max_new_tokens=3, temperature=0.0),
-        state,
-    )
+    with pytest.warns(UserWarning, match="no past_key_values"):
+        generated_ids = generate_steered(
+            model,
+            tokenizer,
+            torch.tensor([[0, 0]]),
+            GenerationConfig(max_new_tokens=3, temperature=0.0),
+            state,
+        )
 
     assert generated_ids == [0, 1]
     assert state.finish_reason == "stop"

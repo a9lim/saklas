@@ -59,6 +59,21 @@
     sessionState.info?.supports_thinking ?? false,
   );
 
+  /** True iff the user can actually turn thinking off (the chat template
+   *  has an ``enable_thinking`` switch).  Forced-thinking models leave
+   *  the toggle locked and read-only so the user knows clicking it
+   *  is a no-op.  Older servers omit the field; default to ``true``
+   *  so we don't lock controls against backends that pre-date the
+   *  field. */
+  const thinkingOptional = $derived(
+    sessionState.info?.thinking_is_optional ?? true,
+  );
+
+  /** Tri-state for the title attribute and disabled gate. */
+  const thinkingForced = $derived(
+    thinkingSupported && !thinkingOptional,
+  );
+
   // ------------------------------------------------------------------- views
   //
   // Each control's *display* value reads ``samplingState`` first (which the
@@ -328,15 +343,18 @@
   <!-- Thinking toggle -->
   <label
     class="control toggle"
-    title={thinkingSupported
-      ? "Force chain-of-thought thinking on/off (overrides auto)"
-      : "This model doesn't support thinking mode"}
+    class:forced={thinkingForced}
+    title={!thinkingSupported
+      ? "This model doesn't support thinking"
+      : !thinkingOptional
+        ? "This model always thinks"
+        : "Force chain-of-thought thinking on/off (overrides auto)"}
   >
-    <span class="label">think</span>
+    <span class="label">think{thinkingForced ? " (forced)" : ""}</span>
     <input
       type="checkbox"
-      checked={thinkingView}
-      disabled={!ready || !thinkingSupported}
+      checked={thinkingForced ? true : thinkingView}
+      disabled={!ready || !thinkingSupported || thinkingForced}
       onchange={onThinking}
       aria-label="thinking mode"
     />
@@ -427,6 +445,14 @@
     font-variant-numeric: tabular-nums;
     min-width: 2.5em;
     text-align: left;
+  }
+
+  /* Forced-thinking toggle: locked-on visual.  The checkbox is disabled
+     so the browser already dims it; we keep the label dim too so the
+     "(forced)" suffix reads as informational rather than interactive. */
+  .control.toggle.forced .label {
+    color: var(--fg-dim);
+    font-style: italic;
   }
 
   /* Fixed-width host for the shared <Slider> inside the inline strip. */

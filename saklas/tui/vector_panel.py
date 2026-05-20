@@ -21,6 +21,10 @@ class LeftPanel(Widget):
         self._vectors: list[dict] = []
         self._selected_idx: int = 0
         self._thinking: bool | None = None  # None = model doesn't support it
+        # True when the model thinks unconditionally (gpt-oss / Mistral-3
+        # Reasoning / Qwen3-Thinking) — the toggle is shown locked so
+        # the user knows ``thinking=False`` would be a no-op.
+        self._thinking_forced: bool = False
         self._temperature: float = 1.0
         self._top_p: float = 0.9
         self._max_tokens: int = 1024
@@ -88,12 +92,14 @@ class LeftPanel(Widget):
 
     def update_gen_config(self, temperature: float, top_p: float,
                           max_tokens: int, system_prompt: str | None,
-                          thinking: bool | None = None) -> None:
+                          thinking: bool | None = None,
+                          thinking_forced: bool = False) -> None:
         self._temperature = temperature
         self._top_p = top_p
         self._max_tokens = max_tokens
         self._system_prompt = system_prompt
         self._thinking = thinking
+        self._thinking_forced = thinking_forced
         self._render_gen_config()
 
     def update_highlight(self, mode: str) -> None:
@@ -198,9 +204,17 @@ class LeftPanel(Widget):
             f"{max_prefix}{_pad(max_prefix, '/max')}[dim]/max[/]",
         ]
         if self._thinking is not None:
-            lines.append(
-                f"{think_prefix}{_pad(think_prefix, '⌃T')}[dim]⌃T[/]"
-            )
+            if self._thinking_forced:
+                # Toggle has no prompt-level effect: dim the line and drop
+                # the ⌃T hint so the user knows pressing it is a no-op.
+                forced_prefix = "Think ON"
+                lines.append(
+                    f"[dim]{forced_prefix}{_pad(forced_prefix, 'forced')}forced[/]"
+                )
+            else:
+                lines.append(
+                    f"{think_prefix}{_pad(think_prefix, '⌃T')}[dim]⌃T[/]"
+                )
         lines.append(
             f"Sys   [dim]{sys_str}[/]{_pad(sys_prefix, '/sys')}[dim]/sys[/]"
         )

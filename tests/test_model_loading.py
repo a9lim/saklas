@@ -229,6 +229,11 @@ def _run_load_with_compile(
         patch.object(model_mod, "AutoConfig") as mock_cfg,
         patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
         patch.object(torch, "compile", side_effect=_fake_compile) as mock_compile,
+        # The probe forwards allocate `torch.full(..., device="cuda", ...)`,
+        # which raises on a no-CUDA CI host before the fake compiled wrapper
+        # is ever called.  We're not exercising the probe here — only that
+        # ``torch.compile`` fired with the right args — so stub it out.
+        patch.object(model_mod, "_run_compile_probes", return_value=None),
     ):
         mock_tok.from_pretrained.return_value = SimpleNamespace()
         mock_cfg.from_pretrained.return_value = cfg

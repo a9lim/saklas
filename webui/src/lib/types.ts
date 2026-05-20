@@ -45,6 +45,15 @@ export interface SessionInfo {
   probes: string[];
   history_length: number;
   supports_thinking: boolean;
+  /** True iff the user can actually turn thinking off — i.e. the chat
+   *  template has an ``enable_thinking`` switch.  Forced-thinking
+   *  families (gpt-oss / Mistral-3 Reasoning / Qwen3-Thinking) ship
+   *  ``supports_thinking=true`` but ``thinking_is_optional=false`` so
+   *  the UI can lock the toggle and explain why pressing it is a
+   *  no-op.  Older servers may omit this field; clients should treat
+   *  ``undefined`` as ``true`` (the historical default — most thinking
+   *  models were toggleable). */
+  thinking_is_optional?: boolean;
   default_steering: string | null;
   /** Non-canonical: optional architecture string surfaced for the
    * yellow-banner warning when ``model_type`` isn't in
