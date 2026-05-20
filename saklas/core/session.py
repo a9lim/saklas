@@ -3671,6 +3671,24 @@ class SaklasSession:
             else {}
         )
 
+        # Snapshot the chat-history anchor BEFORE _start_loom_assistant
+        # mutates the tree.  Otherwise the new (empty) assistant node it
+        # creates becomes the active leaf, and ``messages_for(None)`` later
+        # walks INCLUDING that empty assistant — producing a trailing
+        # empty-content assistant message AND a duplicated trailing user
+        # turn after ``_prepare_input`` re-appends ``input``.  Strict chat
+        # templates (Mistral 3) reject the empty assistant outright with
+        # ``Assistant message must have a string or a list of chunks ...``;
+        # permissive templates render the duplicate user silently and
+        # degrade prompt quality.
+        chat_history_anchor = parent_node_id
+        if (
+            not stateless
+            and isinstance(input, str)
+            and chat_history_anchor is None
+        ):
+            chat_history_anchor = self.tree.active_node_id
+
         assistant_node_id = self._start_loom_assistant(
             input,
             stateless=stateless,
@@ -3685,7 +3703,7 @@ class SaklasSession:
                 steering_cm.__enter__()
             input_ids, use_thinking, prompt_tokens = self._generation_preamble(
                 input, raw, use_thinking_req, stateless=stateless,
-                parent_node_id=parent_node_id,
+                parent_node_id=chat_history_anchor,
             )
             # Refresh snapshot now that steering is pushed (first-scope case).
             vector_snapshot = self._snapshot_steering_alphas()
