@@ -131,11 +131,30 @@ export async function patchSessionDefaults(
   _hydrateSamplingFromInfo();
 }
 
-export async function clearSessionHistory(): Promise<void> {
-  await apiSessions.clear();
-  // History length resets server-side; refresh to reflect it locally.
-  await refreshSession();
-  chatLog.turns = [];
+/** "Clear chat" — preserves the loom tree and just navigates back to the
+ *  synthetic system root.  The next submission lands a fresh user turn
+ *  as a sibling branch off root rather than the legacy behaviour of
+ *  destroying every existing branch.  Earlier conversation paths stay
+ *  reachable from the sidebar.
+ *
+ *  Falls back to the destructive ``apiSessions.clear()`` only when the
+ *  server has no loom (legacy/unavailable) — without that branch the
+ *  button would be a no-op there. */
+export async function resetChatToRoot(): Promise<void> {
+  const root = loomTree.root_id;
+  if (root !== null) {
+    // ``loomNavigate`` runs the navigate REST call and refreshes the
+    // tree; ``syncChatLogFromTree`` then projects the [root]-only
+    // active path to an empty ``chatLog.turns`` because the synthetic
+    // system root is filtered out of the chat view.
+    await loomNavigate(root);
+    return;
+  }
+  if (loomTree.unavailable) {
+    await apiSessions.clear();
+    await refreshSession();
+    chatLog.turns = [];
+  }
 }
 
 export async function rewindSession(): Promise<void> {

@@ -39,7 +39,7 @@
     navigateInputHistory,
     cancelInputPull,
     consumePulledSlot,
-    clearSessionHistory,
+    resetChatToRoot,
     rewindSession,
     sendPrefill,
     sendCommit,
@@ -416,15 +416,16 @@
       enqueuePending({
         label: "/clear",
         text: null,
-        apply: () => void clearSessionHistory(),
+        apply: () => void resetChatToRoot(),
         awaitsGen: false,
         rebuild: null,
-        // /clear resets to the synthetic root (system role) — not a
-        // user node, so the next submission goes through "message" mode.
+        // /clear navigates to the synthetic root (system role) — not a
+        // user node, so the next submission goes through "message" mode
+        // and lands a fresh user branch off root.
         endsOnUserNode: false,
       });
     } else {
-      void clearSessionHistory();
+      void resetChatToRoot();
     }
   }
 
@@ -1021,7 +1022,6 @@
   <div
     class="msg {turn.role}"
     class:shadow={isShadow}
-    class:streaming={chatLog.pendingIndex === turnIdx}
   >
     <span class="role">
       {#if turn.role === "user"}user{:else if turn.role === "system"}system{:else}assistant{#if isShadow} (unsteered){/if}{/if}
@@ -1299,11 +1299,6 @@
   }
   .msg.system .role {
     color: var(--accent-red);
-  }
-  .msg.streaming {
-    /* Subtle pulse on the in-flight turn so the user can see what's
-     * actively being written. */
-    background: rgba(126, 231, 135, 0.04);
   }
   .msg.placeholder {
     color: var(--fg-muted);

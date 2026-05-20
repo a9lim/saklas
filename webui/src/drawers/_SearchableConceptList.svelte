@@ -94,7 +94,13 @@
 
   onMount(() => {
     void load();
-    if (autofocusSearch) queueMicrotask(() => searchInputRef?.focus());
+    // ``preventScroll`` keeps the browser from scrolling the drawer's
+    // ancestors to bring the input into view — the drawer enters mid-
+    // animation at ``translateX(100%)``, so without this the focus call
+    // bumps the layout's ``scrollLeft`` and the chat/rack content visibly
+    // shifts left then snaps back when the slide-in completes.
+    if (autofocusSearch)
+      queueMicrotask(() => searchInputRef?.focus({ preventScroll: true }));
   });
 
   function rowKey(r: LocalPackInfo): string {
