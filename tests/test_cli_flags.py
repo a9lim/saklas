@@ -237,65 +237,66 @@ def test_config_validate_local_vector_missing(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# --no-compile / YAML compile: opt-out (v2.2)
+# --compile / YAML compile: opt-in (defaults off — torch 2.12 inductor
+# bugs on newer architectures and limited per-token benefit on
+# interactive workloads make compile a deliberate choice, not a default)
 # ---------------------------------------------------------------------------
 
-def test_tui_no_compile_flag_parses():
-    """``--no-compile`` is the documented opt-out for CUDA torch.compile
-    auto-enable.  Defaults to off (compile on)."""
+def test_tui_compile_flag_parses():
+    """``--compile`` is the opt-in for CUDA torch.compile.  Off by default."""
     args = cli.parse_args(["tui", "google/gemma-2-2b-it"])
-    assert getattr(args, "no_compile", False) is False
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it", "--no-compile"])
-    assert args.no_compile is True
+    assert getattr(args, "compile", False) is False
+    args = cli.parse_args(["tui", "google/gemma-2-2b-it", "--compile"])
+    assert args.compile is True
 
 
-def test_serve_no_compile_flag_parses():
+def test_serve_compile_flag_parses():
     args = cli.parse_args(["serve", "google/gemma-2-2b-it"])
-    assert getattr(args, "no_compile", False) is False
-    args = cli.parse_args(["serve", "google/gemma-2-2b-it", "--no-compile"])
-    assert args.no_compile is True
+    assert getattr(args, "compile", False) is False
+    args = cli.parse_args(["serve", "google/gemma-2-2b-it", "--compile"])
+    assert args.compile is True
 
 
-def test_yaml_compile_false_folds_onto_args(monkeypatch, tmp_path):
-    """YAML ``compile: false`` should set ``args.no_compile=True``
-    when the CLI didn't already pass ``--no-compile``."""
+def test_yaml_compile_true_folds_onto_args(monkeypatch, tmp_path):
+    """YAML ``compile: true`` should set ``args.compile=True`` when the
+    CLI didn't already pass ``--compile``."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    p = tmp_path / "on.yaml"
+    p.write_text("model: google/gemma-2-2b-it\ncompile: true\n")
+    args = cli.parse_args(["tui", "-c", str(p)])
+    # Pre-effective: argparse default is False.
+    assert getattr(args, "compile", False) is False
+    cli_runners._load_effective_config(args)
+    # YAML opt-in folded on.
+    assert args.compile is True
+
+
+def test_yaml_compile_false_is_noop(monkeypatch, tmp_path):
+    """``compile: false`` matches the default — accepting it in YAML
+    keeps round-trip symmetry but doesn't flip ``args.compile``."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "off.yaml"
     p.write_text("model: google/gemma-2-2b-it\ncompile: false\n")
     args = cli.parse_args(["tui", "-c", str(p)])
-    # Pre-effective: argparse default is False (no --no-compile passed).
-    assert getattr(args, "no_compile", False) is False
     cli_runners._load_effective_config(args)
-    # YAML opt-out folded on.
-    assert args.no_compile is True
+    assert getattr(args, "compile", False) is False
 
 
-def test_yaml_compile_true_is_noop(monkeypatch, tmp_path):
-    """``compile: true`` is the auto-enabled default — accepting it in
-    YAML keeps round-trip symmetry but doesn't flip ``args.no_compile``."""
+def test_cli_compile_overrides_yaml_compile_false(monkeypatch, tmp_path):
+    """CLI flag wins over YAML — passing ``--compile`` even with
+    ``compile: false`` in YAML must keep the opt-in."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    p = tmp_path / "on.yaml"
-    p.write_text("model: google/gemma-2-2b-it\ncompile: true\n")
-    args = cli.parse_args(["tui", "-c", str(p)])
+    p = tmp_path / "off.yaml"
+    p.write_text("model: google/gemma-2-2b-it\ncompile: false\n")
+    args = cli.parse_args(["tui", "-c", str(p), "--compile"])
     cli_runners._load_effective_config(args)
-    assert getattr(args, "no_compile", False) is False
-
-
-def test_cli_no_compile_overrides_yaml_compile_true(monkeypatch, tmp_path):
-    """CLI flag wins over YAML — passing ``--no-compile`` even with
-    ``compile: true`` in YAML must keep the opt-out."""
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    p = tmp_path / "on.yaml"
-    p.write_text("model: google/gemma-2-2b-it\ncompile: true\n")
-    args = cli.parse_args(["tui", "-c", str(p), "--no-compile"])
-    cli_runners._load_effective_config(args)
-    assert args.no_compile is True
+    assert args.compile is True
 
 
 def test_yaml_compile_invalid_type_errors(monkeypatch, tmp_path):
     """Reject non-boolean ``compile:`` values rather than coercing —
-    ``compile: "false"`` (a string) would otherwise pass through as
-    truthy and silently keep compile on."""
+    ``compile: "true"`` (a string) would otherwise pass through as
+    truthy and silently turn compile on."""
     from saklas.cli.config_file import ConfigFile, ConfigFileError
     p = tmp_path / "bad.yaml"
     p.write_text("compile: \"false\"\n")

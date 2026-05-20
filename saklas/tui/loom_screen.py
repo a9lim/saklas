@@ -305,6 +305,13 @@ class LoomScreen(Screen[None]):
         height: 3;
         border: solid ansi_default;
     }
+
+    /* Mirror the chat-input cursor pin — see styles.tcss for the
+     * rationale; same theme variables, same Ubuntu-purple problem. */
+    #loom-prompt-input > .input--cursor {
+        background: ansi_white;
+        color: ansi_black;
+    }
     """
 
     def __init__(self, app: "SaklasApp") -> None:

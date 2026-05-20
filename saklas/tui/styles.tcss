@@ -172,6 +172,19 @@ Widget {
     background: ansi_default;
 }
 
+/* Force a high-contrast cursor block.  TextArea's default cursor styling
+ * resolves to the active theme's ``$input-cursor-{background,foreground}``
+ * variables; under Textual's default ``textual-dark`` theme they land at
+ * ``#e0e0e0`` / ``#121212`` which renders close to the terminal background
+ * on terminals that remap dim greys (Ubuntu's GNOME Terminal is the
+ * canonical case — the cursor block reads as solid black against the
+ * default purple).  Pin to ansi white-on-black so the cursor stays
+ * visible regardless of theme or terminal palette tweaks. */
+#chat-input > .text-area--cursor {
+    background: ansi_white;
+    color: ansi_black;
+}
+
 /* TextArea exposes its selection style through ``.text-area--selection``
  * (vs the old ``Input.input--selection``).  Keep the inverted look so
  * a selection stays visible against the ansi background.

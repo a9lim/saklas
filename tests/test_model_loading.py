@@ -185,13 +185,13 @@ def test_mistral_regex_fix_skipped_for_non_mistral():
 
 
 # ---------------------------------------------------------------------------
-# torch.compile auto-enable.  The compile path is wired in
-# ``load_model``: when ``compile=True`` (default) and ``device == "cuda"``,
+# torch.compile opt-in.  The compile path is wired in ``load_model``:
+# when ``compile=True`` (off by default — torch 2.12 inductor bugs on
+# newer archs make compile a sometimes-trap) and ``device == "cuda"``,
 # the loaded model is wrapped with ``torch.compile``; on MPS/CPU compile
-# is silently skipped, and ``compile=False`` is the explicit opt-out
-# regardless of device.  Tests mock ``torch.compile`` so we never actually
-# compile (which would download dependencies and take seconds); we only
-# verify it was *invoked* with the right args.
+# is silently skipped.  Tests mock ``torch.compile`` so we never actually
+# compile (which would take seconds); we only verify it was *invoked*
+# with the right args.
 # ---------------------------------------------------------------------------
 
 
@@ -207,17 +207,33 @@ def _run_load_with_compile(
     compile_invocations: list[dict] = []
     base_model = _FakeModel("sdpa")
 
+    class _FakeCompiled:
+        """Callable sentinel — ``_compile_with_probe`` runs a probe forward
+        after wrapping, so the result must accept the prefill / decode call
+        shape and return an object with ``.logits``."""
+        _compiled_marker = True
+
+        def __init__(self, model):
+            self._orig_mod = model
+
+        def __call__(self, **fwd):
+            n = fwd["input_ids"].shape[1]
+            return SimpleNamespace(logits=torch.zeros(1, n, 1))
+
     def _fake_compile(model, **kwargs):
         compile_invocations.append({"model": model, **kwargs})
-        # Return a sentinel marker so we can verify the wrapped object
-        # is what propagates back to the caller.
-        return SimpleNamespace(_compiled_marker=True, _orig_mod=model)
+        return _FakeCompiled(model)
 
     with (
         patch.object(model_mod, "AutoTokenizer") as mock_tok,
         patch.object(model_mod, "AutoConfig") as mock_cfg,
         patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
         patch.object(torch, "compile", side_effect=_fake_compile) as mock_compile,
+        # The probe forwards allocate `torch.full(..., device="cuda", ...)`,
+        # which raises on a no-CUDA CI host before the fake compiled wrapper
+        # is ever called.  We're not exercising the probe here — only that
+        # ``torch.compile`` fired with the right args — so stub it out.
+        patch.object(model_mod, "_run_compile_probes", return_value=None),
     ):
         mock_tok.from_pretrained.return_value = SimpleNamespace()
         mock_cfg.from_pretrained.return_value = cfg
@@ -230,8 +246,8 @@ def _run_load_with_compile(
     return (mock_compile.called, compile_invocations, ret_model)
 
 
-def test_compile_auto_enabled_on_cuda():
-    """Default behavior: CUDA load wraps the model with torch.compile."""
+def test_compile_opts_in_on_cuda():
+    """Explicit ``compile=True`` on CUDA wraps the model with torch.compile."""
     called, invocations, model = _run_load_with_compile(device="cuda")
     assert called, "torch.compile should fire on CUDA when compile=True"
     assert len(invocations) == 1
@@ -242,6 +258,29 @@ def test_compile_auto_enabled_on_cuda():
     )
     # The returned model is the compile wrapper, not the original.
     assert getattr(model, "_compiled_marker", False) is True
+
+
+def test_compile_off_by_default():
+    """``load_model`` defaults to ``compile=False`` — torch 2.12 inductor
+    bugs on newer architectures make compile a sometimes-trap, and the
+    upfront cost rarely amortizes on interactive workloads."""
+    cfg = _FakeConfig("qwen3")
+    base_model = _FakeModel("sdpa")
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
+        patch.object(torch, "compile") as mock_compile,
+    ):
+        mock_tok.from_pretrained.return_value = SimpleNamespace()
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_model.from_pretrained.return_value = base_model
+        model_mod.load_model("fake/repo", device="cuda")
+
+    assert not mock_compile.called, (
+        "load_model default must not fire torch.compile — opt-in required"
+    )
 
 
 def test_compile_skipped_on_mps():
@@ -267,6 +306,47 @@ def test_compile_explicit_opt_out_on_cuda():
     )
     assert not called, "compile=False must override the CUDA auto-enable"
     assert not hasattr(model, "_compiled_marker")
+
+
+def test_compile_probe_failure_falls_back_to_eager():
+    """If the compiled artifact raises during the warmup probe (e.g.
+    Gemma-4 + torch 2.12 inductor codegen bug), ``_compile_with_probe``
+    warns and returns the un-compiled model so generation still works."""
+    import warnings as _w
+
+    cfg = _FakeConfig("qwen3")
+    base_model = _FakeModel("sdpa")
+
+    class _BrokenCompiled:
+        _compiled_marker = True
+
+        def __init__(self, model):
+            self._orig_mod = model
+
+        def __call__(self, **fwd):
+            raise RuntimeError("inductor codegen produced an invalid kernel")
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
+        patch.object(torch, "compile", side_effect=lambda m, **k: _BrokenCompiled(m)),
+        _w.catch_warnings(record=True) as caught,
+    ):
+        _w.simplefilter("always")
+        mock_tok.from_pretrained.return_value = SimpleNamespace()
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_model.from_pretrained.return_value = base_model
+        ret_model, _tok = model_mod.load_model(
+            "fake/repo", device="cuda", compile=True,
+        )
+
+    assert not hasattr(ret_model, "_compiled_marker"), (
+        "broken compile must fall back to the un-compiled model"
+    )
+    assert any(
+        "torch.compile probe failed" in str(w.message) for w in caught
+    ), f"expected a fallback UserWarning, got: {[str(w.message) for w in caught]}"
 
 
 def test_compile_mode_propagates():

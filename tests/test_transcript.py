@@ -275,7 +275,10 @@ def test_import_merge_falls_back_to_root_when_no_match():
 def test_guard_model_mismatch_refuses_merge():
     sess = _StubSession(model_id="m1")
     t = _simple_transcript(model_id="m2")
-    with pytest.raises(TranscriptModelMismatch):
+    with (
+        pytest.warns(UserWarning, match="differs from session"),
+        pytest.raises(TranscriptModelMismatch),
+    ):
         t.import_into(sess, mode="merge")
 
 
@@ -344,7 +347,10 @@ def test_guard_probe_drift_warns_then_strict_raises():
         probe_names=("angry.calm",),
         probe_hashes={"angry.calm": "session_hash"},
     )
-    with pytest.raises(TranscriptProbeDriftError):
+    with (
+        pytest.warns(UserWarning, match="drift"),
+        pytest.raises(TranscriptProbeDriftError),
+    ):
         t.import_into(sess2, mode="default", strict=True)
 
 

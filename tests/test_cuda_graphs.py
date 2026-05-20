@@ -157,33 +157,33 @@ def test_support_probe_cache_survives_compile_wrapper(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# CLI + YAML opt-out plumbing.
+# CLI + YAML opt-in plumbing.
 # ---------------------------------------------------------------------------
 
 
-def test_no_cuda_graphs_flag_parses():
+def test_cuda_graphs_flag_parses():
     from saklas import cli
     args = cli.parse_args(["tui", "google/gemma-2-2b-it"])
-    assert getattr(args, "no_cuda_graphs", False) is False
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it", "--no-cuda-graphs"])
-    assert args.no_cuda_graphs is True
+    assert getattr(args, "cuda_graphs", False) is False
+    args = cli.parse_args(["tui", "google/gemma-2-2b-it", "--cuda-graphs"])
+    assert args.cuda_graphs is True
 
 
-def test_yaml_cuda_graphs_false_folds_onto_args(monkeypatch, tmp_path):
+def test_yaml_cuda_graphs_true_folds_onto_args(monkeypatch, tmp_path):
     from saklas import cli
     from saklas.cli import runners as cli_runners
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    p = tmp_path / "off.yaml"
-    p.write_text("model: google/gemma-2-2b-it\ncuda_graphs: false\n")
+    p = tmp_path / "on.yaml"
+    p.write_text("model: google/gemma-2-2b-it\ncuda_graphs: true\n")
     args = cli.parse_args(["tui", "-c", str(p)])
-    assert getattr(args, "no_cuda_graphs", False) is False
+    assert getattr(args, "cuda_graphs", False) is False
     cli_runners._load_effective_config(args)
-    assert args.no_cuda_graphs is True
+    assert args.cuda_graphs is True
 
 
 def test_yaml_cuda_graphs_invalid_type_errors(tmp_path):
-    """``cuda_graphs: "false"`` (a YAML string) must reject rather than
-    coerce — coercion would leave the static-cache path silently active."""
+    """``cuda_graphs: "true"`` (a YAML string) must reject rather than
+    coerce — coercion would silently turn the static-cache path on."""
     from saklas.cli.config_file import ConfigFile, ConfigFileError
     p = tmp_path / "bad.yaml"
     p.write_text('cuda_graphs: "false"\n')
@@ -192,15 +192,15 @@ def test_yaml_cuda_graphs_invalid_type_errors(tmp_path):
 
 
 def test_yaml_compile_and_cuda_graphs_compose(monkeypatch, tmp_path):
-    """Both opt-outs in one YAML — the runner sees both args set."""
+    """Both opt-ins in one YAML — the runner sees both args set."""
     from saklas import cli
     from saklas.cli import runners as cli_runners
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    p = tmp_path / "off.yaml"
+    p = tmp_path / "on.yaml"
     p.write_text(
-        "model: google/gemma-2-2b-it\ncompile: false\ncuda_graphs: false\n"
+        "model: google/gemma-2-2b-it\ncompile: true\ncuda_graphs: true\n"
     )
     args = cli.parse_args(["tui", "-c", str(p)])
     cli_runners._load_effective_config(args)
-    assert args.no_compile is True
-    assert args.no_cuda_graphs is True
+    assert args.compile is True
+    assert args.cuda_graphs is True

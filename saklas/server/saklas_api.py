@@ -37,7 +37,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
-from saklas.core.generation import supports_thinking
+from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.io.probes_bootstrap import load_defaults
 from saklas.core.loom import LoomMutated
 from saklas.core.profile import Profile
@@ -337,8 +337,10 @@ def _session_info(
     device, dtype = _device_dtype(session)
     try:
         thinks = bool(supports_thinking(session._tokenizer))
+        thinks_optional = bool(thinking_is_optional(session._tokenizer))
     except Exception:
         thinks = False
+        thinks_optional = False
     created = getattr(session, "_created_ts", None) or int(time.time())
     default_expr = str(default_steering) if default_steering is not None else None
     return {
@@ -352,6 +354,7 @@ def _session_info(
         "probes": sorted(session.probes.keys()),
         "history_length": len(session.history) if hasattr(session, "history") else 0,
         "supports_thinking": thinks,
+        "thinking_is_optional": thinks_optional,
         "default_steering": default_expr,
     }
 

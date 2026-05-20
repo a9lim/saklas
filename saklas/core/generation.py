@@ -122,6 +122,29 @@ _think_delim_cache: dict[tuple[str, int], tuple[int | None, int | None, int | No
 _none_result: tuple[int | None, int | None, int | None, bool] = (None, None, None, False)
 
 
+def _detect_bracket_delimiters(
+    tokenizer,
+) -> tuple[int | None, int | None, int | None, bool] | None:
+    """Detect bracket-pair thinking delimiters (Mistral-3 Reasoning style).
+
+    These models ship ``[THINK]`` / ``[/THINK]`` as added tokens and bake
+    the reasoning instruction into the chat template's default system
+    prompt, so the model emits ``[THINK]…[/THINK]…response`` regardless of
+    any ``enable_thinking`` flag (the template doesn't have one).  Without
+    engaging the state machine the thinking section + closing bracket
+    leak into the response.
+
+    Returns the delimiter tuple if the pair is present, ``None`` otherwise.
+    """
+    added = getattr(tokenizer, "added_tokens_encoder", {})
+    start_id = added.get("[THINK]")
+    end_id = added.get("[/THINK]")
+    if start_id is None or end_id is None:
+        return None
+    log.debug("bracket-style delimiters: [THINK]=%d [/THINK]=%d", start_id, end_id)
+    return (start_id, end_id, None, False)
+
+
 def _detect_channel_delimiters(
     tokenizer,
 ) -> tuple[int | None, int | None, int | None, bool] | None:
@@ -193,10 +216,16 @@ def _detect_think_delimiters(
 
     template = getattr(tokenizer, "chat_template", None) or ""
     if "enable_thinking" not in template:
-        # Check for channel-based thinking (e.g. gpt-oss) where the
-        # model always generates <|channel|>analysis<|message|> without
-        # an enable_thinking template parameter.
-        result = _detect_channel_delimiters(tokenizer)
+        # Templates without an ``enable_thinking`` switch still need
+        # delimiter detection for two known styles:
+        #   * channel-based (gpt-oss) — ``<|channel|>analysis<|message|>``
+        #   * bracket-pair (Mistral-3 Reasoning) — ``[THINK]…[/THINK]``,
+        #     where the reasoning instruction is baked into the template's
+        #     default system prompt and the model emits the pair itself.
+        result = (
+            _detect_channel_delimiters(tokenizer)
+            or _detect_bracket_delimiters(tokenizer)
+        )
         _think_delim_cache[tok_key] = result if result else _none_result
         return _think_delim_cache[tok_key]
 
@@ -293,6 +322,29 @@ def _detect_think_delimiters(
 def supports_thinking(tokenizer) -> bool:
     """Check if the tokenizer's chat template supports thinking mode."""
     return _detect_think_delimiters(tokenizer) != _none_result
+
+
+def thinking_is_optional(tokenizer) -> bool:
+    """Return True iff the user can actually turn thinking off.
+
+    Templates carry an ``enable_thinking`` Jinja variable for the
+    toggleable case (Qwen3-30B-A3B-style — ``enable_thinking=False``
+    renders an empty closed thinking section so the model skips it).
+    Forced-thinking families have no such switch: gpt-oss always opens
+    a channel, Mistral-3-Reasoning bakes the reasoning instruction
+    into its default system prompt, Qwen3-Thinking hardcodes
+    ``<think>\\n`` in the generation prompt. For these, the
+    ``thinking`` flag is purely cosmetic at the prompt layer — the
+    state-machine still engages so the section is classified, but the
+    model thinks either way.
+
+    Returns False when ``supports_thinking`` is False (no machinery to
+    toggle).
+    """
+    if not supports_thinking(tokenizer):
+        return False
+    template = getattr(tokenizer, "chat_template", None) or ""
+    return "enable_thinking" in template
 
 
 from dataclasses import dataclass  # noqa: E402
@@ -701,13 +753,31 @@ def generate_steered(
     completion_text = ""  # accumulated non-thinking emitted text, for stop matching
     state.finish_reason = "length"  # default: loop exhausted
 
-    # Thinking state tracking
-    if thinking:
-        think_start_id, think_end_id, response_start_id, starts_in_thinking = (
-            _detect_think_delimiters(tokenizer)
-        )
-    else:
-        think_start_id = think_end_id = response_start_id = None
+    # Thinking state tracking.  Always detect delimiters even when the
+    # user opted out of thinking — channel-based formats (gpt-oss) have
+    # no ``enable_thinking`` template switch to suppress the analysis
+    # channel, so the model unconditionally emits
+    # ``<|channel|>analysis<|message|>…<|end|><|start|>assistant<|channel|>final<|message|>…``
+    # and without the state machine engaged those delimiters plus the
+    # analysis content land verbatim in the response text.
+    # ``enable_thinking`` models (Qwen/Gemma) are unaffected: with
+    # ``thinking=False`` the template doesn't open a thinking section,
+    # so the start delimiter never appears and the machine stays in
+    # IDLE.  ``starts_in_thinking`` is forced off when ``thinking=False``
+    # because the cached probe always renders with ``enable_thinking=True``
+    # — the actual runtime prompt under ``thinking=False`` wouldn't open
+    # a thinking section, so we mustn't start the machine mid-thinking.
+    think_start_id, think_end_id, response_start_id, starts_in_thinking = (
+        _detect_think_delimiters(tokenizer)
+    )
+    # ``starts_in_thinking`` is forced off when ``thinking=False`` *only*
+    # for templates the user can actually opt out of (``enable_thinking``
+    # in the template — the runtime prompt under ``thinking=False``
+    # wouldn't open a thinking section, so we mustn't start the machine
+    # mid-thinking). For forced-thinking models (gpt-oss / Mistral-3
+    # Reasoning / Qwen3-Thinking) the runtime prompt is identical
+    # regardless of the flag, so the detector's reading is authoritative.
+    if not thinking and thinking_is_optional(tokenizer):
         starts_in_thinking = False
     # Hoisted: true iff channel-based format (gpt-oss) where EOS acts as
     # a channel separator inside thinking/preamble rather than terminating.
@@ -718,9 +788,11 @@ def generate_steered(
         else _ThinkState.IDLE
     )
     # Mirror the internal tstate onto the public ThinkingState enum.
-    # Outside the thinking machine (no thinking requested, or no delimiters
-    # detected) we go straight to RESPONSE.
-    if thinking and think_end_id is not None:
+    # No delimiters detected → straight to RESPONSE; otherwise track the
+    # machine.  Note: even with ``thinking=False`` the machine engages
+    # for channel-based formats (gpt-oss) so the analysis is correctly
+    # classified rather than leaking into the response.
+    if think_end_id is not None:
         state.thinking_state = (
             ThinkingState.THINKING
             if starts_in_thinking
@@ -1016,16 +1088,29 @@ def generate_steered(
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
                         state.thinking_state = ThinkingState.RESPONSE
-                    elif (response_start_id is not None
-                          and token_id == response_start_id):
-                        tstate = _ThinkState.THINKING
-                        state.thinking_state = ThinkingState.THINKING
-                    else:
-                        tok_text = tokenizer.decode([token_id])
-                        if '\n' in tok_text:
+                        continue  # suppress end delimiter
+                    if response_start_id is not None:
+                        # Channel-style (gpt-oss): suppress channel-name
+                        # tokens between ``<|channel|>`` and ``<|message|>``.
+                        if token_id == response_start_id:
                             tstate = _ThinkState.THINKING
                             state.thinking_state = ThinkingState.THINKING
-                    continue  # suppress preamble
+                        continue  # suppress preamble
+                    # Non-channel preamble (Qwen-style ``<think>\n``, or
+                    # bracket-pair ``[THINK]…`` with no leading whitespace).
+                    # Transition to THINKING on the first non-end token.
+                    # Swallow pure-whitespace tokens (Qwen's ``\n``) so the
+                    # thinking content doesn't carry a leading newline;
+                    # fall through on anything else so the token is processed
+                    # as the first piece of thinking content (the bracket-
+                    # pair case where the model goes directly from
+                    # ``[THINK]`` into content).
+                    tstate = _ThinkState.THINKING
+                    state.thinking_state = ThinkingState.THINKING
+                    tok_text = tokenizer.decode([token_id])
+                    if tok_text == "" or tok_text.isspace():
+                        continue  # swallow leading whitespace
+                    # fall through to normal token handling below
 
                 # Handle end-of-thinking delimiter
                 if tstate == _ThinkState.THINKING and token_id == think_end_id:
