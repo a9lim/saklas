@@ -119,7 +119,10 @@ class TestVectorDiagnostics:
         data = resp.json()
         assert data["name"] == "honest"
         assert data["model"] == "test/model"
-        assert data["total_layers"] == 40
+        # ``total_layers`` is the *model's* depth (so the layer-norms drawer
+        # can show layers DLS dropped), not the profile's — see the endpoint
+        # comment in ``saklas/server/saklas_api.py``.
+        assert data["total_layers"] == session.model_info["num_layers"]
 
         hist = data["histogram"]
         assert hist["buckets"] == HIST_BUCKETS
