@@ -307,10 +307,18 @@
       if (!ta) return;
       const goingUp = ev.key === "ArrowUp";
       if (goingUp ? !shouldRecallUp(ta) : !shouldRecallDown(ta)) return;
-      // ↓ at the live slot (no recall in flight) is a no-op — leave
-      // the keystroke for the textarea so it can move within an empty
-      // last line or trigger the browser's native end-of-input nudge.
-      if (!goingUp && inputHistory.index === null) return;
+      // ↓ at the live slot (no recall in flight, no pending pull) is
+      // a no-op — leave the keystroke for the textarea so it can move
+      // within an empty last line or trigger the browser's native
+      // end-of-input nudge.  Checking only ``index`` misses the
+      // pulled-pending case (``pulledSlot`` is what tracks that),
+      // which would otherwise strand the user inside an edited
+      // pending item with no ↓ exit.
+      if (
+        !goingUp
+        && inputHistory.index === null
+        && inputHistory.pulledSlot === null
+      ) return;
       const recalled = navigateInputHistory(goingUp ? -1 : +1, input);
       if (recalled === null) return;
       ev.preventDefault();
