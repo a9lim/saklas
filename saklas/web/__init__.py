@@ -7,9 +7,8 @@ mounts ``StaticFiles`` against that bundle and adds an SPA fallback.
 
 Two paths to install / run:
 
-* ``pip install saklas[web]`` brings in the same FastAPI + uvicorn the
-  ``[serve]`` extra carries (the static-file mount needs nothing more
-  than what the API server already requires).  Then
+* ``pip install saklas`` is enough: FastAPI + uvicorn are base
+  dependencies and the bundle ships in the wheel, so
   ``saklas serve <model>`` exposes the dashboard at ``/`` by default;
   add ``--no-web`` for API-only mode.
 * From source: ``cd webui && npm ci && npm run build`` regenerates the

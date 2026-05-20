@@ -4,7 +4,7 @@
 
 `saklas` is a Python library + Textual TUI + dual-protocol HTTP server for activation steering and trait monitoring on HuggingFace causal LMs. It runs OpenAI `/v1/*` and Ollama `/api/*` on one port, plus a native `/saklas/v1/*` API and a Svelte dashboard at `/`. Steering vectors come from representation engineering: difference-of-means by default, contrastive PCA via `--method pca` for legacy parity. Injection is angular (rotation toward the concept direction) by default, additive available via `--steer-mode additive`. Per-call alpha, no model mutation. Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve` (HTTP), `saklas tui` (TUI).
 
-Version lives in `saklas/__init__.py` as `__version__` (currently 2.3.0). `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there is one place to bump. Do not bump it as part of feature work — version bumps are user-owned.
+Version lives in `saklas/__init__.py` as `__version__` (currently 3.0.0). `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there is one place to bump. Do not bump it as part of feature work — version bumps are user-owned.
 
 Releases: merge a version bump to `main` → `.github/workflows/release.yml` tags `v$VERSION`, builds, publishes via trusted publishing, and cuts a GitHub release. A push without a bump is a no-op.
 
@@ -23,7 +23,6 @@ Deep internals live in subtree `AGENTS.md` files — Claude Code auto-loads each
 
 ```bash
 pip install -e ".[dev]"                         # editable + pytest
-pip install -e ".[serve]"                       # fastapi + uvicorn
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
 pip install -e ".[cuda]"                        # bitsandbytes + flash-attn (Linux/CUDA)
 pip install -e ".[sae]"                         # SAELens-backed SAE extraction
@@ -175,7 +174,7 @@ Known model-level axis entanglements (cross-model robust, weighted cosine via `v
 - `hallucinating.grounded ↔ humorous.serious` (+0.5–0.7) — humor reads as off-grounded weirdness
 - `angry.calm ↔ authoritative.submissive` (+0.5–0.8) — anger encodes as dominance
 
-90 neutral statements in `saklas/data/neutral_statements.json` follow the same affect-neutral, topically-diverse discipline. Bundled-pair regeneration runs through `scripts/regenerate_bundled_statements.py` — a load-bearing anti-allegory clause keeps non-human axes (`deer.wolf`, `the_sun.the_moon`) literal rather than human-allegory.
+90 neutral statements in `saklas/data/neutral_statements.json` follow the same affect-neutral, topically-diverse discipline. Bundled-pair regeneration runs through `scripts/regenerate_bundled_statements.py`, which calls `session.generate_scenarios` / `session.generate_pairs` — a load-bearing anti-allegory clause in those methods keeps non-human axes (`deer/wolf`, `brick/feather`) literal rather than human-allegory.
 
 ## Package layout
 

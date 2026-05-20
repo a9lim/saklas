@@ -332,9 +332,11 @@ def _run_serve(args: argparse.Namespace) -> None:
         import fastapi  # noqa: F401
         import uvicorn
     except ImportError:
+        # fastapi + uvicorn are base dependencies since v3.x; this only
+        # fires when they've been uninstalled out from under saklas.
         print(
             "Server dependencies not installed. Run:\n"
-            "  pip install saklas[serve]",
+            "  pip install --upgrade saklas",
             file=sys.stderr,
         )
         sys.exit(1)

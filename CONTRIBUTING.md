@@ -10,7 +10,7 @@ cd saklas
 pip install -e ".[dev]"
 ```
 
-Optional extras: `[cuda]` for bitsandbytes and flash-attn, `[serve]` for the FastAPI server, `[research]` for datasets and pandas, `[sae]` for SAELens-backed SAE extraction.
+Optional extras: `[cuda]` for bitsandbytes and flash-attn, `[research]` for datasets and pandas, `[sae]` for SAELens-backed SAE extraction. The HTTP server and web UI bundle are part of the base install.
 
 ## Running tests
 
@@ -30,6 +30,20 @@ CI runs `ruff check .` on every PR. Please run it locally first:
 ruff check .
 ruff check . --fix    # auto-fix what's fixable
 ```
+
+## Working on the web UI
+
+The dashboard source is a Svelte 5 and Vite app at the repo's top-level `webui/` directory. The committed `saklas/web/dist/` bundle is the source of truth that ships in the wheel.
+
+```bash
+cd webui
+npm ci
+npm run dev     # vite dev server on http://localhost:5173 with hot reload
+npm run build   # writes ../saklas/web/dist/
+npm run check   # svelte-check
+```
+
+`npm run dev` proxies `/saklas`, `/v1`, `/api` (HTTP and WebSocket) to `http://localhost:8000`, so keep `saklas serve <model>` running in another shell and the dev server talks to a real model end. When you're done, please run `npm run build` and commit the regenerated `saklas/web/dist/` so the next person installing your branch gets the latest UI.
 
 ## Adding a new model architecture
 
