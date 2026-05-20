@@ -37,7 +37,7 @@
   }
 
   function onAddProbe(): void {
-    openDrawer("probe_picker");
+    openDrawer("vectors");
   }
 </script>
 

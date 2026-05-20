@@ -67,14 +67,13 @@ src/
     ProbeStrip.svelte            # ●/○ select (whole-row click) + name + right-aligned sparkline + bar + value + ✕ + per-layer cells
     loom/                        # LoomSidebar + LoomNode + LoomEdge
   drawers/
-    Load / Compare / SystemPrompt / ModelInfo / Help / Export
+    Load / Compare / SystemPrompt / Help / Export
     SaveConversation / LoadConversation
-    VectorPicker / ProbePicker
+    Vectors / Extract       # unified picker + manage drawer, plus custom-vector form
     Pack / Merge / Clone
     ExperimentLab / ActivationAtlas / RecipeBuilder / AdvancedSampling
     Health / SessionAdmin / TokenDrilldown / Correlation / LayerNorms
     NodeCompare / Transcript
-    _SearchableConceptList.svelte  # shared categorized catalog for both pickers
     index.ts             # barrel re-exports for App.svelte's drawer switch
 ```
 
@@ -108,7 +107,7 @@ The dashboard speaks the existing `/saklas/v1/*` native API:
 * `POST /saklas/v1/sessions/default/extract` — JSON or SSE-progress when `Accept: text/event-stream`
 * `POST /saklas/v1/sessions/default/experiments/fan` — alpha grid as loom siblings
 * `POST /saklas/v1/sessions/default/vectors/{merge,clone}` — register a derived vector
-* `GET /saklas/v1/packs[/search]`, `POST /saklas/v1/packs` — pack browse + install
+* `GET /saklas/v1/packs[/search]`, `POST /saklas/v1/packs`, `DELETE /saklas/v1/packs/{ns}/{name}` — pack browse, install, and remove. The list response carries a session-relative `has_tensor` flag so the unified Vectors drawer can split rows into extracted and statements-only sections; DELETE detaches the concept from the rack before removing the folder.
 * `GET /saklas/v1/sessions/default/tree` and `/tree/active` — full loom tree or active path
 * `POST /saklas/v1/sessions/default/tree/{navigate,edit,branch,star,note,reset}` and `DELETE /tree/{node_id}` — loom mutations
 * `GET /saklas/v1/sessions/default/tree/{edge_label,filter}` — branch labels and search/filter support

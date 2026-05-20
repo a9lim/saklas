@@ -15,12 +15,15 @@
 //   "system_prompt"      → SystemPrompt
 //   "help"               → Help
 //
-// Standalone custom extraction was retired in the webui overhaul — the
-// extract form now inlines into the steering picker (VectorPickerDrawer).
+// ``Vectors`` is the unified vector management drawer — replaces the
+// legacy steer/probe picker pair.  Two sections split on the server's
+// ``has_tensor`` flag (extracted vs statements-only).  Both rack "+
+// add" buttons open this; the ``ExtractDrawer`` is reached from a
+// "+ custom vector" launcher inside it.
 
 export { default as Load } from "./LoadDrawer.svelte";
-export { default as VectorPicker } from "./VectorPickerDrawer.svelte";
-export { default as ProbePicker } from "./ProbePickerDrawer.svelte";
+export { default as Vectors } from "./VectorsDrawer.svelte";
+export { default as Extract } from "./ExtractDrawer.svelte";
 export { default as SaveConversation } from "./SaveConversationDrawer.svelte";
 export { default as LoadConversation } from "./LoadConversationDrawer.svelte";
 export { default as Compare } from "./CompareDrawer.svelte";

@@ -264,6 +264,56 @@ class TestExtract:
         assert data["profile"]["layers"] == [0, 1]
         assert "on_progress" in session.extract.call_args.kwargs
 
+    def test_extract_sse_streams_progress_live(self, session_and_client):
+        """SSE branch must yield each ``on_progress`` message as its own
+        event rather than buffering them all until extraction returns.
+
+        Regression: an earlier shape collected messages into a list and
+        only yielded them after ``session.extract`` had completed, so
+        the client received every progress event in one tick right
+        before ``done`` — the webui's progress toast had no time to
+        render them.  The fix routes progress through an
+        ``asyncio.Queue`` driven from the worker thread.
+        """
+        import torch
+        from saklas.core.profile import Profile
+        session, client = session_and_client
+        profile = Profile({0: torch.ones(4)})
+
+        def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
+            assert on_progress is not None
+            on_progress("Generating 9 scenarios for 'angry.calm'...")
+            on_progress("Generating contrastive pairs across 9 domains...")
+            on_progress("Extracting difference-of-means profile (45 pairs)...")
+            return "angry.calm", profile
+
+        session.extract.side_effect = _extract
+
+        # ``TestClient`` consumes the whole response before returning,
+        # so we can't observe arrival timing here — but we *can* confirm
+        # each progress message lands as its own ``event: progress``
+        # frame ordered before ``event: done``.  If the old buffer-then-
+        # flush shape regressed, the events would still arrive in order
+        # but this assertion still gates the structural fix.
+        with client.stream(
+            "POST",
+            "/saklas/v1/sessions/default/extract",
+            json={"name": "angry.calm", "source": "angry", "register": False},
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            assert resp.status_code == 200
+            body = b"".join(resp.iter_bytes()).decode()
+
+        # Split SSE frames on the blank-line terminator.
+        frames = [f for f in body.split("\n\n") if f.strip()]
+        events = [
+            f.split("\n")[0].removeprefix("event: ") for f in frames
+        ]
+        assert events.count("progress") == 3
+        assert events[-1] == "done"
+        assert "Generating 9 scenarios" in frames[0]
+        assert "Extracting difference-of-means" in frames[2]
+
     def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client):
         import torch
         from saklas.core.profile import Profile

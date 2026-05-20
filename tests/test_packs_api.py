@@ -117,6 +117,43 @@ class TestListPacks:
         assert data["packs"][0]["tags"] == ["affect"]
         assert data["packs"][1]["namespace"] == "local"
 
+    def test_lists_installed_carries_has_tensor_for_session_model(
+        self, session_and_client: tuple[SaklasSession, TestClient],
+    ):
+        """``has_tensor`` is the session-relative flag the unified webui
+        vectors drawer splits on — ``True`` when the pack has a baked
+        tensor for the loaded model (``<safe_model_id>.safetensors``).
+        ``session.model_id = "test/model"`` → safe id ``test__model``.
+        """
+        _, client = session_and_client
+        rows = [
+            ConceptRow(
+                name="has_one", namespace="default", status="installed",
+                recommended_alpha=0.5, tags=[], description="",
+                source="bundled", tensor_models=["test__model", "other__id"],
+            ),
+            ConceptRow(
+                name="other_model_only", namespace="default", status="installed",
+                recommended_alpha=0.5, tags=[], description="",
+                source="bundled", tensor_models=["other__id"],
+            ),
+            ConceptRow(
+                name="empty", namespace="local", status="installed",
+                recommended_alpha=0.4, tags=[], description="",
+                source="local", tensor_models=[],
+            ),
+        ]
+        with patch(
+            "saklas.io.cache_ops.list_concepts",
+            return_value=PackListResult(installed=rows, hf_rows=[], error=None),
+        ):
+            resp = client.get("/saklas/v1/packs")
+        data = resp.json()
+        by_name = {p["name"]: p for p in data["packs"]}
+        assert by_name["has_one"]["has_tensor"] is True
+        assert by_name["other_model_only"]["has_tensor"] is False
+        assert by_name["empty"]["has_tensor"] is False
+
     def test_corrupt_pack_carries_error(self, session_and_client: tuple[SaklasSession, TestClient]):
         _, client = session_and_client
         rows = [
@@ -318,3 +355,99 @@ class TestInstallPack:
                 json={"target": "garbage"},
             )
         assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# DELETE /saklas/v1/packs/{namespace}/{name}
+# ---------------------------------------------------------------------------
+
+
+class TestDeletePack:
+    def _patch_list(self, rows: list[ConceptRow]):
+        return patch(
+            "saklas.io.cache_ops.list_concepts",
+            return_value=PackListResult(installed=rows, hf_rows=[], error=None),
+        )
+
+    def test_delete_local_pack_removes_folder(
+        self, session_and_client: tuple[SaklasSession, TestClient],
+    ):
+        session, client = session_and_client
+        rows = [
+            ConceptRow(
+                name="custom", namespace="local", status="installed",
+                recommended_alpha=0.5, tags=[], description="",
+                source="local", tensor_models=["test__model"],
+            ),
+        ]
+        with self._patch_list(rows), patch(
+            "saklas.io.cache_ops.uninstall", return_value=1,
+        ) as m_un:
+            resp = client.delete("/saklas/v1/packs/local/custom")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {
+            "namespace": "local",
+            "name": "custom",
+            "source": "local",
+            "removed": 1,
+            "rematerializes_on_restart": False,
+        }
+        # ``yes=True`` is load-bearing — fully-qualified selector still
+        # gets the explicit confirm flag from the route.
+        assert m_un.call_args.kwargs == {"yes": True}
+
+    def test_delete_bundled_carries_rematerialize_hint(
+        self, session_and_client: tuple[SaklasSession, TestClient],
+    ):
+        _, client = session_and_client
+        rows = [
+            ConceptRow(
+                name="happy.sad", namespace="default", status="installed",
+                recommended_alpha=0.5, tags=[], description="",
+                source="bundled", tensor_models=[],
+            ),
+        ]
+        with self._patch_list(rows), patch(
+            "saklas.io.cache_ops.uninstall", return_value=1,
+        ):
+            resp = client.delete("/saklas/v1/packs/default/happy.sad")
+        assert resp.status_code == 200
+        assert resp.json()["rematerializes_on_restart"] is True
+
+    def test_delete_missing_404(
+        self, session_and_client: tuple[SaklasSession, TestClient],
+    ):
+        _, client = session_and_client
+        with self._patch_list([]):
+            resp = client.delete("/saklas/v1/packs/local/nonexistent")
+        assert resp.status_code == 404
+
+    def test_delete_unregisters_from_session(
+        self, session_and_client: tuple[SaklasSession, TestClient],
+    ):
+        """If the concept is currently registered (steering rack), the
+        delete route detaches it first so the engine doesn't keep a
+        stale pointer."""
+        from typing import cast, Any
+        session, client = session_and_client
+        # Cast through ``Any`` — the fixture is typed as the real
+        # SaklasSession for editor help, but the underlying object is
+        # a MagicMock, so attribute writes / mock-call assertions need
+        # the type relaxed.
+        mock_session = cast(Any, session)
+        mock_session.vectors = {"custom": object()}
+        rows = [
+            ConceptRow(
+                name="custom", namespace="local", status="installed",
+                recommended_alpha=0.5, tags=[], description="",
+                source="local", tensor_models=["test__model"],
+            ),
+        ]
+        with self._patch_list(rows), patch(
+            "saklas.io.cache_ops.uninstall", return_value=1,
+        ):
+            resp = client.delete("/saklas/v1/packs/local/custom")
+        assert resp.status_code == 200
+        # ``unsteer`` was called with the canonical name.
+        mock_session.unsteer.assert_any_call("custom")

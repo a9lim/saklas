@@ -260,6 +260,17 @@ export interface InstallPackResponse {
   statements_only: boolean;
 }
 
+export interface DeletePackResponse {
+  namespace: string;
+  name: string;
+  /** ``"bundled"`` / ``"local"`` / ``"hf://..."``.  Drives the
+   *  toast wording — bundled concepts re-materialize on restart. */
+  source: string;
+  removed: number;
+  /** Bundled concepts respawn on next session init. */
+  rematerializes_on_restart: boolean;
+}
+
 // ----------------------------------------------------- traits SSE --
 
 export type TraitsEvent =
@@ -861,8 +872,17 @@ export interface PendingAction {
 
 export type DrawerName =
   | "load"
-  | "vector_picker"
-  | "probe_picker"
+  /** Unified vector management drawer (replaces the legacy
+   *  ``vector_picker`` + ``probe_picker`` pair).  Two sections split
+   *  on the server-supplied ``has_tensor`` flag: extracted rows get
+   *  steer/probe/delete toggles, statements-only rows get
+   *  extract/delete.  Opened from both rack "+ add" buttons. */
+  | "vectors"
+  /** Custom-vector extraction form — reached from the
+   *  "+ custom vector" button at the top of ``vectors``.  Submitting
+   *  closes back to the vectors drawer so the new row appears
+   *  reactively. */
+  | "extract"
   | "save_conversation"
   | "load_conversation"
   | "compare"

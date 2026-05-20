@@ -70,12 +70,21 @@ webui/src/
     loom/{LoomSidebar,LoomNode,LoomEdge}.svelte  # permanent "threads" column
   drawers/
     {Load,SaveConversation,LoadConversation,Compare,SystemPrompt,
-     Help,Export,Pack,Merge,Clone,VectorPicker,ProbePicker,TokenDrilldown,
-     ExperimentLab,ActivationAtlas,RecipeBuilder,AdvancedSampling,Health,
-     SessionAdmin,Correlation,LayerNorms,NodeCompare,Transcript}Drawer.svelte
-    _SearchableConceptList.svelte  # shared categorized catalog for both pickers
+     Help,Export,Pack,Merge,Clone,Vectors,Extract,
+     TokenDrilldown,ExperimentLab,ActivationAtlas,RecipeBuilder,
+     AdvancedSampling,Health,SessionAdmin,Correlation,LayerNorms,
+     NodeCompare,Transcript}Drawer.svelte
     index.ts                  # barrel re-exports for App.svelte's switch
 ```
+
+`VectorsDrawer` is the unified vector management surface — both rack `+ add` buttons (steering and probe) and `RecipeBuilderDrawer`'s "browse…" route here.  It reads `packsState.infos` reactively (populated by `refreshPacks`) and splits into two sections on the server's `LocalPackInfo.has_tensor` flag:
+
+- **Extracted** — packs with a baked tensor for the loaded model.  Per row: `[steer] [probe] [delete]` toggles.  The steer/probe buttons reflect current `vectorRack`/`probeRack.active` state and toggle on click (mutate the corresponding store; no server roundtrip for removal, an extract-with-cache-hit before adding so the session has the profile registered).
+- **Statements only** — packs with `statements.json` + `scenarios.json` but no tensor for this model.  Per row: `[extract] [delete]`.  Extract reuses the cached statements — one-click, no form, drives the same sticky-toast progress flow as ExtractDrawer.  On success, `refreshPacks()` reshuffles the row up into the "Extracted" section without remount.
+
+Delete uses a 2-step confirm — first click flips the button label to `confirm?` for ~3 s, second commits.  No native dialog.
+
+`ExtractDrawer` is the custom-vector form, reached from the `+ custom vector` button at the top of VectorsDrawer.  It takes two concept slots (A required, B optional) plus an advanced-options collapsible (method / SAE / DLS); manual `{positive, negative}` pair text is intentionally not exposed — the server still accepts it via the REST API but the UI confines users to slug-based extraction so the picker is the source of truth.  `params.seed_a` pre-fills concept A from the unmatched search query.  Submission closes the form and reopens VectorsDrawer so the user lands back in the list while the sticky progress toast tracks extraction in the background.
 
 (`lib/stores.ts` is a dead legacy file — not imported anywhere; ignore it.)
 
@@ -100,6 +109,10 @@ The server loom tree is authoritative. The browser keeps a first-paint cache of 
 ## Per-token highlighting
 
 Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match (and match the TUI). Clicking any token opens the `token_drilldown` drawer with the per-layer × per-probe heatmap regardless of whether a highlight probe is selected.
+
+## Toasts
+
+`lib/stores/toasts.svelte.ts` toasts carry `kind`, `message`, optional dim `detail` sub-line, and `ttlMs: number | null` — `null` is sticky (no auto-dismiss; caller owns dismissal).  `updateToast(id, patch)` mutates a live toast in place so long-running async work (extract / clone) can drive a single chip from kickoff to completion without spawning new ones.  `Toaster.svelte` only schedules a dismissal timer the first time it sees a non-null TTL, so flipping sticky → ttl mid-flight is a no-op; callers that want a finite TTL at the end should `dismissToast` + `pushToast` instead.  ExtractDrawer is the canonical user — sticky progress on submit, dismissed and replaced with a 6 s success toast (or sticky error toast) when the SSE `done` / `error` lands.
 
 ## Out of scope
 

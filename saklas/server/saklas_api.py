@@ -684,9 +684,19 @@ def register_saklas_routes(app: FastAPI) -> None:
         Mirrors ``saklas pack ls`` (local-only branch). HF hub query is
         the separate ``GET /saklas/v1/packs/search`` route — keeps the
         common case (UI rack refresh) off the network.
+
+        Each row carries a session-relative ``has_tensor`` flag: ``True``
+        when the pack folder contains a baked tensor for the loaded
+        model (``<safe_model_id>.safetensors``).  The unified webui
+        vectors drawer splits the list on that flag — extracted rows
+        get steer/probe/delete actions, statements-only rows get
+        extract/delete — so the client doesn't have to re-derive the
+        safe-model-id slug.
         """
         from saklas.io.cache_ops import list_concepts as _list_concepts
+        from saklas.io.paths import safe_model_id as _safe_id
         result = _list_concepts(None, hf=False)
+        sid = _safe_id(session.model_id)
         return {
             "packs": [
                 {
@@ -698,6 +708,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                     "description": r.description,
                     "source": r.source,
                     "tensor_models": list(r.tensor_models),
+                    "has_tensor": sid in r.tensor_models,
                     **({"error": r.error} if r.error else {}),
                 }
                 for r in result.installed
@@ -766,6 +777,77 @@ def register_saklas_routes(app: FastAPI) -> None:
             "target": req.target,
             "installed_at": str(dst),
             "statements_only": req.statements_only,
+        }
+
+    @app.delete("/saklas/v1/packs/{namespace}/{name}")
+    async def delete_pack(namespace: str, name: str):
+        """Remove a locally installed pack folder.
+
+        Wraps :func:`saklas.io.cache_ops.uninstall` on the parsed
+        ``<namespace>/<name>`` selector.  Always passes ``yes=True`` —
+        the selector is fully qualified so there's no broad-selector
+        risk, and the webui surfaces its own two-step confirm before
+        calling this.
+
+        If the concept is currently registered on the session
+        (steering rack or active probe), unsteers / deactivates it
+        first so the engine doesn't keep a stale pointer.  Bundled
+        concepts re-materialize on next session init — the response
+        carries ``rematerializes_on_restart: True`` for the source so
+        the client can surface a friendlier toast.
+
+        Returns ``{namespace, name, source, removed, rematerializes_on_restart}``.
+        404 if nothing matched the selector.
+        """
+        from saklas.io.cache_ops import uninstall as _uninstall
+        from saklas.io.selectors import parse as _parse_selector
+        try:
+            selector = _parse_selector(f"{namespace}/{name}")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+        # Capture source before deletion so the response can carry the
+        # rematerializes-on-restart hint.  ``ConceptRow.source`` is the
+        # canonical "bundled" / "local" / "hf://..." string.
+        from saklas.io.cache_ops import list_concepts as _list_concepts
+        rows = _list_concepts(None, hf=False).installed
+        match = next(
+            (r for r in rows if r.namespace == namespace and r.name == name),
+            None,
+        )
+        if match is None:
+            raise HTTPException(404, f"pack '{namespace}/{name}' not installed")
+        source = match.source
+
+        # Detach from the session under the lock — refuses mid-extraction
+        # via the engine's gen-lock guard (mutations during generation
+        # raise; the lock here serializes against streaming requests).
+        async with session.lock:
+            await asyncio.to_thread(
+                lambda: (
+                    session.unsteer(name) if name in session.vectors else None,
+                ),
+            )
+            # ``session.vectors`` is keyed by canonical name; the namespace
+            # form is also worth trying for ns-qualified registrations.
+            qualified = f"{namespace}/{name}"
+            if qualified in session.vectors:
+                await asyncio.to_thread(session.unsteer, qualified)
+            try:
+                count = await asyncio.to_thread(
+                    _uninstall, selector, yes=True,
+                )
+            except RuntimeError as e:
+                raise HTTPException(400, str(e))
+
+        if count == 0:
+            raise HTTPException(404, f"pack '{namespace}/{name}' not installed")
+        return {
+            "namespace": namespace,
+            "name": name,
+            "source": source,
+            "removed": count,
+            "rematerializes_on_restart": source == "bundled",
         }
 
     # ----- sessions collection -------------------------------------------
@@ -1480,31 +1562,115 @@ def register_saklas_routes(app: FastAPI) -> None:
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
             async def _sse():
-                progress_msgs: list[str] = []
+                # Live streaming: the `on_progress` callback fires from
+                # the worker thread (``session.extract`` runs under
+                # ``asyncio.to_thread``), so we hop each message back to
+                # the loop via ``call_soon_threadsafe`` and drain a
+                # queue here.  The previous shape collected messages
+                # into a list and yielded them only after extraction
+                # finished, which made the SSE stream silent for the
+                # whole multi-minute cold path and burst all events in
+                # one tick right before ``done`` — the client never had
+                # time to render them as live progress.
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+
+                def _on_progress(msg: str) -> None:
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait, ("progress", msg),
+                    )
+
                 async with session.lock:
+                    async def _run() -> None:
+                        try:
+                            canonical, profile = await asyncio.to_thread(
+                                session.extract, source, req.baseline,
+                                on_progress=_on_progress,
+                                sae=req.sae,
+                                sae_revision=req.sae_revision,
+                                method=req.method,
+                                dls=req.dls,
+                            )
+                            if req.auto_register:
+                                session.steer(req.name, profile)
+                            # Yield once so any pending
+                            # ``call_soon_threadsafe`` progress
+                            # callbacks scheduled by the worker drain
+                            # into the queue *before* the terminal
+                            # ``done`` lands.  Without this nudge the
+                            # late-burst progress messages can be
+                            # short-circuited by the SSE generator's
+                            # ``done`` break.
+                            await asyncio.sleep(0)
+                            queue.put_nowait(("done", canonical, profile))
+                        except SaklasError as e:
+                            import logging
+                            logging.getLogger("saklas.api").exception(
+                                "extract failed for session=%s", session_id,
+                            )
+                            queue.put_nowait((
+                                "error",
+                                {
+                                    "message": "extract failed",
+                                    "code": type(e).__name__,
+                                },
+                            ))
+                        except Exception as e:  # noqa: BLE001
+                            # Catch-all so a crash in the worker doesn't
+                            # leave the SSE generator blocked forever on
+                            # ``queue.get()``.  Log + send a generic
+                            # error frame; preserve traceback in logs.
+                            import logging
+                            logging.getLogger("saklas.api").exception(
+                                "extract crashed for session=%s", session_id,
+                            )
+                            queue.put_nowait((
+                                "error",
+                                {
+                                    "message": str(e) or "internal error",
+                                    "code": type(e).__name__,
+                                },
+                            ))
+
+                    task = asyncio.create_task(_run())
                     try:
-                        canonical, profile = await asyncio.to_thread(
-                            session.extract, source, req.baseline,
-                            on_progress=progress_msgs.append,
-                            sae=req.sae,
-                            sae_revision=req.sae_revision,
-                            method=req.method,
-                            dls=req.dls,
-                        )
-                    except SaklasError as e:
-                        import logging
-                        logging.getLogger("saklas.api").exception(
-                            "extract failed for session=%s", session_id,
-                        )
-                        err = {"message": "extract failed", "code": type(e).__name__}
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
-                    if req.auto_register:
-                        session.steer(req.name, profile)
-                    for msg in progress_msgs:
-                        yield f"event: progress\ndata: {json.dumps({'message': msg})}\n\n"
-                    body = {"done": True, "profile": _profile_to_json(canonical, profile), "canonical": canonical}
-                    yield f"event: done\ndata: {json.dumps(body)}\n\n"
+                        while True:
+                            item = await queue.get()
+                            kind = item[0]
+                            if kind == "progress":
+                                yield (
+                                    f"event: progress\n"
+                                    f"data: {json.dumps({'message': item[1]})}\n\n"
+                                )
+                            elif kind == "done":
+                                _, canonical, profile = item
+                                body = {
+                                    "done": True,
+                                    "profile": _profile_to_json(canonical, profile),
+                                    "canonical": canonical,
+                                }
+                                yield (
+                                    f"event: done\n"
+                                    f"data: {json.dumps(body)}\n\n"
+                                )
+                                break
+                            elif kind == "error":
+                                yield (
+                                    f"event: error\n"
+                                    f"data: {json.dumps(item[1])}\n\n"
+                                )
+                                break
+                    finally:
+                        # If the client disconnects mid-stream the
+                        # generator gets cancelled here — make sure the
+                        # worker task is not orphaned.  The underlying
+                        # thread can't be stopped, but the future is.
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except BaseException:  # noqa: BLE001
+                                pass
 
             return StreamingResponse(_sse(), media_type="text/event-stream")
 

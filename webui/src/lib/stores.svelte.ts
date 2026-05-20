@@ -36,6 +36,7 @@ import type {
 import type {
   ChatTurn,
   GenStatus,
+  LocalPackInfo,
   PendingAction,
   ProbeRackEntry,
   ProbeSortMode,
@@ -1227,15 +1228,24 @@ function buildSamplingPayload(): WSSampling | null {
 // ============================================================ packs ======
 
 export const packsState: {
+  /** ``ns/name`` strings — kept for the consumers that just want a
+   *  set membership check.  Mirrors ``infos`` and is recomputed by
+   *  ``refreshPacks``. */
   installed: string[];
+  /** Full ``LocalPackInfo`` rows — the unified VectorsDrawer reads
+   *  this reactively so a successful extract / delete reshuffles
+   *  rows between the "Extracted" and "Statements only" sections
+   *  without remount. */
+  infos: LocalPackInfo[];
   loading: boolean;
   error: string | null;
-} = $state({ installed: [], loading: false, error: null });
+} = $state({ installed: [], infos: [], loading: false, error: null });
 
 export async function refreshPacks(): Promise<void> {
   packsState.loading = true;
   try {
     const r = await apiPacks.list();
+    packsState.infos = r.packs;
     packsState.installed = r.packs.map((p) => `${p.namespace}/${p.name}`);
     packsState.error = null;
   } catch (e) {
