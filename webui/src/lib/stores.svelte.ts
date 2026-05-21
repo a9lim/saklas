@@ -1345,15 +1345,46 @@ export function discardPendingActions(): void {
  *
  *  Used by the rack/sampling mutations — they don't kick off a gen, so
  *  ``awaitsGen=false`` lets the drain chain through them without
- *  waiting on the next ``done``. */
+ *  waiting on the next ``done``.
+ *
+ *  Consecutive queued rack mutations *coalesce*: when the queue tail is
+ *  already a rack-mutation item, the fresh ``apply`` is chained onto it
+ *  rather than appended as a new slot, and the bubble's label updates
+ *  to the latest action.  A slider drag that fires 30+ intermediate
+ *  ``setVectorAlpha`` calls mid-gen therefore leaves a single queued
+ *  bubble carrying the net effect — "one final steering adjustment" —
+ *  instead of 30 stacked ghosts.  Coalescing stops at any non-rack
+ *  item (send / commit / one-shot mutation): rack changes before and
+ *  after a queued send form distinct groups so FIFO ordering relative
+ *  to the send is preserved. */
+const RACK_COALESCE_KEY = "rack";
 function enqueueOrApply(label: string, apply: () => void): void {
-  if (genStatus.active || pendingActions.queue.length > 0) {
-    enqueuePending({
-      label, text: null, apply, awaitsGen: false, rebuild: null,
-    });
-  } else {
+  if (!(genStatus.active || pendingActions.queue.length > 0)) {
     apply();
+    return;
   }
+  const q = pendingActions.queue;
+  const tail = q[q.length - 1];
+  if (tail && tail.coalesceKey === RACK_COALESCE_KEY) {
+    // Chain onto the trailing rack bubble.  Reassign the slot so the
+    // $state array fires reactivity for PendingBubbles / the queue
+    // count badge (in-place field writes on a proxied item are tracked,
+    // but reassigning is the uniform pattern used across this module).
+    const prev = tail.apply;
+    q[q.length - 1] = {
+      ...tail,
+      label,
+      apply: async () => {
+        await prev();
+        await apply();
+      },
+    };
+    return;
+  }
+  enqueuePending({
+    label, text: null, apply, awaitsGen: false, rebuild: null,
+    coalesceKey: RACK_COALESCE_KEY,
+  });
 }
 
 /** Are we busy enough that fresh submissions should queue instead of

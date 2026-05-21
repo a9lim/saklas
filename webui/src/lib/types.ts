@@ -866,6 +866,14 @@ export interface PendingAction {
    *  actions that land an assistant or root active node (send, prefill,
    *  commit_assistant, regen, /clear). */
   endsOnUserNode?: boolean | null;
+  /** Coalesce tag for fold-into-tail batching.  When a fresh action
+   *  carries the same ``coalesceKey`` as the *current queue tail*, its
+   *  ``apply`` is chained onto that tail item instead of appending a
+   *  new slot — so a slider drag (dozens of intermediate steering
+   *  values) collapses to a single queued bubble carrying the net
+   *  effect.  Only set on instant rack/steering mutations; ``undefined``
+   *  for sends, commits, and one-shot mutations, which never coalesce. */
+  coalesceKey?: string;
 }
 
 // ----------------------------------------------------- drawers --
