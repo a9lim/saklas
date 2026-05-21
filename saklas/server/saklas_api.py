@@ -1395,16 +1395,21 @@ def register_saklas_routes(app: FastAPI) -> None:
         # Precompute fp32 vectors + norms so the inner loop is a single
         # dot per cell.  ``None`` for near-zero norms — propagates to the
         # cell so the client can render an empty / dimmed square instead
-        # of NaN or a meaningless cosine.
+        # of NaN or a meaningless cosine.  Both sides are forced to CPU
+        # so a cross-device pair (e.g. an actively-steered vector hooked
+        # on MPS vs. a disk-loaded peer on CPU) computes cleanly rather
+        # than raising on the dot — hidden_dim × layer-count is small
+        # enough that the device round-trip is free relative to the
+        # request budget.
         import torch as _torch
         vecs_a: list[tuple["_torch.Tensor", float]] = []
         for L in layers_a:
-            v = prof_a[L].float()
+            v = prof_a[L].float().cpu()
             n = float(v.norm().item())
             vecs_a.append((v, n))
         vecs_b: list[tuple["_torch.Tensor", float]] = []
         for L in layers_b:
-            v = prof_b[L].float()
+            v = prof_b[L].float().cpu()
             n = float(v.norm().item())
             vecs_b.append((v, n))
 
