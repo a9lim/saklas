@@ -60,8 +60,8 @@ class TestSteering:
         assert all(isinstance(k, int) for k in profile)
         session.steer("happy", profile)
         assert "happy" in session.vectors
-        # vectors registry returns the dict-shaped inner wire format.
-        assert isinstance(session.vectors["happy"], dict)
+        # vectors registry speaks Profile, not bare dicts (saklas 1.x → 3.x).
+        assert isinstance(session.vectors["happy"], Profile)
 
     def test_unsteer(self, session):
         session.unsteer("happy")

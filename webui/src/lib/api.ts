@@ -10,6 +10,7 @@ import type {
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
+  DeletePackResponse,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
@@ -49,6 +50,7 @@ export type {
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
+  DeletePackResponse,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
@@ -365,6 +367,21 @@ export const apiPacks = {
   },
   install(req: InstallPackRequest): Promise<InstallPackResponse> {
     return request(PACKS_BASE, jsonBody(req));
+  },
+  /** Remove a locally-installed pack folder.  Wraps the server's
+   *  ``cache_ops.uninstall`` on the ``ns/name`` selector and detaches
+   *  the concept from the session (steering rack / probes) first.
+   *  Bundled concepts re-materialize on next session init — the
+   *  response's ``rematerializes_on_restart`` lets the caller tailor
+   *  the success toast. */
+  delete(
+    namespace: string,
+    name: string,
+  ): Promise<DeletePackResponse> {
+    return request(
+      `${PACKS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
   },
 };
 

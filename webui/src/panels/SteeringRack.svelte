@@ -38,7 +38,7 @@
         <button
           type="button"
           class="add-steering"
-          onclick={() => openDrawer("vector_picker")}
+          onclick={() => openDrawer("vectors")}
         >
           + add steering
         </button>
@@ -55,7 +55,7 @@
       <button
         type="button"
         class="add-steering"
-        onclick={() => openDrawer("vector_picker")}
+        onclick={() => openDrawer("vectors")}
         title="Browse the concept catalog or extract a custom vector"
       >
         + add steering

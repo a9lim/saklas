@@ -319,10 +319,22 @@ class Profile:
                 "cosine_similarity: no shared layers between the two profiles"
             )
 
+        # Cross-device pairs (e.g. an actively-steered profile hooked on
+        # the model device against a disk-loaded peer on CPU) would crash
+        # the dot below; resolve to a common device once and reuse for
+        # both code paths.  CPU is the safe choice — these tensors are
+        # tiny relative to the model and the whitener path moves them
+        # back to its own device internally anyway.
+        def _aligned(a_t: torch.Tensor, b_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            af, bf = a_t.float(), b_t.float()
+            if af.device != bf.device:
+                af, bf = af.cpu(), bf.cpu()
+            return af, bf
+
         if per_layer:
             out: dict[int, float] = {}
             for L in shared:
-                a, b = self._tensors[L].float(), other._tensors[L].float()
+                a, b = _aligned(self._tensors[L], other._tensors[L])
                 if whitener is not None and whitener.covers(L):
                     out[L] = whitener.mahalanobis_cosine(L, a, b)
                 else:
@@ -339,7 +351,7 @@ class Profile:
         num = 0.0
         den = 0.0
         for L in shared:
-            a, b = self._tensors[L].float(), other._tensors[L].float()
+            a, b = _aligned(self._tensors[L], other._tensors[L])
             if whitener is not None and whitener.covers(L):
                 na = whitener.mahalanobis_norm(L, a)
                 nb = whitener.mahalanobis_norm(L, b)

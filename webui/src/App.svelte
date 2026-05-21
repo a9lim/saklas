@@ -36,8 +36,8 @@
   // Content-driven drawer sizing — forms and pickers get a narrow panel,
   // analysis views keep the wide one (docs/plans/webui-overhaul.md §8).
   const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
-    "vector_picker",
-    "probe_picker",
+    "vectors",
+    "extract",
     "load",
     "merge",
     "clone",
@@ -209,10 +209,10 @@
         >
           {#if drawerState.open === "load"}
             <Drawers.Load params={drawerState.params} />
-          {:else if drawerState.open === "vector_picker"}
-            <Drawers.VectorPicker params={drawerState.params} />
-          {:else if drawerState.open === "probe_picker"}
-            <Drawers.ProbePicker params={drawerState.params} />
+          {:else if drawerState.open === "vectors"}
+            <Drawers.Vectors params={drawerState.params} />
+          {:else if drawerState.open === "extract"}
+            <Drawers.Extract params={drawerState.params} />
           {:else if drawerState.open === "save_conversation"}
             <Drawers.SaveConversation params={drawerState.params} />
           {:else if drawerState.open === "load_conversation"}

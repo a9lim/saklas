@@ -31,9 +31,10 @@ Not supported by either compat protocol: tool calling, JSON-schema/structured-ou
 Native `/saklas/v1/*` resource tree, mounted by `register_saklas_routes(app)`. URL paths carry `{session_id}` for a multi-session shape, but the impl is single-session: the one session has id `"default"`, and the loaded model id also resolves to it; everything else 404s.
 
 Packs (top-level, not under a session):
-- `GET /saklas/v1/packs` — locally installed packs as JSON via `cache_ops.list_concepts(None, hf=False)`. Local-only, off the network.
+- `GET /saklas/v1/packs` — locally installed packs as JSON via `cache_ops.list_concepts(None, hf=False)`. Local-only, off the network. Each row carries a session-relative `has_tensor: bool` flag (true iff the pack folder contains `<safe_model_id>.safetensors` for the loaded model) so the webui's unified vectors drawer can split rows into extracted-vs-statements-only without re-deriving the safe-id slug.
 - `GET /saklas/v1/packs/search?q=&limit=` — HF-hub search proxy via `cache_ops.search_remote_packs`; returns structured rows. Missing `huggingface_hub` → 503, HF transport error → 502.
 - `POST /saklas/v1/packs` body `{target, as?, force?, statements_only?}` — wraps `cache_ops.install` in a worker thread. `target` is an HF coord `ns/name[@rev]` or local folder. `InstallConflict` → 409, `ValueError` → 400, missing target → 404.
+- `DELETE /saklas/v1/packs/{namespace}/{name}` — wraps `cache_ops.uninstall` on the parsed selector (always `yes=True` — the fully-qualified path means no broad-selector risk). Under the session lock, detaches the concept from the rack (`session.unsteer`) before removing the folder. Response carries `{namespace, name, source, removed, rematerializes_on_restart}` — `source == "bundled"` flips the rematerialize flag so the client can pick a friendlier toast (bundled concepts respawn on next session init via `materialize_bundled`). 404 when nothing matched the selector, 409 when an in-flight extract holds the gen-lock.
 
 Sessions:
 - `GET/POST /saklas/v1/sessions` — list / idempotent create (POST body accepted; a model mismatch warns and returns the existing session).
