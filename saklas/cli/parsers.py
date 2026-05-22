@@ -465,8 +465,9 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         "fit",
         help="Fit a manifold for a model from an authored corpus folder",
         description=(
-            "Pool per-node centroids, fit a per-layer PCA subspace + cubic "
-            "spline, and write the per-model manifold tensor into the folder."
+            "Pool per-node centroids, fit a per-layer PCA subspace + RBF "
+            "interpolant, and write the per-model manifold tensor into the "
+            "folder."
         ),
     )
     fit.add_argument("folder", help="Path to an authored manifold folder")
@@ -492,7 +493,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
 
     show = sub.add_parser(
         "show", help="Show a manifold's nodes and fitted models",
-        description="Print one manifold's node order, cyclic flag, and "
+        description="Print one manifold's domain, node coordinates, and "
                     "per-model fitted tensors.",
     )
     show.add_argument("name", help="Manifold name (or ns/name)")

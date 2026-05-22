@@ -1433,6 +1433,20 @@ def _run_transfer(args: argparse.Namespace) -> None:
     )
 
 
+def _domain_label(spec: dict) -> str:
+    """Short ``type(Nd)`` label for a manifold domain spec dict."""
+    kind = spec.get("type", "?")
+    if kind == "box":
+        n = len(spec.get("axes", []))
+    elif kind == "sphere":
+        n = int(spec.get("dim", 0))
+    elif kind == "custom":
+        n = int(spec.get("embed_dim", 0))
+    else:
+        n = 0
+    return f"{kind}({n}d)"
+
+
 def _run_manifold_fit(args: argparse.Namespace) -> None:
     _require_model(args)
     folder = Path(args.folder)
@@ -1457,7 +1471,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     print(
         f"fitted manifold '{manifold.name}' "
         f"({len(manifold.layers)} layers, {len(manifold.node_labels)} nodes, "
-        f"{'cyclic' if manifold.cyclic else 'sequential'}, "
+        f"{_domain_label(manifold.domain.to_spec())}, "
         f"{manifold.feature_space})"
     )
 
@@ -1493,7 +1507,7 @@ def _run_manifold_ls(args: argparse.Namespace) -> None:
             {
                 "namespace": ns,
                 "name": mf.name,
-                "cyclic": mf.cyclic,
+                "domain": mf.domain,
                 "nodes": mf.node_labels,
                 "fitted_models": mf.tensor_models(),
             }
@@ -1504,7 +1518,7 @@ def _run_manifold_ls(args: argparse.Namespace) -> None:
         print("no manifolds installed under ~/.saklas/manifolds/")
         return
     for ns, mf in rows:
-        kind = "cyclic" if mf.cyclic else "sequential"
+        kind = _domain_label(mf.domain)
         models = ", ".join(mf.tensor_models()) or "(unfitted)"
         print(
             f"  {ns}/{mf.name}  [{kind}, {len(mf.node_labels)} nodes]  {models}"
@@ -1549,16 +1563,22 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
             "namespace": ns,
             "name": mf.name,
             "description": mf.description,
-            "cyclic": mf.cyclic,
-            "nodes": mf.node_labels,
+            "domain": mf.domain,
+            "nodes": [
+                {"label": label, "coords": coords}
+                for label, coords in zip(mf.node_labels, mf.node_coords)
+            ],
             "fitted": fitted,
         }, indent=2))
         return
     print(f"{ns}/{mf.name}")
     if mf.description:
         print(f"  {mf.description}")
-    print(f"  kind:   {'cyclic' if mf.cyclic else 'sequential'}")
-    print(f"  nodes:  {' -> '.join(mf.node_labels)}")
+    print(f"  domain: {_domain_label(mf.domain)}")
+    print("  nodes:")
+    for label, coords in zip(mf.node_labels, mf.node_coords):
+        coord_str = ", ".join(f"{c:g}" for c in coords)
+        print(f"    {label}  ({coord_str})")
     if fitted:
         print("  fitted models:")
         for f in fitted:
@@ -1650,6 +1670,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
     from saklas.core.manifold import (
         compute_node_behavior_centroid,
         compute_trajectory_distributions,
+        domain_from_spec,
         fit_behavior_manifold,
         trajectory_naturalness,
     )
@@ -1668,6 +1689,10 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         sys.exit(2)
     mf = ManifoldFolder.load(mfolder)
     node_groups = mf.node_groups()
+    domain = domain_from_spec(mf.domain)
+    node_params = domain.embed(
+        torch.tensor(mf.node_coords, dtype=torch.float32)
+    )
 
     _print_startup(args)
     session = _make_session(args)
@@ -1682,9 +1707,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         )
         for _label, statements in node_groups
     ]
-    behavior = fit_behavior_manifold(
-        torch.stack(centroids), cyclic=mf.cyclic,
-    )
+    behavior = fit_behavior_manifold(torch.stack(centroids), node_params)
 
     sampling = SamplingConfig(max_tokens=args.max_tokens, seed=0)
 
@@ -1696,7 +1719,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         traj = compute_trajectory_distributions(
             session.model, session.tokenizer, session.device, text,
         )
-        per_step = trajectory_naturalness(traj, behavior)
+        per_step = trajectory_naturalness(traj, behavior, domain)
         return text, float(per_step.mean()), float(per_step.max())
 
     rows: list[dict] = []
@@ -1722,19 +1745,25 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         mt = mterms[0]
         session._ensure_manifold_loaded(mt.manifold)
         act_manifold = session._manifolds[mt.manifold]
-        # Linear baseline: the straight chord from the curve start to the
-        # term's position, per layer — what plain additive steering would
-        # do instead of following the spline.
+        # Linear baseline: the straight chord through activation space
+        # from the manifold point at node 0 to the term's position, per
+        # layer — what plain additive steering would do instead of
+        # following the manifold's curvature.
+        origin = act_manifold.node_coords[0]
         chord = {
-            L: sub.spline_point(mt.position) - sub.spline_point(0.0)
-            for L, sub in act_manifold.layers.items()
+            L: (
+                act_manifold.manifold_point(L, mt.position)
+                - act_manifold.manifold_point(L, origin)
+            )
+            for L in act_manifold.layer_indices
         }
         session.steer("__manifold_linear_baseline__", Profile(chord))
         _ltext, lmean, lmax = _score(
             f"{mt.coeff:g} __manifold_linear_baseline__"
         )
+        pos_label = ",".join(f"{c:g}" for c in mt.position)
         rows.append({
-            "label": "linear-chord", "steering": f"chord@t={mt.position:g}",
+            "label": "linear-chord", "steering": f"chord@{pos_label}",
             "mean_bhattacharyya": lmean, "max_bhattacharyya": lmax,
         })
 

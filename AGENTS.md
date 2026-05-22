@@ -4,7 +4,7 @@
 
 `saklas` is a Python library + Textual TUI + dual-protocol HTTP server for activation steering and trait monitoring on HuggingFace causal LMs. It runs OpenAI `/v1/*` and Ollama `/api/*` on one port, plus a native `/saklas/v1/*` API and a Svelte dashboard at `/`. Steering vectors come from representation engineering: difference-of-means by default, contrastive PCA via `--method pca` for legacy parity. Injection is angular (rotation toward the concept direction) by default, additive available via `--steer-mode additive`. Per-call alpha, no model mutation. Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve` (HTTP), `saklas tui` (TUI).
 
-Version lives in `saklas/__init__.py` as `__version__` (currently 3.1.0). `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there is one place to bump. Do not bump it as part of feature work — version bumps are user-owned.
+Version lives in `saklas/__init__.py` as `__version__` (currently 3.2.0). `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there is one place to bump. Do not bump it as part of feature work — version bumps are user-owned.
 
 Releases: merge a version bump to `main` → `.github/workflows/release.yml` tags `v$VERSION`, builds, publishes via trusted publishing, and cuts a GitHub release. A push without a bump is a no-op.
 
@@ -43,7 +43,7 @@ saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S]
 saklas vector compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]
 saklas vector why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
 saklas vector transfer <concept> --from SRC --to TGT [-f]   # cross-model Procrustes transfer
-saklas vector manifold fit <folder> [-m MODEL] [--sae REL]  # fit a spline steering manifold
+saklas vector manifold fit <folder> [-m MODEL] [--sae REL]  # fit an RBF steering manifold
 saklas vector manifold ls|show [name]                       # list / inspect manifolds
 saklas experiment fan <model> "<prompt>" -g concept=0,0.5,1 # alpha grid as loom siblings
 saklas experiment transcript run <path.yaml> [model]        # replay a saved transcript
@@ -70,7 +70,8 @@ Every input surface — Python, YAML, HTTP, TUI, `vector merge` — speaks the g
 ```
 expr        := term (("+" | "-") term)*
 term        := [coeff "*"?] ["!"] selector ["@" trigger]
-selector    := atom (("~" | "|") atom | "%" NUM)?
+selector    := atom (("~" | "|") atom | "%" coord_list)?
+coord_list  := signed_num ("," signed_num)*
 atom        := [ns "/"] NAME ["." NAME] [":" variant]
 trigger     := preset | gate
 preset      := before | after | both | thinking | response | prompt | generated
@@ -79,7 +80,7 @@ gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
 
 `+`/`-` add terms, `*` attaches a coefficient (omit → 0.5 additive / 1.0 ablation), `~` projects onto a direction (keep the shared component), `|` projects orthogonal (remove it), `!` mean-ablates the concept (`h' = h − α(h·d̂ − μ·d̂)d̂`; bare `!x` is α=1.0). `@<preset>` overrides a term's trigger; `@when:<probe><op><num>` is a probe gate that fires only on decode steps where the monitor reading satisfies the comparison (implicit `prompt=False`). `!` cannot compose with `~`/`|`. Compound triggers (`@after&when:…`) are programmatic-only — build the `Trigger` directly.
 
-`%` is the manifold operator: `<manifold> % <t>` places a generation at position `t ∈ [0,1]` along a fitted steering manifold (e.g. `0.7 emotions%0.5@response`). The coefficient is the blend fraction; the injection is a soft subspace-replace (`core/manifold.py::subspace_replace`) — at position `t` the spline gives a target point and the running activation's projection onto the manifold's PCA subspace is blended toward it, residual kept. A `%` term produces a `ManifoldTerm`, doesn't compose with `~`/`|`/`!`, and forces the slow hook path (no `torch.compile`/StaticCache). Only one manifold per layer; overlapping manifolds raise. See "Manifold steering" below.
+`%` is the manifold operator: `<manifold> % <coord_list>` places a generation at a point of a fitted steering manifold (e.g. `0.7 circumplex%0.3,0.8@response`). The RHS is a comma-separated list of authoring coordinates — one per intrinsic dimension of the manifold's domain; the parser only collects the tuple, arity and range are validated at manifold-load time when the domain is known. The coefficient is the blend fraction; the injection is a soft subspace-replace (`core/manifold.py::subspace_replace`) — the RBF interpolant gives a target point at that position and the running activation's projection onto the manifold's PCA subspace is blended toward it, residual kept. A `%` term produces a `ManifoldTerm`, doesn't compose with `~`/`|`/`!`, and forces the slow hook path (no `torch.compile`/StaticCache). Only one manifold per layer; overlapping manifolds raise. See "Manifold steering" below.
 
 ## Extraction
 
@@ -102,13 +103,15 @@ Per session via `SaklasSession.from_pretrained(injection_mode=..., theta_max=...
 
 ## Manifold steering
 
-Spline-based manifold steering (Goodfire, arXiv 2605.05115): instead of a single linear direction, fit a cubic spline through per-concept activation *centroids* in a low-dim PCA subspace, then steer by moving the running activation's in-subspace component onto a point of that curve. A straight A→B vector cuts through low-density off-manifold regions; the spline stays on the learned manifold.
+Manifold steering (Goodfire, arXiv 2605.05115): instead of a single linear direction, fit an interpolant through per-concept activation *centroids* in a low-dim PCA subspace, then steer by moving the running activation's in-subspace component onto a point of that manifold. A straight A→B vector cuts through low-density off-manifold regions; the manifold stays on the learned surface.
 
-A manifold is its own artifact type — an ordered (optionally cyclic) set of labeled nodes, each a small statement corpus, under `~/.saklas/manifolds/<ns>/<name>/` (not a `ConceptFolder`). The user authors `manifold.json` + `nodes/*.json`; `saklas vector manifold fit` runs `ManifoldExtractionPipeline` (`core/extraction.py`): pool each node's mean activation (`compute_node_centroid`), fit a per-layer PCA subspace + cubic spline (`fit_layer_subspace`), write the per-model tensor. `--sae <release>` reconstructs each centroid through the SAE before the fit (denoised centroids); the fitted subspace is always model-space so the hook never touches the SAE.
+A manifold has arbitrary intrinsic dimension and topology. Its geometry is a `ManifoldDomain` — an embedding of an n-dimensional intrinsic manifold into R^m plus a distance function. `BoxDomain` (per-axis open or periodic) covers Euclidean boxes/disks, cylinders, n-tori; `SphereDomain` covers S^n (chordal metric); `CustomDomain` is the explicit-immersion escape hatch for non-orientable surfaces (Möbius/Klein, at chordal fidelity). The per-layer interpolant is one `r³` polyharmonic RBF with an affine polynomial term, valid in every dimension — at n=1 over an open axis it reproduces the natural cubic spline exactly, so the module subsumes the former cubic machinery.
 
-All manifold math lives in `core/manifold.py` — pure-tensor, fp32, dependency-free (the cubic-spline solves use dense `torch.linalg.solve`; scipy is not pulled in, thin-plate splines are out of scope). `eval_cubic` and `subspace_replace` are the only hot-path-reachable functions. Natural cubic splines for sequential manifolds, periodic for cyclic ones.
+A manifold is its own artifact type — labeled nodes placed at authoring coordinates on a domain, each node a small statement corpus, under `~/.saklas/manifolds/<ns>/<name>/` (not a `ConceptFolder`). The user authors `manifold.json` (domain spec + per-node `{label, coords}`) + `nodes/*.json`; `saklas vector manifold fit` runs `ManifoldExtractionPipeline` (`core/extraction.py`): pool each node's mean activation (`compute_node_centroid`), embed the authoring coords through the domain, fit a per-layer PCA subspace + RBF (`fit_layer_subspace`), write the per-model tensor. `--sae <release>` reconstructs each centroid through the SAE before the fit (denoised centroids); the fitted subspace is always model-space so the hook never touches the SAE. Minimum node count is `min_nodes(n) = 2n+1`; the nodes must also be *poised* (affinely span the embedding) or `fit_rbf_interpolant` raises.
 
-Injection (`core/hooks.py`): a `ManifoldTerm` forces the slow hook path; `subspace_replace` decomposes `h = h_par + h_perp` (in-subspace + orthogonal residual), blends `h_par` toward the precomputed spline target by the coefficient, keeps the residual, restores the original norm. It runs *last* in `hook_fn`, after ablation and additive — the in-subspace overwrite is destructive, so it dominates at the layers it covers. The session loads the `Manifold` artifact lazily on scope entry (`_ensure_manifold_loaded`) and dispatches `ManifoldTerm` to `SteeringManager.add_manifold`.
+All manifold math lives in `core/manifold.py` — pure-tensor, fp32, dependency-free (the RBF fit solves a small dense symmetric-indefinite saddle system with `torch.linalg.solve` — never Cholesky; scipy is not pulled in). `eval_rbf` and `subspace_replace` are the only hot-path-reachable functions. `Manifold.tangent(layer, position)` returns the per-axis steering directions (the analytic RBF Jacobian) — e.g. the local valence/arousal directions of an affect manifold.
+
+Injection (`core/hooks.py`): a `ManifoldTerm` forces the slow hook path; `subspace_replace` decomposes `h = h_par + h_perp` (in-subspace + orthogonal residual), blends `h_par` toward the precomputed manifold target by the coefficient, keeps the residual, restores the original norm. It runs *last* in `hook_fn`, after ablation and additive — the in-subspace overwrite is destructive, so it dominates at the layers it covers. The session loads the `Manifold` artifact lazily on scope entry (`_ensure_manifold_loaded`) and dispatches `ManifoldTerm` to `SteeringManager.add_manifold`, which validates the position arity against the domain.
 
 The naturalness eval (`saklas experiment naturalness`) is the paper's validation half: fit a *behavior-space* manifold over node-corpus output distributions mapped to Hellinger space (`p ↦ √p`), generate, re-run the model over the generated text to recover its behavioral trajectory, and report the per-step Bhattacharyya distance of that trajectory to the behavior manifold — low is natural, high flags off-manifold "teleportation". `--compare-linear` scores a straight-chord additive baseline alongside.
 
@@ -160,9 +163,9 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
     neutral_activations.{safetensors,json}   # 90 neutral prompts × layers, fp16
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
   manifolds/<ns>/<name>/               # steering manifolds (own root, peer of vectors/)
-    manifold.json                      # name, cyclic flag, ordered node labels, files{sha256}
+    manifold.json                      # name, domain spec, nodes [{label,coords}], files{sha256}
     nodes/NN_<label>.json              # one JSON statement list per node (user-editable)
-    <safe_model_id>.safetensors        # fitted per-layer PCA + spline (+ .json sidecar)
+    <safe_model_id>.safetensors        # fitted per-layer PCA + RBF (+ .json sidecar)
   conversations/<name>.json            # explicit loom-tree saves (no autosave)
 ```
 

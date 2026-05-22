@@ -640,7 +640,7 @@ class ExtractionPipeline:
 
 
 class ManifoldExtractionPipeline:
-    """Fit a spline-based steering manifold from an authored corpus.
+    """Fit an RBF-based steering manifold from an authored corpus.
 
     Distinct from :class:`ExtractionPipeline` — manifold extraction has a
     fundamentally different input (N labeled node groups, no contrastive
@@ -649,7 +649,7 @@ class ManifoldExtractionPipeline:
     protocol (it needs ``model`` / ``tokenizer`` / ``layers`` / ``device``
     / ``model_id``) and emits :class:`ManifoldExtracted`.
 
-    Feature space: ``sae=None`` fits per-layer PCA + spline directly on
+    Feature space: ``sae=None`` fits per-layer PCA + RBF directly on
     residual-stream centroids.  ``sae="<release>"`` reconstructs each
     centroid through the SAE (encode then decode) before the fit — a
     denoised, sparse-feature-supported centroid — and restricts the
@@ -682,6 +682,7 @@ class ManifoldExtractionPipeline:
         from saklas.core.manifold import (
             Manifold,
             compute_node_centroid,
+            domain_from_spec,
             fit_layer_subspace,
             load_manifold,
             save_manifold,
@@ -695,6 +696,11 @@ class ManifoldExtractionPipeline:
         mf = ManifoldFolder.load(pathlib.Path(folder))
         node_groups = mf.node_groups()
         nodes_sha = mf.nodes_sha256()
+        domain = domain_from_spec(mf.domain)
+        # Embed the authoring coordinates once; every per-layer fit
+        # interpolates from the same embedded node positions.
+        node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
+        node_params = domain.embed(node_coords)
 
         # Resolve the SAE backend once (lazy import — non-SAE callers
         # never touch the SAE layer).
@@ -721,10 +727,10 @@ class ManifoldExtractionPipeline:
         )
 
         # Cache hit: tensor present + every fit-affecting input unchanged.
-        # ``nodes_sha256`` covers the corpus; ``cyclic`` selects the spline
-        # system (periodic vs natural) and ``sae_revision`` the SAE the
-        # centroids are reconstructed through — neither rides the
-        # filename, so both are checked here or a stale tensor is served.
+        # ``nodes_sha256`` already folds in the corpus, the domain spec
+        # and the node coordinates; ``sae_revision`` is the SAE the
+        # centroids are reconstructed through and does not ride the
+        # filename, so it is checked here or a stale tensor is served.
         sidecar_path = tensor_path.with_suffix(".json")
         cached_revision = (
             sae_backend.revision if sae_backend is not None else None
@@ -737,7 +743,6 @@ class ManifoldExtractionPipeline:
             if (
                 sc is not None
                 and sc.nodes_sha256 == nodes_sha
-                and sc.cyclic == mf.cyclic
                 and sc.sae_revision == cached_revision
             ):
                 _progress(f"Loaded cached manifold '{mf.name}'.")
@@ -783,7 +788,7 @@ class ManifoldExtractionPipeline:
 
         # 3. Per-layer fit.  Stack centroids -> (K, D); for the SAE
         #    variant reconstruct through the SAE before fitting.
-        _progress(f"Fitting splines across {len(fit_layers)} layers...")
+        _progress(f"Fitting RBF interpolant across {len(fit_layers)} layers...")
         layer_subs = {}
         for idx in fit_layers:
             stacked = torch.stack(
@@ -794,12 +799,13 @@ class ManifoldExtractionPipeline:
                     feat = sae_backend.encode_layer(idx, stacked.to(device))
                     recon = sae_backend.decode_layer(idx, feat)
                 stacked = recon.detach().to("cpu", torch.float32)
-            layer_subs[idx] = fit_layer_subspace(stacked, cyclic=mf.cyclic)
+            layer_subs[idx] = fit_layer_subspace(stacked, node_params)
 
         manifold = Manifold(
             name=mf.name,
-            cyclic=mf.cyclic,
+            domain=domain,
             node_labels=[label for label, _ in node_groups],
+            node_coords=node_coords,
             layers=layer_subs,
             feature_space=feature_space,
         )

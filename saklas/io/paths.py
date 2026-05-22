@@ -78,7 +78,7 @@ def manifolds_dir() -> Path:
     """Root of the manifold-steering artifact tree.
 
     Parallel to :func:`vectors_dir` — a manifold is its own artifact kind
-    (an ordered, optionally cyclic set of labeled nodes), not a concept
+    (labeled nodes placed on an n-dimensional domain), not a concept
     folder, so it lives under its own root.
     """
     return saklas_home() / "manifolds"

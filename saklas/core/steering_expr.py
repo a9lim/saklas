@@ -39,10 +39,13 @@ user-supplied coefficient before the term lands in
 values; the session materializes them into derived profiles on scope
 entry.
 
-Manifold steering (v3.2): the ``%`` infix operator places a generation at
-position ``t`` along a fitted manifold — ``manifold % t``, e.g.
-``0.7 emotions%0.5@response``.  The left operand is a manifold name (not a
-concept; no pole resolution), the right is a float in ``[0, 1]``.  A ``%``
+Manifold steering: the ``%`` infix operator places a generation at a
+point of a fitted manifold — ``manifold % coord_list``, e.g.
+``0.7 circumplex%0.3,0.8@response``.  The left operand is a manifold name
+(not a concept; no pole resolution), the right is a comma-separated list
+of authoring coordinates — one per intrinsic dimension of the manifold's
+domain.  The parser only collects the coordinate tuple; arity and range
+are validated at manifold-load time, when the domain is known.  A ``%``
 selector does not compose with the ``~`` / ``|`` projection operators or
 with ``!`` ablation.  Manifold terms produce :class:`ManifoldTerm` values;
 the session loads the manifold artifact and the hook does a soft
@@ -139,24 +142,25 @@ class AblationTerm:
 class ManifoldTerm:
     """Soft subspace-replace entry in ``Steering.alphas``.
 
-    Produced by a ``manifold % position`` term.  The session loads the
+    Produced by a ``manifold % coord_list`` term.  The session loads the
     named :class:`~saklas.core.manifold.Manifold` artifact on scope entry
-    and hands the hook a per-layer subspace plus the spline point at
+    and hands the hook a per-layer subspace plus the manifold point at
     ``position``; the hook blends the running activation's in-subspace
     component toward that point by ``coeff``.  Stored as a value inside
-    ``Steering.alphas`` under the key ``"<manifold>%<position>"`` so two
+    ``Steering.alphas`` under the key ``"<manifold>%<coords>"`` so two
     positions on the same manifold compose as distinct entries and never
     collide with plain / projected / ablation keys.
 
     ``coeff`` is the blend fraction (clamped to ``[0, 1]`` at apply
-    time); ``position`` is the curve parameter ``t`` in ``[0, 1]``.
-    ``manifold`` is the registry key — namespace-qualified when the user
-    typed a namespace, variant-suffixed when not ``raw``.
+    time); ``position`` is the tuple of authoring coordinates — one per
+    intrinsic dimension of the manifold's domain.  ``manifold`` is the
+    registry key — namespace-qualified when the user typed a namespace,
+    variant-suffixed when not ``raw``.
     """
     coeff: float
     trigger: Trigger
     manifold: str
-    position: float
+    position: tuple[float, ...]
 
 
 class SteeringExprError(ValueError, SaklasError):
@@ -181,7 +185,7 @@ _IDENT_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
 _SINGLE_CHAR_TOKENS = {
     ".": "DOT", "/": "SLASH", ":": "COLON", "*": "STAR",
     "+": "PLUS", "-": "MINUS", "@": "AT", "~": "TILDE",
-    "|": "ORTHO", "!": "BANG", "%": "PERCENT",
+    "|": "ORTHO", "!": "BANG", "%": "PERCENT", ",": "COMMA",
 }
 
 # Comparison-op tokens.  Two-char ops (``>=``, ``<=``) take precedence
@@ -283,9 +287,10 @@ class _Selector:
     base: _Atom
     operator: Optional[str]  # None | '~' | '|'
     onto: Optional[_Atom]
-    # Set when the selector is a manifold position term (``base % NUM``);
-    # mutually exclusive with ``operator`` / ``onto``.
-    manifold_position: Optional[float] = None
+    # Set when the selector is a manifold position term
+    # (``base % NUM (, NUM)*``); mutually exclusive with
+    # ``operator`` / ``onto``.
+    manifold_position: Optional[tuple[float, ...]] = None
 
 
 @dataclass
@@ -432,8 +437,12 @@ class _Parser:
             )
         op_str = {"GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="}[op_kind]
         # Allow a leading ``-`` on the threshold so ``@when:x>-0.5``
-        # parses as ``threshold = -0.5``.  Comparison-op token already
-        # consumed; the next token may be MINUS or NUM.
+        # parses as ``threshold = -0.5``.
+        threshold = self._signed_num()
+        return Trigger.when(probe, op_str, threshold)  # type: ignore[arg-type]
+
+    def _signed_num(self) -> float:
+        """Parse an optionally signed numeric literal: ``[+|-] NUM``."""
         sign = +1.0
         if self._peek().kind == "MINUS":
             self._consume()
@@ -441,21 +450,20 @@ class _Parser:
         elif self._peek().kind == "PLUS":
             self._consume()
         num_tok = self._expect("NUM")
-        threshold = sign * float(num_tok.value)
-        return Trigger.when(probe, op_str, threshold)  # type: ignore[arg-type]
+        return sign * float(num_tok.value)
 
     def _selector(self) -> _Selector:
         base = self._atom()
         if self._peek().kind == "PERCENT":
-            # Manifold position term: ``base % NUM``.
+            # Manifold position term: ``base % NUM (, NUM)*``.  The
+            # parser only collects the coordinate tuple — arity (against
+            # the domain's intrinsic dimension) and range are checked at
+            # manifold-load time, when the domain is known.
             self._consume()
-            num_tok = self._expect("NUM")
-            pos = float(num_tok.value)
-            if not (0.0 <= pos <= 1.0):
-                raise SteeringExprError(
-                    f"manifold position must be in [0, 1], got {pos:g}",
-                    col=num_tok.col,
-                )
+            coords: list[float] = [self._signed_num()]
+            while self._peek().kind == "COMMA":
+                self._consume()
+                coords.append(self._signed_num())
             if self._peek().kind in ("TILDE", "ORTHO", "PERCENT"):
                 raise SteeringExprError(
                     "a manifold position does not compose with projection "
@@ -463,7 +471,8 @@ class _Parser:
                     col=self._peek().col,
                 )
             return _Selector(
-                base=base, operator=None, onto=None, manifold_position=pos,
+                base=base, operator=None, onto=None,
+                manifold_position=tuple(coords),
             )
         if self._peek().kind in ("TILDE", "ORTHO"):
             op_tok = self._consume()
@@ -645,14 +654,19 @@ def _resolve_manifold_atom(atom: _Atom) -> str:
     return _with_variant(key, atom.variant)
 
 
+def _fmt_coords(position: tuple[float, ...]) -> str:
+    """Render a manifold coordinate tuple as a comma-joined ``%g`` list."""
+    return ",".join(f"{c:g}" for c in position)
+
+
 def _merge_manifold(
     alphas: "dict[str, AlphaEntry]",
     manifold: str,
     coeff: float,
-    position: float,
+    position: tuple[float, ...],
     trig: Trigger,
 ) -> None:
-    key = f"{manifold}%{position:g}"
+    key = f"{manifold}%{_fmt_coords(position)}"
     if key not in alphas:
         alphas[key] = ManifoldTerm(
             coeff=coeff, trigger=trig, manifold=manifold, position=position,
@@ -665,7 +679,7 @@ def _merge_manifold(
         )
     if existing.trigger != trig:
         raise SteeringExprError(
-            f"manifold '{manifold}%{position:g}' appears with conflicting "
+            f"manifold '{key}' appears with conflicting "
             f"triggers; merge triggers explicitly or split into separate "
             f"Steering entries"
         )
@@ -814,7 +828,7 @@ def _fmt_ablation(a: AblationTerm) -> str:
 
 
 def _fmt_manifold(m: ManifoldTerm) -> str:
-    body = f"{m.coeff:g} {m.manifold}%{m.position:g}"
+    body = f"{m.coeff:g} {m.manifold}%{_fmt_coords(m.position)}"
     if m.trigger != Trigger.BOTH:
         body += "@" + _trigger_name(m.trigger)
     return body

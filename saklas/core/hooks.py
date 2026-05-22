@@ -765,22 +765,32 @@ class SteeringManager:
         self,
         name: str,
         manifold: object,
-        position: float,
+        position: tuple[float, ...],
         alpha: float,
         trigger: Trigger = Trigger.BOTH,
     ) -> None:
         """Register a manifold-steering term.
 
         At ``apply_to_model`` time, for every layer the manifold covers,
-        the spline point at ``position`` is precomputed and a per-layer
+        the manifold point at ``position`` is precomputed and a per-layer
         ``(basis, mean, target, alpha, trigger)`` entry is attached to the
-        corresponding :class:`SteeringHook`.  ``alpha`` is the blend
-        fraction (clamped to ``[0, 1]``); no ``_STEER_GAIN`` applies — it
-        is a fraction, not an additive push.
+        corresponding :class:`SteeringHook`.  ``position`` is the tuple of
+        authoring coordinates; its arity is validated here against the
+        manifold's domain (the grammar cannot — it does not know the
+        domain).  ``alpha`` is the blend fraction (clamped to ``[0, 1]``);
+        no ``_STEER_GAIN`` applies — it is a fraction, not an additive push.
         """
+        domain = getattr(manifold, "domain", None)
+        if domain is not None and len(position) != domain.intrinsic_dim:
+            from saklas.core.steering_expr import SteeringExprError
+            raise SteeringExprError(
+                f"manifold {name!r} has a {domain.intrinsic_dim}-dimensional "
+                f"domain but the steering position has {len(position)} "
+                f"coordinate(s)"
+            )
         self.manifolds[name] = {
             "manifold": manifold,
-            "position": float(position),
+            "position": tuple(float(c) for c in position),
             "alpha": alpha,
             "trigger": trigger,
         }
@@ -875,8 +885,8 @@ class SteeringManager:
                     (vec, means[layer_idx], alpha, trigger),
                 )
 
-        # Manifold entries: precompute the spline target per layer once.
-        # ``t`` is fixed for the whole generation, so the spline eval
+        # Manifold entries: precompute the manifold target per layer once.
+        # ``position`` is fixed for the whole generation, so the RBF eval
         # never reaches the hot path.  Only one manifold may cover a
         # given layer — two would each destructively overwrite the
         # in-subspace component, so their composition is ill-defined.
@@ -899,7 +909,7 @@ class SteeringManager:
                         f"steering allows only one manifold per layer"
                     )
                 manifold_owner[layer_idx] = mname
-                target = sub.spline_point(position)
+                target = manifold.manifold_point(layer_idx, position)
                 manifold_by_layer.setdefault(layer_idx, []).append(
                     (sub.basis, sub.mean, target, alpha, trigger),
                 )

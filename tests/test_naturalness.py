@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import torch
 
 from saklas.core.manifold import (
+    BoxAxis,
+    BoxDomain,
     bhattacharyya_distance,
     compute_node_behavior_centroid,
     compute_trajectory_distributions,
@@ -26,6 +28,13 @@ def _curve_dists(k: int, v: int) -> torch.Tensor:
         logits[1] = 3.0 * math.sin(theta)
         dists[i] = torch.softmax(logits, dim=-1)
     return dists
+
+
+def _loop_domain(k: int) -> tuple[BoxDomain, torch.Tensor, torch.Tensor]:
+    """A 1-D periodic domain over K nodes; returns (domain, coords, params)."""
+    domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
+    coords = torch.tensor([[i / k] for i in range(k)])
+    return domain, coords, domain.embed(coords)
 
 
 # --------------------------------------------------------------- metrics ---
@@ -65,31 +74,32 @@ def test_bhattacharyya_batched():
 
 def test_fit_behavior_manifold_interpolates_nodes():
     dists = _curve_dists(8, 32)
-    behavior = fit_behavior_manifold(dists, cyclic=True)
-    # The fitted spline passes through the Hellinger-mapped centroids.
-    from saklas.core.manifold import eval_cubic
-    got = eval_cubic(
-        behavior.t_knots, behavior.coords, behavior.spline_M, behavior.t_knots,
-    )
-    assert torch.allclose(got, behavior.coords, atol=1e-4)
+    domain, coords, params = _loop_domain(8)
+    behavior = fit_behavior_manifold(dists, params)
+    # The fitted RBF passes through the Hellinger-mapped centroids.
+    for i in range(8):
+        got = behavior.eval_at(domain.embed(coords[i]))
+        assert torch.allclose(got, to_hellinger(dists[i]), atol=1e-3)
 
 
 def test_on_manifold_trajectory_scores_low():
     dists = _curve_dists(8, 32)
-    behavior = fit_behavior_manifold(dists, cyclic=True)
+    domain, _coords, params = _loop_domain(8)
+    behavior = fit_behavior_manifold(dists, params)
     # A trajectory made of the node centroids sits exactly on the curve.
-    on_manifold = trajectory_naturalness(dists, behavior)
+    on_manifold = trajectory_naturalness(dists, behavior, domain)
     assert torch.all(on_manifold < 1e-2)
 
 
 def test_off_manifold_trajectory_scores_higher():
     torch.manual_seed(0)
     dists = _curve_dists(8, 32)
-    behavior = fit_behavior_manifold(dists, cyclic=True)
-    on_manifold = trajectory_naturalness(dists, behavior).mean()
+    domain, _coords, params = _loop_domain(8)
+    behavior = fit_behavior_manifold(dists, params)
+    on_manifold = trajectory_naturalness(dists, behavior, domain).mean()
     # Random distributions are off the learned behavior manifold.
     random_traj = torch.softmax(torch.randn(8, 32), dim=-1)
-    off_manifold = trajectory_naturalness(random_traj, behavior).mean()
+    off_manifold = trajectory_naturalness(random_traj, behavior, domain).mean()
     assert off_manifold > on_manifold
     assert off_manifold > 1e-2
 
@@ -149,10 +159,11 @@ def test_naturalness_end_to_end_mock():
         compute_node_behavior_centroid(model, tok, torch.device("cpu"), g)
         for g in groups
     ])
-    behavior = fit_behavior_manifold(centroids, cyclic=True)
+    domain, _coords, params = _loop_domain(len(groups))
+    behavior = fit_behavior_manifold(centroids, params)
     traj = compute_trajectory_distributions(
         model, tok, torch.device("cpu"), "some generated text here",
     )
-    scores = trajectory_naturalness(traj, behavior)
+    scores = trajectory_naturalness(traj, behavior, domain)
     assert scores.shape[0] == traj.shape[0]
     assert torch.all(scores >= 0)

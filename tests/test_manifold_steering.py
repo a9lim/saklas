@@ -8,7 +8,12 @@ import torch
 from torch import nn
 
 from saklas.core.hooks import SteeringHook, SteeringManager
-from saklas.core.manifold import Manifold, fit_layer_subspace
+from saklas.core.manifold import (
+    BoxAxis,
+    BoxDomain,
+    Manifold,
+    fit_layer_subspace,
+)
 from saklas.core.steering_expr import SteeringExprError
 from saklas.core.triggers import Trigger, TriggerContext
 
@@ -27,12 +32,41 @@ def _circle(k: int, dim: int, scale: float = 1.0) -> torch.Tensor:
 
 
 def _manifold(layers=(0, 1)) -> Manifold:
+    """A 1-D periodic (loop) manifold over 6 nodes."""
+    domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
+    node_coords = torch.tensor([[i / 6] for i in range(6)])
+    node_params = domain.embed(node_coords)
     return Manifold(
         name="mood",
-        cyclic=True,
+        domain=domain,
         node_labels=[f"n{i}" for i in range(6)],
+        node_coords=node_coords,
         layers={
-            L: fit_layer_subspace(_circle(6, _DIM, 1.0 + 0.2 * L), cyclic=True)
+            L: fit_layer_subspace(_circle(6, _DIM, 1.0 + 0.2 * L), node_params)
+            for L in layers
+        },
+        feature_space="raw",
+    )
+
+
+def _manifold2d(layers=(0,)) -> Manifold:
+    """A 2-D box (disk-like) manifold over a 3x3 grid of 9 nodes."""
+    domain = BoxDomain([
+        BoxAxis("u", periodic=False, lo=0.0, hi=1.0),
+        BoxAxis("v", periodic=False, lo=0.0, hi=1.0),
+    ])
+    coords = torch.tensor(
+        [[x, y] for x in (0.0, 0.5, 1.0) for y in (0.0, 0.5, 1.0)]
+    )
+    node_params = domain.embed(coords)
+    torch.manual_seed(7)
+    return Manifold(
+        name="disk",
+        domain=domain,
+        node_labels=[f"n{i}" for i in range(9)],
+        node_coords=coords,
+        layers={
+            L: fit_layer_subspace(torch.randn(9, _DIM), node_params)
             for L in layers
         },
         feature_space="raw",
@@ -41,9 +75,13 @@ def _manifold(layers=(0, 1)) -> Manifold:
 
 # ------------------------------------------------------------- hook level ---
 
-def _recompose_manifold(hook: SteeringHook, sub, alpha: float):
+def _recompose_manifold(
+    hook: SteeringHook, manifold: Manifold, layer: int, alpha: float,
+    position=(0.5,),
+):
     ctx = TriggerContext()
-    target = sub.spline_point(0.5)
+    sub = manifold.layers[layer]
+    target = manifold.manifold_point(layer, position)
     hook.recompose(
         additive_entries=[],
         ablation_entries=[],
@@ -57,18 +95,17 @@ def _recompose_manifold(hook: SteeringHook, sub, alpha: float):
 def test_hook_alpha_zero_is_noop():
     manifold = _manifold()
     hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold.layers[0], alpha=0.0)
+    _recompose_manifold(hook, manifold, 0, alpha=0.0)
     hidden = torch.randn(1, 4, _DIM)
     before = hidden.clone()
     hook.hook_fn(None, None, hidden)
-    # alpha=0 entries drop at recompose time -> no manifold group at all.
     assert torch.allclose(hidden, before, atol=1e-5)
 
 
 def test_hook_preserves_norm():
     manifold = _manifold()
     hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold.layers[0], alpha=0.7)
+    _recompose_manifold(hook, manifold, 0, alpha=0.7)
     hidden = torch.randn(1, 5, _DIM)
     norm_before = hidden.norm(dim=-1).clone()
     hook.hook_fn(None, None, hidden)
@@ -79,13 +116,11 @@ def test_hook_alpha_one_lands_in_subspace_on_target():
     manifold = _manifold()
     sub = manifold.layers[0]
     hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, sub, alpha=1.0)
+    _recompose_manifold(hook, manifold, 0, alpha=1.0)
     hidden = torch.randn(1, 3, _DIM)
     hook.hook_fn(None, None, hidden)
 
-    # After the replace the in-subspace component should be parallel to
-    # the spline target's in-subspace component (norm rescale aside).
-    target = sub.spline_point(0.5)
+    target = manifold.manifold_point(0, (0.5,))
     target_coords = (target - sub.mean) @ sub.basis.T
     for pos in range(hidden.shape[1]):
         h = hidden[0, pos]
@@ -99,7 +134,7 @@ def test_hook_alpha_one_lands_in_subspace_on_target():
 def test_hook_changes_hidden_state():
     manifold = _manifold()
     hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold.layers[0], alpha=0.5)
+    _recompose_manifold(hook, manifold, 0, alpha=0.5)
     hidden = torch.randn(1, 2, _DIM)
     before = hidden.clone()
     hook.hook_fn(None, None, hidden)
@@ -109,21 +144,18 @@ def test_hook_changes_hidden_state():
 def test_hook_additive_mode_applies_manifold():
     manifold = _manifold()
     hook = SteeringHook(injection_mode="additive")
-    _recompose_manifold(hook, manifold.layers[0], alpha=0.6)
+    _recompose_manifold(hook, manifold, 0, alpha=0.6)
     hidden = torch.randn(1, 3, _DIM)
     before = hidden.clone()
     hook.hook_fn(None, None, hidden)
     assert not torch.allclose(hidden, before, atol=1e-3)
-    assert torch.allclose(
-        hidden.norm(dim=-1), before.norm(dim=-1), atol=1e-4,
-    )
+    assert torch.allclose(hidden.norm(dim=-1), before.norm(dim=-1), atol=1e-4)
 
 
 def test_manifold_forces_slow_path():
     manifold = _manifold()
     hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold.layers[0], alpha=0.5)
-    # A manifold group must never collapse into the fast-path tensor.
+    _recompose_manifold(hook, manifold, 0, alpha=0.5)
     assert hook.composed is None
     assert len(hook.manifold_groups) == 1
 
@@ -137,33 +169,37 @@ def _model_layers(n: int) -> nn.ModuleList:
 def test_manager_attaches_manifold_hooks():
     manifold = _manifold(layers=(0, 1))
     mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=0.5, alpha=0.5)
+    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=0.5)
     layers = _model_layers(4)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     assert sorted(mgr.hooks) == [0, 1]
-    # Manifold steering is never fast-path (loses graph capture).
     assert mgr.all_fast_path() is False
 
 
-def test_manager_end_to_end_forward():
-    manifold = _manifold(layers=(0,))
+def test_manager_steer_n2_manifold():
+    manifold = _manifold2d(layers=(0,))
     mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=0.5, alpha=0.8)
+    mgr.add_manifold("disk", manifold, position=(0.3, 0.8), alpha=0.7)
     layers = _model_layers(2)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
-
     hidden = torch.randn(1, 3, _DIM)
-    out = layers[0](hidden)  # nn.Identity -> forward hook fires
-    assert not torch.allclose(out, hidden) or True  # in-place; out is hidden
-    # Norm preserved through the hooked forward.
-    assert hidden.norm(dim=-1).shape == (1, 3)
+    before = hidden.clone()
+    layers[0](hidden)
+    assert not torch.allclose(hidden, before, atol=1e-3)
+
+
+def test_manager_position_length_mismatch_raises():
+    manifold = _manifold2d(layers=(0,))
+    mgr = SteeringManager(injection_mode="angular")
+    # A 2-D manifold steered with a single coordinate.
+    with pytest.raises(SteeringExprError):
+        mgr.add_manifold("disk", manifold, position=(0.5,), alpha=0.5)
 
 
 def test_manager_alpha_clamped():
     manifold = _manifold(layers=(0,))
     mgr = SteeringManager(injection_mode="angular")
-    # alpha > 1 must clamp to 1 (a blend fraction, not a push).
-    mgr.add_manifold("mood", manifold, position=0.5, alpha=5.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=5.0)
     layers = _model_layers(1)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     _trig, _basis, _mean, _target, alpha = mgr.hooks[0].manifold_groups[0]
@@ -174,8 +210,8 @@ def test_manager_rejects_overlapping_manifolds():
     m1 = _manifold(layers=(0, 1))
     m2 = _manifold(layers=(1, 2))
     mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("a", m1, position=0.3, alpha=0.5)
-    mgr.add_manifold("b", m2, position=0.7, alpha=0.5)
+    mgr.add_manifold("a", m1, position=(0.3,), alpha=0.5)
+    mgr.add_manifold("b", m2, position=(0.7,), alpha=0.5)
     layers = _model_layers(4)
     with pytest.raises(SteeringExprError):
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
@@ -184,7 +220,7 @@ def test_manager_rejects_overlapping_manifolds():
 def test_manager_clear_all_drops_manifolds():
     manifold = _manifold(layers=(0,))
     mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=0.5, alpha=0.5)
+    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=0.5)
     mgr.apply_to_model(_model_layers(2), torch.device("cpu"), torch.float32)
     mgr.clear_all()
     assert mgr.manifolds == {}

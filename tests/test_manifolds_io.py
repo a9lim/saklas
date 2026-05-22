@@ -7,50 +7,86 @@ from pathlib import Path
 import pytest
 
 from saklas.io.manifolds import (
+    MANIFOLD_FORMAT_VERSION,
     ManifoldFolder,
     ManifoldFormatError,
     ManifoldSidecar,
     hash_manifold_files,
+    min_nodes,
 )
-from saklas.io.packs import PACK_FORMAT_VERSION
+
+
+def _box1d(periodic: bool, labels: list[str]) -> dict:
+    """A 1-D box domain spec with evenly-spaced node coords."""
+    k = len(labels)
+    axis = (
+        {"name": "t", "periodic": True, "period": 1.0}
+        if periodic
+        else {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}
+    )
+    if periodic:
+        coords = [[i / k] for i in range(k)]
+    else:
+        coords = [[i / (k - 1) if k > 1 else 0.0] for i in range(k)]
+    return {
+        "domain": {"type": "box", "axes": [axis]},
+        "nodes": [
+            {"label": label, "coords": coords[i]}
+            for i, label in enumerate(labels)
+        ],
+    }
 
 
 def _author_manifold(
     root: Path,
     *,
     name: str = "mood",
-    cyclic: bool = True,
+    periodic: bool = True,
     labels: list[str] | None = None,
     files: dict | None = None,
+    domain: dict | None = None,
+    nodes: list[dict] | None = None,
 ) -> Path:
-    """Hand-author a manifold folder; return its path."""
+    """Hand-author a v3 manifold folder; return its path."""
     if labels is None:
         labels = ["calm", "uneasy", "afraid", "frantic"]
     folder = root / name
     (folder / "nodes").mkdir(parents=True)
-    for idx, label in enumerate(labels):
-        statements = [f"{label} statement {i}" for i in range(3)]
-        (folder / "nodes" / f"{idx:02d}_{label}.json").write_text(
+    spec = _box1d(periodic, labels)
+    if domain is not None:
+        spec["domain"] = domain
+    if nodes is not None:
+        spec["nodes"] = nodes
+    for idx, node in enumerate(spec["nodes"]):
+        statements = [f"{node['label']} statement {i}" for i in range(3)]
+        (folder / "nodes" / f"{idx:02d}_{node['label']}.json").write_text(
             json.dumps(statements)
         )
     meta = {
-        "format_version": PACK_FORMAT_VERSION,
+        "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": "a mood manifold",
-        "cyclic": cyclic,
-        "nodes": labels,
+        "domain": spec["domain"],
+        "nodes": spec["nodes"],
         "files": files if files is not None else {},
     }
     (folder / "manifold.json").write_text(json.dumps(meta))
     return folder
 
 
+def test_min_nodes_per_dimension():
+    assert min_nodes(1) == 3
+    assert min_nodes(2) == 5
+    assert min_nodes(3) == 7
+
+
 def test_load_minimal_manifold(tmp_path):
     folder = _author_manifold(tmp_path)
     mf = ManifoldFolder.load(folder)
     assert mf.name == "mood"
-    assert mf.cyclic is True
+    assert mf.domain["type"] == "box"
     assert mf.node_labels == ["calm", "uneasy", "afraid", "frantic"]
+    assert len(mf.node_coords) == 4
     assert mf.description == "a mood manifold"
 
 
@@ -74,7 +110,16 @@ def test_missing_manifold_json_raises(tmp_path):
 def test_stale_format_version_raises(tmp_path):
     folder = _author_manifold(tmp_path)
     meta = json.loads((folder / "manifold.json").read_text())
-    meta["format_version"] = 1
+    meta["format_version"] = 2
+    (folder / "manifold.json").write_text(json.dumps(meta))
+    with pytest.raises(ManifoldFormatError):
+        ManifoldFolder.load(folder)
+
+
+def test_domain_required(tmp_path):
+    folder = _author_manifold(tmp_path)
+    meta = json.loads((folder / "manifold.json").read_text())
+    del meta["domain"]
     (folder / "manifold.json").write_text(json.dumps(meta))
     with pytest.raises(ManifoldFormatError):
         ManifoldFolder.load(folder)
@@ -87,25 +132,73 @@ def test_too_few_nodes_raises(tmp_path):
         )
 
 
-def test_bad_node_label_raises(tmp_path):
-    folder = tmp_path / "bad"
-    (folder / "nodes").mkdir(parents=True)
-    meta = {
-        "format_version": PACK_FORMAT_VERSION,
-        "name": "bad",
-        "cyclic": False,
-        "nodes": ["calm", "Uneasy", "afraid"],  # uppercase invalid
-        "files": {},
+def test_too_few_nodes_for_2d(tmp_path):
+    # A 2-D domain needs min_nodes(2) == 5; four nodes is too few.
+    domain = {
+        "type": "box",
+        "axes": [
+            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+        ],
     }
-    (folder / "manifold.json").write_text(json.dumps(meta))
+    nodes = [
+        {"label": f"n{i}", "coords": [x, y]}
+        for i, (x, y) in enumerate([(0, 0), (1, 0), (0, 1), (1, 1)])
+    ]
     with pytest.raises(ManifoldFormatError):
-        ManifoldFolder.load(folder)
+        ManifoldFolder.load(
+            _author_manifold(tmp_path, domain=domain, nodes=nodes)
+        )
+
+
+def test_node_coords_dim_mismatch_raises(tmp_path):
+    # 1-D domain but a node carrying two coordinates.
+    nodes = [
+        {"label": "a", "coords": [0.0, 0.0]},
+        {"label": "b", "coords": [0.5]},
+        {"label": "c", "coords": [1.0]},
+    ]
+    with pytest.raises(ManifoldFormatError):
+        ManifoldFolder.load(_author_manifold(tmp_path, nodes=nodes))
+
+
+def test_bad_node_label_raises(tmp_path):
+    nodes = [
+        {"label": "calm", "coords": [0.0]},
+        {"label": "Uneasy", "coords": [0.5]},   # uppercase invalid
+        {"label": "afraid", "coords": [1.0]},
+    ]
+    with pytest.raises(ManifoldFormatError):
+        ManifoldFolder.load(_author_manifold(tmp_path, nodes=nodes))
 
 
 def test_duplicate_labels_raises(tmp_path):
+    nodes = [
+        {"label": "calm", "coords": [0.0]},
+        {"label": "calm", "coords": [0.5]},
+        {"label": "afraid", "coords": [1.0]},
+    ]
     with pytest.raises(ManifoldFormatError):
+        ManifoldFolder.load(_author_manifold(tmp_path, nodes=nodes))
+
+
+def test_poisedness_soft_warning(tmp_path):
+    # Five nodes on a 2-D domain but all collinear — a soft warning, not
+    # a hard error (the hard error is raised later at fit time).
+    domain = {
+        "type": "box",
+        "axes": [
+            {"name": "u", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "v", "periodic": False, "lo": 0.0, "hi": 1.0},
+        ],
+    }
+    nodes = [
+        {"label": f"n{i}", "coords": [t, t]}      # the diagonal line
+        for i, t in enumerate([0.0, 0.25, 0.5, 0.75, 1.0])
+    ]
+    with pytest.warns(UserWarning, match="poised"):
         ManifoldFolder.load(
-            _author_manifold(tmp_path, labels=["calm", "calm", "afraid"])
+            _author_manifold(tmp_path, domain=domain, nodes=nodes)
         )
 
 
@@ -121,7 +214,9 @@ def _add_dummy_tensor(folder: Path) -> None:
     (folder / "stub-model.safetensors").write_bytes(b"placeholder-tensor")
     (folder / "stub-model.json").write_text(json.dumps({
         "method": "manifold_pca", "saklas_version": "0",
-        "cyclic": True, "node_count": 4, "node_labels": [],
+        "domain": {"type": "box", "axes": [
+            {"name": "t", "periodic": True, "period": 1.0}]},
+        "node_count": 4, "node_labels": [],
     }))
 
 
@@ -132,17 +227,13 @@ def test_integrity_check_catches_tampering(tmp_path):
     meta = json.loads((folder / "manifold.json").read_text())
     meta["files"] = files
     (folder / "manifold.json").write_text(json.dumps(meta))
-    # Untampered: loads fine.
     ManifoldFolder.load(folder)
-    # Tamper a fitted tensor.
     (folder / "stub-model.safetensors").write_bytes(b"tampered")
     with pytest.raises(ManifoldFormatError):
         ManifoldFolder.load(folder)
 
 
 def test_node_corpus_edits_do_not_trip_integrity(tmp_path):
-    # The node corpus is user-editable — editing it must not fail load
-    # (it is the re-fit trigger, tracked via nodes_sha256).
     folder = _author_manifold(tmp_path)
     _add_dummy_tensor(folder)
     files = hash_manifold_files(folder)
@@ -150,7 +241,6 @@ def test_node_corpus_edits_do_not_trip_integrity(tmp_path):
     meta["files"] = files
     (folder / "manifold.json").write_text(json.dumps(meta))
     (folder / "nodes" / "00_calm.json").write_text(json.dumps(["edited"]))
-    # Loads fine — node files are not in the integrity manifest.
     ManifoldFolder.load(folder)
 
 
@@ -164,6 +254,18 @@ def test_nodes_sha256_stable_and_sensitive(tmp_path):
     assert h1 != h2
 
 
+def test_nodes_sha256_sensitive_to_coords(tmp_path):
+    # Moving a node's authoring coordinate must invalidate the hash even
+    # when the corpus is untouched — the fit depends on the geometry.
+    folder = _author_manifold(tmp_path)
+    h1 = ManifoldFolder.load(folder).nodes_sha256()
+    meta = json.loads((folder / "manifold.json").read_text())
+    meta["nodes"][1]["coords"] = [0.123]
+    (folder / "manifold.json").write_text(json.dumps(meta))
+    h2 = ManifoldFolder.load(folder).nodes_sha256()
+    assert h1 != h2
+
+
 def test_write_metadata_populates_files(tmp_path):
     folder = _author_manifold(tmp_path)
     _add_dummy_tensor(folder)
@@ -172,9 +274,7 @@ def test_write_metadata_populates_files(tmp_path):
     mf.write_metadata()
     assert "stub-model.safetensors" in mf.files
     assert "stub-model.json" in mf.files
-    # The node corpus is not hashed into the manifest.
     assert not any(k.startswith("nodes/") for k in mf.files)
-    # Reload verifies the freshly written manifest.
     reloaded = ManifoldFolder.load(folder)
     assert reloaded.files == mf.files
 
@@ -184,7 +284,7 @@ def test_manifold_sidecar_load(tmp_path):
     path.write_text(json.dumps({
         "method": "manifold_sae",
         "saklas_version": "3.1.0",
-        "cyclic": True,
+        "domain": {"type": "sphere", "dim": 2},
         "node_count": 4,
         "node_labels": ["a", "b", "c", "d"],
         "feature_space": "sae-gemma",
@@ -193,7 +293,7 @@ def test_manifold_sidecar_load(tmp_path):
     }))
     sc = ManifoldSidecar.load(path)
     assert sc.method == "manifold_sae"
-    assert sc.cyclic is True
+    assert sc.domain == {"type": "sphere", "dim": 2}
     assert sc.node_count == 4
     assert sc.feature_space == "sae-gemma"
     assert sc.nodes_sha256 == "deadbeef"
