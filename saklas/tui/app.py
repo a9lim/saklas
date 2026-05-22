@@ -33,7 +33,9 @@ from saklas.tui.chat_panel import (
     ChatInput,
     ChatPanel,
     PendingItem,
+    RawBuffer,
     _AssistantMessage,
+    _RawTextArea,
     _TurnRow,
 )
 from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
@@ -171,6 +173,11 @@ class SaklasApp(App[None]):
             "HL cycle back", show=False,
         ),
         Binding("ctrl+l", "open_loom", "Loom", show=False),
+        # Ctrl+O toggles the chat/raw render surface.  Not Ctrl+M — that
+        # transmits 0x0D (CR), which Textual maps to ``enter`` before
+        # binding resolution, so a ``ctrl+m`` binding collides with the
+        # Enter key (same gotcha as Ctrl+H → backspace).
+        Binding("ctrl+o", "toggle_render_mode", "Mode", show=False),
         Binding("ctrl+e", "edit_active", "Edit", show=False, priority=True),
         Binding("ctrl+b", "branch_active", "Branch", show=False),
         Binding("ctrl+n", "nav_picker", "Nav", show=False),
@@ -243,6 +250,11 @@ class SaklasApp(App[None]):
         self._thinking: bool = (
             self._supports_thinking and not self._thinking_optional
         )
+        # Render mode — ``"chat"`` (turn rows) or ``"raw"`` (a single
+        # flat completion buffer).  Seeded from the model's nature: a
+        # base model defaults to raw, a chat model to chat.  Toggled at
+        # runtime via ``/mode`` — neither choice is locked to the model.
+        self._render_mode: str = "raw" if self._is_base_model else "chat"
 
         self._current_assistant_widget = None
         self._poll_timer: Timer | None = None
@@ -463,11 +475,14 @@ class SaklasApp(App[None]):
         self._poll_timer = self.set_interval(1 / _POLL_FPS, self._poll_generation)
         self._update_panel_focus()
 
-        # Base-model flat mode: drop role headers + the thinking
-        # Collapsible and present turns as flat continuous text.  Set
-        # before any rows mount so the first turn renders flat.
-        if self._is_base_model:
-            self._chat_panel.set_flat_mode(True)
+        # Render mode — raw (flat completion buffer) for base models,
+        # chat (turn rows) otherwise.  Set before the first turn mounts
+        # so the surface is correct from the start.  Toggle with /mode.
+        self._chat_panel.set_render_mode(self._render_mode)
+        if self._render_mode == "raw":
+            self._chat_panel.raw_buffer.sync_committed(
+                self._session.tree.flat_text()
+            )
 
         loaded = (
             f"Model loaded: "
@@ -475,8 +490,9 @@ class SaklasApp(App[None]):
         )
         if self._is_base_model:
             loaded += (
-                "Base (non-chat) model — flat completion mode. "
-                "Type to extend the text. Use /steer and /probe commands."
+                "Base (non-chat) model — raw completion mode. "
+                "Edit the buffer and press Enter to continue. "
+                "Use /steer and /probe; /mode switches surface."
             )
         else:
             loaded += (
@@ -488,7 +504,10 @@ class SaklasApp(App[None]):
     # -- Key Handling --
 
     def on_key(self, event: _textual_events.Key) -> None:
-        if isinstance(self.focused, ChatInput):
+        # The raw-mode completion buffer is a TextArea too — treat it
+        # like the chat input so ``Tab`` still cycles panels and the
+        # arrow keys stay with the editor (no panel-nav / alpha-nudge).
+        if isinstance(self.focused, (ChatInput, _RawTextArea)):
             if event.key == "tab":
                 event.prevent_default()
                 event.stop()
@@ -497,7 +516,9 @@ class SaklasApp(App[None]):
                 event.prevent_default()
                 event.stop()
                 self.action_focus_prev_panel()
-            elif event.key in ("up", "down"):
+            elif event.key in ("up", "down") and isinstance(
+                self.focused, ChatInput
+            ):
                 # Shell-style history recall on the chat input — but
                 # *edge-only* so multi-line editing keeps its native
                 # cursor nav.  ``↑`` only recalls when the cursor sits
@@ -621,6 +642,13 @@ class SaklasApp(App[None]):
             self._handle_command(text, replace_slot=replace_slot)
             return
         self._last_prompt = text
+        if self._raw_mode:
+            # Raw mode: a non-slash line from the command input is a
+            # prompt appended to the buffer — continue from the active
+            # leaf with the typed text as the divergence tail.
+            draft = self._session.tree.flat_text() + text
+            self._submit_raw_continuation(draft, replace_slot=replace_slot)
+            return
         # Role-aware send: when the active loom node is a user turn the
         # input seeds the *assistant* reply (answer-prefill) rather than
         # appending a new user message.  Decide once, here — the pending
@@ -750,6 +778,7 @@ class SaklasApp(App[None]):
             "  /sys [prompt]               — system prompt\n"
             "  /temp, /top-p, /max         — sampling defaults\n"
             "  /model                      — model + session info\n"
+            "  ⌃O                          — toggle chat ⇄ raw buffer\n"
             "  /exit, /help\n"
             "Loom:\n"
             "  /tree                       — open loom screen (⌃L)\n"
@@ -1401,6 +1430,10 @@ class SaklasApp(App[None]):
         self._chat_panel.clear_log()
         self._assistant_messages.clear()
         self._row_for_widget.clear()
+        if self._raw_mode:
+            self._chat_panel.raw_buffer.sync_committed(
+                self._session.tree.flat_text()
+            )
         self._trait_panel.update_values({}, {}, {})
         self._refresh_trait_why()
         self._chat_panel.add_system_message("Chat history cleared.")
@@ -1430,6 +1463,17 @@ class SaklasApp(App[None]):
         self._assistant_messages.clear()
         self._row_for_widget.clear()
         self._current_assistant_widget = None
+        if self._raw_mode:
+            # Raw mode has no turn rows — re-sync the flat buffer from
+            # the navigated active path instead of rebuilding the log.
+            rb = chat.raw_buffer
+            rb.sync_committed(self._session.tree.flat_text())
+            rb.apply_highlight(
+                self._highlighting,
+                self._highlight_probe if self._highlighting else None,
+            )
+            self._refresh_input_mode()
+            return
         # Resolve the highlight probe the same way ``_apply_highlight_to_all``
         # does, then seed it on each widget *before* mount — ``_apply_static``
         # (deferred to ``on_mount``) reads ``_highlight_on`` / ``_highlight_probe``
@@ -1481,6 +1525,10 @@ class SaklasApp(App[None]):
         self._row_for_widget = {
             wid: row for wid, row in self._row_for_widget.items() if row.is_mounted
         }
+        if self._raw_mode:
+            self._chat_panel.raw_buffer.sync_committed(
+                self._session.tree.flat_text()
+            )
         self._chat_panel.add_system_message("Rewound to before last message.")
 
     def _refresh_gen_config(self) -> None:
@@ -1551,12 +1599,30 @@ class SaklasApp(App[None]):
             and self._session._monitor.probe_names
         )
 
-    def _start_generation(self, user_text: str | None = None) -> None:
+    @property
+    def _raw_mode(self) -> bool:
+        """True when the chat panel is showing the flat completion buffer."""
+        return self._render_mode == "raw"
+
+    def _start_generation(
+        self,
+        user_text: str | None = None,
+        *,
+        raw_continuation: bool = False,
+        raw_draft: str = "",
+        raw_parent: str | None = None,
+    ) -> None:
         """Kick off a generation.
 
         ``user_text`` is the new user message (``None`` = regeneration of
-        the last turn, so we pass the existing history via input=[] style —
-        actually we pop the last assistant and re-use the last user content).
+        the last turn, so we pop the last assistant and re-use the last
+        user content).
+
+        ``raw_continuation`` routes the stream into the raw-mode
+        completion buffer instead of mounting a chat turn row:
+        ``user_text`` is the divergence *tail* (``""`` = a bare
+        continuation from the active leaf), ``raw_draft`` the full
+        submitted buffer, ``raw_parent`` the node the tail hangs under.
         """
         self._ui_gen_active = True
 
@@ -1567,10 +1633,19 @@ class SaklasApp(App[None]):
         self._ppl_count = 0
         self._gen_start_time = time.monotonic()
 
-        row, widget = self._chat_panel.start_assistant_message()
-        self._row_for_widget[id(widget)] = row
-        self._current_assistant_widget = widget
-        self._assistant_messages.append(widget)
+        if raw_continuation:
+            # Raw mode: the stream target is the flat completion buffer,
+            # not a fresh turn row.  ``begin_continuation`` stamps the
+            # submitted draft as the committed head; streamed tokens
+            # append (and tint) on top of it.
+            widget = self._chat_panel.raw_buffer
+            widget.begin_continuation(raw_draft)
+            self._current_assistant_widget = widget
+        else:
+            row, widget = self._chat_panel.start_assistant_message()
+            self._row_for_widget[id(widget)] = row
+            self._current_assistant_widget = widget
+            self._assistant_messages.append(widget)
         # Fresh widgets spawn with ``_highlight_on=False``; inherit the
         # app's current highlight state so streamed tokens render
         # highlighted from the first emit instead of requiring a Ctrl+Y
@@ -1620,12 +1695,18 @@ class SaklasApp(App[None]):
         # a sibling rather than a child-of-user.  D15 rejects bare
         # send-from-user; this branch is what tells the engine "I'm
         # regenerating, dedup will land me on the right user node."
-        tree = self._session.tree
-        active_node = tree.nodes.get(tree.active_node_id)
         regen_parent_id: str | None = None
-        if (active_node is not None and active_node.role == "user"
-                and active_node.parent_id is not None):
-            regen_parent_id = active_node.parent_id
+        if raw_continuation:
+            # The tail hangs under the divergence parent (mid-buffer
+            # edit) or the active leaf (clean append) — resolved by the
+            # caller via ``_resolve_raw_divergence``.
+            regen_parent_id = raw_parent
+        else:
+            tree = self._session.tree
+            active_node = tree.nodes.get(tree.active_node_id)
+            if (active_node is not None and active_node.role == "user"
+                    and active_node.parent_id is not None):
+                regen_parent_id = active_node.parent_id
 
         def _generate():
             try:
@@ -1634,7 +1715,7 @@ class SaklasApp(App[None]):
                     steering=steering,
                     sampling=sampling,
                     stateless=False,
-                    raw=self._is_base_model,
+                    raw=self._raw_mode,
                     thinking=use_thinking,
                     parent_node_id=regen_parent_id,
                     live_scores=self._wants_live_probe_scores(),
@@ -1667,6 +1748,99 @@ class SaklasApp(App[None]):
                 self._ui_token_queue.put(("done", False))
 
         self.run_worker(_generate, thread=True)
+
+    # -- Raw (flat completion) mode --
+
+    def _resolve_raw_divergence(
+        self, draft: str,
+    ) -> tuple[str, str | None]:
+        """Diff ``draft`` against the loom active path and locate the
+        single span the change collapses to.
+
+        Port of ``webui``'s ``RawBuffer.svelte::resolveDivergence``.
+        Returns ``(tail, parent_node_id)`` — ``tail`` is the new text
+        from the divergence offset to the end of the draft, and
+        ``parent_node_id`` is the node it hangs under: the diverging
+        node's parent for a mid-buffer edit, the active leaf for a pure
+        append.  A clean draft (no divergence, no append) yields an
+        empty tail under the active leaf — a bare continuation.
+        """
+        tree = self._session.tree
+        nodes = [n for n in tree.active_path() if n.id != tree.root_id]
+        start = 0
+        for node in nodes:
+            ntext = node.text or ""
+            if draft[start:start + len(ntext)] != ntext:
+                # Divergence inside this node — it (and its subtree)
+                # stay as the original branch; the tail branches as a
+                # sibling, a child of the node's parent.
+                return draft[start:], node.parent_id
+            start += len(ntext)
+        # No node diverged — the tail is appended past the joined
+        # buffer and hangs under the active leaf.
+        return draft[start:], tree.active_node_id
+
+    def _submit_raw_continuation(
+        self, draft: str, *, replace_slot: int | None = None,
+    ) -> None:
+        """Continue the raw buffer from ``draft``.
+
+        ``draft`` is the full intended buffer text; divergence (and so
+        the generation's parent node) is resolved at dispatch time so a
+        queued continuation can't bind to a stale tree.
+        """
+        if self._is_busy:
+            self._enqueue_pending(
+                PendingItem("raw_continue", draft), replace_slot=replace_slot,
+            )
+            return
+        tail, parent = self._resolve_raw_divergence(draft)
+        self._start_generation(
+            tail, raw_continuation=True, raw_draft=draft, raw_parent=parent,
+        )
+
+    def on_raw_buffer_continue(self, event: RawBuffer.Continue) -> None:
+        """``Enter`` in the raw completion buffer — generate from it."""
+        self._submit_raw_continuation(event.draft)
+
+    def _set_render_mode(self, mode: str) -> None:
+        """Switch the chat surface between ``"chat"`` and ``"raw"``.
+
+        Non-destructive — both surfaces derive from the same loom tree;
+        the now-visible one is repainted from the active path.  A/B is a
+        chat-mode-only layout, so switching to raw drops it.
+        """
+        if mode not in ("chat", "raw"):
+            self._chat_panel.add_system_message(
+                f"Unknown render mode '{mode}' — use chat or raw."
+            )
+            return
+        if mode == self._render_mode:
+            self._chat_panel.add_system_message(f"Already in {mode} mode.")
+            return
+        if self._session.is_generating:
+            self._session.stop()
+        self._render_mode = mode
+        cp = self._chat_panel
+        if mode == "raw" and self._ab_mode:
+            self._ab_mode = False
+            cp.set_ab_mode(False)
+        cp.set_render_mode(mode)
+        if mode == "raw":
+            cp.raw_buffer.sync_committed(self._session.tree.flat_text())
+            cp.raw_buffer.apply_highlight(
+                self._highlighting,
+                self._highlight_probe if self._highlighting else None,
+            )
+        else:
+            self._repaint_chat_from_active_path()
+        cp.add_system_message(f"Render mode: {mode}.")
+
+    def action_toggle_render_mode(self) -> None:
+        """``Ctrl+O`` — toggle the chat panel between chat and raw."""
+        self._set_render_mode(
+            "chat" if self._render_mode == "raw" else "raw"
+        )
 
     def _prefill_target_node_id(self) -> str | None:
         """Active node id when it's a user turn, else ``None``.
@@ -1814,6 +1988,14 @@ class SaklasApp(App[None]):
         the commit lands once the current gen finishes — mounting a row
         mid-stream would interleave UI in confusing ways.
         """
+        if self._raw_mode:
+            # Raw mode is roleless — there is no commit-vs-prefill
+            # decision.  Edit the buffer directly and Enter to continue.
+            self._chat_panel.add_system_message(
+                "Commit is chat-mode only — in raw mode edit the buffer "
+                "and press Enter to continue."
+            )
+            return
         try:
             inp = self._chat_panel.query_one("#chat-input", ChatInput)
         except Exception:
@@ -2022,6 +2204,10 @@ class SaklasApp(App[None]):
                 widget = self._current_assistant_widget
                 if widget:
                     widget.ensure_thinking_collapsed()
+                if isinstance(widget, RawBuffer):
+                    # Clear the raw buffer's streaming guard so the next
+                    # keystroke is seen as a user edit again.
+                    widget.end_continuation()
                 self._current_assistant_widget = None
                 self._ui_gen_active = False
                 generating = False
@@ -2055,6 +2241,7 @@ class SaklasApp(App[None]):
                 # instead — it lands as a sibling under the user-parent.
                 elif (
                     self._ab_mode
+                    and not self._raw_mode
                     and widget is not None
                     and not self._pending_queue
                     and self._loom_auto_regen_mode == "unsteered"
@@ -2065,6 +2252,7 @@ class SaklasApp(App[None]):
                         break
                 elif (
                     self._loom_auto_regen_on
+                    and not self._raw_mode
                     and self._loom_auto_regen_mode != "unsteered"
                     and not self._pending_queue
                     and widget is not None
@@ -2288,6 +2476,8 @@ class SaklasApp(App[None]):
         self._assistant_messages = [w for w in self._assistant_messages if w.is_mounted]
         for widget in self._assistant_messages:
             widget.apply_highlight(self._highlighting, probe)
+        if self._raw_mode:
+            self._chat_panel.raw_buffer.apply_highlight(self._highlighting, probe)
         # Refresh the persistent HL readout in the left panel — this is
         # the funnel every highlight-state mutation passes through
         # (cycle, /probe, /unprobe, trait-panel nav), so the line stays
@@ -3215,6 +3405,15 @@ class SaklasApp(App[None]):
                 else:
                     self._chat_panel.add_user_message(text)
                     self._start_generation(text)
+            elif kind == "raw_continue":
+                # Raw-mode continuation queued behind an in-flight gen.
+                # ``text`` is the full submitted draft; divergence is
+                # resolved fresh here so it binds to the current tree.
+                tail, parent = self._resolve_raw_divergence(text)
+                self._start_generation(
+                    tail, raw_continuation=True,
+                    raw_draft=text, raw_parent=parent,
+                )
             elif kind == "commit_user":
                 # Ctrl+Enter from a non-user active node, queued behind
                 # in-flight gen.  The role decision was made at submit
@@ -3314,6 +3513,12 @@ class SaklasApp(App[None]):
         self._adjust_config("top_p", 0.05, 0.0, 1.0)
 
     def action_regenerate(self) -> None:
+        if self._raw_mode:
+            self._chat_panel.add_system_message(
+                "Regen is chat-mode only — edit the buffer and press "
+                "Enter to continue."
+            )
+            return
         if not self._messages:
             return
         if self._is_busy:
@@ -3349,6 +3554,11 @@ class SaklasApp(App[None]):
         on re-reveals it without re-running.
         """
         chat = self._chat_panel
+        if self._raw_mode:
+            chat.add_system_message(
+                "A/B compare is a chat-mode layout — switch with /mode."
+            )
+            return
         was_off = not self._ab_mode
         self._ab_mode = not self._ab_mode
         self._loom_auto_regen_on = self._ab_mode
@@ -4180,7 +4390,7 @@ class SaklasApp(App[None]):
             try:
                 stream = self._session.generate_stream(
                     user_text,
-                    raw=self._is_base_model,
+                    raw=self._raw_mode,
                     parent_node_id=parent_node_id,
                     recipe_override=mode,
                     live_scores=self._wants_live_probe_scores(),

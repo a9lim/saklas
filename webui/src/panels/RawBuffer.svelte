@@ -164,10 +164,14 @@
   }
 
   function onKeydown(ev: KeyboardEvent): void {
-    // Ctrl/Cmd+Enter continues; Escape stops an in-flight gen.
-    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+    // Bare Enter continues; Ctrl/Cmd/Option-Enter commits the edit
+    // without generating; Shift-Enter is a literal newline; Escape
+    // stops an in-flight gen.
+    if (ev.key === "Enter") {
+      if (ev.shiftKey) return;
       ev.preventDefault();
-      continueGen();
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) void commitEdit();
+      else continueGen();
       return;
     }
     if (ev.key === "Escape" && genStatus.active) {
@@ -273,7 +277,12 @@
       <span class="dirty-flag" title="the buffer has uncommitted edits">
         edited
       </span>
-      <button type="button" class="act commit" onclick={() => void commitEdit()}>
+      <button
+        type="button"
+        class="act commit"
+        onclick={() => void commitEdit()}
+        title="⌃⏎ — land the edit on the tree without generating"
+      >
         commit edit
       </button>
       <button type="button" class="act revert" onclick={revertEdit}>
@@ -285,7 +294,7 @@
       class="act continue"
       onclick={continueGen}
       disabled={genStatus.active}
-      title="⌃⏎ — generate a raw continuation from the buffer"
+      title="⏎ — generate a raw continuation from the buffer (⇧⏎ for a newline)"
     >continue</button>
     <button
       type="button"

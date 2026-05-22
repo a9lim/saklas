@@ -55,7 +55,7 @@
     setAutoRegenCustom,
     effectiveRawMode,
     genUiMode,
-    setGenUiOverride,
+    setGenUiMode,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
@@ -112,7 +112,7 @@
   // In raw mode the role-aware commit derivations short-circuit: there
   // are no roles, so the input box never enters prefill / commit mode.
   const rawMode = $derived.by(() => {
-    void genUiMode.override;
+    void genUiMode.mode;
     return effectiveRawMode();
   });
 
@@ -870,26 +870,18 @@
       </label>
     {/if}
 
-    <!-- Render-mode badge — compact raw/chat indicator.  Clicking it
-         cycles the override (auto → chat → raw → auto); the full
-         three-state control lives in the advanced sampling drawer. -->
+    <!-- Render-mode badge — raw/chat toggle.  The mode is seeded from
+         the model (base → raw, chat → chat) the first time it is seen,
+         then it's a plain two-state toggle; the same control also sits
+         in the advanced sampling drawer. -->
     <button
       type="button"
       class="mode-badge"
       class:raw={rawMode}
-      onclick={() =>
-        setGenUiOverride(
-          genUiMode.override === null
-            ? "chat"
-            : genUiMode.override === "chat"
-              ? "raw"
-              : null,
-        )}
-      title={"render mode: " +
-        (genUiMode.override ?? "auto") +
-        " — click to cycle (full control in advanced sampling)"}
+      onclick={() => setGenUiMode(rawMode ? "chat" : "raw")}
+      title={"render mode: " + genUiMode.mode + " — click to toggle"}
     >
-      {rawMode ? "raw" : "chat"}{genUiMode.override === null ? " ·auto" : ""}
+      {genUiMode.mode}
     </button>
 
     <!-- Conversation actions — clear / save / load / transcript / auto-

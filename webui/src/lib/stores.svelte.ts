@@ -1282,24 +1282,22 @@ export function setSampling<K extends keyof SamplingState>(
 // Base (non-chat) models have no chat template — the engine handles
 // them as flat completion.  ``genUiMode`` decides whether the chat panel
 // renders bubbles + roles (chat) or a single flat completion buffer
-// (raw).  The override wins over the model's ``is_base_model`` flag;
-// ``null`` follows the model.  Persisted per ``model_id`` so a user's
-// explicit choice survives reloads.
+// (raw).  It is a plain two-state toggle: the default is seeded from the
+// model's ``is_base_model`` flag (base → raw, chat → chat) the first
+// time a model is seen, then the user's explicit choice is persisted
+// per ``model_id`` and survives reloads.
 
 export interface GenUiModeState {
-  /** User override: ``"chat"`` / ``"raw"`` force that mode regardless
-   *  of the model; ``null`` follows ``is_base_model``. */
-  override: "chat" | "raw" | null;
+  /** Which surface the chat panel renders — ``"chat"`` (bubbles +
+   *  roles) or ``"raw"`` (a single flat completion buffer). */
+  mode: "chat" | "raw";
 }
 
-export const genUiMode: GenUiModeState = $state({ override: null });
+export const genUiMode: GenUiModeState = $state({ mode: "chat" });
 
-/** Resolve the effective rendering mode — true means flat raw buffer.
- *  Override wins; otherwise follow the model's ``is_base_model``. */
+/** Resolve the effective rendering mode — true means flat raw buffer. */
 export function effectiveRawMode(): boolean {
-  if (genUiMode.override === "raw") return true;
-  if (genUiMode.override === "chat") return false;
-  return sessionState.info?.is_base_model === true;
+  return genUiMode.mode === "raw";
 }
 
 const GENUI_KEY_PREFIX = "saklas.genui.v1.";
@@ -1309,27 +1307,27 @@ function genUiKey(): string | null {
   return id ? GENUI_KEY_PREFIX + id : null;
 }
 
-/** Load the persisted per-model render-mode override.  Called from
- *  ``bootstrap`` once the model id is known. */
+/** Load the per-model render mode.  Called from ``bootstrap`` once the
+ *  model id is known.  A stored preference wins; with none, the mode is
+ *  seeded from the model's nature — a base model defaults to ``raw``, a
+ *  chat model to ``chat``. */
 function loadGenUiMode(): void {
   const key = genUiKey();
-  if (!key) return;
-  const raw = safeLocalStorageGet(key);
-  if (raw === "chat" || raw === "raw") {
-    genUiMode.override = raw;
+  const stored = key ? safeLocalStorageGet(key) : null;
+  if (stored === "chat" || stored === "raw") {
+    genUiMode.mode = stored;
   } else {
-    genUiMode.override = null;
+    genUiMode.mode =
+      sessionState.info?.is_base_model === true ? "raw" : "chat";
   }
 }
 
-/** Set (and persist) the render-mode override.  Toggling mode never
- *  mutates the loom tree — only generation does. */
-export function setGenUiOverride(override: "chat" | "raw" | null): void {
-  genUiMode.override = override;
+/** Set (and persist) the render mode.  Toggling mode never mutates the
+ *  loom tree — only generation does. */
+export function setGenUiMode(mode: "chat" | "raw"): void {
+  genUiMode.mode = mode;
   const key = genUiKey();
-  if (!key) return;
-  if (override === null) safeLocalStorageRemove(key);
-  else safeLocalStorageSet(key, override);
+  if (key) safeLocalStorageSet(key, mode);
 }
 
 function parsedStopSequences(): string[] | null {

@@ -73,6 +73,7 @@ def _make_app():
     app._manifold_terms = {}
     app._supports_thinking = False
     app._is_base_model = False
+    app._render_mode = "chat"
     app._thinking = False
     app._current_assistant_widget = None
     app._poll_timer = None

@@ -114,6 +114,68 @@ Widget {
     padding: 0 1;
 }
 
+/* Raw-mode completion buffer — the alternate centre surface, swapped in
+ * for #chat-log by ``ChatPanel.set_render_mode``.  #raw-stack layers the
+ * editable textarea (base) and the read-only tinted mirror (over) in the
+ * same cell; the mirror paints on top while a highlight probe is active
+ * and the buffer is clean (not user-edited). */
+#raw-buffer {
+    height: 1fr;
+    display: none;
+    layout: vertical;
+}
+
+#raw-sysline {
+    height: auto;
+    color: ansi_bright_black;
+    padding: 0 1;
+}
+
+#raw-sysline.hidden {
+    display: none;
+}
+
+#raw-stack {
+    height: 1fr;
+    layers: base over;
+}
+
+#raw-textarea {
+    height: 100%;
+    width: 100%;
+    layer: base;
+    border: solid ansi_default;
+    background: ansi_default;
+    color: ansi_default;
+}
+
+#raw-textarea > .text-area--cursor-line {
+    background: ansi_default;
+}
+
+#raw-textarea > .text-area--cursor {
+    background: ansi_white;
+    color: ansi_black;
+}
+
+#raw-textarea > .text-area--selection {
+    background: ansi_white;
+    color: ansi_black;
+}
+
+#raw-mirror {
+    height: 100%;
+    width: 100%;
+    layer: over;
+    background: ansi_default;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#raw-mirror.hidden {
+    display: none;
+}
+
 #status-bar {
     height: 1;
     background: ansi_default;
