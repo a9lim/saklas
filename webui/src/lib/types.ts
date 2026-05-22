@@ -60,6 +60,96 @@ export interface SessionInfo {
    * ``_TESTED_ARCHS``.  Server may or may not populate this; clients
    * should tolerate ``undefined``. */
   architecture?: string;
+  /** True iff the loaded model has no chat template — generation runs
+   *  as flat completion (no roles, no bubbles).  Older servers omit
+   *  this; clients treat ``undefined`` as ``false`` (chat model). */
+  is_base_model?: boolean;
+}
+
+// ----------------------------------------------------- manifolds --
+
+/** One axis of a Box manifold domain.  ``periodic`` axes wrap (the
+ *  authoring coordinate is taken mod ``period``); open axes clamp to
+ *  ``[lo, hi]``. */
+export interface AxisSpec {
+  name: string;
+  periodic: boolean;
+  /** Period of a periodic axis — server canonicalizes; for an open
+   *  axis this is typically ``hi - lo``. */
+  period: number;
+  lo: number;
+  hi: number;
+}
+
+/** Geometry of a steering manifold's authoring domain.  ``box`` carries
+ *  per-axis specs (1D/2D/3D in the webui builder); ``sphere`` is S^dim
+ *  with a chordal metric; ``custom`` is the JSON-authored escape hatch
+ *  the webui shows read-only. */
+export type ManifoldDomain =
+  | { type: "box"; axes: AxisSpec[] }
+  | { type: "sphere"; dim: number }
+  | { type: "custom"; [key: string]: unknown };
+
+/** One node of a manifold — a label, its authoring coordinates (one
+ *  per intrinsic dimension), and the statement corpus pooled into its
+ *  centroid. */
+export interface ManifoldNodeSpec {
+  label: string;
+  coords: number[];
+  statements: string[];
+}
+
+/** Per-model fit record returned in the manifold detail shape. */
+export interface ManifoldFitInfo {
+  stem: string;
+  method: string;
+  feature_space: string;
+  node_count: number;
+  nodes_sha256: string;
+}
+
+/** Manifold list/detail row.  The list route omits ``nodes``'
+ *  statements and ``fitted``; the detail route includes both. */
+export interface ManifoldInfo {
+  namespace: string;
+  name: string;
+  description: string;
+  domain: ManifoldDomain;
+  domain_label: string;
+  intrinsic_dim: number;
+  min_nodes: number;
+  node_count: number;
+  node_labels: string[];
+  node_coords: number[][];
+  fitted_models: string[];
+  /** True iff a tensor for the loaded session model is present. */
+  fitted_for_session: boolean;
+  /** True iff a fitted tensor's ``nodes_sha256`` no longer matches the
+   *  current node geometry — the fit is stale and should be re-run. */
+  stale: boolean;
+  /** Detail-only: full node specs with statement corpora. */
+  nodes?: ManifoldNodeSpec[];
+  /** Detail-only: per-tensor fit records. */
+  fitted?: ManifoldFitInfo[];
+}
+
+export interface ManifoldListResponse {
+  manifolds: ManifoldInfo[];
+}
+
+/** Body for POST /saklas/v1/manifolds. */
+export interface CreateManifoldRequest {
+  namespace?: string;
+  name: string;
+  description: string;
+  domain: ManifoldDomain;
+  nodes: ManifoldNodeSpec[];
+}
+
+/** Body for PATCH /saklas/v1/manifolds/{ns}/{name}. */
+export interface UpdateManifoldRequest {
+  description?: string;
+  nodes?: ManifoldNodeSpec[];
 }
 
 // ----------------------------------------------------- vectors --
@@ -796,6 +886,30 @@ export interface VectorRackEntry {
   enabled: boolean;
 }
 
+// ----------------------------------------------------- manifold rack --
+
+/** One racked manifold — a steering term placing generation at a point
+ *  of a fitted manifold.  ``coords`` is one authoring coordinate per
+ *  intrinsic dimension; ``blend`` is the soft subspace-replace fraction
+ *  in ``[0, 1]``. */
+export interface ManifoldRackEntry {
+  /** Blend fraction in [0, 1] — the term coefficient. */
+  blend: number;
+  /** Authoring coordinates, one per intrinsic dimension. */
+  coords: number[];
+  trigger: Trigger;
+  enabled: boolean;
+}
+
+// ----------------------------------------------------- extract pairs --
+
+/** One contrastive statement pair for custom-statement vector
+ *  extraction.  Mirrors the server's ``{positive, negative}`` shape. */
+export interface StatementPair {
+  positive: string;
+  negative: string;
+}
+
 // ----------------------------------------------------- probe rack --
 
 export type ProbeSortMode = "name" | "value" | "change";
@@ -891,6 +1005,12 @@ export type DrawerName =
    *  closes back to the vectors drawer so the new row appears
    *  reactively. */
   | "extract"
+  /** Manifold browser — split Fitted / Unfitted, per-row steer / fit /
+   *  delete, with a "+ build manifold" launcher. */
+  | "manifolds"
+  /** Manifold authoring form — domain step + node editor.  Reached
+   *  from the "+ build manifold" button inside ``manifolds``. */
+  | "manifold_builder"
   | "save_conversation"
   | "load_conversation"
   | "compare"

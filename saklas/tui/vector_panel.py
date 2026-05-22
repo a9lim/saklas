@@ -139,6 +139,11 @@ class LeftPanel(Widget):
             is_selected = i == self._selected_idx
             enabled = v.get("enabled", True)
             name = v["name"]
+
+            if v.get("kind") == "manifold":
+                lines.append(self._render_manifold_row(v, is_selected, enabled))
+                continue
+
             alpha = v["alpha"]
             peak = v["peak"]
             n_active = v["n_active"]
@@ -175,6 +180,39 @@ class LeftPanel(Widget):
 
         content = self._vector_content
         content.update("\n".join(lines))
+
+    def _render_manifold_row(
+        self, v: dict, is_selected: bool, enabled: bool,
+    ) -> str:
+        """Render one manifold row.
+
+        A manifold term has a fixed position on a fitted surface, not a
+        scalar alpha — so there's no alpha bar.  The second line shows
+        the authoring position (``manifold % 0.3,0.8``) and the blend
+        coefficient instead.
+        """
+        manifold = v.get("manifold", v["name"])
+        coords = v.get("coords", "")
+        blend = v.get("blend", 0.0)
+
+        marker = ">" if is_selected else " "
+        dot = "[ansi_green]●[/]" if enabled else "[dim]○[/]"
+
+        if is_selected and enabled:
+            name_str = f"[bold]{manifold}[/]"
+        elif is_selected and not enabled:
+            name_str = f"[dim bold]{manifold}[/]"
+        elif not enabled:
+            name_str = f"[dim]{manifold}[/]"
+        else:
+            name_str = manifold
+
+        dim_prefix = "dim " if not enabled else ""
+        return (
+            f"{marker} {dot} {name_str} [dim]manifold[/]\n"
+            f"  [{dim_prefix}ansi_blue]% {coords}[/] "
+            f"[dim]blend[/] [{dim_prefix}ansi_blue]{blend:.2f}[/]"
+        )
 
     def _render_gen_config(self) -> None:
         gen = self._gen_config_widget

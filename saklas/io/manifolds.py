@@ -30,10 +30,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import torch
 
@@ -41,6 +42,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.manifold import BoxDomain, domain_from_spec
 from saklas.io.atomic import write_json_atomic
 from saklas.io.packs import NAME_REGEX, verify_integrity
+from saklas.io.paths import manifold_dir, manifolds_dir
 
 # Manifold artifact format version.  Decoupled from concept packs'
 # ``PACK_FORMAT_VERSION`` so the two formats can churn independently.
@@ -169,8 +171,16 @@ class ManifoldFolder:
         meta_path = folder / "manifold.json"
         if not meta_path.exists():
             raise ManifoldFormatError(f"no manifold.json in {folder}")
-        with open(meta_path) as f:
-            data = json.load(f)
+        try:
+            with open(meta_path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            # A malformed manifest must surface as ManifoldFormatError so
+            # callers (iter_manifold_folders, the HTTP routes) catch it
+            # rather than letting a bare JSONDecodeError become a 500.
+            raise ManifoldFormatError(
+                f"manifold.json in {folder} is unreadable: {e}"
+            ) from e
 
         fmt = data.get("format_version", 1)
         if not isinstance(fmt, int) or fmt < MANIFOLD_FORMAT_VERSION:
@@ -396,6 +406,210 @@ def _warn_authoring_quality(
                 )
 
 
+# ===================================================== discovery + authoring ===
+#
+# The functions below are the shared backend for `saklas vector manifold`
+# (CLI) and the `/saklas/v1/manifolds` HTTP routes — folder discovery and
+# the create/update authoring path live here in `io` so neither `cli` nor
+# `server` re-implements the on-disk format, and `server` need not import
+# `cli`.
+
+
+def iter_manifold_folders(
+    namespace: Optional[str] = None,
+) -> Iterator[tuple[str, "ManifoldFolder"]]:
+    """Yield ``(namespace, ManifoldFolder)`` for every installed manifold.
+
+    Walks ``~/.saklas/manifolds/<ns>/<name>/``; malformed folders are
+    skipped rather than raising, so one bad manifold does not break a
+    listing.  Optionally filtered to a single ``namespace``.
+    """
+    root = manifolds_dir()
+    if not root.exists():
+        return
+    for ns_dir in sorted(root.iterdir()):
+        if not ns_dir.is_dir():
+            continue
+        if namespace is not None and ns_dir.name != namespace:
+            continue
+        for mdir in sorted(ns_dir.iterdir()):
+            if not (mdir / "manifold.json").exists():
+                continue
+            try:
+                yield ns_dir.name, ManifoldFolder.load(mdir)
+            except ManifoldFormatError:
+                continue
+
+
+def _validate_authored_nodes(name: str, domain: Any, nodes: Any) -> None:
+    """Validate a webui/CLI-authored node list against the domain.
+
+    ``nodes`` is ``[{label, coords, statements}, ...]`` — the authoring
+    shape, statements inline (on disk they live in ``nodes/*.json``).
+    Raises :class:`ManifoldFormatError` on any problem so the caller
+    surfaces a clean 400 instead of a half-written folder.
+    """
+    n = domain.intrinsic_dim
+    floor = min_nodes(n)
+    if not isinstance(nodes, list) or len(nodes) < floor:
+        raise ManifoldFormatError(
+            f"manifold {name!r} ({n}-D domain) needs >= {floor} nodes, "
+            f"got {len(nodes) if isinstance(nodes, list) else nodes!r}"
+        )
+    labels: list[str] = []
+    for entry in nodes:
+        if not isinstance(entry, dict):
+            raise ManifoldFormatError(
+                f"manifold {name!r} node {entry!r} must be an object"
+            )
+        label = entry.get("label")
+        if not isinstance(label, str) or not NAME_REGEX.match(label):
+            raise ManifoldFormatError(
+                f"manifold {name!r} node label {label!r} invalid; "
+                f"must match {NAME_REGEX.pattern}"
+            )
+        coords = entry.get("coords")
+        if (
+            not isinstance(coords, list)
+            or len(coords) != n
+            or not all(isinstance(c, (int, float)) for c in coords)
+        ):
+            raise ManifoldFormatError(
+                f"manifold {name!r} node {label!r} needs 'coords' of "
+                f"{n} number(s), got {coords!r}"
+            )
+        statements = entry.get("statements")
+        if (
+            not isinstance(statements, list)
+            or not statements
+            or not all(isinstance(s, str) and s.strip() for s in statements)
+        ):
+            raise ManifoldFormatError(
+                f"manifold {name!r} node {label!r} needs a non-empty list "
+                f"of non-blank statement strings"
+            )
+        labels.append(label)
+    if len(set(labels)) != len(labels):
+        raise ManifoldFormatError(f"manifold {name!r} has duplicate node labels")
+
+
+def _write_node_corpus(folder: Path, nodes: list[dict[str, Any]]) -> None:
+    """(Re)write the ``nodes/`` corpus from an authored node list.
+
+    Staged: the new corpus is written to ``nodes.staging/`` in full,
+    then swapped in.  A write or IO error mid-corpus therefore leaves
+    the existing ``nodes/`` untouched rather than half-rewritten — the
+    destructive window shrinks to one ``rmtree`` + one ``rename``.
+    """
+    nodes_dir = folder / "nodes"
+    staging = folder / "nodes.staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    for idx, entry in enumerate(nodes):
+        write_json_atomic(
+            staging / _node_filename(idx, entry["label"]),
+            [str(s) for s in entry["statements"]],
+        )
+    if nodes_dir.exists():
+        shutil.rmtree(nodes_dir)
+    staging.rename(nodes_dir)
+
+
+def _load_with_advisories(folder: Path) -> tuple["ManifoldFolder", list[str]]:
+    """Load a manifold folder, returning it plus any authoring-quality warnings."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mf = ManifoldFolder.load(folder)
+    return mf, [str(w.message) for w in caught]
+
+
+def create_manifold_folder(
+    namespace: str,
+    name: str,
+    description: str,
+    domain_spec: dict[str, Any],
+    nodes: list[dict[str, Any]],
+) -> tuple[Path, list[str]]:
+    """Author a fresh manifold artifact folder on disk.
+
+    ``domain_spec`` is the ``manifold.json`` ``domain`` tagged union;
+    ``nodes`` is ``[{label, coords, statements}, ...]``.  Writes
+    ``manifold.json`` (with an empty ``files`` manifest — there are no
+    fitted tensors yet; ``fit`` back-fills it) and the ``nodes/`` corpus.
+    Returns ``(folder, advisories)`` where ``advisories`` are the soft
+    poisedness/flat-axis warnings so the UI can flag a deficient layout
+    before a fit is paid for.
+
+    Raises :class:`ManifoldFormatError` on any validation failure and
+    :class:`FileExistsError` when a manifold already lives at the path.
+    """
+    if not NAME_REGEX.match(name):
+        raise ManifoldFormatError(
+            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
+        )
+    if not NAME_REGEX.match(namespace):
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} invalid; "
+            f"must match {NAME_REGEX.pattern}"
+        )
+    try:
+        domain = domain_from_spec(domain_spec)
+    except (ValueError, KeyError) as e:
+        raise ManifoldFormatError(f"invalid manifold domain: {e}") from e
+    _validate_authored_nodes(name, domain, nodes)
+
+    folder = manifold_dir(namespace, name)
+    if (folder / "manifold.json").exists():
+        raise FileExistsError(f"manifold {namespace}/{name} already exists")
+
+    folder.mkdir(parents=True, exist_ok=True)
+    _write_node_corpus(folder, nodes)
+    payload: dict[str, Any] = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": description,
+        "domain": domain.to_spec(),
+        "nodes": [
+            {"label": entry["label"], "coords": [float(c) for c in entry["coords"]]}
+            for entry in nodes
+        ],
+        "files": {},
+    }
+    write_json_atomic(folder / "manifold.json", payload)
+
+    _, advisories = _load_with_advisories(folder)
+    return folder, advisories
+
+
+def update_manifold_folder(
+    folder: Path,
+    *,
+    description: Optional[str] = None,
+    nodes: Optional[list[dict[str, Any]]] = None,
+) -> tuple[Path, list[str]]:
+    """Re-author an existing manifold folder.
+
+    ``nodes``, when given, fully replaces the node list (labels, coords
+    and corpus).  Existing fitted tensors are left in place — they become
+    stale (``nodes_sha256`` no longer matches) and the next fit overwrites
+    them.  Returns ``(folder, advisories)``.
+    """
+    folder = Path(folder)
+    mf = ManifoldFolder.load(folder)
+    if description is not None:
+        mf.description = description
+    if nodes is not None:
+        domain = domain_from_spec(mf.domain)
+        _validate_authored_nodes(mf.name, domain, nodes)
+        _write_node_corpus(folder, nodes)
+        mf.node_labels = [entry["label"] for entry in nodes]
+        mf.node_coords = [[float(c) for c in entry["coords"]] for entry in nodes]
+    mf.write_metadata()
+    _, advisories = _load_with_advisories(folder)
+    return folder, advisories
+
+
 __all__ = [
     "MANIFOLD_FORMAT_VERSION",
     "min_nodes",
@@ -403,4 +617,7 @@ __all__ = [
     "ManifoldSidecar",
     "ManifoldFolder",
     "hash_manifold_files",
+    "iter_manifold_folders",
+    "create_manifold_folder",
+    "update_manifold_folder",
 ]

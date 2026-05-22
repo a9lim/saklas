@@ -18,11 +18,14 @@ import type {
   FilterMatchesJSON,
   InstallPackRequest,
   InstallPackResponse,
+  CreateManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
   LoadVectorRequest,
   LoomNodeJSON,
   LoomTreeJSON,
+  ManifoldInfo,
+  ManifoldListResponse,
   MergeVectorRequest,
   MergeVectorResponse,
   NodeDiffJSON,
@@ -36,6 +39,7 @@ import type {
   SessionInfo,
   TraitsEvent,
   TranscriptLoadResponseJSON,
+  UpdateManifoldRequest,
   VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
@@ -50,6 +54,7 @@ export type {
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
+  CreateManifoldRequest,
   DeletePackResponse,
   ExperimentFanRequest,
   ExperimentFanResponse,
@@ -63,6 +68,8 @@ export type {
   LoadVectorRequest,
   LoomNodeJSON,
   LoomTreeJSON,
+  ManifoldInfo,
+  ManifoldListResponse,
   MergeVectorRequest,
   MergeVectorResponse,
   NodeDiffJSON,
@@ -76,6 +83,7 @@ export type {
   SessionInfo,
   TraitsEvent,
   TranscriptLoadResponseJSON,
+  UpdateManifoldRequest,
   VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
@@ -102,6 +110,7 @@ export const API = `/saklas/v1/sessions/${SESSION}`;
 
 const SESSION_BASE = (id: string = SESSION) => `/saklas/v1/sessions/${id}`;
 const PACKS_BASE = "/saklas/v1/packs";
+const MANIFOLDS_BASE = "/saklas/v1/manifolds";
 
 // --------------------------------------------------------- auth --
 
@@ -282,6 +291,26 @@ export const apiVectors = {
   extract(req: ExtractRequest, id: string = SESSION): Promise<ExtractResponse> {
     return request(`${SESSION_BASE(id)}/extract`, jsonBody(req));
   },
+  /** Generate (without committing) the scenario + contrastive-pair
+   *  authoring steps for a pole pair.  Side-effect-free — lets the
+   *  ExtractDrawer surface the LLM-generated pairs for editing before
+   *  the user commits them through ``/extract``. */
+  previewPairs(
+    req: {
+      concept: string;
+      baseline?: string | null;
+      n_pairs?: number;
+      n_scenarios?: number;
+    },
+    id: string = SESSION,
+  ): Promise<{
+    concept: string;
+    baseline: string | null;
+    scenarios: string[];
+    pairs: { positive: string; negative: string }[];
+  }> {
+    return request(`${SESSION_BASE(id)}/extract/preview`, jsonBody(req));
+  },
   merge(
     req: MergeVectorRequest,
     id: string = SESSION,
@@ -384,6 +413,90 @@ export const apiPacks = {
     );
   },
 };
+
+// ========================================================== manifolds ==
+
+/** Steering-manifold endpoints — top-level (not session-scoped), like
+ *  packs.  All routes 404 on servers that pre-date the manifold HTTP
+ *  surface; callers should catch ``ApiError`` with status 404 and treat
+ *  manifolds as unavailable. */
+export const apiManifolds = {
+  list(): Promise<ManifoldListResponse> {
+    return request(MANIFOLDS_BASE);
+  },
+  get(namespace: string, name: string): Promise<ManifoldInfo> {
+    return request(
+      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+    );
+  },
+  /** Create a manifold folder.  Response is the detail shape plus an
+   *  ``advisories`` list of soft poisedness warnings. */
+  create(
+    req: CreateManifoldRequest,
+  ): Promise<ManifoldInfo & { advisories: string[] }> {
+    return request(MANIFOLDS_BASE, jsonBody(req));
+  },
+  update(
+    namespace: string,
+    name: string,
+    req: UpdateManifoldRequest,
+  ): Promise<ManifoldInfo> {
+    return request(
+      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { ...jsonBody(req), method: "PATCH" },
+    );
+  },
+  delete(
+    namespace: string,
+    name: string,
+  ): Promise<{ namespace: string; name: string; removed: boolean }> {
+    return request(
+      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
+  },
+};
+
+/** Streaming manifold fit — mirrors ``apiExtractStream``.  ``done``
+ *  data carries the detail shape plus ``layers_fitted`` /
+ *  ``feature_space``; ``progress`` events fire as the pipeline runs;
+ *  ``error`` data carries ``message`` + ``code`` (the engine emits
+ *  ``PoisednessError`` for an RBF poisedness failure). */
+export async function apiManifoldFitStream(
+  namespace: string,
+  name: string,
+  body: { sae?: string | null; sae_revision?: string | null },
+  onEvent: (ev: { event: string; data: unknown }) => void,
+): Promise<ManifoldInfo> {
+  const path = `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/fit`;
+  const r = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const { text, json } = await parseBody(r);
+    throw new ApiError(r.status, path, text, json);
+  }
+  if (!r.body) throw new Error("manifold fit: server returned no SSE body");
+  let final: ManifoldInfo | null = null;
+  let lastError: string | null = null;
+  for await (const evt of consumeSse(r.body)) {
+    onEvent(evt);
+    if (evt.event === "done" && evt.data && typeof evt.data === "object") {
+      final = evt.data as ManifoldInfo;
+    } else if (evt.event === "error") {
+      lastError =
+        (evt.data as { message?: string } | null)?.message ?? "fit failed";
+    }
+  }
+  if (lastError) throw new Error(lastError);
+  if (!final) throw new Error("manifold fit: stream ended without done event");
+  return final;
+}
 
 // ============================================================ extract ==
 

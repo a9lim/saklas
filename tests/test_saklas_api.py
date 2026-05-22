@@ -36,6 +36,7 @@ def _mock_session():
     session.vectors = {}
     session.probes = {}
     session.history = []
+    session._manifolds = {}
 
     monitor = MagicMock()
     monitor.probe_names = []
@@ -321,7 +322,13 @@ class TestExtract:
         profile = Profile({0: torch.ones(4)})
 
         def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
-            assert source == [("positive text", "negative text")]
+            # A {pairs:[...]} payload coerces to a DataSource carrying the
+            # request's name — not a bare list, which the pipeline would
+            # name "custom" and collide on disk.
+            from saklas.io.datasource import DataSource
+            assert isinstance(source, DataSource)
+            assert source.pairs == [("positive text", "negative text")]
+            assert source.name == "custom"
             assert baseline is None
             assert on_progress is not None
             on_progress("progress")
@@ -347,6 +354,33 @@ class TestExtract:
         data = resp.json()
         assert data["canonical"] == "custom"
         assert data["progress"] == ["progress"]
+
+    def test_extract_json_coerces_single_pair_dict(self, session_and_client):
+        # A bare {positive, negative} object — not wrapped in {"pairs": ...}
+        # — coerces to a one-pair DataSource carrying the request name.
+        import torch
+        from saklas.core.profile import Profile
+        session, client = session_and_client
+        profile = Profile({0: torch.ones(4)})
+
+        def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
+            from saklas.io.datasource import DataSource
+            assert isinstance(source, DataSource)
+            assert source.pairs == [("pos one", "neg one")]
+            assert source.name == "mood"
+            return "mood", profile
+
+        session.extract.side_effect = _extract
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={
+                "name": "mood",
+                "source": {"positive": "pos one", "negative": "neg one"},
+                "register": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["canonical"] == "mood"
 
 
 # ---- WebSocket token+probe co-stream ------------------------------------
@@ -1215,3 +1249,154 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
     assert (concept_folder / "m.safetensors").exists()
     # No _sae-* files
     assert not list(concept_folder.glob("*_sae-*.safetensors"))
+
+
+# ---- extract preview + manifold routes ----------------------------------
+
+
+class TestExtractPreview:
+    def test_preview_returns_pairs(self, session_and_client):
+        session, client = session_and_client
+        session.generate_scenarios.return_value = ["a quiet morning", "a storm"]
+
+        def _pairs(concept, baseline=None, *args, scenarios=None,
+                   on_progress=None, **_kw):
+            assert concept == "calm"
+            assert baseline == "anxious"
+            if on_progress:
+                on_progress("generating pairs")
+            return [("I feel calm.", "I feel anxious."),
+                    ("Steady hands.", "Shaking hands.")]
+
+        session.generate_pairs.side_effect = _pairs
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract/preview",
+            json={"concept": "calm", "baseline": "anxious"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["concept"] == "calm"
+        assert data["scenarios"] == ["a quiet morning", "a storm"]
+        assert data["pairs"][0] == {
+            "positive": "I feel calm.", "negative": "I feel anxious.",
+        }
+
+    def test_preview_rejects_empty_concept(self, session_and_client):
+        _session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract/preview",
+            json={"concept": "   "},
+        )
+        assert resp.status_code == 400
+
+
+def _box1d_payload(name="mood"):
+    return {
+        "namespace": "local",
+        "name": name,
+        "description": "a mood axis",
+        "domain": {
+            "type": "box",
+            "axes": [{"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}],
+        },
+        "nodes": [
+            {"label": "calm", "coords": [0.0],
+             "statements": ["I am calm.", "Steady."]},
+            {"label": "mid", "coords": [0.5],
+             "statements": ["An ordinary moment.", "Nothing notable."]},
+            {"label": "afraid", "coords": [1.0],
+             "statements": ["I am afraid.", "Shaking."]},
+        ],
+    }
+
+
+class TestManifoldRoutes:
+    def test_create_list_get(self, session_and_client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+
+        resp = client.post("/saklas/v1/manifolds", json=_box1d_payload())
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["name"] == "mood"
+        assert body["intrinsic_dim"] == 1
+        assert body["min_nodes"] == 3
+        assert body["fitted_for_session"] is False
+        assert "advisories" in body
+
+        listed = client.get("/saklas/v1/manifolds").json()["manifolds"]
+        assert [m["name"] for m in listed] == ["mood"]
+
+        detail = client.get("/saklas/v1/manifolds/local/mood").json()
+        labels = [n["label"] for n in detail["nodes"]]
+        assert labels == ["calm", "mid", "afraid"]
+        assert detail["nodes"][0]["statements"] == ["I am calm.", "Steady."]
+
+    def test_create_conflict(self, session_and_client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        assert client.post("/saklas/v1/manifolds",
+                           json=_box1d_payload()).status_code == 201
+        assert client.post("/saklas/v1/manifolds",
+                           json=_box1d_payload()).status_code == 409
+
+    def test_create_too_few_nodes(self, session_and_client, tmp_path,
+                                  monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        payload = _box1d_payload()
+        payload["nodes"] = payload["nodes"][:2]
+        assert client.post("/saklas/v1/manifolds",
+                           json=payload).status_code == 400
+
+    def test_patch_description(self, session_and_client, tmp_path,
+                               monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        client.post("/saklas/v1/manifolds", json=_box1d_payload())
+        resp = client.patch("/saklas/v1/manifolds/local/mood",
+                             json={"description": "edited"})
+        assert resp.status_code == 200
+        assert resp.json()["description"] == "edited"
+
+    def test_delete(self, session_and_client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        client.post("/saklas/v1/manifolds", json=_box1d_payload())
+        assert client.delete(
+            "/saklas/v1/manifolds/local/mood").status_code == 200
+        assert client.get(
+            "/saklas/v1/manifolds/local/mood").status_code == 404
+
+    def test_get_missing(self, session_and_client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        assert client.get(
+            "/saklas/v1/manifolds/local/ghost").status_code == 404
+
+    def test_delete_refuses_when_busy(self, session_and_client, tmp_path,
+                                      monkeypatch):
+        # A fit thread holding the engine gen-lock must block a delete —
+        # removing nodes/ mid-fit would corrupt the read.
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        session, client = session_and_client
+        client.post("/saklas/v1/manifolds", json=_box1d_payload())
+        session._gen_lock.acquire.return_value = False
+        assert client.delete(
+            "/saklas/v1/manifolds/local/mood").status_code == 409
+
+    def test_fit_json(self, session_and_client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        session, client = session_and_client
+        client.post("/saklas/v1/manifolds", json=_box1d_payload())
+
+        from unittest.mock import MagicMock as _MM
+        session.extract_manifold.return_value = _MM(
+            layers={0: 1, 1: 1, 2: 1}, feature_space="raw",
+        )
+        resp = client.post("/saklas/v1/manifolds/local/mood/fit", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["done"] is True
+        assert body["layers_fitted"] == 3
+        assert body["feature_space"] == "raw"

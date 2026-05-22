@@ -4,20 +4,32 @@
 //
 //   expr     := term (("+" | "-") term)*
 //   term     := [coeff "*"?] ["!"] selector ["@" trigger]
-//   selector := atom (("~" | "|") atom)?
+//   selector := atom (("~" | "|") atom | "%" coord_list)?
+//   coord_list := signed_num ("," signed_num)*
 //   atom     := [ns "/"] NAME ["." NAME] [":" variant]
 //   trigger  := before|after|both|thinking|response|prompt|generated
 //   variant  := raw | sae | sae-<release>
 //
-// The rack is the source of truth — VectorRackEntry stores α, trigger,
-// variant, projection, ablate, enabled.  serializeExpression emits the
-// canonical string the server's parser accepts; parseExpression hydrates
-// a fresh rack Map from a pasted expression.
+// A ``%`` selector is the manifold operator — ``<manifold> % a,b,...``
+// places generation at a point of a fitted steering manifold.  The
+// coefficient is the blend fraction.
 //
-// Round-trip property: parseExpression(serializeExpression(rack)) === rack
-// for any disabled-stripped rack the parser can express.
+// The racks are the source of truth — VectorRackEntry stores α, trigger,
+// variant, projection, ablate, enabled; ManifoldRackEntry stores blend,
+// coords, trigger, enabled.  serializeExpression emits the canonical
+// string the server's parser accepts; parseExpression hydrates fresh
+// rack Maps from a pasted expression.
+//
+// Round-trip property: parseExpression(serializeExpression(v, m)) ===
+// {v, m} for any disabled-stripped racks the parser can express.
 
-import type { ProjectionSpec, Trigger, Variant, VectorRackEntry } from "./types";
+import type {
+  ManifoldRackEntry,
+  ProjectionSpec,
+  Trigger,
+  Variant,
+  VectorRackEntry,
+} from "./types";
 
 // ----------------------------------------------- triggers ----------------
 
@@ -68,15 +80,23 @@ export class ExpressionParseError extends Error {
 
 // ----------------------------------------------- formatter ---------------
 
-/** Render the rack as a canonical expression string.  Disabled entries
- * are skipped.  Empty/all-disabled rack returns "". */
+/** Render the racks as a canonical expression string.  Disabled
+ * entries are skipped; manifold terms are emitted after vector terms.
+ * Empty/all-disabled racks return "". */
 export function serializeExpression(
   rack: Map<string, VectorRackEntry>,
+  manifolds?: Map<string, ManifoldRackEntry>,
 ): string {
   const parts: string[] = [];
   for (const [name, entry] of rack) {
     if (!entry.enabled) continue;
     parts.push(formatTerm(name, entry));
+  }
+  if (manifolds) {
+    for (const [name, entry] of manifolds) {
+      if (!entry.enabled) continue;
+      parts.push(formatManifoldTerm(name, entry));
+    }
   }
   if (parts.length === 0) return "";
   // First term keeps its leading sign verbatim; subsequent terms join
@@ -127,6 +147,15 @@ function formatTriggerSuffix(trigger: Trigger): string {
   return kw ? `@${kw}` : "";
 }
 
+/** Render one manifold rack entry — ``<coeff> <name>%<c0,c1,...>`` plus
+ *  an optional ``@trigger`` suffix.  The coefficient is the blend
+ *  fraction; ``-`` rides the joiner like vector terms. */
+function formatManifoldTerm(name: string, entry: ManifoldRackEntry): string {
+  const coords = entry.coords.map((c) => formatCoeff(c)).join(",");
+  const selector = `${name}%${coords}`;
+  return `${formatCoeff(entry.blend)} ${selector}${formatTriggerSuffix(entry.trigger)}`;
+}
+
 // ----------------------------------------------- lexer -------------------
 
 interface Tok {
@@ -148,6 +177,8 @@ type TokKind =
   | "TILDE"
   | "ORTHO"
   | "BANG"
+  | "PERCENT"
+  | "COMMA"
   | "EOF";
 
 const SINGLE_CHAR: Record<string, TokKind> = {
@@ -161,6 +192,8 @@ const SINGLE_CHAR: Record<string, TokKind> = {
   "~": "TILDE",
   "|": "ORTHO",
   "!": "BANG",
+  "%": "PERCENT",
+  ",": "COMMA",
 };
 
 const NUM_RE = /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/;
@@ -241,13 +274,29 @@ interface Selector {
   onto: Atom | null;
 }
 
-interface Term {
+/** A vector term — the classic coeff·selector·trigger shape. */
+interface VectorTerm {
+  kind: "vector";
   coeff: number;
   selector: Selector;
   trigger: string | null;
   explicitCoeff: boolean;
   ablation: boolean;
 }
+
+/** A manifold term — ``<coeff> <name>%<coords>``.  Discriminated off
+ *  ``kind`` so ``parseExpression`` can fold the two streams into their
+ *  respective racks. */
+interface ManifoldTerm {
+  kind: "manifold";
+  /** Display name of the manifold (``ns/name`` or bare ``name``). */
+  name: string;
+  coeff: number;
+  coords: number[];
+  trigger: string | null;
+}
+
+type Term = VectorTerm | ManifoldTerm;
 
 class Parser {
   private pos = 0;
@@ -306,26 +355,85 @@ class Parser {
       ablation = true;
       if (!explicit) coeff = sign * DEFAULT_ABLATION_COEFF;
     }
-    const selector = this.selector();
-    let trigger: string | null = null;
-    if (this.peek().kind === "AT") {
-      this.consume();
-      const tok = this.expect("IDENT");
-      trigger = String(tok.value);
-      if (!(trigger in KEYWORD_TO_TRIGGER)) {
-        const valid = Object.keys(KEYWORD_TO_TRIGGER).sort().join(", ");
+    // Parse the base atom up front so a trailing ``%`` can fork into the
+    // manifold production before the vector projection grammar runs.
+    const base = this.atom();
+
+    if (this.peek().kind === "PERCENT") {
+      if (ablation) {
+        const t = this.peek();
         throw new ExpressionParseError(
-          `unknown trigger '@${trigger}'; valid: ${valid}`,
+          "manifold terms ('%') do not compose with ablation ('!')",
           this.src,
-          tok.col,
+          t.col,
         );
       }
+      this.consume(); // '%'
+      const coords = this.coordList();
+      const trigger = this.optTrigger();
+      return {
+        kind: "manifold",
+        name: atomKey(base),
+        coeff,
+        coords,
+        trigger,
+      };
     }
-    return { coeff, selector, trigger, explicitCoeff: explicit, ablation };
+
+    const selector = this.selector(base);
+    const trigger = this.optTrigger();
+    return {
+      kind: "vector",
+      coeff,
+      selector,
+      trigger,
+      explicitCoeff: explicit,
+      ablation,
+    };
   }
 
-  private selector(): Selector {
-    const base = this.atom();
+  /** Parse an optional ``@trigger`` suffix. */
+  private optTrigger(): string | null {
+    if (this.peek().kind !== "AT") return null;
+    this.consume();
+    const tok = this.expect("IDENT");
+    const trigger = String(tok.value);
+    if (!(trigger in KEYWORD_TO_TRIGGER)) {
+      const valid = Object.keys(KEYWORD_TO_TRIGGER).sort().join(", ");
+      throw new ExpressionParseError(
+        `unknown trigger '@${trigger}'; valid: ${valid}`,
+        this.src,
+        tok.col,
+      );
+    }
+    return trigger;
+  }
+
+  /** Parse a non-empty comma-separated list of signed numbers — the
+   *  manifold authoring coordinates.  A leading ``-`` is a sign on the
+   *  number, not a term joiner, since this only runs right after ``%``. */
+  private coordList(): number[] {
+    const out: number[] = [this.signedNum()];
+    while (this.peek().kind === "COMMA") {
+      this.consume();
+      out.push(this.signedNum());
+    }
+    return out;
+  }
+
+  private signedNum(): number {
+    let sign = 1;
+    if (this.peek().kind === "MINUS") {
+      this.consume();
+      sign = -1;
+    } else if (this.peek().kind === "PLUS") {
+      this.consume();
+    }
+    const tok = this.expect("NUM");
+    return sign * (tok.value as number);
+  }
+
+  private selector(base: Atom): Selector {
     if (this.peek().kind === "TILDE" || this.peek().kind === "ORTHO") {
       const opTok = this.consume();
       const operator: "~" | "|" = opTok.kind === "TILDE" ? "~" : "|";
@@ -387,20 +495,50 @@ function atomKey(atom: Atom): string {
   return atom.namespace ? `${atom.namespace}/${atom.concept}` : atom.concept;
 }
 
-/** Hydrate a rack Map from an expression string.  Rack keys use the
- * atom's display form (ns/foo, happy.sad) — variants live on the
- * entry, not in the key, so two terms differing only by variant collide
- * (matching the saklas parser's Steering.alphas semantics; users wanting
- * both should ablate-or-merge explicitly). */
-export function parseExpression(expr: string): Map<string, VectorRackEntry> {
+/** Result of {@link parseExpression} — the two racks a pasted
+ *  expression hydrates: classic vector terms plus manifold (``%``)
+ *  terms. */
+export interface ParsedExpression {
+  vectors: Map<string, VectorRackEntry>;
+  manifolds: Map<string, ManifoldRackEntry>;
+}
+
+/** Hydrate the vector + manifold racks from an expression string.
+ *  Vector rack keys use the atom's display form (ns/foo, happy.sad) —
+ *  variants live on the entry, not in the key, so two terms differing
+ *  only by variant collide (matching the saklas parser's
+ *  Steering.alphas semantics; users wanting both should ablate-or-merge
+ *  explicitly).  Manifold rack keys are the manifold display name. */
+export function parseExpression(expr: string): ParsedExpression {
   if (!expr || !expr.trim()) {
     throw new ExpressionParseError("empty steering expression", expr, null);
   }
   const toks = lex(expr);
   const terms = new Parser(toks, expr).parse();
   const rack = new Map<string, VectorRackEntry>();
+  const manifolds = new Map<string, ManifoldRackEntry>();
 
   for (const term of terms) {
+    if (term.kind === "manifold") {
+      const trigger: Trigger = term.trigger
+        ? KEYWORD_TO_TRIGGER[term.trigger]
+        : "BOTH";
+      const existing = manifolds.get(term.name);
+      if (existing) {
+        throw new ExpressionParseError(
+          `manifold '${term.name}' appears more than once`,
+          expr,
+          null,
+        );
+      }
+      manifolds.set(term.name, {
+        blend: term.coeff,
+        coords: term.coords,
+        trigger,
+        enabled: true,
+      });
+      continue;
+    }
     const sel = term.selector;
     const baseKey = atomKey(sel.base);
     const trigger: Trigger = term.trigger
@@ -439,7 +577,7 @@ export function parseExpression(expr: string): Map<string, VectorRackEntry> {
 
     mergePlain(rack, baseKey, term.coeff, trigger, sel.base.variant);
   }
-  return rack;
+  return { vectors: rack, manifolds };
 }
 
 function mergePlain(

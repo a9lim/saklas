@@ -38,6 +38,8 @@
   const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
     "vectors",
     "extract",
+    "manifolds",
+    "manifold_builder",
     "load",
     "merge",
     "clone",
@@ -213,6 +215,10 @@
             <Drawers.Vectors params={drawerState.params} />
           {:else if drawerState.open === "extract"}
             <Drawers.Extract params={drawerState.params} />
+          {:else if drawerState.open === "manifolds"}
+            <Drawers.Manifolds params={drawerState.params} />
+          {:else if drawerState.open === "manifold_builder"}
+            <Drawers.ManifoldBuilder params={drawerState.params} />
           {:else if drawerState.open === "save_conversation"}
             <Drawers.SaveConversation params={drawerState.params} />
           {:else if drawerState.open === "load_conversation"}

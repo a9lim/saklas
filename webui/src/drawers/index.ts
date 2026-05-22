@@ -24,6 +24,8 @@
 export { default as Load } from "./LoadDrawer.svelte";
 export { default as Vectors } from "./VectorsDrawer.svelte";
 export { default as Extract } from "./ExtractDrawer.svelte";
+export { default as Manifolds } from "./ManifoldDrawer.svelte";
+export { default as ManifoldBuilder } from "./ManifoldBuilderDrawer.svelte";
 export { default as SaveConversation } from "./SaveConversationDrawer.svelte";
 export { default as LoadConversation } from "./LoadConversationDrawer.svelte";
 export { default as Compare } from "./CompareDrawer.svelte";

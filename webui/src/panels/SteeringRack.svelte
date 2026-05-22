@@ -1,10 +1,12 @@
 <script lang="ts">
   // The steering rack — section header, one VectorStrip per loaded
-  // vector (alphabetized for stable ordering across re-renders), and
-  // the + add steering action button.
+  // vector, one ManifoldStrip per racked manifold (both alphabetized
+  // for stable ordering), and the + add steering / + add manifold
+  // action buttons.
 
   import VectorStrip from "./VectorStrip.svelte";
-  import { vectorRack, openDrawer } from "../lib/stores.svelte";
+  import ManifoldStrip from "./ManifoldStrip.svelte";
+  import { vectorRack, manifoldRack, openDrawer } from "../lib/stores.svelte";
 
   // Reactive entries — sorted alphabetically by name for stable order.
   // The Map iteration order tracks insertion which makes the rack
@@ -15,7 +17,15 @@
     return arr;
   });
 
-  const count = $derived(sortedEntries.length);
+  const sortedManifolds = $derived.by(() => {
+    const arr = [...manifoldRack.entries.entries()];
+    arr.sort((a, b) => a[0].localeCompare(b[0]));
+    return arr;
+  });
+
+  const vectorCount = $derived(sortedEntries.length);
+  const manifoldCount = $derived(sortedManifolds.length);
+  const count = $derived(vectorCount + manifoldCount);
 </script>
 
 <section class="rack" aria-label="Steering rack">
@@ -24,7 +34,7 @@
       <span class="title">STEERING</span>
     </div>
     <span class="count" aria-live="polite">
-      {count} vector{count === 1 ? "" : "s"}
+      {count} term{count === 1 ? "" : "s"}
     </span>
   </header>
 
@@ -47,6 +57,9 @@
       {#each sortedEntries as [name, entry] (name)}
         <VectorStrip {name} {entry} />
       {/each}
+      {#each sortedManifolds as [name, entry] (name)}
+        <ManifoldStrip {name} {entry} />
+      {/each}
     {/if}
   </div>
 
@@ -59,6 +72,14 @@
         title="Browse the concept catalog or extract a custom vector"
       >
         + add steering
+      </button>
+      <button
+        type="button"
+        class="add-manifold"
+        onclick={() => openDrawer("manifolds")}
+        title="Rack a fitted steering manifold or build a new one"
+      >
+        + add manifold
       </button>
     </div>
   {/if}
@@ -151,6 +172,8 @@
     flex: 0 0 auto;
     border-top: 1px solid var(--border);
     padding-top: var(--space-4);
+    display: flex;
+    gap: var(--space-2);
   }
   /* Primary entry point — the one obvious way to add a steering vector. */
   .add-steering {
@@ -167,11 +190,33 @@
     cursor: pointer;
     transition: background var(--dur) var(--ease-out);
   }
+  .actions .add-steering {
+    flex: 1 1 0;
+  }
   .empty .add-steering {
     width: auto;
     min-width: 14em;
   }
   .add-steering:hover {
     background: var(--accent-glow);
+  }
+  /* Manifold launcher — purple-tinted to echo the manifold strip's
+   * accent so the two surfaces read as one feature. */
+  .add-manifold {
+    flex: 1 1 0;
+    background: rgba(167, 139, 250, 0.10);
+    color: var(--accent-purple);
+    border: 1px solid var(--border);
+    min-height: 2.1rem;
+    padding: var(--space-4) var(--space-5);
+    border-radius: var(--radius);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease-out);
+  }
+  .add-manifold:hover {
+    background: rgba(167, 139, 250, 0.18);
   }
 </style>

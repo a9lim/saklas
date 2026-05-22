@@ -56,7 +56,7 @@
       return;
     }
     try {
-      const rack: Map<string, VectorRackEntry> = parseExpression(expr);
+      const { vectors: rack } = parseExpression(expr);
       preview = serializeExpression(rack);
       parseError = null;
       parseCol = null;
@@ -90,7 +90,7 @@
     if (!expr) return;
     let rack: Map<string, VectorRackEntry>;
     try {
-      rack = parseExpression(expr);
+      rack = parseExpression(expr).vectors;
     } catch {
       return;
     }

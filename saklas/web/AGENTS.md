@@ -31,7 +31,8 @@ The dashboard speaks the native `/saklas/v1/*` API (`saklas/server/saklas_api.py
 - **GET `/sessions/{id}/vectors/pairwise?a=…&b=…`** — cross-layer cosine matrix between two named vectors / probes. Distinct from `correlation`: one pair, two-axis matrix indexed by layer rather than by name; backs the pairwise-compare analysis drawer. Registered *before* `GET /vectors/{name}` so the literal path wins the routing match.
 - **GET `/sessions/{id}/vectors/{name}/diagnostics`** — 16-bucket layer-magnitude histogram + per-layer magnitudes; falls back to monitor profiles when `name` is a probe.
 - **GET `/packs`**, **GET `/packs/search?q=…`**, **POST `/packs`** — installed packs, HF Hub search proxy, install.
-- **POST `/sessions/{id}/vectors/merge`**, **POST `/sessions/{id}/vectors/clone`** (SSE progress on `Accept: text/event-stream`), **POST `/sessions/{id}/extract`** (SSE).
+- **`/manifolds`** — `GET` list (with `fitted_for_session` / `stale` per manifold), `GET /{ns}/{name}` detail (nodes + statements), `POST` create, `PATCH /{ns}/{name}`, `DELETE /{ns}/{name}`, `POST /{ns}/{name}/fit` (SSE). Steering a fitted manifold is just a `%` term in the WS `steering` string — no separate route.
+- **POST `/sessions/{id}/vectors/merge`**, **POST `/sessions/{id}/vectors/clone`** (SSE progress on `Accept: text/event-stream`), **POST `/sessions/{id}/extract`** (SSE). **POST `/sessions/{id}/extract/preview`** returns the LLM-generated contrastive pairs without committing, so ExtractDrawer can show them in an editable table.
 - **POST `/sessions/{id}/experiments/fan`** — alpha grid as loom siblings, JSON `RunSet` summary.
 - **Loom tree** under `/sessions/{id}/tree` — `tree`/`tree/active` GETs; `navigate`/`edit`/`branch`/`delete`/`star`/`note`/`reset` mutations; `edge_label`, `filter`, `diff`, `joint_logprobs`; `transcript` export/import.
 - **GET `/sessions/{id}/traits/stream`** — live per-token probe SSE.
@@ -63,14 +64,17 @@ webui/src/
     PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row
     Chat.svelte               # thinking-collapsible, probe-tinted tokens, inline actions (clear/save/load/transcript), status footer, pending bubbles
     SamplingStrip.svelte      # T / P / K / max / pres / freq / seed / thinking / alts + advanced/system-prompt buttons; foot of the threads column, below WorkbenchCard
-    SteeringRack.svelte       # vector strips + "+ add steering" + canonical expression
+    SteeringRack.svelte       # vector + manifold strips + "+ add steering"/"+ add manifold"
     VectorStrip.svelte        # enable + α slider + trigger + variant + projection modal
+    ManifoldStrip.svelte      # racked manifold term: position picker + blend slider + trigger
+    manifold/XYPad.svelte     # position picker: 2D xy-pad / 1D-3D sliders, periodic axes wrap
+    RawBuffer.svelte          # base-model flat completion buffer (replaces Chat's bubbles)
     ProbeRack.svelte          # probe strips + sort + "+ add probe"
     ProbeStrip.svelte         # select-for-highlight + sparkline + per-layer reading strip
     loom/{LoomSidebar,LoomNode,LoomEdge}.svelte  # permanent "threads" column
   drawers/
     {Load,SaveConversation,LoadConversation,Compare,SystemPrompt,
-     Help,Export,Pack,Merge,Clone,Vectors,Extract,
+     Help,Export,Pack,Merge,Clone,Vectors,Extract,Manifold,ManifoldBuilder,
      TokenDrilldown,ExperimentLab,ActivationAtlas,RecipeBuilder,
      AdvancedSampling,Health,SessionAdmin,Correlation,LayerNorms,
      NodeCompare,Transcript}Drawer.svelte
@@ -84,7 +88,13 @@ webui/src/
 
 Delete uses a 2-step confirm — first click flips the button label to `confirm?` for ~3 s, second commits.  No native dialog.
 
-`ExtractDrawer` is the custom-vector form, reached from the `+ custom vector` button at the top of VectorsDrawer.  It takes two concept slots (A required, B optional) plus an advanced-options collapsible (method / SAE / DLS); manual `{positive, negative}` pair text is intentionally not exposed — the server still accepts it via the REST API but the UI confines users to slug-based extraction so the picker is the source of truth.  `params.seed_a` pre-fills concept A from the unmatched search query.  Submission closes the form and reopens VectorsDrawer so the user lands back in the list while the sticky progress toast tracks extraction in the background.
+`ExtractDrawer` is the custom-vector form, reached from the `+ custom vector` button at the top of VectorsDrawer.  It has a `poles` / `custom` input-mode switch.  **Poles mode**: two concept slots (A required, B optional) plus an advanced-options collapsible (method / SAE / DLS); a `generate previews` button calls `/extract/preview` and drops the LLM-generated pairs into an editable pos/neg table, which the user edits before committing.  **Custom mode**: the pair table starts empty and the user types pos/neg statements directly.  Either way `submit()` sends `source: {pairs}` (empty rows trimmed) — the legacy slug-string `source` is kept only for a poles-mode submit where the user never previewed.  `params.seed_a` pre-fills concept A from the unmatched search query.  Submission closes the form and reopens VectorsDrawer while the sticky progress toast tracks extraction in the background.
+
+`ManifoldDrawer` is the manifold browser (parallel to VectorsDrawer) — Fitted manifolds get `[+steer] [delete]`, Unfitted get `[fit] [delete]` (fit drives an SSE progress toast), and a `+ build manifold` launcher opens `ManifoldBuilderDrawer`.  The builder authors a manifold in two steps: a domain step (Box 1D/2D/3D with per-axis lo/hi + open/periodic toggles, or a Sphere dim) and a node editor (label + intrinsic-dim coords + an expandable per-node statement list), validated live against `min_nodes = 2n+1` and in-domain coordinates; Save posts to `POST /manifolds`.  A racked manifold renders as a `ManifoldStrip` in `SteeringRack` (below the vector strips) carrying an `XYPad` position picker, a blend slider, and a trigger pill; the position serializes into the steering expression as a `%` term.
+
+`RawBuffer` is the base-model surface.  `SessionInfo.is_base_model` (a non-chat model has no chat template) drives `genUiMode.effectiveRawMode()`; the `genUiMode.override` (`auto`/`chat`/`raw`, persisted per `model_id`, set from the AdvancedSamplingDrawer control or the cycling badge in the Chat header) wins when not `auto`.  In raw mode `Chat.svelte` renders `<RawBuffer />` instead of role bubbles — one continuous editable `pre-wrap` surface with the loom active path joined as plain text, no roles.  "continue" generates with `raw: true` from the active leaf (the whole buffer is a prefill); a mid-buffer edit lands as a `loomEdit`/`loomBranch` first.  Toggling the mode never mutates the tree.  Per-token tinting rides a read-only mirror layer behind the transparent-text textarea (a textarea can't tint spans) and shows only when not actively editing.
+
+`lib/expression.ts` parses `%` manifold terms (`<manifold>%<coord_list>`, e.g. `0.7 circumplex%0.3,0.8@response`) alongside vector terms — `Term` is a discriminated union, `serializeExpression(vectorRack, manifoldRack?)` emits both, `parseExpression` returns `{vectors, manifolds}`.
 
 (`lib/stores.ts` is a dead legacy file — not imported anywhere; ignore it.)
 

@@ -83,6 +83,20 @@ class ExtractRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ExtractPreviewRequest(BaseModel):
+    """Request the LLM-generated contrastive pairs for review/edit.
+
+    Runs the scenario + pair generation half of the extraction pipeline
+    without committing an extraction, so the webui can show and edit the
+    pairs before they are fitted into a vector.
+    """
+
+    concept: str
+    baseline: str | None = None
+    n_pairs: int | None = None
+    n_scenarios: int | None = None
+
+
 class LoadVectorRequest(BaseModel):
     name: str
     source_path: str
@@ -341,6 +355,10 @@ def _session_info(
     except Exception:
         thinks = False
         thinks_optional = False
+    try:
+        is_base = bool(session.is_base_model)
+    except Exception:
+        is_base = False
     created = getattr(session, "_created_ts", None) or int(time.time())
     default_expr = str(default_steering) if default_steering is not None else None
     return {
@@ -355,6 +373,7 @@ def _session_info(
         "history_length": len(session.history) if hasattr(session, "history") else 0,
         "supports_thinking": thinks,
         "thinking_is_optional": thinks_optional,
+        "is_base_model": is_base,
         "default_steering": default_expr,
     }
 
@@ -442,12 +461,32 @@ def _build_steering(
     return Steering(alphas=merged, thinking=thinking)
 
 
-def _coerce_pair_source(source: Any) -> Any:
-    """Normalize JSON pair payloads into DataSource-compatible tuples."""
-    if not (isinstance(source, dict) and "pairs" in source):
+def _coerce_pair_source(source: Any, name: str) -> Any:
+    """Normalize JSON pair payloads into an extraction source.
+
+    A concept-name string passes through unchanged. A ``{pairs: [...]}``
+    object or a bare ``{positive, negative}`` object is turned into a
+    :class:`~saklas.io.datasource.DataSource` carrying ``name`` — *not*
+    a bare list. A bare list source is named ``"custom"`` by the
+    extraction pipeline regardless of the request's ``name``, so two
+    explicit-pair extractions would collide on the ``local/custom/``
+    folder and the ``"custom"`` tensor-cache key; the ``DataSource``
+    keeps each one under its own canonical name.
+    """
+    if not isinstance(source, dict):
         return source
-    pairs = []
-    for idx, pair in enumerate(source["pairs"]):
+
+    raw_pairs: list[Any]
+    if "pairs" in source:
+        raw_pairs = list(source["pairs"])
+    elif "positive" in source and "negative" in source:
+        # A bare single-pair object.
+        raw_pairs = [source]
+    else:
+        return source
+
+    pairs: list[tuple[str, str]] = []
+    for idx, pair in enumerate(raw_pairs):
         if isinstance(pair, dict):
             if "positive" not in pair or "negative" not in pair:
                 raise HTTPException(
@@ -462,7 +501,9 @@ def _coerce_pair_source(source: Any) -> Any:
                 400,
                 f"pairs[{idx}] must be a [positive, negative] pair",
             )
-    return pairs
+
+    from saklas.io.datasource import DataSource
+    return DataSource(pairs=pairs, name=name)
 
 
 def _result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
@@ -674,6 +715,11 @@ def register_saklas_routes(app: FastAPI) -> None:
     """
 
     session: SaklasSession = app.state.session
+
+    # ----- manifolds (top-level, own resource tree) ----------------------
+
+    from saklas.server.manifold_routes import register_manifold_routes
+    register_manifold_routes(app)
 
     # ----- packs (top-level, not under a session) ------------------------
 
@@ -1562,7 +1608,7 @@ def register_saklas_routes(app: FastAPI) -> None:
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
         _resolve_session_id(session, session_id)
         source: Any = req.source if req.source is not None else req.name
-        source = _coerce_pair_source(source)
+        source = _coerce_pair_source(source, req.name)
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
@@ -1696,6 +1742,120 @@ def register_saklas_routes(app: FastAPI) -> None:
             "profile": _profile_to_json(canonical, profile),
             "progress": progress_msgs,
         }
+
+    @app.post("/saklas/v1/sessions/{session_id}/extract/preview")
+    async def extract_preview(
+        session_id: str, req: ExtractPreviewRequest, request: Request,
+    ):
+        """Generate contrastive pairs for review/edit, without extracting.
+
+        Runs ``generate_scenarios`` + ``generate_pairs`` and returns the
+        pairs as JSON. The webui shows them in an editable table; the
+        user edits, then POSTs the result back to ``/extract`` as
+        ``source: {pairs: [...]}`` — which skips generation entirely.
+        Side-effect-free: no ``statements.json`` is written here.
+        """
+        _resolve_session_id(session, session_id)
+        concept = req.concept.strip()
+        if not concept:
+            raise HTTPException(400, "concept must not be empty")
+        baseline = (req.baseline or "").strip() or None
+
+        def _generate(on_progress: Callable[[str], None]) -> dict[str, Any]:
+            if req.n_scenarios and req.n_scenarios > 0:
+                scenarios = session.generate_scenarios(
+                    concept, baseline, req.n_scenarios, on_progress=on_progress,
+                )
+            else:
+                scenarios = session.generate_scenarios(
+                    concept, baseline, on_progress=on_progress,
+                )
+            if req.n_pairs and req.n_pairs > 0:
+                pairs = session.generate_pairs(
+                    concept, baseline, req.n_pairs,
+                    scenarios=scenarios, on_progress=on_progress,
+                )
+            else:
+                pairs = session.generate_pairs(
+                    concept, baseline, scenarios=scenarios,
+                    on_progress=on_progress,
+                )
+            return {
+                "concept": concept,
+                "baseline": baseline,
+                "scenarios": list(scenarios),
+                "pairs": [
+                    {"positive": pos, "negative": neg} for pos, neg in pairs
+                ],
+            }
+
+        accept = request.headers.get("accept", "application/json")
+        if "text/event-stream" in accept:
+            async def _sse():
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+
+                def _on_progress(msg: str) -> None:
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait, ("progress", msg),
+                    )
+
+                async with session.lock:
+                    async def _run() -> None:
+                        try:
+                            body = await asyncio.to_thread(
+                                _generate, _on_progress,
+                            )
+                            await asyncio.sleep(0)
+                            queue.put_nowait(("done", body))
+                        except Exception as e:  # noqa: BLE001
+                            import logging
+                            logging.getLogger("saklas.api").exception(
+                                "extract preview failed for session=%s",
+                                session_id,
+                            )
+                            queue.put_nowait((
+                                "error",
+                                {
+                                    "message": str(e) or "preview failed",
+                                    "code": type(e).__name__,
+                                },
+                            ))
+
+                    task = asyncio.create_task(_run())
+                    try:
+                        while True:
+                            item = await queue.get()
+                            kind = item[0]
+                            if kind == "progress":
+                                yield (
+                                    f"event: progress\n"
+                                    f"data: {json.dumps({'message': item[1]})}\n\n"
+                                )
+                            elif kind == "done":
+                                yield (
+                                    f"event: done\n"
+                                    f"data: {json.dumps(item[1])}\n\n"
+                                )
+                                break
+                            elif kind == "error":
+                                yield (
+                                    f"event: error\n"
+                                    f"data: {json.dumps(item[1])}\n\n"
+                                )
+                                break
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except BaseException:  # noqa: BLE001
+                                pass
+
+            return StreamingResponse(_sse(), media_type="text/event-stream")
+
+        async with session.lock:
+            return await asyncio.to_thread(_generate, lambda _msg: None)
 
     @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
     async def merge_vector(session_id: str, req: MergeVectorRequest):

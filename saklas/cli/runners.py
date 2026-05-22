@@ -1477,25 +1477,15 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
 
 
 def _iter_manifold_folders(namespace: str | None):
-    """Yield ``(namespace, ManifoldFolder)`` for every installed manifold."""
-    from saklas.io.manifolds import ManifoldFolder, ManifoldFormatError
-    from saklas.io.paths import manifolds_dir
+    """Yield ``(namespace, ManifoldFolder)`` for every installed manifold.
 
-    root = manifolds_dir()
-    if not root.exists():
-        return
-    for ns_dir in sorted(root.iterdir()):
-        if not ns_dir.is_dir():
-            continue
-        if namespace is not None and ns_dir.name != namespace:
-            continue
-        for mdir in sorted(ns_dir.iterdir()):
-            if not (mdir / "manifold.json").exists():
-                continue
-            try:
-                yield ns_dir.name, ManifoldFolder.load(mdir)
-            except ManifoldFormatError:
-                continue
+    Thin wrapper over :func:`saklas.io.manifolds.iter_manifold_folders` —
+    the discovery walk lives in ``io`` so the server shares it without
+    importing ``cli``.
+    """
+    from saklas.io.manifolds import iter_manifold_folders
+
+    yield from iter_manifold_folders(namespace)
 
 
 def _run_manifold_ls(args: argparse.Namespace) -> None:

@@ -199,6 +199,20 @@ def _build_registry() -> dict[str, SlashCommand]:
             max_args=None,
         ),
         SlashCommand(
+            name="/pairs",
+            handler=SaklasApp._handle_pairs,
+            usage="Usage: /pairs <name>",
+            min_args=1,
+            max_args=None,  # multi-word poles allowed via the period delim
+        ),
+        SlashCommand(
+            name="/manifold",
+            handler=SaklasApp._handle_manifold,
+            usage="Usage: /manifold fit <folder>",
+            min_args=1,
+            max_args=None,  # folder paths may contain whitespace
+        ),
+        SlashCommand(
             name="/seed",
             handler=SaklasApp._handle_seed,
             usage="Usage: /seed [n|clear]",

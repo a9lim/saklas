@@ -315,3 +315,35 @@ ChatPanel.ab-on .turn-col.shadow {
     height: 1;
     color: ansi_default;
 }
+
+/* Custom-pairs modal (/pairs) */
+CustomPairsModal {
+    align: center middle;
+}
+
+#pairs-modal-box {
+    width: 80%;
+    height: 70%;
+    border: round ansi_blue;
+    background: ansi_default;
+    padding: 1 2;
+}
+
+#pairs-modal-title {
+    height: 1;
+}
+
+#pairs-modal-hint {
+    height: 1;
+    color: ansi_default;
+}
+
+#pairs-modal-input {
+    height: 1fr;
+    border: round ansi_bright_black;
+}
+
+#pairs-modal-error {
+    height: auto;
+    color: ansi_red;
+}

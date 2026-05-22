@@ -36,14 +36,23 @@ Packs (top-level, not under a session):
 - `POST /saklas/v1/packs` body `{target, as?, force?, statements_only?}` — wraps `cache_ops.install` in a worker thread. `target` is an HF coord `ns/name[@rev]` or local folder. `InstallConflict` → 409, `ValueError` → 400, missing target → 404.
 - `DELETE /saklas/v1/packs/{namespace}/{name}` — wraps `cache_ops.uninstall` on the parsed selector (always `yes=True` — the fully-qualified path means no broad-selector risk). Under the session lock, detaches the concept from the rack (`session.unsteer`) before removing the folder. Response carries `{namespace, name, source, removed, rematerializes_on_restart}` — `source == "bundled"` flips the rematerialize flag so the client can pick a friendlier toast (bundled concepts respawn on next session init via `materialize_bundled`). 404 when nothing matched the selector, 409 when an in-flight extract holds the gen-lock.
 
+Manifolds (top-level, own resource tree — registered by `manifold_routes.register_manifold_routes`, called from `register_saklas_routes`):
+- `GET /saklas/v1/manifolds` — every installed manifold with domain spec, intrinsic dim, node labels/coords, `min_nodes`, `fitted_for_session` (a tensor for the loaded model exists), and `stale` (the fitted tensor's `nodes_sha256` no longer matches the corpus).
+- `GET /saklas/v1/manifolds/{ns}/{name}` — one manifold, plus per-node statements and per-tensor fit detail. 404 on missing.
+- `POST /saklas/v1/manifolds` body `{namespace, name, description, domain, nodes:[{label,coords,statements}]}` — authors the artifact via `io.manifolds.create_manifold_folder`; `domain` is box or sphere only. Returns the detail shape plus `advisories` (soft poisedness warnings). 409 on an existing folder, 400 on malformed input.
+- `PATCH /saklas/v1/manifolds/{ns}/{name}` body `{description?, nodes?}` — re-authors via `update_manifold_folder` under the session lock (serializes against an in-flight fit reading `nodes/`). Existing tensors go stale, not deleted.
+- `DELETE /saklas/v1/manifolds/{ns}/{name}` — `rmtree` the folder; 409 when an in-flight fit holds the engine gen-lock. Evicts any cached in-memory `Manifold`.
+- `POST /saklas/v1/manifolds/{ns}/{name}/fit` body `{sae?, sae_revision?}` — runs `session.extract_manifold` under the session lock; SSE progress / JSON like `/extract`. Poisedness failures from the RBF solve are a bare `ValueError` (not a `SaklasError`), caught explicitly and surfaced with `code: "PoisednessError"`. `ConcurrentExtractionError` → 409. Steering a fitted manifold needs no route — a `%` term in any steering expression loads the artifact lazily on scope entry.
+
 Sessions:
-- `GET/POST /saklas/v1/sessions` — list / idempotent create (POST body accepted; a model mismatch warns and returns the existing session).
+- `GET/POST /saklas/v1/sessions` — list / idempotent create (POST body accepted; a model mismatch warns and returns the existing session). `_session_info` carries `is_base_model` so a frontend can switch to a raw-completion UI.
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update session defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
 Vectors under `/sessions/{id}/vectors`:
 - `GET` list, `GET /{name}` profile JSON, `POST` load-from-disk, `DELETE /{name}` (also drops the name from `default_steering`).
-- `POST /extract` — runs `session.extract` in `asyncio.to_thread`; SSE progress when `Accept: text/event-stream`, JSON otherwise.
+- `POST /extract` — runs `session.extract` in `asyncio.to_thread`; SSE progress when `Accept: text/event-stream`, JSON otherwise. `source` accepts a concept name, a `{pairs: [{positive, negative}, ...]}` object, or a bare single-pair `{positive, negative}` object (`_coerce_pair_source` normalizes all three) — so the webui can submit hand-authored or reviewed-and-edited statement pairs without a curated concept.
+- `POST /extract/preview` body `{concept, baseline?, n_pairs?, n_scenarios?}` — runs `generate_scenarios` + `generate_pairs` under the session lock and returns `{concept, baseline, scenarios, pairs}` *without* committing an extraction or writing `statements.json`. Exposes the LLM-authoring half of the pipeline so the webui can show the generated pairs in an editable table; the edited list is POSTed back to `/extract` as `source: {pairs}`. SSE progress when `Accept: text/event-stream`.
 - `POST /vectors/merge` body `{name, expression}` — wraps `merge_into_pack` (model-scoped, `force=True`), loads and registers the merged profile, held under `session.lock`. Returns the same JSON as `GET /vectors/{name}`. `MergeError` → 400.
 - `POST /vectors/clone` body `{name, corpus_path, n_pairs?, seed?, baseline?}` — wraps `session.clone_from_corpus` in `asyncio.to_thread` under `session.lock`; auto-registers on success. SSE branch emits only `done`/`error` (no progress hook in the clone path). Missing corpus → 404.
 - `GET /vectors/{name}/diagnostics` — 16-bucket `||baked||` histogram plus per-layer magnitudes and the `diagnostics_by_layer` / `diagnostics_summary` blocks when the profile carries them. 404 when the vector isn't registered.

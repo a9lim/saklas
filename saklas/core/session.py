@@ -24,7 +24,7 @@ from saklas.core.events import (
     SteeringApplied,
     SteeringCleared,
 )
-from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, generate_steered, supports_thinking
+from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, detect_base_model, generate_steered, supports_thinking
 from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.loom import (
     InvalidNodeOperationError,
@@ -941,6 +941,15 @@ class SaklasSession:
     def is_generating(self) -> bool:
         """``True`` whenever :attr:`gen_state` is not ``GenState.IDLE``."""
         return self._gen_phase is not GenState.IDLE
+
+    @property
+    def is_base_model(self) -> bool:
+        """``True`` when the loaded model has no chat template (a base model).
+
+        Frontends branch on this to switch to a raw-completion UI — no
+        roles, no chat bubbles, the whole buffer is a prefill.
+        """
+        return detect_base_model(self._tokenizer)
 
     # -- Live trait SSE subscribers --
 

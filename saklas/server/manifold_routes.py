@@ -1,0 +1,430 @@
+"""Native ``/saklas/v1/manifolds/*`` routes — manifold steering artifacts.
+
+A manifold is a top-level artifact (labeled nodes on a domain), not
+session-scoped, so these routes live beside the pack routes rather than
+under ``/sessions/{id}``.  The exception is ``fit``, which needs the
+loaded model — it runs ``session.extract_manifold`` under the session
+lock and streams progress like ``/extract`` does.
+
+Authoring (create / update) writes ``manifold.json`` + ``nodes/*.json``
+through :mod:`saklas.io.manifolds`; steering a fitted manifold needs no
+route — a ``%`` term in any steering expression already loads the
+artifact lazily on scope entry.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import shutil
+from typing import Any, Callable, Literal
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from saklas.core.manifold import domain_from_spec
+from saklas.core.session import ConcurrentExtractionError, SaklasSession
+from saklas.io.manifolds import (
+    ManifoldFolder,
+    ManifoldFormatError,
+    create_manifold_folder,
+    iter_manifold_folders,
+    min_nodes,
+    update_manifold_folder,
+)
+from saklas.io.paths import manifold_dir, safe_model_id
+
+log = logging.getLogger("saklas.api")
+
+
+# ----------------------------------------------------------- request models ---
+
+class BoxAxisSpec(BaseModel):
+    name: str = "axis"
+    periodic: bool = False
+    period: float = 1.0
+    lo: float = 0.0
+    hi: float = 1.0
+
+
+class DomainSpec(BaseModel):
+    """A manifold domain — box or sphere only (custom is JSON-authored)."""
+
+    type: Literal["box", "sphere"]
+    axes: list[BoxAxisSpec] | None = None
+    dim: int | None = None
+
+
+class NodeSpec(BaseModel):
+    label: str
+    coords: list[float]
+    statements: list[str]
+
+
+class CreateManifoldRequest(BaseModel):
+    namespace: str = "local"
+    name: str
+    description: str = ""
+    domain: DomainSpec
+    nodes: list[NodeSpec]
+
+
+class UpdateManifoldRequest(BaseModel):
+    description: str | None = None
+    nodes: list[NodeSpec] | None = None
+
+
+class FitManifoldRequest(BaseModel):
+    sae: str | None = None
+    sae_revision: str | None = None
+
+
+# ------------------------------------------------------------------ helpers ---
+
+def _domain_label(spec: dict[str, Any]) -> str:
+    """Short ``type(Nd)`` label for a manifold domain spec dict."""
+    kind = spec.get("type", "?")
+    if kind == "box":
+        n = len(spec.get("axes", []))
+    elif kind == "sphere":
+        n = int(spec.get("dim", 0))
+    elif kind == "custom":
+        n = int(spec.get("embed_dim", 0))
+    else:
+        n = 0
+    return f"{kind}({n}d)"
+
+
+def _intrinsic_dim(spec: dict[str, Any]) -> int:
+    try:
+        return domain_from_spec(spec).intrinsic_dim
+    except (ValueError, KeyError):
+        return 0
+
+
+def _manifold_json(
+    namespace: str,
+    mf: ManifoldFolder,
+    session: SaklasSession,
+    *,
+    full: bool,
+) -> dict[str, Any]:
+    """Serialize a :class:`ManifoldFolder` for the wire.
+
+    ``full`` adds per-node statements and per-tensor fit detail — the
+    list route omits both to stay light.
+    """
+    n = _intrinsic_dim(mf.domain)
+    session_stem = safe_model_id(session.model_id)
+    fitted_models = mf.tensor_models()
+    fitted_for_session = session_stem in fitted_models
+
+    stale = False
+    if fitted_for_session:
+        try:
+            stale = mf.sidecar(session_stem).nodes_sha256 != mf.nodes_sha256()
+        except (KeyError, ManifoldFormatError, OSError):
+            stale = False
+
+    out: dict[str, Any] = {
+        "namespace": namespace,
+        "name": mf.name,
+        "description": mf.description,
+        "domain": mf.domain,
+        "domain_label": _domain_label(mf.domain),
+        "intrinsic_dim": n,
+        "min_nodes": min_nodes(n),
+        "node_count": len(mf.node_labels),
+        "node_labels": list(mf.node_labels),
+        "node_coords": [list(c) for c in mf.node_coords],
+        "fitted_models": fitted_models,
+        "fitted_for_session": fitted_for_session,
+        "stale": stale,
+    }
+
+    if full:
+        groups = dict(mf.node_groups())
+        out["nodes"] = [
+            {
+                "label": label,
+                "coords": list(coords),
+                "statements": list(groups.get(label, [])),
+            }
+            for label, coords in zip(mf.node_labels, mf.node_coords)
+        ]
+        fitted: list[dict[str, Any]] = []
+        for stem in fitted_models:
+            try:
+                sc = mf.sidecar(stem)
+            except KeyError:
+                continue
+            fitted.append({
+                "stem": stem,
+                "method": sc.method,
+                "feature_space": sc.feature_space,
+                "node_count": sc.node_count,
+                "nodes_sha256": sc.nodes_sha256,
+            })
+        out["fitted"] = fitted
+
+    return out
+
+
+def _find_manifold(
+    namespace: str, name: str,
+) -> tuple[str, ManifoldFolder]:
+    """Locate one manifold by namespace + name, or 404."""
+    folder = manifold_dir(namespace, name)
+    if not (folder / "manifold.json").exists():
+        raise HTTPException(404, f"manifold {namespace}/{name} not found")
+    try:
+        return namespace, ManifoldFolder.load(folder)
+    except ManifoldFormatError as e:
+        raise HTTPException(400, f"manifold {namespace}/{name} is malformed: {e}")
+
+
+def _refuse_if_busy(session: SaklasSession) -> None:
+    """Raise 409 when the engine gen-lock is held.
+
+    ``session.lock`` (the asyncio HTTP serializer) orders manifold
+    mutations against each other and the JSON fit path, but an SSE fit
+    whose request was cancelled leaves its worker thread — and the
+    ``_gen_lock`` it holds — alive past the cancel.  A non-blocking probe
+    of ``_gen_lock`` refuses a folder mutation while that thread runs.
+    """
+    if not session._gen_lock.acquire(blocking=False):
+        raise HTTPException(
+            409, "a model operation is in flight; retry shortly",
+        )
+    session._gen_lock.release()
+
+
+def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
+    """Drop any cached in-memory ``Manifold`` for this artifact.
+
+    The grammar key is ``[ns/]name[:variant]``; a bare name resolves
+    cross-namespace, so both forms can be cached.  Pop every match so a
+    delete / re-fit does not leave a stale tensor live.
+    """
+    prefixes = (name, f"{namespace}/{name}")
+    for key in list(session._manifolds):
+        head = key.rsplit(":", 1)[0] if ":" in key else key
+        if head in prefixes:
+            session._manifolds.pop(key, None)
+
+
+# ------------------------------------------------------------------- routes ---
+
+def register_manifold_routes(app: FastAPI) -> None:
+    """Mount the ``/saklas/v1/manifolds/*`` tree onto ``app``."""
+
+    session: SaklasSession = app.state.session
+
+    @app.get("/saklas/v1/manifolds")
+    def list_manifolds():
+        """List every installed manifold with per-session fit status."""
+        return {
+            "manifolds": [
+                _manifold_json(ns, mf, session, full=False)
+                for ns, mf in iter_manifold_folders()
+            ],
+        }
+
+    @app.get("/saklas/v1/manifolds/{namespace}/{name}")
+    def get_manifold(namespace: str, name: str):
+        """One manifold: domain, nodes with statements, per-tensor fit detail."""
+        ns, mf = _find_manifold(namespace, name)
+        return _manifold_json(ns, mf, session, full=True)
+
+    @app.post("/saklas/v1/manifolds", status_code=201)
+    def create_manifold(req: CreateManifoldRequest):
+        """Author a fresh manifold artifact on disk.
+
+        Writes ``manifold.json`` + the ``nodes/`` corpus.  Returns the
+        manifold detail plus ``advisories`` — soft poisedness / flat-axis
+        warnings so the UI can flag a deficient node layout before a fit
+        is paid for.
+        """
+        domain_spec = req.domain.model_dump(exclude_none=True)
+        nodes = [n.model_dump() for n in req.nodes]
+        try:
+            folder, advisories = create_manifold_folder(
+                req.namespace, req.name, req.description, domain_spec, nodes,
+            )
+        except FileExistsError as e:
+            raise HTTPException(409, str(e))
+        except ManifoldFormatError as e:
+            raise HTTPException(400, str(e))
+        mf = ManifoldFolder.load(folder)
+        body = _manifold_json(req.namespace, mf, session, full=True)
+        body["advisories"] = advisories
+        return body
+
+    @app.patch("/saklas/v1/manifolds/{namespace}/{name}")
+    async def update_manifold(
+        namespace: str, name: str, req: UpdateManifoldRequest,
+    ):
+        """Re-author a manifold's description and/or node corpus.
+
+        Held under the session lock so a node-corpus rewrite cannot race
+        an in-flight fit reading the same ``nodes/`` directory.  Existing
+        fitted tensors are kept but become stale.
+        """
+        folder = manifold_dir(namespace, name)
+        if not (folder / "manifold.json").exists():
+            raise HTTPException(404, f"manifold {namespace}/{name} not found")
+        nodes = (
+            [n.model_dump() for n in req.nodes]
+            if req.nodes is not None else None
+        )
+        # ``session.lock`` serializes against another PATCH and the JSON
+        # fit path; the ``_gen_lock`` probe additionally refuses while a
+        # fit thread is in flight (an SSE fit whose request was cancelled
+        # leaves the worker thread — and the lock — alive past the cancel)
+        # so a node-corpus rewrite can't race a fit reading ``nodes/``.
+        async with session.lock:
+            _refuse_if_busy(session)
+            try:
+                await asyncio.to_thread(
+                    update_manifold_folder,
+                    folder,
+                    description=req.description,
+                    nodes=nodes,
+                )
+            except ManifoldFormatError as e:
+                raise HTTPException(400, str(e))
+            _evict_manifold(session, namespace, name)
+        ns, mf = _find_manifold(namespace, name)
+        return _manifold_json(ns, mf, session, full=True)
+
+    @app.delete("/saklas/v1/manifolds/{namespace}/{name}")
+    async def delete_manifold(namespace: str, name: str):
+        """Remove a manifold folder.
+
+        Held under ``session.lock`` so it serializes against PATCH and
+        the JSON fit path; refuses (409) when a fit thread still holds
+        the engine gen-lock — deleting ``nodes/`` mid-fit would corrupt
+        the read.
+        """
+        folder = manifold_dir(namespace, name)
+        if not (folder / "manifold.json").exists():
+            raise HTTPException(404, f"manifold {namespace}/{name} not found")
+        async with session.lock:
+            _refuse_if_busy(session)
+            _evict_manifold(session, namespace, name)
+            await asyncio.to_thread(shutil.rmtree, folder)
+        return {"namespace": namespace, "name": name, "removed": True}
+
+    @app.post("/saklas/v1/manifolds/{namespace}/{name}/fit")
+    async def fit_manifold(
+        namespace: str, name: str, req: FitManifoldRequest, request: Request,
+    ):
+        """Fit the manifold for the loaded model.
+
+        Runs :meth:`SaklasSession.extract_manifold` under the session
+        lock.  SSE progress when ``Accept: text/event-stream``, JSON
+        otherwise.  Poisedness failures (a bare ``ValueError`` from the
+        RBF solve, not a ``SaklasError``) are caught explicitly and
+        surfaced as a clean error frame.
+        """
+        folder = manifold_dir(namespace, name)
+        if not (folder / "manifold.json").exists():
+            raise HTTPException(404, f"manifold {namespace}/{name} not found")
+
+        def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
+            manifold = session.extract_manifold(
+                folder, sae=req.sae, sae_revision=req.sae_revision,
+                on_progress=on_progress,
+            )
+            _evict_manifold(session, namespace, name)
+            ns, mf = _find_manifold(namespace, name)
+            body = _manifold_json(ns, mf, session, full=True)
+            body["done"] = True
+            body["layers_fitted"] = len(manifold.layers)
+            body["feature_space"] = manifold.feature_space
+            return body
+
+        accept = request.headers.get("accept", "application/json")
+        if "text/event-stream" in accept:
+            async def _sse():
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+
+                def _on_progress(msg: str) -> None:
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait, ("progress", msg),
+                    )
+
+                async with session.lock:
+                    async def _run() -> None:
+                        try:
+                            body = await asyncio.to_thread(_fit, _on_progress)
+                            await asyncio.sleep(0)
+                            queue.put_nowait(("done", body))
+                        except ConcurrentExtractionError as e:
+                            queue.put_nowait((
+                                "error",
+                                {"message": str(e), "code": "Conflict"},
+                            ))
+                        except (ValueError, ManifoldFormatError) as e:
+                            queue.put_nowait((
+                                "error",
+                                {
+                                    "message": str(e),
+                                    "code": (
+                                        "PoisednessError"
+                                        if "poisedness" in str(e).lower()
+                                        else type(e).__name__
+                                    ),
+                                },
+                            ))
+                        except Exception as e:  # noqa: BLE001
+                            log.exception("manifold fit crashed")
+                            queue.put_nowait((
+                                "error",
+                                {
+                                    "message": str(e) or "fit failed",
+                                    "code": type(e).__name__,
+                                },
+                            ))
+
+                    task = asyncio.create_task(_run())
+                    try:
+                        while True:
+                            item = await queue.get()
+                            kind = item[0]
+                            if kind == "progress":
+                                yield (
+                                    f"event: progress\n"
+                                    f"data: {json.dumps({'message': item[1]})}\n\n"
+                                )
+                            elif kind == "done":
+                                yield (
+                                    f"event: done\n"
+                                    f"data: {json.dumps(item[1])}\n\n"
+                                )
+                                break
+                            elif kind == "error":
+                                yield (
+                                    f"event: error\n"
+                                    f"data: {json.dumps(item[1])}\n\n"
+                                )
+                                break
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except BaseException:  # noqa: BLE001
+                                pass
+
+            return StreamingResponse(_sse(), media_type="text/event-stream")
+
+        async with session.lock:
+            try:
+                return await asyncio.to_thread(_fit, lambda _msg: None)
+            except ConcurrentExtractionError as e:
+                raise HTTPException(409, str(e))
+            except (ValueError, ManifoldFormatError) as e:
+                raise HTTPException(400, str(e))

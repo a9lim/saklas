@@ -40,6 +40,7 @@ _KIND_LABELS: dict[str, str] = {
     "steer": "/steer",
     "probe": "/probe",
     "extract": "/extract",
+    "manifold_fit": "/manifold",
     "regen_n": "/regen",
     "fan": "/fan",
 }
@@ -270,8 +271,13 @@ class _AssistantMessage(Vertical):
     navigating the trait panel is a dict lookup instead of a rebuild.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, flat: bool = False, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        # Flat mode (base / non-chat model): drop the ``Assistant:``
+        # role header and the thinking ``Collapsible`` — a base model
+        # has no roles and no thinking channel, so the turn renders as
+        # plain continuous text.
+        self._flat: bool = flat
         self._escaped_chat_text: str = ""
         self._escaped_thinking_text: str = ""
         self._thinking_block: Collapsible | None = None
@@ -302,13 +308,26 @@ class _AssistantMessage(Vertical):
         self._pending_static: dict[str, Any] | None = None
 
     def compose(self) -> ComposeResult:
+        if self._flat:
+            # Base model: no role header, no thinking block — just the
+            # continuation text.  An empty hidden ``thinking-view`` is
+            # still yielded so the streaming hooks that target it stay
+            # null-safe (a base model never emits thinking tokens, so it
+            # stays empty).
+            yield Static("", id="thinking-view", classes="hidden")
+            yield Static("", id="response-view")
+            return
         yield Static("[bold ansi_green]Assistant:[/]")
         with Collapsible(title="Thinking...", id="thinking-block", classes="hidden"):
             yield Static("", id="thinking-view")
         yield Static("", id="response-view")
 
     def on_mount(self) -> None:
-        self._thinking_block = self.query_one("#thinking-block", Collapsible)
+        # Flat mode omits the thinking ``Collapsible`` entirely — the
+        # block stays ``None`` and every ``_thinking_block is not None``
+        # guard downstream short-circuits.
+        if not self._flat:
+            self._thinking_block = self.query_one("#thinking-block", Collapsible)
         self._thinking_view = self.query_one("#thinking-view", Static)
         self._response_view = self.query_one("#response-view", Static)
         if self._pending_static is not None:
@@ -562,13 +581,22 @@ class _AssistantMessage(Vertical):
         self._thinking_view.update(markup if markup is not None else self._escaped_thinking_text)
 
 
-def _build_user_widget(text: str) -> Vertical:
+def _build_user_widget(text: str, *, flat: bool = False) -> Vertical:
     """Build a fresh user-message Vertical (header + content) for one column.
 
     A separate widget instance is used in each column so the same text can
     be mirrored in both primary and shadow without a single widget being
     parented twice.
+
+    In ``flat`` mode (base / non-chat model) the ``User:`` role header is
+    dropped — the user's text is just the part of the buffer they
+    authored, presented continuously with the model's continuation.
     """
+    if flat:
+        return Vertical(
+            Static(_rich_escape(text)),
+            classes="user-message",
+        )
     return Vertical(
         Static("[bold ansi_cyan]User:[/]"),
         Static(_rich_escape(text)),
@@ -711,6 +739,11 @@ class ChatPanel(Widget):
         self._log: VerticalScroll | None = None
         self._status_bar: Static | None = None
         self._ab_mode: bool = False
+        # Flat mode (base / non-chat model): mounted rows drop role
+        # headers and the thinking block, presenting turns as flat
+        # continuous text.  Set once at startup via :meth:`set_flat_mode`
+        # — a base model never becomes a chat model mid-session.
+        self._flat_mode: bool = False
         # In-memory mirror of system-message strings.  ``add_system_message``
         # mounts a ``Static`` widget AND appends to this list so callers
         # (tests, transcript export, future log search) can read the
@@ -813,6 +846,14 @@ class ChatPanel(Widget):
             inp = self.query_one("#chat-input", ChatInput)
         except Exception:
             return
+        if self._flat_mode:
+            # Base model: roles don't exist, so "prefill reply" vs
+            # "message" is meaningless — keep the role-neutral
+            # placeholder regardless of the active node.
+            inp.placeholder = (
+                "continue the text…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
+            )
+            return
         # Same `<verb>…  <bind list>` shape as the GUI's Chat.svelte
         # placeholder; terminals can't surface modifier-only keydown so
         # the TUI lacks the commit-key-held variants the GUI shows.
@@ -821,6 +862,22 @@ class ChatPanel(Widget):
             if on
             else "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
         )
+
+    def set_flat_mode(self, on: bool) -> None:
+        """Enable base-model flat rendering.
+
+        When on, freshly mounted user / assistant rows drop their role
+        headers and the assistant's thinking ``Collapsible``, and the
+        input placeholder goes role-neutral.  Called once at app startup
+        when the loaded model is a base (non-chat) model.
+        """
+        self._flat_mode = on
+        try:
+            inp = self.query_one("#chat-input", ChatInput)
+        except Exception:
+            return
+        if on:
+            inp.placeholder = "continue the text…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
 
     # -- AB mode --
 
@@ -911,8 +968,8 @@ class ChatPanel(Widget):
         """
         row = _TurnRow(
             kind="user",
-            primary_child=_build_user_widget(text),
-            shadow_child=_build_user_widget(text),
+            primary_child=_build_user_widget(text, flat=self._flat_mode),
+            shadow_child=_build_user_widget(text, flat=self._flat_mode),
         )
         row.user_text = text
         log = self._log_mounted
@@ -926,7 +983,9 @@ class ChatPanel(Widget):
         shadow gen replaces it via ``start_shadow_message``.
         Returns ``(row, primary_widget)``.
         """
-        widget = _AssistantMessage(classes="assistant-message")
+        widget = _AssistantMessage(
+            flat=self._flat_mode, classes="assistant-message",
+        )
         placeholder = _build_shadow_placeholder()
         row = _TurnRow(
             kind="assistant", primary_child=widget, shadow_child=placeholder,
@@ -952,7 +1011,9 @@ class ChatPanel(Widget):
         so the caller can keep the same widget / row bookkeeping it does
         for streamed turns.
         """
-        widget = _AssistantMessage(classes="assistant-message")
+        widget = _AssistantMessage(
+            flat=self._flat_mode, classes="assistant-message",
+        )
         widget.set_static_content(
             response_text, thinking_text,
             response_tokens=response_tokens,
@@ -976,7 +1037,10 @@ class ChatPanel(Widget):
         if existing is not None:
             return existing
         row.shadow.remove_children()
-        widget = _AssistantMessage(classes="assistant-message shadow-message")
+        widget = _AssistantMessage(
+            flat=self._flat_mode,
+            classes="assistant-message shadow-message",
+        )
         row.shadow.mount(widget)
         return widget
 

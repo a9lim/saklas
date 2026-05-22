@@ -1,10 +1,33 @@
 <script lang="ts">
-  import { closeDrawer, samplingState, setSampling } from "../lib/stores.svelte";
+  import {
+    closeDrawer,
+    samplingState,
+    setSampling,
+    genUiMode,
+    setGenUiOverride,
+    effectiveRawMode,
+    sessionState,
+  } from "../lib/stores.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
     void _drawerProps.params;
   });
+
+  // Render mode — three-state: auto follows the model's
+  // ``is_base_model`` flag, chat / raw force a surface.  Toggling never
+  // mutates the loom tree.
+  const RENDER_MODES: { value: "chat" | "raw" | null; label: string }[] = [
+    { value: null, label: "auto" },
+    { value: "chat", label: "chat" },
+    { value: "raw", label: "raw" },
+  ];
+  const effectiveMode = $derived.by(() => {
+    void genUiMode.override;
+    void sessionState.info?.is_base_model;
+    return effectiveRawMode() ? "raw" : "chat";
+  });
+  const isBaseModel = $derived(sessionState.info?.is_base_model === true);
 
   const logitBiasValid = $derived.by(() => {
     const raw = samplingState.logit_bias_text.trim();
@@ -33,6 +56,31 @@
   </header>
 
   <div class="body">
+    <section class="panel">
+      <h3>render mode</h3>
+      <div class="mode-row" role="group" aria-label="Render mode">
+        {#each RENDER_MODES as m (m.label)}
+          <button
+            type="button"
+            class="mode-opt"
+            class:active={genUiMode.override === m.value}
+            onclick={() => setGenUiOverride(m.value)}
+          >{m.label}</button>
+        {/each}
+      </div>
+      <p class="hint">
+        {#if genUiMode.override === null}
+          auto — follows the model: this is a
+          {isBaseModel ? "base" : "chat"} model, so the
+          {effectiveMode} surface is active.
+        {:else}
+          forced {genUiMode.override} — the {effectiveMode} surface is
+          active regardless of the model.
+        {/if}
+        switching mode never changes the loom tree.
+      </p>
+    </section>
+
     <section class="panel">
       <h3>stop sequences</h3>
       <textarea
@@ -137,8 +185,40 @@
   .hint {
     font-size: var(--text-xs);
     line-height: 1.35;
+    color: var(--fg-muted);
   }
   .error {
     color: var(--accent-red);
+  }
+  .mode-row {
+    display: flex;
+    gap: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-1);
+    margin-bottom: var(--space-3);
+  }
+  .mode-opt {
+    flex: 1 1 0;
+    background: transparent;
+    color: var(--fg-muted);
+    border: 0;
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: lowercase;
+    cursor: pointer;
+    transition:
+      background var(--dur) var(--ease-out),
+      color var(--dur) var(--ease-out);
+  }
+  .mode-opt:hover {
+    color: var(--fg);
+  }
+  .mode-opt.active {
+    background: var(--accent-subtle);
+    color: var(--accent);
   }
 </style>

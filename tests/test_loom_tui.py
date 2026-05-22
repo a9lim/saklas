@@ -70,7 +70,9 @@ def _make_app():
     app._device_str = "cpu"
     app._alphas = {}
     app._enabled = {}
+    app._manifold_terms = {}
     app._supports_thinking = False
+    app._is_base_model = False
     app._thinking = False
     app._current_assistant_widget = None
     app._poll_timer = None

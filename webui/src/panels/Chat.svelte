@@ -18,6 +18,7 @@
   import { SvelteMap } from "svelte/reactivity";
   import StatusFooter from "./StatusFooter.svelte";
   import PendingBubbles from "./PendingBubbles.svelte";
+  import RawBuffer from "./RawBuffer.svelte";
   import {
     autoRegenState,
     chatLog,
@@ -52,6 +53,9 @@
     toggleAutoRegen,
     setAutoRegenMode,
     setAutoRegenCustom,
+    effectiveRawMode,
+    genUiMode,
+    setGenUiOverride,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
@@ -104,13 +108,21 @@
   // assistant's — so the input composes the assistant reply instead:
   //   empty + send → generate a fresh assistant child (re-roll / fan)
   //   text  + send → answer-prefill — seed the reply with that text
+  // Raw (flat completion) mode — base models, or an explicit override.
+  // In raw mode the role-aware commit derivations short-circuit: there
+  // are no roles, so the input box never enters prefill / commit mode.
+  const rawMode = $derived.by(() => {
+    void genUiMode.override;
+    return effectiveRawMode();
+  });
+
   const activeNodeId = $derived(
     loomTree.rev > 0 ? (loomTree.active_node_id ?? null) : null,
   );
   const activeNode = $derived(
     activeNodeId ? (loomTree.nodes.get(activeNodeId) ?? null) : null,
   );
-  const liveOnUserNode = $derived(activeNode?.role === "user");
+  const liveOnUserNode = $derived(!rawMode && activeNode?.role === "user");
   // Queue-aware role: a queued ``commit user`` lands a user node before
   // this submission gets to run, so the next message should already be
   // in prefill / commit-assistant mode.  Walks the queue tail-first;
@@ -118,6 +130,7 @@
   // changes the role.  ``pendingActions.queue.length`` is touched so
   // the derived re-runs on queue mutations.
   const onUserNode = $derived.by(() => {
+    if (rawMode) return false;
     void pendingActions.queue.length;
     const predicted = predictedQueueEndOnUserNode();
     return predicted === null ? liveOnUserNode : predicted;
@@ -857,6 +870,28 @@
       </label>
     {/if}
 
+    <!-- Render-mode badge — compact raw/chat indicator.  Clicking it
+         cycles the override (auto → chat → raw → auto); the full
+         three-state control lives in the advanced sampling drawer. -->
+    <button
+      type="button"
+      class="mode-badge"
+      class:raw={rawMode}
+      onclick={() =>
+        setGenUiOverride(
+          genUiMode.override === null
+            ? "chat"
+            : genUiMode.override === "chat"
+              ? "raw"
+              : null,
+        )}
+      title={"render mode: " +
+        (genUiMode.override ?? "auto") +
+        " — click to cycle (full control in advanced sampling)"}
+    >
+      {rawMode ? "raw" : "chat"}{genUiMode.override === null ? " ·auto" : ""}
+    </button>
+
     <!-- Conversation actions — clear / save / load / transcript / auto-
          regen sit inline at the end of the header so they're one click
          away. -->
@@ -919,6 +954,9 @@
     </div>
   </header>
 
+  {#if rawMode}
+    <RawBuffer />
+  {:else}
   <div
     class="log"
     class:ab={twoColumns}
@@ -1016,6 +1054,7 @@
       >regen</button>
     </div>
   </form>
+  {/if}
 </div>
 
 {#snippet bubble(turn: ChatTurn, turnIdx: number, isShadow: boolean)}
@@ -1148,6 +1187,29 @@
   .ctl-select:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* Render-mode badge — compact raw/chat pill.  Sits between the
+   * highlight controls and the conversation actions. */
+  .mode-badge {
+    background: var(--accent-subtle);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-3);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: lowercase;
+    cursor: pointer;
+    transition: background var(--dur) var(--ease-out);
+  }
+  .mode-badge:hover {
+    background: var(--accent-glow);
+  }
+  .mode-badge.raw {
+    background: rgba(167, 139, 250, 0.12);
+    color: var(--accent-purple);
   }
 
   /* Conversation-actions strip — inline, pushed to the right edge of

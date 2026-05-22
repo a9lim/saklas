@@ -11,8 +11,11 @@ from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
     ManifoldSidecar,
+    create_manifold_folder,
     hash_manifold_files,
+    iter_manifold_folders,
     min_nodes,
+    update_manifold_folder,
 )
 
 
@@ -298,3 +301,158 @@ def test_manifold_sidecar_load(tmp_path):
     assert sc.feature_space == "sae-gemma"
     assert sc.nodes_sha256 == "deadbeef"
     assert sc.sae_release == "gemma"
+
+
+# --------------------------------------------------- authoring (create/update) ---
+
+def _author_nodes(labels):
+    """A well-spread node list for a 1-D box, statements inline."""
+    out = []
+    for i, label in enumerate(labels):
+        out.append({
+            "label": label,
+            "coords": [i / (len(labels) - 1)],
+            "statements": [f"{label} statement {j}" for j in range(3)],
+        })
+    return out
+
+
+def test_create_manifold_folder_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    nodes = _author_nodes(["calm", "uneasy", "afraid"])
+    folder, advisories = create_manifold_folder(
+        "local", "mood", "a mood axis", domain, nodes,
+    )
+    assert folder.exists()
+    mf = ManifoldFolder.load(folder)
+    assert mf.name == "mood"
+    assert mf.node_labels == ["calm", "uneasy", "afraid"]
+    assert mf.files == {}
+    assert dict(mf.node_groups())["calm"][0] == "calm statement 0"
+    # A well-spread 1-D layout draws no poisedness advisory.
+    assert advisories == []
+
+
+def test_create_manifold_folder_conflict(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    nodes = _author_nodes(["a", "b", "c"])
+    create_manifold_folder("local", "dup", "", domain, nodes)
+    with pytest.raises(FileExistsError):
+        create_manifold_folder("local", "dup", "", domain, nodes)
+
+
+def test_create_manifold_folder_too_few_nodes(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    with pytest.raises(ManifoldFormatError):
+        create_manifold_folder(
+            "local", "thin", "", domain, _author_nodes(["a", "b"]),
+        )
+
+
+def test_create_manifold_folder_bad_coords_arity(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    nodes = [
+        {"label": "a", "coords": [0.0, 0.0], "statements": ["x"]},
+        {"label": "b", "coords": [0.5], "statements": ["y"]},
+        {"label": "c", "coords": [1.0], "statements": ["z"]},
+    ]
+    with pytest.raises(ManifoldFormatError):
+        create_manifold_folder("local", "bad", "", domain, nodes)
+
+
+def test_create_manifold_folder_empty_statements(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    nodes = _author_nodes(["a", "b", "c"])
+    nodes[1]["statements"] = []
+    with pytest.raises(ManifoldFormatError):
+        create_manifold_folder("local", "nostmt", "", domain, nodes)
+
+
+def test_create_manifold_folder_bad_namespace(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    with pytest.raises(ManifoldFormatError):
+        create_manifold_folder(
+            "Bad Namespace", "m", "", domain, _author_nodes(["a", "b", "c"]),
+        )
+
+
+def test_update_manifold_folder_statements(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    nodes = _author_nodes(["a", "b", "c"])
+    folder, _ = create_manifold_folder("local", "mood", "", domain, nodes)
+    sha_before = ManifoldFolder.load(folder).nodes_sha256()
+
+    nodes[0]["statements"].append("a fresh statement")
+    update_manifold_folder(folder, description="edited", nodes=nodes)
+    mf = ManifoldFolder.load(folder)
+    assert mf.description == "edited"
+    assert "a fresh statement" in dict(mf.node_groups())["a"]
+    # Editing the corpus must invalidate the staleness key.
+    assert mf.nodes_sha256() != sha_before
+
+
+def test_update_manifold_folder_relabels_cleanly(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    relabeled = _author_nodes(["x", "y", "z"])
+    update_manifold_folder(folder, nodes=relabeled)
+    mf = ManifoldFolder.load(folder)
+    assert mf.node_labels == ["x", "y", "z"]
+    # No orphaned node files from the old labels.
+    assert sorted(p.name for p in (folder / "nodes").iterdir()) == [
+        "00_x.json", "01_y.json", "02_z.json",
+    ]
+
+
+def test_malformed_json_raises_format_error(tmp_path):
+    # A corrupt manifest must surface as ManifoldFormatError, not a bare
+    # JSONDecodeError — the HTTP routes and iter_manifold_folders only
+    # guard against the former.
+    folder = _author_manifold(tmp_path)
+    (folder / "manifold.json").write_text("{ not valid json")
+    with pytest.raises(ManifoldFormatError):
+        ManifoldFolder.load(folder)
+
+
+def test_iter_manifold_folders_skips_malformed(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "good", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    bad = folder.parent / "broken"
+    (bad / "nodes").mkdir(parents=True)
+    (bad / "manifold.json").write_text("{ truncated")
+    found = {mf.name for _ns, mf in iter_manifold_folders()}
+    assert found == {"good"}
+
+
+def test_iter_manifold_folders(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    create_manifold_folder("local", "one", "", domain, _author_nodes(["a", "b", "c"]))
+    create_manifold_folder("shared", "two", "", domain, _author_nodes(["a", "b", "c"]))
+    found = {(ns, mf.name) for ns, mf in iter_manifold_folders()}
+    assert found == {("local", "one"), ("shared", "two")}
+    only_local = {(ns, mf.name) for ns, mf in iter_manifold_folders("local")}
+    assert only_local == {("local", "one")}

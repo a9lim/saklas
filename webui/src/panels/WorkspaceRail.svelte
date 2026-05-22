@@ -33,6 +33,7 @@
         { label: "load vector…", drawer: "load" },
         { label: "merge vector…", drawer: "merge" },
         { label: "clone vector…", drawer: "clone" },
+        { label: "manifolds…", drawer: "manifolds" },
         { label: "packs…", drawer: "pack" },
       ],
     },

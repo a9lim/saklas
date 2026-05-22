@@ -20,6 +20,7 @@ import {
   apiVectors,
   apiProbes,
   apiPacks,
+  apiManifolds,
   apiTree,
   ApiError,
   connectWs,
@@ -28,6 +29,7 @@ import type {
   CorrelationData,
   LoomNodeJSON,
   LoomTreeJSON,
+  ManifoldInfo,
   SessionInfo,
   VectorInfo,
   WSClientMessage,
@@ -37,6 +39,7 @@ import type {
   ChatTurn,
   GenStatus,
   LocalPackInfo,
+  ManifoldRackEntry,
   PendingAction,
   ProbeRackEntry,
   ProbeSortMode,
@@ -328,10 +331,123 @@ function defaultRackEntry(
   };
 }
 
-/** The canonical expression string the rack would send to the server.
- * Recomputed on demand; cheap. */
+/** The canonical expression string the racks would send to the server.
+ * Recomputed on demand; cheap.  Folds in manifold (``%``) terms after
+ * the vector terms. */
 export function currentSteeringExpression(): string {
-  return serializeExpression(vectorRack.entries);
+  return serializeExpression(vectorRack.entries, manifoldRack.entries);
+}
+
+// ========================================================= manifolds ====
+
+export interface ManifoldRack {
+  /** Server-side catalog of available manifolds — refreshed by
+   *  ``refreshManifoldList``.  Empty (and ``unavailable`` true) on
+   *  servers that pre-date the manifold HTTP surface. */
+  catalog: ManifoldInfo[];
+  /** Racked manifolds keyed by display name (``ns/name`` or bare
+   *  ``name``).  Each entry carries blend / coords / trigger / enabled
+   *  — parallel to the vector rack. */
+  entries: Map<string, ManifoldRackEntry>;
+  /** True when the manifold list route 404s — older server. */
+  unavailable: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
+export const manifoldRack: ManifoldRack = $state({
+  catalog: [],
+  entries: new SvelteMap(),
+  unavailable: false,
+  loading: false,
+  error: null,
+});
+
+/** Fetch the manifold catalog.  Tolerates a 404 from an older server —
+ *  flips ``unavailable`` and leaves the catalog empty. */
+export async function refreshManifoldList(): Promise<void> {
+  manifoldRack.loading = true;
+  try {
+    const r = await apiManifolds.list();
+    manifoldRack.catalog = r.manifolds;
+    manifoldRack.unavailable = false;
+    manifoldRack.error = null;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) {
+      manifoldRack.unavailable = true;
+      manifoldRack.catalog = [];
+    } else {
+      manifoldRack.error = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    manifoldRack.loading = false;
+  }
+}
+
+/** Look up a catalog row by display name (``ns/name`` or bare name). */
+export function manifoldByName(name: string): ManifoldInfo | null {
+  for (const m of manifoldRack.catalog) {
+    if (`${m.namespace}/${m.name}` === name || m.name === name) return m;
+  }
+  return null;
+}
+
+/** Domain-centroid coordinates for a manifold — the default rack
+ *  position.  Box: midpoint of each axis.  Sphere: the north pole
+ *  ``[0,…,0,1]`` in R^(dim+1) embedding (here we just author with
+ *  ``dim`` intrinsic coords, all zero, which the domain maps to a valid
+ *  point). */
+export function manifoldCentroid(m: ManifoldInfo): number[] {
+  if (m.domain.type === "box") {
+    return m.domain.axes.map((a) => (a.lo + a.hi) / 2);
+  }
+  // Sphere / custom — intrinsic_dim zeros is a safe authoring default.
+  return new Array(m.intrinsic_dim).fill(0);
+}
+
+/** Add a manifold to the rack at its domain centroid, blend 0.5. */
+export function addManifoldToRack(name: string): void {
+  if (manifoldRack.entries.has(name)) return;
+  const info = manifoldByName(name);
+  const coords = info ? manifoldCentroid(info) : [];
+  manifoldRack.entries.set(name, {
+    blend: 0.5,
+    coords,
+    trigger: "BOTH",
+    enabled: true,
+  });
+}
+
+export function removeManifoldFromRack(name: string): void {
+  manifoldRack.entries.delete(name);
+}
+
+export function setManifoldBlend(name: string, blend: number): void {
+  enqueueOrApply(`manifold blend ${name} ${blend.toFixed(3)}`, () => {
+    const e = manifoldRack.entries.get(name);
+    if (e) manifoldRack.entries.set(name, { ...e, blend });
+  });
+}
+
+export function setManifoldCoords(name: string, coords: number[]): void {
+  enqueueOrApply(`manifold coords ${name}`, () => {
+    const e = manifoldRack.entries.get(name);
+    if (e) manifoldRack.entries.set(name, { ...e, coords: [...coords] });
+  });
+}
+
+export function setManifoldTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`manifold trigger ${name} ${trigger}`, () => {
+    const e = manifoldRack.entries.get(name);
+    if (e) manifoldRack.entries.set(name, { ...e, trigger });
+  });
+}
+
+export function setManifoldEnabled(name: string, enabled: boolean): void {
+  enqueueOrApply(`manifold ${enabled ? "enable" : "disable"} ${name}`, () => {
+    const e = manifoldRack.entries.get(name);
+    if (e) manifoldRack.entries.set(name, { ...e, enabled });
+  });
 }
 
 // =========================================================== probes =====
@@ -1159,6 +1275,61 @@ export function setSampling<K extends keyof SamplingState>(
   value: SamplingState[K],
 ): void {
   samplingState[key] = value;
+}
+
+// ============================================ generation UI mode ========
+//
+// Base (non-chat) models have no chat template — the engine handles
+// them as flat completion.  ``genUiMode`` decides whether the chat panel
+// renders bubbles + roles (chat) or a single flat completion buffer
+// (raw).  The override wins over the model's ``is_base_model`` flag;
+// ``null`` follows the model.  Persisted per ``model_id`` so a user's
+// explicit choice survives reloads.
+
+export interface GenUiModeState {
+  /** User override: ``"chat"`` / ``"raw"`` force that mode regardless
+   *  of the model; ``null`` follows ``is_base_model``. */
+  override: "chat" | "raw" | null;
+}
+
+export const genUiMode: GenUiModeState = $state({ override: null });
+
+/** Resolve the effective rendering mode — true means flat raw buffer.
+ *  Override wins; otherwise follow the model's ``is_base_model``. */
+export function effectiveRawMode(): boolean {
+  if (genUiMode.override === "raw") return true;
+  if (genUiMode.override === "chat") return false;
+  return sessionState.info?.is_base_model === true;
+}
+
+const GENUI_KEY_PREFIX = "saklas.genui.v1.";
+
+function genUiKey(): string | null {
+  const id = sessionState.info?.model_id;
+  return id ? GENUI_KEY_PREFIX + id : null;
+}
+
+/** Load the persisted per-model render-mode override.  Called from
+ *  ``bootstrap`` once the model id is known. */
+function loadGenUiMode(): void {
+  const key = genUiKey();
+  if (!key) return;
+  const raw = safeLocalStorageGet(key);
+  if (raw === "chat" || raw === "raw") {
+    genUiMode.override = raw;
+  } else {
+    genUiMode.override = null;
+  }
+}
+
+/** Set (and persist) the render-mode override.  Toggling mode never
+ *  mutates the loom tree — only generation does. */
+export function setGenUiOverride(override: "chat" | "raw" | null): void {
+  genUiMode.override = override;
+  const key = genUiKey();
+  if (!key) return;
+  if (override === null) safeLocalStorageRemove(key);
+  else safeLocalStorageSet(key, override);
 }
 
 function parsedStopSequences(): string[] | null {
@@ -2968,12 +3139,17 @@ export async function bootstrap(): Promise<void> {
   // First-paint: load persisted (v2 cache or v1 migration) before
   // attaching the persist effect so we don't immediately overwrite.
   loadPersistedChat();
+  // Per-model render-mode override (base vs chat) — also model-scoped.
+  loadGenUiMode();
   attachPersistence();
   await Promise.allSettled([
     refreshVectorList(),
     refreshProbeList(),
     refreshCorrelation(),
     refreshPacks(),
+    // Manifold catalog — 404 tolerated (server pre-dates the manifold
+    // HTTP surface); ``refreshManifoldList`` flips ``unavailable``.
+    refreshManifoldList(),
     // Server tree wins — fetch and reconcile.  404 is a quiet no-op
     // (server pre-loom); other failures surface via loomTree.error.
     refreshLoomTree(),

@@ -1,20 +1,22 @@
 <script lang="ts">
   // Custom-vector extraction — the "+ custom vector" launcher from the
-  // unified VectorsDrawer.  Two top-level fields (concept A required,
-  // concept B optional) plus an advanced-options collapsible.  Manual
-  // ``{positive, negative}`` pair text is intentionally NOT exposed —
-  // the REST API still accepts it, but the UI confines users to
-  // slug-based extraction so the picker is the source of truth.
+  // unified VectorsDrawer.  Two input modes:
+  //
+  //   * poles   — type concept A (required) and B (optional); saklas
+  //               auto-generates contrastive statements.  A "generate
+  //               previews" button surfaces those statements in an
+  //               editable pos/neg table before they commit; the user
+  //               can edit and commit, or skip preview and submit the
+  //               bare slug.
+  //   * custom  — supply the contrastive pairs directly.  The table
+  //               starts with one empty row; no preview call.
   //
   // Submission closes immediately and reopens the vectors drawer so
   // the user lands back in the list while the sticky progress toast
-  // tracks extraction in the background.  When the toast completes
-  // it refreshes the packs list, which Svelte's reactivity uses to
-  // reshuffle rows between the "Extracted" and "Statements only"
-  // sections in real time.
+  // tracks extraction in the background.
 
   import { untrack } from "svelte";
-  import { apiExtractStream, ApiError } from "../lib/api";
+  import { apiExtractStream, apiVectors, ApiError } from "../lib/api";
   import {
     closeDrawer,
     openDrawer,
@@ -26,7 +28,7 @@
     pushToast,
     updateToast,
   } from "../lib/stores/toasts.svelte";
-  import type { ExtractRequest } from "../lib/types";
+  import type { ExtractRequest, StatementPair } from "../lib/types";
 
   interface ExtractParams {
     /** Optional pre-fill for concept A — seeded when the vectors
@@ -43,6 +45,9 @@
     return p && typeof p === "object" ? (p as ExtractParams) : {};
   }
 
+  type InputMode = "poles" | "custom";
+  let inputMode: InputMode = $state("poles");
+
   let conceptA = $state(untrack(() => narrow(params).seed_a ?? ""));
   let conceptB = $state("");
   let advancedOpen = $state(false);
@@ -50,6 +55,64 @@
   let dls = $state(true);
   let sae = $state("");
   let errorMsg: string | null = $state(null);
+
+  // Editable contrastive-pair table.  In poles mode it fills after a
+  // "generate previews" call; in custom mode it starts with one empty
+  // row.  ``previewed`` tracks whether the poles-mode user has ever
+  // generated previews — drives whether submit sends pairs or the bare
+  // slug string.
+  let pairs: StatementPair[] = $state([]);
+  let previewed = $state(false);
+  let previewing = $state(false);
+
+  // Custom mode opens with one empty row to fill in.
+  $effect(() => {
+    if (inputMode === "custom" && pairs.length === 0 && !previewed) {
+      pairs = [{ positive: "", negative: "" }];
+    }
+  });
+
+  function addPairRow(): void {
+    pairs = [...pairs, { positive: "", negative: "" }];
+  }
+  function removePairRow(idx: number): void {
+    pairs = pairs.filter((_, i) => i !== idx);
+  }
+  function setPairField(
+    idx: number,
+    key: keyof StatementPair,
+    value: string,
+  ): void {
+    pairs = pairs.map((p, i) => (i === idx ? { ...p, [key]: value } : p));
+  }
+
+  /** Trimmed pairs with at least one non-empty side dropped. */
+  function cleanPairs(): StatementPair[] {
+    return pairs
+      .map((p) => ({
+        positive: p.positive.trim(),
+        negative: p.negative.trim(),
+      }))
+      .filter((p) => p.positive || p.negative);
+  }
+
+  async function generatePreviews(): Promise<void> {
+    if (!valid.ok || previewing) return;
+    previewing = true;
+    errorMsg = null;
+    try {
+      const r = await apiVectors.previewPairs({ concept: canonicalName });
+      pairs = r.pairs.map((p) => ({
+        positive: p.positive,
+        negative: p.negative,
+      }));
+      previewed = true;
+    } catch (e) {
+      errorMsg = describeError(e);
+    } finally {
+      previewing = false;
+    }
+  }
 
   /** Slugify a free-text concept into the ``NAME_REGEX`` shape the
    *  server accepts: lowercase, ``[^a-z0-9] → _``, no leading/trailing
@@ -71,7 +134,13 @@
 
   const valid = $derived.by(() => {
     if (!conceptA.trim()) {
-      return { ok: false as const, reason: "concept A is required" };
+      return {
+        ok: false as const,
+        reason:
+          inputMode === "custom"
+            ? "a name (concept A) is required to save the vector"
+            : "concept A is required",
+      };
     }
     if (!canonicalName) {
       return {
@@ -83,6 +152,12 @@
       return {
         ok: false as const,
         reason: "combined slug must be ≤ 64 characters",
+      };
+    }
+    if (inputMode === "custom" && cleanPairs().length === 0) {
+      return {
+        ok: false as const,
+        reason: "custom mode needs at least one non-empty pair",
       };
     }
     return { ok: true as const, reason: null };
@@ -145,6 +220,17 @@
     const saeTrim = sae.trim();
     if (saeTrim) req.sae = saeTrim;
 
+    // Source resolution:
+    //   * custom mode, or poles mode where the user generated and
+    //     possibly edited previews → send the explicit pair list, which
+    //     runs the server's generation-skipping fast path.
+    //   * poles mode with no preview ever generated → leave ``source``
+    //     unset so the server slug-resolves and auto-generates pairs.
+    const cleaned = cleanPairs();
+    if (inputMode === "custom" || previewed) {
+      req.source = { pairs: cleaned };
+    }
+
     // Close this drawer and reopen the vectors drawer so the user
     // lands back in the list while extraction runs in the background.
     // ``driveExtract`` runs on the module scope, so the component
@@ -170,10 +256,34 @@
   </header>
 
   <div class="body">
+    <div class="mode-switch" role="tablist" aria-label="Input mode">
+      <button
+        type="button"
+        role="tab"
+        class="mode-btn"
+        class:active={inputMode === "poles"}
+        aria-selected={inputMode === "poles"}
+        onclick={() => (inputMode = "poles")}
+      >poles</button>
+      <button
+        type="button"
+        role="tab"
+        class="mode-btn"
+        class:active={inputMode === "custom"}
+        aria-selected={inputMode === "custom"}
+        onclick={() => (inputMode = "custom")}
+      >custom statements</button>
+    </div>
+
     <p class="hint">
-      enter one or two concepts.  saklas auto-generates contrastive
-      statements, extracts a steering vector, and lands the new row in
-      the vectors drawer ready to steer or probe.
+      {#if inputMode === "poles"}
+        enter one or two concepts.  saklas auto-generates contrastive
+        statements — generate previews to review and edit them before
+        extraction, or submit straight away to use them as-is.
+      {:else}
+        supply the contrastive pairs directly.  each row's positive and
+        negative statement is differenced to build the steering vector.
+      {/if}
     </p>
 
     {#if errorMsg}
@@ -188,7 +298,12 @@
       }}
     >
       <label class="field">
-        <span class="label">concept A <span class="req">required</span></span>
+        <span class="label">
+          concept A <span class="req">required</span>
+          {#if inputMode === "custom"}
+            <span class="opt">— names the saved vector</span>
+          {/if}
+        </span>
         <input
           type="text"
           class="input"
@@ -215,6 +330,71 @@
         <p class="canonical">
           saved as <code>{canonicalName}</code>
         </p>
+      {/if}
+
+      {#if inputMode === "poles"}
+        <button
+          type="button"
+          class="preview-btn"
+          disabled={!valid.ok || previewing}
+          onclick={generatePreviews}
+        >
+          {previewing ? "generating previews…" : "generate previews"}
+        </button>
+      {/if}
+
+      {#if inputMode === "custom" || pairs.length > 0}
+        <section class="pairs">
+          <div class="pairs-head">
+            <span class="label">contrastive pairs</span>
+            <span class="pairs-count">{cleanPairs().length} used</span>
+          </div>
+          <div class="pairs-table">
+            <div class="pair-row pair-header">
+              <span>positive</span>
+              <span>negative</span>
+              <span></span>
+            </div>
+            {#each pairs as pair, idx (idx)}
+              <div class="pair-row">
+                <textarea
+                  class="pair-input"
+                  rows="2"
+                  value={pair.positive}
+                  oninput={(ev) =>
+                    setPairField(
+                      idx,
+                      "positive",
+                      (ev.currentTarget as HTMLTextAreaElement).value,
+                    )}
+                  placeholder="positive statement"
+                ></textarea>
+                <textarea
+                  class="pair-input"
+                  rows="2"
+                  value={pair.negative}
+                  oninput={(ev) =>
+                    setPairField(
+                      idx,
+                      "negative",
+                      (ev.currentTarget as HTMLTextAreaElement).value,
+                    )}
+                  placeholder="negative statement"
+                ></textarea>
+                <button
+                  type="button"
+                  class="pair-remove"
+                  onclick={() => removePairRow(idx)}
+                  aria-label="remove pair {idx + 1}"
+                  title="remove pair"
+                >✕</button>
+              </div>
+            {/each}
+          </div>
+          <button type="button" class="add-pair" onclick={addPairRow}>
+            + add pair
+          </button>
+        </section>
       {/if}
 
       <section class="advanced" class:open={advancedOpen}>
@@ -456,6 +636,137 @@
     color: var(--accent-yellow);
     font-size: var(--text-sm);
     margin: 0;
+  }
+
+  /* ---- input-mode switch ---- */
+  .mode-switch {
+    display: flex;
+    gap: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-1);
+  }
+  .mode-btn {
+    flex: 1 1 0;
+    background: transparent;
+    color: var(--fg-dim);
+    border: 0;
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition:
+      background var(--dur) var(--ease-out),
+      color var(--dur) var(--ease-out);
+  }
+  .mode-btn:hover {
+    color: var(--fg-strong);
+  }
+  .mode-btn.active {
+    background: var(--accent-subtle);
+    color: var(--accent);
+  }
+
+  /* ---- preview button ---- */
+  .preview-btn {
+    background: var(--accent-subtle);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease-out);
+    align-self: flex-start;
+  }
+  .preview-btn:hover:not(:disabled) {
+    background: var(--accent-glow);
+  }
+  .preview-btn:disabled {
+    color: var(--fg-muted);
+    cursor: not-allowed;
+  }
+
+  /* ---- pairs table ---- */
+  .pairs {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    border-top: 1px solid var(--border);
+    padding-top: var(--space-3);
+  }
+  .pairs-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+  .pairs-count {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+  }
+  .pairs-table {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .pair-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: var(--space-2);
+    align-items: start;
+  }
+  .pair-header {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .pair-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--bg-deep);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    resize: vertical;
+    line-height: 1.4;
+  }
+  .pair-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .pair-remove {
+    background: transparent;
+    border: 0;
+    color: var(--fg-muted);
+    font-size: var(--text);
+    cursor: pointer;
+    padding: var(--space-2);
+  }
+  .pair-remove:hover {
+    color: var(--accent-red);
+  }
+  .add-pair {
+    background: var(--accent-subtle);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    align-self: flex-start;
+  }
+  .add-pair:hover {
+    background: var(--accent-glow);
   }
   .extract-btn {
     background: var(--accent);

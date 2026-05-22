@@ -209,7 +209,25 @@ class SaklasApp(App[None]):
         # Session holds the profiles; the TUI holds the alphas.
         self._alphas: dict[str, float] = {}
         self._enabled: dict[str, bool] = {}
-        self._supports_thinking: bool = supports_thinking(session._tokenizer)
+        # Manifold steering terms, keyed by the grammar's manifold key
+        # (``<manifold>%<coords>``).  A ``ManifoldTerm`` is not a
+        # :class:`Profile`, so it can't live in ``_alphas`` (typed
+        # ``dict[str, float]``) — this parallel dict carries the term
+        # values and is merged into the built ``Steering.alphas`` at
+        # generation time (``AlphaEntry`` already admits ``ManifoldTerm``,
+        # so the engine needs no change).  ``_enabled`` is shared — a
+        # manifold key toggles through the same left-panel control.
+        self._manifold_terms: dict[str, Any] = {}
+        # Base (non-chat) model detection — a base model has no chat
+        # template, so role headers / thinking blocks make no sense.  When
+        # base, the chat panel renders flat continuous text and thinking
+        # UI is force-suppressed.  Prefill stays template-agnostic and is
+        # untouched.
+        self._is_base_model: bool = session.is_base_model
+        self._supports_thinking: bool = (
+            False if self._is_base_model
+            else supports_thinking(session._tokenizer)
+        )
         # Forced-thinking families (gpt-oss / Mistral-3 Reasoning /
         # Qwen3-Thinking) have no ``enable_thinking`` template switch,
         # so ``thinking=False`` is a no-op at the prompt layer.  We
@@ -363,13 +381,32 @@ class SaklasApp(App[None]):
         tree.navigate(active.parent_id)
         return True
 
-    def _active_alphas(self) -> dict[str, float]:
-        """Build alphas dict for generation from enabled vectors."""
-        return {name: alpha for name, alpha in self._alphas.items()
-                if self._enabled.get(name, True)}
+    def _active_alphas(self) -> dict[str, Any]:
+        """Build the alphas dict for generation from enabled entries.
+
+        Merges plain scalar vectors (``_alphas``) with manifold terms
+        (``_manifold_terms``); both share the ``_enabled`` flag map so a
+        manifold row toggles through the same left-panel control.  The
+        returned dict's values are ``float`` for vectors and
+        :class:`~saklas.core.steering_expr.ManifoldTerm` for manifolds —
+        ``Steering.alphas``'s ``AlphaEntry`` union admits both.
+        """
+        out: dict[str, Any] = {
+            name: alpha for name, alpha in self._alphas.items()
+            if self._enabled.get(name, True)
+        }
+        for key, term in self._manifold_terms.items():
+            if self._enabled.get(key, True):
+                out[key] = term
+        return out
 
     def _vector_list_for_panel(self) -> list[dict[str, Any]]:
-        """Build the list[dict] format the left panel expects."""
+        """Build the list[dict] format the left panel expects.
+
+        Each entry carries a ``kind`` discriminator: ``"vector"`` rows
+        carry an alpha bar; ``"manifold"`` rows carry a fixed position
+        and a blend coefficient instead (no scalar alpha to nudge).
+        """
         result = []
         for name, alpha in self._alphas.items():
             profile = self._session._profiles.get(name)
@@ -379,6 +416,7 @@ class SaklasApp(App[None]):
             # narrowed-non-None type across the lambda capture (it
             # otherwise widens to include None inside the closure).
             result.append({
+                "kind": "vector",
                 "name": name,
                 "profile": profile,
                 "alpha": alpha,
@@ -388,6 +426,16 @@ class SaklasApp(App[None]):
                     key=lambda k, p=profile: float(p[k].norm().item()),
                 ),
                 "n_active": len(profile),
+            })
+        for key, term in self._manifold_terms.items():
+            coords_str = ",".join(f"{c:g}" for c in term.position)
+            result.append({
+                "kind": "manifold",
+                "name": key,
+                "manifold": term.manifold,
+                "coords": coords_str,
+                "blend": term.coeff,
+                "enabled": self._enabled.get(key, True),
             })
         return result
 
@@ -415,10 +463,27 @@ class SaklasApp(App[None]):
         self._poll_timer = self.set_interval(1 / _POLL_FPS, self._poll_generation)
         self._update_panel_focus()
 
-        self._chat_panel.add_system_message(
-            f"Model loaded: {self._session._model_info.get('model_id', 'unknown')}. "
-            f"Type a message to chat. Use /steer and /probe commands. Tab to switch panels."
+        # Base-model flat mode: drop role headers + the thinking
+        # Collapsible and present turns as flat continuous text.  Set
+        # before any rows mount so the first turn renders flat.
+        if self._is_base_model:
+            self._chat_panel.set_flat_mode(True)
+
+        loaded = (
+            f"Model loaded: "
+            f"{self._session._model_info.get('model_id', 'unknown')}. "
         )
+        if self._is_base_model:
+            loaded += (
+                "Base (non-chat) model — flat completion mode. "
+                "Type to extend the text. Use /steer and /probe commands."
+            )
+        else:
+            loaded += (
+                "Type a message to chat. Use /steer and /probe commands. "
+                "Tab to switch panels."
+            )
+        self._chat_panel.add_system_message(loaded)
 
     # -- Key Handling --
 
@@ -667,7 +732,11 @@ class SaklasApp(App[None]):
             "  /probe <ns>/                — bulk add namespace as probes\n"
             "  /unprobe <name|ns/>         — remove probe(s)\n"
             "  /extract <concept>          — cache-warm only\n"
+            "  /pairs <name>               — extract from custom pairs\n"
             "  /compare <a> [b]            — cosine similarity\n"
+            "Manifold:\n"
+            "  /steer <c> manifold%x,y     — steer toward a manifold point\n"
+            "  /manifold fit <folder>      — fit a manifold pack folder\n"
             "Highlight:\n"
             "  ⌃Y / ⌃⇧Y                    — cycle {off → probe → surprise}\n"
             "Commit (no-gen send):\n"
@@ -985,16 +1054,16 @@ class SaklasApp(App[None]):
                 )
                 return
             if isinstance(val, ManifoldTerm):
-                # Manifold steering (``manifold%t``) routes through a
-                # separate hook path and is not bound to the TUI's
-                # per-vector alpha sliders.  Reject cleanly — express it
-                # in the YAML config (``vectors:``) instead.
-                chat.add_system_message(
-                    f"Manifold terms ('{val.manifold}%{val.position:g}') "
-                    f"aren't supported from /steer; express them in the "
-                    f"YAML config."
-                )
-                return
+                # Manifold steering (``manifold%coords``) routes through a
+                # separate hook path — not bound to the per-vector alpha
+                # sliders.  Dispatch through a worker that eager-loads and
+                # validates the artifact, then stash it on
+                # ``_manifold_terms`` (a ``ManifoldTerm`` is not a
+                # ``Profile``, so it can't live in the scalar ``_alphas``).
+                # ``continue`` rather than ``return`` so a mixed
+                # expression still applies its vector siblings.
+                self._dispatch_manifold_term(key, val)
+                continue
             if isinstance(val, tuple):
                 alpha, _trig = val
             else:
@@ -1046,6 +1115,74 @@ class SaklasApp(App[None]):
             variant=variant, namespace=namespace,
         )
 
+    def _dispatch_manifold_term(self, key: str, term: Any) -> None:
+        """Route one manifold term through eager artifact validation.
+
+        ``key`` is the grammar's manifold registry key
+        (``<manifold>%<coords>``); ``term`` is the parsed
+        :class:`~saklas.core.steering_expr.ManifoldTerm`.  A worker
+        eager-loads the artifact via ``session._ensure_manifold_loaded``
+        — which raises :class:`ManifoldNotRegisteredError` when the named
+        manifold has no fitted tensor for the loaded model — and then
+        validates the position-tuple arity against the loaded manifold's
+        domain.  On success the term lands in ``_manifold_terms`` and the
+        left panel refreshes; any failure surfaces as a system message.
+        """
+        chat = self._chat_panel
+        if self._ab_shadow_active:
+            chat.add_system_message(
+                "Cannot modify steering during A/B shadow gen."
+            )
+            return
+        coords_str = ",".join(f"{c:g}" for c in term.position)
+        chat.add_system_message(
+            f"Loading manifold '{term.manifold}' % {coords_str}..."
+        )
+
+        def _worker() -> None:
+            try:
+                self._session._ensure_manifold_loaded(term.manifold)
+                manifold = self._session._manifolds[term.manifold]
+                want = manifold.domain.intrinsic_dim
+                got = len(term.position)
+                if got != want:
+                    raise ValueError(
+                        f"manifold '{term.manifold}' is {want}-dimensional "
+                        f"but the position has {got} coordinate(s)"
+                    )
+            except SaklasError as e:
+                self.call_from_thread(
+                    self._steer_status, e.user_message()[1],
+                )
+                return
+            except ValueError as e:
+                self.call_from_thread(self._steer_status, str(e))
+                return
+            except Exception as e:
+                self.call_from_thread(
+                    self._steer_status, f"{type(e).__name__}: {e}",
+                )
+                return
+            else:
+                self.call_from_thread(self._on_manifold_added, key, term)
+            finally:
+                # Advance the queue drain — manifold loading runs on a
+                # worker, not the gen loop, so no natural ``done`` lands.
+                self._ui_token_queue.put(("done", False))
+
+        self.run_worker(_worker, thread=True)
+
+    def _on_manifold_added(self, key: str, term: Any) -> None:
+        """Register a validated manifold term and refresh the left panel."""
+        self._manifold_terms[key] = term
+        self._enabled[key] = True
+        coords_str = ",".join(f"{c:g}" for c in term.position)
+        self._chat_panel.add_system_message(
+            f"Manifold '{term.manifold}' % {coords_str} active "
+            f"(blend {term.coeff:.2f})"
+        )
+        self._refresh_left_panel()
+
     def _handle_probe(self, text: str) -> None:
         ns = _detect_namespace_selector(text.strip())
         if ns is not None:
@@ -1067,6 +1204,181 @@ class SaklasApp(App[None]):
             text, include_alpha=False, on_success=_on_success,
             pending_type="extract",
         )
+
+    def _handle_manifold(self, text: str) -> None:
+        """`/manifold fit <folder>` — fit a steering manifold.
+
+        Manifold *authoring* (writing ``manifold.json`` + ``nodes/*.json``)
+        stays out of the TUI; this command only fits an already-authored
+        manifold pack folder for the loaded model.  Gated like
+        ``/extract`` — refused during an A/B shadow gen, deferred behind
+        an in-flight generation via the pending queue.
+        """
+        chat = self._chat_panel
+        text = (text or "").strip()
+        parts = text.split(maxsplit=1)
+        verb = parts[0].lower() if parts else ""
+        if verb != "fit":
+            chat.add_system_message("Usage: /manifold fit <folder>")
+            return
+        folder_arg = parts[1].strip() if len(parts) > 1 else ""
+        folder_arg = _unquote(folder_arg)
+        if not folder_arg:
+            chat.add_system_message("Usage: /manifold fit <folder>")
+            return
+        if self._ab_shadow_active:
+            chat.add_system_message(
+                "Cannot fit a manifold during A/B shadow gen."
+            )
+            return
+        if self._is_busy:
+            self._enqueue_pending(
+                PendingItem(
+                    "manifold_fit", f"/manifold fit {folder_arg}",
+                    (folder_arg,),
+                )
+            )
+            return
+        self._start_manifold_fit(folder_arg)
+
+    def _start_manifold_fit(self, folder_arg: str) -> None:
+        """Run ``session.extract_manifold`` on a worker thread.
+
+        Mirrors ``_handle_extract``'s worker structure: progress lines
+        stream to the chat pane, errors surface as system messages, and
+        the ``finally`` block enqueues a ``done`` sentinel so the pending
+        queue keeps draining (manifold fitting runs off the gen loop).
+        """
+        from pathlib import Path
+
+        folder = Path(folder_arg).expanduser()
+        chat = self._chat_panel
+        if not (folder / "manifold.json").exists():
+            chat.add_system_message(
+                f"/manifold fit: no manifold.json in {folder}"
+            )
+            self._ui_token_queue.put(("done", False))
+            return
+        chat.add_system_message(f"Fitting manifold from {folder}...")
+
+        def _worker() -> None:
+            def _progress(msg: str) -> None:
+                self.call_from_thread(self._steer_status, msg)
+            try:
+                manifold = self._session.extract_manifold(
+                    folder, on_progress=_progress,
+                )
+                self.call_from_thread(
+                    self._steer_status,
+                    f"fitted manifold '{manifold.name}' "
+                    f"({len(manifold.layers)}L, "
+                    f"{len(manifold.node_labels)} nodes) — "
+                    f"steer it with `/steer <coeff> {manifold.name}%<coords>`",
+                )
+            except SaklasError as e:
+                self.call_from_thread(self._steer_status, e.user_message()[1])
+            except ValueError as e:
+                # ``fit_rbf_interpolant`` raises a bare ``ValueError`` on
+                # poisedness failure — not a ``SaklasError``.
+                self.call_from_thread(self._steer_status, str(e))
+            except Exception as e:
+                self.call_from_thread(
+                    self._steer_status, f"{type(e).__name__}: {e}",
+                )
+            finally:
+                self._ui_token_queue.put(("done", False))
+
+        self.run_worker(_worker, thread=True)
+
+    def _handle_pairs(self, text: str) -> None:
+        """`/pairs <name>` — open the custom-statement extraction modal.
+
+        Opens :class:`~saklas.tui.pairs_modal.CustomPairsModal`, a
+        multi-line editor for hand-authored ``positive | negative``
+        contrastive pairs.  On submit the lines are parsed into a pairs
+        list and handed straight to ``session.extract`` — bypassing
+        scenario / pair generation.
+
+        A modal cannot be a :class:`PendingItem`, so ``/pairs`` is
+        refused mid-generation rather than queued (matching how other
+        modal-requiring commands behave).
+        """
+        chat = self._chat_panel
+        name = _unquote((text or "").strip())
+        if not name:
+            chat.add_system_message("Usage: /pairs <name>")
+            return
+        if self._ab_shadow_active:
+            chat.add_system_message(
+                "Cannot extract a vector during A/B shadow gen."
+            )
+            return
+        if self._is_busy:
+            chat.add_system_message(
+                "/pairs opens a modal — finish or stop the current "
+                "generation first."
+            )
+            return
+
+        from saklas.tui.pairs_modal import CustomPairsModal
+
+        def _on_submit(pairs: list[tuple[str, str]] | None) -> None:
+            if not pairs:
+                return  # modal cancelled
+            self._start_pairs_extract(name, pairs)
+
+        self.push_screen(CustomPairsModal(name), _on_submit)
+
+    def _start_pairs_extract(
+        self, name: str, pairs: list[tuple[str, str]],
+    ) -> None:
+        """Extract a steering vector from hand-authored contrastive pairs.
+
+        ``session.extract`` accepts a list of ``(positive, negative)``
+        tuples directly as ``source``, skipping scenario / pair
+        generation.  The extracted vector is steered at
+        :data:`DEFAULT_ALPHA` and registered on the left panel, mirroring
+        ``/steer``'s post-extraction wiring.
+        """
+        chat = self._chat_panel
+        chat.add_system_message(
+            f"Extracting '{name}' from {len(pairs)} custom pair(s)..."
+        )
+
+        def _on_success(canonical: str, profile: Any, alpha: float) -> None:
+            self._session.steer(canonical, profile)
+            self._alphas[canonical] = alpha
+            self._enabled[canonical] = True
+            self.call_from_thread(
+                self._on_vector_extracted, canonical, alpha, profile,
+            )
+
+        def _worker() -> None:
+            def _progress(msg: str) -> None:
+                self.call_from_thread(self._steer_status, msg)
+            try:
+                # Wrap the hand-authored pairs in a ``DataSource`` so the
+                # user-supplied name rides through — a bare list source
+                # would extract as the literal concept ``"custom"``.
+                from saklas.io.datasource import DataSource
+
+                source = DataSource(pairs=pairs, name=name)
+                canonical, profile = self._session.extract(
+                    source, on_progress=_progress, namespace="local",
+                )
+                _on_success(canonical, profile, DEFAULT_ALPHA)
+            except SaklasError as e:
+                self.call_from_thread(self._steer_status, e.user_message()[1])
+            except (ValueError, TypeError) as e:
+                self.call_from_thread(self._steer_status, str(e))
+            except Exception as e:
+                self.call_from_thread(
+                    self._steer_status, f"{type(e).__name__}: {e}",
+                )
+            finally:
+                self._ui_token_queue.put(("done", False))
+
+        self.run_worker(_worker, thread=True)
 
     def _steer_status(self, msg: str) -> None:
         self._chat_panel.add_system_message(msg)
@@ -1834,6 +2146,14 @@ class SaklasApp(App[None]):
         sel = lp.get_selected()
         if sel:
             name = sel["name"]
+            if sel.get("kind") == "manifold":
+                # Manifold rows aren't session-registered profiles —
+                # drop the local term and let the next gen rebuild
+                # ``Steering`` without it.
+                self._manifold_terms.pop(name, None)
+                self._enabled.pop(name, None)
+                self._refresh_left_panel()
+                return
             self._session.unsteer(name)
             self._alphas.pop(name, None)
             self._enabled.pop(name, None)
@@ -1864,6 +2184,10 @@ class SaklasApp(App[None]):
         lp = self._left_panel
         sel = lp.get_selected()
         if sel:
+            if sel.get("kind") == "manifold":
+                # Manifold rows carry a fixed position, not a scalar
+                # alpha — ←/→ has nothing to nudge.
+                return
             name = sel["name"]
             self._alphas[name] = max(-MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta))
             self._refresh_left_panel()
@@ -2094,7 +2418,13 @@ class SaklasApp(App[None]):
         if ns is not None:
             self._handle_unsteer_namespace(ns)
             return
-        matches = _resolve_active_name(raw, self._alphas)
+        # Resolve against both racks — scalar vectors (``_alphas``) and
+        # manifold terms (``_manifold_terms``).  A ``/steer`` with a
+        # ``%`` term lands in ``_manifold_terms``; without this the
+        # slash command would report a racked manifold as "not active".
+        matches = _resolve_active_name(
+            raw, [*self._alphas.keys(), *self._manifold_terms.keys()]
+        )
         if len(matches) == 0:
             chat.add_system_message(f"'{raw}' is not active.")
             return
@@ -2102,6 +2432,15 @@ class SaklasApp(App[None]):
             chat.add_system_message(f"'{raw}' is ambiguous: {', '.join(matches)}")
             return
         name = matches[0]
+        if name in self._manifold_terms:
+            # Manifold rows aren't session-registered profiles — drop the
+            # local term and let the next gen rebuild ``Steering``
+            # without it (mirrors the panel backspace/delete path).
+            self._manifold_terms.pop(name, None)
+            self._enabled.pop(name, None)
+            self._refresh_left_panel()
+            chat.add_system_message(f"Removed manifold '{name}'.")
+            return
         self._session.unsteer(name)
         self._alphas.pop(name, None)
         self._enabled.pop(name, None)
@@ -2290,16 +2629,24 @@ class SaklasApp(App[None]):
         chat = self._chat_panel
         prefix = f"{ns}/"
         matches = [n for n in list(self._alphas.keys()) if n.startswith(prefix)]
-        if not matches:
+        # Manifold terms share the ``ns/name`` key shape — sweep them too.
+        manifold_matches = [
+            n for n in list(self._manifold_terms.keys()) if n.startswith(prefix)
+        ]
+        if not matches and not manifold_matches:
             chat.add_system_message(f"No active vectors under '{ns}/'.")
             return
         for name in matches:
             self._session.unsteer(name)
             self._alphas.pop(name, None)
             self._enabled.pop(name, None)
+        for name in manifold_matches:
+            self._manifold_terms.pop(name, None)
+            self._enabled.pop(name, None)
         self._refresh_left_panel()
+        total = len(matches) + len(manifold_matches)
         chat.add_system_message(
-            f"Removed {len(matches)} vector(s) from '{ns}/'."
+            f"Removed {total} vector(s) from '{ns}/'."
         )
 
     def _handle_unprobe_namespace(self, ns: str) -> None:
@@ -2902,6 +3249,10 @@ class SaklasApp(App[None]):
                 self._handle_probe(payload[0] if payload else text)
             elif kind == "extract":
                 self._handle_extract_only(payload[0] if payload else text)
+            elif kind == "manifold_fit":
+                # ``payload[0]`` is the folder path; the fit runs on a
+                # worker that enqueues its own ``done`` sentinel.
+                self._start_manifold_fit(payload[0] if payload else text)
             elif kind == "regen_n":
                 # N-way regen after an interrupting gen completes; phase
                 # 1's engine serializes via ``session.generate(n=N)``.

@@ -57,7 +57,9 @@ def _make_app():
     app._device_str = "cpu"
     app._alphas = {}
     app._enabled = {}
+    app._manifold_terms = {}
     app._supports_thinking = False
+    app._is_base_model = False
     app._thinking = False
     app._current_assistant_widget = None
     app._poll_timer = None
@@ -167,6 +169,57 @@ def test_unsteer_rejects_missing():
     app = _make_app()
     app._handle_command("/unsteer ghost")
     assert "not active" in _msgs(app)
+
+
+def test_unsteer_removes_manifold_term():
+    """``/unsteer <manifold>`` resolves against ``_manifold_terms`` —
+    a ``%`` term racked via ``/steer`` must be removable by name from
+    the slash command, not only the panel backspace path."""
+    from saklas.core.steering_expr import ManifoldTerm
+    from saklas.core.triggers import Trigger
+
+    app = _make_app()
+    term = ManifoldTerm(
+        coeff=0.7, trigger=Trigger.BOTH, manifold="circumplex",
+        position=(0.3, 0.8),
+    )
+    app._manifold_terms = {"circumplex%0.3,0.8": term}
+    app._enabled = {"circumplex%0.3,0.8": True}
+    app._refresh_left_panel = MagicMock()
+
+    app._handle_command("/unsteer circumplex%0.3,0.8")
+
+    assert "circumplex%0.3,0.8" not in app._manifold_terms
+    assert "circumplex%0.3,0.8" not in app._enabled
+    # Manifold terms aren't session-registered profiles — the session's
+    # ``unsteer`` must not be touched for them.
+    app._session.unsteer.assert_not_called()
+    assert "Removed manifold" in _msgs(app)
+
+
+def test_unsteer_namespace_sweeps_manifold_terms():
+    """``/unsteer ns/`` sweeps both scalar vectors and manifold terms
+    whose keys sit under the namespace."""
+    from saklas.core.steering_expr import ManifoldTerm
+    from saklas.core.triggers import Trigger
+
+    app = _make_app()
+    app._alphas = {"alice/foo": 0.5}
+    term = ManifoldTerm(
+        coeff=0.6, trigger=Trigger.BOTH, manifold="alice/circ",
+        position=(0.1,),
+    )
+    app._manifold_terms = {"alice/circ%0.1": term}
+    app._enabled = {"alice/foo": True, "alice/circ%0.1": True}
+    app._refresh_left_panel = MagicMock()
+
+    app._handle_command("/unsteer alice/")
+
+    assert app._alphas == {}
+    assert app._manifold_terms == {}
+    app._session.unsteer.assert_called_once_with("alice/foo")
+    # The count in the report folds in the manifold term.
+    assert "Removed 2 vector(s)" in _msgs(app)
 
 
 # ---- Task C: new slash commands ----
@@ -1732,3 +1785,299 @@ def test_drain_next_pending_handles_pure_async_chain():
 
     app._drain_next_pending()
     assert [p.text for p in app._pending_queue] == ["second"]
+
+
+# ---------------------------------------------------------------------------
+# /manifold fit dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_manifold_command_rejects_unknown_subverb():
+    """`/manifold` only knows the ``fit`` subverb."""
+    app = _make_app()
+    app._handle_command("/manifold show foo")
+    assert "Usage: /manifold fit" in _msgs(app)
+
+
+def test_manifold_fit_missing_folder_reports(tmp_path):
+    """`/manifold fit` on a folder with no manifold.json reports cleanly
+    without firing a worker."""
+    app = _make_app()
+    app.run_worker = MagicMock()
+    app._handle_command(f"/manifold fit {tmp_path}")
+    assert "no manifold.json" in _msgs(app)
+    app.run_worker.assert_not_called()
+
+
+def test_manifold_fit_runs_session_extract_manifold(tmp_path):
+    """`/manifold fit <folder>` with a manifold.json present routes
+    through ``session.extract_manifold`` on a worker."""
+    (tmp_path / "manifold.json").write_text("{}")
+    app = _make_app()
+
+    fitted = SimpleNamespace(
+        name="circumplex", layers=[0, 1, 2], node_labels=["a", "b", "c"],
+    )
+    captured = {}
+
+    def _fake_extract_manifold(folder, **kwargs):
+        captured["folder"] = folder
+        return fitted
+    app._session.extract_manifold = _fake_extract_manifold
+    app.run_worker = lambda fn, thread=True: fn()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+
+    app._handle_command(f"/manifold fit {tmp_path}")
+
+    assert "folder" in captured
+    assert str(captured["folder"]) == str(tmp_path)
+    assert "fitted manifold 'circumplex'" in _msgs(app)
+
+
+def test_manifold_fit_mid_gen_enqueues_pending():
+    """`/manifold fit` while a generation is in flight queues a
+    ``manifold_fit`` PendingItem rather than running immediately."""
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._session.is_generating = True
+    app._handle_command("/manifold fit /tmp/myfold")
+    assert app._pending_queue == [
+        PendingItem("manifold_fit", "/manifold fit /tmp/myfold", ("/tmp/myfold",))
+    ]
+
+
+# ---------------------------------------------------------------------------
+# /steer manifold terms
+# ---------------------------------------------------------------------------
+
+
+def test_steer_manifold_term_validates_and_registers(monkeypatch, tmp_path):
+    """A ``%`` manifold term in ``/steer`` routes through eager artifact
+    validation and lands on ``_manifold_terms`` — not the scalar
+    ``_alphas`` dict."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import selectors as _sel
+    _sel.invalidate()
+
+    app = _make_app()
+    app._refresh_left_panel = MagicMock()
+
+    # Stub the session manifold-load + registry so validation passes.
+    domain = SimpleNamespace(intrinsic_dim=2)
+    manifold = SimpleNamespace(domain=domain)
+
+    def _ensure(key):
+        app._session._manifolds[key] = manifold
+    app._session._ensure_manifold_loaded = _ensure
+    app._session._manifolds = {}
+    app.run_worker = lambda fn, thread=True: fn()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+
+    app._handle_command("/steer 0.7 circumplex%0.3,0.8")
+
+    assert "circumplex%0.3,0.8" in app._manifold_terms
+    term = app._manifold_terms["circumplex%0.3,0.8"]
+    assert term.position == (0.3, 0.8)
+    assert app._alphas == {}  # not a scalar vector
+    assert app._enabled.get("circumplex%0.3,0.8") is True
+
+
+def test_steer_manifold_term_arity_mismatch_reports(monkeypatch, tmp_path):
+    """A position with the wrong coordinate count is rejected against the
+    loaded manifold's domain."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import selectors as _sel
+    _sel.invalidate()
+
+    app = _make_app()
+    # Domain is 2-D but the position has 3 coords.
+    domain = SimpleNamespace(intrinsic_dim=2)
+    manifold = SimpleNamespace(domain=domain)
+
+    def _ensure(key):
+        app._session._manifolds[key] = manifold
+    app._session._ensure_manifold_loaded = _ensure
+    app._session._manifolds = {}
+    app.run_worker = lambda fn, thread=True: fn()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+
+    app._handle_command("/steer 0.5 circumplex%0.1,0.2,0.3")
+
+    assert "2-dimensional" in _msgs(app)
+    assert app._manifold_terms == {}
+
+
+def test_steer_manifold_unregistered_reports(monkeypatch, tmp_path):
+    """An unfitted manifold surfaces ``ManifoldNotRegisteredError`` as a
+    system message rather than crashing the worker."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import selectors as _sel
+    _sel.invalidate()
+    from saklas.core.session import ManifoldNotRegisteredError
+
+    app = _make_app()
+    app._session._manifolds = {}
+
+    def _ensure(key):
+        raise ManifoldNotRegisteredError(
+            f"manifold '{key}' has no fitted tensor"
+        )
+    app._session._ensure_manifold_loaded = _ensure
+    app.run_worker = lambda fn, thread=True: fn()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+
+    app._handle_command("/steer 0.5 ghost%0.5")
+
+    assert "no fitted tensor" in _msgs(app)
+    assert app._manifold_terms == {}
+
+
+def test_steer_mixed_expression_applies_vector_siblings(monkeypatch, tmp_path):
+    """A mixed expression (vector + manifold) still applies its scalar
+    vector term — the manifold term uses ``continue``, not ``return``."""
+    import torch
+    from saklas.core.profile import Profile
+    from saklas.io import selectors as _sel
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _sel.invalidate()
+
+    app = _make_app()
+    app._refresh_left_panel = MagicMock()
+
+    def _fake_extract(concept, **kwargs):
+        return concept, Profile({0: torch.zeros(4)})
+    app._session.extract = _fake_extract
+
+    domain = SimpleNamespace(intrinsic_dim=1)
+    manifold = SimpleNamespace(domain=domain)
+
+    def _ensure(key):
+        app._session._manifolds[key] = manifold
+    app._session._ensure_manifold_loaded = _ensure
+    app._session._manifolds = {}
+    app.run_worker = lambda fn, thread=True: fn()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+
+    app._handle_command("/steer 0.5 honest + 0.7 circumplex%0.4")
+
+    # The vector sibling landed despite the manifold term in the same
+    # expression.
+    assert "honest" in app._alphas
+    assert "circumplex%0.4" in app._manifold_terms
+
+
+def test_active_alphas_merges_manifold_terms(monkeypatch, tmp_path):
+    """``_active_alphas`` merges scalar vectors and manifold terms,
+    honoring the shared ``_enabled`` flag."""
+    from saklas.core.steering_expr import ManifoldTerm
+    from saklas.core.triggers import Trigger
+
+    app = _make_app()
+    app._alphas = {"honest": 0.5, "warm": 0.3}
+    term = ManifoldTerm(
+        coeff=0.7, trigger=Trigger.BOTH, manifold="circumplex",
+        position=(0.3, 0.8),
+    )
+    app._manifold_terms = {"circumplex%0.3,0.8": term}
+    app._enabled = {
+        "honest": True, "warm": False, "circumplex%0.3,0.8": True,
+    }
+
+    merged = app._active_alphas()
+    assert merged == {"honest": 0.5, "circumplex%0.3,0.8": term}
+
+    # Disabling the manifold drops it from the merged dict.
+    app._enabled["circumplex%0.3,0.8"] = False
+    assert "circumplex%0.3,0.8" not in app._active_alphas()
+
+
+# ---------------------------------------------------------------------------
+# /pairs custom-statement extraction
+# ---------------------------------------------------------------------------
+
+
+def test_pairs_command_requires_name():
+    app = _make_app()
+    app._handle_command("/pairs")
+    assert "Usage: /pairs" in _msgs(app)
+
+
+def test_pairs_command_refused_mid_gen():
+    """`/pairs` opens a modal — it cannot be queued, so it's refused
+    while a generation is in flight rather than enqueued."""
+    app = _make_app()
+    app._session.is_generating = True
+    app._handle_command("/pairs mood")
+    assert "modal" in _msgs(app)
+    assert app._pending_queue == []
+
+
+def test_pairs_command_pushes_modal():
+    """`/pairs <name>` pushes a ``CustomPairsModal``."""
+    from saklas.tui.pairs_modal import CustomPairsModal
+
+    app = _make_app()
+    pushed = {}
+    app.push_screen = lambda screen, callback=None: pushed.update(
+        screen=screen, callback=callback,
+    )
+    app._handle_command("/pairs mood")
+    assert isinstance(pushed["screen"], CustomPairsModal)
+
+
+def test_pairs_modal_parses_pair_lines():
+    """The modal's line parser splits on ``|`` and rejects malformed
+    lines."""
+    from saklas.tui.pairs_modal import parse_pair_lines
+
+    pairs, errors = parse_pair_lines(
+        "i am happy | i am sad\n"
+        "\n"
+        "calm words | angry words\n"
+    )
+    assert pairs == [
+        ("i am happy", "i am sad"),
+        ("calm words", "angry words"),
+    ]
+    assert errors == []
+
+    # Malformed: no delimiter, empty side, two delimiters.
+    pairs, errors = parse_pair_lines(
+        "no delimiter here\n"
+        "good | \n"
+        "a | b | c\n"
+    )
+    assert pairs == []
+    assert len(errors) == 3
+    assert "line 1" in errors[0]
+
+
+def test_pairs_extract_routes_through_session_extract():
+    """A submitted pair list extracts via ``session.extract`` wrapped in
+    a ``DataSource`` carrying the user-supplied name."""
+    import torch
+    from saklas.core.profile import Profile
+    from saklas.io.datasource import DataSource
+
+    app = _make_app()
+    app._refresh_left_panel = MagicMock()
+    captured = {}
+
+    def _fake_extract(source, **kwargs):
+        captured["source"] = source
+        captured["kwargs"] = kwargs
+        return "mood", Profile({0: torch.zeros(4)})
+    app._session.extract = _fake_extract
+    app.run_worker = lambda fn, thread=True: fn()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+
+    app._start_pairs_extract(
+        "mood", [("happy", "sad"), ("calm", "angry")],
+    )
+
+    src = captured["source"]
+    assert isinstance(src, DataSource)
+    assert src.name == "mood"
+    assert src.pairs == [("happy", "sad"), ("calm", "angry")]
+    assert "mood" in app._alphas
