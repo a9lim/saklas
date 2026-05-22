@@ -1433,6 +1433,163 @@ def _run_transfer(args: argparse.Namespace) -> None:
     )
 
 
+def _run_manifold_fit(args: argparse.Namespace) -> None:
+    _require_model(args)
+    folder = Path(args.folder)
+    if not (folder / "manifold.json").exists():
+        print(
+            f"manifold fit: no manifold.json in {folder}", file=sys.stderr,
+        )
+        sys.exit(2)
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+    try:
+        manifold = session.extract_manifold(
+            folder,
+            sae=getattr(args, "sae", None),
+            sae_revision=getattr(args, "sae_revision", None),
+            on_progress=lambda m: print(f"  {m}"),
+        )
+    except Exception as e:
+        print(f"manifold fit failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        f"fitted manifold '{manifold.name}' "
+        f"({len(manifold.layers)} layers, {len(manifold.node_labels)} nodes, "
+        f"{'cyclic' if manifold.cyclic else 'sequential'}, "
+        f"{manifold.feature_space})"
+    )
+
+
+def _iter_manifold_folders(namespace: str | None):
+    """Yield ``(namespace, ManifoldFolder)`` for every installed manifold."""
+    from saklas.io.manifolds import ManifoldFolder, ManifoldFormatError
+    from saklas.io.paths import manifolds_dir
+
+    root = manifolds_dir()
+    if not root.exists():
+        return
+    for ns_dir in sorted(root.iterdir()):
+        if not ns_dir.is_dir():
+            continue
+        if namespace is not None and ns_dir.name != namespace:
+            continue
+        for mdir in sorted(ns_dir.iterdir()):
+            if not (mdir / "manifold.json").exists():
+                continue
+            try:
+                yield ns_dir.name, ManifoldFolder.load(mdir)
+            except ManifoldFormatError:
+                continue
+
+
+def _run_manifold_ls(args: argparse.Namespace) -> None:
+    import json as _json
+
+    rows = list(_iter_manifold_folders(getattr(args, "namespace", None)))
+    if getattr(args, "json_output", False):
+        print(_json.dumps([
+            {
+                "namespace": ns,
+                "name": mf.name,
+                "cyclic": mf.cyclic,
+                "nodes": mf.node_labels,
+                "fitted_models": mf.tensor_models(),
+            }
+            for ns, mf in rows
+        ], indent=2))
+        return
+    if not rows:
+        print("no manifolds installed under ~/.saklas/manifolds/")
+        return
+    for ns, mf in rows:
+        kind = "cyclic" if mf.cyclic else "sequential"
+        models = ", ".join(mf.tensor_models()) or "(unfitted)"
+        print(
+            f"  {ns}/{mf.name}  [{kind}, {len(mf.node_labels)} nodes]  {models}"
+        )
+
+
+def _run_manifold_show(args: argparse.Namespace) -> None:
+    import json as _json
+
+    name = args.name
+    target_ns = None
+    if "/" in name:
+        target_ns, name = name.split("/", 1)
+    matches = [
+        (ns, mf)
+        for ns, mf in _iter_manifold_folders(target_ns)
+        if mf.name == name
+    ]
+    if not matches:
+        print(f"manifold '{args.name}' not found", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        qualified = ", ".join(f"{ns}/{mf.name}" for ns, mf in matches)
+        print(
+            f"ambiguous manifold '{name}': matches {qualified}; "
+            f"qualify with a namespace",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    ns, mf = matches[0]
+    fitted = []
+    for stem in mf.tensor_models():
+        sc = mf.sidecar(stem)
+        fitted.append({
+            "stem": stem,
+            "method": sc.method,
+            "feature_space": sc.feature_space,
+            "node_count": sc.node_count,
+        })
+    if getattr(args, "json_output", False):
+        print(_json.dumps({
+            "namespace": ns,
+            "name": mf.name,
+            "description": mf.description,
+            "cyclic": mf.cyclic,
+            "nodes": mf.node_labels,
+            "fitted": fitted,
+        }, indent=2))
+        return
+    print(f"{ns}/{mf.name}")
+    if mf.description:
+        print(f"  {mf.description}")
+    print(f"  kind:   {'cyclic' if mf.cyclic else 'sequential'}")
+    print(f"  nodes:  {' -> '.join(mf.node_labels)}")
+    if fitted:
+        print("  fitted models:")
+        for f in fitted:
+            print(f"    {f['stem']}  ({f['method']}, {f['feature_space']})")
+    else:
+        print("  fitted models: (none — run `saklas vector manifold fit`)")
+
+
+def _run_vector_manifold(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas vector manifold <verb>``."""
+    cmd = getattr(args, "manifold_cmd", None)
+    if cmd is None:
+        print("usage: saklas vector manifold <verb> [...]")
+        print()
+        print("  fit   Fit a manifold for a model from an authored corpus")
+        print("  ls    List installed manifolds")
+        print("  show  Show a manifold's nodes and fitted models")
+        sys.exit(0)
+    if cmd == "fit":
+        _run_manifold_fit(args)
+        return
+    if cmd == "ls":
+        _run_manifold_ls(args)
+        return
+    if cmd == "show":
+        _run_manifold_show(args)
+        return
+    print(f"unknown vector manifold verb {cmd!r}", file=sys.stderr)
+    sys.exit(2)
+
+
 _VECTOR_RUNNERS = {
     "extract":  _run_extract,
     "merge":    _run_merge,
@@ -1440,6 +1597,7 @@ _VECTOR_RUNNERS = {
     "compare":  _run_compare,
     "why":      _run_why,
     "transfer": _run_transfer,
+    "manifold": _run_vector_manifold,
 }
 
 
@@ -1476,8 +1634,128 @@ def _run_experiment(args: argparse.Namespace) -> None:
     if cmd == "transcript":
         _run_experiment_transcript(args)
         return
+    if cmd == "naturalness":
+        _run_experiment_naturalness(args)
+        return
     print(f"unknown experiment verb {cmd!r}", file=sys.stderr)
     sys.exit(2)
+
+
+def _run_experiment_naturalness(args: argparse.Namespace) -> None:
+    """Score a steered generation's behavior-manifold naturalness."""
+    import json as _json
+
+    import torch
+
+    from saklas.core.manifold import (
+        compute_node_behavior_centroid,
+        compute_trajectory_distributions,
+        fit_behavior_manifold,
+        trajectory_naturalness,
+    )
+    from saklas.core.profile import Profile
+    from saklas.core.sampling import SamplingConfig
+    from saklas.core.steering_expr import ManifoldTerm, parse_expr
+    from saklas.io.manifolds import ManifoldFolder
+
+    _load_effective_config(args)
+    mfolder = Path(args.manifold)
+    if not (mfolder / "manifold.json").exists():
+        print(
+            f"experiment naturalness: no manifold.json in {mfolder}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    mf = ManifoldFolder.load(mfolder)
+    node_groups = mf.node_groups()
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    # 1. Fit the behavior manifold from the node corpus — each node's
+    #    mean next-token distribution, in Hellinger space.
+    print(f"fitting behavior manifold ({len(node_groups)} nodes)...")
+    centroids = [
+        compute_node_behavior_centroid(
+            session.model, session.tokenizer, session.device, statements,
+        )
+        for _label, statements in node_groups
+    ]
+    behavior = fit_behavior_manifold(
+        torch.stack(centroids), cyclic=mf.cyclic,
+    )
+
+    sampling = SamplingConfig(max_tokens=args.max_tokens, seed=0)
+
+    def _score(steer) -> tuple[str, float, float]:
+        result = session.generate(
+            args.prompt, steering=steer, sampling=sampling,
+        )
+        text = result.text
+        traj = compute_trajectory_distributions(
+            session.model, session.tokenizer, session.device, text,
+        )
+        per_step = trajectory_naturalness(traj, behavior)
+        return text, float(per_step.mean()), float(per_step.max())
+
+    rows: list[dict] = []
+    _text, mean_d, max_d = _score(args.steer)
+    rows.append({
+        "label": "manifold", "steering": args.steer,
+        "mean_bhattacharyya": mean_d, "max_bhattacharyya": max_d,
+    })
+
+    if args.compare_linear:
+        steering = parse_expr(args.steer)
+        mterms = [
+            v for v in steering.alphas.values()
+            if isinstance(v, ManifoldTerm)
+        ]
+        if len(mterms) != 1 or len(steering.alphas) != 1:
+            print(
+                "experiment naturalness: --compare-linear requires the "
+                "steer expression to be a single manifold term",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        mt = mterms[0]
+        session._ensure_manifold_loaded(mt.manifold)
+        act_manifold = session._manifolds[mt.manifold]
+        # Linear baseline: the straight chord from the curve start to the
+        # term's position, per layer — what plain additive steering would
+        # do instead of following the spline.
+        chord = {
+            L: sub.spline_point(mt.position) - sub.spline_point(0.0)
+            for L, sub in act_manifold.layers.items()
+        }
+        session.steer("__manifold_linear_baseline__", Profile(chord))
+        _ltext, lmean, lmax = _score(
+            f"{mt.coeff:g} __manifold_linear_baseline__"
+        )
+        rows.append({
+            "label": "linear-chord", "steering": f"chord@t={mt.position:g}",
+            "mean_bhattacharyya": lmean, "max_bhattacharyya": lmax,
+        })
+
+    if args.json_output:
+        print(_json.dumps({"prompt": args.prompt, "results": rows}, indent=2))
+        return
+    print()
+    print("behavior-manifold naturalness  (lower = more natural)")
+    for r in rows:
+        print(
+            f"  {r['label']:<14} mean D_B={r['mean_bhattacharyya']:.4f}  "
+            f"max D_B={r['max_bhattacharyya']:.4f}"
+        )
+    if len(rows) == 2:
+        delta = rows[1]["mean_bhattacharyya"] - rows[0]["mean_bhattacharyya"]
+        verdict = (
+            "manifold steering stays closer to the behavior manifold"
+            if delta > 0 else
+            "linear steering stays closer to the behavior manifold"
+        )
+        print(f"  -> {verdict} (Δmean={delta:+.4f})")
 
 
 def _run_experiment_transcript(args: argparse.Namespace) -> None:

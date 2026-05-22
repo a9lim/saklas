@@ -7,7 +7,7 @@ and the path/selector/cache plumbing the rest of saklas runs on.
 
 Every `~/.saklas/` path resolves through `saklas_home()` (honors `$SAKLAS_HOME`).
 Helpers: `vectors_dir`, `models_dir`, `neutral_statements_path`, `concept_dir(ns, name)`,
-`model_dir(model_id)`, `safe_model_id` (`/` → `__`).
+`model_dir(model_id)`, `manifolds_dir`, `manifold_dir(ns, name)`, `safe_model_id` (`/` → `__`).
 
 Owns the tensor-filename variant scheme. A concept folder can hold multiple
 baked tensors per model, distinguished by filename suffix:
@@ -64,6 +64,10 @@ staleness checks.
 `.bak`), and overwrites `statements.json` only when the user's copy hashes
 equal to the bundled one (canonical-JSON comparison) — a user-edited statements
 file is preserved with an INFO log. Per-model tensors stay put.
+
+## manifolds.py
+
+On-disk format for manifold-steering artifacts — `~/.saklas/manifolds/<ns>/<name>/`, a peer of `vectors/` (a manifold is N ordered labeled nodes, not a single bipolar concept, so not a `ConceptFolder`). `ManifoldFolder.load` parses `manifold.json` (`name` / `cyclic` / ordered `nodes` labels / `files{sha256}`), validates the format version + `NAME_REGEX` on the name and every node label, requires ≥3 nodes (`MIN_MANIFOLD_NODES`), and verifies the `files` manifest when populated. `node_groups()` reads `nodes/NN_<label>.json` (one JSON statement list per node) in order; `nodes_sha256()` hashes the ordered corpus (the per-tensor staleness key). `write_metadata` re-hashes and rewrites `manifold.json` after a fit. The `files` manifest covers only fitted tensors + sidecars — the node corpus is user-editable (editing it is the re-fit trigger) so it is deliberately *not* integrity-hashed (`hash_manifold_files`). `ManifoldSidecar` is the lean per-tensor JSON (`method` / `cyclic` / `node_count` / `nodes_sha256` / optional SAE keys) — separate from `packs.Sidecar`, whose concept-extraction fields are meaningless here. Tensor save/load itself lives in `core/manifold.py`. `ManifoldFormatError` on any malformed folder.
 
 ## atomic.py
 

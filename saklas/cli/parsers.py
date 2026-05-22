@@ -85,11 +85,13 @@ _VECTOR_VERBS: list[tuple[str, str]] = [
     ("compare",   "Cosine similarity between steering vectors"),
     ("why",       "Show which layers contribute most to a steering vector"),
     ("transfer",  "Transfer a probe from one model to another via Procrustes"),
+    ("manifold",  "Fit and inspect spline-based steering manifolds"),
 ]
 
 _EXPERIMENT_VERBS: list[tuple[str, str]] = [
-    ("fan",        "Run an alpha grid as one experiment"),
-    ("transcript", "Replay or inspect saved transcript paths"),
+    ("fan",         "Run an alpha grid as one experiment"),
+    ("transcript",  "Replay or inspect saved transcript paths"),
+    ("naturalness", "Score a steered generation's behavior-manifold naturalness"),
 ]
 
 
@@ -450,6 +452,53 @@ def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
                    help="Emit machine-readable JSON (path + quality summary)")
 
 
+def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
+    """``saklas vector manifold`` — fit and inspect steering manifolds.
+
+    Nested subparser (``fit`` / ``ls`` / ``show``), mirroring
+    ``experiment transcript``.  ``fit`` loads a model and runs the
+    manifold extraction pipeline; ``ls`` / ``show`` are pure-IO.
+    """
+    sub = parser.add_subparsers(dest="manifold_cmd", required=False, metavar="VERB")
+
+    fit = sub.add_parser(
+        "fit",
+        help="Fit a manifold for a model from an authored corpus folder",
+        description=(
+            "Pool per-node centroids, fit a per-layer PCA subspace + cubic "
+            "spline, and write the per-model manifold tensor into the folder."
+        ),
+    )
+    fit.add_argument("folder", help="Path to an authored manifold folder")
+    fit.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+    fit.add_argument(
+        "--sae", default=None, metavar="RELEASE",
+        help="Fit in an SAELens SAE feature space (requires `.[sae]`); "
+             "centroids are reconstructed through the SAE before the fit.",
+    )
+    fit.add_argument(
+        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
+        help="Pin a specific HF revision for the SAE release",
+    )
+    fit.set_defaults(quantize=None, device="auto", probes=None)
+
+    ls = sub.add_parser(
+        "ls", help="List installed manifolds",
+        description="List local manifolds under ~/.saklas/manifolds/.",
+    )
+    ls.add_argument("--namespace", default=None, metavar="NS",
+                    help="Restrict to a single namespace")
+    ls.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+    show = sub.add_parser(
+        "show", help="Show a manifold's nodes and fitted models",
+        description="Print one manifold's node order, cyclic flag, and "
+                    "per-model fitted tensors.",
+    )
+    show.add_argument("name", help="Manifold name (or ns/name)")
+    show.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
 _VECTOR_BUILDERS = {
     "extract":  _build_vector_extract,
     "merge":    _build_vector_merge,
@@ -457,6 +506,7 @@ _VECTOR_BUILDERS = {
     "compare":  _build_vector_compare,
     "why":      _build_vector_why,
     "transfer": _build_vector_transfer,
+    "manifold": _build_vector_manifold,
 }
 
 
@@ -573,9 +623,44 @@ def _build_experiment_transcript_parser(parser: argparse.ArgumentParser) -> None
     # interpretations share the spirit of the flag.
 
 
+def _build_experiment_naturalness(p: argparse.ArgumentParser) -> None:
+    """``saklas experiment naturalness`` — behavior-manifold naturalness eval.
+
+    Fits a behavior-space manifold from the manifold pack's node corpus
+    (each node's mean next-token distribution, mapped to Hellinger
+    space), runs a steered generation, re-runs the model over the
+    generated text to recover its behavioral trajectory, and reports the
+    mean / max Bhattacharyya distance of that trajectory to the behavior
+    manifold — low is natural, high flags off-manifold "teleportation".
+    """
+    p.add_argument("model", help="HuggingFace model ID or local path")
+    p.add_argument("prompt", help="Prompt to generate from")
+    p.add_argument(
+        "--manifold", required=True, metavar="FOLDER",
+        help="Manifold folder whose node corpus seeds the behavior manifold",
+    )
+    p.add_argument(
+        "-S", "--steer", required=True, metavar="EXPR",
+        help="Steering expression to evaluate (e.g. 'mood%%0.5')",
+    )
+    p.add_argument(
+        "--compare-linear", dest="compare_linear", action="store_true",
+        help="Also score a linear-chord steering baseline (the manifold "
+             "term must be a single '%%' term)",
+    )
+    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+    p.add_argument("-d", "--device", default="auto")
+    p.add_argument("-p", "--probes", nargs="*", default=None)
+    p.add_argument("-j", "--json", dest="json_output", action="store_true")
+    _add_injection_args(p)
+    _add_config_args(p)
+
+
 _EXPERIMENT_BUILDERS = {
     "fan": _build_experiment_fan,
     "transcript": _build_experiment_transcript_parser,
+    "naturalness": _build_experiment_naturalness,
 }
 
 

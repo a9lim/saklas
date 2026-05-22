@@ -74,6 +74,20 @@ def models_dir() -> Path:
     return saklas_home() / "models"
 
 
+def manifolds_dir() -> Path:
+    """Root of the manifold-steering artifact tree.
+
+    Parallel to :func:`vectors_dir` — a manifold is its own artifact kind
+    (an ordered, optionally cyclic set of labeled nodes), not a concept
+    folder, so it lives under its own root.
+    """
+    return saklas_home() / "manifolds"
+
+
+def manifold_dir(namespace: str, name: str) -> Path:
+    return manifolds_dir() / namespace / name
+
+
 def neutral_statements_path() -> Path:
     return saklas_home() / "neutral_statements.json"
 

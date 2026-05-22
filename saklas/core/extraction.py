@@ -23,7 +23,7 @@ from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 import torch
 
-from saklas.core.events import EventBus, VectorExtracted
+from saklas.core.events import EventBus, ManifoldExtracted, VectorExtracted
 from saklas.core.profile import Profile
 from saklas.core.sae import SaeBackend
 from saklas.io.datasource import DataSource
@@ -632,3 +632,191 @@ class ExtractionPipeline:
         ))
         self._packs._update_local_pack_files(local_folder)
         return _build_return(profile, diagnostics)
+
+
+# ----------------------------------------------------------------------
+# Manifold extraction.
+# ----------------------------------------------------------------------
+
+
+class ManifoldExtractionPipeline:
+    """Fit a spline-based steering manifold from an authored corpus.
+
+    Distinct from :class:`ExtractionPipeline` — manifold extraction has a
+    fundamentally different input (N labeled node groups, no contrastive
+    pairs, no scenario generation), so it is its own pipeline rather than
+    a method on the concept extractor.  It reuses the :class:`ModelHandle`
+    protocol (it needs ``model`` / ``tokenizer`` / ``layers`` / ``device``
+    / ``model_id``) and emits :class:`ManifoldExtracted`.
+
+    Feature space: ``sae=None`` fits per-layer PCA + spline directly on
+    residual-stream centroids.  ``sae="<release>"`` reconstructs each
+    centroid through the SAE (encode then decode) before the fit — a
+    denoised, sparse-feature-supported centroid — and restricts the
+    manifold to the SAE's covered layers.  Either way the fitted
+    :class:`~saklas.core.manifold.LayerSubspace` is model-space, so the
+    steering hook never touches the SAE.
+    """
+
+    __slots__ = ("_handle", "_events")
+
+    def __init__(self, model_handle: ModelHandle, events: EventBus) -> None:
+        self._handle = model_handle
+        self._events = events
+
+    def fit(
+        self,
+        folder,
+        *,
+        sae: str | SaeBackend | None = None,
+        sae_revision: str | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ):
+        """Fit (or load from cache) a manifold for the session's model.
+
+        ``folder`` is an authored manifold pack directory.  Returns a
+        :class:`~saklas.core.manifold.Manifold`.  A cache hit — the
+        per-model tensor exists and its sidecar ``nodes_sha256`` still
+        matches the corpus — short-circuits the forward passes.
+        """
+        from saklas.core.manifold import (
+            Manifold,
+            compute_node_centroid,
+            fit_layer_subspace,
+            load_manifold,
+            save_manifold,
+        )
+        from saklas.io.manifolds import ManifoldFolder, ManifoldSidecar
+
+        def _progress(msg: str) -> None:
+            if on_progress:
+                on_progress(msg)
+
+        mf = ManifoldFolder.load(pathlib.Path(folder))
+        node_groups = mf.node_groups()
+        nodes_sha = mf.nodes_sha256()
+
+        # Resolve the SAE backend once (lazy import — non-SAE callers
+        # never touch the SAE layer).
+        sae_backend: SaeBackend | None
+        sae_release: str | None
+        if sae is None:
+            sae_backend = None
+            sae_release = None
+        elif isinstance(sae, str):
+            from saklas.core.sae import load_sae_backend
+            sae_backend = load_sae_backend(
+                sae,
+                revision=sae_revision,
+                model_id=self._handle.model_id,
+                device=self._handle.device,
+            )
+            sae_release = sae
+        else:
+            sae_backend = sae
+            sae_release = sae.release
+
+        tensor_path = pathlib.Path(folder) / tensor_filename(
+            self._handle.model_id, release=sae_release,
+        )
+
+        # Cache hit: tensor present + every fit-affecting input unchanged.
+        # ``nodes_sha256`` covers the corpus; ``cyclic`` selects the spline
+        # system (periodic vs natural) and ``sae_revision`` the SAE the
+        # centroids are reconstructed through — neither rides the
+        # filename, so both are checked here or a stale tensor is served.
+        sidecar_path = tensor_path.with_suffix(".json")
+        cached_revision = (
+            sae_backend.revision if sae_backend is not None else None
+        )
+        if tensor_path.exists() and sidecar_path.exists():
+            try:
+                sc = ManifoldSidecar.load(sidecar_path)
+            except (KeyError, ValueError):
+                sc = None
+            if (
+                sc is not None
+                and sc.nodes_sha256 == nodes_sha
+                and sc.cyclic == mf.cyclic
+                and sc.sae_revision == cached_revision
+            ):
+                _progress(f"Loaded cached manifold '{mf.name}'.")
+                manifold = load_manifold(tensor_path)
+                self._events.emit(ManifoldExtracted(
+                    name=mf.name, manifold=manifold,
+                    metadata=dict(manifold.metadata),
+                ))
+                return manifold
+
+        model = self._handle.model
+        tokenizer = self._handle.tokenizer
+        layers = self._handle.layers
+        device = self._handle.device
+        n_layers = len(layers)
+
+        # 1. Per-node centroids (one forward pass per statement).
+        per_node: list[dict[int, torch.Tensor]] = []
+        for label, statements in node_groups:
+            _progress(
+                f"Pooling node '{label}' ({len(statements)} statements)..."
+            )
+            per_node.append(compute_node_centroid(
+                model, tokenizer, layers, device, statements,
+            ))
+
+        # 2. Choose the layer set.
+        if sae_backend is not None:
+            fit_layers = sorted(
+                set(sae_backend.layers) & set(range(n_layers))
+            )
+            if not fit_layers:
+                raise ValueError(
+                    f"SAE release {sae_backend.release!r} covers no layers "
+                    f"of {self._handle.model_id}"
+                )
+            feature_space = f"sae-{sae_backend.release}"
+            method = "manifold_sae"
+        else:
+            fit_layers = list(range(n_layers))
+            feature_space = "raw"
+            method = "manifold_pca"
+
+        # 3. Per-layer fit.  Stack centroids -> (K, D); for the SAE
+        #    variant reconstruct through the SAE before fitting.
+        _progress(f"Fitting splines across {len(fit_layers)} layers...")
+        layer_subs = {}
+        for idx in fit_layers:
+            stacked = torch.stack(
+                [per_node[k][idx] for k in range(len(node_groups))]
+            )  # (K, D) fp32 CPU
+            if sae_backend is not None:
+                with torch.no_grad():
+                    feat = sae_backend.encode_layer(idx, stacked.to(device))
+                    recon = sae_backend.decode_layer(idx, feat)
+                stacked = recon.detach().to("cpu", torch.float32)
+            layer_subs[idx] = fit_layer_subspace(stacked, cyclic=mf.cyclic)
+
+        manifold = Manifold(
+            name=mf.name,
+            cyclic=mf.cyclic,
+            node_labels=[label for label, _ in node_groups],
+            layers=layer_subs,
+            feature_space=feature_space,
+        )
+
+        # 4. Persist + refresh the folder integrity manifest.
+        metadata: dict[str, Any] = {
+            "method": method,
+            "nodes_sha256": nodes_sha,
+        }
+        if sae_backend is not None:
+            metadata["sae_release"] = sae_backend.release
+            metadata["sae_revision"] = sae_backend.revision
+        save_manifold(manifold, tensor_path, metadata)
+        manifold.metadata.update(metadata)
+        mf.write_metadata()
+
+        self._events.emit(ManifoldExtracted(
+            name=mf.name, manifold=manifold, metadata=metadata,
+        ))
+        return manifold

@@ -26,6 +26,13 @@ class VectorExtracted:
 
 
 @dataclass(frozen=True)
+class ManifoldExtracted:
+    name: str
+    manifold: Any  # Manifold — forward ref to avoid import cycle
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class SteeringApplied:
     alphas: dict[str, float]
     # Full entries (alpha + trigger) for subscribers that need to know which
@@ -57,6 +64,7 @@ class GenerationFinished:
 
 Event = Union[
     VectorExtracted,
+    ManifoldExtracted,
     SteeringApplied,
     SteeringCleared,
     ProbeScored,

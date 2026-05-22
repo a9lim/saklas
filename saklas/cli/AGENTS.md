@@ -12,8 +12,8 @@ Six-verb root parser (`tui`/`serve`/`pack`/`vector`/`experiment`/`config`) split
 ## Verb nesting
 
 - `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via `_PACK_VERBS` / `_PACK_BUILDERS` / `_PACK_RUNNERS`
-- `vector` = computation (extract/merge/clone/compare/why/transfer) via `_VECTOR_VERBS` / `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`
-- `experiment` = repeatable research runs (`fan`, `transcript run`) via `_EXPERIMENT_VERBS` / `_EXPERIMENT_BUILDERS`; `_run_experiment` hand-dispatches the two verbs
+- `vector` = computation (extract/merge/clone/compare/why/transfer/manifold) via `_VECTOR_VERBS` / `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`; `manifold` is itself nested (`fit`/`ls`/`show`), hand-dispatched by `_run_vector_manifold`
+- `experiment` = repeatable research runs (`fan`, `transcript run`, `naturalness`) via `_EXPERIMENT_VERBS` / `_EXPERIMENT_BUILDERS`; `_run_experiment` hand-dispatches the verbs
 - `config` = show / validate
 
 ## Config loading
@@ -42,8 +42,10 @@ Six-verb root parser (`tui`/`serve`/`pack`/`vector`/`experiment`/`config`) split
 - `vector compare`: positional `concepts` (1+ selectors), required `-m/--model`, `-v/--verbose`, `-j/--json`, `--metric {euclidean,mahalanobis}` (default `mahalanobis`), `--ridge-scale FLOAT` (default 1.0, mahalanobis only), `--legacy` (≡ `--metric euclidean`). 1-arg mode ranks all installed against the target, 2-arg is pairwise, 3+ prints an N×N matrix. The mahalanobis path loads `LayerWhitener.from_cache(model_id)` up front; a missing whitener cache is fatal (no silent Euclidean fallback).
 - `vector why`: positional `concept`, required `-m/--model`, `-j/--json`. Prints a per-layer `||baked||` histogram (16 buckets) plus diagnostics when the sidecar carries them.
 - `vector transfer`: positional `concept`, required `--from SRC_MODEL` / `--to TGT_MODEL`, `-f/--force`, `-j/--json`. Fits/loads a Procrustes alignment and writes a transferred tensor at the target's `from-<safe_src>` variant.
+- `vector manifold`: nested `fit` / `ls` / `show`. `fit <folder> [-m MODEL] [--sae RELEASE] [--sae-revision REV]` loads a model and runs `ManifoldExtractionPipeline` via `session.extract_manifold`; `ls [--namespace NS] [-j]` and `show <name> [-j]` are pure-IO walks of `manifolds_dir()`.
 - `experiment fan`: positional `model` + `prompt`, required repeatable `-g/--grid CONCEPT=ALPHAS`, `-S/--base-steering EXPR`, `--max-tokens` (default 256), `-j/--json`. Runs the alpha grid through `session.generate_sweep`; JSON mode emits `RunSet.to_dict()`.
 - `experiment transcript run`: positional `path` + optional `model` (falls back to the transcript's embedded `model_id`), `--max-tokens` (default 256). Replays each user turn and reports per-turn readings drift. `transcript` is not a top-level verb.
+- `experiment naturalness`: positional `model` + `prompt`, required `--manifold FOLDER` / `-S/--steer EXPR`, `--compare-linear`, `--max-tokens` (default 128), `-j/--json`. Fits a behavior-space manifold from the manifold's node corpus, generates, and reports the trajectory's Bhattacharyya distance to it; `--compare-linear` scores a straight-chord additive baseline alongside (the steer expression must then be a single `%` term).
 - `pack install`: `target`, `-s/--statements-only`, `-a/--as NS/NAME`, `-f/--force`.
 - `pack refresh`: `selector` (or the literal `neutrals`), `-m/--model`.
 - `pack clear`: `selector`, `-m/--model`, `-y/--yes` (required for broad selectors), `--variant {raw,sae,all}` (default `all`).

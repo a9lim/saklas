@@ -139,6 +139,22 @@ The grammar tokens `@both`, `@response`, `@before`, `@after`, and `@thinking` le
 
 Prefix a concept with `!` to ablate it: at every covered layer, the component of the residual stream along the concept's direction is replaced with the baseline mean.
 
+### Manifold steering
+
+Linear steering moves along a single straight direction. When you want to steer through a *sequence* of related states — days of the week, an emotional gradient, a politeness scale — a straight line between the endpoints cuts through regions of activation space the model never actually visits, and the intermediate generations come out garbled or collapse to sameness. Manifold steering, following [Goodfire's work](https://arxiv.org/abs/2605.05115), fits a smooth spline through the activation centroids of an ordered set of concepts and steers along that curve instead.
+
+A manifold is its own kind of pack: a folder of labelled node corpora that you author, then fit per model with `saklas vector manifold fit <folder>`. Once it's fitted, the `%` operator places a generation at a position along the curve:
+
+```python
+# halfway along the "mood" manifold
+session.generate("Describe your day.", steering="mood%0.5")
+
+# blend strength 0.7, applied to the response only
+session.generate("...", steering="0.7 mood%0.5@response")
+```
+
+The position runs 0 to 1 over the node sequence; the coefficient is how hard to pull the generation onto the curve. Injection is a soft subspace replace — the part of the hidden state inside the manifold's subspace is moved onto the spline point, the rest is left alone. `saklas experiment naturalness` scores how far a steered run drifts off the model's natural behavior, so you can check a manifold run against a plain linear one.
+
 ### SAE-backed extraction (experimental)
 
 > **Experimental** This pipeline is not as tested as the raw extraction path. 
@@ -310,6 +326,9 @@ name, profile = session.extract(DataSource.csv("pairs.csv"))
 
 # Persona cloning
 name, profile = session.clone_from_corpus("transcripts.txt", "hunter", n_pairs=90)
+
+# Manifold fitting
+manifold = session.extract_manifold("manifolds/local/mood")  # fit a spline manifold
 
 # Registry
 session.steer("name", profile)

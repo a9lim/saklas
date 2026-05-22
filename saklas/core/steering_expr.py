@@ -8,7 +8,7 @@ Grammar::
 
     expr        := term (("+" | "-") term)*
     term        := [coeff ["*"]] selector ["@" trigger]
-    selector    := atom (("~" | "|") atom)?
+    selector    := atom (("~" | "|") atom | "%" NUM)?
     atom        := [ns "/"] NAME ["." NAME] [":" variant]
     trigger     := preset | gate
     preset      := "before" | "after" | "both" | "thinking" | "response"
@@ -38,6 +38,15 @@ user-supplied coefficient before the term lands in
 ``Steering.alphas``.  Projection terms produce :class:`ProjectedTerm`
 values; the session materializes them into derived profiles on scope
 entry.
+
+Manifold steering (v3.2): the ``%`` infix operator places a generation at
+position ``t`` along a fitted manifold — ``manifold % t``, e.g.
+``0.7 emotions%0.5@response``.  The left operand is a manifold name (not a
+concept; no pole resolution), the right is a float in ``[0, 1]``.  A ``%``
+selector does not compose with the ``~`` / ``|`` projection operators or
+with ``!`` ablation.  Manifold terms produce :class:`ManifoldTerm` values;
+the session loads the manifold artifact and the hook does a soft
+subspace-replace.
 """
 from __future__ import annotations
 
@@ -126,6 +135,30 @@ class AblationTerm:
     target: str
 
 
+@dataclass(frozen=True)
+class ManifoldTerm:
+    """Soft subspace-replace entry in ``Steering.alphas``.
+
+    Produced by a ``manifold % position`` term.  The session loads the
+    named :class:`~saklas.core.manifold.Manifold` artifact on scope entry
+    and hands the hook a per-layer subspace plus the spline point at
+    ``position``; the hook blends the running activation's in-subspace
+    component toward that point by ``coeff``.  Stored as a value inside
+    ``Steering.alphas`` under the key ``"<manifold>%<position>"`` so two
+    positions on the same manifold compose as distinct entries and never
+    collide with plain / projected / ablation keys.
+
+    ``coeff`` is the blend fraction (clamped to ``[0, 1]`` at apply
+    time); ``position`` is the curve parameter ``t`` in ``[0, 1]``.
+    ``manifold`` is the registry key — namespace-qualified when the user
+    typed a namespace, variant-suffixed when not ``raw``.
+    """
+    coeff: float
+    trigger: Trigger
+    manifold: str
+    position: float
+
+
 class SteeringExprError(ValueError, SaklasError):
     """Raised when a steering expression string cannot be parsed."""
 
@@ -148,7 +181,7 @@ _IDENT_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
 _SINGLE_CHAR_TOKENS = {
     ".": "DOT", "/": "SLASH", ":": "COLON", "*": "STAR",
     "+": "PLUS", "-": "MINUS", "@": "AT", "~": "TILDE",
-    "|": "ORTHO", "!": "BANG",
+    "|": "ORTHO", "!": "BANG", "%": "PERCENT",
 }
 
 # Comparison-op tokens.  Two-char ops (``>=``, ``<=``) take precedence
@@ -250,6 +283,9 @@ class _Selector:
     base: _Atom
     operator: Optional[str]  # None | '~' | '|'
     onto: Optional[_Atom]
+    # Set when the selector is a manifold position term (``base % NUM``);
+    # mutually exclusive with ``operator`` / ``onto``.
+    manifold_position: Optional[float] = None
 
 
 @dataclass
@@ -410,6 +446,25 @@ class _Parser:
 
     def _selector(self) -> _Selector:
         base = self._atom()
+        if self._peek().kind == "PERCENT":
+            # Manifold position term: ``base % NUM``.
+            self._consume()
+            num_tok = self._expect("NUM")
+            pos = float(num_tok.value)
+            if not (0.0 <= pos <= 1.0):
+                raise SteeringExprError(
+                    f"manifold position must be in [0, 1], got {pos:g}",
+                    col=num_tok.col,
+                )
+            if self._peek().kind in ("TILDE", "ORTHO", "PERCENT"):
+                raise SteeringExprError(
+                    "a manifold position does not compose with projection "
+                    "('~'/'|') or a second '%'; use one '%' per term",
+                    col=self._peek().col,
+                )
+            return _Selector(
+                base=base, operator=None, onto=None, manifold_position=pos,
+            )
         if self._peek().kind in ("TILDE", "ORTHO"):
             op_tok = self._consume()
             op = "~" if op_tok.kind == "TILDE" else "|"
@@ -576,12 +631,73 @@ def _merge_ablation(
     )
 
 
+def _resolve_manifold_atom(atom: _Atom) -> str:
+    """Return the registry key for a manifold atom.
+
+    Unlike :func:`_resolve_atom`, manifold atoms do *not* go through
+    ``resolve_pole`` — a manifold name is not a concept and must not
+    alias to one.  The key is the bare name, namespace-prefixed only when
+    the user typed a namespace, variant-suffixed when not ``raw``.
+    """
+    key = atom.concept
+    if atom.namespace is not None:
+        key = f"{atom.namespace}/{key}"
+    return _with_variant(key, atom.variant)
+
+
+def _merge_manifold(
+    alphas: "dict[str, AlphaEntry]",
+    manifold: str,
+    coeff: float,
+    position: float,
+    trig: Trigger,
+) -> None:
+    key = f"{manifold}%{position:g}"
+    if key not in alphas:
+        alphas[key] = ManifoldTerm(
+            coeff=coeff, trigger=trig, manifold=manifold, position=position,
+        )
+        return
+    existing = alphas[key]
+    if not isinstance(existing, ManifoldTerm):
+        raise SteeringExprError(  # pragma: no cover — key namespace is disjoint
+            f"manifold '{key}' conflicts with a non-manifold entry"
+        )
+    if existing.trigger != trig:
+        raise SteeringExprError(
+            f"manifold '{manifold}%{position:g}' appears with conflicting "
+            f"triggers; merge triggers explicitly or split into separate "
+            f"Steering entries"
+        )
+    alphas[key] = ManifoldTerm(
+        coeff=existing.coeff + coeff, trigger=trig,
+        manifold=manifold, position=position,
+    )
+
+
 def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
     from saklas.core.steering import Steering
 
     alphas: "dict[str, AlphaEntry]" = {}
     for term in terms:
         sel = term.selector
+        # Manifold position terms resolve before ``_resolve_atom`` — a
+        # manifold name must not run through concept pole-resolution.
+        if sel.manifold_position is not None:
+            if term.ablation:
+                raise SteeringExprError(
+                    "ablation ('!') does not compose with a manifold "
+                    "position ('%')"
+                )
+            mfld_key = _resolve_manifold_atom(sel.base)
+            mfld_trig = (
+                term.trigger if term.trigger is not None else Trigger.BOTH
+            )
+            _merge_manifold(
+                alphas, mfld_key, term.coeff, sel.manifold_position,
+                mfld_trig,
+            )
+            continue
         base_key, base_sign = _resolve_atom(sel.base, namespace)
         coeff = term.coeff * base_sign
         # ``_Term.trigger`` already carries a resolved Trigger object
@@ -652,6 +768,9 @@ def format_expr(steering: "Steering") -> str:
         if isinstance(val, ProjectedTerm):
             parts.append(_fmt_projected(val))
             continue
+        if isinstance(val, ManifoldTerm):
+            parts.append(_fmt_manifold(val))
+            continue
         if isinstance(val, tuple):
             coeff, trig = float(val[0]), val[1]
         else:
@@ -691,6 +810,13 @@ def _fmt_ablation(a: AblationTerm) -> str:
         body = f"{a.coeff:g} !{a.target}"
     if a.trigger != Trigger.BOTH:
         body += "@" + _trigger_name(a.trigger)
+    return body
+
+
+def _fmt_manifold(m: ManifoldTerm) -> str:
+    body = f"{m.coeff:g} {m.manifold}%{m.position:g}"
+    if m.trigger != Trigger.BOTH:
+        body += "@" + _trigger_name(m.trigger)
     return body
 
 
@@ -738,6 +864,8 @@ def referenced_selectors(
     Walks the AST before pole resolution so namespace prefixes survive —
     useful at install time, when the CLI needs to know which pack to fetch
     for each atom.  Projection terms contribute two entries (base + onto).
+    Manifold terms are skipped — a manifold name is not a concept and
+    resolves through :func:`referenced_manifolds` instead.
     """
     if not text or not text.strip():
         return []
@@ -746,9 +874,35 @@ def referenced_selectors(
     out: list[tuple[Optional[str], str, str]] = []
     for term in terms:
         sel = term.selector
+        if sel.manifold_position is not None:
+            continue
         out.append((sel.base.namespace, sel.base.concept, sel.base.variant))
         if sel.onto is not None:
             out.append((sel.onto.namespace, sel.onto.concept, sel.onto.variant))
+    return out
+
+
+def referenced_manifolds(
+    text: str,
+) -> list[tuple[Optional[str], str, str]]:
+    """Return every ``(namespace, name, variant)`` manifold referenced.
+
+    The manifold-term analogue of :func:`referenced_selectors` — kept a
+    separate function so ``referenced_selectors`` keeps its exact 3-tuple
+    shape and no concept-install caller has to learn about manifolds.
+    Walks the AST before resolution so namespace prefixes survive.
+    """
+    if not text or not text.strip():
+        return []
+    toks = _lex(text)
+    terms = _Parser(toks).parse()
+    out: list[tuple[Optional[str], str, str]] = []
+    for term in terms:
+        sel = term.selector
+        if sel.manifold_position is not None:
+            out.append(
+                (sel.base.namespace, sel.base.concept, sel.base.variant)
+            )
     return out
 
 
@@ -756,9 +910,11 @@ __all__ = [
     "DEFAULT_COEFF",
     "DEFAULT_ABLATION_COEFF",
     "AblationTerm",
+    "ManifoldTerm",
     "ProjectedTerm",
     "SteeringExprError",
     "parse_expr",
     "format_expr",
     "referenced_selectors",
+    "referenced_manifolds",
 ]

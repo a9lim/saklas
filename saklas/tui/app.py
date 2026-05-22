@@ -928,7 +928,8 @@ class SaklasApp(App[None]):
         terms are accepted and routed through session-level materialization.
         """
         from saklas.core.steering_expr import (
-            AblationTerm, ProjectedTerm, SteeringExprError, parse_expr,
+            AblationTerm, ManifoldTerm, ProjectedTerm, SteeringExprError,
+            parse_expr,
         )
 
         chat = self._chat_panel
@@ -981,6 +982,17 @@ class SaklasApp(App[None]):
                 chat.add_system_message(
                     f"Ablation terms (!{key.lstrip('!')}) aren't supported "
                     f"from /steer; express them in the YAML config."
+                )
+                return
+            if isinstance(val, ManifoldTerm):
+                # Manifold steering (``manifold%t``) routes through a
+                # separate hook path and is not bound to the TUI's
+                # per-vector alpha sliders.  Reject cleanly — express it
+                # in the YAML config (``vectors:``) instead.
+                chat.add_system_message(
+                    f"Manifold terms ('{val.manifold}%{val.position:g}') "
+                    f"aren't supported from /steer; express them in the "
+                    f"YAML config."
                 )
                 return
             if isinstance(val, tuple):

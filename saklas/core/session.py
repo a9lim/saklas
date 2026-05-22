@@ -43,7 +43,8 @@ from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, RunSet, TokenEvent, ProbeReadings
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
-from saklas.core.steering_expr import AblationTerm
+from saklas.core.steering_expr import AblationTerm, ManifoldTerm
+from saklas.core.manifold import Manifold
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import load_profile as _load_profile
 
@@ -276,6 +277,14 @@ class VectorNotRegisteredError(KeyError, SaklasError):
         return (404, str(msg))
 
 
+class ManifoldNotRegisteredError(KeyError, SaklasError):
+    """Raised when manifold steering references an unknown / unfitted manifold."""
+
+    def user_message(self) -> tuple[int, str]:
+        msg = self.args[0] if self.args else self.__class__.__name__
+        return (404, str(msg))
+
+
 class ConcurrentExtractionError(RuntimeError, SaklasError):
     """Raised when ``session.extract`` is called while a generation is in flight.
 
@@ -295,7 +304,7 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 # values carrying their own coeff + trigger + target.  The union flows
 # through the stack, ``_flatten``, ``_push``/``_pop``, and is dispatched
 # by type in ``_compose_steering_entries``.
-SteeringStackEntry = tuple[float, Trigger] | AblationTerm
+SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
 
 
 class _SteeringContext:
@@ -593,6 +602,9 @@ class SaklasSession:
 
         # Vector registry: name -> profile. No alphas, no hooks.
         self._profiles: dict[str, dict[int, torch.Tensor]] = {}
+        # Manifold registry: registry key -> loaded Manifold artifact,
+        # populated lazily by ``_ensure_manifold_loaded`` on scope entry.
+        self._manifolds: dict[str, Manifold] = {}
 
         # Transient steering manager — used only during generation.  The
         # session-level injection_mode + θ_max are stamped onto every hook
@@ -1481,6 +1493,42 @@ class SaklasSession:
         finally:
             self._gen_lock.release()
 
+    def extract_manifold(
+        self,
+        folder,
+        *,
+        sae: str | None = None,
+        sae_revision: str | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> Manifold:
+        """Fit a steering manifold from an authored manifold-pack folder.
+
+        Thin delegate to :class:`ManifoldExtractionPipeline` — that
+        pipeline owns corpus loading, per-node centroid pooling, the
+        per-layer PCA + spline fit, and the cache short-circuit.  Gated
+        against generation like :meth:`extract`: manifold fitting runs
+        forward passes through the model.
+        """
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentExtractionError(
+                "session.extract_manifold called while another model use "
+                "is in flight"
+            )
+        try:
+            if self._gen_phase is not GenState.IDLE:
+                raise ConcurrentExtractionError(
+                    "session.extract_manifold called while a generation "
+                    "is in flight"
+                )
+            from saklas.core.extraction import ManifoldExtractionPipeline
+            pipe = ManifoldExtractionPipeline(self, self.events)
+            return pipe.fit(
+                folder, sae=sae, sae_revision=sae_revision,
+                on_progress=on_progress,
+            )
+        finally:
+            self._gen_lock.release()
+
     def clone_from_corpus(
         self,
         path,
@@ -1599,6 +1647,18 @@ class SaklasSession:
                     # UnknownVariantError; let it surface at hook-install
                     # with the shared VectorNotRegisteredError shape.
                     pass
+            resolved[key] = val
+        # Fold in manifold terms.  Like ablation, ``normalized_entries``
+        # strips ``ManifoldTerm`` values, so walk ``alphas`` directly.
+        # Keys carry the ``<manifold>%<pos>`` form — disjoint from
+        # plain/projection/ablation keys.  The manifold artifact is
+        # loaded into ``self._manifolds`` here so a miss surfaces
+        # eagerly (``ManifoldNotRegisteredError``) rather than at hook
+        # install.
+        for key, val in steering_obj.alphas.items():
+            if not isinstance(val, ManifoldTerm):
+                continue
+            self._ensure_manifold_loaded(val.manifold)
             resolved[key] = val
         # Per-call overrides ride along with the entries.  ``None`` means
         # "inherit"; the resolver folds session defaults at hook-install.
@@ -1722,6 +1782,69 @@ class SaklasSession:
                 f"projection references '{key}' which is not registered "
                 f"and no pack could be autoloaded for this model"
             )
+
+    def _ensure_manifold_loaded(self, key: str) -> None:
+        """Load the manifold artifact for registry key ``key`` if absent.
+
+        ``key`` is the manifold registry key produced by the grammar:
+        ``[ns/]name[:variant]``.  ``raw`` (default) selects the
+        residual-stream tensor; ``sae-<release>`` selects the SAE-variant
+        tensor.  A bare name (no namespace) searches every namespace
+        under ``manifolds/``.  The loaded :class:`Manifold` is promoted
+        onto the session device (kept fp32 — the spline math wants it).
+        Raises :class:`ManifoldNotRegisteredError` on a miss.
+        """
+        if key in self._manifolds:
+            return
+        from saklas.core.manifold import load_manifold
+        from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
+
+        name_part, variant = (
+            key.rsplit(":", 1) if ":" in key else (key, "raw")
+        )
+        if "/" in name_part:
+            ns, name = name_part.split("/", 1)
+            search_ns = [ns]
+        else:
+            name = name_part
+            root = manifolds_dir()
+            search_ns = (
+                sorted(d.name for d in root.iterdir() if d.is_dir())
+                if root.exists() else []
+            )
+        if variant == "raw":
+            release: str | None = None
+        elif variant.startswith("sae-"):
+            release = variant[len("sae-"):]
+        else:
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}': unsupported variant '{variant}'"
+            )
+        fname = tensor_filename(self.model_id, release=release)
+
+        matches = [
+            (ns, manifold_dir(ns, name) / fname)
+            for ns in search_ns
+            if (manifold_dir(ns, name) / fname).exists()
+        ]
+        if not matches:
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' has no fitted tensor for {self.model_id}; "
+                f"run `saklas vector manifold fit` first"
+            )
+        if len(matches) > 1:
+            # A bare name collided across namespaces — refuse rather than
+            # silently pick one, mirroring concept selector resolution.
+            from saklas.io.selectors import AmbiguousSelectorError
+            qualified = ", ".join(f"{ns}/{name}" for ns, _ in matches)
+            raise AmbiguousSelectorError(
+                f"ambiguous manifold '{name}': matches {qualified}. "
+                f"Qualify it with a namespace."
+            )
+        manifold = load_manifold(matches[0][1])
+        self._manifolds[key] = manifold.to(
+            device=self._device, dtype=torch.float32,
+        )
 
     def _resolve_pole_aliases(
         self, entries: dict[str, tuple[float, Trigger]],
@@ -2013,7 +2136,7 @@ class SaklasSession:
         alphas_only: dict[str, float] = {}
         entries_out: dict[str, tuple[float, Trigger]] = {}
         for name, entry in flat.items():
-            if isinstance(entry, AblationTerm):
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 alphas_only[name] = entry.coeff
                 entries_out[name] = (entry.coeff, entry.trigger)
                 continue
@@ -2063,7 +2186,7 @@ class SaklasSession:
         """
         flat = self._flatten_steering_stack()
         for entry in flat.values():
-            if isinstance(entry, AblationTerm):
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 if entry.trigger.gate is not None:
                     return True
                 continue
@@ -2142,6 +2265,18 @@ class SaklasSession:
                     target, self._profiles[target],
                     alpha=entry.coeff, trigger=entry.trigger,
                     layer_means=self._layer_means,
+                )
+                continue
+            if isinstance(entry, ManifoldTerm):
+                manifold = self._manifolds.get(entry.manifold)
+                if manifold is None:
+                    raise ManifoldNotRegisteredError(
+                        f"No manifold registered for '{entry.manifold}'"
+                    )
+                self._steering.add_manifold(
+                    entry.manifold, manifold,
+                    position=entry.position, alpha=entry.coeff,
+                    trigger=entry.trigger,
                 )
                 continue
             alpha, trigger = entry
@@ -3387,7 +3522,7 @@ class SaklasSession:
         """Flatten the active steering stack for ``GenerationResult.vectors``."""
         snap: dict[str, float] = {}
         for name, entry in self._flatten_steering_stack().items():
-            if isinstance(entry, AblationTerm):
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 snap[name] = entry.coeff
                 continue
             snap[name] = entry[0]
@@ -4239,6 +4374,7 @@ class SaklasSession:
     def close(self) -> None:
         self._steering.clear_all()
         self._profiles.clear()
+        self._manifolds.clear()
 
     def __enter__(self):
         return self

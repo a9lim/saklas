@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 
+from saklas.core.manifold import subspace_replace
 from saklas.core.triggers import Trigger, TriggerContext
 
 
@@ -200,6 +201,14 @@ class SteeringHook:
         self.ablation_groups: list[
             tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
+        # Manifold groups: (Trigger, basis [R,dim], mean [dim],
+        # target [dim], alpha).  ``target`` is the spline point at the
+        # term's fixed position ``t`` — precomputed at recompose time, so
+        # the hot path only does the subspace-replace matmuls.  Any
+        # manifold group forces the slow path.
+        self.manifold_groups: list[
+            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor, float]
+        ] = []
         # Injection-mode state.  Angular cache is populated only on the
         # fast path; the slow path computes per-fire from active groups.
         self.injection_mode: InjectionMode = injection_mode
@@ -236,6 +245,7 @@ class SteeringHook:
         dtype: torch.dtype,
         ctx: TriggerContext,
         *,
+        manifold_entries: "list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, Trigger]] | None" = None,
         injection_mode: InjectionMode | None = None,
         theta_max: float | None = None,
     ) -> None:
@@ -352,18 +362,38 @@ class SteeringHook:
         self.ablation_groups = ablation_groups
         self.angular_strengths = angular_strengths
 
+        # --- manifold grouping ---
+        # ``target`` is the spline point at the term's fixed position,
+        # already computed by the manager; the hot path only runs the
+        # subspace-replace matmuls.  Zero-alpha entries drop here.
+        manifold_groups: list[
+            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor, float]
+        ] = []
+        for basis, mean, target, alpha, trig in (manifold_entries or []):
+            if alpha == 0.0:
+                continue
+            manifold_groups.append((
+                trig,
+                basis.to(device=device, dtype=dtype),
+                mean.to(device=device, dtype=dtype),
+                target.to(device=device, dtype=dtype),
+                float(alpha),
+            ))
+        self.manifold_groups = manifold_groups
+
         # --- fast-path collapse decision ---
-        if not composed_groups and not ablation_groups:
+        if not composed_groups and not ablation_groups and not manifold_groups:
             self.composed = None
             self.composed_groups = []
             self._d_hat = None
             return
 
         # Fast path only when the single contributor is additive/BOTH and
-        # no ablation is attached.  Any ablation forces the slow path so
-        # the hook_fn can sequence ablation-then-additive.
+        # no ablation or manifold group is attached.  Either forces the
+        # slow path so the hook_fn can sequence the ops.
         if (
             not ablation_groups
+            and not manifold_groups
             and len(composed_groups) == 1
             and composed_groups[0][0] == Trigger.BOTH
         ):
@@ -469,7 +499,8 @@ class SteeringHook:
 
         add_groups = self.composed_groups
         abl_groups = self.ablation_groups
-        if not add_groups and not abl_groups:
+        mfld_groups = self.manifold_groups
+        if not add_groups and not abl_groups and not mfld_groups:
             return output
         ctx = self._ctx
         if ctx is None:
@@ -485,6 +516,11 @@ class SteeringHook:
         if not any_active:
             for trig, _ in add_groups:
                 if trig.active(ctx):
+                    any_active = True
+                    break
+        if not any_active:
+            for grp in mfld_groups:
+                if grp[0].active(ctx):
                     any_active = True
                     break
         if not any_active:
@@ -515,6 +551,11 @@ class SteeringHook:
                 hidden, dim=-1, keepdim=True, dtype=torch.float32,
             ).clamp_(min=1e-6)
             hidden.mul_((norm_pre / norm_post).to(hidden.dtype))
+            # Manifold replace runs last — it is a destructive overwrite
+            # of the in-subspace component, so it dominates at the layers
+            # it covers; running after additive/ablation makes that
+            # ordering explicit.
+            self._apply_manifold_groups(hidden, ctx)
             return output
 
         # --- angular slow path ---
@@ -546,21 +587,41 @@ class SteeringHook:
             # constructing one in practice requires explicit user intent.
             active_strength += strength
 
-        if active_composed is None or active_strength <= 1e-12:
-            return output
+        if active_composed is not None and active_strength > 1e-12:
+            c_f32 = active_composed.to(torch.float32)
+            c_norm_t = torch.linalg.vector_norm(c_f32)
+            c_norm = float(c_norm_t.item())
+            if c_norm > 1e-12:
+                d_hat = (c_f32 / c_norm).to(dtype=hidden.dtype)
+                ratio = active_strength
+                if ratio > 1.0:
+                    ratio = 1.0
+                theta = ratio * self.theta_max
+                _angular_inplace(
+                    hidden, d_hat, math.cos(theta), math.sin(theta),
+                )
 
-        c_f32 = active_composed.to(torch.float32)
-        c_norm_t = torch.linalg.vector_norm(c_f32)
-        c_norm = float(c_norm_t.item())
-        if c_norm <= 1e-12:
-            return output
-        d_hat = (c_f32 / c_norm).to(dtype=hidden.dtype)
-        ratio = active_strength
-        if ratio > 1.0:
-            ratio = 1.0
-        theta = ratio * self.theta_max
-        _angular_inplace(hidden, d_hat, math.cos(theta), math.sin(theta))
+        # Manifold replace runs last (see the additive branch).
+        self._apply_manifold_groups(hidden, ctx)
         return output
+
+    def _apply_manifold_groups(
+        self, hidden: torch.Tensor, ctx: TriggerContext,
+    ) -> None:
+        """Apply every active manifold group as a soft subspace-replace.
+
+        Each group blends ``hidden``'s projection onto the manifold's PCA
+        subspace toward the precomputed spline target by ``alpha`` and
+        restores the original per-position norm.  Runs after ablation and
+        additive so the destructive in-subspace overwrite wins at the
+        layers it covers.
+        """
+        for trig, basis, mean, target, alpha in self.manifold_groups:
+            if not trig.active(ctx):
+                continue
+            hidden.copy_(
+                subspace_replace(hidden, mean, basis, target, alpha)
+            )
 
     def attach(self, layer_module: torch.nn.Module) -> None:
         """Register forward hook on a layer module."""
@@ -636,6 +697,7 @@ class SteeringManager:
         self.hooks: dict[int, SteeringHook] = {}
         self.vectors: dict[str, dict] = {}
         self.ablations: dict[str, dict] = {}
+        self.manifolds: dict[str, dict] = {}
         self.ctx: TriggerContext = TriggerContext()
         self.injection_mode: InjectionMode = injection_mode
         self.theta_max: float = theta_max
@@ -697,6 +759,30 @@ class SteeringManager:
             "alpha": alpha,
             "trigger": trigger,
             "layer_means": layer_means,
+        }
+
+    def add_manifold(
+        self,
+        name: str,
+        manifold: object,
+        position: float,
+        alpha: float,
+        trigger: Trigger = Trigger.BOTH,
+    ) -> None:
+        """Register a manifold-steering term.
+
+        At ``apply_to_model`` time, for every layer the manifold covers,
+        the spline point at ``position`` is precomputed and a per-layer
+        ``(basis, mean, target, alpha, trigger)`` entry is attached to the
+        corresponding :class:`SteeringHook`.  ``alpha`` is the blend
+        fraction (clamped to ``[0, 1]``); no ``_STEER_GAIN`` applies — it
+        is a fraction, not an additive push.
+        """
+        self.manifolds[name] = {
+            "manifold": manifold,
+            "position": float(position),
+            "alpha": alpha,
+            "trigger": trigger,
         }
 
     def apply_to_model(
@@ -789,7 +875,40 @@ class SteeringManager:
                     (vec, means[layer_idx], alpha, trigger),
                 )
 
-        active_layers = set(additive_by_layer) | set(ablation_by_layer)
+        # Manifold entries: precompute the spline target per layer once.
+        # ``t`` is fixed for the whole generation, so the spline eval
+        # never reaches the hot path.  Only one manifold may cover a
+        # given layer — two would each destructively overwrite the
+        # in-subspace component, so their composition is ill-defined.
+        manifold_by_layer: dict[
+            int,
+            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, Trigger]],
+        ] = {}
+        manifold_owner: dict[int, str] = {}
+        for mname, m in self.manifolds.items():
+            manifold = m["manifold"]
+            position = m["position"]
+            trigger = m["trigger"]
+            alpha = max(0.0, min(1.0, float(m["alpha"])))
+            for layer_idx, sub in manifold.layers.items():
+                if layer_idx in manifold_owner:
+                    from saklas.core.steering_expr import SteeringExprError
+                    raise SteeringExprError(
+                        f"manifolds '{manifold_owner[layer_idx]}' and "
+                        f"'{mname}' both cover layer {layer_idx}; manifold "
+                        f"steering allows only one manifold per layer"
+                    )
+                manifold_owner[layer_idx] = mname
+                target = sub.spline_point(position)
+                manifold_by_layer.setdefault(layer_idx, []).append(
+                    (sub.basis, sub.mean, target, alpha, trigger),
+                )
+
+        active_layers = (
+            set(additive_by_layer)
+            | set(ablation_by_layer)
+            | set(manifold_by_layer)
+        )
 
         # Detach hooks for layers that no longer have any contribution.
         for idx in list(self.hooks):
@@ -808,15 +927,17 @@ class SteeringManager:
             self.hooks[idx].recompose(
                 additive_entries=additive_by_layer.get(idx, []),
                 ablation_entries=ablation_by_layer.get(idx, []),
+                manifold_entries=manifold_by_layer.get(idx, []),
                 injection_mode=self.injection_mode,
                 theta_max=self.theta_max,
                 device=device, dtype=dtype, ctx=self.ctx,
             )
 
     def clear_all(self) -> None:
-        """Detach all hooks and clear vectors + ablations."""
+        """Detach all hooks and clear vectors + ablations + manifolds."""
         for hook in self.hooks.values():
             hook.detach()
         self.hooks.clear()
         self.vectors.clear()
         self.ablations.clear()
+        self.manifolds.clear()

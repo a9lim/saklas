@@ -43,8 +43,11 @@ saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S]
 saklas vector compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]
 saklas vector why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
 saklas vector transfer <concept> --from SRC --to TGT [-f]   # cross-model Procrustes transfer
+saklas vector manifold fit <folder> [-m MODEL] [--sae REL]  # fit a spline steering manifold
+saklas vector manifold ls|show [name]                       # list / inspect manifolds
 saklas experiment fan <model> "<prompt>" -g concept=0,0.5,1 # alpha grid as loom siblings
 saklas experiment transcript run <path.yaml> [model]        # replay a saved transcript
+saklas experiment naturalness <model> "<prompt>" --manifold F -S EXPR  # behavior-manifold eval
 saklas config show [-c PATH ...] [--no-default] [-m MODEL]
 saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
@@ -67,7 +70,7 @@ Every input surface — Python, YAML, HTTP, TUI, `vector merge` — speaks the g
 ```
 expr        := term (("+" | "-") term)*
 term        := [coeff "*"?] ["!"] selector ["@" trigger]
-selector    := atom (("~" | "|") atom)?
+selector    := atom (("~" | "|") atom | "%" NUM)?
 atom        := [ns "/"] NAME ["." NAME] [":" variant]
 trigger     := preset | gate
 preset      := before | after | both | thinking | response | prompt | generated
@@ -75,6 +78,8 @@ gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
 ```
 
 `+`/`-` add terms, `*` attaches a coefficient (omit → 0.5 additive / 1.0 ablation), `~` projects onto a direction (keep the shared component), `|` projects orthogonal (remove it), `!` mean-ablates the concept (`h' = h − α(h·d̂ − μ·d̂)d̂`; bare `!x` is α=1.0). `@<preset>` overrides a term's trigger; `@when:<probe><op><num>` is a probe gate that fires only on decode steps where the monitor reading satisfies the comparison (implicit `prompt=False`). `!` cannot compose with `~`/`|`. Compound triggers (`@after&when:…`) are programmatic-only — build the `Trigger` directly.
+
+`%` is the manifold operator: `<manifold> % <t>` places a generation at position `t ∈ [0,1]` along a fitted steering manifold (e.g. `0.7 emotions%0.5@response`). The coefficient is the blend fraction; the injection is a soft subspace-replace (`core/manifold.py::subspace_replace`) — at position `t` the spline gives a target point and the running activation's projection onto the manifold's PCA subspace is blended toward it, residual kept. A `%` term produces a `ManifoldTerm`, doesn't compose with `~`/`|`/`!`, and forces the slow hook path (no `torch.compile`/StaticCache). Only one manifold per layer; overlapping manifolds raise. See "Manifold steering" below.
 
 ## Extraction
 
@@ -94,6 +99,18 @@ Per session via `SaklasSession.from_pretrained(injection_mode=..., theta_max=...
 - **Additive**: `composed_L = α × _STEER_GAIN × baked_L` with an explicit per-position norm rescale. `_STEER_GAIN = 2.0` only multiplies under this mode.
 
 `DEFAULT_THETA_MAX = π/2`.
+
+## Manifold steering
+
+Spline-based manifold steering (Goodfire, arXiv 2605.05115): instead of a single linear direction, fit a cubic spline through per-concept activation *centroids* in a low-dim PCA subspace, then steer by moving the running activation's in-subspace component onto a point of that curve. A straight A→B vector cuts through low-density off-manifold regions; the spline stays on the learned manifold.
+
+A manifold is its own artifact type — an ordered (optionally cyclic) set of labeled nodes, each a small statement corpus, under `~/.saklas/manifolds/<ns>/<name>/` (not a `ConceptFolder`). The user authors `manifold.json` + `nodes/*.json`; `saklas vector manifold fit` runs `ManifoldExtractionPipeline` (`core/extraction.py`): pool each node's mean activation (`compute_node_centroid`), fit a per-layer PCA subspace + cubic spline (`fit_layer_subspace`), write the per-model tensor. `--sae <release>` reconstructs each centroid through the SAE before the fit (denoised centroids); the fitted subspace is always model-space so the hook never touches the SAE.
+
+All manifold math lives in `core/manifold.py` — pure-tensor, fp32, dependency-free (the cubic-spline solves use dense `torch.linalg.solve`; scipy is not pulled in, thin-plate splines are out of scope). `eval_cubic` and `subspace_replace` are the only hot-path-reachable functions. Natural cubic splines for sequential manifolds, periodic for cyclic ones.
+
+Injection (`core/hooks.py`): a `ManifoldTerm` forces the slow hook path; `subspace_replace` decomposes `h = h_par + h_perp` (in-subspace + orthogonal residual), blends `h_par` toward the precomputed spline target by the coefficient, keeps the residual, restores the original norm. It runs *last* in `hook_fn`, after ablation and additive — the in-subspace overwrite is destructive, so it dominates at the layers it covers. The session loads the `Manifold` artifact lazily on scope entry (`_ensure_manifold_loaded`) and dispatches `ManifoldTerm` to `SteeringManager.add_manifold`.
+
+The naturalness eval (`saklas experiment naturalness`) is the paper's validation half: fit a *behavior-space* manifold over node-corpus output distributions mapped to Hellinger space (`p ↦ √p`), generate, re-run the model over the generated text to recover its behavioral trajectory, and report the per-step Bhattacharyya distance of that trajectory to the behavior manifold — low is natural, high flags off-manifold "teleportation". `--compare-linear` scores a straight-chord additive baseline alongside.
 
 ## Python API
 
@@ -142,6 +159,10 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
     layer_means.{safetensors,json}     # probe-centering baseline
     neutral_activations.{safetensors,json}   # 90 neutral prompts × layers, fp16
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
+  manifolds/<ns>/<name>/               # steering manifolds (own root, peer of vectors/)
+    manifold.json                      # name, cyclic flag, ordered node labels, files{sha256}
+    nodes/NN_<label>.json              # one JSON statement list per node (user-editable)
+    <safe_model_id>.safetensors        # fitted per-layer PCA + spline (+ .json sidecar)
   conversations/<name>.json            # explicit loom-tree saves (no autosave)
 ```
 
