@@ -17,8 +17,7 @@
   import {
     chatLog,
     loomTree,
-    loomEdit,
-    loomBranch,
+    sendCommit,
     genStatus,
     sendGenerate,
     sendStop,
@@ -38,16 +37,33 @@
 
   // Local editable mirror.  Synced from ``bufferText`` whenever the
   // tree changes and the user isn't mid-edit; user edits write here
-  // and a "commit edit" lands them on the tree.
+  // and "continue" / "commit edit" land them on the tree.
   let draft = $state("");
   let dirty = $state(false);
+  // Set the moment a continue/commit is fired: the tree hasn't caught
+  // up to the locally-edited draft yet, so the buffer→draft sync below
+  // is held until ``bufferText`` reaches the draft — without this the
+  // draft would briefly snap back to the pre-edit text (a flash of the
+  // user's typed tail vanishing) for the server round-trip.
+  let committing = $state(false);
   let textareaRef: HTMLTextAreaElement | null = $state(null);
 
   // Re-sync the draft from the tree when the buffer changes and the
   // user has no pending edit.  ``dirty`` guards against clobbering an
-  // in-progress edit when a token stream updates ``bufferText``.
+  // in-progress edit; ``committing`` holds the just-sent draft until
+  // the server-side node lands, after which streamed tokens flow in.
   $effect(() => {
     const text = bufferText;
+    if (committing) {
+      // Hold until the tree genuinely carries the committed draft as a
+      // prefix — a *content* check, not a length one.  A length compare
+      // releases early when a fast-streaming continuation fills the
+      // buffer to the right size before the committed span has landed
+      // (or under a transient wrong-parent active path), snapping the
+      // draft onto text that doesn't contain what the user wrote.
+      if (!text.startsWith(draft)) return;
+      committing = false;
+    }
     if (!dirty) {
       draft = text;
     }
@@ -56,130 +72,95 @@
   function onInput(ev: Event): void {
     draft = (ev.currentTarget as HTMLTextAreaElement).value;
     dirty = draft !== bufferText;
+    // Any keystroke supersedes a pending commit — resume live sync.
+    committing = false;
   }
 
-  // ---------- continue ----------
+  // ---------- continue / commit ----------
+  //
+  // Flat mode is non-linear: editing text anywhere in the buffer is the
+  // same operation as appending to the end.  Both collapse to a single
+  // "divergence" — the first character that differs from the committed
+  // tree text — and everything from there becomes one new span.  The
+  // node containing the divergence (and its whole subtree) is preserved
+  // untouched as the original branch; the edited tail is recorded as a
+  // fresh span branched at that point.  Appending is just the special
+  // case where the divergence sits at the very end of the buffer.
 
-  /** The active leaf node — what a raw continuation extends. */
+  /** The active leaf node — what a clean continuation extends. */
   const activeLeaf = $derived(
     loomTree.rev > 0 ? (loomTree.active_node_id ?? null) : null,
   );
 
-  function continueGen(): void {
-    if (genStatus.active) return;
-    // If the buffer carries an uncommitted edit, land it first so the
-    // continuation extends the edited text, not the stale leaf.
-    if (dirty) {
-      void commitEdit().then(() => fireContinue());
-      return;
-    }
-    fireContinue();
+  interface Divergence {
+    /** New text — from the divergence offset to the end of the draft. */
+    tail: string;
+    /** Where the new span hangs: the diverging node's parent for a
+     *  mid-buffer edit, the active leaf for a pure append.
+     *  ``undefined`` means the buffer is clean — continue from the leaf
+     *  with no new span at all. */
+    parentNodeId: string | null | undefined;
   }
 
-  function fireContinue(): void {
-    // The whole buffer is the prefill; an empty input string with
-    // ``raw: true`` continues from the active leaf's accumulated text.
-    void sendGenerate("", { raw: true });
-  }
-
-  // ---------- edit ----------
-
-  /** Commit the edited buffer to the tree.
-   *
-   *  The buffer is the join of every turn's text, so an edit anywhere
-   *  in it has to be mapped back to the loom node(s) it actually
-   *  touched — silently keeping only the tail would discard a prefix
-   *  edit, and a flat completion buffer means the *whole* buffer is the
-   *  editable context.
-   *
-   *  Strategy: walk the turns accumulating their original start offsets
-   *  and find the first turn whose contribution to the buffer diverges
-   *  from the draft.  From that divergence point on, turn boundaries no
-   *  longer line up (an edit shifts every later offset), so the edited
-   *  tail — everything from the diverging turn's start to the end of
-   *  the draft — is treated as one continuous completion and committed
-   *  against that turn's node:
-   *
-   *    - Leaf, unchanged subtree → ``loomEdit`` in place.
-   *    - Otherwise (interior node, or a node with children) → branch a
-   *      sibling carrying the edited tail so no subtree is orphaned.
-   *
-   *  Branching is always-sibling and ``make_active`` on the server, so
-   *  the new node becomes the active leaf and a follow-up continuation
-   *  extends the edited text. */
-  async function commitEdit(): Promise<void> {
-    if (!dirty) return;
+  /** Diff the draft against the committed buffer and locate the single
+   *  span the change collapses to. */
+  function resolveDivergence(): Divergence {
+    if (!dirty) return { tail: "", parentNodeId: undefined };
     const turns = chatLog.turns;
-    if (turns.length === 0) return;
-
-    // Find the first turn whose text region diverges from the draft.
-    // ``startOffset`` is that turn's offset into the original buffer
-    // (== its offset into the draft up to the divergence point, since
-    // everything before it matches byte-for-byte).
     let startOffset = 0;
-    let divergeIdx = -1;
     for (let i = 0; i < turns.length; i++) {
       const turnText = turns[i].text ?? "";
-      const draftSlice = draft.slice(startOffset, startOffset + turnText.length);
-      if (draftSlice !== turnText) {
-        divergeIdx = i;
-        break;
+      const slice = draft.slice(startOffset, startOffset + turnText.length);
+      if (slice !== turnText) {
+        // Divergence inside turns[i].  That node + its subtree stay as
+        // the original branch; the tail (this node's start → end of
+        // draft) becomes a new span branched as its sibling — i.e. a
+        // child of the node's parent.
+        const nid = turns[i].nodeId ?? null;
+        const parentNodeId = nid
+          ? (loomTree.nodes.get(nid)?.parent_id ?? null)
+          : (activeLeaf ?? null);
+        return { tail: draft.slice(startOffset), parentNodeId };
       }
       startOffset += turnText.length;
     }
+    // No node diverged — the draft runs past the joined buffer.  The
+    // appended tail hangs under the active leaf as a fresh child.
+    return { tail: draft.slice(startOffset), parentNodeId: activeLeaf ?? null };
+  }
 
-    if (divergeIdx === -1) {
-      // No per-turn slice diverged, yet ``dirty`` is set — the draft is
-      // strictly longer than the joined buffer (the user appended past
-      // the final turn).  That tail belongs on the active leaf.
-      const leaf = activeLeaf;
-      if (!leaf) {
-        dirty = false;
-        return;
-      }
-      const leafTurn = turns[turns.length - 1];
-      const leafStart = startOffset - (leafTurn.text ?? "").length;
-      const leafText = draft.slice(leafStart);
-      const children = loomTree.children_of.get(leaf) ?? [];
-      if (children.length > 0) {
-        await loomBranch(leaf, leafText);
-      } else {
-        await loomEdit(leaf, leafText);
-      }
-      dirty = false;
-      return;
-    }
-
-    // The diverging turn's node owns the edit.  Everything from its
-    // start offset to the end of the draft is the new (flat) text.
-    const target = turns[divergeIdx];
-    const targetNode = target.nodeId ?? null;
-    if (!targetNode) {
-      // No backing node id (legacy single-path render with rev 0) —
-      // fall back to editing the active leaf so the edit isn't lost.
-      const leaf = activeLeaf;
-      if (leaf) await loomEdit(leaf, draft.slice(startOffset));
-      dirty = false;
-      return;
-    }
-    const newText = draft.slice(startOffset);
-    const children = loomTree.children_of.get(targetNode) ?? [];
-    const isLeaf = children.length === 0 && targetNode === activeLeaf;
-    if (isLeaf) {
-      // Editing the tail node in place — no subtree to orphan.
-      await loomEdit(targetNode, newText);
-    } else {
-      // The edit reaches an interior turn (it has children, or later
-      // turns follow it).  Branch a sibling carrying the whole edited
-      // tail so the original subtree is preserved.
-      await loomBranch(targetNode, newText);
-    }
+  function continueGen(): void {
+    if (genStatus.active) return;
+    const d = resolveDivergence();
+    // The divergence tail rides as raw input: the engine records it as
+    // a node and continues from the flat active-path text.  A clean
+    // buffer sends "" — a bare continuation from the active leaf.
+    committing = true;
     dirty = false;
+    void sendGenerate(d.tail, { raw: true, parent_node_id: d.parentNodeId });
+  }
+
+  // ---------- edit (commit without generating) ----------
+
+  /** Land the pending edit on the tree without generating — the same
+   *  divergence branch ``continueGen`` would take, minus the decode. */
+  async function commitEdit(): Promise<void> {
+    if (!dirty) return;
+    const d = resolveDivergence();
+    dirty = false;
+    if (d.tail === "") {
+      // Pure truncation back to a node boundary — nothing new to land;
+      // the boundary node already holds the committed text.
+      return;
+    }
+    committing = true;
+    await sendCommit("user", d.parentNodeId ?? null, d.tail, { raw: true });
   }
 
   function revertEdit(): void {
     draft = bufferText;
     dirty = false;
+    committing = false;
   }
 
   function onKeydown(ev: KeyboardEvent): void {
@@ -218,8 +199,15 @@
 
   /** True when a tinted read-only mirror should render — a highlight
    *  probe is selected and the buffer isn't being actively edited. */
+  // The tinted mirror is built from ``chatLog.turns`` (the committed
+  // tree), so while ``committing`` holds an edit the tree hasn't caught
+  // up to, the mirror would lag the textarea — show the plain textarea
+  // (which carries the held draft) until the tree reconciles.
   const showTint = $derived(
-    highlightState.target !== null && !dirty && allTokens.length > 0,
+    highlightState.target !== null &&
+      !dirty &&
+      !committing &&
+      allTokens.length > 0,
   );
 
   function tokenScore(t: TokenScore): number | undefined {

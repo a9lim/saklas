@@ -2634,10 +2634,14 @@ async def _ws_handle_generate(
         async with session.lock:
             try:
                 if msg.commit_role == "user":
+                    # ``raw`` flags a flat (base-model) commit — the
+                    # authored span may hang under a node of any role,
+                    # so the user-under-user guard is lifted.
                     new_id = await asyncio.to_thread(
                         session.append_user_turn,
                         parent_node_id,
                         commit_text,
+                        allow_any_parent=msg.raw,
                     )
                 else:
                     # ``parent_node_id`` is non-None here (validated above

@@ -2823,6 +2823,8 @@ class SaklasSession:
         self,
         parent_node_id: str | None,
         text: str,
+        *,
+        allow_any_parent: bool = False,
     ) -> str:
         """Land a user turn under ``parent_node_id`` without generating.
 
@@ -2840,6 +2842,11 @@ class SaklasSession:
         returned without growing the tree, matching the regen workflow.
         Returns the new (or deduped) user node id.
 
+        ``allow_any_parent`` skips the user-under-user guard: in flat
+        (base-model) mode the role tag is authorship provenance, not a
+        turn-taking constraint, so an authored span may hang under a
+        node of any role.
+
         ``text`` must be non-empty (whitespace-only is honored, but a
         completely empty string raises) — empty commits should be
         no-op'd at the surface, not sent over the wire.
@@ -2848,7 +2855,8 @@ class SaklasSession:
             raise InvalidNodeOperationError(
                 "append_user_turn: text must be non-empty"
             )
-        self._check_user_send_target(parent_node_id)
+        if not allow_any_parent:
+            self._check_user_send_target(parent_node_id)
         return self.tree.add_user_turn(text, parent_id=parent_node_id)
 
     def append_assistant_turn(
@@ -3183,6 +3191,16 @@ class SaklasSession:
         stateless: bool = False,
         parent_node_id: str | None = None,
     ) -> torch.Tensor:
+        if raw and isinstance(input, str):
+            # Flat (base-model / completion) path: no chat template, no
+            # role markers.  The model sees the active-path text verbatim
+            # — every node along the loom path concatenated — plus this
+            # call's own ``input``.  ``stateless`` skips the tree walk so
+            # the buffer is purely ``input``.
+            prefix = "" if stateless else self.tree.flat_text(parent_node_id)
+            return self._tokenizer.encode(
+                prefix + input, return_tensors="pt",
+            ).to(self._device)
         if isinstance(input, str):
             if stateless:
                 prior: list[dict[str, str]] = []
@@ -3196,10 +3214,6 @@ class SaklasSession:
             messages = list(input)
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
-        if raw and isinstance(input, str):
-            return self._tokenizer.encode(
-                input, return_tensors="pt",
-            ).to(self._device)
         return build_chat_input(
             self._tokenizer, messages, self.config.system_prompt,
             thinking=thinking,
@@ -3542,6 +3556,7 @@ class SaklasSession:
         input,
         *,
         stateless: bool,
+        raw: bool,
         parent_node_id: str | None,
         sampling: SamplingConfig | None,
         steering_obj: Steering | None,
@@ -3551,7 +3566,20 @@ class SaklasSession:
         if stateless:
             return None
 
-        if isinstance(input, str):
+        if isinstance(input, str) and raw:
+            # Flat (base-model) path: no user/assistant turn pairing.  A
+            # non-empty ``input`` is a typed span recorded as its own
+            # node; an empty ``input`` is a bare continuation that just
+            # extends the active leaf.  ``_check_user_send_target`` is
+            # skipped — in flat mode the role tag is authorship
+            # provenance, not a turn-taking constraint, so a span may
+            # hang under a node of any role.
+            if input != "":
+                user_node_id = self.tree.add_user_turn(
+                    input, parent_id=parent_node_id)
+            else:
+                user_node_id = parent_node_id or self.tree.active_node_id
+        elif isinstance(input, str):
             self._check_user_send_target(parent_node_id)
             user_node_id = self.tree.add_user_turn(input, parent_id=parent_node_id)
         else:
@@ -3836,6 +3864,7 @@ class SaklasSession:
         assistant_node_id = self._start_loom_assistant(
             input,
             stateless=stateless,
+            raw=raw,
             parent_node_id=parent_node_id,
             sampling=sampling,
             steering_obj=steering_obj,

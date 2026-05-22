@@ -2294,6 +2294,7 @@ function buildCommitPending(
   role: "user" | "assistant",
   parentNodeId: string | null | "active@drain",
   text: string,
+  raw: boolean = false,
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
@@ -2307,10 +2308,11 @@ function buildCommitPending(
       const parent = parentNodeId === "active@drain"
         ? loomTree.active_node_id
         : parentNodeId;
-      return sendCommitNow(role, parent, text);
+      return sendCommitNow(role, parent, text, raw);
     },
     awaitsGen: true,
-    rebuild: (newText: string) => buildCommitPending(role, parentNodeId, newText),
+    rebuild: (newText: string) =>
+      buildCommitPending(role, parentNodeId, newText, raw),
     createdAt: Date.now(),
     endsOnUserNode: role === "user",
   };
@@ -2331,10 +2333,10 @@ export async function sendCommit(
   role: "user" | "assistant",
   parentNodeId: string | null | "active@drain",
   text: string,
-  opts: { replaceSlot?: number | null } = {},
+  opts: { replaceSlot?: number | null; raw?: boolean } = {},
 ): Promise<void> {
   if (isPendingBusy()) {
-    const item = buildCommitPending(role, parentNodeId, text);
+    const item = buildCommitPending(role, parentNodeId, text, opts.raw ?? false);
     enqueuePending(
       {
         label: item.label,
@@ -2354,13 +2356,14 @@ export async function sendCommit(
   const resolved = parentNodeId === "active@drain"
     ? loomTree.active_node_id
     : parentNodeId;
-  return sendCommitNow(role, resolved, text);
+  return sendCommitNow(role, resolved, text, opts.raw ?? false);
 }
 
 async function sendCommitNow(
   role: "user" | "assistant",
   parentNodeId: string | null,
   text: string,
+  raw: boolean = false,
 ): Promise<void> {
   const sock = await ensureWebSocket();
   const payload: WSClientMessage = {
@@ -2368,6 +2371,9 @@ async function sendCommitNow(
     commit_role: role,
     commit_text: text,
     parent_node_id: parentNodeId,
+    // ``raw`` lifts the user-under-user guard server-side — a flat
+    // (base-model) commit's authored span may hang under any role.
+    raw,
   };
   const send = () => sock.send(JSON.stringify(payload));
   if (sock.readyState === WebSocket.OPEN) send();

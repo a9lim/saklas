@@ -122,6 +122,41 @@ def test_messages_for_explicit_leaf():
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hi there"},
     ]
+
+
+def test_flat_text_concatenates_active_path():
+    """Flat-mode buffer: every node's text joined, no roles, no markers."""
+    t = _seed_tree()
+    assert t.flat_text() == "hihello"
+
+
+def test_flat_text_skips_synthetic_root():
+    """An empty tree (bare system root) flattens to the empty string."""
+    t = LoomTree()
+    assert t.flat_text() == ""
+
+
+def test_flat_text_explicit_leaf():
+    """Flat text of an off-path branch walks that branch, not the active one."""
+    t = LoomTree()
+    u1 = t.add_user_turn("once upon a ")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="time")
+    a2 = t.branch(a1, "day")
+    assert t.flat_text(a1) == "once upon a time"
+    assert t.flat_text(a2) == "once upon a day"
+
+
+def test_flat_text_assistant_chain():
+    """Bare continuations chain assistant-under-assistant — flat_text still
+    walks the whole path with no separators."""
+    t = LoomTree()
+    u1 = t.add_user_turn("seed ")
+    a1 = t.begin_assistant(u1)
+    t.finalize_assistant(a1, text="one ")
+    a2 = t.begin_assistant(a1)  # continuation hangs straight off a1
+    t.finalize_assistant(a2, text="two")
+    assert t.flat_text() == "seed one two"
     # active_path() still tracks the live cursor (now a2 after branch).
     assert t.active_node_id == a2
 

@@ -257,13 +257,14 @@ class _StubSession:
         return result
 
     # ----- commit entry points (Ctrl+Enter on either surface) ----------
-    def append_user_turn(self, parent_node_id, text):
+    def append_user_turn(self, parent_node_id, text, *, allow_any_parent=False):
         """Stub commit-user.
 
         Mirrors ``SaklasSession.append_user_turn``: refuses anchoring
         under a user-role parent (the same D15 rule the normal-send
-        path enforces), otherwise wraps ``LoomTree.add_user_turn`` so
-        dedup + active-node advancement match the real session.
+        path enforces) unless ``allow_any_parent`` is set (flat /
+        base-model commit), otherwise wraps ``LoomTree.add_user_turn``
+        so dedup + active-node advancement match the real session.
         """
         from saklas.core.loom import InvalidNodeOperationError
         if text == "":
@@ -280,7 +281,7 @@ class _StubSession:
             if resolved_parent is not None
             else None
         )
-        if parent is not None and parent.role == "user":
+        if not allow_any_parent and parent is not None and parent.role == "user":
             raise InvalidNodeOperationError(
                 f"cannot send a new user turn from a user node "
                 f"({resolved_parent}): the active turn is already "
@@ -1004,6 +1005,31 @@ class TestCommit:
                     break
         assert msg["type"] == "error"
         assert msg["code"] == "InvalidNodeOperationError"
+
+    def test_commit_user_raw_allows_user_parent(self, session_and_client):
+        """A flat (base-model) commit carries ``raw: true`` — the
+        user-under-user guard is lifted, so an authored span lands
+        under a node of any role."""
+        session, client = session_and_client
+        uid = session.tree.add_user_turn("first")  # active = uid, role user
+        done = None
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "commit_role": "user",
+                "commit_text": "second",
+                "parent_node_id": uid,
+                "raw": True,
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    done = msg
+                    break
+                assert msg["type"] != "error", msg
+        assert done is not None
+        new_id = done["result"]["node_id"]
+        assert session.tree.nodes[new_id].parent_id == uid
 
     def test_commit_assistant_lands_authored_sibling(self, session_and_client):
         """Ctrl+Enter on a user active node lands a sibling assistant

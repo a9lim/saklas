@@ -1634,6 +1634,7 @@ class SaklasApp(App[None]):
                     steering=steering,
                     sampling=sampling,
                     stateless=False,
+                    raw=self._is_base_model,
                     thinking=use_thinking,
                     parent_node_id=regen_parent_id,
                     live_scores=self._wants_live_probe_scores(),
@@ -4179,6 +4180,7 @@ class SaklasApp(App[None]):
             try:
                 stream = self._session.generate_stream(
                     user_text,
+                    raw=self._is_base_model,
                     parent_node_id=parent_node_id,
                     recipe_override=mode,
                     live_scores=self._wants_live_probe_scores(),

@@ -42,6 +42,56 @@ class _StopTokenizer:
         return "".join(pieces)
 
 
+class _EchoTokenizer:
+    """Minimal tokenizer: encodes text to a tensor of its char codes."""
+
+    name_or_path = "echo-tokenizer"
+
+    def encode(self, text, return_tensors=None):
+        ids = [ord(c) for c in text]
+        if return_tensors == "pt":
+            return torch.tensor([ids], dtype=torch.long)
+        return ids
+
+
+def _decode_echo(ids: torch.Tensor) -> str:
+    return "".join(chr(int(t)) for t in ids[0])
+
+
+def test_prepare_input_raw_feeds_flat_active_path():
+    """raw=True walks the loom tree as flat text — no chat template, no
+    role markers — and appends the call's own input."""
+    from saklas.core.loom import LoomTree
+
+    tree = LoomTree()
+    u1 = tree.add_user_turn("once upon a ")
+    a1 = tree.begin_assistant(u1)
+    tree.finalize_assistant(a1, text="time")
+
+    session = SaklasSession.__new__(SaklasSession)
+    session._tokenizer = _EchoTokenizer()
+    session._device = torch.device("cpu")
+    session.tree = tree
+
+    # Non-stateless: prefix is the flattened active path; input rides on top.
+    ids = SaklasSession._prepare_input(
+        session, " the fox", raw=True, parent_node_id=a1,
+    )
+    assert _decode_echo(ids) == "once upon a time the fox"
+
+    # Stateless: the tree is ignored — only the input string is encoded.
+    ids = SaklasSession._prepare_input(
+        session, " the fox", raw=True, stateless=True, parent_node_id=a1,
+    )
+    assert _decode_echo(ids) == " the fox"
+
+    # Empty input is a bare continuation — just the flattened buffer.
+    ids = SaklasSession._prepare_input(
+        session, "", raw=True, parent_node_id=a1,
+    )
+    assert _decode_echo(ids) == "once upon a time"
+
+
 class _StopModel:
     config = SimpleNamespace(vocab_size=4)
     generation_config = SimpleNamespace(eos_token_id=3)

@@ -668,6 +668,27 @@ class LoomTree:
             out.append({"role": node.role, "content": node.text})
         return out
 
+    def flat_text(self, leaf_id: str | None = None) -> str:
+        """Return the active-path (or path-to-``leaf_id``) text, concatenated.
+
+        The base-model / flat-completion analogue of :meth:`messages_for`:
+        no roles, no separators, no chat template — every node's text
+        joined in root-to-leaf order, with the synthetic system root
+        skipped.  The raw-mode generation path feeds this verbatim to the
+        tokenizer so a completion model sees one continuous buffer rather
+        than a chat-templated transcript.  Returns ``""`` when the tree is
+        empty (target resolves to ``None`` or the bare root).
+        """
+        target = leaf_id if leaf_id is not None else self.active_node_id
+        if target is None:
+            return ""
+        parts: list[str] = []
+        for node in self.path_to(target):
+            if node.id == self.root_id:
+                continue
+            parts.append(node.text)
+        return "".join(parts)
+
     def ancestors_of(self, node_id: str) -> Iterator[str]:
         """Yield ``node_id``'s ancestor ids (parent first, root last)."""
         cur = self.nodes[node_id].parent_id
