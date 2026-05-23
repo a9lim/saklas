@@ -412,3 +412,139 @@ class TestAblationPerformance:
             )
         finally:
             session.close()
+
+
+class TestDiscoverManifoldEndToEnd:
+    """End-to-end discover-mode fit on a real model.
+
+    Exercises the integration path the unit-test suite skips: the LLM-side
+    K-tuple generator, the per-node centroid forward pass, the per-model
+    PCA + RBF fit, and the steered-generation hook at a manifold position.
+    Held to a tight time budget (corpus generation is the slow part — 1
+    scenario call + N_concepts × N_scenarios statement calls — so 5
+    concepts × 2 scenarios × 3 statements stays under ~6× the existing
+    extraction budget).
+
+    Asserts the structural invariants only: the fit produces a
+    ``CustomDomain(k)``, every node lands at distinct derived coords, and
+    a soft subspace-replace at one node's centroid produces *different*
+    text from a steered call at a different node's centroid.  Going
+    deeper (e.g. probe-score asymmetry between opposite node positions)
+    requires the manifold to encode a probe-aligned axis, which depends
+    on which concept heap the generator produces — too fragile for a
+    smoke test, properly the job of the naturalness eval.
+    """
+
+    _CONCEPTS = ["pirate", "scholar", "robot", "caveman", "assistant"]
+    _N_SCENARIOS = 2
+    _STATEMENTS_PER_CONCEPT = 3
+    # Generation = 1 scenario call + N×K statement calls = 11 LLM turns.
+    # Per-turn budget mirrors `_EXTRACTION_BUDGET_S` × generator-call count.
+    _GENERATE_BUDGET_S = _EXTRACTION_BUDGET_S * 6
+    _FIT_BUDGET_S = _EXTRACTION_BUDGET_S * 2
+
+    def test_discover_pipeline(self, model_and_tokenizer, tmp_path, monkeypatch):
+        from saklas.core.manifold import CustomDomain
+        from saklas.core.session import SaklasSession
+        from saklas.io.manifolds import create_discover_manifold_folder
+
+        # Pin SAKLAS_HOME to a per-test temp dir so the manifold folder
+        # lands somewhere disposable; bundled neutrals still copy in
+        # fresh on first session init.
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+        model, tokenizer = model_and_tokenizer
+        # probes=[] — the smoke test doesn't need probe scoring and
+        # skipping bootstrap shaves seconds off the discover gate.
+        session = SaklasSession(model, tokenizer, probes=[])
+        try:
+            # ---- 1. generate per-concept corpora ----
+            t0 = time.perf_counter()
+            corpora = session.generate_concept_statements(
+                self._CONCEPTS,
+                n_scenarios=self._N_SCENARIOS,
+                statements_per_concept_per_scenario=self._STATEMENTS_PER_CONCEPT,
+            )
+            dt_gen = time.perf_counter() - t0
+            assert dt_gen < self._GENERATE_BUDGET_S, (
+                f"generate_concept_statements took {dt_gen:.1f}s, "
+                f"budget {self._GENERATE_BUDGET_S:.1f}s"
+            )
+            assert set(corpora.keys()) == set(self._CONCEPTS)
+            expected_per_concept = (
+                self._N_SCENARIOS * self._STATEMENTS_PER_CONCEPT
+            )
+            for c, lines in corpora.items():
+                assert len(lines) == expected_per_concept, (
+                    f"corpus for {c!r}: {len(lines)} statements, "
+                    f"expected {expected_per_concept}"
+                )
+
+            # ---- 2. author the discover folder ----
+            folder = create_discover_manifold_folder(
+                "local", "smoke_personas", "smoke-test discover",
+                fit_mode="pca",
+                node_corpora=corpora,
+                hyperparams={"max_dim": 2, "var_threshold": 0.70},
+            )
+
+            # ---- 3. fit through the session pipeline ----
+            t0 = time.perf_counter()
+            manifold = session.extract_manifold(folder)
+            dt_fit = time.perf_counter() - t0
+            assert dt_fit < self._FIT_BUDGET_S, (
+                f"extract_manifold took {dt_fit:.1f}s, "
+                f"budget {self._FIT_BUDGET_S:.1f}s"
+            )
+
+            # Discover-mode shape invariants.
+            assert isinstance(manifold.domain, CustomDomain)
+            k = manifold.domain.intrinsic_dim
+            assert 1 <= k <= 2
+            assert manifold.node_coords.shape == (
+                len(self._CONCEPTS), k,
+            )
+            # Derived coords must distinguish nodes — every pair distinct
+            # by at least a small floor, else the fit collapsed.
+            from itertools import combinations
+            for i, j in combinations(range(len(self._CONCEPTS)), 2):
+                dist = (
+                    manifold.node_coords[i] - manifold.node_coords[j]
+                ).norm().item()
+                assert dist > 1e-3, (
+                    f"derived coords for nodes {i} and {j} are "
+                    f"degenerate (dist={dist:.2e}) — fit collapsed"
+                )
+
+            # ---- 4. steered generation at one node vs another ----
+            # The manifold loads into session._manifolds lazily on
+            # scope entry; ManifoldTerm carries the authoring position.
+            label_a = manifold.node_labels[0]  # pirate
+            label_b = manifold.node_labels[2]  # robot
+            pos_a = ",".join(
+                f"{float(c):.4f}" for c in manifold.node_coords[0]
+            )
+            pos_b = ",".join(
+                f"{float(c):.4f}" for c in manifold.node_coords[2]
+            )
+            prompt = "Describe what you see in this room."
+
+            from saklas.core.sampling import SamplingConfig
+            sampling = SamplingConfig(
+                temperature=0.0, max_tokens=48, seed=0,
+            )
+            with session.steering(
+                f"1.0 local/smoke_personas%{pos_a}@response",
+            ):
+                r_a = session.generate(prompt, sampling=sampling)
+            with session.steering(
+                f"1.0 local/smoke_personas%{pos_b}@response",
+            ):
+                r_b = session.generate(prompt, sampling=sampling)
+            assert r_a.text != r_b.text, (
+                f"steering at node {label_a!r} produced identical text "
+                f"to node {label_b!r} — the manifold hook isn't moving "
+                f"activations"
+            )
+        finally:
+            session.close()

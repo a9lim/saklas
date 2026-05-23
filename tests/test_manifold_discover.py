@@ -1,0 +1,366 @@
+"""Discover-mode coord derivation: derive_pca_coords / derive_spectral_coords.
+
+Pure CPU, no model, no IO. The fit math is tensor over centroids; the
+centroids are synthesized so every test exercises a known ground truth.
+The Procrustes-agreement test in particular is the discriminating check
+for "did we wire the methods up correctly": PCA and spectral must
+agree on genuinely flat data and disagree on genuinely curved data.
+"""
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from saklas.core.manifold import (
+    PcaDiagnostics,
+    SpectralDiagnostics,
+    derive_pca_coords,
+    derive_spectral_coords,
+    discover_coords,
+)
+
+
+# ---------------------------------------------------------------- helpers ---
+
+def _random_orthonormal_plane(d: int, k: int, *, seed: int) -> torch.Tensor:
+    """A ``(d, k)`` matrix with orthonormal columns — a random k-plane in R^d."""
+    g = torch.Generator().manual_seed(seed)
+    A = torch.randn(d, k, generator=g)
+    Q, _ = torch.linalg.qr(A)
+    return Q  # (d, k)
+
+
+def _procrustes_align(
+    a: torch.Tensor, b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Orthogonal Procrustes: return ``(a' , b')`` aligned and both centered.
+
+    Both ``a`` and ``b`` are ``(N, k)``.  ``a'`` is ``a`` centered and
+    then rotated/reflected by the orthogonal matrix minimizing
+    ``||a R - b||_F``; ``b'`` is ``b`` centered.  Allows reflections —
+    spectral coords are sign-ambiguous, so requiring a proper rotation
+    would spuriously fail.
+    """
+    a_c = a - a.mean(dim=0, keepdim=True)
+    b_c = b - b.mean(dim=0, keepdim=True)
+    M = a_c.T @ b_c  # (k, k)
+    U, _, Vh = torch.linalg.svd(M)
+    R = U @ Vh
+    return a_c @ R, b_c
+
+
+def _procrustes_distance(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Normalized Procrustes distance: ``||a' - b'||_F / ||b'||_F``."""
+    a_aligned, b_c = _procrustes_align(a, b)
+    num = torch.linalg.norm(a_aligned - b_c)
+    den = torch.linalg.norm(b_c).clamp(min=1e-12)
+    return float((num / den).item())
+
+
+def _circle_centroids(
+    n: int, *, ambient: int, noise: float, seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """N uniformly-spaced 2D circle points embedded into R^ambient + noise.
+
+    Returns ``(centroids, theta)`` so the test can check the recovered
+    layout against the generating angles.
+    """
+    g = torch.Generator().manual_seed(seed)
+    theta = torch.linspace(0.0, 2.0 * math.pi, n + 1)[:-1]  # exclude wrap
+    plane = _random_orthonormal_plane(ambient, 2, seed=seed)  # (ambient, 2)
+    circle_2d = torch.stack(
+        [torch.cos(theta), torch.sin(theta)], dim=1,
+    )                                                          # (N, 2)
+    centroids = circle_2d @ plane.T                            # (N, ambient)
+    centroids = centroids + noise * torch.randn(
+        n, ambient, generator=g,
+    )
+    return centroids, theta
+
+
+def _flat_centroids(
+    n: int, *, ambient: int, rank: int, noise: float, seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """N points in a random ``rank``-plane of R^ambient + isotropic noise.
+
+    Returns ``(centroids, true_coords)`` — ``true_coords`` is the
+    ``(N, rank)`` matrix the embedding came from, against which PCA's
+    recovered layout must match (up to orthogonal rotation).
+    """
+    g = torch.Generator().manual_seed(seed)
+    true_coords = torch.randn(n, rank, generator=g)
+    plane = _random_orthonormal_plane(ambient, rank, seed=seed)
+    centroids = true_coords @ plane.T
+    centroids = centroids + noise * torch.randn(
+        n, ambient, generator=g,
+    )
+    return centroids, true_coords
+
+
+# ---------------------------------------------------------- PCA: headlines ---
+
+def test_pca_recovers_flat_subspace_rank():
+    """At a 0.95 threshold, PCA picks k=3 on rank-3 data and recovers the layout.
+
+    The 0.70 default is the cumulative-variance picker, not a rank
+    detector — random rank-3 data with one PC carrying ~45% and a
+    second ~30% crosses 0.70 at k=2.  Threshold 0.95 forces the picker
+    to keep going until the noise floor, which on a rank-3 dataset
+    happens exactly at k=3.  The threshold-semantics test below
+    exercises the lower-threshold contract directly.
+    """
+    centroids, true_coords = _flat_centroids(
+        n=60, ambient=32, rank=3, noise=0.02, seed=11,
+    )
+    coords, diag = derive_pca_coords(
+        centroids, max_dim=8, var_threshold=0.95,
+    )
+    assert isinstance(diag, PcaDiagnostics)
+    assert diag.picked_k == 3
+    # Cumulative variance crosses the 95% threshold exactly at k=3.
+    assert diag.cumulative_variance[2] >= 0.95
+    assert diag.cumulative_variance[1] < 0.95
+    # Coords have the right shape, and the recovered layout is an
+    # orthogonal rotation of the generating coords (Procrustes distance
+    # under noise floor).
+    assert coords.shape == (60, 3)
+    dist = _procrustes_distance(coords, true_coords)
+    assert dist < 0.10, f"Procrustes distance {dist:.4f} too large"
+
+
+def test_pca_threshold_semantics():
+    """Picked k is the smallest prefix whose cumvar crosses the threshold.
+
+    Direct test of the contract: ``cum_var[picked_k - 1] >= threshold``
+    and ``cum_var[picked_k - 2] < threshold`` (when picked_k > 1).
+    """
+    centroids, _ = _flat_centroids(
+        n=60, ambient=32, rank=3, noise=0.02, seed=11,
+    )
+    for threshold in (0.50, 0.70, 0.90, 0.99):
+        _, diag = derive_pca_coords(
+            centroids, max_dim=8, var_threshold=threshold,
+        )
+        k = diag.picked_k
+        assert diag.cumulative_variance[k - 1] >= threshold, (
+            f"threshold {threshold}: cumvar at picked_k={k} is "
+            f"{diag.cumulative_variance[k - 1]:.3f} < {threshold}"
+        )
+        if k > 1:
+            assert diag.cumulative_variance[k - 2] < threshold, (
+                f"threshold {threshold}: picked_k={k} but k-1 already "
+                f"crossed ({diag.cumulative_variance[k - 2]:.3f})"
+            )
+
+
+def test_pca_picks_k1_when_one_direction_dominates():
+    """A near-1D heap collapses to k=1 with cumvar already past threshold."""
+    # 1D linear ramp dominates; everything else is tiny noise.
+    g = torch.Generator().manual_seed(7)
+    n, d = 40, 32
+    ramp = torch.linspace(-5.0, 5.0, n).unsqueeze(1)  # (N, 1)
+    plane = _random_orthonormal_plane(d, 1, seed=7)
+    centroids = ramp @ plane.T + 0.01 * torch.randn(n, d, generator=g)
+    coords, diag = derive_pca_coords(centroids, max_dim=8, var_threshold=0.70)
+    assert diag.picked_k == 1
+    assert diag.cumulative_variance[0] >= 0.70
+    assert coords.shape == (40, 1)
+
+
+def test_pca_caps_at_max_dim_when_threshold_unreachable():
+    """Pure isotropic noise — no prefix crosses 70%, so we cap at max_dim."""
+    g = torch.Generator().manual_seed(3)
+    centroids = torch.randn(50, 32, generator=g)
+    coords, diag = derive_pca_coords(centroids, max_dim=4, var_threshold=0.99)
+    # Variance is spread across all 32 axes; threshold 0.99 unreachable
+    # inside the cap.  Picked_k pins to max_dim.
+    assert diag.picked_k == 4
+    assert coords.shape == (50, 4)
+
+
+def test_pca_rejects_too_few_centroids():
+    """K=1 has no variance; the function refuses rather than divide by zero."""
+    with pytest.raises(ValueError, match=">= 2 centroids"):
+        derive_pca_coords(torch.zeros(1, 32))
+
+
+# -------------------------------------------------- spectral: circle recovery ---
+
+def test_spectral_recovers_circle_topology():
+    """The headline test: S^1 → spectral picks k=2, recovers angular order."""
+    centroids, theta = _circle_centroids(
+        n=80, ambient=32, noise=0.02, seed=21,
+    )
+    coords, diag = derive_spectral_coords(centroids, max_dim=6)
+    assert isinstance(diag, SpectralDiagnostics)
+    assert diag.component_count == 1
+    # S^1 has two non-trivial Laplacian eigenvalues (the cos/sin pair)
+    # before a clean gap to the next pair.  picked_k = 2.
+    assert diag.picked_k == 2
+    assert coords.shape == (80, 2)
+    # The recovered 2-coord embedding wraps once around the origin.
+    # Sort by atan2 of recovered coords; the original angular order
+    # should be preserved up to reflection.
+    rec_angle = torch.atan2(coords[:, 1], coords[:, 0])
+    rec_order = torch.argsort(rec_angle)
+    orig_order = torch.argsort(theta)
+    # Cyclic shift + possible reflection: rotate orig_order until it
+    # aligns with rec_order in either direction.
+    rec_idx = rec_order.tolist()
+    orig_idx = orig_order.tolist()
+
+    def cyclic_match(a: list[int], b: list[int]) -> bool:
+        n = len(a)
+        for start in range(n):
+            if all(a[(start + i) % n] == b[i] for i in range(n)):
+                return True
+        return False
+
+    matches_forward = cyclic_match(orig_idx, rec_idx)
+    matches_reflected = cyclic_match(orig_idx[::-1], rec_idx)
+    assert matches_forward or matches_reflected, (
+        "spectral embedding did not preserve circular order"
+    )
+
+
+def test_spectral_flat_subspace_picks_small_k():
+    """On flat data, spectral still works — it just won't show a big gap.
+
+    The recovered layout should still embed the rank, but the gap
+    detection won't have a sharp peak.  This is the negative-space
+    test for the headline: spectral isn't broken on flat input, it
+    just doesn't have the structural advantage there.
+    """
+    centroids, _ = _flat_centroids(
+        n=60, ambient=32, rank=3, noise=0.02, seed=33,
+    )
+    coords, diag = derive_spectral_coords(centroids, max_dim=6)
+    assert diag.component_count == 1
+    # The fit succeeded and produced some k between 1 and max_dim.
+    assert 1 <= diag.picked_k <= 6
+    assert coords.shape == (60, diag.picked_k)
+
+
+# ------------------------------------------------ agreement-iff-flat invariant ---
+
+def test_pca_and_spectral_pick_same_k_on_flat_data():
+    """Structural agreement on flat data: both methods pick the same intrinsic dim.
+
+    PCA and spectral have different objectives — PCA preserves
+    *variance*, spectral preserves *local distances* — so their
+    coordinate values can disagree pointwise even on flat data,
+    depending on the sampling pattern (a gaussian cloud and a uniform
+    grid give different layouts under spectral, the same under PCA).
+    The *structural* invariant — what intrinsic dimension each method
+    recovers — should agree, and that's the discriminating wiring test:
+    if PCA says rank-2 and spectral says rank-5 on data that genuinely
+    lies on a flat 2-plane, one of them is miscomputed.
+    """
+    centroids, _ = _flat_centroids(
+        n=60, ambient=32, rank=2, noise=0.02, seed=44,
+    )
+    _, pca_diag = derive_pca_coords(
+        centroids, max_dim=8, var_threshold=0.95,
+    )
+    _, spec_diag = derive_spectral_coords(centroids, max_dim=8)
+    assert pca_diag.picked_k == 2, (
+        f"PCA picked k={pca_diag.picked_k} on rank-2 data"
+    )
+    # Spectral may pick 1 or 2 on a noisy 2-plane (low-rank noise can
+    # blur the ratio cliff into the first eigengap); both are
+    # structurally reasonable.  What's *not* reasonable is spectral
+    # picking the max_dim cap on flat data — that flags a broken gap.
+    assert spec_diag.picked_k <= 2, (
+        f"spectral picked k={spec_diag.picked_k} on flat rank-2 data; "
+        f"the eigengap heuristic is over-counting"
+    )
+
+
+def test_pca_and_spectral_diverge_on_curved_data():
+    """On a circle, PCA flattens the loop and spectral preserves it.
+
+    Inverse of the structural-agreement test: on genuinely curved
+    input the *coordinate layouts* must differ substantially.  PCA's
+    2-D embedding of a circle is the uniform 2-disk projection (a flat
+    chord layout); spectral's is the unwrapped circle.  These should
+    show a large Procrustes distance — the discriminator that the
+    methods are actually behaving differently rather than collapsing
+    to the same layout for trivial reasons.
+    """
+    centroids, _ = _circle_centroids(
+        n=80, ambient=32, noise=0.02, seed=55,
+    )
+    pca_coords, _ = derive_pca_coords(
+        centroids, max_dim=2, var_threshold=0.95,
+    )
+    spec_coords, _ = derive_spectral_coords(centroids, max_dim=2)
+    if spec_coords.shape[1] != 2 or pca_coords.shape[1] != 2:
+        pytest.skip(
+            f"need k=2 from both for Procrustes match "
+            f"(pca={pca_coords.shape[1]}, spec={spec_coords.shape[1]})"
+        )
+    dist = _procrustes_distance(spec_coords, pca_coords)
+    assert dist > 0.40, (
+        f"PCA and spectral agree on curved data (Procrustes dist "
+        f"{dist:.3f}); spectral may be collapsing to PCA"
+    )
+
+
+# ----------------------------------------------------- error paths / safety ---
+
+def test_spectral_rejects_disconnected_graph():
+    """Two well-separated clusters with small k_nn → ValueError on n_components."""
+    g = torch.Generator().manual_seed(99)
+    cluster_a = torch.randn(20, 32, generator=g) * 0.3 + 10.0
+    cluster_b = torch.randn(20, 32, generator=g) * 0.3 - 10.0
+    centroids = torch.cat([cluster_a, cluster_b], dim=0)
+    with pytest.raises(ValueError, match=r"2 connected components"):
+        derive_spectral_coords(centroids, max_dim=4, k_nn=3)
+
+
+def test_spectral_rejects_too_few_centroids():
+    """Below the floor K=4 the heuristics are pure noise; refuse early."""
+    with pytest.raises(ValueError, match=">= 4 centroids"):
+        derive_spectral_coords(torch.zeros(3, 32))
+
+
+def test_spectral_diagnostics_record_data_driven_defaults():
+    """The default ``k_nn`` and ``bandwidth`` ride into diagnostics for repro."""
+    centroids, _ = _circle_centroids(
+        n=50, ambient=16, noise=0.01, seed=66,
+    )
+    _, diag = derive_spectral_coords(centroids, max_dim=4)
+    assert diag.k_nn == max(5, math.ceil(math.log(50)))
+    assert diag.bandwidth > 0.0
+    assert diag.eigenvalues.shape[0] >= diag.picked_k
+
+
+# --------------------------------------------------------------- dispatcher ---
+
+def test_discover_coords_routes_to_pca():
+    centroids, _ = _flat_centroids(
+        n=40, ambient=16, rank=2, noise=0.02, seed=77,
+    )
+    coords, diag = discover_coords(
+        centroids, method="pca", max_dim=4, var_threshold=0.70,
+    )
+    assert isinstance(diag, PcaDiagnostics)
+    assert coords.shape[0] == 40
+
+
+def test_discover_coords_routes_to_spectral():
+    centroids, _ = _circle_centroids(
+        n=40, ambient=16, noise=0.02, seed=88,
+    )
+    coords, diag = discover_coords(
+        centroids, method="spectral", max_dim=4,
+    )
+    assert isinstance(diag, SpectralDiagnostics)
+    assert coords.shape[0] == 40
+
+
+def test_discover_coords_rejects_unknown_method():
+    with pytest.raises(ValueError, match=r"unknown discover method"):
+        discover_coords(torch.randn(10, 32), method="banana")

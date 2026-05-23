@@ -1542,39 +1542,363 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
     fitted = []
     for stem in mf.tensor_models():
         sc = mf.sidecar(stem)
-        fitted.append({
+        entry: dict = {
             "stem": stem,
             "method": sc.method,
             "feature_space": sc.feature_space,
             "node_count": sc.node_count,
-        })
+            "fit_mode": sc.fit_mode,
+        }
+        if sc.hyperparams:
+            entry["hyperparams"] = sc.hyperparams
+        if sc.diagnostics:
+            entry["diagnostics"] = sc.diagnostics
+        fitted.append(entry)
+
+    # In discover mode the folder itself has no per-node coords (they are
+    # derived per-model at fit time) — try to surface the derived coords
+    # from the per-model tensor when a fit exists.  Cheap: one safetensors
+    # header read.  Soft-fails to an empty list if the tensor isn't there.
+    derived_node_coords: list[list[float]] = []
+    if mf.is_discover and fitted:
+        from saklas.core.manifold import load_manifold
+        stem_for_session = fitted[0]["stem"]
+        try:
+            m = load_manifold(mf.tensor_path(stem_for_session))
+            derived_node_coords = [
+                [float(x) for x in row]
+                for row in m.node_coords.tolist()
+            ]
+        except (FileNotFoundError, KeyError, ValueError):
+            derived_node_coords = []
+
     if getattr(args, "json_output", False):
-        print(_json.dumps({
+        if mf.is_discover:
+            nodes_json = [
+                {
+                    "label": label,
+                    "coords": (
+                        derived_node_coords[i]
+                        if i < len(derived_node_coords) else None
+                    ),
+                }
+                for i, label in enumerate(mf.node_labels)
+            ]
+        else:
+            nodes_json = [
+                {"label": label, "coords": coords}
+                for label, coords in zip(mf.node_labels, mf.node_coords)
+            ]
+        body: dict = {
             "namespace": ns,
             "name": mf.name,
             "description": mf.description,
+            "fit_mode": mf.fit_mode,
             "domain": mf.domain,
-            "nodes": [
-                {"label": label, "coords": coords}
-                for label, coords in zip(mf.node_labels, mf.node_coords)
-            ],
+            "nodes": nodes_json,
             "fitted": fitted,
-        }, indent=2))
+        }
+        if mf.hyperparams:
+            body["hyperparams"] = mf.hyperparams
+        print(_json.dumps(body, indent=2))
         return
+
     print(f"{ns}/{mf.name}")
     if mf.description:
         print(f"  {mf.description}")
-    print(f"  domain: {_domain_label(mf.domain)}")
-    print("  nodes:")
-    for label, coords in zip(mf.node_labels, mf.node_coords):
-        coord_str = ", ".join(f"{c:g}" for c in coords)
-        print(f"    {label}  ({coord_str})")
+    if mf.is_discover:
+        print(f"  fit_mode: {mf.fit_mode} (discover — coords derived per-model)")
+        if mf.hyperparams:
+            hp = ", ".join(f"{k}={v}" for k, v in sorted(mf.hyperparams.items()))
+            print(f"  hyperparams: {hp}")
+        print("  nodes:")
+        for i, label in enumerate(mf.node_labels):
+            if i < len(derived_node_coords):
+                coord_str = ", ".join(f"{c:.3g}" for c in derived_node_coords[i])
+                print(f"    {label}  ({coord_str})")
+            else:
+                print(f"    {label}  (coords pending fit)")
+    else:
+        print(f"  domain: {_domain_label(mf.domain)}")
+        print("  nodes:")
+        for label, coords in zip(mf.node_labels, mf.node_coords):
+            coord_str = ", ".join(f"{c:g}" for c in coords)
+            print(f"    {label}  ({coord_str})")
     if fitted:
         print("  fitted models:")
         for f in fitted:
-            print(f"    {f['stem']}  ({f['method']}, {f['feature_space']})")
+            tag = f"{f['method']}, {f['feature_space']}"
+            if f.get("fit_mode") and f["fit_mode"] != "authored":
+                tag += f", fit_mode={f['fit_mode']}"
+            print(f"    {f['stem']}  ({tag})")
+            diag = f.get("diagnostics") or {}
+            # Per-method one-line summary.  PCA: picked_k + cumvar at k.
+            # Spectral: picked_k + gap_magnitude + bandwidth + k_nn.
+            if diag and f.get("fit_mode") == "pca":
+                cumvar = diag.get("cumulative_variance") or []
+                k = diag.get("picked_k")
+                if k and 1 <= k <= len(cumvar):
+                    print(
+                        f"      pca: picked_k={k}, "
+                        f"cumvar@k={cumvar[k - 1]:.3f} "
+                        f"(threshold={diag.get('threshold', '?')})"
+                    )
+            elif diag and f.get("fit_mode") == "spectral":
+                k = diag.get("picked_k")
+                gap = diag.get("gap_magnitude")
+                bw = diag.get("bandwidth")
+                knn = diag.get("k_nn")
+                bits = [f"picked_k={k}"]
+                if gap is not None:
+                    bits.append(f"gap={gap:.3g}")
+                if bw is not None:
+                    bits.append(f"bandwidth={bw:.3g}")
+                if knn is not None:
+                    bits.append(f"k_nn={knn}")
+                print(f"      spectral: {', '.join(bits)}")
+            if f.get("hyperparams"):
+                hp = ", ".join(
+                    f"{k}={v}" for k, v in sorted(f["hyperparams"].items())
+                )
+                print(f"      hyperparams: {hp}")
     else:
-        print("  fitted models: (none — run `saklas vector manifold fit`)")
+        hint = (
+            "discover" if mf.is_discover else "fit"
+        )
+        print(f"  fitted models: (none — run `saklas vector manifold {hint}`)")
+
+
+def _resolve_manifold_folder(name: str) -> Path:
+    """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to a folder path.
+
+    Mirrors :func:`_run_manifold_show`'s ambiguity handling — bare names
+    resolve cross-namespace and raise on collision; an ``ns/name`` form
+    pins to a single namespace.  Exits with a clear error on miss /
+    ambiguity so the discover and show runners share semantics.
+    """
+    target_ns: str | None = None
+    if "/" in name:
+        target_ns, name = name.split("/", 1)
+    matches = [
+        (ns, mf)
+        for ns, mf in _iter_manifold_folders(target_ns)
+        if mf.name == name
+    ]
+    if not matches:
+        print(f"manifold '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        qualified = ", ".join(f"{ns}/{mf.name}" for ns, mf in matches)
+        print(
+            f"ambiguous manifold '{name}': matches {qualified}; "
+            f"qualify with a namespace",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return matches[0][1].folder
+
+
+def _run_manifold_discover(args: argparse.Namespace) -> None:
+    """``saklas vector manifold discover`` — fit a discover-mode manifold.
+
+    The folder must already exist (usually created by ``generate``) and
+    be in discover shape.  Any CLI overrides (``--method``, ``--max-dim``,
+    ``--var-threshold``, ``--k-nn``, ``--bandwidth``) are written back
+    to ``manifold.json`` *before* the fit so the cache key reflects the
+    actual fit inputs.  This means a subsequent fit with different
+    overrides reliably misses cache; the folder's manifest is the
+    single source of truth for "what hyperparams produced the cached
+    tensor."
+    """
+    import json as _json
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.manifolds import (
+        ManifoldFolder, ManifoldFormatError, _sanitize_hyperparams,
+    )
+
+    _require_model(args)
+    folder = _resolve_manifold_folder(args.name)
+
+    # Validate folder is discover-shape before paying for model load.
+    try:
+        mf = ManifoldFolder.load(folder)
+    except ManifoldFormatError as e:
+        print(f"manifold discover: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not mf.is_discover:
+        print(
+            f"manifold discover: '{args.name}' is authored, not discover; "
+            f"use `saklas vector manifold fit` for authored manifolds",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Compose the effective fit_mode + hyperparams from CLI overrides.
+    new_fit_mode = args.method or mf.fit_mode
+    if new_fit_mode not in {"pca", "spectral"}:
+        print(
+            f"manifold discover: invalid method {new_fit_mode!r}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    new_hyperparams = dict(mf.hyperparams)
+    # PCA knobs.
+    if args.max_dim is not None:
+        new_hyperparams["max_dim"] = int(args.max_dim)
+    if args.var_threshold is not None:
+        new_hyperparams["var_threshold"] = float(args.var_threshold)
+    # Spectral knobs.
+    if args.k_nn is not None:
+        new_hyperparams["k_nn"] = int(args.k_nn)
+    if args.bandwidth is not None:
+        new_hyperparams["bandwidth"] = float(args.bandwidth)
+    # Cross-method knobs that don't apply get dropped — silently
+    # carrying e.g. ``var_threshold`` into a spectral fit pollutes the
+    # cache key without affecting the fit, and an out-of-whitelist key
+    # would crash the dispatcher at fit time.  Single source of truth
+    # lives in ``io.manifolds._sanitize_hyperparams``.
+    new_hyperparams = _sanitize_hyperparams(new_fit_mode, new_hyperparams)
+
+    # Write back if anything changed.  Staged write — a crash mid-rewrite
+    # would leave the folder unreadable and ``ManifoldFolder.load`` would
+    # 400 on the next list call.
+    if new_fit_mode != mf.fit_mode or new_hyperparams != mf.hyperparams:
+        data = _json.loads((folder / "manifold.json").read_text())
+        data["fit_mode"] = new_fit_mode
+        data["hyperparams"] = new_hyperparams
+        # Re-author the nodes list in case fit_mode changed and it
+        # accidentally carries authored shape.  Discover nodes are
+        # label-only.
+        data["nodes"] = [{"label": label} for label in mf.node_labels]
+        data.pop("domain", None)
+        write_json_atomic(folder / "manifold.json", data)
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+    try:
+        manifold = session.extract_manifold(
+            folder,
+            sae=getattr(args, "sae", None),
+            sae_revision=getattr(args, "sae_revision", None),
+            on_progress=lambda m: print(f"  {m}"),
+        )
+    except (ValueError, ManifoldFormatError) as e:
+        print(f"manifold discover failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        f"discovered manifold '{manifold.name}' "
+        f"({len(manifold.layers)} layers, "
+        f"{len(manifold.node_labels)} nodes, "
+        f"{_domain_label(manifold.domain.to_spec())}, "
+        f"{manifold.feature_space}, "
+        f"fit_mode={new_fit_mode})"
+    )
+
+
+def _run_manifold_generate(args: argparse.Namespace) -> None:
+    """``saklas vector manifold generate`` — author + LLM-fill a discover folder.
+
+    Two-step end-to-end: load the model, run
+    :meth:`SaklasSession.generate_concept_statements` to fill per-concept
+    corpora with the anti-allegory K-tuple generator, then write the
+    folder via :func:`create_discover_manifold_folder`.  The folder is
+    ready for ``vector manifold discover`` to fit; the two-step split
+    keeps the failure modes legible (a flaky generation run leaves
+    inspectable corpora) and lets the user review the statements before
+    paying for the discover fit.
+    """
+    import json as _json
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.manifolds import (
+        ManifoldFormatError,
+        create_discover_manifold_folder,
+    )
+    from saklas.io.paths import manifold_dir
+
+    _require_model(args)
+    if len(args.concepts) < 2:
+        print(
+            "manifold generate: need >= 2 concepts (shared-scenario "
+            "structure is meaningless with one)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    namespace = "local"
+    name = args.name
+    if "/" in name:
+        namespace, name = name.split("/", 1)
+
+    folder = manifold_dir(namespace, name)
+    if (folder / "manifold.json").exists():
+        if not args.force:
+            print(
+                f"manifold generate: {namespace}/{name} already exists "
+                f"(pass -f/--force to overwrite)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        import shutil
+        shutil.rmtree(folder)
+
+    _print_startup(args)
+    session = _make_session(args)
+    _print_model_info(session)
+
+    print(
+        f"generating {args.n_scenarios} scenarios + "
+        f"{args.statements_per_concept} statements per "
+        f"(scenario × concept) cell for {len(args.concepts)} concepts..."
+    )
+    try:
+        corpora = session.generate_concept_statements(
+            list(args.concepts),
+            n_scenarios=args.n_scenarios,
+            statements_per_concept_per_scenario=args.statements_per_concept,
+            on_progress=lambda m: print(f"  {m}"),
+        )
+    except ValueError as e:
+        print(f"manifold generate failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        out_folder = create_discover_manifold_folder(
+            namespace, name, args.description,
+            fit_mode="pca",  # default; the user can override at discover time
+            node_corpora=corpora,
+        )
+    except (FileExistsError, ManifoldFormatError) as e:
+        print(f"manifold generate failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Record the scenarios alongside the corpora as provenance — mirror
+    # the convention extract uses (``local/<canonical>/scenarios.json``).
+    # The scenarios themselves aren't preserved in ``generate_concept_statements``'s
+    # return value, but they live inside each statement (recoverable
+    # from corpus reading); writing a stub provenance file flags
+    # whether the corpora went through the generator vs hand-author.
+    write_json_atomic(
+        out_folder / "scenarios.json",
+        {
+            "generator": "session.generate_concept_statements",
+            "n_scenarios": args.n_scenarios,
+            "statements_per_concept": args.statements_per_concept,
+            "concepts": list(args.concepts),
+            "model_id": session.model_id,
+        },
+    )
+
+    total = sum(len(s) for s in corpora.values())
+    print(
+        f"wrote {namespace}/{name} "
+        f"({len(corpora)} concepts × "
+        f"{args.n_scenarios} scenarios × "
+        f"{args.statements_per_concept} statements = {total} statements)"
+    )
+    print(
+        f"  → run `saklas vector manifold discover {namespace}/{name}` to fit"
+    )
 
 
 def _run_vector_manifold(args: argparse.Namespace) -> None:
@@ -1583,12 +1907,20 @@ def _run_vector_manifold(args: argparse.Namespace) -> None:
     if cmd is None:
         print("usage: saklas vector manifold <verb> [...]")
         print()
-        print("  fit   Fit a manifold for a model from an authored corpus")
-        print("  ls    List installed manifolds")
-        print("  show  Show a manifold's nodes and fitted models")
+        print("  fit       Fit an authored manifold (user-supplied coords)")
+        print("  discover  Fit a discover-mode manifold (coords derived from activations)")
+        print("  generate  Author a discover-mode manifold from a concept list")
+        print("  ls        List installed manifolds")
+        print("  show      Show a manifold's nodes and fitted models")
         sys.exit(0)
     if cmd == "fit":
         _run_manifold_fit(args)
+        return
+    if cmd == "discover":
+        _run_manifold_discover(args)
+        return
+    if cmd == "generate":
+        _run_manifold_generate(args)
         return
     if cmd == "ls":
         _run_manifold_ls(args)

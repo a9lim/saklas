@@ -764,6 +764,338 @@ def subspace_replace(
     return h_new.to(h.dtype)
 
 
+# ======================================================= coord discovery ===
+#
+# Auto-fitting: derive node coordinates from per-node activation
+# centroids when the user hasn't authored a coordinate system.  PCA is
+# the safe linear default (reproduces the flat-subspace layout a user
+# would author themselves once they knew the answer).  Spectral
+# (Laplacian eigenmaps) recovers curved-manifold topology that PCA
+# flattens.  Both feed the same downstream machinery:
+# ``CustomDomain(k)`` with identity embedding, then per-layer
+# :func:`fit_layer_subspace` exactly as for authored manifolds.
+
+
+@dataclass(frozen=True)
+class PcaDiagnostics:
+    """Diagnostics for a PCA coordinate derivation.
+
+    Surfaced on the per-model sidecar so a user inspecting a fitted
+    manifold can tell whether the chosen ``k`` was well-supported by
+    the data (a sharp variance plateau) or compromised (variance still
+    rising at the cap).
+    """
+
+    per_component_variance: torch.Tensor  # (max_dim,) normalized to sum to 1
+    cumulative_variance: torch.Tensor     # (max_dim,)
+    picked_k: int
+    threshold: float
+
+
+@dataclass(frozen=True)
+class SpectralDiagnostics:
+    """Diagnostics for a spectral (Laplacian-eigenmaps) coordinate derivation.
+
+    The spectral gap is the one knob that says "the data has a clean
+    k-dimensional structure" (large gap at ``picked_k``) versus "no
+    clean cut, pick a dim by hand" (gaps flat across the candidate
+    range).  Bandwidth + ``k_nn`` are recorded for reproducibility:
+    both default to data-driven values (median k-NN distance,
+    ``max(5, ceil(log K))``) when the user doesn't override.
+    """
+
+    eigenvalues: torch.Tensor  # (kept_count,) non-trivial spectrum, ascending
+    picked_k: int
+    # ``picked_k`` is chosen by the eigenvalue-*ratio* heuristic
+    # (``argmax(λ_{k+1} / λ_k)`` over ``[1, max_dim]``), not the spec's
+    # original absolute-gap form -- the absolute gap scales like k² on
+    # S¹ (continuous-limit eigenvalues are quadratic in k) and pushes
+    # the picker toward larger k.  ``gap_index`` is kept as an alias of
+    # ``picked_k`` for diagnostic-render call sites that pre-date the
+    # rename; ``gap_magnitude`` is still the *absolute* gap at
+    # ``picked_k`` for the inspector's bar-chart annotation.
+    gap_index: int             # == picked_k
+    gap_magnitude: float       # eigenvalues[picked_k] - eigenvalues[picked_k - 1]
+    bandwidth: float           # heat-kernel sigma actually used
+    k_nn: int                  # number of nearest neighbors actually used
+    component_count: int       # always 1 on success (disconnected graphs raise)
+
+
+def derive_pca_coords(
+    centroids: torch.Tensor,
+    *,
+    max_dim: int = 8,
+    var_threshold: float = 0.70,
+) -> tuple[torch.Tensor, PcaDiagnostics]:
+    """Derive node coordinates from centroid PCA.
+
+    ``centroids`` is ``(K, D)`` — one per-node mean activation in the
+    chosen reference layer.  Returns ``(coords, diagnostics)`` where
+    ``coords`` is ``(K, k)`` and ``k`` is the smallest prefix whose
+    cumulative variance crosses ``var_threshold``, capped at
+    ``max_dim`` and floored at 1.
+
+    Reproduces the flat-subspace layout a user would author themselves
+    once they knew the answer.  Pure tensor, fp32, dependency-free.
+    """
+    centroids = centroids.to(torch.float32)
+    K = centroids.shape[0]
+    if K < 2:
+        raise ValueError(
+            f"PCA coord derivation needs >= 2 centroids, got {K}"
+        )
+    centered = centroids - centroids.mean(dim=0, keepdim=True)
+    # full_matrices=False gives U: (K, min(K,D)), S: (min(K,D),),
+    # Vh: (min(K,D), D).  We only need U @ diag(S) as the scores.
+    U, S, _ = torch.linalg.svd(centered, full_matrices=False)
+    # Variance fractions are (S^2)_i / sum_i (S^2)_i — metric-invariant
+    # and unaffected by sample-size scaling, so no (K-1) divisor.
+    var = S.pow(2)
+    total = var.sum().clamp(min=1e-12)
+    var_frac = var / total                       # (min(K,D),)
+    cum_var = torch.cumsum(var_frac, dim=0)      # (min(K,D),)
+    cap = min(max_dim, var_frac.shape[0])
+    # Smallest k such that cum_var[k-1] >= threshold; default to cap.
+    over = (cum_var[:cap] >= var_threshold).nonzero(as_tuple=False)
+    picked_k = int(over[0].item()) + 1 if over.numel() > 0 else cap
+    picked_k = max(1, min(picked_k, cap))
+
+    coords = U[:, :picked_k] * S[:picked_k]      # (K, picked_k)
+    diagnostics = PcaDiagnostics(
+        per_component_variance=var_frac[:cap].detach().clone(),
+        cumulative_variance=cum_var[:cap].detach().clone(),
+        picked_k=picked_k,
+        threshold=float(var_threshold),
+    )
+    return coords.contiguous(), diagnostics
+
+
+def _knn_adjacency(
+    distances: torch.Tensor, k_nn: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric k-NN graph from a pairwise distance matrix.
+
+    Returns ``(mask, neighbor_dists)`` where ``mask`` is a ``(K, K)``
+    bool tensor (True for retained edges, no self-loops) and
+    ``neighbor_dists`` is the flat 1-D tensor of edge distances actually
+    kept — useful for the median-bandwidth default.
+
+    Edges are symmetrized by **union** (``i ↔ j`` if ``j`` is in
+    ``knn(i)`` OR ``i`` is in ``knn(j)``).  Union is the standard
+    convention for Laplacian eigenmaps; intersection drops too many
+    edges and tends to disconnect borderline points.
+    """
+    K = distances.shape[0]
+    # Include self-distance in the top-k+1 call, then strip the self
+    # entry — guaranteed at position 0 because diag is zero.
+    k_eff = min(k_nn + 1, K)
+    _, idx = torch.topk(distances, k=k_eff, dim=1, largest=False)
+    # Build directed mask: row i has 1 in column idx[i, j] for j>=1.
+    directed = torch.zeros(K, K, dtype=torch.bool, device=distances.device)
+    rows = torch.arange(K, device=distances.device).unsqueeze(1).expand(-1, k_eff)
+    directed[rows, idx] = True
+    directed.fill_diagonal_(False)
+    # Symmetrize via union.
+    mask = directed | directed.T
+    neighbor_dists = distances[mask]
+    return mask, neighbor_dists
+
+
+def _connected_components(mask: torch.Tensor) -> int:
+    """Number of connected components in an undirected adjacency mask.
+
+    Plain union-find on a small ``(K, K)`` bool matrix — ``K`` is on
+    the order of tens to hundreds, so a quadratic scan over the upper
+    triangle is fine and avoids both scipy and the eigenvalue-counting
+    tolerance choice.
+    """
+    K = mask.shape[0]
+    parent = list(range(K))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Only need the upper triangle since the mask is symmetric.
+    rows, cols = mask.triu(diagonal=1).nonzero(as_tuple=True)
+    for r, c in zip(rows.tolist(), cols.tolist()):
+        union(r, c)
+    return len({find(i) for i in range(K)})
+
+
+def derive_spectral_coords(
+    centroids: torch.Tensor,
+    *,
+    max_dim: int = 8,
+    k_nn: int | None = None,
+    bandwidth: float | None = None,
+) -> tuple[torch.Tensor, SpectralDiagnostics]:
+    """Derive node coordinates from a Laplacian-eigenmaps spectral embedding.
+
+    Build a symmetric k-NN graph over the ``(K, D)`` centroids,
+    heat-kernel weights ``W_ij = exp(-d_ij^2 / (2 sigma^2))``, the
+    normalized Laplacian ``L = I - D^{-1/2} W D^{-1/2}``, eigendecompose
+    via :func:`torch.linalg.eigh`, drop the smallest (trivial) eigenvalue,
+    and take the next ``k`` eigenvector entries as coordinates.
+
+    ``k`` is chosen by the **eigenvalue-ratio** heuristic: the index
+    that maximizes ``λ_{k+1} / λ_k`` for ``1 <= k <= max_dim``.  This
+    captures the structural cliff between "signal" and "noise"
+    eigenvalues robustly across topologies — on a circle the cos/sin
+    pair at the lowest frequency produces a clean ratio cliff between
+    ``λ_2`` and ``λ_3``, picking ``k=2``.  Absolute gaps
+    ``λ_{k+1} - λ_k`` would over-pick on S^1 because the eigenvalues
+    scale ~ ``k²`` in the continuous limit, so the largest absolute
+    gap lands at high ``k`` rather than the structural cliff.
+
+    Defaults: ``k_nn = max(5, ceil(log K))``, ``bandwidth = median
+    k-NN distance``.  Both are recorded in the diagnostics.
+
+    A disconnected k-NN graph raises :class:`ValueError` with the
+    component count — a degenerate heap with isolated centroids cannot
+    be embedded by Laplacian eigenmaps.  Recommend the user raise
+    ``k_nn`` or switch to PCA.
+
+    Stays inside saklas's no-scipy rule.  Noisy below roughly 50 nodes
+    (too few centroids for stable heat-kernel weights, spectral gap
+    collapses into the eigenvalue noise floor); PCA is the right
+    default at bundled-heap sizes.
+    """
+    centroids = centroids.to(torch.float32)
+    K, _ = centroids.shape
+    if K < 4:
+        # Need at least 4 nodes to form any kind of k-NN graph and have
+        # a candidate gap range.  Below that the heuristics are pure
+        # noise; raise early rather than ship a meaningless embedding.
+        raise ValueError(
+            f"spectral coord derivation needs >= 4 centroids, got {K}"
+        )
+    if k_nn is None:
+        k_nn = max(5, math.ceil(math.log(K)))
+    k_nn = max(1, min(k_nn, K - 1))
+
+    distances = torch.cdist(centroids, centroids)
+    mask, neighbor_dists = _knn_adjacency(distances, k_nn)
+
+    components = _connected_components(mask)
+    if components > 1:
+        raise ValueError(
+            f"spectral coord derivation: k-NN graph has {components} "
+            f"connected components (need 1). Raise --k-nn or switch to "
+            f"--method pca."
+        )
+
+    if bandwidth is None:
+        if neighbor_dists.numel() == 0:
+            raise ValueError(
+                "spectral coord derivation: k-NN graph has no edges"
+            )
+        bandwidth = float(neighbor_dists.median().item())
+        if bandwidth <= 0.0:
+            # All-zero neighbor distances would NaN out the heat kernel.
+            # Falls back to a small positive sentinel; the caller's data
+            # is degenerate but we'd rather return something than crash.
+            bandwidth = 1e-6
+    bandwidth = float(bandwidth)
+
+    # Heat-kernel weights on the symmetric k-NN edge set.
+    W = torch.zeros_like(distances)
+    sq = (distances * distances) / (2.0 * bandwidth * bandwidth)
+    W = torch.where(mask, torch.exp(-sq), W)
+    # Belt-and-braces: kill any residual self-loops.
+    W.fill_diagonal_(0.0)
+
+    deg = W.sum(dim=1)
+    # _connected_components above guarantees no isolated vertex, so
+    # deg > 0 everywhere; the clamp is purely defensive against fp32
+    # underflow on huge bandwidths.
+    d_inv_sqrt = deg.clamp(min=1e-12).rsqrt()
+    # L_sym = I - D^{-1/2} W D^{-1/2}
+    L = -W * d_inv_sqrt.unsqueeze(0) * d_inv_sqrt.unsqueeze(1)
+    L.fill_diagonal_(0.0)
+    L = L + torch.eye(K, dtype=L.dtype, device=L.device)
+
+    eigvals, eigvecs = torch.linalg.eigh(L)  # ascending
+
+    # Drop the smallest eigenvalue (~0 for a connected graph).  The
+    # corresponding eigenvector is D^{1/2}1, not constant — it carries
+    # no embedding information.
+    nontrivial_vals = eigvals[1:]
+    nontrivial_vecs = eigvecs[:, 1:]
+
+    # Pick k by the eigenvalue-ratio heuristic.  For each candidate
+    # ``k`` in ``[1, cap]`` the ratio ``nontrivial[k] / nontrivial[k-1]``
+    # measures the multiplicative cliff between "kept" and "dropped"
+    # eigenvalues — large when ``k`` separates a structural cluster of
+    # low eigenvalues from a clearly higher group, near 1 when the
+    # spectrum is smooth.  Picking the argmax-ratio is the standard
+    # spectral-gap heuristic; the alternative absolute gap
+    # ``nontrivial[k] - nontrivial[k-1]`` over-picks on S^1 because
+    # eigenvalues scale ~ ``k²``.
+    cap = min(max_dim, nontrivial_vals.shape[0] - 1, K - 2)
+    cap = max(1, cap)
+    if cap == 1:
+        picked_k = 1
+        gap_magnitude = float(
+            (nontrivial_vals[1] - nontrivial_vals[0]).item()
+            if nontrivial_vals.shape[0] > 1
+            else 0.0
+        )
+    else:
+        # Ratio at "use k dims" = nontrivial[k] / nontrivial[k-1].
+        # Clamp the denominator off zero — a vanishing eigenvalue at
+        # ``k-1`` already means the graph is near-disconnected; the
+        # ratio there is meaningless but mustn't NaN out the argmax.
+        denom = nontrivial_vals[:cap].clamp(min=1e-12)
+        ratios = nontrivial_vals[1:cap + 1] / denom
+        picked_k = int(ratios.argmax().item()) + 1
+        gap_magnitude = float(
+            (nontrivial_vals[picked_k] - nontrivial_vals[picked_k - 1]).item()
+        )
+
+    coords = nontrivial_vecs[:, :picked_k].contiguous()  # (K, picked_k)
+
+    kept = min(max_dim + 5, nontrivial_vals.shape[0])
+    diagnostics = SpectralDiagnostics(
+        eigenvalues=nontrivial_vals[:kept].detach().clone(),
+        picked_k=picked_k,
+        gap_index=picked_k,
+        gap_magnitude=gap_magnitude,
+        bandwidth=bandwidth,
+        k_nn=k_nn,
+        component_count=1,
+    )
+    return coords, diagnostics
+
+
+def discover_coords(
+    centroids: torch.Tensor,
+    method: str,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, PcaDiagnostics | SpectralDiagnostics]:
+    """Dispatch to :func:`derive_pca_coords` or :func:`derive_spectral_coords`.
+
+    Exists so the pipeline doesn't branch on method strings; downstream
+    code calls ``discover_coords(centroids, method, **fit_kwargs)``
+    once and the diagnostics ride into the sidecar through the same
+    seam regardless of method.
+    """
+    if method == "pca":
+        return derive_pca_coords(centroids, **kwargs)
+    if method == "spectral":
+        return derive_spectral_coords(centroids, **kwargs)
+    raise ValueError(
+        f"unknown discover method {method!r} (expected 'pca' | 'spectral')"
+    )
+
+
 # ------------------------------------------------------ centroid capture ---
 
 def compute_node_centroid(
@@ -856,6 +1188,13 @@ def save_manifold(
     }
     for key in (
         "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
+        # Discover-mode fields.  ``fit_mode`` discriminates authored vs
+        # discover at read time; ``hyperparams`` records the knobs the
+        # fitter was called with (max_dim / var_threshold / k_nn /
+        # bandwidth) for reproducibility; ``diagnostics`` carries the
+        # per-method PCA variance bars or spectral spectrum for the
+        # CLI / webui inspector.  All absent for authored fits.
+        "fit_mode", "hyperparams", "diagnostics",
     ):
         if key in metadata:
             sidecar[key] = metadata[key]
@@ -1127,6 +1466,11 @@ __all__ = [
     "eval_rbf_jacobian",
     "fit_layer_subspace",
     "subspace_replace",
+    "PcaDiagnostics",
+    "SpectralDiagnostics",
+    "derive_pca_coords",
+    "derive_spectral_coords",
+    "discover_coords",
     "compute_node_centroid",
     "save_manifold",
     "load_manifold",

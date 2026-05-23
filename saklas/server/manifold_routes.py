@@ -25,9 +25,12 @@ from pydantic import BaseModel
 
 from saklas.core.manifold import domain_from_spec
 from saklas.core.session import ConcurrentExtractionError, SaklasSession
+from saklas.io.atomic import write_json_atomic
 from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
+    _sanitize_hyperparams,
+    create_discover_manifold_folder,
     create_manifold_folder,
     iter_manifold_folders,
     min_nodes,
@@ -62,6 +65,17 @@ class NodeSpec(BaseModel):
     statements: list[str]
 
 
+class DiscoverNodeSpec(BaseModel):
+    """A node in a discover-mode authoring payload — label + statements only.
+
+    No ``coords``: coords are derived per-model at fit time from the
+    pooled centroids.
+    """
+
+    label: str
+    statements: list[str]
+
+
 class CreateManifoldRequest(BaseModel):
     namespace: str = "local"
     name: str
@@ -70,14 +84,62 @@ class CreateManifoldRequest(BaseModel):
     nodes: list[NodeSpec]
 
 
+class CreateDiscoverManifoldRequest(BaseModel):
+    """Author a discover-mode manifold from supplied per-concept corpora.
+
+    The user provides labeled statement corpora; the fit derives node
+    coordinates per-model via PCA or spectral embedding when the
+    matching ``POST .../fit`` runs.
+    """
+
+    namespace: str = "local"
+    name: str
+    description: str = ""
+    fit_mode: Literal["pca", "spectral"] = "pca"
+    nodes: list[DiscoverNodeSpec]
+    hyperparams: dict[str, Any] = {}
+
+
+class GenerateManifoldRequest(BaseModel):
+    """LLM-author a discover-mode manifold from a flat concept list.
+
+    Wraps :meth:`SaklasSession.generate_concept_statements` — produces
+    one statement corpus per concept by asking the loaded model for
+    shared scenarios, then per-cell statements.  No coords supplied;
+    the fit derives them per-model.
+    """
+
+    namespace: str = "local"
+    name: str
+    description: str = ""
+    concepts: list[str]
+    n_scenarios: int = 9
+    statements_per_concept: int = 5
+    fit_mode: Literal["pca", "spectral"] = "pca"
+    hyperparams: dict[str, Any] = {}
+    force: bool = False
+
+
 class UpdateManifoldRequest(BaseModel):
     description: str | None = None
     nodes: list[NodeSpec] | None = None
 
 
 class FitManifoldRequest(BaseModel):
+    """Body for ``POST /manifolds/{ns}/{name}/fit``.
+
+    For authored manifolds only ``sae`` / ``sae_revision`` are honored.
+    For discover-mode manifolds ``fit_mode`` and ``hyperparams`` can
+    override the folder's stored values; when provided, the folder
+    manifest is rewritten *before* the fit so the cache key reflects
+    the actual fit inputs.
+    """
+
     sae: str | None = None
     sae_revision: str | None = None
+    # Discover-mode override fields — ignored when the folder is authored.
+    fit_mode: Literal["pca", "spectral"] | None = None
+    hyperparams: dict[str, Any] | None = None
 
 
 # ------------------------------------------------------------------ helpers ---
@@ -134,10 +196,12 @@ def _manifold_json(
         "domain": mf.domain,
         "domain_label": _domain_label(mf.domain),
         "intrinsic_dim": n,
-        "min_nodes": min_nodes(n),
+        "min_nodes": min_nodes(n) if n > 0 else None,
         "node_count": len(mf.node_labels),
         "node_labels": list(mf.node_labels),
         "node_coords": [list(c) for c in mf.node_coords],
+        "fit_mode": mf.fit_mode,
+        "hyperparams": dict(mf.hyperparams),
         "fitted_models": fitted_models,
         "fitted_for_session": fitted_for_session,
         "stale": stale,
@@ -145,27 +209,63 @@ def _manifold_json(
 
     if full:
         groups = dict(mf.node_groups())
-        out["nodes"] = [
-            {
-                "label": label,
-                "coords": list(coords),
-                "statements": list(groups.get(label, [])),
-            }
-            for label, coords in zip(mf.node_labels, mf.node_coords)
-        ]
+        if mf.fit_mode == "authored":
+            out["nodes"] = [
+                {
+                    "label": label,
+                    "coords": list(coords),
+                    "statements": list(groups.get(label, [])),
+                }
+                for label, coords in zip(mf.node_labels, mf.node_coords)
+            ]
+        else:
+            # Discover: no per-node coords in the folder; if a fit is
+            # present for this session's model, include the derived
+            # coords from the sidecar so the inspector can render the
+            # layout.
+            derived_coords: list[list[float]] = []
+            if fitted_for_session:
+                # The per-model safetensors carries the derived
+                # ``node_coords`` tensor for discover fits; load it on
+                # demand.  Cheap (one safetensors header read).
+                from saklas.core.manifold import load_manifold
+                try:
+                    m = load_manifold(mf.tensor_path(session_stem))
+                    derived_coords = [
+                        [float(x) for x in row]
+                        for row in m.node_coords.tolist()
+                    ]
+                except (FileNotFoundError, KeyError, ValueError):
+                    derived_coords = []
+            out["nodes"] = [
+                {
+                    "label": label,
+                    "coords": (
+                        derived_coords[i] if i < len(derived_coords) else None
+                    ),
+                    "statements": list(groups.get(label, [])),
+                }
+                for i, label in enumerate(mf.node_labels)
+            ]
         fitted: list[dict[str, Any]] = []
         for stem in fitted_models:
             try:
                 sc = mf.sidecar(stem)
             except KeyError:
                 continue
-            fitted.append({
+            entry: dict[str, Any] = {
                 "stem": stem,
                 "method": sc.method,
                 "feature_space": sc.feature_space,
                 "node_count": sc.node_count,
                 "nodes_sha256": sc.nodes_sha256,
-            })
+                "fit_mode": sc.fit_mode,
+            }
+            if sc.hyperparams:
+                entry["hyperparams"] = sc.hyperparams
+            if sc.diagnostics:
+                entry["diagnostics"] = sc.diagnostics
+            fitted.append(entry)
         out["fitted"] = fitted
 
     return out
@@ -239,12 +339,13 @@ def register_manifold_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/manifolds", status_code=201)
     def create_manifold(req: CreateManifoldRequest):
-        """Author a fresh manifold artifact on disk.
+        """Author a fresh authored manifold artifact on disk.
 
         Writes ``manifold.json`` + the ``nodes/`` corpus.  Returns the
         manifold detail plus ``advisories`` — soft poisedness / flat-axis
         warnings so the UI can flag a deficient node layout before a fit
-        is paid for.
+        is paid for.  For discover-mode authoring (no per-node coords),
+        ``POST /saklas/v1/manifolds/discover`` is the entry point.
         """
         domain_spec = req.domain.model_dump(exclude_none=True)
         nodes = [n.model_dump() for n in req.nodes]
@@ -260,6 +361,162 @@ def register_manifold_routes(app: FastAPI) -> None:
         body = _manifold_json(req.namespace, mf, session, full=True)
         body["advisories"] = advisories
         return body
+
+    @app.post("/saklas/v1/manifolds/discover", status_code=201)
+    def create_discover_manifold(req: CreateDiscoverManifoldRequest):
+        """Author a fresh discover-mode manifold from supplied per-concept corpora.
+
+        Nodes carry ``{label, statements}`` only — coords are derived
+        per-model at fit time.  Pair with ``POST /saklas/v1/manifolds/
+        {ns}/{name}/fit`` to run the discovery + fit.
+        """
+        node_corpora = {n.label: list(n.statements) for n in req.nodes}
+        try:
+            folder = create_discover_manifold_folder(
+                req.namespace, req.name, req.description,
+                fit_mode=req.fit_mode,
+                node_corpora=node_corpora,
+                hyperparams=req.hyperparams,
+            )
+        except FileExistsError as e:
+            raise HTTPException(409, str(e))
+        except ManifoldFormatError as e:
+            raise HTTPException(400, str(e))
+        mf = ManifoldFolder.load(folder)
+        return _manifold_json(req.namespace, mf, session, full=True)
+
+    @app.post("/saklas/v1/manifolds/generate", status_code=201)
+    async def generate_manifold(req: GenerateManifoldRequest, request: Request):
+        """LLM-author a discover-mode manifold from a flat concept list.
+
+        Runs :meth:`SaklasSession.generate_concept_statements` under the
+        session lock — the K-tuple generator that produces one statement
+        corpus per concept sharing scenarios across the row.  SSE
+        progress when ``Accept: text/event-stream``, JSON otherwise.
+        Writes a fresh discover-mode manifold folder; pair with
+        ``POST .../fit`` to derive coords + fit.
+        """
+        if len(req.concepts) < 2:
+            raise HTTPException(
+                400,
+                "manifold generate: need >= 2 concepts "
+                "(shared-scenario structure is meaningless with one)",
+            )
+        folder = manifold_dir(req.namespace, req.name)
+        if (folder / "manifold.json").exists():
+            if not req.force:
+                raise HTTPException(
+                    409,
+                    f"manifold {req.namespace}/{req.name} already exists "
+                    f"(pass force=true to overwrite)",
+                )
+
+        def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
+            corpora = session.generate_concept_statements(
+                list(req.concepts),
+                n_scenarios=req.n_scenarios,
+                statements_per_concept_per_scenario=req.statements_per_concept,
+                on_progress=on_progress,
+            )
+            if folder.exists():
+                shutil.rmtree(folder)
+            try:
+                out_folder = create_discover_manifold_folder(
+                    req.namespace, req.name, req.description,
+                    fit_mode=req.fit_mode,
+                    node_corpora=corpora,
+                    hyperparams=req.hyperparams,
+                )
+            except (FileExistsError, ManifoldFormatError) as e:
+                raise HTTPException(400, str(e))
+            write_json_atomic(
+                out_folder / "scenarios.json",
+                {
+                    "generator": "session.generate_concept_statements",
+                    "n_scenarios": req.n_scenarios,
+                    "statements_per_concept": req.statements_per_concept,
+                    "concepts": list(req.concepts),
+                    "model_id": session.model_id,
+                },
+            )
+            _evict_manifold(session, req.namespace, req.name)
+            ns, mf = _find_manifold(req.namespace, req.name)
+            body = _manifold_json(ns, mf, session, full=True)
+            body["done"] = True
+            return body
+
+        accept = request.headers.get("accept", "application/json")
+        if "text/event-stream" in accept:
+            async def _sse():
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+
+                def _on_progress(msg: str) -> None:
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait, ("progress", msg),
+                    )
+
+                async with session.lock:
+                    async def _run() -> None:
+                        try:
+                            body = await asyncio.to_thread(_gen, _on_progress)
+                            queue.put_nowait(("done", body))
+                        except HTTPException as e:
+                            queue.put_nowait((
+                                "error",
+                                {"message": e.detail, "code": "HTTPException"},
+                            ))
+                        except ValueError as e:
+                            queue.put_nowait((
+                                "error",
+                                {"message": str(e), "code": "ValueError"},
+                            ))
+                        except Exception as e:  # noqa: BLE001
+                            log.exception("manifold generate crashed")
+                            queue.put_nowait((
+                                "error",
+                                {
+                                    "message": str(e) or "generate failed",
+                                    "code": type(e).__name__,
+                                },
+                            ))
+
+                    task = asyncio.create_task(_run())
+                    try:
+                        while True:
+                            kind, payload = await queue.get()
+                            if kind == "progress":
+                                yield (
+                                    f"event: progress\n"
+                                    f"data: {json.dumps({'message': payload})}\n\n"
+                                )
+                            elif kind == "done":
+                                yield (
+                                    f"event: done\n"
+                                    f"data: {json.dumps(payload)}\n\n"
+                                )
+                                break
+                            elif kind == "error":
+                                yield (
+                                    f"event: error\n"
+                                    f"data: {json.dumps(payload)}\n\n"
+                                )
+                                break
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except BaseException:  # noqa: BLE001
+                                pass
+
+            return StreamingResponse(_sse(), media_type="text/event-stream")
+
+        async with session.lock:
+            try:
+                return await asyncio.to_thread(_gen, lambda _msg: None)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
 
     @app.patch("/saklas/v1/manifolds/{namespace}/{name}")
     async def update_manifold(
@@ -331,6 +588,41 @@ def register_manifold_routes(app: FastAPI) -> None:
         folder = manifold_dir(namespace, name)
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
+
+        # Discover-mode hyperparam overrides: write to the folder
+        # manifest *before* the fit so the cache key reflects the
+        # actual fit inputs.  Authored folders ignore these fields
+        # (FitManifoldRequest accepts them, the discriminator below
+        # gates the rewrite).
+        if req.fit_mode is not None or req.hyperparams is not None:
+            try:
+                pre_mf = ManifoldFolder.load(folder)
+            except ManifoldFormatError as e:
+                raise HTTPException(400, str(e))
+            if not pre_mf.is_discover and (
+                req.fit_mode is not None or req.hyperparams is not None
+            ):
+                raise HTTPException(
+                    400,
+                    f"fit_mode/hyperparams overrides are discover-mode "
+                    f"only; {namespace}/{name} is authored",
+                )
+            new_fit_mode = req.fit_mode or pre_mf.fit_mode
+            new_hp = dict(pre_mf.hyperparams)
+            if req.hyperparams is not None:
+                new_hp.update(req.hyperparams)
+            # Method-incompatible knobs get dropped at the IO boundary.
+            new_hp = _sanitize_hyperparams(new_fit_mode, new_hp)
+            data = json.loads((folder / "manifold.json").read_text())
+            data["fit_mode"] = new_fit_mode
+            data["hyperparams"] = new_hp
+            data["nodes"] = [{"label": label} for label in pre_mf.node_labels]
+            data.pop("domain", None)
+            # Staged write — a crash mid-rewrite would corrupt the
+            # manifest and 400 every subsequent route call.  Same
+            # discipline ``io.manifolds`` uses for every other manifest
+            # write; this override path was the lone outlier.
+            write_json_atomic(folder / "manifold.json", data)
 
         def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
             manifold = session.extract_manifold(

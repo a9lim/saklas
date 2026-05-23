@@ -44,6 +44,47 @@ from saklas.io.atomic import write_json_atomic
 from saklas.io.packs import NAME_REGEX, verify_integrity
 from saklas.io.paths import manifold_dir, manifolds_dir
 
+# Discover-mode fit modes — set as ``manifold.json::fit_mode`` for
+# manifolds whose node coordinates are derived from the model's
+# activations rather than authored by hand.  Authored manifolds carry
+# ``fit_mode == "authored"`` (or omit the field, which means the same).
+_FIT_MODES_DISCOVER: frozenset[str] = frozenset({"pca", "spectral"})
+_FIT_MODES_ALL: frozenset[str] = frozenset({"authored"}) | _FIT_MODES_DISCOVER
+
+# Per-method hyperparameter whitelists.  Anything outside the whitelist
+# for a given fit_mode is dropped at folder-create time so a user
+# POSTing ``{fit_mode: "pca", hyperparams: {"k_nn": 5}}`` doesn't land
+# a foreign key that would then crash ``derive_pca_coords`` at fit
+# time with ``TypeError: unexpected keyword argument``.  ``max_dim``
+# is shared.  ``reference_layer`` is honored by both methods (consumed
+# in ``ManifoldExtractionPipeline.fit`` before the dispatch).
+_HYPERPARAMS_BY_MODE: dict[str, frozenset[str]] = {
+    "pca": frozenset({"max_dim", "var_threshold", "reference_layer"}),
+    "spectral": frozenset({
+        "max_dim", "k_nn", "bandwidth", "reference_layer",
+    }),
+}
+
+
+def _sanitize_hyperparams(
+    fit_mode: str, hyperparams: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Drop hyperparam keys that don't apply to ``fit_mode``.
+
+    Single source of truth for the per-method whitelist; both the create
+    and the fit-override paths funnel through this so the folder
+    manifest never carries a key that would crash the dispatcher.  An
+    unknown ``fit_mode`` (already validated upstream) passes through
+    unchanged — better to land a soft "extra key" warning at fit time
+    than to silently drop everything.
+    """
+    if hyperparams is None:
+        return {}
+    allowed = _HYPERPARAMS_BY_MODE.get(fit_mode)
+    if allowed is None:
+        return dict(hyperparams)
+    return {k: v for k, v in hyperparams.items() if k in allowed}
+
 # Manifold artifact format version.  Decoupled from concept packs'
 # ``PACK_FORMAT_VERSION`` so the two formats can churn independently.
 # v3 is the arbitrary-dimensional / arbitrary-topology format (domain
@@ -113,9 +154,19 @@ class ManifoldSidecar:
     :class:`saklas.io.packs.Sidecar` (``statements_sha256``,
     ``diagnostics_by_layer`` ...) are meaningless for a manifold, so this
     is a separate type rather than a reuse.
+
+    Discover-mode fits (``fit_mode != "authored"``) additionally carry
+    the derived ``coords``, the hyperparameters used, and the per-method
+    diagnostics block (PCA variance bars or spectral spectrum) so the
+    sidecar is self-describing for downstream inspection.
     """
 
-    method: str            # "manifold_pca" | "manifold_sae"
+    # ``manifold_pca`` / ``manifold_sae`` for authored fits;
+    # ``manifold_discover_pca`` / ``manifold_discover_spectral`` /
+    # ``manifold_discover_sae`` for discover-mode fits (the SAE label
+    # collapses across pca/spectral because the SAE reconstruction
+    # rides into both before the coord derivation runs).
+    method: str
     saklas_version: str
     domain: dict[str, Any]
     node_count: int
@@ -124,6 +175,10 @@ class ManifoldSidecar:
     nodes_sha256: Optional[str] = None
     sae_release: Optional[str] = None
     sae_revision: Optional[str] = None
+    # Discover-mode-only fields.  ``None`` on authored fits.
+    fit_mode: str = "authored"
+    hyperparams: dict[str, Any] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "ManifoldSidecar":
@@ -144,6 +199,9 @@ class ManifoldSidecar:
             nodes_sha256=data.get("nodes_sha256"),
             sae_release=data.get("sae_release"),
             sae_revision=data.get("sae_revision"),
+            fit_mode=data.get("fit_mode", "authored"),
+            hyperparams=dict(data.get("hyperparams", {})),
+            diagnostics=dict(data.get("diagnostics", {})),
         )
 
 
@@ -153,6 +211,27 @@ class ManifoldFolder:
 
     Discovery + corpus + integrity only — the fitted RBF tensors are
     loaded through :func:`saklas.core.manifold.load_manifold`.
+
+    Two folder shapes share this class via the ``fit_mode`` field:
+
+    - ``fit_mode == "authored"`` (default for legacy v3 manifolds): the
+      user supplied per-node ``coords`` on a declared ``domain``.  The
+      fit pipeline embeds the coords and runs straight into
+      ``fit_layer_subspace``.
+    - ``fit_mode in {"pca", "spectral"}`` (discover mode): nodes carry
+      ``{label}`` only — no coords, no top-level ``domain``.  The fit
+      pipeline pools per-node centroids, derives coords via
+      :func:`saklas.core.manifold.discover_coords` (per-model, since
+      different models embed the same heap differently), wraps them in
+      a ``CustomDomain(k)`` with identity embedding, and fits.
+
+    For authored folders ``domain`` is the tagged-union spec and
+    ``node_coords`` is the K×n list; for discover folders both are
+    empty placeholders (``{}`` and ``[]``) — the real geometry lives
+    in the per-model sidecar after the fit runs.  ``hyperparams``
+    captures the discover-mode knobs (``max_dim``, ``var_threshold``
+    for PCA; ``max_dim``, ``k_nn``, ``bandwidth`` for spectral) and is
+    empty for authored folders.
     """
 
     folder: Path
@@ -162,8 +241,15 @@ class ManifoldFolder:
     node_labels: list[str]
     node_coords: list[list[float]]
     files: dict[str, str]
+    fit_mode: str = "authored"
+    hyperparams: dict[str, Any] = field(default_factory=dict)
     # tensor stem (``<safe_model>`` or ``<safe_model>_sae-<rel>``) -> sidecar.
     _sidecars: dict[str, ManifoldSidecar] = field(default_factory=dict)
+
+    @property
+    def is_discover(self) -> bool:
+        """True when this folder's coords are derived per-model rather than authored."""
+        return self.fit_mode in _FIT_MODES_DISCOVER
 
     @classmethod
     def load(cls, folder: Path) -> "ManifoldFolder":
@@ -197,59 +283,113 @@ class ManifoldFolder:
                 f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
             )
 
-        domain_spec = data.get("domain")
-        if not isinstance(domain_spec, dict):
+        # Authored vs discover.  Authored = the historical shape:
+        # ``domain`` + per-node ``coords``.  Discover = no ``domain`` and
+        # nodes carry ``{label}`` only; coords are derived per-model at
+        # fit time.  Default ``"authored"`` keeps every pre-discover v3
+        # manifold loading unchanged.
+        fit_mode = data.get("fit_mode", "authored")
+        if fit_mode not in _FIT_MODES_ALL:
             raise ManifoldFormatError(
-                f"manifold {name!r} needs a 'domain' object"
+                f"manifold {name!r} fit_mode {fit_mode!r} invalid; "
+                f"expected one of {sorted(_FIT_MODES_ALL)}"
             )
-        try:
-            domain = domain_from_spec(domain_spec)
-        except (ValueError, KeyError) as e:
-            raise ManifoldFormatError(
-                f"manifold {name!r} has an invalid domain: {e}"
-            ) from e
-        n = domain.intrinsic_dim
 
         nodes = data.get("nodes")
-        floor = min_nodes(n)
-        if not isinstance(nodes, list) or len(nodes) < floor:
+        if not isinstance(nodes, list) or not nodes:
             raise ManifoldFormatError(
-                f"manifold {name!r} ({n}-D domain) needs a 'nodes' list of "
-                f">= {floor} entries, got {nodes!r}"
+                f"manifold {name!r} needs a non-empty 'nodes' list"
             )
 
         node_labels: list[str] = []
         node_coords: list[list[float]] = []
-        for entry in nodes:
-            if not isinstance(entry, dict):
+        hyperparams: dict[str, Any] = {}
+        domain_spec: dict[str, Any]
+
+        if fit_mode == "authored":
+            domain_spec = data.get("domain") or {}
+            if not isinstance(domain_spec, dict) or not domain_spec:
                 raise ManifoldFormatError(
-                    f"manifold {name!r} node {entry!r} must be an object "
-                    f"with 'label' and 'coords'"
+                    f"authored manifold {name!r} needs a 'domain' object"
                 )
-            label = entry.get("label")
-            if not isinstance(label, str) or not NAME_REGEX.match(label):
+            try:
+                domain = domain_from_spec(domain_spec)
+            except (ValueError, KeyError) as e:
                 raise ManifoldFormatError(
-                    f"manifold {name!r} node label {label!r} invalid; "
-                    f"must match {NAME_REGEX.pattern}"
-                )
-            coords = entry.get("coords")
-            if (
-                not isinstance(coords, list)
-                or len(coords) != n
-                or not all(isinstance(c, (int, float)) for c in coords)
-            ):
+                    f"manifold {name!r} has an invalid domain: {e}"
+                ) from e
+            n = domain.intrinsic_dim
+            floor = min_nodes(n)
+            if len(nodes) < floor:
                 raise ManifoldFormatError(
-                    f"manifold {name!r} node {label!r} needs 'coords' of "
-                    f"{n} number(s), got {coords!r}"
+                    f"manifold {name!r} ({n}-D domain) needs a 'nodes' "
+                    f"list of >= {floor} entries, got {len(nodes)}"
                 )
-            node_labels.append(label)
-            node_coords.append([float(c) for c in coords])
+            for entry in nodes:
+                if not isinstance(entry, dict):
+                    raise ManifoldFormatError(
+                        f"manifold {name!r} node {entry!r} must be an "
+                        f"object with 'label' and 'coords'"
+                    )
+                label = entry.get("label")
+                if not isinstance(label, str) or not NAME_REGEX.match(label):
+                    raise ManifoldFormatError(
+                        f"manifold {name!r} node label {label!r} invalid; "
+                        f"must match {NAME_REGEX.pattern}"
+                    )
+                coords = entry.get("coords")
+                if (
+                    not isinstance(coords, list)
+                    or len(coords) != n
+                    or not all(isinstance(c, (int, float)) for c in coords)
+                ):
+                    raise ManifoldFormatError(
+                        f"manifold {name!r} node {label!r} needs 'coords' "
+                        f"of {n} number(s), got {coords!r}"
+                    )
+                node_labels.append(label)
+                node_coords.append([float(c) for c in coords])
+            _warn_authoring_quality(name, domain, node_coords)
+        else:
+            # Discover mode: no ``domain`` field, no per-node ``coords``.
+            # The fit pipeline derives coords per-model from the
+            # activations and wraps them in a ``CustomDomain(k)``.  We
+            # do not even know the intrinsic dimension until after the
+            # fit, so the ``min_nodes(k)`` floor is enforced at fit time
+            # (once ``k`` is picked) rather than here.
+            if "domain" in data and data["domain"]:
+                raise ManifoldFormatError(
+                    f"discover-mode manifold {name!r} must not carry a "
+                    f"'domain' field — coords are derived per-model at "
+                    f"fit time"
+                )
+            domain_spec = {}
+            hyperparams = dict(data.get("hyperparams", {}))
+            for entry in nodes:
+                if not isinstance(entry, dict):
+                    raise ManifoldFormatError(
+                        f"discover manifold {name!r} node {entry!r} must "
+                        f"be an object with 'label'"
+                    )
+                label = entry.get("label")
+                if not isinstance(label, str) or not NAME_REGEX.match(label):
+                    raise ManifoldFormatError(
+                        f"discover manifold {name!r} node label "
+                        f"{label!r} invalid; must match "
+                        f"{NAME_REGEX.pattern}"
+                    )
+                if "coords" in entry:
+                    raise ManifoldFormatError(
+                        f"discover manifold {name!r} node {label!r} "
+                        f"must not carry 'coords' — coords are derived "
+                        f"at fit time"
+                    )
+                node_labels.append(label)
+
         if len(set(node_labels)) != len(node_labels):
             raise ManifoldFormatError(
                 f"manifold {name!r} has duplicate node labels"
             )
-
-        _warn_authoring_quality(name, domain, node_coords)
 
         files = data.get("files", {})
         if not isinstance(files, dict):
@@ -274,6 +414,8 @@ class ManifoldFolder:
             node_labels=node_labels,
             node_coords=node_coords,
             files=files,
+            fit_mode=fit_mode,
+            hyperparams=hyperparams,
         )
 
         # Every node file must be present.
@@ -317,19 +459,33 @@ class ManifoldFolder:
         return groups
 
     def nodes_sha256(self) -> str:
-        """Stable hash of the ordered node corpus, domain, and node coords.
+        """Stable hash of the inputs that determine a fit's output.
 
         The staleness key: a fitted tensor's sidecar records this, and a
-        re-fit is needed when it no longer matches.  Folding the domain
-        spec and the authoring coordinates into the hash means any
-        geometry edit — moving a node, flipping an axis to periodic —
-        triggers a re-fit alongside corpus edits.
+        re-fit is needed when it no longer matches.  For authored
+        manifolds the hash folds in the corpus, the domain spec, and
+        the authoring coordinates — any geometry edit (moving a node,
+        flipping an axis to periodic) triggers a re-fit alongside
+        corpus edits.  For discover manifolds the corresponding inputs
+        are the corpus plus the fit mode plus the hyperparameters
+        (``max_dim``, ``var_threshold`` for PCA; ``max_dim``,
+        ``k_nn``, ``bandwidth`` for spectral) — changing any of those
+        invalidates a cached fit.
+
+        The field name is unchanged for backward compat with v3
+        sidecars; the semantics naturally extends in the discover case.
         """
         h = hashlib.sha256()
         for idx in range(len(self.node_labels)):
             h.update(self.node_path(idx).read_bytes())
-        h.update(_canonical_json(self.domain))
-        h.update(_canonical_json(self.node_coords))
+        if self.fit_mode == "authored":
+            h.update(_canonical_json(self.domain))
+            h.update(_canonical_json(self.node_coords))
+        else:
+            h.update(_canonical_json({
+                "fit_mode": self.fit_mode,
+                "hyperparams": self.hyperparams,
+            }))
         return h.hexdigest()
 
     # -- fitted tensors ----------------------------------------------------
@@ -359,13 +515,18 @@ class ManifoldFolder:
             "format_version": MANIFOLD_FORMAT_VERSION,
             "name": self.name,
             "description": self.description,
-            "domain": self.domain,
-            "nodes": [
-                {"label": label, "coords": list(coords)}
-                for label, coords in zip(self.node_labels, self.node_coords)
-            ],
+            "fit_mode": self.fit_mode,
             "files": files,
         }
+        if self.fit_mode == "authored":
+            payload["domain"] = self.domain
+            payload["nodes"] = [
+                {"label": label, "coords": list(coords)}
+                for label, coords in zip(self.node_labels, self.node_coords)
+            ]
+        else:
+            payload["hyperparams"] = self.hyperparams
+            payload["nodes"] = [{"label": label} for label in self.node_labels]
         write_json_atomic(self.folder / "manifold.json", payload)
 
 
@@ -582,6 +743,123 @@ def create_manifold_folder(
     return folder, advisories
 
 
+def _validate_discover_corpora(
+    name: str, node_corpora: dict[str, list[str]],
+) -> None:
+    """Validate a discover-mode node corpus dict.
+
+    ``node_corpora`` is ``{label: [statement, ...]}`` — the authoring
+    shape for discover mode, where coords are derived at fit time and
+    the user only supplies labels + statements.  Labels must match
+    ``NAME_REGEX`` and every statement list must be non-empty strings.
+    """
+    if not isinstance(node_corpora, dict) or not node_corpora:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} needs a non-empty "
+            f"{{label: [statements]}} dict"
+        )
+    for label, statements in node_corpora.items():
+        if not isinstance(label, str) or not NAME_REGEX.match(label):
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} label {label!r} invalid; "
+                f"must match {NAME_REGEX.pattern}"
+            )
+        if (
+            not isinstance(statements, list)
+            or not statements
+            or not all(isinstance(s, str) and s.strip() for s in statements)
+        ):
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} node {label!r} needs a "
+                f"non-empty list of non-blank statement strings"
+            )
+
+
+def create_discover_manifold_folder(
+    namespace: str,
+    name: str,
+    description: str,
+    *,
+    fit_mode: str,
+    node_corpora: dict[str, list[str]],
+    hyperparams: Optional[dict[str, Any]] = None,
+) -> Path:
+    """Author a fresh discover-mode manifold artifact folder on disk.
+
+    ``fit_mode`` is one of ``"pca"`` / ``"spectral"``;
+    ``node_corpora`` is the authoring shape ``{label: [statement, ...]}``.
+    Writes ``manifold.json`` (no ``domain``, no per-node ``coords``,
+    empty ``files`` manifest) and the ``nodes/`` corpus.  Returns the
+    folder path.
+
+    Coords are derived per-model at fit time
+    (:func:`saklas.core.manifold.discover_coords` runs over the per-node
+    centroids), so authoring quality cannot be advised here the way it
+    is for authored manifolds — the spectral connectivity check and PCA
+    variance-floor diagnostics surface only on the fit itself.
+
+    Raises :class:`ManifoldFormatError` on any validation failure and
+    :class:`FileExistsError` when a manifold already lives at the path.
+
+    TODO (cross-model alignment, deferred from Part 2 v1):
+        A discover-mode manifold's coords are *per-model* — the same
+        node heap fitted against Gemma vs Qwen produces different
+        layouts.  The deferred extension is a Procrustes rotation
+        shipped alongside the per-model tensors so an authoring
+        coordinate on the source model maps to a steering point on a
+        target model.  The machinery already exists for steering
+        vectors: :mod:`saklas.io.alignment` (``fit_alignment`` /
+        ``alignment_quality`` / ``transfer_profile``) and ``saklas
+        vector transfer`` (which writes ``_from-<safe_src>`` variant
+        tensors).  The right shape is probably a peer
+        ``transfer_manifold`` that reuses ``alignment_cache_path`` —
+        do not rebuild the per-layer Procrustes solver.
+    """
+    if not NAME_REGEX.match(name):
+        raise ManifoldFormatError(
+            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
+        )
+    if not NAME_REGEX.match(namespace):
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} invalid; "
+            f"must match {NAME_REGEX.pattern}"
+        )
+    if fit_mode not in _FIT_MODES_DISCOVER:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
+            f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
+        )
+    _validate_discover_corpora(name, node_corpora)
+
+    folder = manifold_dir(namespace, name)
+    if (folder / "manifold.json").exists():
+        raise FileExistsError(f"manifold {namespace}/{name} already exists")
+
+    folder.mkdir(parents=True, exist_ok=True)
+    # ``_write_node_corpus`` takes the authored-shape list; convert.
+    authored_shape = [
+        {"label": label, "statements": statements}
+        for label, statements in node_corpora.items()
+    ]
+    _write_node_corpus(folder, authored_shape)
+    # Drop cross-method hyperparam keys at the IO boundary so a stray
+    # ``k_nn`` on a PCA fit (or a stray ``var_threshold`` on a spectral
+    # fit) never lands in the manifest.  Otherwise the dispatcher would
+    # raise ``TypeError`` at fit time and the folder would be unusable
+    # until manually edited.
+    payload: dict[str, Any] = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": description,
+        "fit_mode": fit_mode,
+        "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
+        "nodes": [{"label": label} for label in node_corpora],
+        "files": {},
+    }
+    write_json_atomic(folder / "manifold.json", payload)
+    return folder
+
+
 def update_manifold_folder(
     folder: Path,
     *,
@@ -619,5 +897,7 @@ __all__ = [
     "hash_manifold_files",
     "iter_manifold_folders",
     "create_manifold_folder",
+    "create_discover_manifold_folder",
     "update_manifold_folder",
+    "_sanitize_hyperparams",
 ]

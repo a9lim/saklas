@@ -453,11 +453,18 @@ def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
 
 
 def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
-    """``saklas vector manifold`` — fit and inspect steering manifolds.
+    """``saklas vector manifold`` — fit, discover, generate, and inspect.
 
-    Nested subparser (``fit`` / ``ls`` / ``show``), mirroring
-    ``experiment transcript``.  ``fit`` loads a model and runs the
-    manifold extraction pipeline; ``ls`` / ``show`` are pure-IO.
+    Nested subparser:
+      ``fit`` — fit an authored manifold (user-supplied coords).
+      ``discover`` — fit a discover-mode manifold (coords derived from
+        per-node activations via PCA or spectral embedding).
+      ``generate`` — author a discover-mode manifold folder by asking
+        the loaded model for per-concept statement corpora.
+      ``ls`` / ``show`` — pure-IO discovery + inspection.
+
+    ``fit`` / ``discover`` / ``generate`` load a model; ``ls`` / ``show``
+    are pure-IO over ``~/.saklas/manifolds/``.
     """
     sub = parser.add_subparsers(dest="manifold_cmd", required=False, metavar="VERB")
 
@@ -482,6 +489,97 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Pin a specific HF revision for the SAE release",
     )
     fit.set_defaults(quantize=None, device="auto", probes=None)
+
+    discover = sub.add_parser(
+        "discover",
+        help="Fit a discover-mode manifold (coords derived from activations)",
+        description=(
+            "Pool per-node centroids, derive node coordinates via PCA or "
+            "spectral embedding, fit a per-layer RBF, and write the per-model "
+            "manifold tensor.  Operates on an existing discover-mode manifold "
+            "folder (usually authored by `saklas vector manifold generate`).  "
+            "PCA is the safe default for current bundled-heap sizes (~20–48 "
+            "nodes); spectral is the right choice once heaps cross ~50 nodes "
+            "and start to hint at curved structure — below that the spectral "
+            "gap collapses into the eigenvalue noise floor and the layout "
+            "looks meaningful but isn't."
+        ),
+    )
+    discover.add_argument("name", help="Manifold name (or ns/name)")
+    discover.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+    discover.add_argument(
+        "--method", choices=("pca", "spectral"), default=None,
+        help="Override the folder's fit_mode (default: keep folder's setting)",
+    )
+    discover.add_argument(
+        "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
+        help="Cap intrinsic dimension (default: 8 for PCA, 8 for spectral)",
+    )
+    discover.add_argument(
+        "--var-threshold", dest="var_threshold", type=float, default=None,
+        metavar="T",
+        help="PCA: smallest cumulative-variance prefix that crosses T "
+             "is picked (default: 0.70)",
+    )
+    discover.add_argument(
+        "--k-nn", dest="k_nn", type=int, default=None, metavar="K",
+        help="Spectral: number of nearest neighbors in the k-NN graph "
+             "(default: max(5, ceil(log K)))",
+    )
+    discover.add_argument(
+        "--bandwidth", type=float, default=None, metavar="SIGMA",
+        help="Spectral: heat-kernel bandwidth (default: median k-NN distance)",
+    )
+    discover.add_argument(
+        "--sae", default=None, metavar="RELEASE",
+        help="Reconstruct centroids through an SAELens SAE before the fit "
+             "(requires `.[sae]`)",
+    )
+    discover.add_argument(
+        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
+    )
+    discover.set_defaults(quantize=None, device="auto", probes=None)
+
+    generate = sub.add_parser(
+        "generate",
+        help="Generate per-concept corpora and write a discover-mode manifold",
+        description=(
+            "Ask the loaded model for shared situational scenarios that have "
+            "purchase for every concept on the list, then for each (scenario, "
+            "concept) cell write K first-person statements as a literal "
+            "instance of that concept under that scenario.  Writes a fresh "
+            "discover-mode manifold folder under "
+            "~/.saklas/manifolds/<ns>/<name>/ ready for `vector manifold "
+            "discover` to fit.  Scenario sharing across the row is "
+            "load-bearing — statement j of every concept came from the same "
+            "scenario, so the per-concept centroids stay comparable."
+        ),
+    )
+    generate.add_argument("name", help="Manifold name (use ns/name for non-local)")
+    generate.add_argument(
+        "--concepts", nargs="+", required=True, metavar="CONCEPT",
+        help="Concept slugs to generate corpora for (>= 2)",
+    )
+    generate.add_argument(
+        "--n-scenarios", dest="n_scenarios", type=int, default=9,
+        metavar="N",
+        help="Number of shared scenarios (default: 9)",
+    )
+    generate.add_argument(
+        "--statements-per-concept", dest="statements_per_concept",
+        type=int, default=5, metavar="K",
+        help="Statements per (concept, scenario) cell (default: 5)",
+    )
+    generate.add_argument(
+        "--description", default="", metavar="TEXT",
+        help="Human-readable description for the manifold folder",
+    )
+    generate.add_argument(
+        "-f", "--force", action="store_true",
+        help="Overwrite an existing manifold folder",
+    )
+    generate.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+    generate.set_defaults(quantize=None, device="auto", probes=None)
 
     ls = sub.add_parser(
         "ls", help="List installed manifolds",

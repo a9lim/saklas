@@ -11,6 +11,7 @@ from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
     ManifoldSidecar,
+    create_discover_manifold_folder,
     create_manifold_folder,
     hash_manifold_files,
     iter_manifold_folders,
@@ -456,3 +457,216 @@ def test_iter_manifold_folders(tmp_path, monkeypatch):
     assert found == {("local", "one"), ("shared", "two")}
     only_local = {(ns, mf.name) for ns, mf in iter_manifold_folders("local")}
     assert only_local == {("local", "one")}
+
+
+# ============================================================ discover mode ===
+
+def _discover_corpora(labels: list[str]) -> dict[str, list[str]]:
+    """``{label: [statement, ...]}`` for the discover authoring shape."""
+    return {
+        label: [f"{label} statement {i}" for i in range(3)]
+        for label in labels
+    }
+
+
+def test_create_discover_manifold_folder_round_trip(tmp_path, monkeypatch):
+    """A freshly authored discover folder loads with the expected shape."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "personas", "five personas",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(
+            ["pirate", "caveman", "assistant", "scholar", "robot"],
+        ),
+        hyperparams={"max_dim": 8, "var_threshold": 0.70},
+    )
+    mf = ManifoldFolder.load(folder)
+    assert mf.name == "personas"
+    assert mf.fit_mode == "pca"
+    assert mf.is_discover
+    assert mf.domain == {}
+    assert mf.node_coords == []
+    assert mf.node_labels == [
+        "pirate", "caveman", "assistant", "scholar", "robot",
+    ]
+    assert mf.hyperparams == {"max_dim": 8, "var_threshold": 0.70}
+    groups = mf.node_groups()
+    assert [label for label, _ in groups] == mf.node_labels
+    assert all(len(stmts) == 3 for _, stmts in groups)
+
+
+def test_create_discover_manifold_rejects_unknown_fit_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    with pytest.raises(ManifoldFormatError, match="fit_mode"):
+        create_discover_manifold_folder(
+            "local", "bad", "",
+            fit_mode="banana",
+            node_corpora=_discover_corpora(["a", "b", "c"]),
+        )
+
+
+def test_create_discover_manifold_rejects_authored_fit_mode(tmp_path, monkeypatch):
+    """``authored`` is not a valid discover-mode fit_mode."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    with pytest.raises(ManifoldFormatError, match="fit_mode"):
+        create_discover_manifold_folder(
+            "local", "wrong", "",
+            fit_mode="authored",
+            node_corpora=_discover_corpora(["a", "b", "c"]),
+        )
+
+
+def test_discover_manifold_rejects_coords_on_nodes(tmp_path):
+    """A discover folder must not carry per-node ``coords`` — those are derived."""
+    folder = tmp_path / "leaky"
+    (folder / "nodes").mkdir(parents=True)
+    (folder / "nodes" / "00_a.json").write_text(json.dumps(["a says"]))
+    (folder / "manifold.json").write_text(json.dumps({
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "leaky",
+        "fit_mode": "pca",
+        "hyperparams": {"max_dim": 4},
+        "nodes": [{"label": "a", "coords": [0.5]}],
+        "files": {},
+    }))
+    with pytest.raises(ManifoldFormatError, match="must not carry 'coords'"):
+        ManifoldFolder.load(folder)
+
+
+def test_discover_manifold_rejects_domain_field(tmp_path):
+    """A discover folder must not carry a ``domain`` — coords are derived."""
+    folder = tmp_path / "leaky2"
+    (folder / "nodes").mkdir(parents=True)
+    (folder / "nodes" / "00_a.json").write_text(json.dumps(["a says"]))
+    (folder / "manifold.json").write_text(json.dumps({
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "leaky2",
+        "fit_mode": "spectral",
+        "hyperparams": {"max_dim": 4},
+        "domain": {"type": "box", "axes": [
+            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+        ]},
+        "nodes": [{"label": "a"}],
+        "files": {},
+    }))
+    with pytest.raises(ManifoldFormatError, match="must not carry a 'domain'"):
+        ManifoldFolder.load(folder)
+
+
+def test_discover_nodes_sha256_sensitive_to_hyperparams(tmp_path, monkeypatch):
+    """A hyperparam edit invalidates the fit cache — the staleness key changes."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "pca_a", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b", "c"]),
+        hyperparams={"max_dim": 8, "var_threshold": 0.70},
+    )
+    h1 = ManifoldFolder.load(folder).nodes_sha256()
+    data = json.loads((folder / "manifold.json").read_text())
+    data["hyperparams"] = {"max_dim": 4, "var_threshold": 0.70}
+    (folder / "manifold.json").write_text(json.dumps(data))
+    h2 = ManifoldFolder.load(folder).nodes_sha256()
+    assert h1 != h2, "hyperparam change must invalidate the fit cache"
+
+
+def test_discover_nodes_sha256_sensitive_to_fit_mode(tmp_path, monkeypatch):
+    """Switching ``pca`` ↔ ``spectral`` invalidates the fit cache."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "mode_a", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b", "c"]),
+        hyperparams={"max_dim": 8},
+    )
+    h_pca = ManifoldFolder.load(folder).nodes_sha256()
+    data = json.loads((folder / "manifold.json").read_text())
+    data["fit_mode"] = "spectral"
+    (folder / "manifold.json").write_text(json.dumps(data))
+    h_spec = ManifoldFolder.load(folder).nodes_sha256()
+    assert h_pca != h_spec, "fit_mode change must invalidate the fit cache"
+
+
+def test_discover_nodes_sha256_sensitive_to_corpus(tmp_path, monkeypatch):
+    """The standing invariant: a corpus edit invalidates the fit cache."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "corp_a", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b", "c"]),
+    )
+    h1 = ManifoldFolder.load(folder).nodes_sha256()
+    (folder / "nodes" / "00_a.json").write_text(
+        json.dumps(["a says something else"])
+    )
+    h2 = ManifoldFolder.load(folder).nodes_sha256()
+    assert h1 != h2
+
+
+def test_discover_write_metadata_round_trip(tmp_path, monkeypatch):
+    """A re-written discover folder loads identically."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "rw", "round-trip",
+        fit_mode="spectral",
+        node_corpora=_discover_corpora(["a", "b", "c"]),
+        hyperparams={"max_dim": 6, "k_nn": 5},
+    )
+    mf = ManifoldFolder.load(folder)
+    mf.write_metadata()
+    again = ManifoldFolder.load(folder)
+    assert again.fit_mode == "spectral"
+    assert again.hyperparams == {"max_dim": 6, "k_nn": 5}
+    assert again.node_labels == mf.node_labels
+    assert again.domain == {}
+    assert again.node_coords == []
+
+
+def test_discover_create_drops_cross_method_hyperparams(tmp_path, monkeypatch):
+    """A spectral key on a pca create gets dropped — would crash the dispatcher."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "sanity_pca", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b", "c"]),
+        hyperparams={
+            "max_dim": 8,            # shared — kept
+            "var_threshold": 0.70,   # pca — kept
+            "k_nn": 5,               # spectral — dropped
+            "bandwidth": 0.1,        # spectral — dropped
+            "foo": "bar",            # unknown — dropped
+        },
+    )
+    mf = ManifoldFolder.load(folder)
+    assert mf.hyperparams == {"max_dim": 8, "var_threshold": 0.70}
+
+
+def test_discover_create_drops_cross_method_hyperparams_spectral(tmp_path, monkeypatch):
+    """Mirror — a pca key on a spectral create gets dropped."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "sanity_spec", "",
+        fit_mode="spectral",
+        node_corpora=_discover_corpora(["a", "b", "c"]),
+        hyperparams={
+            "max_dim": 8,
+            "k_nn": 5,
+            "bandwidth": 0.1,
+            "var_threshold": 0.70,   # pca — dropped
+        },
+    )
+    mf = ManifoldFolder.load(folder)
+    assert mf.hyperparams == {"max_dim": 8, "k_nn": 5, "bandwidth": 0.1}
+
+
+def test_authored_fit_mode_defaults_when_field_absent(tmp_path, monkeypatch):
+    """A legacy v3 manifold.json without a ``fit_mode`` field loads as authored."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = _author_manifold(tmp_path)
+    data = json.loads((folder / "manifold.json").read_text())
+    data.pop("fit_mode", None)
+    (folder / "manifold.json").write_text(json.dumps(data))
+    mf = ManifoldFolder.load(folder)
+    assert mf.fit_mode == "authored"
+    assert not mf.is_discover
+

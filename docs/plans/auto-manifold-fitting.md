@@ -430,3 +430,131 @@ The Procrustes cross-model alignment extension is deferred. Note it
 in `saklas/io/manifolds.py` as a TODO referencing
 `saklas/io/alignment.py` and `vector transfer` so the future
 implementer finds the existing machinery rather than rebuilding it.
+
+## Design decisions (post-discussion)
+
+Folded in after reviewing the plan against the existing engine /
+manifold-IO layer. These supersede the literal text above where they
+conflict.
+
+**The `--from <selector>...` form is dropped for v1.** A concept
+selector resolves to a bipolar (or monopolar) extracted *direction*,
+not a node. "What is the centroid of `happy.sad`?" has no clean
+answer — the positive-pole statements? both poles pooled? — and
+shipping ambiguous semantics is worse than not shipping the affordance.
+Discover mode operates on a folder of corpora or the output of
+`generate`. Reach for selectors later if a real use case appears.
+
+**`ManifoldFolder` gets a `fit_mode` discriminator, no sibling spec
+class.** Rather than a parallel `DiscoverFitSpec` carried alongside
+`ManifoldFolder`, the existing folder type gains `fit_mode:
+"authored" | "pca" | "spectral"` as a first-class field on
+`manifold.json`. In discover mode, per-node `coords` and the
+top-level `domain` are absent; the pipeline switches on
+`folder.fit_mode`. One artifact type, one save/load path, one
+discovery walk.
+
+**Derived `coords` live in the safetensors payload.** Per-model
+`<safe_model>.safetensors` gains a `derived_node_coords` tensor
+alongside `node_coords` / `node_params` / `rbf_weights` for discover
+fits. The JSON sidecar stays lean — `fit_mode`, hyperparams, and
+diagnostics scalars only. Coords are tensors; they belong with
+tensors, and JSON round-tripping of floats costs precision.
+
+**No `discover --generate` sugar.** Two-step (`generate` writes the
+folder, `discover` fits it) is clearer, and the corpus persists
+naturally if fit fails — exactly what you'd want anyway.
+
+**`generate` writes a sibling `scenarios.json`.** Mirroring the
+existing convention in `local/<canonical>/scenarios.json`. The
+scenario-sharing structure is load-bearing for the K-tuple
+generalization, and recording it on disk turns implicit provenance
+into addressable provenance.
+
+**Staleness key is renamed `fit_inputs_sha256`.** Today
+`nodes_sha256` folds in `{corpus, domain, node_coords}`. In discover
+mode `domain` and `node_coords` are derived per-model, so the same
+hash needs to fold in `{corpus, fit_mode, hyperparams}` instead. One
+hash covering everything the fit depends on, regardless of mode, is
+cleaner than two parallel keys with overlapping coverage.
+
+**Spectral connectivity check uses zero-eigenvalue count.** The
+plan's "drop the trivial eigenvector at index 0" is sloppy phrasing —
+for the symmetric *normalized* Laplacian the trivial eigenvector is
+`D^{1/2} 1`, not constant. The correct test is: drop the smallest
+eigenvalue (~0 for a connected graph) and detect disconnection by
+counting eigenvalues below a small tolerance — that count *is* the
+component count.
+
+## Implementation deviations (resolved post-build)
+
+Recorded for future readers — the source of truth is the codebase, not
+the spec body. The first design-decisions section above superseded the
+body where they conflict; this section captures the further drift that
+showed up during the build and the audit, with rationale.
+
+**Spectral k-selection: eigenvalue ratio, not absolute gap.** The body
+calls for "the index of the largest gap `λ_{i+1} − λ_i`". The impl
+picks `argmax(λ_{k+1} / λ_k)` over `[1, max_dim]` instead. The
+absolute gap over-picks on `S^1` because the continuous-limit
+eigenvalues scale like `k²`, pushing the picker toward large `k` on
+exactly the topology the headline test is meant to recover. The
+multiplicative cliff captures the structural cluster-vs-noise split
+without that bias. `SpectralDiagnostics.gap_index` is preserved as an
+alias of `picked_k` so the diagnostics shape stays stable.
+`gap_magnitude` is still the *absolute* gap at the picked index, used
+only by the inspector's bar-chart annotation.
+
+**`nodes_sha256` not renamed to `fit_inputs_sha256`.** The earlier
+design decision called for the rename. The impl instead extends the
+existing field's semantics: for authored folders the hash still folds
+in `{corpus, domain, node_coords}`; for discover folders it folds in
+`{corpus, fit_mode, hyperparams}`. Same staleness coverage, no
+sidecar migration, v3-era manifests load unchanged.
+
+**Spectral connectivity check uses union-find, not zero-eigenvalue
+counting.** The previous design decision called for the eigenvalue
+count form. The impl uses a plain union-find scan over the symmetric
+k-NN adjacency upper triangle (`_connected_components` in
+`core/manifold.py`). Avoids the tolerance choice the eigenvalue
+approach would need (what counts as "near zero") and runs in `O(K²)`
+on a `K`-on-the-order-of-tens-to-hundreds graph, which is well below
+any noticeable cost.
+
+**`seed` parameter on `generate_concept_statements` was dropped.** The
+spec listed `seed: int | None = None` in the implementation slot. It
+landed once as `del seed  # reserved` and got removed in the audit
+sweep — neither the CLI (`vector manifold generate`) nor the server
+(`POST /manifolds/generate`) plumbed it through, so the public surface
+never carried it. Per-call decoder determinism is reachable later via
+`SamplingConfig.seed` wired around the inner `_run_generator` loop;
+no signature change needed when it gets added.
+
+**Short-cell padding in `generate_concept_statements`.** Not in the
+spec. When a per-(scenario, concept) LM call returns fewer than `K`
+parseable statements after every retry, the cell is padded by
+repeating its last statement (or a placeholder when nothing parsed).
+The scenario-shared-index invariant is load-bearing for discover-mode
+centroid pooling — a ragged corpus would silently miscount scenario
+positions downstream. Repetition is preferable to losing the
+alignment; a downstream centroid pool over a padded cell is at worst
+noisier than one over a full cell.
+
+**`_sanitize_hyperparams` at the IO boundary.** Not in the spec.
+`create_discover_manifold_folder` and the discover-mode override paths
+on `vector manifold discover` + `POST /manifolds/{ns}/{name}/fit` all
+funnel hyperparam dicts through one whitelist per `fit_mode` (PCA:
+`{max_dim, var_threshold, reference_layer}`; spectral: `{max_dim,
+k_nn, bandwidth, reference_layer}`). Without this, a user POSTing
+`{fit_mode: "pca", hyperparams: {"k_nn": 5}}` would land `k_nn` in the
+manifest and crash `derive_pca_coords` at fit time with `TypeError:
+unexpected keyword argument`. The whitelist drops cross-method and
+unknown keys silently — surfacing them as 400 felt overzealous given
+they're harmless once dropped.
+
+**`vector manifold discover` resolves a name, not a folder path.** The
+spec body's `--from FOLDER_OR_SELECTORS...` form was already dropped
+in the first design-decisions section ("--from <selector>... dropped
+for v1"). The impl takes a positional `<name>` (or `<ns>/<name>`) that
+resolves through `_resolve_manifold_folder` — same ambiguity handling
+as `vector manifold show`. Mirrors `fit`'s arg shape.

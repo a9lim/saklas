@@ -1465,6 +1465,224 @@ class SaklasSession:
                 i += 1
         return pairs
 
+    def generate_concept_statements(
+        self,
+        concepts: list[str],
+        *,
+        n_scenarios: int = _N_SCENARIOS,
+        statements_per_concept_per_scenario: int = _N_PAIRS_PER_SCENARIO,
+        on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
+    ) -> dict[str, list[str]]:
+        """K-tuple generalization of :meth:`generate_pairs` for discover mode.
+
+        Given a flat list of concepts (no pole structure: e.g.
+        ``["pirate", "caveman", "assistant", "scholar", "robot"]``),
+        produce one statement corpus per concept by:
+
+        1. Generating ``n_scenarios`` shared situational domains where
+           every concept on the list has a natural take.
+        2. For each (scenario, concept) cell, generating
+           ``statements_per_concept_per_scenario`` first-person
+           statements of that concept under that scenario.
+
+        Scenario sharing across the row is load-bearing: statement
+        index ``j`` of concept ``i`` and statement index ``j`` of
+        concept ``k`` came from the *same* scenario.  Without that
+        shared structure, the per-concept centroids would mix concept
+        signal with scenario signal and the discover-mode PCA /
+        spectral layout would surface scenario as the dominant axis.
+
+        The anti-allegory clause is preserved verbatim in both the
+        scenario prompt and the per-cell statement prompt — a robot is
+        a machine with sensors and actuators, not a metaphor; a
+        caveman is a person living in a cave with stone tools, not a
+        metaphor.  Tests assert the clause's presence.
+
+        Returns ``{concept: [statement, ...]}`` where each list has
+        ``n_scenarios * statements_per_concept_per_scenario`` entries,
+        ordered scenario-first then within-scenario.  The dict's key
+        order is the concept order the caller passed in.
+
+        Short-cell padding: if a per-(concept, scenario) LM call returns
+        fewer than ``statements_per_concept_per_scenario`` parseable
+        statements after every retry, the cell is padded by repeating
+        its last statement (or a placeholder when nothing parsed) so
+        the scenario-shared-index invariant survives.  A ragged corpus
+        would silently miscount scenario positions downstream — the
+        repetition is preferable to losing the alignment, and a
+        downstream centroid pool over a padded cell is at worst noisier
+        than one over a full cell.
+        """
+        if not isinstance(concepts, list) or len(concepts) < 2:
+            raise ValueError(
+                "generate_concept_statements needs >= 2 concepts; "
+                "shared-scenario structure is meaningless with one"
+            )
+        if n_scenarios <= 0 or statements_per_concept_per_scenario <= 0:
+            raise ValueError(
+                "n_scenarios and statements_per_concept_per_scenario "
+                "must both be > 0"
+            )
+        # Reject duplicates up front — they'd produce duplicate keys in
+        # the return dict, silently overwriting one corpus.
+        if len(set(concepts)) != len(concepts):
+            raise ValueError(
+                f"generate_concept_statements: duplicate concept in "
+                f"{concepts!r}"
+            )
+
+        # Slug underscores read as spaces in the LLM-facing prompt; the
+        # canonical concept slug is preserved for the return-dict keys.
+        humanized = [_humanize_concept(c) for c in concepts]
+        concept_list_str = ", ".join(f'"{h}"' for h in humanized)
+
+        scenario_prompt = (
+            f"You are writing situational domains for an analysis "
+            f"of {len(concepts)} distinct concepts.\n\n"
+            f"Concepts: {concept_list_str}.\n\n"
+            f"List exactly {n_scenarios} broad situational domains "
+            f"where *every* concept on the list would naturally have "
+            f"something to do or say. A domain is a category of "
+            f"experience, 2 to 6 words, concrete enough to evoke "
+            f"specific situations, broad enough that every listed "
+            f"concept could plausibly respond.\n\n"
+            f"A good domain has purchase for the whole list — for "
+            f"example, 'dealing with a sudden storm' lets every "
+            f"concept above have a take. A bad domain has purchase "
+            f"for only some — 'writing a Python decorator' leaves "
+            f"most of the list silent.\n\n"
+            f"Cover the full range of contexts these concepts might "
+            f"face — internal states, social or relational contact, "
+            f"physical environment, routine moments, high-stakes "
+            f"moments — whatever lets every concept on the list "
+            f"contribute.\n\n"
+            f"Do not force human-social framing onto concepts that "
+            f"aren't about humans. Treat each concept literally: a "
+            f"robot is a machine with sensors and actuators, not a "
+            f"metaphor for cold logic; a caveman is a person living "
+            f"in a cave with stone tools, not a metaphor for "
+            f"primitive behavior. A literal reading of every concept "
+            f"is mandatory.\n\n"
+            f"No meta-commentary, no explanations, no sub-bullets.\n\n"
+            f"Format: number, period, then the domain name. Nothing "
+            f"else.\n\n"
+            f"1. [domain]\n"
+            f"2. [domain]\n"
+            f"...\n"
+            f"{n_scenarios}. [domain]"
+        )
+
+        if on_progress:
+            on_progress(
+                f"Generating {n_scenarios} shared scenarios for "
+                f"{len(concepts)} concepts..."
+            )
+        scenarios: list[str] = []
+        for attempt in range(_MAX_GEN_ATTEMPTS):
+            text = self._run_generator(
+                _GEN_SYSTEM_MSG, scenario_prompt,
+                max_new_tokens=max(400, n_scenarios * 40),
+                role=role,
+            )
+            parsed = self._parse_scenarios(text)
+            if len(parsed) >= n_scenarios:
+                scenarios = parsed[:n_scenarios]
+                break
+            if len(parsed) > len(scenarios):
+                scenarios = parsed
+        if not scenarios:
+            raise ValueError(
+                f"could not generate scenarios for concepts "
+                f"{concepts!r}; try fewer or more-cohesive concepts"
+            )
+
+        # Pre-allocate the per-concept corpora with empty lists so
+        # short-LLM-output retries don't leave the dict shape ragged.
+        corpora: dict[str, list[str]] = {c: [] for c in concepts}
+        K = statements_per_concept_per_scenario
+
+        for s_idx, scenario in enumerate(scenarios, 1):
+            for c, h in zip(concepts, humanized):
+                if on_progress:
+                    on_progress(
+                        f"Domain {s_idx}/{len(scenarios)} "
+                        f"({scenario}): generating {K} statements for "
+                        f"'{h}'..."
+                    )
+                statement_prompt = (
+                    f"Concept: \"{h}\".\n"
+                    f"Domain: {scenario}.\n\n"
+                    f"Write exactly {K} first-person statements as a "
+                    f"literal \"{h}\" facing the situation that this "
+                    f"domain evokes. Treat \"{h}\" literally — a "
+                    f"robot is a machine with sensors and actuators, "
+                    f"not a metaphor for cold logic; a caveman is a "
+                    f"person living in a cave with stone tools, not "
+                    f"a metaphor for primitive behavior. Do not force "
+                    f"human-social framing onto a concept that isn't "
+                    f"about humans.\n\n"
+                    f"Each statement should be at least 12 words and "
+                    f"natural to \"{h}\"'s voice and concerns in this "
+                    f"situation. Do not start with 'As a {h}' or 'I "
+                    f"am a {h}' or any similar self-label — just "
+                    f"inhabit the concept directly.\n\n"
+                    f"Format: number, period, then the statement. "
+                    f"Nothing else.\n\n"
+                    f"1. [statement]\n"
+                    f"2. [statement]\n"
+                    f"...\n"
+                    f"{K}. [statement]"
+                )
+                cell_best: list[str] = []
+                for _ in range(_MAX_GEN_ATTEMPTS):
+                    text = self._run_generator(
+                        _GEN_SYSTEM_MSG, statement_prompt,
+                        max_new_tokens=max(400, K * 80),
+                        role=role,
+                    )
+                    parsed = self._parse_numbered_statements(text)
+                    if len(parsed) >= K:
+                        cell_best = parsed[:K]
+                        break
+                    if len(parsed) > len(cell_best):
+                        cell_best = parsed
+                # Always extend by K — pad with the last statement
+                # (or a placeholder if nothing parsed) to preserve the
+                # scenario-shared index invariant.  A ragged corpus
+                # would silently miscount scenario positions downstream.
+                if not cell_best:
+                    cell_best = [
+                        f"({h} statement under '{scenario}' — "
+                        f"generation failed)"
+                    ]
+                while len(cell_best) < K:
+                    cell_best.append(cell_best[-1])
+                corpora[c].extend(cell_best)
+
+        return corpora
+
+    @staticmethod
+    def _parse_numbered_statements(text: str) -> list[str]:
+        """Parse a plain numbered statement list (no a/b pairing).
+
+        Mirror of :meth:`_parse_scenarios` — accepts ``1. statement``,
+        ``1) statement``, tolerates bracket markers and trailing
+        punctuation, but keeps the statement body verbatim (unlike
+        scenarios which strip trailing ``.,;:``).
+        """
+        out: list[str] = []
+        for line in text.split("\n"):
+            m = _SCENARIO_LINE_RE.match(line)
+            if not m:
+                continue
+            body = m.group(2).strip().strip("[]").strip()
+            if len(body) < 8:
+                # A bare number or stub line — drop, not a real statement.
+                continue
+            out.append(body)
+        return out
+
     def extract(
         self,
         source,

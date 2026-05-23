@@ -682,6 +682,37 @@ class ExtractionPipeline:
 # ----------------------------------------------------------------------
 
 
+def _diagnostics_to_dict(diag: Any) -> dict[str, Any]:
+    """Convert a discover-mode diagnostics dataclass into a JSON-safe dict.
+
+    Both :class:`PcaDiagnostics` and :class:`SpectralDiagnostics` carry
+    one or more tensor fields; the sidecar is JSON, so tensors are
+    converted to plain Python lists and floats here.  The dispatcher is
+    structural — duck-typed on the dataclass fields — so adding a third
+    method later doesn't require touching this helper as long as the
+    dataclass stays JSON-serializable in this way.
+    """
+    out: dict[str, Any] = {}
+    for name in (
+        "per_component_variance", "cumulative_variance", "eigenvalues",
+    ):
+        if hasattr(diag, name):
+            t = getattr(diag, name)
+            if isinstance(t, torch.Tensor):
+                out[name] = [float(x) for x in t.tolist()]
+            else:
+                out[name] = list(t)
+    for name in (
+        "picked_k", "gap_index", "k_nn", "component_count",
+    ):
+        if hasattr(diag, name):
+            out[name] = int(getattr(diag, name))
+    for name in ("threshold", "gap_magnitude", "bandwidth"):
+        if hasattr(diag, name):
+            out[name] = float(getattr(diag, name))
+    return out
+
+
 class ManifoldExtractionPipeline:
     """Fit an RBF-based steering manifold from an authored corpus.
 
@@ -717,20 +748,32 @@ class ManifoldExtractionPipeline:
     ):
         """Fit (or load from cache) a manifold for the session's model.
 
-        ``folder`` is an authored manifold pack directory.  Returns a
-        :class:`~saklas.core.manifold.Manifold`.  A cache hit — the
-        per-model tensor exists and its sidecar ``nodes_sha256`` still
-        matches the corpus — short-circuits the forward passes.
+        ``folder`` is a manifold pack directory — either authored (the
+        user supplied a domain spec + per-node coordinates) or
+        discover-mode (the user supplied only labeled node corpora; the
+        coords are derived per-model via
+        :func:`saklas.core.manifold.discover_coords`).  Returns a
+        :class:`~saklas.core.manifold.Manifold`.
+
+        A cache hit — the per-model tensor exists and its sidecar
+        ``nodes_sha256`` still matches the folder's current state —
+        short-circuits the forward passes.  For discover-mode folders
+        the staleness key folds in ``fit_mode`` + ``hyperparams``, so
+        a refit with different hyperparameters reliably misses cache.
         """
         from saklas.core.manifold import (
+            CustomDomain,
             Manifold,
             compute_node_centroid,
+            discover_coords,
             domain_from_spec,
             fit_layer_subspace,
             load_manifold,
             save_manifold,
         )
-        from saklas.io.manifolds import ManifoldFolder, ManifoldSidecar
+        from saklas.io.manifolds import (
+            ManifoldFolder, ManifoldSidecar, min_nodes,
+        )
 
         def _progress(msg: str) -> None:
             if on_progress:
@@ -739,11 +782,6 @@ class ManifoldExtractionPipeline:
         mf = ManifoldFolder.load(pathlib.Path(folder))
         node_groups = mf.node_groups()
         nodes_sha = mf.nodes_sha256()
-        domain = domain_from_spec(mf.domain)
-        # Embed the authoring coordinates once; every per-layer fit
-        # interpolates from the same embedded node positions.
-        node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
-        node_params = domain.embed(node_coords)
 
         # Resolve the SAE backend once (lazy import — non-SAE callers
         # never touch the SAE layer).
@@ -770,10 +808,11 @@ class ManifoldExtractionPipeline:
         )
 
         # Cache hit: tensor present + every fit-affecting input unchanged.
-        # ``nodes_sha256`` already folds in the corpus, the domain spec
-        # and the node coordinates; ``sae_revision`` is the SAE the
-        # centroids are reconstructed through and does not ride the
-        # filename, so it is checked here or a stale tensor is served.
+        # ``nodes_sha256`` folds in the corpus, plus either the domain
+        # spec + node coords (authored) or the fit_mode + hyperparams
+        # (discover); ``sae_revision`` is the SAE the centroids are
+        # reconstructed through and does not ride the filename, so it is
+        # checked here or a stale tensor is served.
         sidecar_path = tensor_path.with_suffix(".json")
         cached_revision = (
             sae_backend.revision if sae_backend is not None else None
@@ -801,8 +840,10 @@ class ManifoldExtractionPipeline:
         layers = self._handle.layers
         device = self._handle.device
         n_layers = len(layers)
+        K = len(node_groups)
 
-        # 1. Per-node centroids (one forward pass per statement).
+        # 1. Per-node centroids (one forward pass per statement) — shared
+        #    between authored and discover paths.
         per_node: list[dict[int, torch.Tensor]] = []
         for label, statements in node_groups:
             _progress(
@@ -812,7 +853,7 @@ class ManifoldExtractionPipeline:
                 model, tokenizer, layers, device, statements,
             ))
 
-        # 2. Choose the layer set.
+        # 2. Choose the layer set — shared.
         if sae_backend is not None:
             fit_layers = sorted(
                 set(sae_backend.layers) & set(range(n_layers))
@@ -823,19 +864,91 @@ class ManifoldExtractionPipeline:
                     f"of {self._handle.model_id}"
                 )
             feature_space = f"sae-{sae_backend.release}"
-            method = "manifold_sae"
         else:
             fit_layers = list(range(n_layers))
             feature_space = "raw"
-            method = "manifold_pca"
 
-        # 3. Per-layer fit.  Stack centroids -> (K, D); for the SAE
+        # 3. Resolve domain + node_params — the only step that differs
+        #    between authored and discover paths.
+        discover_metadata: dict[str, Any] = {}
+        if mf.fit_mode == "authored":
+            domain = domain_from_spec(mf.domain)
+            node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
+            node_params = domain.embed(node_coords)
+            method = "manifold_sae" if sae_backend is not None else "manifold_pca"
+        else:
+            # Discover: derive coords from per-node centroids at a
+            # reference layer (middle of the fit-layer set by default,
+            # or ``reference_layer`` override).  The same coords feed
+            # the per-layer RBF as the manifold's intrinsic coordinates
+            # — wrapped in a ``CustomDomain(k)`` with identity embed so
+            # the existing fit machinery handles them unchanged.
+            hyperparams = dict(mf.hyperparams)
+            ref_layer = hyperparams.pop(
+                "reference_layer", fit_layers[len(fit_layers) // 2],
+            )
+            if ref_layer not in fit_layers:
+                raise ValueError(
+                    f"discover manifold {mf.name!r}: reference_layer "
+                    f"{ref_layer} not in fit_layers {fit_layers}"
+                )
+            ref_stack = torch.stack(
+                [per_node[k][ref_layer] for k in range(K)]
+            )  # (K, D) fp32 CPU
+            if sae_backend is not None:
+                with torch.no_grad():
+                    feat = sae_backend.encode_layer(
+                        ref_layer, ref_stack.to(device),
+                    )
+                    recon = sae_backend.decode_layer(ref_layer, feat)
+                ref_stack = recon.detach().to("cpu", torch.float32)
+            _progress(
+                f"Deriving {mf.fit_mode} coords from layer "
+                f"{ref_layer} ({K} centroids)..."
+            )
+            derived_coords, diagnostics = discover_coords(
+                ref_stack, method=mf.fit_mode, **hyperparams,
+            )
+            k = derived_coords.shape[1]
+            floor = min_nodes(k)
+            if K < floor:
+                raise ValueError(
+                    f"discover manifold {mf.name!r}: picked k={k} needs "
+                    f">= {floor} nodes for the RBF fit, got K={K}"
+                )
+            domain = CustomDomain(k)
+            node_coords = derived_coords
+            node_params = derived_coords  # identity embedding
+            method = (
+                "manifold_discover_sae" if sae_backend is not None
+                else f"manifold_discover_{mf.fit_mode}"
+            )
+            # Record what we ran with — fit_mode + hyperparams (with
+            # any derived defaults filled in, e.g. spectral's resolved
+            # ``k_nn``/``bandwidth``) + the diagnostics for the sidecar
+            # and the inspector surfaces.
+            resolved_hyperparams = dict(hyperparams)
+            resolved_hyperparams["reference_layer"] = int(ref_layer)
+            if hasattr(diagnostics, "k_nn"):  # SpectralDiagnostics
+                resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)
+                resolved_hyperparams["bandwidth"] = float(
+                    diagnostics.bandwidth,
+                )
+            discover_metadata = {
+                "fit_mode": mf.fit_mode,
+                "hyperparams": resolved_hyperparams,
+                "diagnostics": _diagnostics_to_dict(diagnostics),
+            }
+
+        # 4. Per-layer fit.  Stack centroids -> (K, D); for the SAE
         #    variant reconstruct through the SAE before fitting.
-        _progress(f"Fitting RBF interpolant across {len(fit_layers)} layers...")
+        _progress(
+            f"Fitting RBF interpolant across {len(fit_layers)} layers..."
+        )
         layer_subs = {}
         for idx in fit_layers:
             stacked = torch.stack(
-                [per_node[k][idx] for k in range(len(node_groups))]
+                [per_node[k][idx] for k in range(K)]
             )  # (K, D) fp32 CPU
             if sae_backend is not None:
                 with torch.no_grad():
@@ -853,7 +966,7 @@ class ManifoldExtractionPipeline:
             feature_space=feature_space,
         )
 
-        # 4. Persist + refresh the folder integrity manifest.
+        # 5. Persist + refresh the folder integrity manifest.
         metadata: dict[str, Any] = {
             "method": method,
             "nodes_sha256": nodes_sha,
@@ -861,6 +974,7 @@ class ManifoldExtractionPipeline:
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release
             metadata["sae_revision"] = sae_backend.revision
+        metadata.update(discover_metadata)
         save_manifold(manifold, tensor_path, metadata)
         manifold.metadata.update(metadata)
         mf.write_metadata()

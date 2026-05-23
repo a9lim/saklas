@@ -10,15 +10,18 @@ import type {
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
+  CreateDiscoverManifoldRequest,
+  CreateManifoldRequest,
   DeletePackResponse,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
   ExtractResponse,
   FilterMatchesJSON,
+  FitManifoldRequest,
+  GenerateManifoldRequest,
   InstallPackRequest,
   InstallPackResponse,
-  CreateManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
   LoadVectorRequest,
@@ -54,7 +57,10 @@ export type {
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
+  CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
+  FitManifoldRequest,
+  GenerateManifoldRequest,
   DeletePackResponse,
   ExperimentFanRequest,
   ExperimentFanResponse,
@@ -429,12 +435,20 @@ export const apiManifolds = {
       `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
     );
   },
-  /** Create a manifold folder.  Response is the detail shape plus an
-   *  ``advisories`` list of soft poisedness warnings. */
+  /** Create an authored manifold folder.  Response is the detail shape
+   *  plus an ``advisories`` list of soft poisedness warnings. */
   create(
     req: CreateManifoldRequest,
   ): Promise<ManifoldInfo & { advisories: string[] }> {
     return request(MANIFOLDS_BASE, jsonBody(req));
+  },
+  /** Create a discover-mode manifold folder — labeled corpora only, no
+   *  coords (coords are derived per-model at fit time).  Pair with
+   *  ``apiManifoldFitStream`` to run the discover + fit. */
+  createDiscover(
+    req: CreateDiscoverManifoldRequest,
+  ): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/discover`, jsonBody(req));
   },
   update(
     namespace: string,
@@ -465,7 +479,7 @@ export const apiManifolds = {
 export async function apiManifoldFitStream(
   namespace: string,
   name: string,
-  body: { sae?: string | null; sae_revision?: string | null },
+  body: FitManifoldRequest,
   onEvent: (ev: { event: string; data: unknown }) => void,
 ): Promise<ManifoldInfo> {
   const path = `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/fit`;
@@ -495,6 +509,48 @@ export async function apiManifoldFitStream(
   }
   if (lastError) throw new Error(lastError);
   if (!final) throw new Error("manifold fit: stream ended without done event");
+  return final;
+}
+
+/** Streaming manifold generate — LLM-author a discover-mode folder from
+ *  a flat concept list.  Mirrors ``apiManifoldFitStream`` shape: SSE
+ *  progress events as the K-tuple generator runs, then a ``done`` event
+ *  carrying the freshly-written manifold detail.  Pair with a follow-up
+ *  ``apiManifoldFitStream`` call to derive coords + fit. */
+export async function apiManifoldGenerateStream(
+  body: GenerateManifoldRequest,
+  onEvent: (ev: { event: string; data: unknown }) => void,
+): Promise<ManifoldInfo> {
+  const path = `${MANIFOLDS_BASE}/generate`;
+  const r = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const { text, json } = await parseBody(r);
+    throw new ApiError(r.status, path, text, json);
+  }
+  if (!r.body) throw new Error("manifold generate: server returned no SSE body");
+  let final: ManifoldInfo | null = null;
+  let lastError: string | null = null;
+  for await (const evt of consumeSse(r.body)) {
+    onEvent(evt);
+    if (evt.event === "done" && evt.data && typeof evt.data === "object") {
+      final = evt.data as ManifoldInfo;
+    } else if (evt.event === "error") {
+      lastError =
+        (evt.data as { message?: string } | null)?.message ??
+        "generate failed";
+    }
+  }
+  if (lastError) throw new Error(lastError);
+  if (!final) {
+    throw new Error("manifold generate: stream ended without done event");
+  }
   return final;
 }
 

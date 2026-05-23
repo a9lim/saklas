@@ -43,7 +43,9 @@ saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S]
 saklas vector compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]
 saklas vector why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
 saklas vector transfer <concept> --from SRC --to TGT [-f]   # cross-model Procrustes transfer
-saklas vector manifold fit <folder> [-m MODEL] [--sae REL]  # fit an RBF steering manifold
+saklas vector manifold fit <folder> [-m MODEL] [--sae REL]  # fit an authored RBF manifold
+saklas vector manifold discover <name> [-m MODEL] [--method pca|spectral] [--max-dim N] ...
+saklas vector manifold generate <name> --concepts C... [--n-scenarios N] [--statements-per-concept K]
 saklas vector manifold ls|show [name]                       # list / inspect manifolds
 saklas experiment fan <model> "<prompt>" -g concept=0,0.5,1 # alpha grid as loom siblings
 saklas experiment transcript run <path.yaml> [model]        # replay a saved transcript
@@ -109,6 +111,16 @@ A manifold has arbitrary intrinsic dimension and topology. Its geometry is a `Ma
 
 A manifold is its own artifact type — labeled nodes placed at authoring coordinates on a domain, each node a small statement corpus, under `~/.saklas/manifolds/<ns>/<name>/` (not a `ConceptFolder`). The artifact is authored as `manifold.json` (domain spec + per-node `{label, coords}`) + `nodes/*.json` — by hand, or through the webui manifold builder (which posts to the `/saklas/v1/manifolds` routes; `io.manifolds.create_manifold_folder` does the write). `saklas vector manifold fit`, the webui fit action, and the `POST .../fit` route all run `ManifoldExtractionPipeline` (`core/extraction.py`): pool each node's mean activation (`compute_node_centroid`), embed the authoring coords through the domain, fit a per-layer PCA subspace + RBF (`fit_layer_subspace`), write the per-model tensor. `--sae <release>` reconstructs each centroid through the SAE before the fit (denoised centroids); the fitted subspace is always model-space so the hook never touches the SAE. Minimum node count is `min_nodes(n) = 2n+1`; the nodes must also be *poised* (affinely span the embedding) or `fit_rbf_interpolant` raises.
 
+### Discover mode (auto-fit from a heap of corpora)
+
+A second authoring path drops the requirement that the user know a coordinate system in advance. `manifold.json::fit_mode` is the discriminator: `"authored"` (default) is the historical shape; `"pca"` / `"spectral"` are *discover* — the user supplies labeled corpora only, and coordinates are derived per-model at fit time from the pooled centroids. PCA picks the smallest prefix whose cumulative variance crosses `var_threshold` (default 0.70), capped at `max_dim` (default 8); spectral runs Laplacian eigenmaps on a symmetric k-NN graph (default `k_nn = max(5, ⌈log K⌉)`, heat-kernel bandwidth defaults to the median k-NN edge) and picks `k` by the eigenvalue-ratio cliff. Both feed `CustomDomain(k)` with identity embedding, then the same `fit_layer_subspace` + RBF the authored path uses — `subspace_replace` is identical.
+
+Per-model coordinates are the architectural shift: a Gemma fit and a Qwen fit produce different node layouts for the same heap. Discover-mode `manifold.json` carries `fit_mode` + `hyperparams` + label-only `nodes`; per-model `<safe>.safetensors` carries `node_coords` (the derived layout); per-tensor `.json` sidecar carries `fit_mode` + `hyperparams` + `diagnostics` (PCA variance bars or spectral spectrum). Spec promised a `fit_inputs_sha256` rename but the impl keeps `nodes_sha256` for back-compat — semantics extends to fold in `{corpus, fit_mode, hyperparams}` for discover folders.
+
+`saklas vector manifold generate <name> --concepts ...` LLM-authors a discover folder by asking the loaded model for shared scenarios (one call) and per-(scenario, concept) statements (N×K cells) via `SaklasSession.generate_concept_statements`. Scenario-sharing across the row is load-bearing — without it, per-concept centroids would mix concept signal with scenario signal. Anti-allegory clause carries verbatim from the bipolar pair generator. `saklas vector manifold discover <name>` then fits; the two steps are deliberate (a flaky generation run leaves inspectable corpora). Discover-mode authoring also lives in the webui (`ManifoldBuilderDrawer.svelte`'s authored/discover tabs). `vector manifold show` surfaces the discover layout + per-method diagnostics summary; the webui inspector renders the variance bars / eigenvalue spectrum with the picked-k cut highlighted.
+
+Cross-model Procrustes alignment for discover-mode coords (so an authoring point on a source model maps to a comparable point on a target) is deferred — see the TODO in `saklas/io/manifolds.py::create_discover_manifold_folder` pointing at `saklas/io/alignment.py` + `vector transfer` for the reuse path.
+
 All manifold math lives in `core/manifold.py` — pure-tensor, fp32, dependency-free (the RBF fit solves a small dense symmetric-indefinite saddle system with `torch.linalg.solve` — never Cholesky; scipy is not pulled in). `eval_rbf` and `subspace_replace` are the only hot-path-reachable functions. `Manifold.tangent(layer, position)` returns the per-axis steering directions (the analytic RBF Jacobian) — e.g. the local valence/arousal directions of an affect manifold.
 
 Injection (`core/hooks.py`): a `ManifoldTerm` forces the slow hook path; `subspace_replace` decomposes `h = h_par + h_perp` (in-subspace + orthogonal residual), blends `h_par` toward the precomputed manifold target by the coefficient, keeps the residual, restores the original norm. It runs *last* in `hook_fn`, after ablation and additive — the in-subspace overwrite is destructive, so it dominates at the layers it covers. The session loads the `Manifold` artifact lazily on scope entry (`_ensure_manifold_loaded`) and dispatches `ManifoldTerm` to `SteeringManager.add_manifold`, which validates the position arity against the domain.
@@ -163,9 +175,15 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
     neutral_activations.{safetensors,json}   # 90 neutral prompts × layers, fp16
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
   manifolds/<ns>/<name>/               # steering manifolds (own root, peer of vectors/)
-    manifold.json                      # name, domain spec, nodes [{label,coords}], files{sha256}
+    manifold.json                      # authored: name, domain spec, nodes [{label,coords}]
+                                       # discover: name, fit_mode, hyperparams, nodes [{label}]
+                                       # (always carries files{sha256})
     nodes/NN_<label>.json              # one JSON statement list per node (user-editable)
-    <safe_model_id>.safetensors        # fitted per-layer PCA + RBF (+ .json sidecar)
+    scenarios.json                     # discover-only: provenance of `generate` call
+    <safe_model_id>.safetensors        # fitted per-layer PCA + RBF; discover variant also
+                                       # carries `node_coords` (the derived per-model layout)
+                                       # (+ .json sidecar — adds fit_mode/hyperparams/diagnostics
+                                       # for discover fits)
   conversations/<name>.json            # explicit loom-tree saves (no autosave)
 ```
 

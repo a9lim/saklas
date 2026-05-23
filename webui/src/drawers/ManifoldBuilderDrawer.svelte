@@ -11,21 +11,48 @@
   // ``min_nodes = 2n+1`` and that every coordinate sits in the domain.
   // Save → apiManifolds.create, then back to the ManifoldDrawer.
 
-  import { apiManifolds, ApiError } from "../lib/api";
+  import {
+    apiManifolds,
+    apiManifoldFitStream,
+    apiManifoldGenerateStream,
+    ApiError,
+  } from "../lib/api";
   import {
     closeDrawer,
     openDrawer,
     refreshManifoldList,
   } from "../lib/stores.svelte";
-  import { pushToast } from "../lib/stores/toasts.svelte";
+  import {
+    dismissToast,
+    pushToast,
+    updateToast,
+  } from "../lib/stores/toasts.svelte";
   import type {
     AxisSpec,
     CreateManifoldRequest,
+    GenerateManifoldRequest,
     ManifoldDomain,
   } from "../lib/types";
 
   let { params: _params }: { params?: unknown } = $props();
   $effect(() => { void _params; });
+
+  // ---------- mode picker ----------
+  //
+  // Two authoring paths share this drawer:
+  //
+  //   * Authored  — user picks a domain (box / sphere) and places nodes
+  //                 at user-supplied coordinates.  The historical path.
+  //   * Discover  — user hands the model a flat concept list; the K-tuple
+  //                 generator produces per-concept corpora, then the
+  //                 fitter derives coords per-model via PCA or spectral
+  //                 embedding.  No coords to author; no domain to pick.
+  //
+  // Both build into the same on-disk manifold artifact; the mode shows
+  // up as ``manifold.json::fit_mode``.  Inspector + steering paths are
+  // unchanged from there on.
+  type AuthoringMode = "authored" | "discover";
+  let authoringMode: AuthoringMode = $state("authored");
 
   // ---------- domain ----------
 
@@ -264,6 +291,196 @@
     sphereDim = d;
     reshapeNodeCoords();
   }
+
+  // ============================================================ discover ===
+
+  type DiscoverFitMode = "pca" | "spectral";
+  let discoverFitMode: DiscoverFitMode = $state("pca");
+  let discoverConceptsText = $state("");
+  let discoverNScenarios = $state(9);
+  let discoverStatementsPerConcept = $state(5);
+  let discoverMaxDim = $state(8);
+  let discoverVarThreshold = $state(0.70);
+  let discoverKNN: number | null = $state(null);
+  let discoverBandwidth: number | null = $state(null);
+  let discoverForce = $state(false);
+  let discoverProgress: string | null = $state(null);
+  let alsoFit = $state(true);
+
+  function parseConcepts(text: string): string[] {
+    return text
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  const discoverConcepts = $derived(parseConcepts(discoverConceptsText));
+
+  const discoverValidation = $derived.by<{
+    ok: boolean;
+    messages: string[];
+  }>(() => {
+    const messages: string[] = [];
+    if (!slug(manifoldName)) {
+      messages.push("a manifold name is required");
+    }
+    if (discoverConcepts.length < 2) {
+      messages.push(
+        `need >= 2 concepts (have ${discoverConcepts.length}) — ` +
+        "shared-scenario structure is meaningless with one",
+      );
+    }
+    const seen = new Set<string>();
+    for (const c of discoverConcepts) {
+      const s = slug(c);
+      if (!s) {
+        messages.push(`bad concept slug: "${c}"`);
+      } else if (seen.has(s)) {
+        messages.push(`duplicate concept: "${s}"`);
+      } else {
+        seen.add(s);
+      }
+    }
+    if (discoverNScenarios <= 0) messages.push("n_scenarios must be > 0");
+    if (discoverStatementsPerConcept <= 0) {
+      messages.push("statements_per_concept must be > 0");
+    }
+    if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
+    if (
+      discoverFitMode === "pca" &&
+      (discoverVarThreshold <= 0 || discoverVarThreshold > 1)
+    ) {
+      messages.push("var_threshold must be in (0, 1]");
+    }
+    return { ok: messages.length === 0, messages };
+  });
+
+  function buildDiscoverHyperparams(): Record<string, number> {
+    if (discoverFitMode === "pca") {
+      return {
+        max_dim: discoverMaxDim,
+        var_threshold: discoverVarThreshold,
+      };
+    }
+    // spectral: only include the optional knobs when the user set
+    // them.  Server fills in data-driven defaults otherwise (median
+    // k-NN distance, ``max(5, ceil(log K))``).
+    const hp: Record<string, number> = { max_dim: discoverMaxDim };
+    if (discoverKNN !== null && discoverKNN > 0) hp.k_nn = discoverKNN;
+    if (discoverBandwidth !== null && discoverBandwidth > 0) {
+      hp.bandwidth = discoverBandwidth;
+    }
+    return hp;
+  }
+
+  async function discoverSave(): Promise<void> {
+    if (!discoverValidation.ok || submitting) return;
+    submitting = true;
+    discoverProgress = null;
+    const namespaceSlug = slug(namespace) || "local";
+    const nameSlug = slug(manifoldName);
+    const req: GenerateManifoldRequest = {
+      namespace: namespaceSlug,
+      name: nameSlug,
+      description: description.trim(),
+      concepts: discoverConcepts.map((c) => slug(c)),
+      n_scenarios: discoverNScenarios,
+      statements_per_concept: discoverStatementsPerConcept,
+      fit_mode: discoverFitMode,
+      hyperparams: buildDiscoverHyperparams(),
+      force: discoverForce,
+    };
+    const toastId = pushToast(
+      `generating ${namespaceSlug}/${nameSlug} corpora…`,
+      { kind: "info", ttlMs: null },
+    );
+    try {
+      await apiManifoldGenerateStream(req, (ev) => {
+        if (ev.event === "progress") {
+          const msg =
+            ev.data && typeof ev.data === "object"
+              ? (ev.data as { message?: string }).message
+              : null;
+          if (msg) {
+            discoverProgress = msg;
+            updateToast(toastId, { detail: msg });
+          }
+        }
+      });
+      dismissToast(toastId);
+      if (alsoFit) {
+        // Chain the fit immediately — the user opted into the
+        // two-step.  The fit endpoint accepts the discover-mode
+        // hyperparams as an override; passing them here keeps the
+        // sidecar metadata in sync even if the folder already had
+        // matching values from generate.
+        const fitToastId = pushToast(
+          `fitting ${namespaceSlug}/${nameSlug}…`,
+          { kind: "info", ttlMs: null },
+        );
+        try {
+          await apiManifoldFitStream(
+            namespaceSlug,
+            nameSlug,
+            {
+              fit_mode: discoverFitMode,
+              hyperparams: buildDiscoverHyperparams(),
+            },
+            (ev) => {
+              if (ev.event === "progress") {
+                const msg =
+                  ev.data && typeof ev.data === "object"
+                    ? (ev.data as { message?: string }).message
+                    : null;
+                if (msg) {
+                  discoverProgress = msg;
+                  updateToast(fitToastId, { detail: msg });
+                }
+              }
+            },
+          );
+          dismissToast(fitToastId);
+          pushToast(
+            `fit ${namespaceSlug}/${nameSlug} (${discoverFitMode})`,
+            { kind: "info" },
+          );
+        } catch (e) {
+          dismissToast(fitToastId);
+          pushToast(`fit failed — ${describeFitError(e)}`, {
+            kind: "error",
+            ttlMs: null,
+          });
+        }
+      } else {
+        pushToast(
+          `generated ${namespaceSlug}/${nameSlug} — open manifolds drawer to fit`,
+          { kind: "info" },
+        );
+      }
+      await refreshManifoldList();
+      closeDrawer();
+      openDrawer("manifolds");
+    } catch (e) {
+      dismissToast(toastId);
+      const msg = describeFitError(e);
+      pushToast(`generate failed — ${msg}`, {
+        kind: "error",
+        ttlMs: null,
+      });
+    } finally {
+      submitting = false;
+      discoverProgress = null;
+    }
+  }
+
+  function describeFitError(e: unknown): string {
+    if (e instanceof ApiError) {
+      return e.body && typeof e.body === "object" && "detail" in (e.body as object)
+        ? String((e.body as { detail: unknown }).detail)
+        : e.message;
+    }
+    return e instanceof Error ? e.message : String(e);
+  }
 </script>
 
 <section class="drawer-shell" aria-label="Build manifold">
@@ -274,11 +491,41 @@
   </header>
 
   <div class="body">
-    <p class="hint">
-      author a steering manifold: pick a domain, place labelled nodes
-      with a statement corpus each, then fit it from the manifolds
-      drawer.
-    </p>
+    <!-- mode picker — authored vs discover -->
+    <div class="mode-tabs" role="tablist" aria-label="Authoring mode">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={authoringMode === "authored"}
+        class="mode-tab"
+        class:active={authoringMode === "authored"}
+        onclick={() => (authoringMode = "authored")}
+      >authored</button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={authoringMode === "discover"}
+        class="mode-tab"
+        class:active={authoringMode === "discover"}
+        onclick={() => (authoringMode = "discover")}
+      >discover</button>
+    </div>
+
+    {#if authoringMode === "authored"}
+      <p class="hint">
+        author a steering manifold: pick a domain, place labelled nodes
+        with a statement corpus each, then fit it from the manifolds
+        drawer.
+      </p>
+    {:else}
+      <p class="hint">
+        hand the model a flat list of concepts; the K-tuple generator
+        produces shared scenarios + per-concept statements, and the
+        fitter derives node coordinates per-model via pca or spectral
+        embedding. recommended at 20–48 concepts; spectral comes into
+        its own only past ~50 nodes.
+      </p>
+    {/if}
 
     <!-- identity -->
     <div class="grid2">
@@ -316,6 +563,7 @@
       />
     </label>
 
+    {#if authoringMode === "authored"}
     <!-- domain step -->
     <section class="step">
       <h2 class="step-title">1 · domain</h2>
@@ -513,6 +761,181 @@
     >
       {submitting ? "building…" : "build manifold → return to list"}
     </button>
+    {:else}
+      <!-- discover-mode authoring -->
+      <section class="step">
+        <h2 class="step-title">1 · concepts</h2>
+        <label class="field">
+          <span class="label">
+            concept list <span class="req">required (≥2)</span>
+          </span>
+          <textarea
+            class="input"
+            rows="4"
+            placeholder={"pirate caveman assistant scholar robot\n(whitespace or comma-separated)"}
+            bind:value={discoverConceptsText}
+            spellcheck="false"
+          ></textarea>
+          <span class="dim-note">
+            parsed: <strong>{discoverConcepts.length}</strong> concept(s)
+          </span>
+        </label>
+        <div class="grid2">
+          <label class="field">
+            <span class="label">n_scenarios</span>
+            <input
+              type="number"
+              class="input mini"
+              min="1"
+              step="1"
+              bind:value={discoverNScenarios}
+            />
+          </label>
+          <label class="field">
+            <span class="label">statements per concept × scenario</span>
+            <input
+              type="number"
+              class="input mini"
+              min="1"
+              step="1"
+              bind:value={discoverStatementsPerConcept}
+            />
+          </label>
+        </div>
+        <p class="dim-note">
+          total per-concept statements:
+          <strong>
+            {discoverNScenarios * discoverStatementsPerConcept}
+          </strong>
+          (across {discoverNScenarios} shared scenarios)
+        </p>
+      </section>
+
+      <section class="step">
+        <h2 class="step-title">2 · discovery method</h2>
+        <div class="domain-kind">
+          <button
+            type="button"
+            class="kind-btn"
+            class:active={discoverFitMode === "pca"}
+            onclick={() => (discoverFitMode = "pca")}
+          >pca</button>
+          <button
+            type="button"
+            class="kind-btn"
+            class:active={discoverFitMode === "spectral"}
+            onclick={() => (discoverFitMode = "spectral")}
+          >spectral</button>
+        </div>
+        <p class="dim-note">
+          {#if discoverFitMode === "pca"}
+            safe linear default — picks the smallest prefix whose
+            cumulative variance crosses the threshold, capped at
+            max_dim. recommended at bundled-heap sizes.
+          {:else}
+            laplacian eigenmaps — recovers curved-manifold topology
+            that pca flattens. noisy below ~50 nodes.
+          {/if}
+        </p>
+        <div class="grid2">
+          <label class="field">
+            <span class="label">max_dim</span>
+            <input
+              type="number"
+              class="input mini"
+              min="1"
+              step="1"
+              bind:value={discoverMaxDim}
+            />
+          </label>
+          {#if discoverFitMode === "pca"}
+            <label class="field">
+              <span class="label">var_threshold</span>
+              <input
+                type="number"
+                class="input mini"
+                min="0"
+                max="1"
+                step="0.05"
+                bind:value={discoverVarThreshold}
+              />
+            </label>
+          {:else}
+            <label class="field">
+              <span class="label">k_nn (blank → auto)</span>
+              <input
+                type="number"
+                class="input mini"
+                min="1"
+                step="1"
+                placeholder="max(5, ⌈log K⌉)"
+                value={discoverKNN ?? ""}
+                oninput={(ev) => {
+                  const v = (ev.currentTarget as HTMLInputElement).value;
+                  discoverKNN = v === "" ? null : Number(v);
+                }}
+              />
+            </label>
+          {/if}
+        </div>
+        {#if discoverFitMode === "spectral"}
+          <label class="field">
+            <span class="label">bandwidth σ (blank → median k-NN distance)</span>
+            <input
+              type="number"
+              class="input mini"
+              min="0"
+              step="0.01"
+              placeholder="median(k-NN edges)"
+              value={discoverBandwidth ?? ""}
+              oninput={(ev) => {
+                const v = (ev.currentTarget as HTMLInputElement).value;
+                discoverBandwidth = v === "" ? null : Number(v);
+              }}
+            />
+          </label>
+        {/if}
+      </section>
+
+      <section class="step">
+        <label class="axis-check">
+          <input type="checkbox" bind:checked={alsoFit} />
+          <span>fit immediately after generating corpora</span>
+        </label>
+        <label class="axis-check">
+          <input type="checkbox" bind:checked={discoverForce} />
+          <span>overwrite an existing manifold with this name</span>
+        </label>
+      </section>
+
+      {#if discoverProgress}
+        <p class="progress">{discoverProgress}</p>
+      {/if}
+
+      {#if !discoverValidation.ok}
+        <div class="validation" role="alert">
+          <p class="validation-head">not ready to discover:</p>
+          <ul>
+            {#each discoverValidation.messages as m (m)}
+              <li>{m}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+
+      <button
+        type="button"
+        class="save-btn"
+        disabled={!discoverValidation.ok || submitting}
+        onclick={discoverSave}
+      >
+        {submitting
+          ? "generating…"
+          : alsoFit
+            ? "generate corpora + fit"
+            : "generate corpora"}
+      </button>
+    {/if}
   </div>
 </section>
 
@@ -818,5 +1241,49 @@
     color: var(--fg-muted);
     border-color: var(--border);
     cursor: not-allowed;
+  }
+
+  .mode-tabs {
+    display: flex;
+    gap: var(--space-1);
+    background: var(--bg-deep);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 2px;
+    align-self: flex-start;
+  }
+  .mode-tab {
+    background: transparent;
+    color: var(--fg-muted);
+    border: 0;
+    padding: var(--space-2) var(--space-4);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    border-radius: calc(var(--radius) - 2px);
+    transition:
+      background var(--dur) var(--ease-out),
+      color var(--dur) var(--ease-out);
+  }
+  .mode-tab:hover {
+    color: var(--fg-strong);
+  }
+  .mode-tab.active {
+    background: var(--accent-subtle);
+    color: var(--accent);
+  }
+  textarea.input {
+    resize: vertical;
+    line-height: 1.4;
+    min-height: 4em;
+  }
+  .progress {
+    margin: 0;
+    color: var(--accent);
+    font-size: var(--text-xs);
+    font-style: italic;
   }
 </style>

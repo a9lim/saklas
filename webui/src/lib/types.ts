@@ -99,13 +99,51 @@ export interface ManifoldNodeSpec {
   statements: string[];
 }
 
-/** Per-model fit record returned in the manifold detail shape. */
+/** PCA discover-fit diagnostics block surfaced in the inspector.
+ *  Wire-shape mirror of ``saklas.core.manifold.PcaDiagnostics``.  Tensor
+ *  fields are flattened to plain number[]'s server-side; everything
+ *  else is a primitive. */
+export interface ManifoldPcaDiagnostics {
+  per_component_variance: number[];
+  cumulative_variance: number[];
+  picked_k: number;
+  threshold: number;
+}
+
+/** Spectral (Laplacian-eigenmaps) discover-fit diagnostics block.
+ *  Wire-shape mirror of ``saklas.core.manifold.SpectralDiagnostics``. */
+export interface ManifoldSpectralDiagnostics {
+  eigenvalues: number[];
+  picked_k: number;
+  gap_index: number;
+  gap_magnitude: number;
+  bandwidth: number;
+  k_nn: number;
+  component_count: number;
+}
+
+/** Per-model fit record returned in the manifold detail shape.
+ *
+ *  ``fit_mode`` ``"authored"`` means the user supplied per-node coords;
+ *  ``"pca"`` / ``"spectral"`` mean the coords were derived per-model at
+ *  fit time and live in the safetensors payload, with ``diagnostics``
+ *  giving the variance bars or spectrum the inspector renders. */
 export interface ManifoldFitInfo {
   stem: string;
   method: string;
   feature_space: string;
   node_count: number;
-  nodes_sha256: string;
+  nodes_sha256?: string;
+  /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
+   *  ``spectral`` for coords derived from per-node activations.  Older
+   *  servers may omit this; treat ``undefined`` as ``"authored"``. */
+  fit_mode?: "authored" | "pca" | "spectral";
+  /** Discover-mode only.  ``max_dim``/``var_threshold`` for PCA;
+   *  ``max_dim``/``k_nn``/``bandwidth``/``reference_layer`` for spectral. */
+  hyperparams?: Record<string, number | string>;
+  /** Discover-mode only.  Method-tagged via ``picked_k`` + presence of
+   *  ``per_component_variance`` (PCA) vs ``eigenvalues`` (spectral). */
+  diagnostics?: ManifoldPcaDiagnostics | ManifoldSpectralDiagnostics;
 }
 
 /** Manifold list/detail row.  The list route omits ``nodes``'
@@ -127,8 +165,18 @@ export interface ManifoldInfo {
   /** True iff a fitted tensor's ``nodes_sha256`` no longer matches the
    *  current node geometry — the fit is stale and should be re-run. */
   stale: boolean;
-  /** Detail-only: full node specs with statement corpora. */
-  nodes?: ManifoldNodeSpec[];
+  /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
+   *  ``spectral`` for coords derived per-model from activations.  Older
+   *  servers may omit this; treat ``undefined`` as ``"authored"``. */
+  fit_mode?: "authored" | "pca" | "spectral";
+  /** Discover-mode only: the knobs the fit (will) use.  Empty / absent
+   *  on authored folders.  PCA accepts ``max_dim`` / ``var_threshold``;
+   *  spectral accepts ``max_dim`` / ``k_nn`` / ``bandwidth``. */
+  hyperparams?: Record<string, number | string>;
+  /** Detail-only: full node specs with statement corpora.  In discover
+   *  mode each node's ``coords`` is either the derived per-model layout
+   *  (when a fit exists) or ``null`` (pending fit). */
+  nodes?: (ManifoldNodeSpec | { label: string; coords: number[] | null; statements: string[] })[];
   /** Detail-only: per-tensor fit records. */
   fitted?: ManifoldFitInfo[];
 }
@@ -150,6 +198,59 @@ export interface CreateManifoldRequest {
 export interface UpdateManifoldRequest {
   description?: string;
   nodes?: ManifoldNodeSpec[];
+}
+
+/** One node of a discover-mode manifold — label + statements only.
+ *  Coords are derived per-model at fit time, so the authoring shape
+ *  carries no ``coords`` field. */
+export interface DiscoverManifoldNodeSpec {
+  label: string;
+  statements: string[];
+}
+
+/** Body for POST /saklas/v1/manifolds/discover.
+ *
+ *  The user supplies labeled statement corpora; the matching ``fit``
+ *  call derives node coordinates per-model via PCA or spectral
+ *  embedding. */
+export interface CreateDiscoverManifoldRequest {
+  namespace?: string;
+  name: string;
+  description?: string;
+  fit_mode: "pca" | "spectral";
+  nodes: DiscoverManifoldNodeSpec[];
+  hyperparams?: Record<string, number | string>;
+}
+
+/** Body for POST /saklas/v1/manifolds/generate.
+ *
+ *  LLM-author a discover-mode manifold from a flat concept list: the
+ *  server runs ``SaklasSession.generate_concept_statements`` (shared
+ *  scenarios + per-concept statements) and writes a fresh discover
+ *  folder ready for ``POST .../fit``. */
+export interface GenerateManifoldRequest {
+  namespace?: string;
+  name: string;
+  description?: string;
+  concepts: string[];
+  n_scenarios?: number;
+  statements_per_concept?: number;
+  fit_mode?: "pca" | "spectral";
+  hyperparams?: Record<string, number | string>;
+  force?: boolean;
+}
+
+/** Body for POST /saklas/v1/manifolds/{ns}/{name}/fit.
+ *
+ *  Authored folders only consume ``sae`` / ``sae_revision``; discover
+ *  folders additionally accept ``fit_mode`` / ``hyperparams`` overrides
+ *  that get persisted into the folder before the fit runs so the cache
+ *  key reflects the actual inputs. */
+export interface FitManifoldRequest {
+  sae?: string | null;
+  sae_revision?: string | null;
+  fit_mode?: "pca" | "spectral" | null;
+  hyperparams?: Record<string, number | string> | null;
 }
 
 // ----------------------------------------------------- vectors --

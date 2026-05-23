@@ -14,7 +14,7 @@
   // delete uses a 2-step confirm.
 
   import { onMount } from "svelte";
-  import { SvelteSet } from "svelte/reactivity";
+  import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { ApiError, apiManifolds, apiManifoldFitStream } from "../lib/api";
   import {
     addManifoldToRack,
@@ -29,6 +29,7 @@
     updateToast,
   } from "../lib/stores/toasts.svelte";
   import type { ManifoldInfo } from "../lib/types";
+  import DiagnosticsPanel from "../lib/manifolds/DiagnosticsPanel.svelte";
 
   let { params: _params }: { params?: unknown } = $props();
   $effect(() => { void _params; });
@@ -38,6 +39,17 @@
   const busyKeys = new SvelteSet<string>();
   const confirmKeys = new SvelteSet<string>();
   const confirmTimers = new Map<string, number>();
+
+  // Per-row inspector state.  The list endpoint omits per-tensor
+  // diagnostics (the JSON would balloon on big heaps), so the
+  // inspector lazily GETs the detail shape the first time the user
+  // expands a row.  ``inspectKeys`` drives the open/closed flag;
+  // ``detailCache`` keeps the fetched payload alive for subsequent
+  // re-opens within the same drawer mount.
+  const inspectKeys = new SvelteSet<string>();
+  const detailCache = new SvelteMap<string, ManifoldInfo>();
+  const detailLoading = new SvelteSet<string>();
+  const detailErrors = new SvelteMap<string, string>();
 
   onMount(() => {
     void refreshManifoldList();
@@ -152,6 +164,35 @@
   function gotoBuilder(): void {
     openDrawer("manifold_builder");
   }
+
+  function fitModeBadge(m: ManifoldInfo): string | null {
+    if (m.fit_mode && m.fit_mode !== "authored") return m.fit_mode;
+    return null;
+  }
+
+  function isDiscoverMode(m: ManifoldInfo): boolean {
+    return m.fit_mode === "pca" || m.fit_mode === "spectral";
+  }
+
+  async function toggleInspect(m: ManifoldInfo): Promise<void> {
+    const key = rowKey(m);
+    if (inspectKeys.has(key)) {
+      inspectKeys.delete(key);
+      return;
+    }
+    inspectKeys.add(key);
+    if (detailCache.has(key)) return;
+    detailLoading.add(key);
+    detailErrors.delete(key);
+    try {
+      const detail = await apiManifolds.get(m.namespace, m.name);
+      detailCache.set(key, detail);
+    } catch (e) {
+      detailErrors.set(key, describeError(e));
+    } finally {
+      detailLoading.delete(key);
+    }
+  }
 </script>
 
 <section class="drawer-shell" aria-label="Manifolds">
@@ -191,40 +232,71 @@
             {@const key = rowKey(m)}
             {@const busy = busyKeys.has(key)}
             {@const confirming = confirmKeys.has(key)}
+            {@const inspecting = inspectKeys.has(key)}
+            {@const badge = fitModeBadge(m)}
             <li class="row" title={m.description || key}>
-              <div class="meta">
-                <span class="row-name">{key}</span>
-                <span class="row-sub">
-                  {m.domain_label} · {m.node_count} nodes
-                  {#if m.stale}<span class="stale">stale</span>{/if}
-                </span>
+              <div class="row-line">
+                <div class="meta">
+                  <span class="row-name">{key}</span>
+                  <span class="row-sub">
+                    {m.domain_label} · {m.node_count} nodes
+                    {#if badge}<span class="fit-badge fit-{badge}">{badge}</span>{/if}
+                    {#if m.stale}<span class="stale">stale</span>{/if}
+                  </span>
+                </div>
+                <div class="actions">
+                  <button
+                    type="button"
+                    class="act inspect"
+                    aria-expanded={inspecting}
+                    onclick={() => void toggleInspect(m)}
+                    title={inspecting ? "hide diagnostics" : "inspect fit"}
+                  >{inspecting ? "▾" : "ⓘ"}</button>
+                  <button
+                    type="button"
+                    class="act steer"
+                    disabled={busy || isRacked(m)}
+                    onclick={() => onSteer(m)}
+                    title={isRacked(m)
+                      ? `${key} is already racked`
+                      : `rack ${key} for steering`}
+                  >+steer</button>
+                  <button
+                    type="button"
+                    class="act fit"
+                    disabled={busy}
+                    onclick={() => onFit(m)}
+                    title={`re-fit ${key} for the current model`}
+                  >{busy ? "…" : "re-fit"}</button>
+                  <button
+                    type="button"
+                    class="act del"
+                    class:confirm={confirming}
+                    disabled={busy}
+                    onclick={() => onDeleteClick(m)}
+                    title={confirming ? "click again to confirm" : `delete ${key}`}
+                  >{confirming ? "confirm?" : "delete"}</button>
+                </div>
               </div>
-              <div class="actions">
-                <button
-                  type="button"
-                  class="act steer"
-                  disabled={busy || isRacked(m)}
-                  onclick={() => onSteer(m)}
-                  title={isRacked(m)
-                    ? `${key} is already racked`
-                    : `rack ${key} for steering`}
-                >+steer</button>
-                <button
-                  type="button"
-                  class="act fit"
-                  disabled={busy}
-                  onclick={() => onFit(m)}
-                  title={`re-fit ${key} for the current model`}
-                >{busy ? "…" : "re-fit"}</button>
-                <button
-                  type="button"
-                  class="act del"
-                  class:confirm={confirming}
-                  disabled={busy}
-                  onclick={() => onDeleteClick(m)}
-                  title={confirming ? "click again to confirm" : `delete ${key}`}
-                >{confirming ? "confirm?" : "delete"}</button>
-              </div>
+              {#if inspecting}
+                <div class="inspect-body">
+                  {#if detailLoading.has(key)}
+                    <p class="muted">loading…</p>
+                  {:else if detailErrors.has(key)}
+                    <p class="error">{detailErrors.get(key)}</p>
+                  {:else if detailCache.has(key)}
+                    {@const detail = detailCache.get(key)!}
+                    {#if isDiscoverMode(detail)}
+                      <DiagnosticsPanel manifold={detail} />
+                    {:else}
+                      <p class="muted">
+                        authored manifold — no discover-mode diagnostics
+                        ({detail.domain_label}, dim={detail.intrinsic_dim})
+                      </p>
+                    {/if}
+                  {/if}
+                </div>
+              {/if}
             </li>
           {/each}
         </ul>
@@ -240,29 +312,33 @@
             {@const key = rowKey(m)}
             {@const busy = busyKeys.has(key)}
             {@const confirming = confirmKeys.has(key)}
+            {@const badge = fitModeBadge(m)}
             <li class="row" title={m.description || key}>
-              <div class="meta">
-                <span class="row-name">{key}</span>
-                <span class="row-sub">
-                  {m.domain_label} · {m.node_count} nodes
-                </span>
-              </div>
-              <div class="actions">
-                <button
-                  type="button"
-                  class="act fit"
-                  disabled={busy}
-                  onclick={() => onFit(m)}
-                  title={`fit ${key} for the current model`}
-                >{busy ? "…" : "fit"}</button>
-                <button
-                  type="button"
-                  class="act del"
-                  class:confirm={confirming}
-                  disabled={busy}
-                  onclick={() => onDeleteClick(m)}
-                  title={confirming ? "click again to confirm" : `delete ${key}`}
-                >{confirming ? "confirm?" : "delete"}</button>
+              <div class="row-line">
+                <div class="meta">
+                  <span class="row-name">{key}</span>
+                  <span class="row-sub">
+                    {m.domain_label} · {m.node_count} nodes
+                    {#if badge}<span class="fit-badge fit-{badge}">{badge}</span>{/if}
+                  </span>
+                </div>
+                <div class="actions">
+                  <button
+                    type="button"
+                    class="act fit"
+                    disabled={busy}
+                    onclick={() => onFit(m)}
+                    title={`fit ${key} for the current model`}
+                  >{busy ? "…" : "fit"}</button>
+                  <button
+                    type="button"
+                    class="act del"
+                    class:confirm={confirming}
+                    disabled={busy}
+                    onclick={() => onDeleteClick(m)}
+                    title={confirming ? "click again to confirm" : `delete ${key}`}
+                  >{confirming ? "confirm?" : "delete"}</button>
+                </div>
               </div>
             </li>
           {/each}
@@ -394,10 +470,9 @@
     gap: var(--space-2);
   }
   .row {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    align-items: center;
-    gap: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
     background: var(--bg-deep);
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -405,6 +480,45 @@
     transition: border-color var(--dur) var(--ease-out);
   }
   .row:hover {
+    border-color: var(--accent-purple);
+  }
+  .row-line {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .fit-badge {
+    display: inline-block;
+    margin-left: var(--space-2);
+    padding: 0 var(--space-2);
+    border-radius: var(--radius);
+    text-transform: uppercase;
+    font-size: var(--text-2xs);
+    letter-spacing: 0.04em;
+    border: 1px solid var(--border);
+    color: var(--accent-purple);
+    background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
+  }
+  .fit-spectral {
+    color: var(--accent);
+    background: var(--accent-subtle);
+  }
+  .inspect-body {
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border);
+  }
+  .error {
+    color: var(--accent-error);
+    font-size: var(--text-xs);
+    margin: 0;
+  }
+  .act.inspect {
+    color: var(--fg-dim);
+    min-width: 2.2em;
+  }
+  .act.inspect:hover:not(:disabled) {
+    color: var(--accent-purple);
     border-color: var(--accent-purple);
   }
   .meta {
