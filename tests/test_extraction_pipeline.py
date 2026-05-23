@@ -77,12 +77,19 @@ class _StubHandle:
         # response is bogus on purpose.
         return ""
 
-    def generate_scenarios(self, concept, baseline=None, n=9, *, on_progress=None):
+    def generate_scenarios(
+        self, concept, baseline=None, n=9, *, on_progress=None, role=None,
+    ):
         self.scenarios_calls += 1
+        self.last_scenarios_role = role
         return list(self._scenarios_response)
 
-    def generate_pairs(self, concept, baseline=None, n=45, *, scenarios=None, on_progress=None):
+    def generate_pairs(
+        self, concept, baseline=None, n=45, *,
+        scenarios=None, on_progress=None, role=None,
+    ):
         self.pairs_calls += 1
+        self.last_pairs_role = role
         return list(self._pairs_response)
 
     # PackWriter surface -------------------------------------------------
@@ -362,3 +369,106 @@ class TestSessionGate:
         # 409 conflict — same shape as ConcurrentGenerationError.
         code, _msg = ConcurrentExtractionError("x").user_message()
         assert code == 409
+
+
+# ----------------------------------------------------------------------
+# Role-augmented extraction (role-extraction Phase 7)
+# ----------------------------------------------------------------------
+
+
+class TestRoleVariant:
+    """``ExtractionPipeline.extract(role=...)`` writes the per-role tensor
+    file, threads the role through generator + extractor calls, and
+    refuses to compose with ``sae=``.
+    """
+
+    def test_extract_with_role_writes_role_variant_file(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+        captured = _fake_extract(monkeypatch)
+
+        from saklas.io.selectors import invalidate
+        invalidate()
+
+        handle = _StubHandle(tmp_path)
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
+
+        name, profile = pipeline.extract("honest.deceptive", role="pirate")
+
+        # The variant-qualified output name surfaces the role.
+        assert name == "honest.deceptive:role-pirate"
+        # The extractor saw role= and model_type= via the kwargs dict.
+        assert captured.get("call_count") == 1
+        # The role-tagged tensor file landed on disk under the canonical
+        # local-pack folder, matching the io.paths suffix scheme.
+        from saklas.io.paths import tensor_filename
+        expected_path = (
+            tmp_path / "vectors" / "local" / "honest.deceptive"
+            / tensor_filename("stub-model", role="pirate")
+        )
+        assert expected_path.exists()
+        # The generators received the role kwarg too — same persona
+        # drives scenario + pair generation as the activation pool.
+        assert handle.last_scenarios_role == "pirate"
+        assert handle.last_pairs_role == "pirate"
+
+    def test_extract_role_rejects_with_sae(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+        from saklas.io.selectors import invalidate
+        invalidate()
+        from saklas.core.sae import MockSaeBackend
+
+        handle = _StubHandle(tmp_path)
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
+
+        # Compose-time mutex — role and sae are both kind suffixes and
+        # paths.py refuses to fuse them.  The pipeline surfaces the
+        # error eagerly with a clear message before any forward-pass
+        # work begins.
+        sae_backend = MockSaeBackend(
+            layers=frozenset({0, 1}), d_model=4, release="test-release",
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            pipeline.extract(
+                "honest.deceptive", role="pirate", sae=sae_backend,
+            )
+
+    def test_extract_role_cache_hit_returns_role_qualified_name(
+        self, tmp_path, monkeypatch,
+    ):
+        """A pre-baked role tensor short-circuits the pipeline and the
+        cached output name still carries the role suffix."""
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+        captured = _fake_extract(monkeypatch)
+
+        # Pre-populate a role-tagged tensor under local/<concept>/.
+        from saklas.core.vectors import save_profile
+        from saklas.io.packs import PackMetadata, hash_folder_files
+        from saklas.io.paths import tensor_filename
+        from saklas.io.selectors import invalidate
+        invalidate()
+
+        folder = tmp_path / "vectors" / "local" / "honest.deceptive"
+        folder.mkdir(parents=True)
+        save_profile(
+            {0: torch.full((4,), 0.5)},
+            str(folder / tensor_filename("stub-model", role="pirate")),
+            {"method": "difference_of_means", "role": "pirate"},
+        )
+        PackMetadata(
+            name="honest.deceptive", description="x", version="1.0.0",
+            license="MIT", tags=[], recommended_alpha=0.5,
+            source="local", files=hash_folder_files(folder),
+        ).write(folder)
+
+        handle = _StubHandle(tmp_path)
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
+
+        name, _profile = pipeline.extract("honest.deceptive", role="pirate")
+
+        assert name == "honest.deceptive:role-pirate"
+        assert "call_count" not in captured  # cache hit — no extractor

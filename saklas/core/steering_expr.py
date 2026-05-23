@@ -17,7 +17,7 @@ Grammar::
     probe_atom  := NAME ["." NAME]    # canonical concept (e.g. "angry.calm")
     op          := ">" | ">=" | "<" | "<="
     coeff       := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
-    variant     := "raw" | "sae" | "sae-" ID
+    variant     := "raw" | "sae" | "sae-" ID | "role-" ID
 
 Probe gates (v2.1): ``@when:<probe><op><threshold>`` fires the term only
 on decode steps where the named probe's last reading satisfies the

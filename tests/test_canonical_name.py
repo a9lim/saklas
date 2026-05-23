@@ -69,7 +69,7 @@ class TestHumanize:
             def __init__(self):  # bypass real construction
                 pass
 
-            def _run_generator(self, system_msg, prompt, max_new_tokens):
+            def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
                 captured["prompt"] = prompt
                 return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
 
@@ -87,7 +87,7 @@ class TestHumanize:
             def __init__(self):
                 pass
 
-            def _run_generator(self, system_msg, prompt, max_new_tokens):
+            def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
                 captured["prompt"] = prompt
                 return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
 
@@ -127,7 +127,7 @@ class TestHumanize:
             def __init__(self):
                 pass
 
-            def _run_generator(self, system_msg, prompt, max_new_tokens):
+            def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
                 captured.setdefault("prompts", []).append(prompt)
                 return (
                     "1a. Statement one.\n1b. Statement two.\n"

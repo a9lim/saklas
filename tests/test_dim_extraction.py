@@ -22,7 +22,7 @@ from saklas.core.sae import MockSaeBackend
 # ---------------------------------------------------------------------------
 
 
-def _stub_encode_separable(model, tokenizer, text, layers, device):
+def _stub_encode_separable(model, tokenizer, text, layers, device, **_kwargs):
     """Stable pos/neg activations along axis 0 with tiny gaussian noise."""
     n = len(layers)
     sign = 1.0 if "pos" in text else -1.0
@@ -34,7 +34,7 @@ def _stub_encode_separable(model, tokenizer, text, layers, device):
     return out
 
 
-def _stub_encode_noisy(model, tokenizer, text, layers, device):
+def _stub_encode_noisy(model, tokenizer, text, layers, device, **_kwargs):
     """Noisier pos/neg pairs — class-mean axis still axis 0 but per-pair
     diff has substantial off-axis variance.  This is the regime where Im
     & Li 2025 predicts PCA can pick a near-orthogonal direction; DiM

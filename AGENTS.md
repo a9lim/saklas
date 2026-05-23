@@ -59,7 +59,7 @@ Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml` fir
 
 ## Selector grammar
 
-Shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`, `model:<m>`, `default`, `all`, optionally suffixed `:<variant>` where `<variant>` is `raw` (canonical DiM), `pca` (legacy PCA tensor), `sae`, or `sae-<release>`. Bare names resolve cross-namespace and raise `AmbiguousSelectorError` on collision; a bare `:sae` raises `AmbiguousVariantError` when a concept has multiple SAE releases. Bare poles alias to installed bipolar concepts: `wolf` → `deer.wolf @ -0.5` (caller multiplies user alpha by the sign), via `io.selectors.resolve_pole`.
+Shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<t>`, `namespace:<ns>`, `model:<m>`, `default`, `all`, optionally suffixed `:<variant>` where `<variant>` is `raw` (canonical DiM), `pca` (legacy PCA tensor), `sae`, `sae-<release>`, or `role-<name>` (role-augmented extraction — the contrast pairs were generated under a chat template whose assistant-role label was substituted, and the same substitution is auto-applied at steering time so extract baseline equals steer baseline). Bare names resolve cross-namespace and raise `AmbiguousSelectorError` on collision; a bare `:sae` raises `AmbiguousVariantError` when a concept has multiple SAE releases. Bare poles alias to installed bipolar concepts: `wolf` → `deer.wolf @ -0.5` (caller multiplies user alpha by the sign), via `io.selectors.resolve_pole`. A steering expression composing role-augmented terms must agree on role (`SteeringExprError` on disagreement); plain `:raw` terms compose with role terms but emit a one-time `RoleBaselineMismatchWarning`.
 
 Canonical naming: `session.canonical_concept_name` slugs poles via `[^a-z0-9]+ → _` and joins bipolar poles with `BIPOLAR_SEP = "."`, so `/steer happy . sad` and `/steer happy.sad` resolve to the same vector. `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$`; `@` is forbidden (it is the HF revision separator), and `.` is used over `~` because HF repo names reject `~`.
 
@@ -187,6 +187,8 @@ These gate `test_smoke.py::test_throughput_regression` (steered ≥ 85% of vanil
 ## Tested architectures
 
 `_TESTED_ARCHS` in `core/model.py` emits a one-time `UserWarning` on load when `model_type` isn't in the set. Known working: `qwen2`, `qwen3`, `qwen3_5` (+ `_text`/`_moe`), `gemma2`, `gemma3` (+ `_text`), `gemma4` (+ `_text`), `mistral3`, `ministral3`, `gpt_oss`, `llama`, `glm`, `talkie`. Many more architectures are wired up via `_LAYER_ACCESSORS` but untested — adding one is a single accessor entry. Architectures whose modeling ignores `past_key_values` (e.g. the original talkie port) auto-fall back to O(N²) no-KV-cache generation with a one-time warning.
+
+Role-augmented extraction (`:role-<name>` variant) needs a chat template with a substitutable assistant-role label. The per-family registry lives in `core/role_templates.py::ROLE_HEADERS`. Supported: `qwen2`/`qwen3`/`qwen3_5` (ChatML), `gemma2`/`gemma3`/`gemma4` (`<start_of_turn>`, label is `model` not `assistant`), `llama`, `glm`, `gpt_oss`. Unsupported (the registry maps them to `None`, `apply_with_role` raises `RoleSubstitutionUnsupportedError`): `mistral3` / `ministral3` (positional `[INST]`/`[/INST]`, no role label in the rendered string), `talkie` (opted out, untested).
 
 ## Bundled concepts
 

@@ -83,7 +83,7 @@ class TestComputeLayerDiagnostics:
 # ---------------------------------------------------------------------------
 
 
-def _stub_encode(model, tokenizer, text, layers, device):
+def _stub_encode(model, tokenizer, text, layers, device, **_kwargs):
     """Per-layer activation that has clear pos/neg separation along axis 0.
 
     Reused by every full-extraction test below; matches the shape
@@ -168,7 +168,7 @@ class TestSoftWarning:
     def test_one_sided_pairs_warn(self, monkeypatch) -> None:
         # Identical pos/neg activations except a tiny axis-0 separation —
         # high EVR, near-zero intra variance, no inter-pair disagreement.
-        def _identical(model, tokenizer, text, layers, device):
+        def _identical(model, tokenizer, text, layers, device, **_kwargs):
             sign = 1.0 if "pos" in text else -1.0
             return {idx: torch.tensor([sign * 0.001, 0.0, 0.0, 0.0])
                     for idx in range(len(layers))}

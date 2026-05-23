@@ -332,7 +332,7 @@ class _SteeringContext:
     __slots__ = (
         "_session", "_entries", "_entered",
         "_injection_mode", "_theta_max", "_projection_metric",
-        "_synthetic_snapshots",
+        "_synthetic_snapshots", "_active_role", "_prev_active_role",
     )
 
     def __init__(
@@ -344,6 +344,7 @@ class _SteeringContext:
         theta_max: float | None = None,
         projection_metric: str | None = None,
         synthetic_snapshots: dict[str, "object"] | None = None,
+        active_role: str | None = None,
     ) -> None:
         self._session = session
         self._entries = entries
@@ -360,6 +361,11 @@ class _SteeringContext:
         self._synthetic_snapshots: dict[str, object] = (
             dict(synthetic_snapshots) if synthetic_snapshots else {}
         )
+        # Active role (role-extraction Phase 7): the role label every
+        # role-augmented term in this scope shares.  Restored on exit so
+        # nested scopes save/restore inner-wins.
+        self._active_role = active_role
+        self._prev_active_role: str | None = None
 
     def __enter__(self) -> "_SteeringContext":
         # _push_steering rolls its own stack entry back if _rebuild_steering_hooks
@@ -372,6 +378,13 @@ class _SteeringContext:
             theta_max=self._theta_max,
             projection_metric=self._projection_metric,
         )
+        # Save / overwrite the session-level active_role.  Inner scopes
+        # override outer; the outer is restored on ``__exit__``.  An
+        # inner scope with ``active_role=None`` inherits — leave the
+        # outer's value in place.
+        self._prev_active_role = getattr(self._session, "_active_role", None)
+        if self._active_role is not None:
+            self._session._active_role = self._active_role
         self._entered = True
         return self
 
@@ -384,6 +397,11 @@ class _SteeringContext:
         if self._entered:
             self._session._pop_steering()
             self._entered = False
+        # Restore the prior active_role.  Done unconditionally — even
+        # if pop_steering raised — so the session never leaks a stale
+        # role binding into the next request.
+        if self._active_role is not None:
+            self._session._active_role = self._prev_active_role
         # Restore any pre-existing values for synthetic-projection
         # keys this scope clobbered.  Runs even if ``_pop_steering``
         # raised — best-effort cleanup keeps the registry consistent
@@ -689,6 +707,17 @@ class SaklasSession:
         self._steering_override_stack: list[
             tuple[str | None, float | None, str | None]
         ] = []
+
+        # Active assistant-role label for the current ``session.steering()``
+        # scope — populated when every role-tagged term in the resolved
+        # expression agrees on a role.  ``None`` means "use the family's
+        # standard assistant label", the legacy zero-overhead path.
+        # Push/save/restore is handled by ``_SteeringContext`` so nested
+        # scopes inner-wins for the duration of the inner block.  The
+        # generation surface reads this when assembling the chat-template
+        # input so the assistant turn opens with ``<role>`` instead of
+        # ``assistant``.
+        self._active_role: str | None = None
 
         # Synchronous event bus.  Emits on extraction, steering enter/exit,
         # probe scoring, generation start/finish.  Subscribers run on the
@@ -1116,20 +1145,41 @@ class SaklasSession:
         system_msg: str,
         prompt: str,
         max_new_tokens: int,
+        *,
+        role: str | None = None,
     ) -> str:
         """Single-turn LLM call shared by scenario and pair generators.
 
         Builds a chat input from (system_msg, prompt), runs the model
         under inference_mode, decodes and returns the generated text.
         No parsing, no retry — callers drive the retry loop.
+
+        ``role`` (optional): substitute a custom assistant-role label so
+        the generation prompt opens with ``<role>`` instead of
+        ``assistant``.  Routed through :func:`build_chat_input`.  Mirrors
+        the role-augmented extraction path so the scenario / pair
+        generators inhabit the same persona the corpus will be pooled
+        from.  ``role=None`` is the zero-overhead default.
         """
         pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
         messages = [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": prompt},
         ]
+        model_type_for_role: str | None = None
+        if role is not None:
+            model_cfg = getattr(self._model, "config", None)
+            text_cfg = getattr(model_cfg, "text_config", None) if model_cfg is not None else None
+            model_type_for_role = (
+                getattr(text_cfg, "model_type", None)
+                if text_cfg is not None
+                else None
+            )
+            if model_type_for_role is None and model_cfg is not None:
+                model_type_for_role = getattr(model_cfg, "model_type", None)
         input_ids = build_chat_input(
             self._tokenizer, messages, system_prompt=None,
+            role=role, model_type=model_type_for_role,
         ).to(self._device)
         attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
@@ -1150,6 +1200,7 @@ class SaklasSession:
         n: int = _N_SCENARIOS,
         *,
         on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
     ) -> list[str]:
         """Ask the generator for ``n`` broad situational domains shared across the axis.
 
@@ -1220,7 +1271,9 @@ class SaklasSession:
                     f"Generating {n} scenarios for '{concept}' "
                     f"(attempt {attempt}/{_MAX_GEN_ATTEMPTS})..."
                 )
-            text = self._run_generator(_GEN_SYSTEM_MSG, prompt, max_new_tokens)
+            text = self._run_generator(
+                _GEN_SYSTEM_MSG, prompt, max_new_tokens, role=role,
+            )
             parsed = self._parse_scenarios(text)
             if len(parsed) >= n:
                 return parsed[:n]
@@ -1259,6 +1312,7 @@ class SaklasSession:
         *,
         scenarios: list[str] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
     ) -> list[tuple[str, str]]:
         """Generate contrastive statement pairs via the open-ended pipeline.
 
@@ -1277,7 +1331,8 @@ class SaklasSession:
         """
         if scenarios is None:
             scenarios = self.generate_scenarios(
-                concept, baseline, _N_SCENARIOS, on_progress=on_progress,
+                concept, baseline, _N_SCENARIOS,
+                on_progress=on_progress, role=role,
             )
         if not scenarios:
             return []
@@ -1364,7 +1419,7 @@ class SaklasSession:
             batch_best: list[tuple[str, str]] = []
             for _attempt in range(_MAX_GEN_ATTEMPTS):
                 text = self._run_generator(
-                    _GEN_SYSTEM_MSG, prompt, max_new_tokens,
+                    _GEN_SYSTEM_MSG, prompt, max_new_tokens, role=role,
                 )
                 parsed = self._parse_pairs(text)
                 if len(parsed) >= pairs_per_scenario:
@@ -1424,6 +1479,7 @@ class SaklasSession:
         namespace: str | None = None,
         method: str | None = None,
         dls: bool | None = None,
+        role: str | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit ``VectorExtracted``.
 
@@ -1498,6 +1554,7 @@ class SaklasSession:
                 namespace=namespace,
                 method=effective_method,  # type: ignore[arg-type]
                 dls=effective_dls,
+                role=role,
             )
         finally:
             self._gen_lock.release()
@@ -1631,6 +1688,47 @@ class SaklasSession:
             self._resolve_pole_aliases(raw_entries)
         )
 
+        # Role-augmented extraction (role-extraction Phase 7):
+        # collect the set of ``role-<id>`` variants across every resolved
+        # term so the generation surface can substitute the assistant-
+        # role label.  Unanimity is the only coherent regime — mixing
+        # multiple roles in one scope has no defined semantics.  A plain
+        # term mixed with a role-tagged term is allowed but warns: the
+        # plain term's baseline was ``assistant``, not ``<role>``.
+        role_variants: set[str] = set()
+        any_plain_term = False
+        for key in resolved:
+            if ":" not in key:
+                any_plain_term = True
+                continue
+            variant = key.rsplit(":", 1)[1]
+            if variant.startswith("role-"):
+                role_variants.add(variant[len("role-"):])
+            else:
+                # Non-role variant (sae, sae-<rel>) — treat as plain for
+                # baseline-mismatch tracking.  Its baseline is also the
+                # standard assistant role, distinct from the role
+                # substitution path.
+                any_plain_term = True
+        if len(role_variants) > 1:
+            from saklas.core.steering_expr import SteeringExprError
+            raise SteeringExprError(
+                f"conflicting roles in expression: {sorted(role_variants)}; "
+                f"all role-augmented terms must agree on role"
+            )
+        active_role: str | None = next(iter(role_variants), None)
+        if active_role is not None and any_plain_term:
+            import warnings as _warnings
+            from saklas.core.errors import RoleBaselineMismatchWarning
+            _warnings.warn(
+                f"steering scope mixes plain terms with role-augmented "
+                f"terms (role={active_role!r}); the plain term's "
+                f"extraction baseline was the standard assistant role, "
+                f"not {active_role!r}",
+                RoleBaselineMismatchWarning,
+                stacklevel=2,
+            )
+
         # Fold in ablation entries alongside additive/projection ones.
         # ``normalized_entries`` strips ``AblationTerm`` values, so walk
         # ``steering_obj.alphas`` directly.  Keys already carry the
@@ -1692,6 +1790,7 @@ class SaklasSession:
             theta_max=theta_override,
             projection_metric=metric_override,
             synthetic_snapshots=snapshots,
+            active_role=active_role,
         )
 
     def _materialize_projections(self, steering: Steering) -> dict[str, object]:
@@ -3214,9 +3313,30 @@ class SaklasSession:
             messages = list(input)
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
+        # Active role (role-extraction Phase 7): when a role-augmented
+        # steering scope is open, route the chat-template render through
+        # ``apply_with_role`` so the assistant turn opens with the
+        # substituted role label.  No active scope → zero-overhead
+        # standard render.
+        active_role = getattr(self, "_active_role", None)
+        model_type_for_role: str | None = None
+        if active_role is not None:
+            model_cfg = getattr(self._model, "config", None)
+            text_cfg = (
+                getattr(model_cfg, "text_config", None)
+                if model_cfg is not None else None
+            )
+            model_type_for_role = (
+                getattr(text_cfg, "model_type", None)
+                if text_cfg is not None
+                else None
+            )
+            if model_type_for_role is None and model_cfg is not None:
+                model_type_for_role = getattr(model_cfg, "model_type", None)
         return build_chat_input(
             self._tokenizer, messages, self.config.system_prompt,
             thinking=thinking,
+            role=active_role, model_type=model_type_for_role,
         ).to(self._device)
 
     def build_readings(self) -> dict[str, ProbeReadings]:

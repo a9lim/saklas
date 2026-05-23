@@ -150,6 +150,11 @@ class Sidecar:
     source_model_id: Optional[str] = None
     alignment_map_hash: Optional[str] = None
     transfer_quality_estimate: Optional[float] = None
+    # Role/persona provenance — set on role-variant tensors. The filename
+    # ``_role-<name>`` suffix is the source of truth; this field is a
+    # convenience for dashboard display so the UI doesn't need to re-parse
+    # the filename.
+    role: Optional[str] = None
 
     @classmethod
     def load(cls, path: Path) -> "Sidecar":
@@ -181,6 +186,7 @@ class Sidecar:
             source_model_id=data.get("source_model_id"),
             alignment_map_hash=data.get("alignment_map_hash"),
             transfer_quality_estimate=float(tqe) if tqe is not None else None,
+            role=data.get("role"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -203,6 +209,8 @@ class Sidecar:
             out["alignment_map_hash"] = self.alignment_map_hash
         if self.transfer_quality_estimate is not None:
             out["transfer_quality_estimate"] = float(self.transfer_quality_estimate)
+        if self.role is not None:
+            out["role"] = self.role
         return out
 
     def write(self, path: Path) -> None:
@@ -594,6 +602,8 @@ def enumerate_variants(folder: Path, model_id: str) -> dict[str, Path]:
       * ``"sae-<release>-pca"`` — legacy SAE-PCA variant.
       * ``"from-<safe_src>"`` — transferred-from variant (method-agnostic;
         transfers preserve their source method, recorded in the sidecar).
+      * ``"role-<name>"`` — role/persona variant (DiM).
+      * ``"role-<name>-pca"`` — legacy role variant with PCA method.
 
     Paths point at the ``.safetensors`` files; callers derive the sidecar
     path by swapping the extension.

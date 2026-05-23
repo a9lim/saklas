@@ -112,7 +112,12 @@ def _capture_all_hidden_states(model, layers, input_ids):
     return captured_hidden
 
 
-def _encode_and_capture_all(model, tokenizer, text, layers, device):
+def _encode_and_capture_all(
+    model, tokenizer, text, layers, device,
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+):
     """Tokenize text, run forward pass, return last-content-token hidden state per layer in fp32.
 
     For instruction-tuned models (those with a chat template), wraps the text
@@ -125,6 +130,12 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
     token's hidden state is itself an attention-weighted summary of prior
     positions and is exactly what the model uses for next-token prediction.
 
+    ``role`` (optional): substitute a custom assistant-role label into the
+    chat template via :func:`saklas.core.role_templates.apply_with_role` —
+    the extraction baseline shifts from "model speaking as assistant" to
+    "model speaking as <role>".  Requires ``model_type``.  ``role=None``
+    keeps the standard assistant-baseline path with zero overhead.
+
     Returns:
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
@@ -134,11 +145,30 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
         kwargs: dict = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = False
+
+        def _render(msgs: list[dict[str, str]]) -> str:
+            if role is None:
+                return tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=False, **kwargs,
+                )
+            if model_type is None:
+                raise ValueError(
+                    "_encode_and_capture_all: role= requires model_type= "
+                    "so the family's role-header registry entry can be "
+                    "looked up"
+                )
+            from saklas.core.role_templates import apply_with_role
+            return apply_with_role(
+                tokenizer, msgs,
+                role=role, model_type=model_type,
+                add_generation_prompt=False,
+                tokenize=False,
+                **kwargs,
+            )
+
         messages = [{"role": "assistant", "content": text}]
         try:
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False, **kwargs,
-            )
+            text = _render(messages)
         except Exception:
             # Some chat templates require a user turn before assistant.
             # The filler must be semantically empty — "." triggers
@@ -148,13 +178,15 @@ def _encode_and_capture_all(model, tokenizer, text, layers, device):
                 {"role": "user", "content": "Continue:"},
                 {"role": "assistant", "content": text},
             ]
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False, **kwargs,
-            )
+            text = _render(messages)
         # Some chat templates inject a large system prompt (e.g.
         # Ministral adds ~500 tokens).  For contrastive extraction the
         # overhead cancels in the diff but wastes memory on every
         # forward pass.  Fall back to raw tokenization when excessive.
+        # The template-overhead probe is role-agnostic — splicing a
+        # different role label can't shift the overhead by more than a
+        # few characters, and the cache key intentionally ignores role
+        # so the probe runs once per tokenizer.
         overhead = _chat_template_overhead(tokenizer, kwargs)
         if overhead > _MAX_TEMPLATE_OVERHEAD:
             text = messages[-1]["content"]  # use raw text
@@ -550,6 +582,8 @@ def _capture_diffs_for_pairs(
     device,
     *,
     sae: "SaeBackend | None" = None,
+    role: str | None = None,
+    model_type: str | None = None,
 ) -> tuple[
     int,
     dict[int, list[torch.Tensor]],
@@ -635,8 +669,14 @@ def _capture_diffs_for_pairs(
     diff_device = "cpu" if _mps else device
 
     for pair in pairs:
-        pos_all = _encode_and_capture_all(model, tokenizer, pair["positive"], layers, device)
-        neg_all = _encode_and_capture_all(model, tokenizer, pair["negative"], layers, device)
+        pos_all = _encode_and_capture_all(
+            model, tokenizer, pair["positive"], layers, device,
+            role=role, model_type=model_type,
+        )
+        neg_all = _encode_and_capture_all(
+            model, tokenizer, pair["negative"], layers, device,
+            role=role, model_type=model_type,
+        )
         for idx in range(n_layers):
             p, n = pos_all[idx], neg_all[idx]
             norm_sums[idx] += p.norm() + n.norm()
@@ -750,6 +790,8 @@ def extract_contrastive(
     concept_label: str | None = None,
     dls: bool = True,
     layer_means: dict[int, torch.Tensor] | None = None,
+    role: str | None = None,
+    model_type: str | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Contrastive direction extraction via PCA across all layers.
 
@@ -824,6 +866,7 @@ def extract_contrastive(
      norm_sums_cpu, sae_layer_set,
      mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
         model, tokenizer, pairs, layers, device, sae=sae,
+        role=role, model_type=model_type,
     )
 
     n_pairs = len(pairs)
@@ -1014,6 +1057,8 @@ def extract_difference_of_means(
     whitener: "Any | None" = None,
     dls: bool = True,
     layer_means: dict[int, torch.Tensor] | None = None,
+    role: str | None = None,
+    model_type: str | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
     """Contrastive direction extraction via **difference of means** (DiM).
 
@@ -1082,6 +1127,7 @@ def extract_difference_of_means(
      norm_sums_cpu, sae_layer_set,
      mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
         model, tokenizer, pairs, layers, device, sae=sae,
+        role=role, model_type=model_type,
     )
 
     n_pairs = len(pairs)

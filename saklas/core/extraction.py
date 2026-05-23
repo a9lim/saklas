@@ -138,6 +138,7 @@ class ModelHandle(Protocol):
         n: int = ...,
         *,
         on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
     ) -> list[str]: ...
 
     def generate_pairs(
@@ -148,6 +149,7 @@ class ModelHandle(Protocol):
         *,
         scenarios: list[str] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
     ) -> list[tuple[str, str]]: ...
 
 
@@ -211,6 +213,7 @@ class ExtractionPipeline:
         namespace: str | None = None,
         method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
         dls: bool = True,
+        role: str | None = None,
     ) -> tuple[str, Profile]:
         """Extract a steering vector profile and emit ``VectorExtracted``.
 
@@ -246,6 +249,7 @@ class ExtractionPipeline:
             namespace=namespace,
             method=method,
             dls=dls,
+            role=role,
         )
         try:
             meta = dict(profile.metadata) if hasattr(profile, "metadata") else {}
@@ -272,6 +276,7 @@ class ExtractionPipeline:
         namespace: str | None = None,
         method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
         dls: bool = True,
+        role: str | None = None,
     ) -> tuple[str, Profile]:
         """Extraction body.  See :meth:`extract` for the wrapper.
 
@@ -337,6 +342,35 @@ class ExtractionPipeline:
                 "sae_ids_by_layer": getattr(sae_backend, "sae_ids_by_layer", {}),
             }
 
+        # Role-augmented extraction (Phase 7 of the role-extraction plan).
+        # ``role`` is mutually exclusive with ``sae`` / ``transferred_from``
+        # — paths.py raises the canonical message at filename construction,
+        # but surface it here too so callers see a clean error before any
+        # forward-pass work begins.
+        if role is not None and sae_backend is not None:
+            raise ValueError(
+                "ExtractionPipeline.extract: role= and sae= are mutually "
+                "exclusive — role substitutes the assistant baseline; "
+                "SAE substitutes the feature space.  Pick one."
+            )
+        # Resolve the model_type once for downstream chat-template
+        # rendering.  Falls back to the text_config when present
+        # (multimodal-with-text-submodel loads).  ``None`` is safe when
+        # role is also None (the chat-template path stays plain).
+        role_metadata: dict = {}
+        model_type_for_role: str | None = None
+        if role is not None:
+            model_cfg = getattr(self._handle.model, "config", None)
+            text_cfg = getattr(model_cfg, "text_config", None) if model_cfg is not None else None
+            model_type_for_role = (
+                getattr(text_cfg, "model_type", None)
+                if text_cfg is not None
+                else None
+            )
+            if model_type_for_role is None and model_cfg is not None:
+                model_type_for_role = getattr(model_cfg, "model_type", None)
+            role_metadata = {"role": role}
+
         method_label = _method_label(method, sae_backend)
         extractor = _extractor_for(method)
 
@@ -364,6 +398,8 @@ class ExtractionPipeline:
             "sae": sae_backend,
             "concept_label": canonical,
             "dls": dls,
+            "role": role,
+            "model_type": model_type_for_role,
         }
 
         def _resolve_extract_kwargs() -> dict:
@@ -392,13 +428,15 @@ class ExtractionPipeline:
         ) -> tuple[str, Profile]:
             meta: dict = {"method": method_label, "bake": bake_label}
             meta.update(sae_metadata)
+            meta.update(role_metadata)
             if diagnostics:
                 meta["diagnostics"] = diagnostics
-            out_name = (
-                canonical
-                if sae_backend is None
-                else f"{canonical}:sae-{sae_backend.release}"
-            )
+            if role is not None:
+                out_name = f"{canonical}:role-{role}"
+            elif sae_backend is not None:
+                out_name = f"{canonical}:sae-{sae_backend.release}"
+            else:
+                out_name = canonical
             return out_name, Profile(profile_dict, metadata=meta)
 
         def _save_meta(
@@ -410,6 +448,7 @@ class ExtractionPipeline:
             if extra:
                 meta.update(extra)
             meta.update(sae_metadata)
+            meta.update(role_metadata)
             if diagnostics:
                 meta["diagnostics"] = diagnostics
             return meta
@@ -421,8 +460,21 @@ class ExtractionPipeline:
 
         def _path_for(folder: pathlib.Path) -> str:
             return str(folder / tensor_filename(
-                model_id, release=sae_release, method=method,
+                model_id, release=sae_release, method=method, role=role,
             ))
+
+        def _out_name_for_cache() -> str:
+            """The variant-qualified concept key returned on a cache hit.
+
+            Mirrors the ``role > sae > raw`` precedence in
+            :func:`tensor_filename`; the three are mutually exclusive
+            so at most one suffix attaches.
+            """
+            if role is not None:
+                return f"{canonical}:role-{role}"
+            if sae_backend is not None:
+                return f"{canonical}:sae-{sae_backend.release}"
+            return canonical
 
         # For DataSource or raw pairs, skip the full pipeline — just extract.
         if isinstance(source, (DataSource, list)):
@@ -436,12 +488,7 @@ class ExtractionPipeline:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._packs._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{canonical}'.")
-                out_name = (
-                    canonical
-                    if sae_backend is None
-                    else f"{canonical}:sae-{sae_backend.release}"
-                )
-                return out_name, Profile(profile, metadata=_meta)
+                return _out_name_for_cache(), Profile(profile, metadata=_meta)
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -495,12 +542,7 @@ class ExtractionPipeline:
                 profile, _meta = _load_profile(cache_path)
                 profile = self._packs._promote_profile(profile)
                 _progress(f"Loaded cached profile for '{canonical}'.")
-                out_name = (
-                    canonical
-                    if sae_backend is None
-                    else f"{canonical}:sae-{sae_backend.release}"
-                )
-                return out_name, Profile(profile, metadata=_meta)
+                return _out_name_for_cache(), Profile(profile, metadata=_meta)
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -584,7 +626,7 @@ class ExtractionPipeline:
             if not eff_scenarios:
                 _progress(f"Generating scenarios for '{concept}'{suffix}...")
                 eff_scenarios = self._handle.generate_scenarios(
-                    concept, baseline, on_progress=_progress,
+                    concept, baseline, on_progress=_progress, role=role,
                 )
 
             if not eff_scenarios:
@@ -605,6 +647,7 @@ class ExtractionPipeline:
                 concept, baseline,
                 scenarios=eff_scenarios,
                 on_progress=_progress,
+                role=role,
             )
             pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
             with open(stmt_cache_path, "w") as f:

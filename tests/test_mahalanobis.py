@@ -392,7 +392,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
         """
         import hashlib
 
-        def _stub(model, tokenizer, text, layers, device):
+        def _stub(model, tokenizer, text, layers, device, **_kwargs):
             # Deterministic per-text seed — md5 of (seed, text) gives a
             # 64-bit int with no Python hash-randomization sensitivity.
             digest = hashlib.md5(f"{seed}_{text}".encode()).hexdigest()[:16]

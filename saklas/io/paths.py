@@ -15,21 +15,27 @@ from pathlib import Path
 #   SAE-DiM             -> ``<safe_model_id>_sae-<release>.safetensors``
 #   SAE-PCA (legacy)    -> ``<safe_model_id>_sae-<release>_pca.safetensors``
 #   transferred (v1.6)  -> ``<safe_model_id>_from-<safe_src>.safetensors``
+#   role                -> ``<safe_model_id>_role-<name>.safetensors``
+#   role-PCA (legacy)   -> ``<safe_model_id>_role-<name>_pca.safetensors``
 #
-# The literals ``_sae-`` and ``_from-`` are the *kind* separators — no HF
-# model id slug contains either, and the right-hand-side slugs (release
-# strings, safe-model-ids) follow the same ``[a-z0-9._-]`` discipline so
-# the parse is unambiguous.  ``_pca`` is a *method* suffix: applied last,
-# stripped first on parse, never composed with ``_from-`` (transfer
-# preserves the source method).  Default method is DiM (no suffix);
-# ``_pca`` opts into the legacy contrastive-PCA tensors that coexist with
-# the canonical DiM file.
+# The literals ``_sae-``, ``_from-``, and ``_role-`` are the *kind*
+# separators — no HF model id slug contains any of them, and the right-
+# hand-side slugs (release strings, safe-model-ids, role names) follow
+# the same ``[a-z0-9._-]`` discipline so the parse is unambiguous.
+# ``_pca`` is a *method* suffix: applied last, stripped first on parse,
+# never composed with ``_from-`` (transfer preserves the source method).
+# Default method is DiM (no suffix); ``_pca`` opts into the legacy
+# contrastive-PCA tensors that coexist with the canonical DiM file.
+# Kind suffixes are mutually exclusive in v1 — a tensor is at most one
+# of {SAE, transferred, role}.
 _VARIANT_SEP_SAE = "_sae-"
 _VARIANT_SEP_FROM = "_from-"
+_VARIANT_SEP_ROLE = "_role-"
 _METHOD_SUFFIX_PCA = "_pca"
 _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
     (_VARIANT_SEP_SAE, "sae"),
     (_VARIANT_SEP_FROM, "from"),
+    (_VARIANT_SEP_ROLE, "role"),
 )
 # Back-compat: the old single-separator alias many callers already
 # imported.  Kept identical to the SAE form because that's what every
@@ -136,19 +142,34 @@ def safe_from_suffix(source_safe_id: str | None) -> str:
     return f"{_VARIANT_SEP_FROM}{slug}"
 
 
+def safe_role_suffix(role_name: str | None) -> str:
+    """Filename suffix for a role variant.  ``None``/``""`` = raw (no suffix).
+
+    The role name is slugified with the same ``[a-z0-9._-]`` discipline
+    as :func:`safe_sae_suffix` — lowercased, unsafe characters collapsed
+    to ``_`` — so the parse is unambiguous against neighbouring kind
+    separators.
+    """
+    if not role_name:
+        return ""
+    slug = _UNSAFE_VARIANT_CHARS.sub("_", role_name.lower())
+    return f"{_VARIANT_SEP_ROLE}{slug}"
+
+
 def tensor_filename(
     model_id: str,
     *,
     release: str | None = None,
     transferred_from: str | None = None,
     method: str = "dim",
+    role: str | None = None,
 ) -> str:
     """Construct the canonical tensor filename.
 
-    Exactly one of ``release`` and ``transferred_from`` may be set —
-    SAE-on-transferred and transferred-on-SAE are not supported as
-    composed variants in v1.6.  ``transferred_from`` accepts either an
-    HF model id (``"google/gemma-3-4b-it"``) or its safe form
+    At most one of ``release``, ``transferred_from``, and ``role`` may be
+    set — composed kind variants (SAE-on-transferred, role-on-SAE, etc.)
+    are not supported in v1.  ``transferred_from`` accepts either an HF
+    model id (``"google/gemma-3-4b-it"``) or its safe form
     (``"google__gemma-3-4b-it"``); both flatten to the same slug.
 
     ``method`` controls the trailing method suffix:
@@ -159,11 +180,15 @@ def tensor_filename(
         with a ``_pca`` suffix appended after any kind suffix.
         ``transferred_from`` rejects ``method="pca"`` because transfers
         preserve their source method (the source's sidecar carries the
-        provenance string).
+        provenance string).  ``role`` composes with ``method="pca"``.
+
+    ``role`` (optional) names a role/persona variant; the filename gets
+    a ``_role-<safe_role>`` suffix, slugified like the SAE release slug.
     """
-    if release and transferred_from:
+    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
         raise ValueError(
-            "tensor_filename: release and transferred_from are mutually exclusive"
+            "tensor_filename: release, transferred_from, and role are "
+            "mutually exclusive"
         )
     if transferred_from and method != "dim":
         raise ValueError(
@@ -181,6 +206,10 @@ def tensor_filename(
         # whichever they have.
         src = safe_model_id(transferred_from)
         return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.safetensors"
+    if role:
+        return (
+            f"{safe_model_id(model_id)}{safe_role_suffix(role)}{suffix}.safetensors"
+        )
     return f"{safe_model_id(model_id)}{suffix}.safetensors"
 
 
@@ -190,11 +219,13 @@ def sidecar_filename(
     release: str | None = None,
     transferred_from: str | None = None,
     method: str = "dim",
+    role: str | None = None,
 ) -> str:
     """Sidecar JSON partner for a tensor filename."""
-    if release and transferred_from:
+    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
         raise ValueError(
-            "sidecar_filename: release and transferred_from are mutually exclusive"
+            "sidecar_filename: release, transferred_from, and role are "
+            "mutually exclusive"
         )
     if transferred_from and method != "dim":
         raise ValueError(
@@ -207,6 +238,8 @@ def sidecar_filename(
     if transferred_from:
         src = safe_model_id(transferred_from)
         return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.json"
+    if role:
+        return f"{safe_model_id(model_id)}{safe_role_suffix(role)}{suffix}.json"
     return f"{safe_model_id(model_id)}{suffix}.json"
 
 
@@ -222,6 +255,8 @@ def parse_tensor_filename(
       * ``"sae-<release>-pca"`` — SAE-PCA variant (legacy).
       * ``"from-<safe_src>"`` — transferred-from variant (method-agnostic;
         transfers preserve source method).
+      * ``"role-<name>"`` — role variant (DiM).
+      * ``"role-<name>-pca"`` — role variant with legacy PCA method.
 
     The variant string carries its kind / method tags so callers can
     dispatch without re-parsing.  Returns ``None`` for filenames that

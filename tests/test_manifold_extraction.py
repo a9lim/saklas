@@ -22,7 +22,7 @@ _DIM = 8
 _N_LAYERS = 4
 
 
-def _stub_encoder(model, tokenizer, text, layers, device):
+def _stub_encoder(model, tokenizer, text, layers, device, **_kwargs):
     """Synthetic per-layer activations, deterministic per node label."""
     label = text.split()[0]
     seed = abs(hash(label)) % 100_000

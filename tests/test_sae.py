@@ -122,7 +122,7 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch):
     from saklas.core import vectors as V
     from saklas.core.sae import MockSaeBackend
 
-    def fake_encode_and_capture(model, tokenizer, text, layers, device):
+    def fake_encode_and_capture(model, tokenizer, text, layers, device, **_kwargs):
         torch.manual_seed(hash(text) & 0xFFFF)
         out = {}
         for idx in range(len(layers)):
@@ -163,7 +163,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
 
     torch.manual_seed(0)
 
-    def fake_encode_and_capture(model, tokenizer, text, layers, device):
+    def fake_encode_and_capture(model, tokenizer, text, layers, device, **_kwargs):
         out = {}
         for idx in range(len(layers)):
             base = torch.zeros(4)
@@ -233,7 +233,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
     # Seed so the noise doesn't flip signs or perturb magnitudes.
     torch.manual_seed(0)
 
-    def fake_encode_and_capture(model, tokenizer, text, layers, device):
+    def fake_encode_and_capture(model, tokenizer, text, layers, device, **_kwargs):
         # Layer 0: high-SNR separation (evr near 1.0)
         # Layer 1: low-SNR separation (evr lower — noise dominates)
         out = {}
@@ -440,7 +440,7 @@ def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypat
     torch.manual_seed(0)
     N = 10
 
-    def fake_encode(model, tokenizer, text, layers, device):
+    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
         sign = 1.0 if "pos" in text else -1.0
         return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
                 for i in range(N)}
@@ -470,7 +470,7 @@ def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch):
     torch.manual_seed(0)
     N = 6
 
-    def fake_encode(model, tokenizer, text, layers, device):
+    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
         sign = 1.0 if "pos" in text else -1.0
         return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
                 for i in range(N)}
@@ -504,7 +504,7 @@ def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch):
     # Layers 0..3: clean opposite-sign separation (pos = +e0, neg = -e0).
     # Layers 4..7: both poles project +e0 from baseline (= 0) — both
     # land on the *same side* of the neutral.  DLS should drop these.
-    def fake_encode(model, tokenizer, text, layers, device):
+    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
         is_pos = "pos" in text
         out = {}
         for i in range(N):
@@ -547,7 +547,7 @@ def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch):
     N = 4
 
     # Both poles always lean positive — nothing is discriminative.
-    def fake_encode(model, tokenizer, text, layers, device):
+    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
         is_pos = "pos" in text
         return {i: torch.tensor(
             [0.7 if is_pos else 0.3, 0.0, 0.0, 0.0],

@@ -420,6 +420,64 @@ def test_enumerate_variants_nonexistent_folder(tmp_path: Path):
     assert enumerate_variants(tmp_path / "does-not-exist", "any/model") == {}
 
 
+def test_variants_for_concept_includes_role(tmp_path: Path):
+    """enumerate_variants surfaces role-tagged tensors alongside the raw tensor."""
+    from saklas.io.packs import enumerate_variants
+
+    folder = tmp_path / "honest.deceptive"
+    folder.mkdir()
+    # Raw
+    (folder / "google__gemma-2-2b-it.safetensors").write_bytes(b"")
+    (folder / "google__gemma-2-2b-it.json").write_text("{}")
+    # Role variant
+    (folder / "google__gemma-2-2b-it_role-pirate.safetensors").write_bytes(b"")
+    (folder / "google__gemma-2-2b-it_role-pirate.json").write_text("{}")
+
+    result = enumerate_variants(folder, "google/gemma-2-2b-it")
+    assert set(result.keys()) == {"raw", "role-pirate"}
+    assert result["role-pirate"].name == "google__gemma-2-2b-it_role-pirate.safetensors"
+
+
+def test_variants_for_concept_role_and_pca_combo(tmp_path: Path):
+    """Role and role-PCA variants are surfaced under distinct keys."""
+    from saklas.io.packs import enumerate_variants
+
+    folder = tmp_path / "honest.deceptive"
+    folder.mkdir()
+    (folder / "google__gemma-2-2b-it_role-pirate.safetensors").write_bytes(b"")
+    (folder / "google__gemma-2-2b-it_role-pirate.json").write_text("{}")
+    (folder / "google__gemma-2-2b-it_role-pirate_pca.safetensors").write_bytes(b"")
+    (folder / "google__gemma-2-2b-it_role-pirate_pca.json").write_text("{}")
+
+    result = enumerate_variants(folder, "google/gemma-2-2b-it")
+    assert set(result.keys()) == {"role-pirate", "role-pirate-pca"}
+    assert result["role-pirate"].name == "google__gemma-2-2b-it_role-pirate.safetensors"
+    assert result["role-pirate-pca"].name == (
+        "google__gemma-2-2b-it_role-pirate_pca.safetensors"
+    )
+
+
+def test_sidecar_role_roundtrip(tmp_path: Path):
+    """Sidecar.role survives a to_dict / from_dict round-trip via write/load."""
+    p = tmp_path / "google__gemma-2-2b-it_role-pirate.json"
+    sc = packs.Sidecar(
+        method="difference_of_means",
+        saklas_version="3.2.0",
+        role="pirate",
+    )
+    sc.write(p)
+    loaded = packs.Sidecar.load(p)
+    assert loaded.role == "pirate"
+    # Round-trip preserves the field through serialization too.
+    assert sc.to_dict()["role"] == "pirate"
+    # Absent role stays absent on the wire (no null/empty leakage).
+    sc_no_role = packs.Sidecar(
+        method="difference_of_means",
+        saklas_version="3.2.0",
+    )
+    assert "role" not in sc_no_role.to_dict()
+
+
 def test_save_profile_writes_sae_sidecar_fields(tmp_path: Path):
     """save_profile with sae metadata writes sae_release/sae_ids_by_layer to sidecar."""
     import json

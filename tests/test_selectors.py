@@ -370,6 +370,59 @@ def test_parse_rejects_unknown_variant():
         parse("honest:garbage")
 
 
+def test_parse_role_variant():
+    """parse() with a :role-<id> suffix strips the variant, keeps Selector.value as the bare name."""
+    from saklas.io.selectors import parse
+    s = parse("honest:role-pirate")
+    assert s.kind == "name"
+    assert s.value == "honest"
+    assert s.namespace is None
+
+
+def test_resolve_pole_role_variant(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "angry.calm")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.io.selectors import resolve_pole, invalidate
+    invalidate()
+
+    canonical, sign, match, variant = resolve_pole("angry:role-pirate")
+    assert canonical == "angry.calm"
+    assert sign == 1
+    assert match is not None
+    assert variant == "role-pirate"
+
+
+def test_resolve_pole_role_with_dotted_id(tmp_path, monkeypatch):
+    _install_minimal_pack(tmp_path, "happy.sad")
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    from saklas.io.selectors import resolve_pole, invalidate
+    invalidate()
+
+    canonical, sign, match, variant = resolve_pole("happy.sad:role-mad-scientist")
+    assert canonical == "happy.sad"
+    assert sign == 1
+    assert match is not None
+    assert variant == "role-mad-scientist"
+
+
+def test_parse_role_variant_invalid_slug():
+    """Uppercase id rejected — matches the SAE precedent for `sae-FOO`."""
+    import pytest as _pt
+    from saklas.io.selectors import parse, SelectorError
+    with _pt.raises(SelectorError):
+        parse("honest:role-PIRATE")
+
+
+def test_parse_role_with_namespace():
+    from saklas.io.selectors import parse
+    s = parse("default/honest:role-pirate")
+    assert s.kind == "name"
+    assert s.value == "honest"
+    assert s.namespace == "default"
+
+
 def test_materialize_then_invalidate_makes_bundled_visible(monkeypatch, tmp_path):
     """The contract `SaklasSession.__init__` relies on for bundled visibility.
 

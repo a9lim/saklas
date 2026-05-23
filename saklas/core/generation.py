@@ -511,7 +511,7 @@ class _PenaltyState:
 # cheaply to tuples so the per-lookup hash cost is negligible.
 _CHAT_INPUT_CACHE_MAX = 128
 _chat_input_cache: dict[
-    tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool],
+    tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool, str | None],
     torch.Tensor,
 ] = {}
 
@@ -522,13 +522,15 @@ def _chat_input_cache_key(
     system_prompt: str | None,
     thinking: bool,
     add_generation_prompt: bool,
-) -> tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool]:
+    role: str | None = None,
+) -> tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool, str | None]:
     return (
         id(tokenizer),
         system_prompt,
         tuple((m["role"], m["content"]) for m in chat),
         thinking,
         add_generation_prompt,
+        role,
     )
 
 
@@ -539,7 +541,19 @@ def build_chat_input(
     thinking: bool = False,
     *,
     add_generation_prompt: bool = True,
+    role: str | None = None,
+    model_type: str | None = None,
 ) -> torch.Tensor:
+    """Render a chat history to ``input_ids``.
+
+    ``role`` (optional): substitute a custom assistant-role label into the
+    rendered chat template via
+    :func:`saklas.core.role_templates.apply_with_role`.  ``role=None`` (the
+    default) is a zero-overhead pass-through to
+    ``tokenizer.apply_chat_template``.  When ``role`` is set,
+    ``model_type`` is required so the family's role-header registry entry
+    can be looked up; pass ``model.config.model_type``.
+    """
     chat = []
     if system_prompt:
         chat.append({"role": "system", "content": system_prompt})
@@ -548,8 +562,11 @@ def build_chat_input(
         # Cache lookup: see _chat_input_cache docstring for invalidation
         # semantics.  Only the chat-template branch is cached — the
         # base-model fallback is sub-ms and not worth complicating.
+        # ``role`` participates in the key so role-tagged renders never
+        # collide with plain renders of the same chat.
         key = _chat_input_cache_key(
-            tokenizer, chat, system_prompt, thinking, add_generation_prompt,
+            tokenizer, chat, system_prompt, thinking,
+            add_generation_prompt, role,
         )
         cached = _chat_input_cache.get(key)
         if cached is not None:
@@ -559,10 +576,26 @@ def build_chat_input(
         kwargs: dict = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = thinking
-        result = tokenizer.apply_chat_template(
-            chat, add_generation_prompt=add_generation_prompt,
-            return_tensors="pt", **kwargs,
-        )
+        if role is None:
+            result = tokenizer.apply_chat_template(
+                chat, add_generation_prompt=add_generation_prompt,
+                return_tensors="pt", **kwargs,
+            )
+        else:
+            if model_type is None:
+                raise ValueError(
+                    "build_chat_input: role= requires model_type= "
+                    "(model.config.model_type) so the family's role-header "
+                    "registry entry can be looked up"
+                )
+            from saklas.core.role_templates import apply_with_role
+            result = apply_with_role(
+                tokenizer, chat,
+                role=role, model_type=model_type,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True, return_tensors="pt",
+                **kwargs,
+            )
         # Some tokenizers return a BatchEncoding dict instead of a raw tensor
         if isinstance(result, torch.Tensor):
             tensor = result
@@ -578,7 +611,11 @@ def build_chat_input(
             _chat_input_cache.pop(next(iter(_chat_input_cache)))
         _chat_input_cache[key] = tensor
         return tensor.clone()
-    # Base model without chat template — add minimal role markers
+    # Base model without chat template — add minimal role markers.
+    # ``role`` has no chat template to splice into; the base-model
+    # surface is raw-completion and roles are irrelevant.  Silently
+    # ignore the kwarg here rather than raising — the engine routes
+    # base-model traffic to the raw path before this branch fires.
     text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in chat) + "\nAssistant:"
     return tokenizer(text, return_tensors="pt")["input_ids"]
 

@@ -64,6 +64,10 @@ class _Stub(SaklasSession):
         # neutral-activation build path.
         self._whitener = None
         self._layer_means = {}
+        # Active assistant role (role-extraction Phase 7) — populated by
+        # the steering scope's __enter__ when role-augmented terms agree
+        # on a role, restored to None on exit.
+        self._active_role: str | None = None
         self.events = EventBus()
         self._rebuild_calls: list[dict[str, float]] = []
         self._rebuild_entries: list[dict[str, tuple[float, Trigger]]] = []
@@ -274,3 +278,105 @@ def test_autoload_cache_hit_registers_bundled_vector(monkeypatch, tmp_path):
     assert 0 in s._profiles["myprobe"] and 1 in s._profiles["myprobe"]
     s._try_autoload_vector("no_such_concept")
     assert "no_such_concept" not in s._profiles
+
+
+# ---------------------------------------------------------------------------
+# Role-augmented steering (role-extraction Phase 7)
+# ---------------------------------------------------------------------------
+
+
+class TestRoleUnanimity:
+    """``session.steering()`` enforces that every role-tagged term in one
+    scope agrees on a single role, and surfaces the union to
+    ``session._active_role`` so the generation prompt can splice the
+    matching assistant-role label.
+    """
+
+    def test_role_unanimity_violation(self):
+        from saklas.core.steering_expr import SteeringExprError
+        s = _Stub({
+            "honest.deceptive:role-pirate": None,
+            "honest.deceptive:role-sage": None,
+        })
+        with pytest.raises(SteeringExprError) as info:
+            with s.steering(
+                "0.5 honest.deceptive:role-pirate "
+                "+ 0.3 honest.deceptive:role-sage",
+            ):
+                pass
+        # The error message names both conflicting roles so the user
+        # doesn't have to guess which term they need to drop.
+        msg = str(info.value)
+        assert "pirate" in msg
+        assert "sage" in msg
+
+    def test_role_unanimity_same_role_ok(self):
+        s = _Stub({
+            "honest.deceptive:role-pirate": None,
+            "angry.calm:role-pirate": None,
+        })
+        with s.steering(
+            "0.5 honest.deceptive:role-pirate "
+            "+ 0.3 angry.calm:role-pirate",
+        ):
+            # Active role is the shared label.
+            assert s._active_role == "pirate"
+            # Stack landed both entries — no parser rejection on the
+            # unanimous-role path.
+            entries = s._steering_stack[0]
+            assert "honest.deceptive:role-pirate" in entries
+            assert "angry.calm:role-pirate" in entries
+        # Restored to no-role on scope exit.
+        assert s._active_role is None
+
+    def test_plain_and_role_mixing_warns(self):
+        import warnings
+        from saklas.core.errors import RoleBaselineMismatchWarning
+        s = _Stub({
+            "honest.deceptive": None,
+            "angry.calm:role-pirate": None,
+        })
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with s.steering(
+                "0.5 honest.deceptive + 0.3 angry.calm:role-pirate",
+            ):
+                # Active role still reflects the role-tagged term.
+                assert s._active_role == "pirate"
+            mismatch = [
+                w for w in caught
+                if issubclass(w.category, RoleBaselineMismatchWarning)
+            ]
+            assert len(mismatch) >= 1
+            assert "pirate" in str(mismatch[0].message)
+        assert s._active_role is None
+
+    def test_role_only_in_expression_inherits(self):
+        """A pure role expression (no plain terms) lifts the role without
+        warning."""
+        import warnings
+        from saklas.core.errors import RoleBaselineMismatchWarning
+        s = _Stub({"honest.deceptive:role-pirate": None})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with s.steering("0.5 honest.deceptive:role-pirate"):
+                assert s._active_role == "pirate"
+            assert not [
+                w for w in caught
+                if issubclass(w.category, RoleBaselineMismatchWarning)
+            ]
+        assert s._active_role is None
+
+    def test_nested_role_scopes_inner_wins(self):
+        """An inner role scope overrides the outer's active_role for the
+        inner scope only; the outer is restored on inner exit."""
+        s = _Stub({
+            "honest.deceptive:role-pirate": None,
+            "angry.calm:role-sage": None,
+        })
+        with s.steering("0.5 honest.deceptive:role-pirate"):
+            assert s._active_role == "pirate"
+            with s.steering("0.3 angry.calm:role-sage"):
+                assert s._active_role == "sage"
+            assert s._active_role == "pirate"
+        assert s._active_role is None

@@ -76,6 +76,17 @@ class UnknownVariantError(KeyError, SaklasError):
         return (404, str(msg))
 
 
+class RoleBaselineMismatchWarning(UserWarning):
+    """Warns that a role-augmented steering expression mixes a plain term
+    in.  The plain term's baseline was the family's standard ``assistant``
+    role label; the role-augmented terms substitute a custom role label
+    into the chat-template render.  Composing them is supported but the
+    plain term's baseline doesn't track the substituted role, so the
+    interaction may behave unexpectedly.  The warning fires once per
+    mixed-baseline ``steering()`` scope.
+    """
+
+
 class StaleSidecarError(ValueError, SaklasError):
     """Raised when an extracted tensor's recorded ``statements_sha256``
     disagrees with the live ``statements.json`` on disk.

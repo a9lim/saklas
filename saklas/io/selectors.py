@@ -25,7 +25,7 @@ from saklas.core.errors import SaklasError
 from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata
 from saklas.io.paths import vectors_dir
 
-_VARIANT_REGEX = _re.compile(r"^(raw|pca|sae(?:-[a-z0-9._-]+)?)$")
+_VARIANT_REGEX = _re.compile(r"^(raw|pca|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?)$")
 
 
 class SelectorError(ValueError, SaklasError):
@@ -180,9 +180,9 @@ def resolve_pole(
 
     Grammar: ``<name_part>[":"<variant>]`` where ``<variant>`` is ``raw``
     (the default when no suffix is present), ``sae`` (unique SAE variant),
-    or ``sae-<release>``. The name part feeds the existing pole-alias
-    pipeline; variant is passed through unchanged for callers to propagate
-    to autoload / registry-key selection.
+    ``sae-<release>``, ``role``, or ``role-<id>``. The name part feeds the
+    existing pole-alias pipeline; variant is passed through unchanged for
+    callers to propagate to autoload / registry-key selection.
 
     Alias resolution for bipolar packs: if the user types a single-pole
     name that appears on either side of an installed bipolar concept,
@@ -202,7 +202,8 @@ def resolve_pole(
 
     Raises:
         SelectorError: when the ``:variant`` suffix doesn't match
-            ``_VARIANT_REGEX`` (``raw`` | ``sae`` | ``sae-<release>``).
+            ``_VARIANT_REGEX`` (``raw`` | ``pca`` | ``sae`` |
+            ``sae-<release>`` | ``role`` | ``role-<id>``).
         AmbiguousSelectorError: when multiple installed concepts match
             the input under different canonical names (e.g. both
             ``alice/angry`` and ``default/angry.calm`` exist and the
