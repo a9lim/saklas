@@ -243,6 +243,7 @@ def test_apply_with_role_none_unsupported_family_passes_through():
     expected = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     # Mistral template ignores add_generation_prompt, so both renders match.
     # Use add_generation_prompt=False to align both calls.
+    assert out == expected
     out_no_gen = apply_with_role(
         tok,
         messages,

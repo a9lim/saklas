@@ -122,10 +122,7 @@
 
   const variantOptions = $derived.by(() => {
     const opts: VectorRackEntry["variant"][] = ["raw", "sae"];
-    if (
-      entry.variant.startsWith("sae-") &&
-      !opts.includes(entry.variant)
-    ) {
+    if (!opts.includes(entry.variant)) {
       opts.push(entry.variant);
     }
     return opts;

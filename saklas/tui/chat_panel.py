@@ -34,6 +34,7 @@ _KIND_LABELS: dict[str, str] = {
     "raw_continue": "continue",
     "commit_user": "commit",
     "commit_assistant": "commit",
+    "raw_commit": "commit",
     "regenerate": "regen",
     "rewind": "/rewind",
     "clear": "/clear",
@@ -64,6 +65,7 @@ _KIND_ENDS_ON_USER_NODE: dict[str, bool] = {
     "submit": False,           # send → assistant
     "commit_user": True,       # user turn lands → active = user
     "commit_assistant": False, # assistant turn lands → active = assistant
+    "raw_commit": True,        # raw span lands as a flat user node
     "regenerate": False,       # new assistant sibling
     "rewind": True,            # rewinds to the previous user turn
     "clear": False,            # resets to root (system, not user)
@@ -789,6 +791,11 @@ class RawBuffer(Vertical):
     def draft(self) -> str:
         """The buffer's current editable text."""
         return self._textarea.text if self._textarea is not None else ""
+
+    @property
+    def is_dirty(self) -> bool:
+        """True when the visible draft diverges from the committed tree."""
+        return self._dirty
 
     def focus_input(self) -> None:
         if self._textarea is not None:

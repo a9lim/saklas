@@ -466,6 +466,42 @@ class TestWebSocket:
                         break
                     assert msg["type"] == "token"
 
+    def test_mid_generation_generate_frame_runs_after_current_turn(self, session_and_client):
+        """A premature second generate frame is deferred, not re-read in a spin loop."""
+        session, client = session_and_client
+        calls: list[str] = []
+
+        def _gen(input, *, steering=None, sampling=None, stateless=False,
+                 raw=False, thinking=None, on_token=None,
+                 parent_node_id=None, n=1):
+            calls.append(str(input))
+            time.sleep(0.02 if input == "one" else 0.001)
+            on_token(str(input), False, 1000 + len(calls), None, None)
+            result = GenerationResult(
+                text=str(input), tokens=[1000 + len(calls)],
+                token_count=1, tok_per_sec=50.0, elapsed=0.02,
+                finish_reason="stop",
+            )
+            session._last_result = result
+            session.last_result = result
+            session._last_per_token_scores = {}
+            session.last_per_token_scores = {}
+            return result
+
+        session.generate.side_effect = _gen
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "one"})
+            ws.send_json({"type": "generate", "input": "two"})
+            done = []
+            while len(done) < 2:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    done.append(msg["result"]["text"])
+
+        assert done == ["one", "two"]
+        assert calls == ["one", "two"]
+
     def test_idle_stop_is_noop(self, session_and_client):
         """A ``{type: "stop"}`` outside any generation closes cleanly."""
         _, client = session_and_client
@@ -502,6 +538,14 @@ class TestWebSocket:
         with client.websocket_connect(
             "/saklas/v1/sessions/default/stream",
             headers={"Authorization": "Bearer s3cret"},
+        ) as ws:
+            ws.send_json({"type": "frobnicate"})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+        # Browser clients cannot set Authorization on the WS constructor;
+        # the dashboard sends the bearer as ?token=...
+        with client.websocket_connect(
+            "/saklas/v1/sessions/default/stream?token=s3cret",
         ) as ws:
             ws.send_json({"type": "frobnicate"})
             msg = ws.receive_json()

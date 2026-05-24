@@ -8,7 +8,7 @@
 //   coord_list := signed_num ("," signed_num)*
 //   atom     := [ns "/"] NAME ["." NAME] [":" variant]
 //   trigger  := before|after|both|thinking|response|prompt|generated
-//   variant  := raw | sae | sae-<release>
+//   variant  := raw | pca | sae | sae-<release> | role | role-<name>
 //
 // A ``%`` selector is the manifold operator — ``<manifold> % a,b,...``
 // places generation at a point of a fitted steering manifold.  The
@@ -472,13 +472,13 @@ class Parser {
       this.consume();
       const v = this.expect("IDENT");
       const vs = String(v.value);
-      if (vs === "sae" || vs === "raw") {
+      if (vs === "raw" || vs === "pca" || vs === "sae" || vs === "role") {
         variant = vs as Variant;
-      } else if (vs.startsWith("sae-")) {
+      } else if (vs.startsWith("sae-") || vs.startsWith("role-")) {
         variant = vs as Variant;
       } else {
         throw new ExpressionParseError(
-          `unknown variant ':${vs}'; expected raw, sae, or sae-<release>`,
+          `unknown variant ':${vs}'; expected raw, pca, sae, sae-<release>, role, or role-<name>`,
           this.src,
           v.col,
         );

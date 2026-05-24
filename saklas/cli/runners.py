@@ -1808,7 +1808,6 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     inspectable corpora) and lets the user review the statements before
     paying for the discover fit.
     """
-    import json as _json
     from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
         ManifoldFormatError,

@@ -34,6 +34,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
@@ -656,10 +657,10 @@ def register_ollama_routes(app: FastAPI) -> None:
 
         ``gen_kwargs`` and ``system`` are resolved by the caller (the
         route handler) so any ``SaklasError`` from ``parse_expr`` raises
-        *before* ``StreamingResponse`` flushes headers. Once the stream
-        has started, FastAPI's exception handler can no longer convert
-        an exception to a 400 — the client would just see a TCP cutoff
-        mid-stream.
+        *before* ``StreamingResponse`` flushes headers. Materialization
+        errors can still happen when generation starts, so the iterator
+        also converts ``SaklasError`` in-band instead of cutting the TCP
+        stream off mid-flight.
         """
         if is_chat:
             msgs = _extract_messages(body)
@@ -734,6 +735,14 @@ def register_ollama_routes(app: FastAPI) -> None:
                     yield json.dumps({
                         "model": model_name, "created_at": _now_iso(),
                         "error": "Generation already in progress",
+                    }) + "\n"
+                    return
+                except SaklasError as e:
+                    _status, msg = e.user_message()
+                    yield json.dumps({
+                        "model": model_name,
+                        "created_at": _now_iso(),
+                        "error": msg,
                     }) + "\n"
                     return
 

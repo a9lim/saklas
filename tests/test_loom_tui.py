@@ -1269,6 +1269,59 @@ def test_commit_action_during_gen_queues_commit_assistant_with_target():
     app._session.stop.assert_not_called()
 
 
+def test_raw_commit_action_uses_buffer_draft():
+    """Ctrl+Enter in raw mode commits the flat buffer edit."""
+    app = _make_app()
+    app._render_mode = "raw"
+    app._chat_panel.raw_buffer = SimpleNamespace(
+        draft="existing text plus edit",
+        is_dirty=True,
+    )
+    app._commit_raw_draft = MagicMock()
+
+    app.action_commit_text()
+
+    app._commit_raw_draft.assert_called_once_with("existing text plus edit")
+
+
+def test_dispatch_pending_raw_commit_routes_correctly():
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._start_raw_commit = MagicMock()
+
+    app._dispatch_pending_action(PendingItem("raw_commit", "queued flat text"))
+
+    app._start_raw_commit.assert_called_once_with("queued flat text")
+
+
+def test_nav_refuses_dirty_raw_buffer():
+    app = _make_app()
+    tree = app._session.tree
+    _uid, aid = _seed_tree(tree)
+    tree.navigate(tree.root_id)
+    app._render_mode = "raw"
+    app._chat_panel.raw_buffer = SimpleNamespace(is_dirty=True)
+
+    app._handle_nav(aid[:8])
+
+    assert tree.active_node_id != aid
+    assert "uncommitted edits" in _msgs(app)
+
+
+def test_raw_edit_resyncs_buffer_after_tree_mutation():
+    app = _make_app()
+    tree = app._session.tree
+    _uid, aid = _seed_tree(tree)
+    tree.navigate(aid)
+    app._render_mode = "raw"
+    app._sync_raw_buffer_from_tree = MagicMock()
+
+    app._handle_edit("edited text")
+
+    app._sync_raw_buffer_from_tree.assert_called_once()
+
+
 def test_dispatch_pending_commit_user_routes_correctly():
     """``_dispatch_pending_action(PendingItem("commit_user", text))`` calls
     ``_start_commit_user`` — the post-gen wakeup path."""

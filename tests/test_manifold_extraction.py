@@ -364,6 +364,7 @@ def test_discover_cache_invalidates_on_hyperparam_change(tmp_path):
     m2 = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
     # The two fits agree on at most max_dim=2, so the second's intrinsic
     # dim is bounded by 2; if cache had hit we'd still see m1's dim.
+    assert m1.domain.intrinsic_dim >= m2.domain.intrinsic_dim
     assert m2.domain.intrinsic_dim <= 2
 
 

@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, TokenEvent
-from saklas.core.session import ConcurrentGenerationError
+from saklas.core.session import ConcurrentGenerationError, VectorNotRegisteredError
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +169,34 @@ class TestChatCompletions:
         done_idx = next(i for i, l in enumerate(lines) if l == "data: [DONE]")
         final = json.loads(lines[done_idx - 1].removeprefix("data: "))
         assert final["choices"][0]["finish_reason"] == "stop"
+
+    def test_streaming_saklas_error_is_sent_in_band(self, session_and_client):
+        session, client = session_and_client
+
+        def _mock_stream(*args, **kwargs):
+            if False:
+                yield TokenEvent(text="", token_id=0, index=0)
+            raise VectorNotRegisteredError("No vector registered for 'missing'")
+
+        session.generate_stream.return_value = _mock_stream()
+
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "steering": "0.5 missing",
+        })
+        assert resp.status_code == 200
+
+        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data: ")]
+        chunks = [
+            json.loads(l.removeprefix("data: "))
+            for l in lines
+            if l != "data: [DONE]"
+        ]
+        err = next(c["error"] for c in chunks if "error" in c)
+        assert err["code"] == 404
+        assert err["type"] == "invalid_request_error"
+        assert "No vector registered for 'missing'" in err["message"]
 
     def test_conflict_on_concurrent_generation(self, session_and_client):
         session, client = session_and_client
@@ -461,6 +489,30 @@ class TestOllamaApi:
         assert final["eval_count"] == 2
         assert final["prompt_eval_count"] == 3
         assert final["message"]["content"] == ""
+
+    def test_chat_streaming_materialization_error_is_ndjson(self, session_and_client):
+        session, client = session_and_client
+
+        def _mock_stream(*args, **kwargs):
+            if False:
+                yield TokenEvent(text="", token_id=0, index=0)
+            raise VectorNotRegisteredError("No vector registered for 'missing'")
+
+        session.generate_stream.return_value = _mock_stream()
+
+        resp = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "options": {"steer": "0.5 missing"},
+        })
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        lines = [json.loads(l) for l in resp.text.strip().split("\n") if l]
+        assert lines == [{
+            "model": "test/model",
+            "created_at": lines[0]["created_at"],
+            "error": "No vector registered for 'missing'",
+        }]
 
     def test_generate_non_streaming(self, session_and_client):
         session, client = session_and_client

@@ -21,8 +21,14 @@ export type Trigger =
   | "PROMPT" // alias of BEFORE
   | "GENERATED"; // alias of RESPONSE
 
-/** SAE variant suffix — ``raw`` (default), ``sae`` (unique), ``sae-<release>``. */
-export type Variant = "raw" | "sae" | `sae-${string}`;
+/** Tensor variant suffix from the shared steering grammar. */
+export type Variant =
+  | "raw"
+  | "pca"
+  | "sae"
+  | `sae-${string}`
+  | "role"
+  | `role-${string}`;
 
 // ----------------------------------------------------- session info --
 

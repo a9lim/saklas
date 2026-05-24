@@ -480,9 +480,7 @@ class SaklasApp(App[None]):
         # so the surface is correct from the start.  Toggle with /mode.
         self._chat_panel.set_render_mode(self._render_mode)
         if self._render_mode == "raw":
-            self._chat_panel.raw_buffer.sync_committed(
-                self._session.tree.flat_text()
-            )
+            self._sync_raw_buffer_from_tree()
 
         loaded = (
             f"Model loaded: "
@@ -1431,9 +1429,7 @@ class SaklasApp(App[None]):
         self._assistant_messages.clear()
         self._row_for_widget.clear()
         if self._raw_mode:
-            self._chat_panel.raw_buffer.sync_committed(
-                self._session.tree.flat_text()
-            )
+            self._sync_raw_buffer_from_tree()
         self._trait_panel.update_values({}, {}, {})
         self._refresh_trait_why()
         self._chat_panel.add_system_message("Chat history cleared.")
@@ -1466,12 +1462,7 @@ class SaklasApp(App[None]):
         if self._raw_mode:
             # Raw mode has no turn rows — re-sync the flat buffer from
             # the navigated active path instead of rebuilding the log.
-            rb = chat.raw_buffer
-            rb.sync_committed(self._session.tree.flat_text())
-            rb.apply_highlight(
-                self._highlighting,
-                self._highlight_probe if self._highlighting else None,
-            )
+            self._sync_raw_buffer_from_tree()
             self._refresh_input_mode()
             return
         # Resolve the highlight probe the same way ``_apply_highlight_to_all``
@@ -1526,9 +1517,7 @@ class SaklasApp(App[None]):
             wid: row for wid, row in self._row_for_widget.items() if row.is_mounted
         }
         if self._raw_mode:
-            self._chat_panel.raw_buffer.sync_committed(
-                self._session.tree.flat_text()
-            )
+            self._sync_raw_buffer_from_tree()
         self._chat_panel.add_system_message("Rewound to before last message.")
 
     def _refresh_gen_config(self) -> None:
@@ -1603,6 +1592,17 @@ class SaklasApp(App[None]):
     def _raw_mode(self) -> bool:
         """True when the chat panel is showing the flat completion buffer."""
         return self._render_mode == "raw"
+
+    def _sync_raw_buffer_from_tree(self) -> None:
+        """Refresh the raw buffer from the active loom path, if visible."""
+        if not self._raw_mode:
+            return
+        rb = self._chat_panel.raw_buffer
+        rb.sync_committed(self._session.tree.flat_text())
+        rb.apply_highlight(
+            self._highlighting,
+            self._highlight_probe if self._highlighting else None,
+        )
 
     def _start_generation(
         self,
@@ -1810,6 +1810,16 @@ class SaklasApp(App[None]):
         the now-visible one is repainted from the active path.  A/B is a
         chat-mode-only layout, so switching to raw drops it.
         """
+        if (
+            self._raw_mode
+            and mode == "chat"
+            and self._chat_panel.raw_buffer.is_dirty
+        ):
+            self._chat_panel.add_system_message(
+                "Raw buffer has uncommitted edits; press Ctrl+Enter to "
+                "commit them, or Enter to continue before switching."
+            )
+            return
         if mode not in ("chat", "raw"):
             self._chat_panel.add_system_message(
                 f"Unknown render mode '{mode}' — use chat or raw."
@@ -1827,11 +1837,7 @@ class SaklasApp(App[None]):
             cp.set_ab_mode(False)
         cp.set_render_mode(mode)
         if mode == "raw":
-            cp.raw_buffer.sync_committed(self._session.tree.flat_text())
-            cp.raw_buffer.apply_highlight(
-                self._highlighting,
-                self._highlight_probe if self._highlighting else None,
-            )
+            self._sync_raw_buffer_from_tree()
         else:
             self._repaint_chat_from_active_path()
         cp.add_system_message(f"Render mode: {mode}.")
@@ -1989,12 +1995,10 @@ class SaklasApp(App[None]):
         mid-stream would interleave UI in confusing ways.
         """
         if self._raw_mode:
-            # Raw mode is roleless — there is no commit-vs-prefill
-            # decision.  Edit the buffer directly and Enter to continue.
-            self._chat_panel.add_system_message(
-                "Commit is chat-mode only — in raw mode edit the buffer "
-                "and press Enter to continue."
-            )
+            # Raw mode is a single flat buffer: Ctrl+Enter lands the
+            # current divergent span without decoding, matching the web
+            # UI's commit-edit path.
+            self._commit_raw_draft(self._chat_panel.raw_buffer.draft)
             return
         try:
             inp = self._chat_panel.query_one("#chat-input", ChatInput)
@@ -2066,10 +2070,52 @@ class SaklasApp(App[None]):
         if not text:
             self._chat_panel.add_system_message("Usage: /commit <text>")
             return
+        if self._raw_mode:
+            draft = self._chat_panel.raw_buffer.draft + text
+            self._commit_raw_draft(draft)
+            return
         # The slash dispatcher already pushed the full ``/commit …``
         # line to input history before invoking this handler — don't
         # double-push.
         self._commit_with_text(text)
+
+    def _commit_raw_draft(
+        self, draft: str, *, replace_slot: int | None = None,
+    ) -> None:
+        """Land the raw buffer's divergent span without generating."""
+        if self._is_busy:
+            self._enqueue_pending(
+                PendingItem("raw_commit", draft), replace_slot=replace_slot,
+            )
+            return
+        self._start_raw_commit(draft)
+
+    def _start_raw_commit(self, draft: str) -> None:
+        tail, parent = self._resolve_raw_divergence(draft)
+        if tail == "":
+            self._chat_panel.add_system_message("raw commit: no pending edit.")
+            return
+
+        def _commit() -> None:
+            try:
+                self._session.append_user_turn(
+                    parent, tail, allow_any_parent=True,
+                )
+                self.call_from_thread(self._sync_raw_buffer_from_tree)
+                self.call_from_thread(
+                    self._chat_panel.add_system_message,
+                    "raw commit landed.",
+                )
+            except BaseException as e:
+                msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
+                self.call_from_thread(
+                    self._chat_panel.add_system_message,
+                    f"raw commit failed: {msg}",
+                )
+            finally:
+                self._ui_token_queue.put(("done", False))
+
+        self.run_worker(_commit, thread=True)
 
     def _start_commit_user(self, text: str) -> None:
         """Land a user turn under the active node without generating.
@@ -2268,6 +2314,13 @@ class SaklasApp(App[None]):
                     if row is not None:
                         self._fire_auto_regen(row)
                         break
+                    self._fire_auto_regen(None)
+                elif (
+                    self._loom_auto_regen_on
+                    and self._raw_mode
+                    and self._loom_auto_regen_mode != "unsteered"
+                    and not self._pending_queue
+                ):
                     self._fire_auto_regen(None)
 
                 # Drain one queued item per ``done`` — each item kicks
@@ -3383,9 +3436,12 @@ class SaklasApp(App[None]):
         chat = self._chat_panel
         try:
             if kind == "regenerate":
-                self._rewind_active_assistant()
-                chat.rewind_last_assistant()
-                self._start_generation()
+                if self._raw_mode:
+                    self._run_regen_n_worker(1)
+                else:
+                    self._rewind_active_assistant()
+                    chat.rewind_last_assistant()
+                    self._start_generation()
             elif kind == "submit":
                 # Phase 5 carries the role decision made at submit time
                 # so the deferred dispatch matches whatever the user-row
@@ -3414,6 +3470,8 @@ class SaklasApp(App[None]):
                     tail, raw_continuation=True,
                     raw_draft=text, raw_parent=parent,
                 )
+            elif kind == "raw_commit":
+                self._start_raw_commit(text)
             elif kind == "commit_user":
                 # Ctrl+Enter from a non-user active node, queued behind
                 # in-flight gen.  The role decision was made at submit
@@ -3514,10 +3572,10 @@ class SaklasApp(App[None]):
 
     def action_regenerate(self) -> None:
         if self._raw_mode:
-            self._chat_panel.add_system_message(
-                "Regen is chat-mode only — edit the buffer and press "
-                "Enter to continue."
-            )
+            if self._is_busy:
+                self._enqueue_pending(PendingItem("regenerate", "regen"))
+                return
+            self._run_regen_n_worker(1)
             return
         if not self._messages:
             return
@@ -3708,6 +3766,12 @@ class SaklasApp(App[None]):
 
         from saklas.tui.loom_screen import LoomScreen
 
+        if self._raw_mode and self._chat_panel.raw_buffer.is_dirty:
+            self._chat_panel.add_system_message(
+                "Raw buffer has uncommitted edits; press Ctrl+Enter to "
+                "commit them, or Enter to continue before opening the tree."
+            )
+            return
         try:
             self.push_screen(LoomScreen(self))
         except Exception as e:
@@ -3726,6 +3790,12 @@ class SaklasApp(App[None]):
         prefix = arg.strip()
         if not prefix:
             chat.add_system_message("Usage: /nav <id-prefix>")
+            return
+        if self._raw_mode and chat.raw_buffer.is_dirty:
+            chat.add_system_message(
+                "Raw buffer has uncommitted edits; press Ctrl+Enter to "
+                "commit them, or Enter to continue before navigating."
+            )
             return
         match = resolve_node_prefix(self._session.tree, prefix)
         if match.missing:
@@ -3775,6 +3845,7 @@ class SaklasApp(App[None]):
                 InvalidNodeOperationError, LoomTreeError) as e:
             chat.add_system_message(f"/edit failed: {e}")
             return
+        self._sync_raw_buffer_from_tree()
         chat.add_system_message(f"edited {target[:8]}")
 
     def action_edit_active(self) -> None:
@@ -3811,6 +3882,7 @@ class SaklasApp(App[None]):
                 InvalidNodeOperationError, LoomTreeError) as e:
             chat.add_system_message(f"/branch failed: {e}")
             return
+        self._sync_raw_buffer_from_tree()
         chat.add_system_message(f"branched {target[:8]} → {new_id[:8]}")
 
     def action_branch_active(self) -> None:
@@ -3853,6 +3925,7 @@ class SaklasApp(App[None]):
             chat.add_system_message(f"/del failed: {e}")
             return
         new_active_id = tree.active_node_id
+        self._sync_raw_buffer_from_tree()
         chat.add_system_message(
             f"deleted {removed} node(s); active now {new_active_id[:8]}"
         )
@@ -4083,6 +4156,8 @@ class SaklasApp(App[None]):
                 self._session.regen_with_modifier(
                     user_parent_id, mode, n=n,
                 )
+                if self._raw_mode:
+                    self.call_from_thread(self._sync_raw_buffer_from_tree)
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self.call_from_thread(
@@ -4151,8 +4226,11 @@ class SaklasApp(App[None]):
                     sampling=sampling,
                     stateless=False,
                     n=n,
+                    raw=self._raw_mode,
                     parent_node_id=regen_parent_id,
                 )
+                if self._raw_mode:
+                    self.call_from_thread(self._sync_raw_buffer_from_tree)
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
                 self.call_from_thread(
@@ -4359,6 +4437,8 @@ class SaklasApp(App[None]):
                     )
                     return
                 new_id = self._session.tree.active_node_id
+                if self._raw_mode:
+                    self.call_from_thread(self._sync_raw_buffer_from_tree)
                 self.call_from_thread(
                     self._chat_panel.add_system_message,
                     f"auto-regen ({rendered_mode}) → sibling {new_id[:8]}",

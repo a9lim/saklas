@@ -29,6 +29,7 @@ import asyncio
 import json
 import time
 import uuid
+from collections import deque
 from dataclasses import replace as _replace
 from typing import Any, Awaitable, Callable, Literal
 
@@ -2387,9 +2388,15 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         forwarder_task = asyncio.create_task(_tree_forwarder())
 
+        deferred_incoming: deque[Any] = deque()
+
         try:
             while True:
-                msg = await incoming.get()
+                msg = (
+                    deferred_incoming.popleft()
+                    if deferred_incoming
+                    else await incoming.get()
+                )
                 if msg is _DISCONNECT:
                     raise WebSocketDisconnect(code=1000)
                 if isinstance(msg, dict) and "_reader_error" in msg:
@@ -2408,7 +2415,8 @@ def register_saklas_routes(app: FastAPI) -> None:
                         continue
                     await _ws_handle_generate(
                         websocket, session, parsed,
-                        app.state.default_steering, incoming, _send_json,
+                        app.state.default_steering, incoming,
+                        deferred_incoming, _send_json,
                     )
                 elif mtype == "stop":
                     # Idle-state stop: nothing in flight.
@@ -2467,6 +2475,7 @@ async def _ws_handle_generate(
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
     incoming: asyncio.Queue[Any],
+    deferred_incoming: "deque[Any]",
     send_json: Callable[[Any], Awaitable[None]],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
@@ -2900,7 +2909,7 @@ async def _ws_handle_generate(
                 while not done:
                     token_get = asyncio.create_task(token_queue.get())
                     client_get = asyncio.create_task(incoming.get())
-                    finished, _pending = await asyncio.wait(
+                    finished, pending = await asyncio.wait(
                         {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
                     )
                     if client_get in finished:
@@ -2922,16 +2931,22 @@ async def _ws_handle_generate(
                                 except Exception:
                                     pass
                                 stop_signaled = True
-                                # Re-enqueue so the outer dispatch loop
+                                # Defer so the outer dispatch loop
                                 # surfaces the error after we wind down.
-                                await incoming.put(incoming_msg)
+                                deferred_incoming.append(incoming_msg)
                             else:
                                 # Out-of-band frame during a generation —
-                                # re-enqueue so the outer loop sees it
+                                # defer so the outer loop sees it
                                 # after this turn finishes.  Most likely
                                 # an early ``{type: "generate"}`` from a
                                 # client that didn't wait for ``done``.
-                                await incoming.put(incoming_msg)
+                                #
+                                # Do not put it back on ``incoming`` here:
+                                # the next loop iteration would consume it
+                                # immediately, cancel token_queue.get(), and
+                                # spin until the worker happened to have a
+                                # token already queued.
+                                deferred_incoming.append(incoming_msg)
                         else:
                             # Disconnect sentinel from the reader.
                             try:
@@ -2939,17 +2954,17 @@ async def _ws_handle_generate(
                             except Exception:
                                 pass
                             stop_signaled = True
-                            await incoming.put(incoming_msg)
-                    else:
-                        client_get.cancel()
+                            deferred_incoming.append(incoming_msg)
                     if token_get in finished:
                         item = token_get.result()
                         if item is _SENTINEL:
                             done = True
                         else:
                             await send_json(item)
-                    else:
-                        token_get.cancel()
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
             finally:
                 # Drain any residual events the worker pushed between
                 # sentinel and join — should be none because the

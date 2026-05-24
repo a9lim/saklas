@@ -259,7 +259,11 @@ def ws_auth_ok(websocket) -> bool:
     expected = getattr(websocket.app.state, "api_key", None)
     if not expected:
         return True
-    return _check_bearer(websocket.headers, expected)
+    if _check_bearer(websocket.headers, expected):
+        return True
+    # Browser WebSocket constructors cannot attach Authorization headers.
+    # The bundled dashboard sends the same bearer value as ?token=... .
+    return websocket.query_params.get("token") == expected
 
 
 def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
@@ -445,6 +449,22 @@ async def _stream_generation(
                     yield f"data: {json.dumps(chunk)}\n\n"
             except ConcurrentGenerationError:
                 err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
+                yield f"data: {json.dumps(err)}\n\n"
+                return
+            except SaklasError as e:
+                status, msg = e.user_message()
+                err_type = (
+                    "conflict" if status == 409
+                    else "invalid_request_error" if 400 <= status < 500
+                    else "server_error"
+                )
+                err = {
+                    "error": {
+                        "message": msg,
+                        "type": err_type,
+                        "code": status,
+                    }
+                }
                 yield f"data: {json.dumps(err)}\n\n"
                 return
 
