@@ -640,8 +640,20 @@ def _run_extract(args: argparse.Namespace) -> None:
     candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
     candidate_folders.append(session._local_concept_folder(canonical))
     requested_release = getattr(args, "sae", None)
+    requested_role = getattr(args, "role", None)
+    if requested_release and requested_role:
+        print(
+            "extract: --sae and --role are mutually exclusive "
+            "(role substitution composes with method=pca via tensor "
+            "filename but not with SAE feature space)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     candidate_tensor_name = tensor_filename(
-        session.model_id, release=requested_release, method=method,
+        session.model_id,
+        release=requested_release,
+        method=method,
+        role=requested_role,
     )
     candidate_paths = [
         pathlib.Path(folder) / candidate_tensor_name for folder in candidate_folders
@@ -662,6 +674,8 @@ def _run_extract(args: argparse.Namespace) -> None:
         extract_kwargs["sae"] = args.sae
     if getattr(args, "sae_revision", None):
         extract_kwargs["sae_revision"] = args.sae_revision
+    if requested_role:
+        extract_kwargs["role"] = requested_role
 
     try:
         if baseline is not None:
@@ -672,11 +686,20 @@ def _run_extract(args: argparse.Namespace) -> None:
         print(f"extract failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # `canonical` may be "name:sae-<release>" — peel it for filename construction.
+    # `canonical` may carry a trailing variant suffix from the engine —
+    # ``:sae-<release>`` when ``sae=`` was passed, ``:role-<slug>`` when
+    # ``role=`` was.  Peel either for tensor-path construction; bare
+    # ``canonical`` otherwise.  ``role`` and ``sae`` are mutually
+    # exclusive at the flag layer above, so we never see both.
     if ":sae-" in canonical:
         core_name, _, rel = canonical.partition(":sae-")
         tensor_name = tensor_filename(
             session.model_id, release=rel, method=method,
+        )
+    elif ":role-" in canonical:
+        core_name, _, role_slug = canonical.partition(":role-")
+        tensor_name = tensor_filename(
+            session.model_id, role=role_slug, method=method,
         )
     else:
         core_name = canonical
@@ -1482,9 +1505,23 @@ def _iter_manifold_folders(namespace: str | None):
     Thin wrapper over :func:`saklas.io.manifolds.iter_manifold_folders` —
     the discovery walk lives in ``io`` so the server shares it without
     importing ``cli``.
-    """
-    from saklas.io.manifolds import iter_manifold_folders
 
+    Materializes bundled manifolds (e.g. ``default/personas``) before
+    the walk.  CLI verbs like ``manifold discover`` / ``show`` / ``ls``
+    resolve folders *before* any session is constructed, so the session-
+    startup ``materialize_bundled_manifolds`` call hasn't fired yet —
+    without this hop, a user's first ``saklas vector manifold discover
+    default/personas`` would miss the bundled folder and exit with "not
+    found".  The format-version short-circuit inside the materialize
+    function makes repeated calls cheap (no-op when up-to-date).  The
+    server has its own session-driven materialization at startup, so
+    going through ``iter_manifold_folders`` directly stays correct.
+    """
+    from saklas.io.manifolds import (
+        iter_manifold_folders, materialize_bundled_manifolds,
+    )
+
+    materialize_bundled_manifolds()
     yield from iter_manifold_folders(namespace)
 
 
@@ -1572,6 +1609,13 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
         except (FileNotFoundError, KeyError, ValueError):
             derived_node_coords = []
 
+    # Per-node roles ride alongside coords in the JSON shape; ``None``
+    # for a given node means "pooled under the standard assistant
+    # baseline" (the legacy / non-role default).  Padded to the label
+    # count so consumers can index by node.
+    node_roles_padded = list(mf.node_roles) + [None] * (
+        len(mf.node_labels) - len(mf.node_roles)
+    )
     if getattr(args, "json_output", False):
         if mf.is_discover:
             nodes_json = [
@@ -1581,13 +1625,16 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
                         derived_node_coords[i]
                         if i < len(derived_node_coords) else None
                     ),
+                    "role": node_roles_padded[i],
                 }
                 for i, label in enumerate(mf.node_labels)
             ]
         else:
             nodes_json = [
-                {"label": label, "coords": coords}
-                for label, coords in zip(mf.node_labels, mf.node_coords)
+                {"label": label, "coords": coords, "role": role}
+                for label, coords, role in zip(
+                    mf.node_labels, mf.node_coords, node_roles_padded,
+                )
             ]
         body: dict = {
             "namespace": ns,
@@ -1613,17 +1660,24 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
             print(f"  hyperparams: {hp}")
         print("  nodes:")
         for i, label in enumerate(mf.node_labels):
+            role_tail = (
+                f"  [role={node_roles_padded[i]}]"
+                if node_roles_padded[i] else ""
+            )
             if i < len(derived_node_coords):
                 coord_str = ", ".join(f"{c:.3g}" for c in derived_node_coords[i])
-                print(f"    {label}  ({coord_str})")
+                print(f"    {label}  ({coord_str}){role_tail}")
             else:
-                print(f"    {label}  (coords pending fit)")
+                print(f"    {label}  (coords pending fit){role_tail}")
     else:
         print(f"  domain: {_domain_label(mf.domain)}")
         print("  nodes:")
-        for label, coords in zip(mf.node_labels, mf.node_coords):
+        for label, coords, role in zip(
+            mf.node_labels, mf.node_coords, node_roles_padded,
+        ):
             coord_str = ", ".join(f"{c:g}" for c in coords)
-            print(f"    {label}  ({coord_str})")
+            role_tail = f"  [role={role}]" if role else ""
+            print(f"    {label}  ({coord_str}){role_tail}")
     if fitted:
         print("  fitted models:")
         for f in fitted:
@@ -1752,6 +1806,9 @@ def _run_manifold_discover(args: argparse.Namespace) -> None:
         new_hyperparams["k_nn"] = int(args.k_nn)
     if args.bandwidth is not None:
         new_hyperparams["bandwidth"] = float(args.bandwidth)
+    # Shared knob (applies to both PCA and spectral fits).
+    if getattr(args, "max_subspace_dim", None) is not None:
+        new_hyperparams["max_subspace_dim"] = int(args.max_subspace_dim)
     # Cross-method knobs that don't apply get dropped — silently
     # carrying e.g. ``var_threshold`` into a spectral fit pollutes the
     # cache key without affecting the fit, and an out-of-whitelist key
@@ -1861,11 +1918,21 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
         print(f"manifold generate failed: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # ``--role-per-node``: the concept slug doubles as the assistant-role
+    # substitution at that node's fit time.  Validated against the engine's
+    # role-slug regex by ``create_discover_manifold_folder`` itself; an
+    # unsupported family raises later at fit time (the folder is model-
+    # agnostic, so we don't pay the family check here).
+    node_roles: dict[str, str | None] | None = None
+    if getattr(args, "role_per_node", False):
+        node_roles = {concept: concept for concept in args.concepts}
+
     try:
         out_folder = create_discover_manifold_folder(
             namespace, name, args.description,
             fit_mode="pca",  # default; the user can override at discover time
             node_corpora=corpora,
+            node_roles=node_roles,
         )
     except (FileExistsError, ManifoldFormatError) as e:
         print(f"manifold generate failed: {e}", file=sys.stderr)
@@ -2066,6 +2133,11 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         mt = mterms[0]
         session._ensure_manifold_loaded(mt.manifold)
         act_manifold = session._manifolds[mt.manifold]
+        # Resolve label-form positions to coords up front — every
+        # downstream call here wants a coord tuple, and the chord
+        # baseline is per-coord arithmetic that can't operate on a
+        # string label.
+        mt_position = act_manifold.resolve_position(mt.position)
         # Linear baseline: the straight chord through activation space
         # from the manifold point at node 0 to the term's position, per
         # layer — what plain additive steering would do instead of
@@ -2073,7 +2145,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         origin = act_manifold.node_coords[0]
         chord = {
             L: (
-                act_manifold.manifold_point(L, mt.position)
+                act_manifold.manifold_point(L, mt_position)
                 - act_manifold.manifold_point(L, origin)
             )
             for L in act_manifold.layer_indices
@@ -2082,7 +2154,10 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         _ltext, lmean, lmax = _score(
             f"{mt.coeff:g} __manifold_linear_baseline__"
         )
-        pos_label = ",".join(f"{c:g}" for c in mt.position)
+        pos_label = (
+            mt.position if isinstance(mt.position, str)
+            else ",".join(f"{c:g}" for c in mt_position)
+        )
         rows.append({
             "label": "linear-chord", "steering": f"chord@{pos_label}",
             "mean_bhattacharyya": lmean, "max_bhattacharyya": lmax,

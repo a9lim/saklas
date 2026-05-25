@@ -345,6 +345,16 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
         "--sae-revision", dest="sae_revision", default=None, metavar="REV",
         help="Pin a specific HF revision for the SAE release",
     )
+    p.add_argument(
+        "--role", default=None, metavar="SLUG",
+        help="Role-augmented extraction: render pairs under a chat template "
+             "whose assistant-role label is replaced by SLUG (e.g. 'pirate'). "
+             "Writes the tensor under a ``_role-<slug>`` filename suffix; "
+             "steer it with the matching ``:role-<slug>`` variant in any "
+             "expression. Slug must match ``[a-z0-9._-]+``. Mutually "
+             "exclusive with ``--sae``. Mistral-3 / talkie families don't "
+             "carry a substitutable role label and raise at runtime.",
+    )
     p.set_defaults(quantize=None, device="auto", probes=None)
 
 
@@ -531,6 +541,16 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Spectral: heat-kernel bandwidth (default: median k-NN distance)",
     )
     discover.add_argument(
+        "--max-subspace-dim", dest="max_subspace_dim", type=int, default=None,
+        metavar="R",
+        help="Per-layer PCA subspace dim cap (default 64). Smaller values "
+             "give finer-grained steering control at large K — each axis the "
+             "RBF can move along is an axis subspace_replace can displace, "
+             "so fewer axes = smaller per-α effect = wider coherence regime. "
+             "Recommended: set near the manifold's intrinsic dim (=picked_k) "
+             "for steering use; keep at 64 for representational analysis.",
+    )
+    discover.add_argument(
         "--sae", default=None, metavar="RELEASE",
         help="Reconstruct centroids through an SAELens SAE before the fit "
              "(requires `.[sae]`)",
@@ -573,6 +593,19 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     generate.add_argument(
         "--description", default="", metavar="TEXT",
         help="Human-readable description for the manifold folder",
+    )
+    generate.add_argument(
+        "--role-per-node", dest="role_per_node", action="store_true",
+        help=(
+            "Role-augmented (persona) manifold: use each --concepts slug "
+            "as that node's assistant-role substitution at fit time.  The "
+            "fitted manifold lives in persona-baseline activation space "
+            "and steering through it implies the nearest node's role at "
+            "decode time (role-paired manifold steering).  Slugs must "
+            "match [a-z0-9._-]+; family must carry a substitutable role "
+            "header (Qwen / Gemma / Llama / GLM / gpt-oss — Mistral-3 / "
+            "talkie raise at fit time)."
+        ),
     )
     generate.add_argument(
         "-f", "--force", action="store_true",

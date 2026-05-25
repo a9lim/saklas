@@ -842,15 +842,36 @@ class ManifoldExtractionPipeline:
         n_layers = len(layers)
         K = len(node_groups)
 
+        # ``model_type`` is the family-key for the role-header registry —
+        # only needed when any node carries a custom ``role``.  We resolve
+        # it once up front and pass it on each centroid call regardless;
+        # ``_encode_and_capture_all`` only consults it when ``role`` is set.
+        model_type = getattr(getattr(model, "config", None), "model_type", None)
+        node_roles = mf._roles_padded()
+        any_role = any(r is not None for r in node_roles)
+        if any_role and model_type is None:
+            raise ValueError(
+                f"manifold {mf.name!r} carries per-node roles but model "
+                f"config has no 'model_type' — cannot resolve the role-header "
+                f"registry entry"
+            )
+
         # 1. Per-node centroids (one forward pass per statement) — shared
-        #    between authored and discover paths.
+        #    between authored and discover paths.  Per-node role rides
+        #    through ``compute_node_centroid`` so each node's centroid is
+        #    pooled under its own assistant-role substitution.  A ``None``
+        #    role goes through the standard assistant baseline branch
+        #    (same byte-identical path as today's non-role manifolds).
         per_node: list[dict[int, torch.Tensor]] = []
-        for label, statements in node_groups:
+        for (label, statements), role in zip(node_groups, node_roles):
+            role_note = f" [role={role}]" if role else ""
             _progress(
-                f"Pooling node '{label}' ({len(statements)} statements)..."
+                f"Pooling node '{label}'{role_note} "
+                f"({len(statements)} statements)..."
             )
             per_node.append(compute_node_centroid(
                 model, tokenizer, layers, device, statements,
+                role=role, model_type=model_type,
             ))
 
         # 2. Choose the layer set — shared.
@@ -871,6 +892,19 @@ class ManifoldExtractionPipeline:
         # 3. Resolve domain + node_params — the only step that differs
         #    between authored and discover paths.
         discover_metadata: dict[str, Any] = {}
+        # ``max_subspace_dim`` caps the per-layer PCA subspace in
+        # ``fit_layer_subspace`` (default :data:`DEFAULT_N_COMPONENTS` = 64).
+        # Smaller values constrain the dim count that ``subspace_replace``
+        # displaces at steer time — finer-grained steering control at the
+        # cost of representing less per-layer activation variance.  At K
+        # large (e.g. 100), the default 64 makes the per-layer subspace
+        # cover most of the centroid span; reducing to the manifold's
+        # intrinsic dim (=picked_k for discover) gives an order-of-
+        # magnitude smaller per-α displacement, widening the coherence
+        # regime.  Authored manifolds don't currently route hyperparams
+        # so they inherit the default.
+        max_subspace_dim_override: int | None = None
+
         if mf.fit_mode == "authored":
             domain = domain_from_spec(mf.domain)
             node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
@@ -887,6 +921,11 @@ class ManifoldExtractionPipeline:
             ref_layer = hyperparams.pop(
                 "reference_layer", fit_layers[len(fit_layers) // 2],
             )
+            # ``max_subspace_dim`` is consumed by the per-layer fit, not
+            # by ``discover_coords`` — pop it before the discover call so
+            # the dispatcher doesn't get an unexpected kwarg.
+            if "max_subspace_dim" in hyperparams:
+                max_subspace_dim_override = int(hyperparams.pop("max_subspace_dim"))
             if ref_layer not in fit_layers:
                 raise ValueError(
                     f"discover manifold {mf.name!r}: reference_layer "
@@ -929,6 +968,8 @@ class ManifoldExtractionPipeline:
             # and the inspector surfaces.
             resolved_hyperparams = dict(hyperparams)
             resolved_hyperparams["reference_layer"] = int(ref_layer)
+            if max_subspace_dim_override is not None:
+                resolved_hyperparams["max_subspace_dim"] = max_subspace_dim_override
             if hasattr(diagnostics, "k_nn"):  # SpectralDiagnostics
                 resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)
                 resolved_hyperparams["bandwidth"] = float(
@@ -946,6 +987,9 @@ class ManifoldExtractionPipeline:
             f"Fitting RBF interpolant across {len(fit_layers)} layers..."
         )
         layer_subs = {}
+        fit_kwargs: dict[str, Any] = {}
+        if max_subspace_dim_override is not None:
+            fit_kwargs["n_components"] = max_subspace_dim_override
         for idx in fit_layers:
             stacked = torch.stack(
                 [per_node[k][idx] for k in range(K)]
@@ -955,7 +999,9 @@ class ManifoldExtractionPipeline:
                     feat = sae_backend.encode_layer(idx, stacked.to(device))
                     recon = sae_backend.decode_layer(idx, feat)
                 stacked = recon.detach().to("cpu", torch.float32)
-            layer_subs[idx] = fit_layer_subspace(stacked, node_params)
+            layer_subs[idx] = fit_layer_subspace(
+                stacked, node_params, **fit_kwargs,
+            )
 
         manifold = Manifold(
             name=mf.name,
@@ -974,6 +1020,13 @@ class ManifoldExtractionPipeline:
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release
             metadata["sae_revision"] = sae_backend.revision
+        if any_role:
+            # Per-node roles ride into the sidecar so `vector manifold
+            # show` and the inspector surfaces can report "this node was
+            # pooled as <role>" without re-reading manifold.json.  The
+            # order matches ``node_labels``; a missing entry means
+            # ``None`` (standard assistant baseline).
+            metadata["node_roles"] = list(node_roles)
         metadata.update(discover_metadata)
         save_manifold(manifold, tensor_path, metadata)
         manifold.metadata.update(metadata)

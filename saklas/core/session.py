@@ -820,9 +820,16 @@ class SaklasSession:
         # layer for the rest of the session.  Calling explicitly here keeps
         # the invariant intact regardless of probe-loading config; the call
         # is cheap when up-to-date (pack.json format-version short-circuit).
+        # Bundled manifolds (e.g. ``personas``) materialize in the same
+        # pre-invalidate window so the bare-name resolver picks up bundled
+        # manifold node labels alongside bundled bipolar poles.
         from saklas.io.packs import materialize_bundled as _materialize_bundled
+        from saklas.io.manifolds import (
+            materialize_bundled_manifolds as _materialize_bundled_manifolds,
+        )
         from saklas.io import selectors as _selectors
         _materialize_bundled()
+        _materialize_bundled_manifolds()
         _selectors.invalidate()
 
         # Bootstrap probes
@@ -1980,11 +1987,83 @@ class SaklasSession:
         # loaded into ``self._manifolds`` here so a miss surfaces
         # eagerly (``ManifoldNotRegisteredError``) rather than at hook
         # install.
+        manifold_terms: list[ManifoldTerm] = []
         for key, val in steering_obj.alphas.items():
             if not isinstance(val, ManifoldTerm):
                 continue
             self._ensure_manifold_loaded(val.manifold)
             resolved[key] = val
+            manifold_terms.append(val)
+
+        # Role-paired manifold steering (Phase A.4): each manifold term
+        # implies a role via its nearest-node lookup.  Aggregate across
+        # all manifold terms by highest absolute coefficient (Phase A.4
+        # disagreement policy: soft-warn + highest-coeff wins).  An
+        # explicit ``:role-<X>`` term wins over any manifold-implied
+        # role — explicit user intent dominates implicit lookup — with
+        # a soft warn if they disagreed.  ``None``-roles (nodes opting
+        # out of substitution) abstain from the aggregate; they don't
+        # vote for the standard baseline against an explicit role.
+        manifold_role: str | None = None
+        manifold_role_coeff = -1.0
+        manifold_role_disagreement = False
+        for term in manifold_terms:
+            manifold = self._manifolds.get(term.manifold)
+            if manifold is None:
+                # Should not happen — ``_ensure_manifold_loaded`` either
+                # populates ``self._manifolds`` or raises.  Defensive.
+                continue
+            try:
+                implied = manifold.nearest_node_role(term.position)
+            except ValueError:
+                implied = None
+            if implied is None:
+                continue
+            abs_c = abs(term.coeff)
+            if manifold_role is None:
+                manifold_role = implied
+                manifold_role_coeff = abs_c
+            elif implied == manifold_role:
+                # Same role — pick the larger coefficient as tiebreaker
+                # so the warning copy below carries the dominant term.
+                manifold_role_coeff = max(manifold_role_coeff, abs_c)
+            else:
+                manifold_role_disagreement = True
+                if abs_c > manifold_role_coeff:
+                    manifold_role = implied
+                    manifold_role_coeff = abs_c
+        if manifold_role_disagreement:
+            import warnings as _warnings
+            from saklas.core.errors import RoleBaselineMismatchWarning
+            _warnings.warn(
+                f"steering scope has manifold terms implying distinct "
+                f"per-node roles; highest-coefficient term wins "
+                f"(role={manifold_role!r}, |coeff|={manifold_role_coeff:.3f}). "
+                f"Compose with a single manifold term or align the active "
+                f"nodes if you want a different role.",
+                RoleBaselineMismatchWarning,
+                stacklevel=2,
+            )
+
+        # Resolve the final active role across both tiers:
+        # explicit ``:role-<X>`` (already aggregated as ``active_role``
+        # above) wins over any manifold-implied role.  Soft-warn when
+        # the two tiers disagreed — the user typed an explicit role and
+        # also has a manifold term pulling toward a different persona.
+        if active_role is None:
+            active_role = manifold_role
+        elif manifold_role is not None and manifold_role != active_role:
+            import warnings as _warnings
+            from saklas.core.errors import RoleBaselineMismatchWarning
+            _warnings.warn(
+                f"steering scope has an explicit role={active_role!r} "
+                f"and a manifold term implying role={manifold_role!r}; "
+                f"explicit role wins, manifold-implied role ignored. "
+                f"Use the same role on both, or drop the explicit "
+                f":role-{active_role} variant to let the manifold drive.",
+                RoleBaselineMismatchWarning,
+                stacklevel=2,
+            )
         # Per-call overrides ride along with the entries.  ``None`` means
         # "inherit"; the resolver folds session defaults at hook-install.
         mode_override = getattr(steering_obj, "injection_mode", None)

@@ -1,0 +1,310 @@
+{
+  "format_version": 3,
+  "name": "personas",
+  "description": "Persona archetypes drawn from Anthropic's Assistant Axis paper (arXiv 2601.10387) and the Persona Selection Model framing. 100 nodes spanning assistant-cluster, everyday human roles, pre-modern roles, creative archetypes, fantastical characters, AI / non-human personas, and the named harmful cluster. PCA over per-node centroids recovers the assistant-axis structure as the leading component on any role-supporting model family.",
+  "fit_mode": "pca",
+  "hyperparams": {},
+  "nodes": [
+    {
+      "label": "assistant"
+    },
+    {
+      "label": "consultant"
+    },
+    {
+      "label": "analyst"
+    },
+    {
+      "label": "evaluator"
+    },
+    {
+      "label": "reviewer"
+    },
+    {
+      "label": "auditor"
+    },
+    {
+      "label": "advisor"
+    },
+    {
+      "label": "examiner"
+    },
+    {
+      "label": "mediator"
+    },
+    {
+      "label": "facilitator"
+    },
+    {
+      "label": "coordinator"
+    },
+    {
+      "label": "secretary"
+    },
+    {
+      "label": "assessor"
+    },
+    {
+      "label": "teacher"
+    },
+    {
+      "label": "doctor"
+    },
+    {
+      "label": "librarian"
+    },
+    {
+      "label": "farmer"
+    },
+    {
+      "label": "soldier"
+    },
+    {
+      "label": "nurse"
+    },
+    {
+      "label": "lawyer"
+    },
+    {
+      "label": "chef"
+    },
+    {
+      "label": "journalist"
+    },
+    {
+      "label": "mechanic"
+    },
+    {
+      "label": "electrician"
+    },
+    {
+      "label": "carpenter"
+    },
+    {
+      "label": "plumber"
+    },
+    {
+      "label": "accountant"
+    },
+    {
+      "label": "baker"
+    },
+    {
+      "label": "gardener"
+    },
+    {
+      "label": "fisherman"
+    },
+    {
+      "label": "pilot"
+    },
+    {
+      "label": "sailor"
+    },
+    {
+      "label": "athlete"
+    },
+    {
+      "label": "engineer"
+    },
+    {
+      "label": "scientist"
+    },
+    {
+      "label": "banker"
+    },
+    {
+      "label": "salesperson"
+    },
+    {
+      "label": "driver"
+    },
+    {
+      "label": "caveman"
+    },
+    {
+      "label": "monk"
+    },
+    {
+      "label": "knight"
+    },
+    {
+      "label": "scribe"
+    },
+    {
+      "label": "alchemist"
+    },
+    {
+      "label": "blacksmith"
+    },
+    {
+      "label": "peasant"
+    },
+    {
+      "label": "samurai"
+    },
+    {
+      "label": "viking"
+    },
+    {
+      "label": "gladiator"
+    },
+    {
+      "label": "druid"
+    },
+    {
+      "label": "shaman"
+    },
+    {
+      "label": "poet"
+    },
+    {
+      "label": "bard"
+    },
+    {
+      "label": "jester"
+    },
+    {
+      "label": "philosopher"
+    },
+    {
+      "label": "painter"
+    },
+    {
+      "label": "sculptor"
+    },
+    {
+      "label": "dancer"
+    },
+    {
+      "label": "novelist"
+    },
+    {
+      "label": "comedian"
+    },
+    {
+      "label": "musician"
+    },
+    {
+      "label": "storyteller"
+    },
+    {
+      "label": "playwright"
+    },
+    {
+      "label": "sage"
+    },
+    {
+      "label": "oracle"
+    },
+    {
+      "label": "ghost"
+    },
+    {
+      "label": "leviathan"
+    },
+    {
+      "label": "wizard"
+    },
+    {
+      "label": "vampire"
+    },
+    {
+      "label": "mermaid"
+    },
+    {
+      "label": "dragon"
+    },
+    {
+      "label": "centaur"
+    },
+    {
+      "label": "sphinx"
+    },
+    {
+      "label": "banshee"
+    },
+    {
+      "label": "golem"
+    },
+    {
+      "label": "witch"
+    },
+    {
+      "label": "robot"
+    },
+    {
+      "label": "hive"
+    },
+    {
+      "label": "chatbot"
+    },
+    {
+      "label": "npc"
+    },
+    {
+      "label": "android"
+    },
+    {
+      "label": "drone"
+    },
+    {
+      "label": "hologram"
+    },
+    {
+      "label": "alien"
+    },
+    {
+      "label": "copilot"
+    },
+    {
+      "label": "satellite"
+    },
+    {
+      "label": "simulation"
+    },
+    {
+      "label": "swarm"
+    },
+    {
+      "label": "virus"
+    },
+    {
+      "label": "saboteur"
+    },
+    {
+      "label": "spy"
+    },
+    {
+      "label": "narcissist"
+    },
+    {
+      "label": "demon"
+    },
+    {
+      "label": "assassin"
+    },
+    {
+      "label": "thief"
+    },
+    {
+      "label": "conman"
+    },
+    {
+      "label": "hacker"
+    },
+    {
+      "label": "cultist"
+    },
+    {
+      "label": "tyrant"
+    },
+    {
+      "label": "traitor"
+    },
+    {
+      "label": "vandal"
+    }
+  ],
+  "files": {}
+}

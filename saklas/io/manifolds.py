@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import warnings
 from dataclasses import dataclass, field
+from importlib import resources as _resources
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -40,9 +42,18 @@ import torch
 
 from saklas.core.errors import SaklasError
 from saklas.core.manifold import BoxDomain, domain_from_spec
-from saklas.io.atomic import write_json_atomic
+from saklas.core.role_templates import _ROLE_SLUG_RE
+from saklas.io.atomic import write_bytes_atomic, write_json_atomic
 from saklas.io.packs import NAME_REGEX, verify_integrity
-from saklas.io.paths import manifold_dir, manifolds_dir
+from saklas.io.paths import manifold_dir, manifolds_dir, saklas_home
+
+_log = logging.getLogger("saklas.io.manifolds")
+
+# Process-scope flag: set True after the first ``materialize_bundled_manifolds``
+# call so subsequent calls within the same Python process are no-ops.  See
+# the docstring on that function for rationale (avoids clobbering CLI-set
+# hyperparams on session re-init within the same invocation).
+_materialized_this_process: bool = False
 
 # Discover-mode fit modes — set as ``manifold.json::fit_mode`` for
 # manifolds whose node coordinates are derived from the model's
@@ -59,9 +70,11 @@ _FIT_MODES_ALL: frozenset[str] = frozenset({"authored"}) | _FIT_MODES_DISCOVER
 # is shared.  ``reference_layer`` is honored by both methods (consumed
 # in ``ManifoldExtractionPipeline.fit`` before the dispatch).
 _HYPERPARAMS_BY_MODE: dict[str, frozenset[str]] = {
-    "pca": frozenset({"max_dim", "var_threshold", "reference_layer"}),
+    "pca": frozenset({
+        "max_dim", "var_threshold", "reference_layer", "max_subspace_dim",
+    }),
     "spectral": frozenset({
-        "max_dim", "k_nn", "bandwidth", "reference_layer",
+        "max_dim", "k_nn", "bandwidth", "reference_layer", "max_subspace_dim",
     }),
 }
 
@@ -91,6 +104,26 @@ def _sanitize_hyperparams(
 # spec + per-node coordinates); v2 and earlier were the 1-D cyclic-spline
 # format and must be converted with ``scripts/upgrade_manifolds.py``.
 MANIFOLD_FORMAT_VERSION = 3
+
+
+def _validate_node_role(name: str, label: str, role: Any) -> str | None:
+    """Validate an optional per-node ``role`` field.
+
+    ``None`` / missing means "use the standard assistant baseline" (the
+    legacy shape, same as today).  A non-empty string must match
+    :data:`saklas.core.role_templates._ROLE_SLUG_RE`
+    (``[a-z0-9._-]+``).  Family-unsupported (Mistral-3, talkie) is *not*
+    checked here — the folder is model-agnostic; the check fires when
+    :func:`saklas.core.role_templates.apply_with_role` runs at fit time.
+    """
+    if role is None:
+        return None
+    if not isinstance(role, str) or not _ROLE_SLUG_RE.match(role):
+        raise ManifoldFormatError(
+            f"manifold {name!r} node {label!r} role {role!r} invalid; "
+            f"must match {_ROLE_SLUG_RE.pattern}"
+        )
+    return role
 
 
 class ManifoldFormatError(ValueError, SaklasError):
@@ -179,6 +212,16 @@ class ManifoldSidecar:
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Per-node assistant-role substitution used at fit time, in
+    # ``node_labels`` index order.  ``None`` for a given node (and an
+    # empty list as a whole) = "standard assistant baseline" — the
+    # default, byte-identical to today's non-role manifolds.  The same
+    # information rides ``ManifoldFolder.node_roles`` but the sidecar
+    # carries an independent copy so a downstream consumer
+    # (``vector manifold show``, the webui inspector) doesn't have to
+    # round-trip through the folder to know which role each node was
+    # pooled under.
+    node_roles: list[str | None] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "ManifoldSidecar":
@@ -202,6 +245,7 @@ class ManifoldSidecar:
             fit_mode=data.get("fit_mode", "authored"),
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
+            node_roles=list(data.get("node_roles", [])),
         )
 
 
@@ -243,6 +287,14 @@ class ManifoldFolder:
     files: dict[str, str]
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
+    # Per-node assistant-role substitution for role-augmented manifolds
+    # (e.g. a persona manifold where each node is a persona).  Aligned
+    # with ``node_labels`` index-by-index.  ``None`` for a given node =
+    # "use the standard assistant baseline" (the legacy shape, what every
+    # pre-role-differential manifold carries).  An all-``None`` list is
+    # semantically identical to today's behavior — the centroid pooling
+    # just goes through the default chat-template branch.
+    node_roles: list[str | None] = field(default_factory=list)
     # tensor stem (``<safe_model>`` or ``<safe_model>_sae-<rel>``) -> sidecar.
     _sidecars: dict[str, ManifoldSidecar] = field(default_factory=dict)
 
@@ -303,6 +355,7 @@ class ManifoldFolder:
 
         node_labels: list[str] = []
         node_coords: list[list[float]] = []
+        node_roles: list[str | None] = []
         hyperparams: dict[str, Any] = {}
         domain_spec: dict[str, Any]
 
@@ -349,6 +402,7 @@ class ManifoldFolder:
                     )
                 node_labels.append(label)
                 node_coords.append([float(c) for c in coords])
+                node_roles.append(_validate_node_role(name, label, entry.get("role")))
             _warn_authoring_quality(name, domain, node_coords)
         else:
             # Discover mode: no ``domain`` field, no per-node ``coords``.
@@ -385,6 +439,7 @@ class ManifoldFolder:
                         f"at fit time"
                     )
                 node_labels.append(label)
+                node_roles.append(_validate_node_role(name, label, entry.get("role")))
 
         if len(set(node_labels)) != len(node_labels):
             raise ManifoldFormatError(
@@ -416,6 +471,7 @@ class ManifoldFolder:
             files=files,
             fit_mode=fit_mode,
             hyperparams=hyperparams,
+            node_roles=node_roles,
         )
 
         # Every node file must be present.
@@ -486,6 +542,13 @@ class ManifoldFolder:
                 "fit_mode": self.fit_mode,
                 "hyperparams": self.hyperparams,
             }))
+        # Per-node roles are inputs that determine the fit's geometry
+        # (each node's centroid is pooled under its role's chat-template
+        # substitution), so a role edit must invalidate a cached fit.
+        # All-``None`` (legacy / non-role) hashes to the same value
+        # whether the field is missing or explicit-None — same shape.
+        if any(r is not None for r in self.node_roles):
+            h.update(_canonical_json(self.node_roles))
         return h.hexdigest()
 
     # -- fitted tensors ----------------------------------------------------
@@ -518,16 +581,60 @@ class ManifoldFolder:
             "fit_mode": self.fit_mode,
             "files": files,
         }
+        # Per-node ``role`` is written only when set — keeps the legacy
+        # shape (every node carries ``{label, coords}`` or ``{label}``
+        # only) byte-identical for non-role manifolds, and a stray
+        # ``role: null`` doesn't leak into the manifest for a node that
+        # opted out.
         if self.fit_mode == "authored":
             payload["domain"] = self.domain
             payload["nodes"] = [
-                {"label": label, "coords": list(coords)}
-                for label, coords in zip(self.node_labels, self.node_coords)
+                _node_payload_authored(label, coords, role)
+                for label, coords, role in zip(
+                    self.node_labels, self.node_coords, self._roles_padded(),
+                )
             ]
         else:
             payload["hyperparams"] = self.hyperparams
-            payload["nodes"] = [{"label": label} for label in self.node_labels]
+            payload["nodes"] = [
+                _node_payload_discover(label, role)
+                for label, role in zip(self.node_labels, self._roles_padded())
+            ]
         write_json_atomic(self.folder / "manifold.json", payload)
+
+    def _roles_padded(self) -> list[str | None]:
+        """Return ``node_roles`` padded to ``len(node_labels)`` with ``None``s.
+
+        ``ManifoldFolder`` constructed via :meth:`load` always carries a
+        full-length ``node_roles``, but in-memory mutations (e.g.
+        :func:`update_manifold_folder` swapping the node list) might
+        leave the roles list out of sync.  Padding here is defensive.
+        """
+        if len(self.node_roles) == len(self.node_labels):
+            return list(self.node_roles)
+        return [None] * len(self.node_labels)
+
+
+def _node_payload_authored(
+    label: str, coords: list[float], role: str | None,
+) -> dict[str, Any]:
+    """Build one authored-mode node entry for ``manifold.json``.
+
+    ``role`` is emitted only when set, so the legacy ``{label, coords}``
+    shape stays byte-identical for non-role manifolds.
+    """
+    out: dict[str, Any] = {"label": label, "coords": [float(c) for c in coords]}
+    if role is not None:
+        out["role"] = role
+    return out
+
+
+def _node_payload_discover(label: str, role: str | None) -> dict[str, Any]:
+    """Build one discover-mode node entry for ``manifold.json``."""
+    out: dict[str, Any] = {"label": label}
+    if role is not None:
+        out["role"] = role
+    return out
 
 
 def _warn_authoring_quality(
@@ -649,6 +756,9 @@ def _validate_authored_nodes(name: str, domain: Any, nodes: Any) -> None:
                 f"manifold {name!r} node {label!r} needs a non-empty list "
                 f"of non-blank statement strings"
             )
+        # ``role`` is optional; validate the slug shape when set, no-op
+        # otherwise.  Family-unsupported is a fit-time concern.
+        _validate_node_role(name, label, entry.get("role"))
         labels.append(label)
     if len(set(labels)) != len(labels):
         raise ManifoldFormatError(f"manifold {name!r} has duplicate node labels")
@@ -732,7 +842,9 @@ def create_manifold_folder(
         "description": description,
         "domain": domain.to_spec(),
         "nodes": [
-            {"label": entry["label"], "coords": [float(c) for c in entry["coords"]]}
+            _node_payload_authored(
+                entry["label"], entry["coords"], entry.get("role"),
+            )
             for entry in nodes
         ],
         "files": {},
@@ -783,6 +895,7 @@ def create_discover_manifold_folder(
     fit_mode: str,
     node_corpora: dict[str, list[str]],
     hyperparams: Optional[dict[str, Any]] = None,
+    node_roles: Optional[dict[str, str | None]] = None,
 ) -> Path:
     """Author a fresh discover-mode manifold artifact folder on disk.
 
@@ -830,6 +943,20 @@ def create_discover_manifold_folder(
             f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
         )
     _validate_discover_corpora(name, node_corpora)
+    # Validate the optional ``node_roles`` mapping up front, before any
+    # corpus is written — keeps the failure mode consistent (no
+    # half-built folder on a bad role slug).  Extra keys outside the
+    # corpus labels raise; missing keys default to ``None``.
+    roles_resolved: dict[str, str | None] = {label: None for label in node_corpora}
+    if node_roles is not None:
+        unknown = set(node_roles) - set(node_corpora)
+        if unknown:
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} node_roles carries labels "
+                f"not in node_corpora: {sorted(unknown)}"
+            )
+        for label, role in node_roles.items():
+            roles_resolved[label] = _validate_node_role(name, label, role)
 
     folder = manifold_dir(namespace, name)
     if (folder / "manifold.json").exists():
@@ -853,7 +980,10 @@ def create_discover_manifold_folder(
         "description": description,
         "fit_mode": fit_mode,
         "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
-        "nodes": [{"label": label} for label in node_corpora],
+        "nodes": [
+            _node_payload_discover(label, roles_resolved[label])
+            for label in node_corpora
+        ],
         "files": {},
     }
     write_json_atomic(folder / "manifold.json", payload)
@@ -883,9 +1013,220 @@ def update_manifold_folder(
         _write_node_corpus(folder, nodes)
         mf.node_labels = [entry["label"] for entry in nodes]
         mf.node_coords = [[float(c) for c in entry["coords"]] for entry in nodes]
+        # Roles ride per-entry; defaults to None for entries that
+        # don't carry the field.  ``_validate_authored_nodes`` already
+        # checked the slug shape, so this is a pure copy.
+        mf.node_roles = [entry.get("role") for entry in nodes]
     mf.write_metadata()
     _, advisories = _load_with_advisories(folder)
     return folder, advisories
+
+
+# ====================================================== bundled materialization ===
+#
+# Parallel to ``saklas.io.packs.materialize_bundled`` but for the
+# manifold artifact kind.  Bundled manifolds live under
+# ``saklas/data/manifolds/<name>/`` in the wheel and materialize into
+# ``~/.saklas/manifolds/default/<name>/`` on session startup.  JSON-only
+# on the shipped side — per-model ``.safetensors`` fits are produced on
+# the user's machine via ``saklas vector manifold discover``.
+
+
+def bundled_manifold_names() -> list[str]:
+    """List every manifold shipped under ``saklas/data/manifolds/``."""
+    try:
+        root = _resources.files("saklas.data.manifolds")
+    except (ModuleNotFoundError, FileNotFoundError):
+        return []
+    return sorted(
+        p.name for p in root.iterdir()
+        if p.is_dir() and (p / "manifold.json").is_file()
+    )
+
+
+def _canonical_json_sha256(data: bytes) -> str:
+    """Content-stable sha256 of a JSON byte payload.
+
+    Hashes the canonical-JSON form (sorted keys, no surrounding
+    whitespace) so cosmetic-only differences (key order, indent, trailing
+    newline) compare equal.  Mirrors the helper in
+    :mod:`saklas.io.packs` — kept local to avoid reaching into a private
+    cross-module name.  Falls back to a raw sha256 if the bytes don't
+    parse as JSON, so unparseable on-disk content is treated as "user
+    edited" rather than silently overwritten.
+    """
+    try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(_canonical_json(parsed)).hexdigest()
+
+
+def _copy_bundled_manifold_fresh(pkg_root: Any, target: Path) -> None:
+    """Fresh install of a bundled manifold — copy every shipped file."""
+    target.mkdir(parents=True, exist_ok=True)
+    for entry in pkg_root.iterdir():
+        if entry.is_file():
+            write_bytes_atomic(target / entry.name, entry.read_bytes())
+        elif entry.is_dir() and entry.name == "nodes":
+            nodes_dir = target / "nodes"
+            nodes_dir.mkdir(parents=True, exist_ok=True)
+            for node_file in entry.iterdir():
+                if node_file.is_file():
+                    write_bytes_atomic(
+                        nodes_dir / node_file.name, node_file.read_bytes(),
+                    )
+
+
+def _refresh_all_bundled_nodes(pkg_root: Any, target: Path) -> None:
+    """Re-copy every shipped node file unconditionally.
+
+    Bundle-update path — the manifest moved under the user, so any
+    node-level "edits" are stale-against-old-bundle (the corpus that
+    statement at position N referred to no longer matches what bundle-
+    position-N currently is).  Better to drop them and have the user
+    re-edit against the new bundle than to silently mix two corpora.
+
+    Stale node files from the old bundle are removed if they don't
+    exist in the new bundle (label set change).
+    """
+    pkg_nodes = pkg_root.joinpath("nodes")
+    if not pkg_nodes.is_dir():
+        return
+    target_nodes = target / "nodes"
+    target_nodes.mkdir(parents=True, exist_ok=True)
+    bundled_names: set[str] = set()
+    for node_file in pkg_nodes.iterdir():
+        if not node_file.is_file():
+            continue
+        bundled_names.add(node_file.name)
+        write_bytes_atomic(target_nodes / node_file.name, node_file.read_bytes())
+    # Drop any on-disk node files that aren't in the new bundle (label
+    # set shrank or rename happened).  Without this, an old roster's
+    # files would linger and confuse the loader.
+    for stale in target_nodes.iterdir():
+        if stale.is_file() and stale.name not in bundled_names:
+            stale.unlink()
+
+
+def materialize_bundled_manifolds() -> None:
+    """Copy bundled manifolds into ``~/.saklas/manifolds/default/``.
+
+    For each ``saklas/data/manifolds/<name>/`` in the wheel, ensure
+    ``~/.saklas/manifolds/default/<name>/`` is current.  Mirrors
+    :func:`saklas.io.packs.materialize_bundled` for the manifold artifact
+    kind; only touches ``manifold.json`` and ``nodes/*.json`` since
+    bundled manifolds ship JSON-only (no per-model ``.safetensors`` —
+    those are user-side fits).
+
+    Three paths:
+
+    - **Fresh install** (target dir doesn't exist) — copy every shipped
+      file atomically.
+    - **Bundle update** (canonical-JSON hash of bundled ``manifold.json``
+      differs from materialized, OR on-disk ``format_version`` is older
+      than :data:`MANIFOLD_FORMAT_VERSION`) — re-copy ``manifold.json``
+      in place (writing a ``.bak``), re-copy every node file
+      unconditionally, re-copy any other top-level shipped files.
+    - **No change** (manifest hashes match AND format_version is
+      current) — skip.
+
+    Bundle-update intentionally does NOT preserve user edits to node
+    files.  A node-level "user edit" is meaningful only relative to a
+    specific bundle version; once the bundle has moved (manifest hash
+    differs), the edit is stale-against-old-bundle and silently keeping
+    it would mix corpora from two versions.  Users who want to override
+    a bundled node corpus should fork it under a different namespace
+    (``saklas vector manifold generate ...`` or hand-author under
+    ``local/<name>/``) rather than edit the default-namespace copy.
+
+    Per-model ``.safetensors`` tensor files stay put on bundle update —
+    they're expensive to refit and the per-tensor ``nodes_sha256``
+    check invalidates them automatically on next discover/fit.
+
+    **Process-scoped no-op after first call.**  Subsequent calls within
+    the same process return immediately without touching disk.  This
+    prevents a second materialize (from e.g. ``SaklasSession.from_pretrained``
+    later in the same CLI invocation) from clobbering CLI-set
+    hyperparams that the runner wrote between the two calls — the
+    materialize-detects-bundle-update logic can't distinguish
+    "bundle changed under user" from "user changed manifest via CLI
+    override", and process-scope caching sidesteps the entire
+    ambiguity.  A long-running server that wants to pick up a bundle
+    update mid-process would need a restart; this is not a real use
+    case (bundle updates ship via pip and require restart anyway).
+    """
+    global _materialized_this_process
+    if _materialized_this_process:
+        return
+    _materialized_this_process = True
+
+    home = saklas_home()
+    home.mkdir(parents=True, exist_ok=True)
+
+    default_dir = manifolds_dir() / "default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    for name in bundled_manifold_names():
+        target = default_dir / name
+        pkg_root = _resources.files("saklas.data.manifolds").joinpath(name)
+
+        if not target.exists():
+            _copy_bundled_manifold_fresh(pkg_root, target)
+            continue
+
+        on_disk_manifest = target / "manifold.json"
+        if not on_disk_manifest.exists():
+            # Folder exists without a manifold.json — refuse to fabricate one.
+            continue
+
+        try:
+            with open(on_disk_manifest) as f:
+                on_disk_payload = json.load(f)
+        except Exception:
+            # Corrupt; don't stomp user state.
+            continue
+
+        bundled_manifest_bytes = (pkg_root / "manifold.json").read_bytes()
+        on_disk_manifest_bytes = on_disk_manifest.read_bytes()
+        manifest_changed = (
+            _canonical_json_sha256(on_disk_manifest_bytes)
+            != _canonical_json_sha256(bundled_manifest_bytes)
+        )
+        fmt = on_disk_payload.get("format_version")
+        format_stale = isinstance(fmt, int) and fmt < MANIFOLD_FORMAT_VERSION
+
+        if not manifest_changed and not format_stale:
+            # Same bundle, current format — nothing to do.
+            continue
+
+        # Bundle update — manifest moved or format_version bumped.  Both
+        # cases want the new bundled state to win; user node-edits are
+        # interpreted as stale-against-old-bundle and replaced.
+        write_bytes_atomic(
+            on_disk_manifest.with_suffix(".json.bak"), on_disk_manifest_bytes,
+        )
+        write_bytes_atomic(on_disk_manifest, bundled_manifest_bytes)
+
+        _refresh_all_bundled_nodes(pkg_root, target)
+
+        # Re-copy other top-level shipped files (e.g. scenarios.json
+        # provenance) that aren't manifold.json or under nodes/.
+        for entry in pkg_root.iterdir():
+            if not entry.is_file():
+                continue
+            if entry.name == "manifold.json":
+                continue
+            write_bytes_atomic(target / entry.name, entry.read_bytes())
+
+        reason = (
+            f"v{fmt}->v{MANIFOLD_FORMAT_VERSION} (format_version)"
+            if format_stale
+            else "manifest content changed"
+        )
+        _log.info(
+            "materialize_bundled_manifolds: refreshed default/%s — %s",
+            name, reason,
+        )
 
 
 __all__ = [
@@ -899,5 +1240,7 @@ __all__ = [
     "create_manifold_folder",
     "create_discover_manifold_folder",
     "update_manifold_folder",
+    "bundled_manifold_names",
+    "materialize_bundled_manifolds",
     "_sanitize_hyperparams",
 ]

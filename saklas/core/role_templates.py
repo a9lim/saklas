@@ -61,6 +61,12 @@ class RoleHeader:
 def _build_role_headers() -> dict[str, RoleHeader | None]:
     qwen = RoleHeader(before="<|im_start|>", after="\n", label="assistant")
     gemma = RoleHeader(before="<start_of_turn>", after="\n", label="model")
+    # Gemma-4 shipped a new turn-boundary scheme — ``<|turn>...<turn|>``
+    # instead of the prior ``<start_of_turn>...<end_of_turn>``.  The label
+    # stays ``model`` (gemma family convention), only the surrounding
+    # delimiter changed.  Verified empirically against the
+    # ``google/gemma-4-31b-it`` tokenizer's rendered chat template (2026-05).
+    gemma4 = RoleHeader(before="<|turn>", after="\n", label="model")
     llama = RoleHeader(
         before="<|start_header_id|>", after="<|end_header_id|>", label="assistant"
     )
@@ -76,12 +82,13 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
         "qwen3_text": qwen,
         "qwen3_moe": qwen,
         "qwen3_5": qwen,
-        # Gemma family — note label="model", not "assistant"
+        # Gemma family — note label="model", not "assistant".  Gemma-4
+        # uses a different delimiter than 2/3 (see ``gemma4`` above).
         "gemma2": gemma,
         "gemma3": gemma,
         "gemma3_text": gemma,
-        "gemma4": gemma,
-        "gemma4_text": gemma,
+        "gemma4": gemma4,
+        "gemma4_text": gemma4,
         # Llama family
         "llama": llama,
         # GLM (ChatGLM-4)
