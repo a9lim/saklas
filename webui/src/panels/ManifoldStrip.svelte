@@ -12,6 +12,7 @@
     manifoldByName,
     setManifoldBlend,
     setManifoldCoords,
+    setManifoldLabel,
     setManifoldTrigger,
     setManifoldEnabled,
     removeManifoldFromRack,
@@ -73,6 +74,16 @@
     entry.coords.map((c) => (Number.isFinite(c) ? c.toFixed(2) : "0")).join(", "),
   );
 
+  // Snap-to-node dropdown: the user can pick a labeled node from the
+  // manifold's node list, which switches the term to label-form
+  // (``persona%pirate``).  An empty selection clears the label binding
+  // — the position becomes free-form, drag on the XYPad to author.
+  function onSnapToNode(ev: Event): void {
+    const t = ev.currentTarget as HTMLSelectElement;
+    const val = t.value;
+    setManifoldLabel(name, val === "" ? null : val);
+  }
+
   // A manifold needs a tensor for the loaded model to actually steer.
   const fitted = $derived(info?.fitted_for_session === true);
   const stale = $derived(info?.stale === true);
@@ -111,7 +122,13 @@
       </span>
     {/if}
 
-    <span class="coords" title="authoring position: {coordsLabel}">{coordsLabel}</span>
+    <span class="coords" title="authoring position: {coordsLabel}">
+      {#if entry.label}
+        <span class="node-pill" title="snapped to node '{entry.label}' (label-form)">%{entry.label}</span>
+      {:else}
+        {coordsLabel}
+      {/if}
+    </span>
 
     <button
       type="button"
@@ -151,6 +168,25 @@
   {#if expanded}
     <div class="picker">
       {#if info}
+        {#if info.node_labels.length > 0}
+          <label class="snap-row">
+            <span class="snap-label">snap to node</span>
+            <select
+              class="snap-select"
+              value={entry.label ?? ""}
+              onchange={onSnapToNode}
+              title="pick a node to switch to label-form, or '(free)' to drag the pad"
+            >
+              <option value="">(free position)</option>
+              {#each info.node_labels as nl, i (nl)}
+                {@const role = info.node_roles?.[i]}
+                <option value={nl}>
+                  {nl}{role ? ` [role=${role}]` : ""}
+                </option>
+              {/each}
+            </select>
+          </label>
+        {/if}
         <XYPad manifold={info} coords={entry.coords} onchange={onCoordsChange} />
       {:else}
         <p class="picker-missing">
@@ -167,7 +203,11 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
+    /* Phase C.3: a left purple stripe + matching name color
+     * differentiates manifold rows from vector rows at a glance.
+     * Same accent the TUI's manifold rows use (ansi_magenta). */
     border: 1px solid var(--border);
+    border-left: 3px solid var(--accent-purple);
     border-radius: var(--radius);
     background: var(--bg-alt);
     font-size: var(--text-sm);
@@ -202,7 +242,9 @@
     gap: var(--space-2);
     background: transparent;
     border: 0;
-    color: var(--fg-strong);
+    /* Manifold rows use purple as the name color to set them apart
+     * from vector rows (which use fg-strong / accent on hover). */
+    color: var(--accent-purple);
     font: inherit;
     font-family: var(--font-mono);
     cursor: pointer;
@@ -293,10 +335,45 @@
   .picker {
     border-top: 1px solid var(--border);
     padding-top: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
   }
   .picker-missing {
     margin: 0;
     color: var(--fg-muted);
     font-size: var(--text-xs);
+  }
+  .snap-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--fg-strong);
+    font-size: var(--text-xs);
+  }
+  .snap-label {
+    color: var(--fg-muted);
+    flex: 0 0 auto;
+  }
+  .snap-select {
+    flex: 1 1 auto;
+    background: var(--bg-deep);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+  .snap-select:focus {
+    outline: none;
+    border-color: var(--accent-purple);
+  }
+  .node-pill {
+    background: color-mix(in srgb, var(--accent-purple) 14%, transparent);
+    color: var(--accent-purple);
+    padding: 0 var(--space-2);
+    border-radius: var(--radius);
+    font-variant-numeric: tabular-nums;
   }
 </style>

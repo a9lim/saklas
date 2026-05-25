@@ -263,6 +263,130 @@ def resolve_pole(
     return c_name, c_sign, c_resolved, variant
 
 
+@dataclass(frozen=True)
+class ResolvedManifoldLabel:
+    """A unique match for :func:`resolve_manifold_label`.
+
+    Carries both the manifold's namespace-qualified name (the form a
+    grammar ``%`` term consumes) and the bare label so the synthesized
+    term reads naturally:  ``<manifold_key>%<label>``.
+    """
+
+    namespace: str
+    manifold_name: str
+    label: str
+
+    @property
+    def manifold_key(self) -> str:
+        """``<ns>/<name>`` — the form the grammar uses to reference the manifold."""
+        return f"{self.namespace}/{self.manifold_name}"
+
+
+def resolve_manifold_label(
+    label: str, *, namespace: Optional[str] = None,
+) -> Optional[ResolvedManifoldLabel]:
+    """Resolve a bare label to (namespace, manifold, label) — or ``None``.
+
+    Walks every installed manifold (or every manifold inside
+    ``namespace`` when set) for one whose ``node_labels`` contains
+    ``label``.  Returns a :class:`ResolvedManifoldLabel` on a single
+    match, ``None`` when nothing matches (the caller falls through to
+    other resolution tiers — e.g. a fresh concept), and raises
+    :class:`AmbiguousSelectorError` when multiple manifolds carry a
+    node by the same label.  This is the manifold analogue of
+    :func:`resolve_pole`'s bipolar-pole alias; together they let
+    ``persona`` (the manifold node) and ``angry`` (the bipolar pole)
+    resolve through the same bare-name surface.
+
+    The lookup is a folder scan, not a fitted-tensor check — labels
+    exist on the artifact regardless of whether the manifold has been
+    fitted for the loaded model.  A persona manifold authored on
+    disk but never fitted still surfaces here.
+    """
+    # Lazy import — selectors.py lives under io/ and shouldn't import
+    # at module-load time from a peer that may import it back.
+    from saklas.io.manifolds import (
+        ManifoldFormatError, iter_manifold_folders,
+    )
+
+    matches: list[ResolvedManifoldLabel] = []
+    try:
+        manifolds = list(iter_manifold_folders(namespace))
+    except ManifoldFormatError:
+        # A single malformed folder shouldn't poison the whole resolve;
+        # ``iter_manifold_folders`` already skips them, but defensive.
+        return None
+    for ns, mf in manifolds:
+        if label in mf.node_labels:
+            matches.append(ResolvedManifoldLabel(
+                namespace=ns,
+                manifold_name=mf.name,
+                label=label,
+            ))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        qualified = ", ".join(
+            f"{m.manifold_key} (label '{m.label}')" for m in matches
+        )
+        raise AmbiguousSelectorError(
+            f"ambiguous manifold label '{label}': matches {qualified}. "
+            f"Specify the manifold explicitly as <ns>/<name>%{label}."
+        )
+    return matches[0]
+
+
+def resolve_bare_name(
+    raw: str, *, namespace: Optional[str] = None,
+) -> tuple[
+    Optional[tuple[str, int, Optional["ResolvedConcept"], str]],
+    Optional[ResolvedManifoldLabel],
+]:
+    """Unified bare-name resolver across the bipolar-pole and manifold-label tiers.
+
+    Returns ``(pole_hit, manifold_hit)`` — exactly one is non-``None``
+    on a successful resolution, both are ``None`` when no installed
+    artifact owns ``raw``, and an :class:`AmbiguousSelectorError` is
+    raised when both tiers claim ``raw`` (cross-tier collision —
+    e.g. ``pirate`` is both a bipolar pole and a manifold node).
+
+    Resolution order: pole resolution runs first because it's the
+    historical surface and the disambiguation message it produces is
+    already a known shape.  Manifold-label resolution is tried only
+    when pole resolution doesn't hit an installed concept.  This
+    means a bare ``pirate`` with a ``civilian.pirate`` pack *and* a
+    ``persona`` manifold with a ``pirate`` node raises rather than
+    silently picking one tier — same shape as cross-namespace pole
+    ambiguity.
+
+    The caller routes the hit downstream: a ``pole_hit`` synthesizes
+    a plain vector term; a ``manifold_hit`` synthesizes a
+    ``<manifold>%<label>`` :class:`~saklas.core.steering_expr.ManifoldTerm`.
+    """
+    # ``resolve_pole`` returns ``match=None`` on a miss but doesn't
+    # raise — peel its tuple to detect whether anything actually hit.
+    pole_tuple = resolve_pole(raw, namespace=namespace)
+    pole_hit = pole_tuple if pole_tuple[2] is not None else None
+
+    manifold_hit = resolve_manifold_label(raw, namespace=namespace)
+
+    if pole_hit is not None and manifold_hit is not None:
+        canonical, sign, match, variant = pole_hit
+        pole_label = (
+            f"{match.namespace}/{canonical}"
+            + (" (negated)" if sign < 0 else "")
+            + (f":{variant}" if variant != "raw" else "")
+        )
+        raise AmbiguousSelectorError(
+            f"ambiguous bare name '{raw}': matches both a vector "
+            f"pole ({pole_label}) and a manifold node "
+            f"({manifold_hit.manifold_key}%{manifold_hit.label}). "
+            f"Qualify the form: '<canonical>' for the vector or "
+            f"'<manifold>%<label>' for the manifold node."
+        )
+    return pole_hit, manifold_hit
+
+
 def parse_args(tokens: list[str]) -> tuple[Selector, Optional[str]]:
     """Parse a list of selector tokens into (concept selector, optional model scope).
 

@@ -103,6 +103,15 @@ export interface ManifoldNodeSpec {
   label: string;
   coords: number[];
   statements: string[];
+  /** Optional per-node assistant-role substitution.  When set, this
+   *  node's centroid is pooled with the chat-template's assistant-role
+   *  label replaced by this slug — the persona-manifold building block
+   *  that lets one fitted manifold span multiple personas in
+   *  role-baselined activation space.  Slug must match
+   *  ``[a-z0-9._-]+``.  Omit / leave empty for the standard assistant
+   *  baseline (the legacy default).  Family-unsupported (Mistral-3 /
+   *  talkie) raises at fit time. */
+  role?: string | null;
 }
 
 /** PCA discover-fit diagnostics block surfaced in the inspector.
@@ -165,6 +174,13 @@ export interface ManifoldInfo {
   node_count: number;
   node_labels: string[];
   node_coords: number[][];
+  /** Per-node assistant-role substitution recorded on the manifold,
+   *  aligned with ``node_labels``.  ``null`` for a given node means
+   *  "pooled under the standard assistant baseline" (the legacy
+   *  default).  An all-``null`` array (or absent) marks a non-role
+   *  manifold; any non-``null`` entry marks a persona / role-paired
+   *  manifold. */
+  node_roles?: (string | null)[];
   fitted_models: string[];
   /** True iff a tensor for the loaded session model is present. */
   fitted_for_session: boolean;
@@ -212,6 +228,9 @@ export interface UpdateManifoldRequest {
 export interface DiscoverManifoldNodeSpec {
   label: string;
   statements: string[];
+  /** Optional per-node assistant-role substitution; see
+   *  :class:`ManifoldNodeSpec` for semantics. */
+  role?: string | null;
 }
 
 /** Body for POST /saklas/v1/manifolds/discover.
@@ -244,6 +263,12 @@ export interface GenerateManifoldRequest {
   fit_mode?: "pca" | "spectral";
   hyperparams?: Record<string, number | string>;
   force?: boolean;
+  /** Persona-manifold opt-in: each ``concepts[i]`` slug doubles as
+   *  that node's assistant-role substitution at fit time, producing a
+   *  role-paired manifold.  Steering through it implies the nearest
+   *  node's role at decode time (the manifold lives in
+   *  role-baselined activation space). */
+  role_per_node?: boolean;
 }
 
 /** Body for POST /saklas/v1/manifolds/{ns}/{name}/fit.
@@ -288,6 +313,14 @@ export interface ExtractRequest {
   dls?: boolean | null;
   sae?: string | null;
   sae_revision?: string | null;
+  /** Role-augmented extraction: replace the assistant-role label in
+   * the chat template with this slug at extract time (e.g. "pirate").
+   * The same substitution rides at steer time so the extract baseline
+   * matches the steer baseline.  The tensor lands under a
+   * ``_role-<slug>`` filename suffix and is steerable via the matching
+   * ``:role-<slug>`` variant.  Slug must match ``[a-z0-9._-]+``;
+   * mutually exclusive with ``sae``. */
+  role?: string | null;
   register?: boolean;
 }
 
@@ -1004,6 +1037,14 @@ export interface ManifoldRackEntry {
   blend: number;
   /** Authoring coordinates, one per intrinsic dimension. */
   coords: number[];
+  /** Optional node-label form of the position: when set, the term
+   *  serializes as ``<name>%<label>`` (Phase B label-form) and the
+   *  coords are this node's authoring coords mirrored for the XYPad
+   *  display.  ``null`` = the position was authored coord-wise (drag
+   *  on the XYPad), serialize as the comma-joined coord list.  Pulling
+   *  on the XYPad clears the label; picking from the snap-to-node
+   *  dropdown sets it. */
+  label?: string | null;
   trigger: Trigger;
   enabled: boolean;
 }

@@ -147,12 +147,16 @@ function formatTriggerSuffix(trigger: Trigger): string {
   return kw ? `@${kw}` : "";
 }
 
-/** Render one manifold rack entry — ``<coeff> <name>%<c0,c1,...>`` plus
- *  an optional ``@trigger`` suffix.  The coefficient is the blend
- *  fraction; ``-`` rides the joiner like vector terms. */
+/** Render one manifold rack entry — ``<coeff> <name>%<position>`` plus
+ *  an optional ``@trigger`` suffix.  Coefficient is the blend fraction
+ *  (``-`` rides the joiner like vector terms).  ``<position>`` is the
+ *  label form (``persona%pirate``) when ``entry.label`` is set;
+ *  otherwise the comma-joined coord list (``persona%0.3,0.8``). */
 function formatManifoldTerm(name: string, entry: ManifoldRackEntry): string {
-  const coords = entry.coords.map((c) => formatCoeff(c)).join(",");
-  const selector = `${name}%${coords}`;
+  const position = entry.label
+    ? entry.label
+    : entry.coords.map((c) => formatCoeff(c)).join(",");
+  const selector = `${name}%${position}`;
   return `${formatCoeff(entry.blend)} ${selector}${formatTriggerSuffix(entry.trigger)}`;
 }
 
@@ -284,15 +288,18 @@ interface VectorTerm {
   ablation: boolean;
 }
 
-/** A manifold term — ``<coeff> <name>%<coords>``.  Discriminated off
+/** A manifold term — ``<coeff> <name>%<position>``.  Discriminated off
  *  ``kind`` so ``parseExpression`` can fold the two streams into their
- *  respective racks. */
+ *  respective racks.  ``label`` is the label-form payload
+ *  (``persona%pirate`` — Phase B sugar); ``coords`` is the coord-form
+ *  payload.  Exactly one is non-null. */
 interface ManifoldTerm {
   kind: "manifold";
   /** Display name of the manifold (``ns/name`` or bare ``name``). */
   name: string;
   coeff: number;
-  coords: number[];
+  coords: number[] | null;
+  label: string | null;
   trigger: string | null;
 }
 
@@ -369,13 +376,24 @@ class Parser {
         );
       }
       this.consume(); // '%'
-      const coords = this.coordList();
+      // Label form (``persona%pirate``) vs coord form
+      // (``persona%0.3,0.8``).  Disambiguate on the next token: a
+      // bare identifier is a node label, everything else (NUM, signed
+      // NUM) starts a coord list.  Mirrors the Python grammar parser.
+      let coords: number[] | null = null;
+      let label: string | null = null;
+      if (this.peek().kind === "IDENT") {
+        label = String(this.consume().value);
+      } else {
+        coords = this.coordList();
+      }
       const trigger = this.optTrigger();
       return {
         kind: "manifold",
         name: atomKey(base),
         coeff,
         coords,
+        label,
         trigger,
       };
     }
@@ -531,9 +549,15 @@ export function parseExpression(expr: string): ParsedExpression {
           null,
         );
       }
+      // Label-form term: ``coords`` is null on the parser output and
+      // will be filled in when the strip resolves through the
+      // catalog's ``node_labels`` (else stays empty until the user
+      // pulls on the XYPad).  Coord-form: ``coords`` is the literal
+      // tuple, ``label`` is null.
       manifolds.set(term.name, {
         blend: term.coeff,
-        coords: term.coords,
+        coords: term.coords ?? [],
+        label: term.label,
         trigger,
         enabled: true,
       });

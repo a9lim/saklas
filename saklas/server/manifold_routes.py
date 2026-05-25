@@ -63,17 +63,25 @@ class NodeSpec(BaseModel):
     label: str
     coords: list[float]
     statements: list[str]
+    # Optional per-node assistant-role substitution.  ``None`` (default)
+    # = standard assistant baseline.  When set, this node's centroid is
+    # pooled with the chat-template's assistant-role label replaced by
+    # this slug.  Engine validates the slug shape (``[a-z0-9._-]+``)
+    # and the family's support at fit time.
+    role: str | None = None
 
 
 class DiscoverNodeSpec(BaseModel):
     """A node in a discover-mode authoring payload — label + statements only.
 
     No ``coords``: coords are derived per-model at fit time from the
-    pooled centroids.
+    pooled centroids.  ``role`` (optional) carries the per-node
+    assistant-role substitution; see :class:`NodeSpec`.
     """
 
     label: str
     statements: list[str]
+    role: str | None = None
 
 
 class CreateManifoldRequest(BaseModel):
@@ -118,6 +126,12 @@ class GenerateManifoldRequest(BaseModel):
     fit_mode: Literal["pca", "spectral"] = "pca"
     hyperparams: dict[str, Any] = {}
     force: bool = False
+    # ``role_per_node=True`` (the GUI "use slug as per-node role"
+    # checkbox) means each ``concepts[i]`` slug doubles as that node's
+    # assistant-role substitution at fit time — producing a persona
+    # manifold where the geometry captures persona-relative structure
+    # in role-baselined activation space.
+    role_per_node: bool = False
 
 
 class UpdateManifoldRequest(BaseModel):
@@ -189,6 +203,14 @@ def _manifold_json(
         except (KeyError, ManifoldFormatError, OSError):
             stale = False
 
+    # Per-node roles are part of the manifest shape — surface alongside
+    # labels/coords.  Padded to ``node_count`` with ``None`` so a
+    # consumer can ``zip`` against ``node_labels`` without checking the
+    # length first.  All-``None`` (the legacy / non-role default)
+    # serializes identically to today.
+    node_roles_padded = list(mf.node_roles) + [None] * (
+        len(mf.node_labels) - len(mf.node_roles)
+    )
     out: dict[str, Any] = {
         "namespace": namespace,
         "name": mf.name,
@@ -200,6 +222,7 @@ def _manifold_json(
         "node_count": len(mf.node_labels),
         "node_labels": list(mf.node_labels),
         "node_coords": [list(c) for c in mf.node_coords],
+        "node_roles": node_roles_padded,
         "fit_mode": mf.fit_mode,
         "hyperparams": dict(mf.hyperparams),
         "fitted_models": fitted_models,
@@ -215,8 +238,11 @@ def _manifold_json(
                     "label": label,
                     "coords": list(coords),
                     "statements": list(groups.get(label, [])),
+                    "role": role,
                 }
-                for label, coords in zip(mf.node_labels, mf.node_coords)
+                for label, coords, role in zip(
+                    mf.node_labels, mf.node_coords, node_roles_padded,
+                )
             ]
         else:
             # Discover: no per-node coords in the folder; if a fit is
@@ -244,6 +270,7 @@ def _manifold_json(
                         derived_coords[i] if i < len(derived_coords) else None
                     ),
                     "statements": list(groups.get(label, [])),
+                    "role": node_roles_padded[i],
                 }
                 for i, label in enumerate(mf.node_labels)
             ]
@@ -371,12 +398,18 @@ def register_manifold_routes(app: FastAPI) -> None:
         {ns}/{name}/fit`` to run the discovery + fit.
         """
         node_corpora = {n.label: list(n.statements) for n in req.nodes}
+        # Roles ride per-node; ``None`` (default) on a NodeSpec maps to
+        # the standard assistant baseline.  An all-``None`` dict is
+        # equivalent to "no roles" and is byte-identical to the
+        # pre-A-phase manifest.
+        node_roles_map = {n.label: n.role for n in req.nodes}
         try:
             folder = create_discover_manifold_folder(
                 req.namespace, req.name, req.description,
                 fit_mode=req.fit_mode,
                 node_corpora=node_corpora,
                 hyperparams=req.hyperparams,
+                node_roles=node_roles_map,
             )
         except FileExistsError as e:
             raise HTTPException(409, str(e))
@@ -411,6 +444,15 @@ def register_manifold_routes(app: FastAPI) -> None:
                     f"(pass force=true to overwrite)",
                 )
 
+        # ``role_per_node`` mirrors the CLI ``--role-per-node`` flag —
+        # each concept slug doubles as that node's assistant-role
+        # substitution.  An unsupported family raises at fit time
+        # (the folder is model-agnostic; we don't pay the family check
+        # at generate time).
+        node_roles_map: dict[str, str | None] | None = None
+        if req.role_per_node:
+            node_roles_map = {c: c for c in req.concepts}
+
         def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
             corpora = session.generate_concept_statements(
                 list(req.concepts),
@@ -426,6 +468,7 @@ def register_manifold_routes(app: FastAPI) -> None:
                     fit_mode=req.fit_mode,
                     node_corpora=corpora,
                     hyperparams=req.hyperparams,
+                    node_roles=node_roles_map,
                 )
             except (FileExistsError, ManifoldFormatError) as e:
                 raise HTTPException(400, str(e))

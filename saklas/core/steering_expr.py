@@ -142,25 +142,36 @@ class AblationTerm:
 class ManifoldTerm:
     """Soft subspace-replace entry in ``Steering.alphas``.
 
-    Produced by a ``manifold % coord_list`` term.  The session loads the
+    Produced by a ``manifold % position`` term.  The session loads the
     named :class:`~saklas.core.manifold.Manifold` artifact on scope entry
     and hands the hook a per-layer subspace plus the manifold point at
     ``position``; the hook blends the running activation's in-subspace
     component toward that point by ``coeff``.  Stored as a value inside
-    ``Steering.alphas`` under the key ``"<manifold>%<coords>"`` so two
+    ``Steering.alphas`` under the key ``"<manifold>%<position>"`` so two
     positions on the same manifold compose as distinct entries and never
     collide with plain / projected / ablation keys.
 
     ``coeff`` is the blend fraction (clamped to ``[0, 1]`` at apply
-    time); ``position`` is the tuple of authoring coordinates — one per
-    intrinsic dimension of the manifold's domain.  ``manifold`` is the
-    registry key — namespace-qualified when the user typed a namespace,
-    variant-suffixed when not ``raw``.
+    time); ``manifold`` is the registry key — namespace-qualified when
+    the user typed a namespace, variant-suffixed when not ``raw``.
+
+    ``position`` is either:
+
+    - A tuple of authoring coordinates — one float per intrinsic
+      dimension of the manifold's domain (the historical shape, e.g.
+      ``(0.3, 0.8)`` on a 2-D affect manifold).
+    - A node label string — sugar for "the coords of the node labeled
+      <s> on this manifold", resolved at scope entry via
+      :meth:`Manifold.resolve_position`.  The label form makes
+      ``persona%pirate`` a first-class steering term parallel to
+      ``persona%0.3,0.8``.
+
+    Round-trip via :func:`format_expr` preserves the authored form.
     """
     coeff: float
     trigger: Trigger
     manifold: str
-    position: tuple[float, ...]
+    position: tuple[float, ...] | str
 
 
 class SteeringExprError(ValueError, SaklasError):
@@ -290,7 +301,10 @@ class _Selector:
     # Set when the selector is a manifold position term
     # (``base % NUM (, NUM)*``); mutually exclusive with
     # ``operator`` / ``onto``.
-    manifold_position: Optional[tuple[float, ...]] = None
+    # ``tuple[float, ...]`` for coord-form (``%0.3,0.8``); ``str`` for
+    # label-form (``%pirate``).  ``None`` when this selector is not a
+    # manifold term.
+    manifold_position: Optional[tuple[float, ...] | str] = None
 
 
 @dataclass
@@ -455,15 +469,33 @@ class _Parser:
     def _selector(self) -> _Selector:
         base = self._atom()
         if self._peek().kind == "PERCENT":
-            # Manifold position term: ``base % NUM (, NUM)*``.  The
-            # parser only collects the coordinate tuple — arity (against
-            # the domain's intrinsic dimension) and range are checked at
-            # manifold-load time, when the domain is known.
+            # Manifold position term: ``base % NUM(,NUM)*`` (coord form)
+            # OR ``base % IDENT`` (label form, sugar for "the coords of
+            # the node labeled <s>"; resolved at scope entry).  The
+            # parser only collects the position payload — arity (against
+            # the domain's intrinsic dimension) for the coord form, and
+            # label existence + role-paired lookup for the label form,
+            # are checked at manifold-load time when both the domain
+            # and the node labels are known.
             self._consume()
-            coords: list[float] = [self._signed_num()]
-            while self._peek().kind == "COMMA":
-                self._consume()
-                coords.append(self._signed_num())
+            head = self._peek()
+            position: tuple[float, ...] | str
+            if head.kind == "IDENT":
+                # Label form: a single bare identifier.  No comma list
+                # — a manifold node label is one slug, not a tuple.
+                # Variant suffixes (``%pirate:role-pirate``) are not
+                # meaningful on a position and so not part of the
+                # grammar; if the user typed one, it lexed as a
+                # separate ``:`` token and will fall out as a parse
+                # error on the trailing arm below.
+                tok = self._consume()
+                position = str(tok.value)
+            else:
+                coords: list[float] = [self._signed_num()]
+                while self._peek().kind == "COMMA":
+                    self._consume()
+                    coords.append(self._signed_num())
+                position = tuple(coords)
             if self._peek().kind in ("TILDE", "ORTHO", "PERCENT"):
                 raise SteeringExprError(
                     "a manifold position does not compose with projection "
@@ -472,7 +504,7 @@ class _Parser:
                 )
             return _Selector(
                 base=base, operator=None, onto=None,
-                manifold_position=tuple(coords),
+                manifold_position=position,
             )
         if self._peek().kind in ("TILDE", "ORTHO"):
             op_tok = self._consume()
@@ -654,19 +686,34 @@ def _resolve_manifold_atom(atom: _Atom) -> str:
     return _with_variant(key, atom.variant)
 
 
-def _fmt_coords(position: tuple[float, ...]) -> str:
-    """Render a manifold coordinate tuple as a comma-joined ``%g`` list."""
+def _fmt_position(position: tuple[float, ...] | str) -> str:
+    """Render a manifold position payload back to grammar form.
+
+    Coord tuple → comma-joined ``%g`` list (``0.3,0.8``).  Label string
+    → the slug verbatim (``pirate``).  The two forms are unambiguous
+    by shape — a node label is a slug-shaped identifier, a coord list
+    starts with a digit / sign.
+    """
+    if isinstance(position, str):
+        return position
     return ",".join(f"{c:g}" for c in position)
+
+
+# Backwards-compat alias for the rename above — narrower callers still
+# pass strict coord tuples (e.g. the naturalness CLI's chord baseline)
+# and shouldn't care about the wider position type.
+def _fmt_coords(position: tuple[float, ...]) -> str:
+    return _fmt_position(position)
 
 
 def _merge_manifold(
     alphas: "dict[str, AlphaEntry]",
     manifold: str,
     coeff: float,
-    position: tuple[float, ...],
+    position: tuple[float, ...] | str,
     trig: Trigger,
 ) -> None:
-    key = f"{manifold}%{_fmt_coords(position)}"
+    key = f"{manifold}%{_fmt_position(position)}"
     if key not in alphas:
         alphas[key] = ManifoldTerm(
             coeff=coeff, trigger=trig, manifold=manifold, position=position,
@@ -712,6 +759,41 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 mfld_trig,
             )
             continue
+        # Bare-name manifold-label fallback (Phase C.2): a plain term
+        # whose base is a bare slug (no namespace, no variant suffix,
+        # no bipolar ``.``, no projection / ablation) is a candidate
+        # for the unified bare-name resolver.  If the slug isn't an
+        # installed bipolar pole *and* matches a manifold's node
+        # label, synthesize a label-form ManifoldTerm at that node
+        # instead of treating the slug as a fresh concept.  Cross-tier
+        # collisions (slug matches both a pole and a manifold node)
+        # raise ``AmbiguousSelectorError`` inside ``resolve_bare_name``.
+        if (
+            sel.operator is None
+            and not term.ablation
+            and sel.base.variant == "raw"
+            and sel.base.namespace is None
+            and "." not in sel.base.concept
+        ):
+            from saklas.io.selectors import resolve_bare_name
+            try:
+                pole_hit, manifold_hit = resolve_bare_name(
+                    sel.base.concept, namespace=namespace,
+                )
+            except Exception:
+                # Errors fall through to the historical resolve_pole
+                # path below; if the same error is genuine, it raises
+                # there with the canonical surface message.
+                pole_hit, manifold_hit = None, None
+            if manifold_hit is not None and pole_hit is None:
+                mfld_trig = (
+                    term.trigger if term.trigger is not None else Trigger.BOTH
+                )
+                _merge_manifold(
+                    alphas, manifold_hit.manifold_key, term.coeff,
+                    manifold_hit.label, mfld_trig,
+                )
+                continue
         base_key, base_sign = _resolve_atom(sel.base, namespace)
         coeff = term.coeff * base_sign
         # ``_Term.trigger`` already carries a resolved Trigger object
@@ -828,7 +910,7 @@ def _fmt_ablation(a: AblationTerm) -> str:
 
 
 def _fmt_manifold(m: ManifoldTerm) -> str:
-    body = f"{m.coeff:g} {m.manifold}%{_fmt_coords(m.position)}"
+    body = f"{m.coeff:g} {m.manifold}%{_fmt_position(m.position)}"
     if m.trigger != Trigger.BOTH:
         body += "@" + _trigger_name(m.trigger)
     return body

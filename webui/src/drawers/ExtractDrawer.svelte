@@ -54,7 +54,18 @@
   let method: "dim" | "pca" = $state("dim");
   let dls = $state(true);
   let sae = $state("");
+  // Role-augmented extraction (`:role-<slug>` variant).  Empty = raw
+  // extraction.  Validated client-side against the same slug regex
+  // the server uses (``[a-z0-9._-]+``); a non-empty role with
+  // ``sae`` set is refused at submit time (engine-mutually-exclusive).
+  let role = $state("");
   let errorMsg: string | null = $state(null);
+
+  const roleTrim = $derived(role.trim());
+  const ROLE_SLUG_RE = /^[a-z0-9._-]+$/;
+  const roleValid = $derived(
+    roleTrim === "" || ROLE_SLUG_RE.test(roleTrim),
+  );
 
   // Editable contrastive-pair table.  In poles mode it fills after a
   // "generate previews" call; in custom mode it starts with one empty
@@ -160,6 +171,18 @@
         reason: "custom mode needs at least one non-empty pair",
       };
     }
+    if (!roleValid) {
+      return {
+        ok: false as const,
+        reason: "role slug must match [a-z0-9._-]+ (lowercase only)",
+      };
+    }
+    if (roleTrim && sae.trim()) {
+      return {
+        ok: false as const,
+        reason: "role and SAE release are mutually exclusive",
+      };
+    }
     return { ok: true as const, reason: null };
   });
 
@@ -219,6 +242,7 @@
     };
     const saeTrim = sae.trim();
     if (saeTrim) req.sae = saeTrim;
+    if (roleTrim) req.role = roleTrim;
 
     // Source resolution:
     //   * custom mode, or poles mode where the user generated and
@@ -436,6 +460,29 @@
               />
             </label>
 
+            <label class="field">
+              <span class="label">
+                role <span class="opt">optional — role-augmented extraction</span>
+              </span>
+              <input
+                type="text"
+                class="input"
+                bind:value={role}
+                placeholder="e.g. pirate — replaces the assistant-role label"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <span class="field-hint">
+                Renders contrastive pairs with the chat template's
+                assistant role substituted by this slug, and re-applies
+                the substitution at steer time so baselines match.
+                Steer the result with the matching <code>:role-{
+                  roleTrim || "&lt;slug&gt;"
+                }</code> variant. Mistral-3 / talkie families don't
+                support role substitution.
+              </span>
+            </label>
+
             <label class="check">
               <input type="checkbox" bind:checked={dls} />
               <span>centered DLS layer selection</span>
@@ -636,6 +683,19 @@
     color: var(--accent-yellow);
     font-size: var(--text-sm);
     margin: 0;
+  }
+
+  .field-hint {
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+    line-height: 1.4;
+  }
+  .field-hint code {
+    color: var(--accent);
+    background: var(--bg-alt);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
   }
 
   /* ---- input-mode switch ---- */

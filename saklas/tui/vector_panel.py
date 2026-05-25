@@ -208,10 +208,15 @@ class LeftPanel(Widget):
             name_str = manifold
 
         dim_prefix = "dim " if not enabled else ""
+        # Phase C.3: manifold rows render in purple
+        # (``ansi_magenta``) — visually distinct from vector rows
+        # (red/green per the alpha sign) so a bare-name resolution
+        # that lands on a manifold-label is immediately legible in
+        # the rack.  The GUI ``ManifoldStrip`` uses the same accent.
         return (
             f"{marker} {dot} {name_str} [dim]manifold[/]\n"
-            f"  [{dim_prefix}ansi_blue]% {coords}[/] "
-            f"[dim]blend[/] [{dim_prefix}ansi_blue]{blend:.2f}[/]"
+            f"  [{dim_prefix}ansi_magenta]% {coords}[/] "
+            f"[dim]blend[/] [{dim_prefix}ansi_magenta]{blend:.2f}[/]"
         )
 
     def _render_gen_config(self) -> None:

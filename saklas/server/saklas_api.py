@@ -79,6 +79,16 @@ class ExtractRequest(BaseModel):
     dls: bool | None = None
     sae: str | None = None
     sae_revision: str | None = None
+    # Role-augmented extraction (engine: ``core/role_templates``).  When
+    # set, the chat template's assistant-role label is replaced by this
+    # slug at extract time, and the same substitution is auto-applied at
+    # steer time so the extract baseline matches the steer baseline.
+    # Tensor lands under a ``_role-<slug>`` filename suffix and the
+    # returned ``canonical`` carries a ``:role-<slug>`` variant tail.
+    # Slug must match ``[a-z0-9._-]+``; family must carry a
+    # substitutable role header (Qwen / Gemma / Llama / GLM / gpt-oss).
+    # Mutually exclusive with ``sae`` at the engine layer.
+    role: str | None = None
     auto_register: bool = Field(True, alias="register")
 
     model_config = {"populate_by_name": True}
@@ -1642,6 +1652,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                                 sae_revision=req.sae_revision,
                                 method=req.method,
                                 dls=req.dls,
+                                role=req.role,
                             )
                             if req.auto_register:
                                 session.steer(req.name, profile)
@@ -1735,6 +1746,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                 sae_revision=req.sae_revision,
                 method=req.method,
                 dls=req.dls,
+                role=req.role,
             )
             if req.auto_register:
                 session.steer(req.name, profile)

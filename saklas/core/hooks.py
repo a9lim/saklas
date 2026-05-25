@@ -765,7 +765,7 @@ class SteeringManager:
         self,
         name: str,
         manifold: object,
-        position: tuple[float, ...],
+        position: tuple[float, ...] | str,
         alpha: float,
         trigger: Trigger = Trigger.BOTH,
     ) -> None:
@@ -774,23 +774,46 @@ class SteeringManager:
         At ``apply_to_model`` time, for every layer the manifold covers,
         the manifold point at ``position`` is precomputed and a per-layer
         ``(basis, mean, target, alpha, trigger)`` entry is attached to the
-        corresponding :class:`SteeringHook`.  ``position`` is the tuple of
-        authoring coordinates; its arity is validated here against the
-        manifold's domain (the grammar cannot — it does not know the
-        domain).  ``alpha`` is the blend fraction (clamped to ``[0, 1]``);
-        no ``_STEER_GAIN`` applies — it is a fraction, not an additive push.
+        corresponding :class:`SteeringHook`.
+
+        ``position`` is either a tuple of authoring coordinates (coord
+        form) or a node-label string (label form, sugar for that node's
+        coords).  Labels are resolved through
+        :meth:`Manifold.resolve_position` here so the downstream
+        ``manifolds`` dict always carries a plain coord tuple.  An
+        unknown label raises
+        :class:`saklas.core.manifold.UnknownManifoldLabelError`; arity
+        mismatches against the manifold's domain (only meaningful for
+        coord-form input) raise
+        :class:`saklas.core.steering_expr.SteeringExprError`.
+
+        ``alpha`` is the blend fraction (clamped to ``[0, 1]``); no
+        ``_STEER_GAIN`` applies — it is a fraction, not an additive push.
         """
+        resolve = getattr(manifold, "resolve_position", None)
+        if resolve is not None:
+            resolved = resolve(position)
+        elif isinstance(position, str):
+            # Defensive: a manifold-shaped object without
+            # ``resolve_position`` (e.g. a test double) can't resolve
+            # labels.  Raise rather than guess.
+            raise TypeError(
+                f"manifold {name!r} cannot resolve a label-form position "
+                f"({position!r}) — the manifold lacks resolve_position()"
+            )
+        else:
+            resolved = tuple(float(c) for c in position)
         domain = getattr(manifold, "domain", None)
-        if domain is not None and len(position) != domain.intrinsic_dim:
+        if domain is not None and len(resolved) != domain.intrinsic_dim:
             from saklas.core.steering_expr import SteeringExprError
             raise SteeringExprError(
                 f"manifold {name!r} has a {domain.intrinsic_dim}-dimensional "
-                f"domain but the steering position has {len(position)} "
+                f"domain but the steering position has {len(resolved)} "
                 f"coordinate(s)"
             )
         self.manifolds[name] = {
             "manifold": manifold,
-            "position": tuple(float(c) for c in position),
+            "position": tuple(float(c) for c in resolved),
             "alpha": alpha,
             "trigger": trigger,
         }

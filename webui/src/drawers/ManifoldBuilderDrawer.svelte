@@ -98,10 +98,17 @@
     label: string;
     coords: number[];
     statements: string;
+    /** Optional per-node assistant-role substitution.  Empty string =
+     *  "use the standard assistant baseline" (the legacy default).
+     *  Validated client-side against the same slug regex the engine
+     *  uses (`[a-z0-9._-]+`).  Persona manifolds use this — each node's
+     *  centroid is pooled under its role's chat-template substitution. */
+    role: string;
     expanded: boolean;
   }
 
   let nodes: NodeDraft[] = $state([]);
+  const ROLE_SLUG_RE = /^[a-z0-9._-]+$/;
 
   /** Resize every node's coord array to the current intrinsic dim,
    *  preserving existing values, padding with zeros. */
@@ -121,6 +128,7 @@
         label: `node_${nodes.length + 1}`,
         coords: new Array(intrinsicDim).fill(0),
         statements: "",
+        role: "",
         expanded: true,
       },
     ];
@@ -222,6 +230,12 @@
       if (statementsOf(nd).length === 0) {
         messages.push(`node "${nd.label}" needs at least one statement`);
       }
+      const r = nd.role.trim();
+      if (r && !ROLE_SLUG_RE.test(r)) {
+        messages.push(
+          `node "${nd.label}" role "${r}" must match [a-z0-9._-]+`,
+        );
+      }
     }
     return { ok: messages.length === 0, messages };
   });
@@ -236,11 +250,15 @@
       name: slug(manifoldName),
       description: description.trim(),
       domain: buildDomain(),
-      nodes: nodes.map((nd) => ({
-        label: slug(nd.label),
-        coords: nd.coords.slice(0, intrinsicDim),
-        statements: statementsOf(nd),
-      })),
+      nodes: nodes.map((nd) => {
+        const r = nd.role.trim();
+        return {
+          label: slug(nd.label),
+          coords: nd.coords.slice(0, intrinsicDim),
+          statements: statementsOf(nd),
+          ...(r ? { role: r } : {}),
+        };
+      }),
     };
     try {
       const r = await apiManifolds.create(req);
@@ -304,6 +322,13 @@
   let discoverKNN: number | null = $state(null);
   let discoverBandwidth: number | null = $state(null);
   let discoverForce = $state(false);
+  // Persona-manifold opt-in: when set, each concept slug doubles as the
+  // matching node's assistant-role substitution at fit time, producing a
+  // role-paired manifold (steering through it implies the nearest
+  // node's role at decode time).  The slug regex matches the engine's
+  // role validation — concepts that pass ``slug()`` are already in
+  // ``[a-z0-9._-]+``.
+  let discoverRolePerNode = $state(false);
   let discoverProgress: string | null = $state(null);
   let alsoFit = $state(true);
 
@@ -389,6 +414,7 @@
       fit_mode: discoverFitMode,
       hyperparams: buildDiscoverHyperparams(),
       force: discoverForce,
+      role_per_node: discoverRolePerNode,
     };
     const toastId = pushToast(
       `generating ${namespaceSlug}/${nameSlug} corpora…`,
@@ -721,6 +747,25 @@
               >✕</button>
             </div>
             {#if node.expanded}
+              <label class="node-role">
+                <span class="label">
+                  role <span class="opt">optional — role-augmented baseline</span>
+                </span>
+                <input
+                  type="text"
+                  class="input mini"
+                  value={node.role}
+                  oninput={(ev) =>
+                    setNodeField(
+                      idx,
+                      "role",
+                      (ev.currentTarget as HTMLInputElement).value,
+                    )}
+                  placeholder="e.g. pirate — leave empty for standard assistant baseline"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </label>
               <textarea
                 class="node-statements"
                 rows="4"
@@ -902,6 +947,22 @@
           <input type="checkbox" bind:checked={alsoFit} />
           <span>fit immediately after generating corpora</span>
         </label>
+        <label class="axis-check">
+          <input type="checkbox" bind:checked={discoverRolePerNode} />
+          <span>
+            persona manifold (use each concept slug as that node's role)
+          </span>
+        </label>
+        {#if discoverRolePerNode}
+          <p class="role-hint">
+            Each node's centroid will be pooled with the chat template's
+            assistant-role label replaced by the concept slug. The fitted
+            manifold lives in persona-baseline activation space; steering
+            through it implies the nearest node's role at decode time.
+            Mistral-3 / talkie families don't support role substitution
+            and raise at fit time.
+          </p>
+        {/if}
         <label class="axis-check">
           <input type="checkbox" bind:checked={discoverForce} />
           <span>overwrite an existing manifold with this name</span>
@@ -1109,6 +1170,18 @@
   }
   .axis-check input {
     accent-color: var(--accent);
+  }
+  .node-role {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2) var(--space-3) 0;
+  }
+  .role-hint {
+    margin: var(--space-1) 0 0 var(--space-5);
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+    line-height: 1.4;
   }
   .sphere-field {
     max-width: 18em;

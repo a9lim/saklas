@@ -757,8 +757,8 @@ class SaklasApp(App[None]):
             "  /probe <concept>            — add probe (highlight on)\n"
             "  /probe <ns>/                — bulk add namespace as probes\n"
             "  /unprobe <name|ns/>         — remove probe(s)\n"
-            "  /extract <concept>          — cache-warm only\n"
-            "  /pairs <name>               — extract from custom pairs\n"
+            "  /extract <concept>          — cache-warm; --role <slug> for role-aug.\n"
+            "  /pairs <name>               — custom pairs; --role <slug> opts in\n"
             "  /compare <a> [b]            — cosine similarity\n"
             "Manifold:\n"
             "  /steer <c> manifold%x,y     — steer toward a manifold point\n"
@@ -868,6 +868,32 @@ class SaklasApp(App[None]):
             return concept, baseline, alpha
         return concept, baseline
 
+    @staticmethod
+    def _peel_role_flag(text: str) -> tuple[str, str | None]:
+        """Peel a trailing ``--role <slug>`` off a slash-command argument
+        string.  Returns ``(rest, role)`` — ``role`` is ``None`` when the
+        flag is absent.
+
+        Accepted forms:
+            ``... --role pirate``
+            ``... --role=pirate``
+
+        Anywhere on the line is fine; first match wins, the flag and
+        its value are excised, the rest is re-joined with a single
+        space.  Slug validation is left to ``core.role_templates`` —
+        we just route the raw string.  Multi-word slugs are not
+        supported (the engine slug regex is ``[a-z0-9._-]+``).
+        """
+        import re
+
+        m = re.search(r"\s*--role(?:=|\s+)(\S+)", text)
+        if m is None:
+            return text, None
+        head = text[: m.start()].rstrip()
+        tail = text[m.end():].lstrip()
+        rest = (head + (" " + tail if tail else "")).strip()
+        return rest, m.group(1)
+
     def _handle_extract(self, text: str, include_alpha: bool, on_success,
                         pending_type: str | None = None,
                         variant: str = "raw",
@@ -888,6 +914,10 @@ class SaklasApp(App[None]):
                 PendingItem(pending_type, display_text, (text,))
             )
             return
+        # Peel ``--role <slug>`` off the args before the bipolar parser
+        # runs, so a multi-word pole (``a dog . a pair of cats``) doesn't
+        # have to compete with the trailing flag for tokens.
+        text, role = self._peel_role_flag(text)
         try:
             if include_alpha:
                 concept, baseline, alpha = self._parse_args(text, include_alpha=True)
@@ -897,7 +927,9 @@ class SaklasApp(App[None]):
         except (ValueError, IndexError) as e:
             chat.add_system_message(
                 f"Parse error: {e}\n"
-                f"Usage: /{pending_type} <pos> . <neg>" + (" [alpha]" if include_alpha else "")
+                f"Usage: /{pending_type} <pos> . <neg>"
+                + (" [alpha]" if include_alpha else "")
+                + " [--role <slug>]"
             )
             return
 
@@ -939,15 +971,24 @@ class SaklasApp(App[None]):
         # unique already-extracted SAE tensor for this concept on disk" —
         # session autoload handles it. To drive a fresh extraction, users
         # pass the explicit ``:sae-<release>`` suffix, which routes the
-        # release through ``session.extract(sae=RELEASE)``.
+        # release through ``session.extract(sae=RELEASE)``.  Same shape
+        # for role-augmented extraction via the ``:role-<slug>`` variant
+        # — the variant tail wins over an explicit ``--role`` flag (the
+        # variant rode through ``resolve_pole``'s ``explicit_variant``
+        # arm and is the canonical form).
         sae_release: str | None = None
         if variant.startswith("sae-"):
             sae_release = variant[len("sae-"):]
+        if variant.startswith("role-"):
+            role = variant[len("role-"):]
 
         display = concept if len(concept) <= 20 else concept[:17] + "..."
         suffix = f" vs '{baseline}'" if baseline else ""
         variant_note = f" [{variant}]" if variant != "raw" else ""
-        chat.add_system_message(f"Extracting '{display}'{suffix}{variant_note}...")
+        role_note = f" as :role-{role}" if role else ""
+        chat.add_system_message(
+            f"Extracting '{display}'{suffix}{variant_note}{role_note}..."
+        )
 
         def _worker():
             def _progress(msg):
@@ -980,6 +1021,8 @@ class SaklasApp(App[None]):
                     extract_kwargs["sae"] = sae_release
                 if namespace is not None:
                     extract_kwargs["namespace"] = namespace
+                if role is not None:
+                    extract_kwargs["role"] = role
                 # ``session.extract`` already returns the fully-qualified
                 # canonical name — including the ``:sae-<release>`` suffix
                 # when ``sae=`` was passed. Rebuilding it here would
@@ -1161,17 +1204,41 @@ class SaklasApp(App[None]):
                 "Cannot modify steering during A/B shadow gen."
             )
             return
-        coords_str = ",".join(f"{c:g}" for c in term.position)
+        # Position can be a node-label string (``persona%pirate``) or a
+        # coord tuple (``persona%0.3,0.8``); display each in its
+        # natural form.  Arity is only meaningful in coord form — the
+        # label form resolves to whatever coords the node carries.
+        if isinstance(term.position, str):
+            pos_str = term.position
+        else:
+            pos_str = ",".join(f"{c:g}" for c in term.position)
         chat.add_system_message(
-            f"Loading manifold '{term.manifold}' % {coords_str}..."
+            f"Loading manifold '{term.manifold}' % {pos_str}..."
         )
 
         def _worker() -> None:
             try:
                 self._session._ensure_manifold_loaded(term.manifold)
                 manifold = self._session._manifolds[term.manifold]
+                # ``resolve_position`` validates label-form (raises
+                # UnknownManifoldLabelError on miss) and passes through
+                # coord-form unchanged.  A test-double manifold without
+                # ``resolve_position`` falls back to ``term.position``
+                # directly — fine for coord form, raises here for
+                # label form (the real engine path catches it).
+                resolve = getattr(manifold, "resolve_position", None)
+                if resolve is not None:
+                    resolved = resolve(term.position)
+                elif isinstance(term.position, str):
+                    raise ValueError(
+                        f"manifold '{term.manifold}' cannot resolve "
+                        f"label {term.position!r} — manifold lacks "
+                        f"resolve_position()"
+                    )
+                else:
+                    resolved = term.position
                 want = manifold.domain.intrinsic_dim
-                got = len(term.position)
+                got = len(resolved)
                 if got != want:
                     raise ValueError(
                         f"manifold '{term.manifold}' is {want}-dimensional "
@@ -1331,9 +1398,11 @@ class SaklasApp(App[None]):
         modal-requiring commands behave).
         """
         chat = self._chat_panel
-        name = _unquote((text or "").strip())
+        raw_args = (text or "").strip()
+        raw_args, role = self._peel_role_flag(raw_args)
+        name = _unquote(raw_args)
         if not name:
-            chat.add_system_message("Usage: /pairs <name>")
+            chat.add_system_message("Usage: /pairs <name> [--role <slug>]")
             return
         if self._ab_shadow_active:
             chat.add_system_message(
@@ -1352,12 +1421,13 @@ class SaklasApp(App[None]):
         def _on_submit(pairs: list[tuple[str, str]] | None) -> None:
             if not pairs:
                 return  # modal cancelled
-            self._start_pairs_extract(name, pairs)
+            self._start_pairs_extract(name, pairs, role=role)
 
         self.push_screen(CustomPairsModal(name), _on_submit)
 
     def _start_pairs_extract(
         self, name: str, pairs: list[tuple[str, str]],
+        *, role: str | None = None,
     ) -> None:
         """Extract a steering vector from hand-authored contrastive pairs.
 
@@ -1368,8 +1438,9 @@ class SaklasApp(App[None]):
         ``/steer``'s post-extraction wiring.
         """
         chat = self._chat_panel
+        role_note = f" as :role-{role}" if role else ""
         chat.add_system_message(
-            f"Extracting '{name}' from {len(pairs)} custom pair(s)..."
+            f"Extracting '{name}'{role_note} from {len(pairs)} custom pair(s)..."
         )
 
         def _on_success(canonical: str, profile: Any, alpha: float) -> None:
@@ -1390,8 +1461,13 @@ class SaklasApp(App[None]):
                 from saklas.io.datasource import DataSource
 
                 source = DataSource(pairs=pairs, name=name)
+                extract_kwargs: dict = {
+                    "on_progress": _progress, "namespace": "local",
+                }
+                if role is not None:
+                    extract_kwargs["role"] = role
                 canonical, profile = self._session.extract(
-                    source, on_progress=_progress, namespace="local",
+                    source, **extract_kwargs,
                 )
                 _on_success(canonical, profile, DEFAULT_ALPHA)
             except SaklasError as e:

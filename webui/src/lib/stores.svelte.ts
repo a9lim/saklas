@@ -413,6 +413,7 @@ export function addManifoldToRack(name: string): void {
   manifoldRack.entries.set(name, {
     blend: 0.5,
     coords,
+    label: null,
     trigger: "BOTH",
     enabled: true,
   });
@@ -430,9 +431,43 @@ export function setManifoldBlend(name: string, blend: number): void {
 }
 
 export function setManifoldCoords(name: string, coords: number[]): void {
+  // Pulling on the XYPad authors a free-form position; the term drops
+  // its label-form binding (if any) so the canonical expression
+  // serializes as a coord list and the snap-to-node dropdown shows
+  // "(no node)" until the user picks one.
   enqueueOrApply(`manifold coords ${name}`, () => {
     const e = manifoldRack.entries.get(name);
-    if (e) manifoldRack.entries.set(name, { ...e, coords: [...coords] });
+    if (e) manifoldRack.entries.set(name, {
+      ...e, coords: [...coords], label: null,
+    });
+  });
+}
+
+/** Switch the term to label-form (``<name>%<label>``).  ``label=null``
+ *  clears the binding and reverts to coord-form on the next
+ *  serialization.  When ``label`` is non-null the matching node's
+ *  coords are mirrored onto ``coords`` so the XYPad still renders the
+ *  position correctly. */
+export function setManifoldLabel(name: string, label: string | null): void {
+  enqueueOrApply(`manifold label ${name} ${label ?? "<null>"}`, () => {
+    const e = manifoldRack.entries.get(name);
+    if (!e) return;
+    if (label === null) {
+      manifoldRack.entries.set(name, { ...e, label: null });
+      return;
+    }
+    const info = manifoldByName(name);
+    if (!info) {
+      // No catalog metadata — accept the label without mirroring
+      // coords; downstream resolution happens server-side.
+      manifoldRack.entries.set(name, { ...e, label });
+      return;
+    }
+    const idx = info.node_labels.indexOf(label);
+    const coords = (idx >= 0 && info.node_coords[idx])
+      ? [...info.node_coords[idx]]
+      : e.coords;
+    manifoldRack.entries.set(name, { ...e, label, coords });
   });
 }
 

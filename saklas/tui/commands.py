@@ -192,8 +192,8 @@ def _build_registry() -> dict[str, SlashCommand]:
             name="/extract",
             handler=SaklasApp._handle_extract_only,
             usage=(
-                "Usage: /extract <concept>\n"
-                "       /extract <pos> . <neg>"
+                "Usage: /extract <concept> [--role <slug>]\n"
+                "       /extract <pos> . <neg> [--role <slug>]"
             ),
             min_args=1,
             max_args=None,
@@ -201,7 +201,7 @@ def _build_registry() -> dict[str, SlashCommand]:
         SlashCommand(
             name="/pairs",
             handler=SaklasApp._handle_pairs,
-            usage="Usage: /pairs <name>",
+            usage="Usage: /pairs <name> [--role <slug>]",
             min_args=1,
             max_args=None,  # multi-word poles allowed via the period delim
         ),

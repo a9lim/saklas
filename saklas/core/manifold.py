@@ -47,7 +47,23 @@ from typing import Any, Sequence
 import torch
 from safetensors.torch import load_file, save_file
 
+from saklas.core.errors import SaklasError
+
 log = logging.getLogger(__name__)
+
+
+class UnknownManifoldLabelError(KeyError, SaklasError):
+    """Raised when a manifold position payload names an unknown node label.
+
+    Produced by :meth:`Manifold.resolve_position` (and the nearest-node
+    helpers, which short-circuit on labels) when the label is not in
+    :attr:`Manifold.node_labels`.  Surfaces a 404-shaped error at the
+    HTTP layer through the shared :class:`SaklasError` MRO; CLI / TUI
+    handlers print the message and recover.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (404, str(self))
 
 
 # Default PCA width for a fitted manifold subspace.  Matches the paper's
@@ -637,6 +653,12 @@ class Manifold:
     layers: dict[int, LayerSubspace]
     feature_space: str = "raw"
     metadata: dict[str, object] = field(default_factory=dict)
+    # Per-node assistant-role substitution recorded at fit time, aligned
+    # with ``node_labels``.  ``None`` for a given node = "pooled under
+    # the standard assistant baseline" (the legacy shape, what every
+    # non-role manifold carries).  Used by
+    # :meth:`Manifold.nearest_node_role` for role-paired steering.
+    node_roles: list[str | None] = field(default_factory=list)
 
     @property
     def layer_indices(self) -> list[int]:
@@ -655,6 +677,7 @@ class Manifold:
             },
             feature_space=self.feature_space,
             metadata=dict(self.metadata),
+            node_roles=list(self.node_roles),
         )
 
     def _position_tensor(
@@ -691,6 +714,120 @@ class Manifold:
         )
         embedded = self.domain.embed(self.domain.clamp_position(pos))
         return sub.eval_at(embedded)
+
+    def resolve_position(
+        self,
+        position: "float | Sequence[float] | str | torch.Tensor",
+    ) -> tuple[float, ...]:
+        """Coerce a position payload to a coord tuple.
+
+        Two input shapes are accepted (parser produces both):
+
+        - A coord payload (tuple, list, float, or 1-D tensor) — passthrough
+          to a plain coord tuple with arity unchanged.  Arity validation
+          against the domain's intrinsic dimension happens downstream in
+          :meth:`SteeringManager.add_manifold`.
+        - A node-label string (``"pirate"``) — sugar for "the coords of
+          the node labeled <s>".  The label is looked up in
+          :attr:`node_labels` and the matching row of
+          :attr:`node_coords` is returned.  An unknown label raises
+          :class:`UnknownManifoldLabelError`.
+
+        Label form makes ``persona%pirate`` a first-class steering term
+        in the shared grammar; the bare-name resolver (Phase C) builds
+        on the same lookup.
+        """
+        if isinstance(position, str):
+            try:
+                idx = self.node_labels.index(position)
+            except ValueError:
+                raise UnknownManifoldLabelError(
+                    f"manifold {self.name!r} has no node labeled "
+                    f"{position!r}; known labels: "
+                    f"{sorted(self.node_labels)}"
+                ) from None
+            row = self.node_coords[idx]
+            return tuple(float(c) for c in row.tolist())
+        if isinstance(position, torch.Tensor):
+            return tuple(float(c) for c in position.reshape(-1).tolist())
+        if isinstance(position, (int, float)):
+            return (float(position),)
+        return tuple(float(c) for c in position)
+
+    def nearest_node_index(
+        self, position: "float | Sequence[float] | str | torch.Tensor",
+    ) -> int:
+        """Index of the node whose authoring coords lie nearest ``position``.
+
+        Distance is the domain's chordal distance between embedded
+        points (the same metric the fit pipeline uses for poisedness
+        + the RBF kernel), so periodic axes wrap correctly and a
+        sphere is measured on its chord.  ``position`` may be a coord
+        payload or a node label — labels short-circuit to the matching
+        node index without a distance computation.
+
+        Raises ``ValueError`` when the manifold has no nodes recorded
+        (a fitted manifold always carries ``node_coords`` from disk).
+        """
+        if self.node_coords.numel() == 0 or not self.node_labels:
+            raise ValueError(
+                f"manifold {self.name!r} carries no node coords — cannot "
+                f"resolve a nearest node"
+            )
+        if isinstance(position, str):
+            # A node label trivially is the nearest node to itself.
+            # Bypass the geometry; surface UnknownManifoldLabelError on
+            # a typo through the same channel as resolve_position.
+            try:
+                return self.node_labels.index(position)
+            except ValueError:
+                raise UnknownManifoldLabelError(
+                    f"manifold {self.name!r} has no node labeled "
+                    f"{position!r}; known labels: "
+                    f"{sorted(self.node_labels)}"
+                ) from None
+        # Coerce + embed both sides through the domain so the metric is
+        # consistent.  CPU/fp32 — this runs once per scope entry, off
+        # the hot path; we don't need to chase the model's device.
+        ref_dtype = self.node_coords.dtype
+        pos = self._position_tensor(
+            position, device=self.node_coords.device, dtype=ref_dtype,
+        )
+        pos = self.domain.clamp_position(pos)
+        embedded_pos = self.domain.embed(pos)                       # (m,)
+        clamped_nodes = self.domain.clamp_position(self.node_coords)
+        embedded_nodes = self.domain.embed(clamped_nodes)           # (K, m)
+        dists = self.domain.distance(embedded_pos, embedded_nodes)  # (K,)
+        return int(torch.argmin(dists).item())
+
+    def nearest_node_label(
+        self, position: "float | Sequence[float] | str | torch.Tensor",
+    ) -> str:
+        """Label of the node nearest ``position``."""
+        return self.node_labels[self.nearest_node_index(position)]
+
+    def nearest_node_role(
+        self, position: "float | Sequence[float] | str | torch.Tensor",
+    ) -> str | None:
+        """Role of the node nearest ``position`` — or ``None``.
+
+        Returns ``None`` when the nearest node carries no role (legacy
+        nodes, or nodes that opted out of role substitution).  The
+        return value rides through to ``session._active_role`` so the
+        generation prefill re-applies the substitution at decode time,
+        producing role-paired manifold steering (Phase A.3).
+
+        ``node_roles`` may be empty on a legacy fitted manifold whose
+        sidecar predates the per-node-role schema — that case also
+        returns ``None`` (treat the whole manifold as standard
+        assistant baseline).
+        """
+        if not self.node_roles:
+            return None
+        idx = self.nearest_node_index(position)
+        if idx >= len(self.node_roles):
+            return None
+        return self.node_roles[idx]
 
     def tangent(
         self, layer: int, position: "float | Sequence[float] | torch.Tensor",
@@ -1104,6 +1241,9 @@ def compute_node_centroid(
     layers: "torch.nn.ModuleList",
     device: torch.device,
     statements: list[str],
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
 ) -> dict[int, torch.Tensor]:
     """Mean per-layer pooled activation over a manifold node's statements.
 
@@ -1111,6 +1251,13 @@ def compute_node_centroid(
     chat-templated, last-content-token, fp32 pooling discipline that
     backs :func:`saklas.core.vectors.compute_layer_means` -- and the same
     MPS ``empty_cache`` discipline between forward passes.
+
+    ``role`` (optional): substitute a custom assistant-role label into
+    the chat template via :func:`saklas.core.role_templates.apply_with_role`
+    for every statement, so the pooled centroid lives in
+    persona-baseline activation space instead of the standard assistant
+    baseline.  Requires ``model_type`` (the family-key into the
+    role-header registry).  ``role=None`` is the zero-overhead default.
 
     Returns ``{layer_idx: centroid (D,)}`` in fp32 on CPU.
     """
@@ -1126,6 +1273,7 @@ def compute_node_centroid(
     for text in statements:
         per_layer = _encode_and_capture_all(
             model, tokenizer, text, layers, device,
+            role=role, model_type=model_type,
         )
         if not sums:
             for idx in range(n_layers):
@@ -1195,6 +1343,13 @@ def save_manifold(
         # per-method PCA variance bars or spectral spectrum for the
         # CLI / webui inspector.  All absent for authored fits.
         "fit_mode", "hyperparams", "diagnostics",
+        # Per-node role-augmented fit metadata.  Aligned with
+        # ``node_labels`` index-by-index; ``None`` for a given node means
+        # "pooled under the standard assistant baseline" (the legacy
+        # shape, what every pre-role-differential manifold carries).
+        # Absent on non-role manifolds — the pipeline only stamps it
+        # when at least one node opts into role substitution.
+        "node_roles",
     ):
         if key in metadata:
             sidecar[key] = metadata[key]
@@ -1247,6 +1402,9 @@ def load_manifold(path: str | Path) -> Manifold:
         layers=layers,
         feature_space=sidecar.get("feature_space", "raw"),
         metadata=sidecar,
+        # ``node_roles`` is absent on non-role manifolds (every
+        # pre-Phase-A fit); the loaded list stays empty in that case.
+        node_roles=list(sidecar.get("node_roles", [])),
     )
 
 

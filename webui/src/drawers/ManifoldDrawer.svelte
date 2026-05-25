@@ -170,6 +170,12 @@
     return null;
   }
 
+  /** True iff at least one node carries a non-null role — this is a
+   *  persona / role-paired manifold. */
+  function isRoleAugmented(m: ManifoldInfo): boolean {
+    return (m.node_roles ?? []).some((r) => r);
+  }
+
   function isDiscoverMode(m: ManifoldInfo): boolean {
     return m.fit_mode === "pca" || m.fit_mode === "spectral";
   }
@@ -241,6 +247,7 @@
                   <span class="row-sub">
                     {m.domain_label} · {m.node_count} nodes
                     {#if badge}<span class="fit-badge fit-{badge}">{badge}</span>{/if}
+                    {#if isRoleAugmented(m)}<span class="fit-badge fit-persona" title="persona / role-paired manifold">persona</span>{/if}
                     {#if m.stale}<span class="stale">stale</span>{/if}
                   </span>
                 </div>
