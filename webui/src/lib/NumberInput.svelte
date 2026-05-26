@@ -169,7 +169,7 @@
     flex: 1 1 0;
     min-width: 0;
     width: 100%;
-    padding: var(--space-3) var(--space-4);
+    padding: var(--space-2) var(--space-3);
     padding-right: var(--space-6); /* room for the steppers */
     background: var(--bg-elev);
     color: var(--fg);
@@ -177,7 +177,7 @@
     border-radius: var(--radius);
     font: inherit;
     font-family: var(--font-mono);
-    font-size: var(--text);
+    font-size: var(--text-sm);
     -moz-appearance: textfield;
     appearance: textfield;
   }

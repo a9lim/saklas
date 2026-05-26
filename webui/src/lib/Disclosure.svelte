@@ -68,7 +68,7 @@
     align-items: center;
     gap: var(--space-3);
     width: 100%;
-    padding: var(--space-3) var(--space-4);
+    padding: var(--space-2) var(--space-3);
     background: transparent;
     color: var(--fg-strong);
     border: 0;
@@ -76,7 +76,7 @@
     text-align: left;
     cursor: pointer;
     font-family: var(--font-mono);
-    font-size: var(--text);
+    font-size: var(--text-sm);
     transition: background var(--dur-fast) var(--ease-out);
   }
   .sk-disclosure.is-flush .sk-disclosure-trigger {

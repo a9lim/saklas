@@ -310,15 +310,15 @@
     align-items: center;
     justify-content: space-between;
     width: 100%;
-    gap: var(--space-3);
-    padding: var(--space-3) var(--space-4);
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
     background: var(--bg-elev);
     color: var(--fg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     font: inherit;
     font-family: var(--font-mono);
-    font-size: var(--text);
+    font-size: var(--text-sm);
     text-align: left;
     cursor: pointer;
     transition: background var(--dur-fast) var(--ease-out);
@@ -351,7 +351,7 @@
   .sk-select-caret {
     flex: 0 0 auto;
     color: var(--fg-muted);
-    font-size: var(--text-sm);
+    font-size: var(--text-xs);
     transition: transform var(--dur-fast) var(--ease-out);
   }
   .sk-select.is-open .sk-select-caret {
@@ -382,10 +382,10 @@
   }
 
   .sk-select-opt {
-    padding: var(--space-3) var(--space-4);
+    padding: var(--space-2) var(--space-3);
     color: var(--fg-strong);
     cursor: pointer;
-    font-size: var(--text);
+    font-size: var(--text-sm);
     line-height: 1.3;
     white-space: nowrap;
     overflow: hidden;

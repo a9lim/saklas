@@ -121,7 +121,7 @@
   .sk-checkbox-label {
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--text);
+    font-size: var(--text-sm);
     cursor: pointer;
   }
   .sk-checkbox-label.is-disabled {

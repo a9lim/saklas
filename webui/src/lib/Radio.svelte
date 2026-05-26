@@ -121,7 +121,7 @@
   .sk-radio-label {
     color: var(--fg);
     font-family: var(--font-mono);
-    font-size: var(--text);
+    font-size: var(--text-sm);
     cursor: pointer;
   }
   .sk-radio-label.is-disabled {
