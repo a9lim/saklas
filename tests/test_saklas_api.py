@@ -1183,8 +1183,8 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
         def generate_scenarios(self, *a, **kw):  # pragma: no cover
             raise AssertionError("scenario gen path should not be reached")
 
-        def generate_pairs(self, *a, **kw):  # pragma: no cover
-            raise AssertionError("pair gen path should not be reached")
+        def generate_statements(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("statement gen path should not be reached")
 
         def _local_concept_folder(self, canonical):
             import pathlib
@@ -1303,16 +1303,22 @@ class TestExtractPreview:
         session, client = session_and_client
         session.generate_scenarios.return_value = ["a quiet morning", "a storm"]
 
-        def _pairs(concept, baseline=None, *args, scenarios=None,
-                   on_progress=None, **_kw):
-            assert concept == "calm"
-            assert baseline == "anxious"
+        def _statements(concepts, *args, scenarios=None,
+                        statements_per_cell=None, share_moment=False,
+                        on_progress=None, **_kw):
+            # The route wraps generate_statements with share_moment=True
+            # and two concepts ([positive, negative_slot]).
+            assert share_moment is True
+            assert concepts[0] == "calm"
+            assert concepts[1] == "anxious"
             if on_progress:
                 on_progress("generating pairs")
-            return [("I feel calm.", "I feel anxious."),
-                    ("Steady hands.", "Shaking hands.")]
+            return {
+                "calm": ["I feel calm.", "Steady hands."],
+                "anxious": ["I feel anxious.", "Shaking hands."],
+            }
 
-        session.generate_pairs.side_effect = _pairs
+        session.generate_statements.side_effect = _statements
         resp = client.post(
             "/saklas/v1/sessions/default/extract/preview",
             json={"concept": "calm", "baseline": "anxious"},

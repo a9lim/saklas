@@ -1,9 +1,9 @@
 """Prototype harness for the open-ended scenario + pair generator.
 
 Thin wrapper over the library-side ``SaklasSession.generate_scenarios``
-and ``SaklasSession.generate_pairs(mode="open_ended")`` methods. Does
-not own any prompt logic — the script is purely a test harness that
-prints what the library produces.
+and ``SaklasSession.generate_statements(share_moment=True)`` methods.
+Does not own any prompt logic — the script is purely a test harness
+that prints what the library produces.
 
 Defaults to ``google/gemma-4-e4b-it`` (a weak 4B model) so that
 prompt-robustness regressions surface loudly. Override with ``--model``.
@@ -134,18 +134,21 @@ def main() -> int:
             continue
 
         t0 = time.time()
-        pairs = session.generate_pairs(
-            pos, neg,
-            mode="open_ended",
+        neg_slot = neg if neg is not None else f"the_opposite_of_{pos}"
+        pairs_per_scenario = 5
+        corpora = session.generate_statements(
+            [pos, neg_slot],
             scenarios=scenarios,
+            statements_per_cell=pairs_per_scenario,
+            share_moment=True,
             on_progress=_progress,
         )
+        pairs = list(zip(corpora[pos], corpora[neg_slot]))
         dt = time.time() - t0
 
-        # Present pairs grouped by scenario for readability. Each batch
-        # from _generate_pairs_open_ended is (pairs_per_scenario) long
-        # and corresponds to scenarios in order, so we slice.
-        pairs_per_scenario = max(1, -(-len(pairs) // max(1, len(scenarios))))
+        # Present pairs grouped by scenario for readability. The corpora
+        # are ordered scenario-first then within-scenario, K rows per
+        # scenario.
         for i, scn in enumerate(scenarios):
             start = i * pairs_per_scenario
             end = start + pairs_per_scenario

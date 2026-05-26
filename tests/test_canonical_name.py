@@ -130,15 +130,21 @@ class TestHumanize:
             def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
                 captured.setdefault("prompts", []).append(prompt)
                 return (
-                    "1a. Statement one.\n1b. Statement two.\n"
-                    "2a. Statement three.\n2b. Statement four.\n"
+                    "1a. Statement one is more than ten characters long.\n"
+                    "1b. Statement two is more than ten characters long.\n"
+                    "2a. Statement three is more than ten characters long.\n"
+                    "2b. Statement four is more than ten characters long.\n"
                 )
 
-        _FakeSession().generate_pairs(
-            "artificial_intelligence",
-            baseline=None, n=2, scenarios=["a domain"],
+        _FakeSession().generate_statements(
+            ["artificial_intelligence", "natural_intelligence"],
+            scenarios=["a domain"],
+            statements_per_cell=2,
+            share_moment=True,
         )
-        assert captured["prompts"], "pair generator was not invoked"
+        # The statement-generation call is the second entry (after scenarios are
+        # provided so scenario generation is skipped).
+        assert captured["prompts"], "statement generator was not invoked"
         prompt = captured["prompts"][0]
         assert "artificial intelligence" in prompt
         assert "artificial_intelligence" not in prompt

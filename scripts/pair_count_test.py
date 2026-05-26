@@ -94,12 +94,15 @@ def stage_gen() -> int:
           flush=True)
 
     t0 = time.time()
-    new_pairs = session.generate_pairs(
-        "angry", "calm",
-        n=n_new,
+    statements_per_cell = max(1, -(-n_new // max(1, len(scenarios))))
+    corpora = session.generate_statements(
+        ["angry", "calm"],
         scenarios=scenarios,
+        statements_per_cell=statements_per_cell,
+        share_moment=True,
         on_progress=lambda m: print(f"  {m}", flush=True),
     )
+    new_pairs = list(zip(corpora["angry"], corpora["calm"]))[:n_new]
     print(f"[gen] got {len(new_pairs)} new pairs in {time.time()-t0:.1f}s")
 
     new_payload = [{"positive": a, "negative": b} for a, b in new_pairs]

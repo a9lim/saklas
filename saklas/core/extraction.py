@@ -141,16 +141,17 @@ class ModelHandle(Protocol):
         role: str | None = None,
     ) -> list[str]: ...
 
-    def generate_pairs(
+    def generate_statements(
         self,
-        concept: str,
-        baseline: str | None = None,
-        n: int = ...,
+        concepts: list[str],
         *,
         scenarios: list[str] | None = None,
+        n_scenarios: int = ...,
+        statements_per_cell: int = ...,
+        share_moment: bool = False,
         on_progress: Callable[[str], None] | None = None,
         role: str | None = None,
-    ) -> list[tuple[str, str]]: ...
+    ) -> dict[str, list[str]]: ...
 
 
 @runtime_checkable
@@ -661,13 +662,33 @@ class ExtractionPipeline:
                 f"Generating contrastive pairs for '{concept}'{suffix} "
                 f"across {len(eff_scenarios)} domains..."
             )
-            raw_pairs = self._handle.generate_pairs(
-                concept, baseline,
+            # Bipolar contrastive extraction wants moment-shared
+            # pairs (the load-bearing within-pair structure that lets
+            # DiM cancel scenario+moment variance).  For a monopolar
+            # concept (no baseline) the "B speaker" is the semantic
+            # opposite — slot a placeholder concept slug that the
+            # share_moment prompt template renders as the opposite of
+            # ``concept``.  ``zip`` then recovers (positive, negative).
+            if baseline is None:
+                # Humanizes to "the opposite of <concept>" — the model
+                # reads this as a self-defining anti-pole, the same
+                # semantic the legacy monopolar pair prompt encoded.
+                neg_slot = f"the_opposite_of_{concept}"
+            else:
+                neg_slot = baseline
+            corpora = self._handle.generate_statements(
+                [concept, neg_slot],
                 scenarios=eff_scenarios,
+                share_moment=True,
                 on_progress=_progress,
                 role=role,
             )
-            pairs = [{"positive": p, "negative": n} for p, n in raw_pairs]
+            pos_lines = corpora[concept]
+            neg_lines = corpora[neg_slot]
+            pairs = [
+                {"positive": p, "negative": n}
+                for p, n in zip(pos_lines, neg_lines)
+            ]
             with open(stmt_cache_path, "w") as f:
                 json.dump(pairs, f, indent=2)
 

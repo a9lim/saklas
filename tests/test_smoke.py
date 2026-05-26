@@ -460,14 +460,14 @@ class TestDiscoverManifoldEndToEnd:
         try:
             # ---- 1. generate per-concept corpora ----
             t0 = time.perf_counter()
-            corpora = session.generate_concept_statements(
+            corpora = session.generate_statements(
                 self._CONCEPTS,
                 n_scenarios=self._N_SCENARIOS,
-                statements_per_concept_per_scenario=self._STATEMENTS_PER_CONCEPT,
+                statements_per_cell=self._STATEMENTS_PER_CONCEPT,
             )
             dt_gen = time.perf_counter() - t0
             assert dt_gen < self._GENERATE_BUDGET_S, (
-                f"generate_concept_statements took {dt_gen:.1f}s, "
+                f"generate_statements took {dt_gen:.1f}s, "
                 f"budget {self._GENERATE_BUDGET_S:.1f}s"
             )
             assert set(corpora.keys()) == set(self._CONCEPTS)

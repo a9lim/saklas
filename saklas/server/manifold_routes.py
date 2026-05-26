@@ -465,12 +465,12 @@ def register_manifold_routes(app: FastAPI) -> None:
     async def generate_manifold(req: GenerateManifoldRequest, request: Request):
         """LLM-author a discover-mode manifold from a flat concept list.
 
-        Runs :meth:`SaklasSession.generate_concept_statements` under the
-        session lock — the K-tuple generator that produces one statement
-        corpus per concept sharing scenarios across the row.  SSE
-        progress when ``Accept: text/event-stream``, JSON otherwise.
-        Writes a fresh discover-mode manifold folder; pair with
-        ``POST .../fit`` to derive coords + fit.
+        Runs :meth:`SaklasSession.generate_statements` under the
+        session lock — the unified K-tuple generator producing one
+        statement corpus per concept, scenarios shared across the
+        row.  SSE progress when ``Accept: text/event-stream``, JSON
+        otherwise.  Writes a fresh discover-mode manifold folder;
+        pair with ``POST .../fit`` to derive coords + fit.
         """
         if len(req.concepts) < 2:
             raise HTTPException(
@@ -497,10 +497,10 @@ def register_manifold_routes(app: FastAPI) -> None:
             node_roles_map = {c: c for c in req.concepts}
 
         def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            corpora = session.generate_concept_statements(
+            corpora = session.generate_statements(
                 list(req.concepts),
                 n_scenarios=req.n_scenarios,
-                statements_per_concept_per_scenario=req.statements_per_concept,
+                statements_per_cell=req.statements_per_concept,
                 on_progress=on_progress,
             )
             if folder.exists():
@@ -518,7 +518,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             write_json_atomic(
                 out_folder / "scenarios.json",
                 {
-                    "generator": "session.generate_concept_statements",
+                    "generator": "session.generate_statements",
                     "n_scenarios": req.n_scenarios,
                     "statements_per_concept": req.statements_per_concept,
                     "concepts": list(req.concepts),

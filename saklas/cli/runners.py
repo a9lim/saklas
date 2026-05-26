@@ -1880,7 +1880,7 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     """``saklas vector manifold generate`` — author + LLM-fill a discover folder.
 
     Two-step end-to-end: load the model, run
-    :meth:`SaklasSession.generate_concept_statements` to fill per-concept
+    :meth:`SaklasSession.generate_statements` to fill per-concept
     corpora with the anti-allegory K-tuple generator, then write the
     folder via :func:`create_discover_manifold_folder`.  The folder is
     ready for ``vector manifold discover`` to fit; the two-step split
@@ -1931,10 +1931,10 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
         f"(scenario × concept) cell for {len(args.concepts)} concepts..."
     )
     try:
-        corpora = session.generate_concept_statements(
+        corpora = session.generate_statements(
             list(args.concepts),
             n_scenarios=args.n_scenarios,
-            statements_per_concept_per_scenario=args.statements_per_concept,
+            statements_per_cell=args.statements_per_concept,
             on_progress=lambda m: print(f"  {m}"),
         )
     except ValueError as e:
@@ -1963,14 +1963,14 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
 
     # Record the scenarios alongside the corpora as provenance — mirror
     # the convention extract uses (``local/<canonical>/scenarios.json``).
-    # The scenarios themselves aren't preserved in ``generate_concept_statements``'s
+    # The scenarios themselves aren't preserved in ``generate_statements``'s
     # return value, but they live inside each statement (recoverable
     # from corpus reading); writing a stub provenance file flags
     # whether the corpora went through the generator vs hand-author.
     write_json_atomic(
         out_folder / "scenarios.json",
         {
-            "generator": "session.generate_concept_statements",
+            "generator": "session.generate_statements",
             "n_scenarios": args.n_scenarios,
             "statements_per_concept": args.statements_per_concept,
             "concepts": list(args.concepts),

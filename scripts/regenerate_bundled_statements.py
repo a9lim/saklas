@@ -4,7 +4,7 @@ using a capable instruct model as the generator.
 The bundled pack is driven by two manifests:
 
 - BIPOLAR: concepts with a named negative pole. Generated via
-  `SaklasSession.generate_pairs(concept=pos, baseline=neg)`, which hits
+  `SaklasSession.generate_statements([pos, neg], share_moment=True)`, which hits
   the `Speaker A IS X / Speaker B IS Y` branch of the prompt — sharper
   contrastive direction than topically-disjoint monopolar pairs.
 - MONOPOLAR: concepts without a clean opposite. Generated with the
@@ -145,7 +145,8 @@ def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> boo
     """Run the open-ended pipeline end-to-end for a bundled concept.
 
     Stage 1: ``session.generate_scenarios`` → save ``scenarios.json``.
-    Stage 2: ``session.generate_pairs(scenarios=...)`` → save ``statements.json``.
+    Stage 2: ``session.generate_statements([pos, neg], share_moment=True, scenarios=...)``
+    → save ``statements.json``.
     Stage 3: refresh the pack.json file manifest.
 
     Scenarios and statements are regenerated as a unit — statements
@@ -186,13 +187,22 @@ def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> boo
     )
     print(f"    saved {len(scenarios)} scenarios")
 
-    # Stage 2: pairs.
-    pairs = session.generate_pairs(
-        pos, neg,
-        n=N_PAIRS,
+    # Stage 2: pairs (moment-shared via share_moment=True).  For a
+    # monopolar concept (neg is None) the second slot encodes "the
+    # semantic opposite of <pos>" as a humanized slug — same semantic
+    # the legacy monopolar pair prompt carried.
+    neg_slot = neg if neg is not None else f"the_opposite_of_{pos}"
+    statements_per_cell = max(1, -(-N_PAIRS // max(1, len(scenarios))))
+    corpora = session.generate_statements(
+        [pos, neg_slot],
         scenarios=scenarios,
+        statements_per_cell=statements_per_cell,
+        share_moment=True,
         on_progress=lambda msg: print(f"    {msg}", flush=True),
     )
+    pos_lines = corpora[pos]
+    neg_lines = corpora[neg_slot]
+    pairs = list(zip(pos_lines, neg_lines))[:N_PAIRS]
     if len(pairs) < N_PAIRS // 2:
         print(f"  [warn] {name}: only {len(pairs)} pairs — not writing")
         return False

@@ -1779,11 +1779,13 @@ def register_saklas_routes(app: FastAPI) -> None:
     ):
         """Generate contrastive pairs for review/edit, without extracting.
 
-        Runs ``generate_scenarios`` + ``generate_pairs`` and returns the
-        pairs as JSON. The webui shows them in an editable table; the
-        user edits, then POSTs the result back to ``/extract`` as
-        ``source: {pairs: [...]}`` — which skips generation entirely.
-        Side-effect-free: no ``statements.json`` is written here.
+        Runs ``generate_scenarios`` + ``generate_statements(share_moment=True)``
+        and recovers ``(positive, negative)`` pairs by zipping the
+        per-concept corpora.  The webui shows them in an editable
+        table; the user edits, then POSTs the result back to
+        ``/extract`` as ``source: {pairs: [...]}`` — which skips
+        generation entirely.  Side-effect-free: no ``statements.json``
+        is written here.
         """
         _resolve_session_id(session, session_id)
         concept = req.concept.strip()
@@ -1792,24 +1794,41 @@ def register_saklas_routes(app: FastAPI) -> None:
         baseline = (req.baseline or "").strip() or None
 
         def _generate(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            if req.n_scenarios and req.n_scenarios > 0:
-                scenarios = session.generate_scenarios(
-                    concept, baseline, req.n_scenarios, on_progress=on_progress,
+            # Engine defaults: 9 scenarios × 5 statements/cell = 45.
+            n_scenarios = (
+                req.n_scenarios
+                if req.n_scenarios and req.n_scenarios > 0
+                else 9
+            )
+            scenarios = session.generate_scenarios(
+                concept, baseline, n_scenarios, on_progress=on_progress,
+            )
+            # ``n_pairs`` is a total-pair budget; map onto the per-cell
+            # parameterization the engine speaks now.  Ceil-div mirrors
+            # the legacy ``generate_pairs`` derivation.
+            if req.n_pairs and req.n_pairs > 0 and scenarios:
+                statements_per_cell = max(
+                    1, -(-req.n_pairs // len(scenarios))
                 )
             else:
-                scenarios = session.generate_scenarios(
-                    concept, baseline, on_progress=on_progress,
-                )
+                statements_per_cell = 5
+            neg_slot = baseline if baseline is not None else (
+                f"the_opposite_of_{concept}"
+            )
+            corpora = session.generate_statements(
+                [concept, neg_slot],
+                scenarios=list(scenarios),
+                statements_per_cell=statements_per_cell,
+                share_moment=True,
+                on_progress=on_progress,
+            )
+            pos_lines = corpora[concept]
+            neg_lines = corpora[neg_slot]
+            pairs = list(zip(pos_lines, neg_lines))
+            # Honor the ``n_pairs`` budget if the cell parameterization
+            # over-shot (ceil-div rounded up).
             if req.n_pairs and req.n_pairs > 0:
-                pairs = session.generate_pairs(
-                    concept, baseline, req.n_pairs,
-                    scenarios=scenarios, on_progress=on_progress,
-                )
-            else:
-                pairs = session.generate_pairs(
-                    concept, baseline, scenarios=scenarios,
-                    on_progress=on_progress,
-                )
+                pairs = pairs[: req.n_pairs]
             return {
                 "concept": concept,
                 "baseline": baseline,

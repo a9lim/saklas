@@ -84,13 +84,25 @@ class _StubHandle:
         self.last_scenarios_role = role
         return list(self._scenarios_response)
 
-    def generate_pairs(
-        self, concept, baseline=None, n=45, *,
-        scenarios=None, on_progress=None, role=None,
+    def generate_statements(
+        self, concepts, *,
+        scenarios=None, n_scenarios=9, statements_per_cell=5,
+        share_moment=False, on_progress=None, role=None,
     ):
         self.pairs_calls += 1
         self.last_pairs_role = role
-        return list(self._pairs_response)
+        # Reshape the canned ``(positive, negative)`` pairs into the
+        # dict-of-corpora shape the new API returns.  The pipeline
+        # always passes a 2-element concepts list under
+        # ``share_moment=True``, so ``concepts[0]`` is positive and
+        # ``concepts[1]`` is the negative slot (real baseline or the
+        # synthesized ``the_opposite_of_<X>`` for monopolar concepts).
+        pos_lines = [p for p, _ in self._pairs_response]
+        neg_lines = [n for _, n in self._pairs_response]
+        return {
+            concepts[0]: pos_lines,
+            concepts[1]: neg_lines,
+        }
 
     # PackWriter surface -------------------------------------------------
 

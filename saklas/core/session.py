@@ -160,7 +160,7 @@ PROBE_CATEGORIES = [
 ]
 MIN_ELAPSED_FOR_RATE = 0.1
 
-_PAIR_RE = re.compile(r"(?:\d+|N)\s*([ab])[.)]\s*(.*)", re.IGNORECASE)
+_GROUPED_RE = re.compile(r"^\s*(\d+)\s*([a-z])[.)]\s*(.+)$", re.IGNORECASE)
 _SCENARIO_LINE_RE = re.compile(r"^\s*(\d+)\s*[.\)]\s*(.+?)\s*$")
 
 # System prompt shared by scenario and pair generators. Tightened from
@@ -203,7 +203,7 @@ def _split_composite_source(
     ``canonical_concept_name`` already performs this split for the
     storage name.  ``extract()`` needs the same split at the generator
     interface so :meth:`SaklasSession.generate_scenarios` and
-    :meth:`SaklasSession.generate_pairs` route ``concept`` and
+    :meth:`SaklasSession.generate_statements` route ``concept`` and
     ``baseline`` as two distinct poles — otherwise the LLM sees one
     composite blob vs "its semantic opposite" and the A/B assignment in
     the returned statements no longer matches the user's declared pole
@@ -1318,232 +1318,91 @@ class SaklasSession:
             out.append(name)
         return out
 
-    def generate_pairs(
-        self,
-        concept: str,
-        baseline: str | None = None,
-        n: int = _N_PAIRS,
-        *,
-        scenarios: list[str] | None = None,
-        on_progress: Callable[[str], None] | None = None,
-        role: str | None = None,
-    ) -> list[tuple[str, str]]:
-        """Generate contrastive statement pairs via the open-ended pipeline.
-
-        For each of ``len(scenarios)`` broad domains (passed via
-        ``scenarios`` or generated fresh via :meth:`generate_scenarios`),
-        ask the model for ``ceil(n / len(scenarios))`` first-person
-        contrastive pairs drawn from concrete moments within that
-        domain. Uses POV/behavior framing that generalizes across human
-        and non-human concepts — a ``deer.wolf`` axis yields literal
-        animal-life pairs rather than human-allegory pairs. Returns up
-        to ``n`` pairs total.
-
-        Bipolar (baseline given): Speaker A embodies ``concept``,
-        Speaker B embodies ``baseline``. Monopolar (baseline None):
-        Speaker B embodies the semantic opposite of ``concept``.
-        """
-        if scenarios is None:
-            scenarios = self.generate_scenarios(
-                concept, baseline, _N_SCENARIOS,
-                on_progress=on_progress, role=role,
-            )
-        if not scenarios:
-            return []
-
-        pairs_per_scenario = max(1, -(-n // len(scenarios)))  # ceil div
-
-        # See ``generate_scenarios`` — slug underscores become spaces for
-        # the LLM-facing prompt only; progress messages and cache keys
-        # keep the slug form.
-        concept_h = _humanize_concept(concept)
-        baseline_h = _humanize_concept(baseline) if baseline is not None else None
-        if baseline_h is not None:
-            axis_phrase = f'"{concept_h}" vs "{baseline_h}"'
-            a_line = (
-                f'   - Statement A: write like you ARE "{concept_h}", '
-                f'facing that moment.'
-            )
-            b_line = (
-                f'   - Statement B: write like you ARE "{baseline_h}", '
-                f'facing the same moment.'
-            )
-            labels_ban = (
-                f'Do not name the poles. Never write "I am a {concept_h}" '
-                f'or "as a {baseline_h}" or any similar self-label — just '
-                f'inhabit the pole directly.'
-            )
-        else:
-            axis_phrase = f'"{concept_h}" vs its semantic opposite'
-            a_line = (
-                f'   - Statement A: write like you ARE "{concept_h}", '
-                f'facing that moment.'
-            )
-            b_line = (
-                f'   - Statement B: write like you ARE the semantic '
-                f'opposite of "{concept_h}" — whatever that opposite '
-                f'naturally is — facing the same moment.'
-            )
-            labels_ban = (
-                f'Do not name the pole. Never write "I am a {concept_h}" '
-                f'or any similar self-label — just inhabit the pole '
-                f'directly.'
-            )
-
-        all_pairs: list[tuple[str, str]] = []
-        for idx, scenario in enumerate(scenarios, 1):
-            if len(all_pairs) >= n:
-                break
-            if on_progress:
-                on_progress(
-                    f"Generating {pairs_per_scenario} pairs for domain "
-                    f"{idx}/{len(scenarios)}: {scenario}"
-                )
-            prompt = (
-                f"Axis: {axis_phrase}.\n"
-                f"Domain: {scenario}.\n\n"
-                f"Write exactly {pairs_per_scenario} contrastive "
-                f"statement pairs drawn from this domain.\n\n"
-                f"For each pair:\n"
-                f"1. Pick a specific concrete moment that naturally "
-                f"lives inside the domain — a thing happening right "
-                f"now, not a generality.\n"
-                f"2. Write two first-person statements about that "
-                f"same moment:\n"
-                f"{a_line}\n"
-                f"{b_line}\n\n"
-                f"Write AS the pole, not ABOUT it. {labels_ban}\n\n"
-                f"Both statements in a pair should have the same "
-                f"overall shape — both an inner thought, or both a "
-                f"description of what you do, or both something said "
-                f"aloud — so the only axis of variation is "
-                f"{axis_phrase}.\n\n"
-                f"Each statement should be at least 12 words; longer "
-                f"is fine. Natural, unhurried language. Lean into the "
-                f"pole and let it speak in its natural register.\n\n"
-                f"Format: number then a/b, period, then the statement. "
-                f"Nothing else.\n\n"
-                f"1a. [Statement A for moment 1]\n"
-                f"1b. [Statement B for moment 1]\n"
-                f"2a. [Statement A for moment 2]\n"
-                f"2b. [Statement B for moment 2]\n"
-                f"..."
-            )
-            max_new_tokens = max(400, pairs_per_scenario * 200)
-            batch_best: list[tuple[str, str]] = []
-            for _attempt in range(_MAX_GEN_ATTEMPTS):
-                text = self._run_generator(
-                    _GEN_SYSTEM_MSG, prompt, max_new_tokens, role=role,
-                )
-                parsed = self._parse_pairs(text)
-                if len(parsed) >= pairs_per_scenario:
-                    batch_best = parsed[:pairs_per_scenario]
-                    break
-                if len(parsed) > len(batch_best):
-                    batch_best = parsed
-            all_pairs.extend(batch_best)
-
-        return all_pairs[:n]
-
-    @staticmethod
-    def _parse_pairs(text: str) -> list[tuple[str, str]]:
-        """Parse contrastive pairs from generated text.
-
-        Accepts varied formats: "1a.", "Na.", "a.", "1a)", "a)" etc.
-        Pairs positionally: each 'a' entry pairs with the nearest 'b'
-        (either direction), tolerating reversed, misnumbered, skipped,
-        or duplicated indices.
-        """
-        entries: list[tuple[str, str]] = []  # ("a"|"b", content)
-        for line in text.split("\n"):
-            line = line.strip()
-            m = _PAIR_RE.match(line)
-            if not m:
-                continue
-            ab, content = m.group(1).lower(), m.group(2).strip()
-            if len(content) > 10:
-                entries.append((ab, content))
-        # Pair adjacent a/b entries regardless of order
-        pairs = []
-        i = 0
-        while i < len(entries) - 1:
-            cur, nxt = entries[i], entries[i + 1]
-            if cur[0] == "a" and nxt[0] == "b":
-                pairs.append((cur[1], nxt[1]))
-                i += 2
-            elif cur[0] == "b" and nxt[0] == "a":
-                pairs.append((nxt[1], cur[1]))
-                i += 2
-            else:
-                # Two of the same in a row — skip the first, try the second
-                i += 1
-        return pairs
-
-    def generate_concept_statements(
+    def generate_statements(
         self,
         concepts: list[str],
         *,
+        scenarios: list[str] | None = None,
         n_scenarios: int = _N_SCENARIOS,
-        statements_per_concept_per_scenario: int = _N_PAIRS_PER_SCENARIO,
+        statements_per_cell: int = _N_PAIRS_PER_SCENARIO,
+        share_moment: bool = False,
         on_progress: Callable[[str], None] | None = None,
         role: str | None = None,
     ) -> dict[str, list[str]]:
-        """K-tuple generalization of :meth:`generate_pairs` for discover mode.
+        """Unified statement-corpus generator for a flat list of concepts.
 
-        Given a flat list of concepts (no pole structure: e.g.
-        ``["pirate", "caveman", "assistant", "scholar", "robot"]``),
-        produce one statement corpus per concept by:
+        Produces ``n_scenarios * statements_per_cell`` first-person
+        statements per concept, sharing scenarios across the row so
+        statement index ``j`` of every concept came from the *same*
+        scenario.  The K-tuple analogue of "one corpus per concept,
+        scenario-aligned" — the load-bearing structural invariant for
+        downstream contrastive diffs and discover-mode centroid pools.
 
-        1. Generating ``n_scenarios`` shared situational domains where
-           every concept on the list has a natural take.
-        2. For each (scenario, concept) cell, generating
-           ``statements_per_concept_per_scenario`` first-person
-           statements of that concept under that scenario.
+        Two cell-fill modes:
 
-        Scenario sharing across the row is load-bearing: statement
-        index ``j`` of concept ``i`` and statement index ``j`` of
-        concept ``k`` came from the *same* scenario.  Without that
-        shared structure, the per-concept centroids would mix concept
-        signal with scenario signal and the discover-mode PCA /
-        spectral layout would surface scenario as the dominant axis.
+        - ``share_moment=False`` (default): one LLM call per (scenario,
+          concept) cell, producing K independent statements per cell.
+          The discover-mode shape — per-cell statements are unmatched
+          across concepts, but the scenario index aligns the row.
+        - ``share_moment=True``: one LLM call per scenario writes K
+          *moment-shared groups*, each a concrete situation with one
+          first-person statement per concept facing that same moment.
+          The bipolar contrastive shape — within group ``i`` of a
+          scenario, every concept's statement is about the same
+          concrete moment, so per-pair diffs cancel scenario+moment
+          variance and isolate the concept axis. The shape that gives
+          DiM its clean signal. Passing ``len(concepts)==2`` reproduces
+          the legacy ``generate_pairs`` semantics; the caller recovers
+          pairs via ``zip(out[concepts[0]], out[concepts[1]])``. N>2
+          generalizes naturally to moment-shared K-tuples — letter
+          labels ``a..z`` cap the concept budget at 26.
 
-        The anti-allegory clause is preserved verbatim in both the
-        scenario prompt and the per-cell statement prompt — a robot is
-        a machine with sensors and actuators, not a metaphor; a
-        caveman is a person living in a cave with stone tools, not a
-        metaphor.  Tests assert the clause's presence.
+        ``scenarios=None`` auto-generates a fresh scenario list (the
+        K-tuple scenario prompt; covers both N=2 and N>2). Pass
+        ``scenarios`` explicitly to reuse a curated list — e.g. the
+        bundled regeneration pipeline pins scenarios to the on-disk
+        ``scenarios.json`` so statements regenerate against fixed
+        domains.
+
+        The anti-allegory clause ("don't force human-social framing
+        onto concepts that aren't about humans; a robot is a machine,
+        not a metaphor") is verbatim in both the scenario prompt and
+        the per-cell statement prompt.  Tests assert the clause's
+        presence.
 
         Returns ``{concept: [statement, ...]}`` where each list has
-        ``n_scenarios * statements_per_concept_per_scenario`` entries,
+        exactly ``len(scenarios) * statements_per_cell`` entries,
         ordered scenario-first then within-scenario.  The dict's key
         order is the concept order the caller passed in.
 
-        Short-cell padding: if a per-(concept, scenario) LM call returns
-        fewer than ``statements_per_concept_per_scenario`` parseable
-        statements after every retry, the cell is padded by repeating
-        its last statement (or a placeholder when nothing parsed) so
-        the scenario-shared-index invariant survives.  A ragged corpus
-        would silently miscount scenario positions downstream — the
-        repetition is preferable to losing the alignment, and a
-        downstream centroid pool over a padded cell is at worst noisier
-        than one over a full cell.
+        Short-cell padding: if a cell LLM call yields fewer than
+        ``statements_per_cell`` parseable rows after every retry, the
+        cell is padded by repeating its last entry (or a placeholder
+        when nothing parsed) so the scenario-shared-index invariant
+        survives a flaky LM.  A ragged corpus would silently miscount
+        scenario positions downstream.
         """
         if not isinstance(concepts, list) or len(concepts) < 2:
             raise ValueError(
-                "generate_concept_statements needs >= 2 concepts; "
+                "generate_statements needs >= 2 concepts; "
                 "shared-scenario structure is meaningless with one"
             )
-        if n_scenarios <= 0 or statements_per_concept_per_scenario <= 0:
+        if n_scenarios <= 0 or statements_per_cell <= 0:
             raise ValueError(
-                "n_scenarios and statements_per_concept_per_scenario "
-                "must both be > 0"
+                "n_scenarios and statements_per_cell must both be > 0"
             )
-        # Reject duplicates up front — they'd produce duplicate keys in
-        # the return dict, silently overwriting one corpus.
+        # Reject duplicates up front — they'd produce duplicate keys
+        # in the return dict, silently overwriting one corpus.
         if len(set(concepts)) != len(concepts):
             raise ValueError(
-                f"generate_concept_statements: duplicate concept in "
-                f"{concepts!r}"
+                f"generate_statements: duplicate concept in {concepts!r}"
+            )
+        if share_moment and len(concepts) > 26:
+            # ``_parse_grouped_statements`` uses single-letter labels
+            # (a–z) to align statements within a moment group.
+            raise ValueError(
+                "generate_statements: share_moment supports up to 26 "
+                f"concepts (got {len(concepts)})"
             )
 
         # Slug underscores read as spaces in the LLM-facing prompt; the
@@ -1551,130 +1410,205 @@ class SaklasSession:
         humanized = [_humanize_concept(c) for c in concepts]
         concept_list_str = ", ".join(f'"{h}"' for h in humanized)
 
-        scenario_prompt = (
-            f"You are writing situational domains for an analysis "
-            f"of {len(concepts)} distinct concepts.\n\n"
-            f"Concepts: {concept_list_str}.\n\n"
-            f"List exactly {n_scenarios} broad situational domains "
-            f"where *every* concept on the list would naturally have "
-            f"something to do or say. A domain is a category of "
-            f"experience, 2 to 6 words, concrete enough to evoke "
-            f"specific situations, broad enough that every listed "
-            f"concept could plausibly respond.\n\n"
-            f"A good domain has purchase for the whole list — for "
-            f"example, 'dealing with a sudden storm' lets every "
-            f"concept above have a take. A bad domain has purchase "
-            f"for only some — 'writing a Python decorator' leaves "
-            f"most of the list silent.\n\n"
-            f"Cover the full range of contexts these concepts might "
-            f"face — internal states, social or relational contact, "
-            f"physical environment, routine moments, high-stakes "
-            f"moments — whatever lets every concept on the list "
-            f"contribute.\n\n"
-            f"Do not force human-social framing onto concepts that "
-            f"aren't about humans. Treat each concept literally: a "
-            f"robot is a machine with sensors and actuators, not a "
-            f"metaphor for cold logic; a caveman is a person living "
-            f"in a cave with stone tools, not a metaphor for "
-            f"primitive behavior. A literal reading of every concept "
-            f"is mandatory.\n\n"
-            f"No meta-commentary, no explanations, no sub-bullets.\n\n"
-            f"Format: number, period, then the domain name. Nothing "
-            f"else.\n\n"
-            f"1. [domain]\n"
-            f"2. [domain]\n"
-            f"...\n"
-            f"{n_scenarios}. [domain]"
-        )
+        # ---- Scenarios ------------------------------------------------
+        if scenarios is None:
+            scenario_prompt = (
+                f"Concepts: {concept_list_str}.\n\n"
+                f"List {n_scenarios} varied, distinctive situational "
+                f"domains. Every literal concept should have a "
+                f"distinct perspective on each domain. List only the "
+                f"domains.\n\n"
+                f"Format:\n"
+                f"1. [domain]\n"
+                f"2. [domain]\n"
+                f"...\n"
+                f"{n_scenarios}. [domain]"
+            )
+            if on_progress:
+                on_progress(
+                    f"Generating {n_scenarios} shared scenarios for "
+                    f"{len(concepts)} concepts..."
+                )
+            scenarios = []
+            for _ in range(_MAX_GEN_ATTEMPTS):
+                text = self._run_generator(
+                    _GEN_SYSTEM_MSG, scenario_prompt,
+                    max_new_tokens=max(400, n_scenarios * 40),
+                    role=role,
+                )
+                parsed = self._parse_scenarios(text)
+                if len(parsed) >= n_scenarios:
+                    scenarios = parsed[:n_scenarios]
+                    break
+                if len(parsed) > len(scenarios):
+                    scenarios = parsed
+            if not scenarios:
+                raise ValueError(
+                    f"could not generate scenarios for concepts "
+                    f"{concepts!r}; try fewer or more-cohesive concepts"
+                )
 
-        if on_progress:
-            on_progress(
-                f"Generating {n_scenarios} shared scenarios for "
-                f"{len(concepts)} concepts..."
-            )
-        scenarios: list[str] = []
-        for attempt in range(_MAX_GEN_ATTEMPTS):
-            text = self._run_generator(
-                _GEN_SYSTEM_MSG, scenario_prompt,
-                max_new_tokens=max(400, n_scenarios * 40),
-                role=role,
-            )
-            parsed = self._parse_scenarios(text)
-            if len(parsed) >= n_scenarios:
-                scenarios = parsed[:n_scenarios]
-                break
-            if len(parsed) > len(scenarios):
-                scenarios = parsed
-        if not scenarios:
-            raise ValueError(
-                f"could not generate scenarios for concepts "
-                f"{concepts!r}; try fewer or more-cohesive concepts"
-            )
-
-        # Pre-allocate the per-concept corpora with empty lists so
-        # short-LLM-output retries don't leave the dict shape ragged.
+        # ---- Statements ----------------------------------------------
         corpora: dict[str, list[str]] = {c: [] for c in concepts}
-        K = statements_per_concept_per_scenario
+        K = statements_per_cell
+        N = len(concepts)
 
-        for s_idx, scenario in enumerate(scenarios, 1):
-            for c, h in zip(concepts, humanized):
+        if share_moment:
+            # ``Speakers: a="pirate", b="caveman", c="robot"`` — one line
+            # binds each letter label to its concept.  The format
+            # example below uses these letters as row labels.
+            speakers_inline = ", ".join(
+                f"{chr(ord('a') + i)}=\"{h}\""
+                for i, h in enumerate(humanized)
+            )
+            for s_idx, scenario in enumerate(scenarios, 1):
                 if on_progress:
                     on_progress(
                         f"Domain {s_idx}/{len(scenarios)} "
-                        f"({scenario}): generating {K} statements for "
-                        f"'{h}'..."
+                        f"({scenario}): {K} moment-shared groups of "
+                        f"{N} statements..."
                     )
-                statement_prompt = (
-                    f"Concept: \"{h}\".\n"
-                    f"Domain: {scenario}.\n\n"
-                    f"Write exactly {K} first-person statements as a "
-                    f"literal \"{h}\" facing the situation that this "
-                    f"domain evokes. Treat \"{h}\" literally — a "
-                    f"robot is a machine with sensors and actuators, "
-                    f"not a metaphor for cold logic; a caveman is a "
-                    f"person living in a cave with stone tools, not "
-                    f"a metaphor for primitive behavior. Do not force "
-                    f"human-social framing onto a concept that isn't "
-                    f"about humans.\n\n"
-                    f"Each statement should be at least 12 words and "
-                    f"natural to \"{h}\"'s voice and concerns in this "
-                    f"situation. Do not start with 'As a {h}' or 'I "
-                    f"am a {h}' or any similar self-label — just "
-                    f"inhabit the concept directly.\n\n"
-                    f"Format: number, period, then the statement. "
-                    f"Nothing else.\n\n"
-                    f"1. [statement]\n"
-                    f"2. [statement]\n"
-                    f"...\n"
-                    f"{K}. [statement]"
+                # Build the format example with the right number of
+                # speaker letters so the model sees its actual row
+                # template.
+                example_letters = [chr(ord("a") + i) for i in range(N)]
+                example_block_1 = "\n".join(
+                    f"1{letter}. [set 1, speaker {letter}]"
+                    for letter in example_letters
                 )
-                cell_best: list[str] = []
+                example_block_2 = f"2{example_letters[0]}. [set 2, speaker {example_letters[0]}]"
+                prompt = (
+                    f"Domain: {scenario}.\n"
+                    f"Speakers: {speakers_inline}.\n\n"
+                    f"Write {K} sets of first-person statements. For "
+                    f"each set, pick one aspect of the domain to "
+                    f"write about, then for each of the literal "
+                    f"concepts, write one statement from their "
+                    f"perspective. Each statement should be a rich "
+                    f"and complete sentence.\n\n"
+                    f"Format:\n"
+                    f"{example_block_1}\n"
+                    f"...\n"
+                    f"{example_block_2}\n"
+                    f"..."
+                )
+                max_new_tokens = max(400, K * N * 100)
+                groups_best: list[tuple[str, ...]] = []
                 for _ in range(_MAX_GEN_ATTEMPTS):
                     text = self._run_generator(
-                        _GEN_SYSTEM_MSG, statement_prompt,
-                        max_new_tokens=max(400, K * 80),
-                        role=role,
+                        _GEN_SYSTEM_MSG, prompt, max_new_tokens, role=role,
                     )
-                    parsed = self._parse_numbered_statements(text)
+                    parsed = self._parse_grouped_statements(text, N)
                     if len(parsed) >= K:
-                        cell_best = parsed[:K]
+                        groups_best = parsed[:K]
                         break
-                    if len(parsed) > len(cell_best):
-                        cell_best = parsed
-                # Always extend by K — pad with the last statement
-                # (or a placeholder if nothing parsed) to preserve the
-                # scenario-shared index invariant.  A ragged corpus
-                # would silently miscount scenario positions downstream.
-                if not cell_best:
-                    cell_best = [
-                        f"({h} statement under '{scenario}' — "
-                        f"generation failed)"
+                    if len(parsed) > len(groups_best):
+                        groups_best = parsed
+                # Pad to K groups so the scenario-shared-index invariant
+                # survives.  Placeholder respects the per-concept slot.
+                if not groups_best:
+                    groups_best = [
+                        tuple(
+                            f"({h} statement under '{scenario}' — "
+                            f"generation failed)"
+                            for h in humanized
+                        )
                     ]
-                while len(cell_best) < K:
-                    cell_best.append(cell_best[-1])
-                corpora[c].extend(cell_best)
+                while len(groups_best) < K:
+                    groups_best.append(groups_best[-1])
+                for group in groups_best:
+                    for c, stmt in zip(concepts, group):
+                        corpora[c].append(stmt)
+        else:
+            for s_idx, scenario in enumerate(scenarios, 1):
+                for c, h in zip(concepts, humanized):
+                    if on_progress:
+                        on_progress(
+                            f"Domain {s_idx}/{len(scenarios)} "
+                            f"({scenario}): generating {K} statements "
+                            f"for '{h}'..."
+                        )
+                    statement_prompt = (
+                        f"Concept: \"{h}\".\n"
+                        f"Domain: {scenario}.\n\n"
+                        f"Write {K} first-person statements. For each "
+                        f"statement, pick one aspect of the domain to "
+                        f"write about, then as the literal concept, "
+                        f"write one statement from their perspective. "
+                        f"Each statement should be a rich and "
+                        f"complete sentence.\n\n"
+                        f"Format:\n"
+                        f"1. [statement]\n"
+                        f"2. [statement]\n"
+                        f"...\n"
+                        f"{K}. [statement]"
+                    )
+                    cell_best: list[str] = []
+                    for _ in range(_MAX_GEN_ATTEMPTS):
+                        text = self._run_generator(
+                            _GEN_SYSTEM_MSG, statement_prompt,
+                            max_new_tokens=max(400, K * 80),
+                            role=role,
+                        )
+                        parsed = self._parse_numbered_statements(text)
+                        if len(parsed) >= K:
+                            cell_best = parsed[:K]
+                            break
+                        if len(parsed) > len(cell_best):
+                            cell_best = parsed
+                    if not cell_best:
+                        cell_best = [
+                            f"({h} statement under '{scenario}' — "
+                            f"generation failed)"
+                        ]
+                    while len(cell_best) < K:
+                        cell_best.append(cell_best[-1])
+                    corpora[c].extend(cell_best)
 
         return corpora
+
+    @staticmethod
+    def _parse_grouped_statements(
+        text: str, group_size: int,
+    ) -> list[tuple[str, ...]]:
+        """Parse ``N<letter>`` grouped statements from generated text.
+
+        Accepts ``1a. stmt`` / ``2b) stmt`` etc.  Lines are grouped by
+        their numeric prefix; within a group, lines are bucketed by
+        their letter (a..z, case-insensitive) and the first
+        ``group_size`` letters must all be present for the group to
+        emerge.  Out-of-order letters within a group are fine (sorts
+        on letter); incomplete groups are dropped (caller retries).
+
+        For ``group_size == 2`` this is a stricter form of the legacy
+        ``_parse_pairs`` — both produce ``(a, b)`` tuples and tolerate
+        reversed ``b/a`` ordering within a group, but this parser
+        additionally rejects pairs missing their numeric prefix.
+        """
+        import collections
+        groups: dict[int, dict[str, str]] = collections.defaultdict(dict)
+        for line in text.split("\n"):
+            m = _GROUPED_RE.match(line.strip())
+            if not m:
+                continue
+            idx = int(m.group(1))
+            letter = m.group(2).lower()
+            content = m.group(3).strip()
+            if len(content) < 10:
+                continue
+            letter_idx = ord(letter) - ord("a")
+            if not 0 <= letter_idx < group_size:
+                continue
+            # First occurrence of (idx, letter) wins; later duplicates
+            # are dropped rather than confusing the row.
+            groups[idx].setdefault(letter, content)
+        out: list[tuple[str, ...]] = []
+        for idx in sorted(groups.keys()):
+            bag = groups[idx]
+            wanted = [chr(ord("a") + i) for i in range(group_size)]
+            if all(letter in bag for letter in wanted):
+                out.append(tuple(bag[letter] for letter in wanted))
+        return out
 
     @staticmethod
     def _parse_numbered_statements(text: str) -> list[str]:
