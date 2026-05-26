@@ -212,10 +212,10 @@ def main() -> None:
             f"{n_statements} statements total)..."
         )
         t0 = time.time()
-        corpora = session.generate_concept_statements(
+        corpora = session.generate_statements(
             PERSONAS,
             n_scenarios=args.n_scenarios,
-            statements_per_concept_per_scenario=args.statements_per_concept,
+            statements_per_cell=args.statements_per_concept,
             on_progress=lambda msg: print(f"  {msg}", flush=True),
         )
         print(f"generation finished in {time.time() - t0:.1f}s")
