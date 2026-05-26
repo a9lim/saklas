@@ -45,14 +45,25 @@ QWEN_TEMPLATE = (
 )
 
 
-# Gemma: ``<start_of_turn>{role}\n{content}<end_of_turn>`` — and the assistant
-# role is labeled ``model``, not ``assistant``.
+# Gemma 2/3: ``<start_of_turn>{role}\n{content}<end_of_turn>`` — and the
+# assistant role is labeled ``model``, not ``assistant``.
 GEMMA_TEMPLATE = (
     "{% for m in messages %}"
     "{% set role = 'model' if m['role'] == 'assistant' else m['role'] %}"
     "<start_of_turn>{{ role }}\n{{ m['content'] }}<end_of_turn>\n"
     "{% endfor %}"
     "{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}"
+)
+
+
+# Gemma 4: same ``model`` label, new turn delimiters
+# (``<|turn>...<turn|>`` instead of ``<start_of_turn>...<end_of_turn>``).
+GEMMA4_TEMPLATE = (
+    "{% for m in messages %}"
+    "{% set role = 'model' if m['role'] == 'assistant' else m['role'] %}"
+    "<|turn>{{ role }}\n{{ m['content'] }}<turn|>\n"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|turn>model\n{% endif %}"
 )
 
 
@@ -167,6 +178,10 @@ def _qwen_tok() -> FakeTokenizer:
 
 def _gemma_tok() -> FakeTokenizer:
     return FakeTokenizer(GEMMA_TEMPLATE)
+
+
+def _gemma4_tok() -> FakeTokenizer:
+    return FakeTokenizer(GEMMA4_TEMPLATE)
 
 
 def _llama_tok() -> FakeTokenizer:
@@ -314,10 +329,28 @@ def test_apply_with_role_gemma3_label_remap():
     assert "<start_of_turn>user\n" in out
 
 
-def test_apply_with_role_gemma_text_variant_inherits():
-    """gemma3_text / gemma4 / gemma4_text inherit gemma's RoleHeader."""
-    for mt in ("gemma3_text", "gemma4", "gemma4_text"):
-        tok = _gemma_tok()
+def test_apply_with_role_gemma3_text_variant_inherits():
+    """gemma3_text inherits the gemma family's <start_of_turn> RoleHeader."""
+    tok = _gemma_tok()
+    out = apply_with_role(
+        tok,
+        _sample_messages(),
+        role="pirate",
+        model_type="gemma3_text",
+        tokenize=False,
+    )
+    assert "<start_of_turn>pirate\n" in out
+
+
+def test_apply_with_role_gemma4_variants_use_new_delimiter():
+    """gemma4 and gemma4_text use the <|turn> delimiter, distinct from gemma 2/3.
+
+    Gemma 4 ships a new turn-boundary scheme; the registry carries a
+    separate ``gemma4`` :class:`RoleHeader` and ``gemma4_text`` inherits
+    that — not the gemma 2/3 ``<start_of_turn>`` header.
+    """
+    for mt in ("gemma4", "gemma4_text"):
+        tok = _gemma4_tok()
         out = apply_with_role(
             tok,
             _sample_messages(),
@@ -325,7 +358,10 @@ def test_apply_with_role_gemma_text_variant_inherits():
             model_type=mt,
             tokenize=False,
         )
-        assert "<start_of_turn>pirate\n" in out, f"failed for {mt}"
+        assert "<|turn>pirate\n" in out, f"failed for {mt}"
+        # The substituted assistant marker is gone; user-role markers untouched.
+        assert "<|turn>model\n" not in out
+        assert "<|turn>user\n" in out
 
 
 def test_apply_with_role_llama3():
