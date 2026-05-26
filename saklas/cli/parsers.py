@@ -355,6 +355,16 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "exclusive with ``--sae``. Mistral-3 / talkie families don't "
              "carry a substitutable role label and raise at runtime.",
     )
+    p.add_argument(
+        "--namespace", default=None, metavar="NS",
+        help="Destination namespace for the extracted vector folder.  "
+             "Unset lands the tensor under "
+             "``~/.saklas/vectors/local/<canonical>/`` — the historical "
+             "landing site.  Any other value relocates to "
+             "``vectors/<namespace>/<canonical>/``.  Parity with the "
+             "webui ExtractDrawer's namespace control and with "
+             "``vector manifold`` / `discover``'s NS slot.",
+    )
     p.set_defaults(quantize=None, device="auto", probes=None)
 
 

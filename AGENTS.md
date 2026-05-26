@@ -37,7 +37,7 @@ saklas pack ls [selector] [-j|-v]               # LOCAL installed packs only
 saklas pack search <query> [-j|-v]              # search HF hub for saklas-pack repos
 saklas pack push <selector> [-a OWNER/NAME] [-m MODEL] [--variant raw|sae|all] ...
 saklas pack export gguf <selector> [-m MODEL] [-o PATH] [--model-hint HINT]
-saklas vector extract <concept>|<pos> <neg> [-m MODEL] [--method dim|pca] [--sae RELEASE] [--role SLUG]
+saklas vector extract <concept>|<pos> <neg> [-m MODEL] [--method dim|pca] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas vector merge <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b~ns/c"
 saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S]
 saklas vector compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]

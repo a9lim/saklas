@@ -404,8 +404,8 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch, tmp_path, c
                                "hidden_dim": 8, "vram_used_gb": 0.0}
             self.probes = {}
 
-        def _local_concept_folder(self, canonical):
-            return vectors_dir() / "local" / canonical
+        def _local_concept_folder(self, canonical, *, namespace="local"):
+            return vectors_dir() / namespace / canonical
 
         def extract(self, *a, **kw):
             raise AssertionError("extract() must not be called on cache hit")

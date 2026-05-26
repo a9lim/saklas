@@ -637,8 +637,20 @@ def _run_extract(args: argparse.Namespace) -> None:
     from saklas.io.selectors import _all_concepts
     # ``method`` was resolved at the top of the function (pre-flight
     # validation; see ``_resolve_legacy_method``).
-    candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
-    candidate_folders.append(session._local_concept_folder(canonical))
+    requested_namespace = getattr(args, "namespace", None)
+    if requested_namespace is not None:
+        # User pinned a destination — restrict the existence check to
+        # that namespace so an unrelated match elsewhere doesn't trip
+        # "already extracted".
+        candidate_folders = [
+            c.folder for c in _all_concepts()
+            if c.name == canonical and c.namespace == requested_namespace
+        ]
+    else:
+        candidate_folders = [c.folder for c in _all_concepts() if c.name == canonical]
+    candidate_folders.append(session._local_concept_folder(
+        canonical, namespace=requested_namespace or "local",
+    ))
     requested_release = getattr(args, "sae", None)
     requested_role = getattr(args, "role", None)
     if requested_release and requested_role:
@@ -676,6 +688,15 @@ def _run_extract(args: argparse.Namespace) -> None:
         extract_kwargs["sae_revision"] = args.sae_revision
     if requested_role:
         extract_kwargs["role"] = requested_role
+    if requested_namespace is not None:
+        extract_kwargs["namespace"] = requested_namespace
+    if args.force:
+        # Webui parity: ``--force`` on the CLI matches the
+        # ExtractDrawer's "overwrite an existing vector" checkbox —
+        # pre-deleted tensors above force a tensor-cache miss; passing
+        # ``force_statements=True`` here additionally bypasses the
+        # statements-cache reuse so the regenerate is end-to-end.
+        extract_kwargs["force_statements"] = True
 
     try:
         if baseline is not None:
@@ -710,7 +731,9 @@ def _run_extract(args: argparse.Namespace) -> None:
     final_path = next((p for p in final_paths if p.exists()), None)
     if final_path is None:
         final_path = (
-            pathlib.Path(session._local_concept_folder(core_name)) / tensor_name
+            pathlib.Path(session._local_concept_folder(
+                core_name, namespace=requested_namespace or "local",
+            )) / tensor_name
         )
     print(f"extracted {canonical} ({method}) -> {final_path}")
 
