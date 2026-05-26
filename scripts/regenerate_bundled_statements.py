@@ -30,11 +30,8 @@ import sys
 import time
 from pathlib import Path
 
-import torch
-
 from saklas.core.session import SaklasSession
 from saklas.io.packs import PackMetadata, PackFormatError
-from saklas.core.generation import build_chat_input
 
 REPO = Path(__file__).resolve().parent.parent
 VECTORS_DIR = REPO / "saklas" / "data" / "vectors"
@@ -218,78 +215,34 @@ def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> boo
 
 # --- neutrals ---------------------------------------------------------------
 
-NEUTRAL_SYSTEM = (
-    "You generate affect-neutral baseline statements for activation-vector "
-    "interpretability research. Statements anchor the model's neutral "
-    "linguistic state, so they should read like encyclopedia captions: "
-    "calm, third-person, factual, with no narrative voice or speaker."
-)
-
-NEUTRAL_DOMAINS = [
-    "everyday objects and household routines",
-    "weather, geography, and natural phenomena",
-    "scientific facts and physical processes",
-    "mechanical procedures, tools, and how things work",
-    "urban scenes, architecture, and infrastructure",
-    "plants, animals, and ecosystems",
-    "materials, textures, and physical properties",
-    "abstract concepts, definitions, and categories",
-    "numerical, temporal, or measurement-based facts",
-]
-
 
 def generate_neutrals(session: SaklasSession, n: int) -> list[str]:
-    batch = max(6, n // len(NEUTRAL_DOMAINS) + 1)
-    out: list[str] = []
-    pad_id = session._tokenizer.pad_token_id or session._tokenizer.eos_token_id
-    for domain in NEUTRAL_DOMAINS:
-        if len(out) >= n:
-            break
-        prompt = (
-            f"Write exactly {batch} factual descriptive sentences about "
-            f"{domain}.\n\n"
-            f"Each sentence is one observation, stated plainly in the third "
-            f"person, like a caption in a textbook or an encyclopedia entry. "
-            f"Use neutral declarative prose, vary the grammatical subject "
-            f"and specific topic across sentences, and keep each sentence "
-            f"between 10 and 20 words.\n\n"
-            f"Format: number, period, then the sentence. Nothing else.\n\n"
-            f"1. [sentence]\n"
-            f"2. [sentence]"
-        )
-        messages = [
-            {"role": "system", "content": NEUTRAL_SYSTEM},
-            {"role": "user", "content": prompt},
-        ]
-        input_ids = build_chat_input(
-            session._tokenizer, messages, system_prompt=None,
-        ).to(session._device)
-        with torch.inference_mode():
-            result = session._model.generate(
-                input_ids,
-                max_new_tokens=batch * 45,
-                do_sample=True, temperature=1.0, top_p=0.9,
-                pad_token_id=pad_id,
-            )
-        new_ids = result[0][input_ids.shape[-1]:]
-        text = session._tokenizer.decode(new_ids, skip_special_tokens=True)
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(".", 1)
-            if len(parts) == 2 and parts[0].strip().isdigit():
-                s = parts[1].strip()
-            else:
-                parts = line.split(")", 1)
-                if len(parts) == 2 and parts[0].strip().isdigit():
-                    s = parts[1].strip()
-                else:
-                    continue
-            if 20 < len(s) < 200 and s not in out:
-                out.append(s)
-        print(f"  [neutral] {domain[:40]}: {len(out)} total", flush=True)
-    return out[:n]
+    """Generate ``n`` neutral baseline statements via the unified pipeline.
+
+    Routes through :meth:`SaklasSession.generate_statements` with a
+    single-concept list (``["neutral"]``), which triggers the no-
+    concept-naming prompt variant — the model writes first-person
+    statements about each generated domain from its default voice,
+    with no concept-axis anchor.  The activation average across the
+    resulting statements becomes the ``mu_neutral`` reference that
+    probe-centering, DLS, and Mahalanobis whitening all depend on.
+
+    First-person register matches the contrastive corpora (which are
+    also first-person), so ``mu_neutral`` lives in the same register
+    space as ``mu_pos`` and ``mu_neg``.  The previous third-person
+    encyclopedia-caption style sat in a different register, potentially
+    biasing DLS layer selection along the register-shift axis rather
+    than along concept-polarity.
+    """
+    n_scenarios = 9
+    statements_per_cell = max(1, -(-n // n_scenarios))  # ceil-div
+    corpora = session.generate_statements(
+        ["neutral"],
+        n_scenarios=n_scenarios,
+        statements_per_cell=statements_per_cell,
+        on_progress=lambda m: print(f"  [neutral] {m}", flush=True),
+    )
+    return corpora["neutral"][:n]
 
 
 # --- main -------------------------------------------------------------------

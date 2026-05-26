@@ -1207,6 +1207,7 @@ class SaklasSession:
                 model_type_for_role = getattr(model_cfg, "model_type", None)
         input_ids = build_chat_input(
             self._tokenizer, messages, system_prompt=None,
+            thinking=False,
             role=role, model_type=model_type_for_role,
         ).to(self._device)
         attention_mask = torch.ones_like(input_ids)
@@ -1334,7 +1335,16 @@ class SaklasSession:
         scenario-aligned" — the load-bearing structural invariant for
         downstream contrastive diffs and discover-mode centroid pools.
 
-        Two cell-fill modes:
+        ``len(concepts) == 1`` is the neutrals path: no concept naming
+        in either the scenario or statement prompt, so the activation
+        average becomes the model's natural-voice baseline across
+        diverse everyday domains.  Used to build the probe-centering
+        ``mu_neutral`` reference that DLS + Mahalanobis depend on.  The
+        returned dict still uses the concept slug as its single key
+        (caller picks the slug as a marker).  ``share_moment=True`` is
+        rejected for N=1 — nothing to share moments across.
+
+        Two cell-fill modes (for N >= 2):
 
         - ``share_moment=False`` (default): one LLM call per (scenario,
           concept) cell, producing K independent statements per cell.
@@ -1378,10 +1388,16 @@ class SaklasSession:
         survives a flaky LM.  A ragged corpus would silently miscount
         scenario positions downstream.
         """
-        if not isinstance(concepts, list) or len(concepts) < 2:
+        if not isinstance(concepts, list) or len(concepts) < 1:
             raise ValueError(
-                "generate_statements needs >= 2 concepts; "
-                "shared-scenario structure is meaningless with one"
+                "generate_statements needs >= 1 concept"
+            )
+        if share_moment and len(concepts) < 2:
+            # Moment-sharing has nothing to share with one speaker.
+            raise ValueError(
+                "generate_statements: share_moment=True needs >= 2 "
+                "concepts (otherwise there's no shared moment to "
+                "anchor against)"
             )
         if n_scenarios <= 0 or statements_per_cell <= 0:
             raise ValueError(
@@ -1408,18 +1424,37 @@ class SaklasSession:
 
         # ---- Scenarios ------------------------------------------------
         if scenarios is None:
-            scenario_prompt = (
-                f"Concepts: {concept_list_str}.\n\n"
-                f"List {n_scenarios} varied, distinctive situational "
-                f"domains. Every literal concept should have a "
-                f"distinct perspective on each domain. List only the "
-                f"domains.\n\n"
-                f"Format:\n"
-                f"1. [domain]\n"
-                f"2. [domain]\n"
-                f"...\n"
-                f"{n_scenarios}. [domain]"
-            )
+            if len(concepts) == 1:
+                # Neutrals path: no concept naming in the prompt, so
+                # mu_neutral represents the model's natural-voice
+                # baseline across diverse everyday domains rather than
+                # being pulled toward any concept's activation
+                # neighborhood.  "Everyday" qualifier nudges the model
+                # toward affect-neutral / topically-mundane domains
+                # rather than affect-loaded ones the open-ended phrasing
+                # would otherwise allow.
+                scenario_prompt = (
+                    f"List {n_scenarios} varied, distinctive everyday "
+                    f"situational domains.\n\n"
+                    f"Format:\n"
+                    f"1. [domain]\n"
+                    f"2. [domain]\n"
+                    f"...\n"
+                    f"{n_scenarios}. [domain]"
+                )
+            else:
+                scenario_prompt = (
+                    f"Concepts: {concept_list_str}.\n\n"
+                    f"List {n_scenarios} varied, distinctive situational "
+                    f"domains. Every literal concept should have a "
+                    f"distinct perspective on each domain. List only the "
+                    f"domains.\n\n"
+                    f"Format:\n"
+                    f"1. [domain]\n"
+                    f"2. [domain]\n"
+                    f"...\n"
+                    f"{n_scenarios}. [domain]"
+                )
             if on_progress:
                 on_progress(
                     f"Generating {n_scenarios} shared scenarios for "
@@ -1524,21 +1559,42 @@ class SaklasSession:
                             f"({scenario}): generating {K} statements "
                             f"for '{h}'..."
                         )
-                    statement_prompt = (
-                        f"Concept: \"{h}\".\n"
-                        f"Domain: {scenario}.\n\n"
-                        f"Write {K} first-person statements. For each "
-                        f"statement, pick one aspect of the domain to "
-                        f"write about, then as the literal concept, "
-                        f"write one statement from their perspective. "
-                        f"Each statement should be a rich and "
-                        f"complete sentence.\n\n"
-                        f"Format:\n"
-                        f"1. [statement]\n"
-                        f"2. [statement]\n"
-                        f"...\n"
-                        f"{K}. [statement]"
-                    )
+                    if len(concepts) == 1:
+                        # Neutrals: no concept anchor in the prompt so
+                        # the model writes from its default first-person
+                        # voice.  ``stated plainly`` biases toward
+                        # observational register rather than reflective
+                        # / affect-laden, so ``mu_neutral`` doesn't
+                        # accumulate a positive-affect bias from
+                        # everyday-personal-experience domains.
+                        statement_prompt = (
+                            f"Domain: {scenario}.\n\n"
+                            f"Write {K} first-person statements about "
+                            f"this domain, stated plainly. Each "
+                            f"statement should be a rich and complete "
+                            f"sentence.\n\n"
+                            f"Format:\n"
+                            f"1. [statement]\n"
+                            f"2. [statement]\n"
+                            f"...\n"
+                            f"{K}. [statement]"
+                        )
+                    else:
+                        statement_prompt = (
+                            f"Concept: \"{h}\".\n"
+                            f"Domain: {scenario}.\n\n"
+                            f"Write {K} first-person statements. For each "
+                            f"statement, pick one aspect of the domain to "
+                            f"write about, then as the literal concept, "
+                            f"write one statement from their perspective. "
+                            f"Each statement should be a rich and "
+                            f"complete sentence.\n\n"
+                            f"Format:\n"
+                            f"1. [statement]\n"
+                            f"2. [statement]\n"
+                            f"...\n"
+                            f"{K}. [statement]"
+                        )
                     cell_best: list[str] = []
                     for _ in range(_MAX_GEN_ATTEMPTS):
                         text = self._run_generator(

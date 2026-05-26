@@ -357,10 +357,17 @@ def test_moment_shared_across_concept_corpora_in_share_moment_mode():
 
 # --------------------------------------------------------------- error paths ---
 
-def test_rejects_fewer_than_two_concepts():
+def test_rejects_empty_concept_list():
     session = _fake_session_class()()
-    with pytest.raises(ValueError, match=">= 2 concepts"):
-        session.generate_statements(["lone"])
+    with pytest.raises(ValueError, match=">= 1 concept"):
+        session.generate_statements([])
+
+
+def test_rejects_share_moment_with_single_concept():
+    """``share_moment=True`` is meaningless with only one speaker."""
+    session = _fake_session_class()()
+    with pytest.raises(ValueError, match="share_moment.*>= 2"):
+        session.generate_statements(["lone"], share_moment=True)
 
 
 def test_rejects_duplicate_concepts():
@@ -493,6 +500,104 @@ def test_share_moment_two_concepts_zip_recovers_paired_contrastive_corpus():
             f"paired statements disagree on moment: "
             f"happy={happy_stmt!r}, sad={sad_stmt!r}"
         )
+
+
+# --------------------------------------------- single-concept (neutrals path) ---
+
+def _neutrals_fake_session_class():
+    """Fake session that emits canned scenarios + numbered statements
+    without trying to parse a concept name from the prompt.
+
+    Used for the N=1 (neutrals) tests, where the prompt deliberately
+    omits any ``Concept:`` header.
+    """
+    class _NeutralsFake(SaklasSession):
+        def __init__(self):
+            self._calls: list[tuple[str, str, int]] = []
+
+        def _run_generator(
+            self, system_msg, prompt, max_new_tokens, **_kwargs,
+        ):
+            self._calls.append((prompt, system_msg, max_new_tokens))
+            if "everyday" in prompt and "domains" in prompt:
+                return _scenarios_text(_N_SCENARIOS)
+            return _statements_text(_K, "scn", "neutral")
+
+    return _NeutralsFake
+
+
+def test_single_concept_returns_dict_with_one_key():
+    """Neutrals path: dict has one entry, sized n_scenarios * K."""
+    session = _neutrals_fake_session_class()()
+    out = session.generate_statements(
+        ["neutral"],
+        n_scenarios=_N_SCENARIOS,
+        statements_per_cell=_K,
+    )
+    assert list(out.keys()) == ["neutral"]
+    assert len(out["neutral"]) == _N_SCENARIOS * _K
+
+
+def test_single_concept_scenario_prompt_omits_concept_naming():
+    """N=1 scenario prompt should not name the concept (anti-allegory
+    by absence — model writes from its default voice across domains).
+    """
+    session = _neutrals_fake_session_class()()
+    session.generate_statements(
+        ["neutral"],
+        n_scenarios=_N_SCENARIOS,
+        statements_per_cell=_K,
+    )
+    scenario_prompt = session._calls[0][0]
+    # Bracketed concept name should be absent (the N≥2 prompt has
+    # ``Concepts: "X", ...``; the N=1 form drops it entirely).
+    assert 'Concepts:' not in scenario_prompt, (
+        "N=1 scenario prompt leaked a concept-list header"
+    )
+    assert "neutral" not in scenario_prompt, (
+        "N=1 scenario prompt leaked the concept slug — defeats the "
+        "no-concept-pull property of the neutrals path"
+    )
+    # The "everyday" anchor steers the model toward affect-neutral
+    # domains rather than open-ended (potentially affect-loaded) ones.
+    assert "everyday" in scenario_prompt
+
+
+def test_single_concept_statement_prompt_omits_concept_naming():
+    """N=1 statement prompt should write from the default voice."""
+    session = _neutrals_fake_session_class()()
+    session.generate_statements(
+        ["neutral"],
+        n_scenarios=_N_SCENARIOS,
+        statements_per_cell=_K,
+    )
+    # First call is scenarios; the next n_scenarios calls are per-cell
+    # statement prompts.  All of them should be concept-free.
+    for prompt, _system, _max in session._calls[1:]:
+        assert 'Concept:' not in prompt, (
+            f"N=1 statement prompt leaked a Concept: header: "
+            f"{prompt[:200]!r}"
+        )
+        assert "literal concept" not in prompt, (
+            "N=1 statement prompt should drop the 'as the literal "
+            "concept' anchor — neutrals have no concept axis"
+        )
+        # The first-person directive is the load-bearing piece for
+        # register-match with downstream contrastive corpora.
+        assert "first-person" in prompt
+
+
+def test_single_concept_calls_lm_once_per_scenario():
+    """N=1: one scenario call + one statement call per scenario."""
+    session = _neutrals_fake_session_class()()
+    session.generate_statements(
+        ["neutral"],
+        n_scenarios=_N_SCENARIOS,
+        statements_per_cell=_K,
+    )
+    # 1 scenario call + n_scenarios cell calls (single concept, so
+    # no inner loop iterations).
+    assert len(session._calls) == 1 + _N_SCENARIOS
 
 
 # -------------------------------------------------------- scenarios override ---
