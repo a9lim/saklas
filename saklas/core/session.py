@@ -163,14 +163,20 @@ MIN_ELAPSED_FOR_RATE = 0.1
 _GROUPED_RE = re.compile(r"^\s*(\d+)\s*([a-z])[.)]\s*(.+)$", re.IGNORECASE)
 _SCENARIO_LINE_RE = re.compile(r"^\s*(\d+)\s*[.\)]\s*(.+?)\s*$")
 
-# System prompt shared by scenario and pair generators. Tightened from
-# the v1 generic framing to emphasize format discipline — weaker models
-# (gemma-4-e4b-it) parse first-try with this.
-_GEN_SYSTEM_MSG = (
-    "You generate structured output for neural network interpretability "
-    "research. Your output is parsed programmatically. Emit exactly the "
-    "number of items requested in exactly the format requested, nothing else."
-)
+# System prompt shared by scenario and pair generators.  Stripped to
+# just the format-discipline anchor: empirically the persona-framing
+# half of the old constant ("interpretability research output
+# generator") was biasing statement register toward clinical / academic
+# voice and hurting contrastive signal on register-sensitive axes, but
+# the format-discipline half is genuinely load-bearing — without it,
+# weak models occasionally read the format example's bracket placeholders
+# (``[domain]``, ``[set 1, speaker a]``) as content and cascade into a
+# degenerate token loop ("set set set set...").  Six words is enough
+# anchor to suppress that failure mode while letting voice settle.
+#
+# Empty string drops the system role entirely — _run_generator handles
+# that gracefully (skips the system message in the chat input).
+_GEN_SYSTEM_MSG = "Emit the requested format, nothing else."
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 BIPOLAR_SEP = "."
 
@@ -1168,6 +1174,14 @@ class SaklasSession:
         under inference_mode, decodes and returns the generated text.
         No parsing, no retry — callers drive the retry loop.
 
+        An empty ``system_msg`` (``""``) drops the system role entirely
+        — the chat template sees only the user turn.  Useful for
+        measuring whether the system framing is biasing statement
+        register: with the persona-priming gone, the model writes from
+        its default assistant identity rather than the "interpretability
+        research output generator" framing the constant has historically
+        carried.
+
         ``role`` (optional): substitute a custom assistant-role label so
         the generation prompt opens with ``<role>`` instead of
         ``assistant``.  Routed through :func:`build_chat_input`.  Mirrors
@@ -1176,10 +1190,10 @@ class SaklasSession:
         from.  ``role=None`` is the zero-overhead default.
         """
         pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt},
-        ]
+        messages: list[dict[str, str]] = []
+        if system_msg:
+            messages.append({"role": "system", "content": system_msg})
+        messages.append({"role": "user", "content": prompt})
         model_type_for_role: str | None = None
         if role is not None:
             model_cfg = getattr(self._model, "config", None)
