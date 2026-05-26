@@ -1564,9 +1564,18 @@ class SaklasSession:
                         # the model writes from its default first-person
                         # voice.  ``stated plainly`` biases toward
                         # observational register rather than reflective
-                        # / affect-laden, so ``mu_neutral`` doesn't
-                        # accumulate a positive-affect bias from
-                        # everyday-personal-experience domains.
+                        # / affect-laden.  Tried ``neutral`` as a
+                        # qualifier — the model interpreted that as
+                        # "moderate / balanced" and produced uniformly
+                        # mild-positive statements (its default voice).
+                        # ``stated plainly`` reads as "without
+                        # commentary" so the model describes the actual
+                        # domain reality — sometimes positive (a
+                        # pleasant walk), sometimes negative (rush-hour
+                        # stress), often factual — and the valences
+                        # cancel across the n=90 average, landing
+                        # mu_neutral closer to true center than the
+                        # uniformly-mild-positive ``neutral`` variant.
                         statement_prompt = (
                             f"Domain: {scenario}.\n\n"
                             f"Write {K} first-person statements about "
