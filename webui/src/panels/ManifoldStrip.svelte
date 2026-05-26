@@ -30,8 +30,6 @@
 
   const info = $derived(manifoldByName(name));
 
-  let expanded = $state(false);
-
   // ---------- trigger cycle (mirror VectorStrip) ----------
 
   const TRIGGER_ORDER: Trigger[] = [
@@ -79,6 +77,13 @@
   // manifold's node list, which switches the term to label-form
   // (``persona%pirate``).  An empty selection clears the label binding
   // — the position becomes free-form, drag on the XYPad to author.
+  //
+  // ``setManifoldLabel`` already mirrors the catalog's
+  // ``node_coords[idx]`` onto ``entry.coords`` so the XYPad readout
+  // reflects the picked node's actual position.  The pad is rendered
+  // ``locked`` while a label is bound — the engine takes the position
+  // from the named node and ignores ``coords``, so dragging would
+  // confuse rather than steer.
   function onSnapToNode(val: string): void {
     setManifoldLabel(name, val === "" ? null : val);
   }
@@ -113,15 +118,9 @@
       {entry.enabled ? "●" : "○"}
     </button>
 
-    <button
-      type="button"
-      class="name"
-      onclick={() => (expanded = !expanded)}
-      title="manifold {name} — click to {expanded ? 'collapse' : 'edit position'}"
-    >
-      <span class="caret" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+    <span class="name" title="manifold {name}">
       <span class="name-text">{name}</span>
-    </button>
+    </span>
 
     {#if !fitted}
       <span class="warn" title="no fitted tensor for the loaded model — fit it from the manifolds drawer">
@@ -176,31 +175,34 @@
     <span class="blend-val">{entry.blend.toFixed(2)}</span>
   </div>
 
-  {#if expanded}
-    <div class="picker">
-      {#if info}
-        {#if info.node_labels.length > 0}
-          <label class="snap-row">
-            <span class="snap-label">snap to node</span>
-            <span class="snap-select">
-              <Select
-                value={entry.label ?? ""}
-                options={snapOptions}
-                onchange={onSnapToNode}
-                ariaLabel="snap to node"
-                title="pick a node to switch to label-form, or '(free position)' to drag the pad"
-              />
-            </span>
-          </label>
-        {/if}
-        <XYPad manifold={info} coords={entry.coords} onchange={onCoordsChange} />
-      {:else}
-        <p class="picker-missing">
-          manifold metadata unavailable — coordinates are still applied.
-        </p>
+  <div class="picker">
+    {#if info}
+      {#if info.node_labels.length > 0}
+        <label class="snap-row">
+          <span class="snap-label">snap to node</span>
+          <span class="snap-select">
+            <Select
+              value={entry.label ?? ""}
+              options={snapOptions}
+              onchange={onSnapToNode}
+              ariaLabel="snap to node"
+              title="pick a node to switch to label-form, or '(free position)' to drag the pad"
+            />
+          </span>
+        </label>
       {/if}
-    </div>
-  {/if}
+      <XYPad
+        manifold={info}
+        coords={entry.coords}
+        onchange={onCoordsChange}
+        locked={entry.label !== null}
+      />
+    {:else}
+      <p class="picker-missing">
+        manifold metadata unavailable — coordinates are still applied.
+      </p>
+    {/if}
+  </div>
 </div>
 
 <style>
@@ -246,25 +248,14 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
-    background: transparent;
-    border: 0;
     /* Manifold rows use purple as the name color to set them apart
-     * from vector rows (which use fg-strong / accent on hover). */
+     * from vector rows (which use fg-strong on the analogous label). */
     color: var(--accent-purple);
     font: inherit;
     font-family: var(--font-mono);
-    cursor: pointer;
     min-width: 0;
     flex: 1 1 auto;
     text-align: left;
-  }
-  .name:hover {
-    color: var(--accent);
-  }
-  .caret {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    flex: 0 0 auto;
   }
   .name-text {
     overflow: hidden;

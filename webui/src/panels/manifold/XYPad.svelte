@@ -19,9 +19,16 @@
     /** Current authoring coordinates — one per intrinsic dimension. */
     coords: number[];
     onchange: (coords: number[]) => void;
+    /** When true, the pad / sliders display the coords but reject
+     *  input — used by ``ManifoldStrip`` for label-form terms, where
+     *  the engine takes the position from the named node and the
+     *  surfaced coords would be ignored.  Keeping the controls
+     *  visible (instead of hiding them) gives the user a read-out of
+     *  where the snapped node actually sits in the manifold. */
+    locked?: boolean;
   }
 
-  let { manifold, coords, onchange }: Props = $props();
+  let { manifold, coords, onchange, locked = false }: Props = $props();
 
   interface AxisRange {
     name: string;
@@ -31,7 +38,17 @@
   }
 
   // Per-axis range + label.  Box domains carry explicit axes; sphere /
-  // custom fall back to a symmetric [-1, 1] range per intrinsic coord.
+  // custom domains have no authored bounds, so we derive each axis as
+  // a symmetric ``[-R, R]`` around 0 where ``R = max(1, ceil(max|v|))``
+  // over the per-axis node coords.  Centering on 0 lines up the pad's
+  // crosshair gridlines + the slider midpoint with the (0, 0, ...)
+  // centroid where every freshly-racked manifold term starts, and
+  // ``ceil(max-magnitude)`` keeps the range a clean whole number that
+  // still envelops every node (a persona node at ``c0 = -10`` lands at
+  // exactly the left endpoint with ``R = 10``).  The ``max(1, ...)``
+  // floor keeps the slider usable when every node sits very close to
+  // 0 on a particular axis.  Falls back to ``[-1, 1]`` when no fitted
+  // coords are available (the unfitted-manifold pre-fit state).
   const axes = $derived.by<AxisRange[]>(() => {
     const d = manifold.domain;
     if (d.type === "box") {
@@ -43,12 +60,22 @@
       }));
     }
     const n = manifold.intrinsic_dim;
-    return Array.from({ length: n }, (_, i) => ({
-      name: `c${i}`,
-      lo: -1,
-      hi: 1,
-      periodic: false,
-    }));
+    const coords = manifold.node_coords ?? [];
+    return Array.from({ length: n }, (_, i) => {
+      let r = 1;
+      if (coords.length > 0) {
+        let mag = 0;
+        for (const row of coords) {
+          const v = row?.[i];
+          if (Number.isFinite(v)) {
+            const a = Math.abs(v);
+            if (a > mag) mag = a;
+          }
+        }
+        if (mag > 0) r = Math.max(1, Math.ceil(mag));
+      }
+      return { name: `c${i}`, lo: -r, hi: r, periodic: false };
+    });
   });
 
   /** Clamp (open axis) or wrap (periodic axis) a raw coordinate into
@@ -95,12 +122,13 @@
   }
 
   function onPadPointerDown(ev: PointerEvent): void {
+    if (locked) return;
     dragging = true;
     (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
     padToCoords(ev);
   }
   function onPadPointerMove(ev: PointerEvent): void {
-    if (!dragging) return;
+    if (!dragging || locked) return;
     padToCoords(ev);
   }
   function onPadPointerUp(ev: PointerEvent): void {
@@ -127,10 +155,11 @@
   }
 </script>
 
-<div class="xypad">
+<div class="xypad" class:locked>
   {#if is2D}
     <div
       class="pad"
+      class:locked
       bind:this={padRef}
       role="slider"
       tabindex="0"
@@ -139,6 +168,7 @@
       aria-valuemax={axes[0].hi}
       aria-valuenow={coords[0] ?? axes[0].lo}
       aria-valuetext="{axes[0].name} {fmt(coords[0] ?? 0)}, {axes[1].name} {fmt(coords[1] ?? 0)}"
+      aria-disabled={locked}
       onpointerdown={onPadPointerDown}
       onpointermove={onPadPointerMove}
       onpointerup={onPadPointerUp}
@@ -170,6 +200,7 @@
             step={(axis.hi - axis.lo) / 100 || 0.01}
             oninput={(v) => setCoord(i, v)}
             ariaLabel="{axis.name} coordinate"
+            disabled={locked}
           />
           <span class="axis-val">{fmt(coords[i] ?? axis.lo)}</span>
         </label>
@@ -194,6 +225,21 @@
     border-radius: var(--radius);
     cursor: crosshair;
     touch-action: none;
+  }
+  /* Label-form lock: the pad is a read-out, not a control.  Dim the
+   * fill, switch the cursor away from crosshair, and let pointer
+   * events still arrive (so the title hover survives) — the handlers
+   * themselves short-circuit on ``locked``. */
+  .pad.locked {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+  /* The slider rows inside the non-2D fallback live in
+   * ``.sliders > .axis-row > Slider``; the disabled prop already
+   * handles input dimming, but we also dim the surrounding axis-name
+   * + readout so the whole row reads "locked" at a glance. */
+  .xypad.locked .sliders {
+    opacity: 0.7;
   }
   .grid-line {
     position: absolute;

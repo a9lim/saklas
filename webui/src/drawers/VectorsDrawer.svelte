@@ -25,6 +25,7 @@
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import { ApiError, apiExtractStream, apiPacks } from "../lib/api";
+  import type { ExtractRequest } from "../lib/types";
   import {
     activateProbe,
     addVectorToRack,
@@ -65,6 +66,10 @@
   const busyKeys = new SvelteSet<string>();
   const confirmKeys = new SvelteSet<string>();
   const confirmTimers = new Map<string, number>();
+  // Per-row inspect open state — parallels ManifoldDrawer's inspector.
+  // Toggling ⓘ reveals a small in-row metadata + "deep diagnostics"
+  // affordance without committing to opening LayerNormsDrawer.
+  const inspectKeys = new SvelteSet<string>();
 
   onMount(() => {
     void refreshPacks();
@@ -217,19 +222,28 @@
 
   /** Statements-only extract.  The concept has a name + cached
    *  pairs/scenarios; this kicks off the same toast-driven flow as
-   *  the custom-vector form, no user input required. */
-  function onExtract(row: LocalPackInfo): void {
+   *  the custom-vector form, no user input required.
+   *
+   *  ``force=true`` is the re-fit path: the row already has a tensor
+   *  for this model, but the user wants to bypass the tensor cache
+   *  and re-run the contrastive forward passes (parity with the
+   *  manifold drawer's "re-fit" action).  The toast wording branches
+   *  so the user sees "re-extracting" vs "extracting". */
+  function onExtract(row: LocalPackInfo, opts: { force?: boolean } = {}): void {
     const name = row.name;
     const key = rowKey(row);
     setBusy(key, true);
-    const toastId = pushToast(`extracting '${name}'…`, {
+    const verb = opts.force ? "re-extracting" : "extracting";
+    const toastId = pushToast(`${verb} '${name}'…`, {
       kind: "info",
       ttlMs: null,
     });
+    const req: ExtractRequest = { name, register: true };
+    if (opts.force) req.force = true;
     void (async () => {
       try {
         const result = await apiExtractStream(
-          { name, register: true },
+          req,
           (ev) => {
             if (ev.event === "progress") {
               const m =
@@ -245,10 +259,12 @@
         // the newly-registered profile.
         await Promise.all([refreshVectorList(), refreshPacks()]);
         dismissToast(toastId);
-        pushToast(`extracted ${result.canonical}`, { kind: "info" });
+        const past = opts.force ? "re-extracted" : "extracted";
+        pushToast(`${past} ${result.canonical}`, { kind: "info" });
       } catch (e) {
         dismissToast(toastId);
-        pushToast(`extract '${name}' failed — ${describeError(e)}`, {
+        const verbed = opts.force ? "re-extract" : "extract";
+        pushToast(`${verbed} '${name}' failed — ${describeError(e)}`, {
           kind: "error",
           ttlMs: null,
         });
@@ -302,6 +318,34 @@
 
   function gotoCustom(): void {
     openDrawer("extract", { seed_a: query.trim() || undefined });
+  }
+
+  /** Toggle the per-row inspect body.  Light by design — the deep
+   *  diagnostics + layer-norms view lives one click further in via the
+   *  LayerNormsDrawer, matching ManifoldDrawer's "ⓘ + drill-down"
+   *  split. */
+  function toggleInspect(row: LocalPackInfo): void {
+    const key = rowKey(row);
+    if (inspectKeys.has(key)) inspectKeys.delete(key);
+    else inspectKeys.add(key);
+  }
+
+  /** Open the layer-norms drawer pre-selected on this concept.  Used
+   *  by the inspect body's "show layer norms →" link as the bridge
+   *  from the cheap inline panel to the heavier per-layer diagnostics
+   *  view. */
+  function gotoLayerNorms(row: LocalPackInfo): void {
+    openDrawer("layer_norms", { name: row.name });
+  }
+
+  /** Tensor-models field is a loose pass-through on LocalPackInfo —
+   *  returns the list of safe-model-id stems this concept is extracted
+   *  for.  We surface it in the inspect body so the user sees which
+   *  other models the tensor is available on. */
+  function tensorModels(row: LocalPackInfo): string[] {
+    const raw = (row as { tensor_models?: unknown }).tensor_models;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((m): m is string => typeof m === "string");
   }
 </script>
 
@@ -386,44 +430,88 @@
                     {@const poles = polesOf(row.name)}
                     {@const mono = poles.negative === null}
                     {@const confirming = confirmKeys.has(sel)}
+                    {@const inspecting = inspectKeys.has(sel)}
+                    {@const models = tensorModels(row)}
                     <li class="row" title={row.description || sel}>
-                      <span class="concept">
-                        {#if !mono}
-                          <span class="pole neg">{poles.negative}</span>
-                          <span class="axis-sep" aria-hidden="true">↔</span>
-                        {/if}
-                        <span class="pole pos">{poles.positive}</span>
-                      </span>
-                      <div class="actions">
-                        <button
-                          type="button"
-                          class="act steer"
-                          disabled={inFlight || inRack}
-                          onclick={() => void onSteer(row)}
-                          title={inRack
-                            ? `${sel} is already in the steering rack — remove via the rack strip's ✕`
-                            : `steer ${sel} at α ${recommendedAlpha(row).toFixed(2)}`}
-                        >+steer</button>
-                        <button
-                          type="button"
-                          class="act probe"
-                          disabled={inFlight || active}
-                          onclick={() => void onProbe(row)}
-                          title={active
-                            ? `${sel} is already an active probe — remove via the probe strip's ✕`
-                            : `activate probe ${sel}`}
-                        >+probe</button>
-                        <button
-                          type="button"
-                          class="act del"
-                          class:confirm={confirming}
-                          disabled={inFlight}
-                          onclick={() => onDeleteClick(row)}
-                          title={confirming
-                            ? "click again to confirm"
-                            : `delete ${sel}`}
-                        >{confirming ? "confirm?" : "delete"}</button>
+                      <div class="row-line">
+                        <span class="concept">
+                          {#if !mono}
+                            <span class="pole neg">{poles.negative}</span>
+                            <span class="axis-sep" aria-hidden="true">↔</span>
+                          {/if}
+                          <span class="pole pos">{poles.positive}</span>
+                        </span>
+                        <div class="actions">
+                          <button
+                            type="button"
+                            class="act inspect"
+                            aria-expanded={inspecting}
+                            onclick={() => toggleInspect(row)}
+                            title={inspecting ? "hide details" : "inspect pack metadata"}
+                          >{inspecting ? "▾" : "ⓘ"}</button>
+                          <button
+                            type="button"
+                            class="act steer"
+                            disabled={inFlight || inRack}
+                            onclick={() => void onSteer(row)}
+                            title={inRack
+                              ? `${sel} is already in the steering rack — remove via the rack strip's ✕`
+                              : `steer ${sel} at α ${recommendedAlpha(row).toFixed(2)}`}
+                          >+steer</button>
+                          <button
+                            type="button"
+                            class="act probe"
+                            disabled={inFlight || active}
+                            onclick={() => void onProbe(row)}
+                            title={active
+                              ? `${sel} is already an active probe — remove via the probe strip's ✕`
+                              : `activate probe ${sel}`}
+                          >+probe</button>
+                          <button
+                            type="button"
+                            class="act refit"
+                            disabled={inFlight}
+                            onclick={() => onExtract(row, { force: true })}
+                            title={`re-extract ${sel} for the current model (bypass tensor cache)`}
+                          >{inFlight ? "…" : "re-extract"}</button>
+                          <button
+                            type="button"
+                            class="act del"
+                            class:confirm={confirming}
+                            disabled={inFlight}
+                            onclick={() => onDeleteClick(row)}
+                            title={confirming
+                              ? "click again to confirm"
+                              : `delete ${sel}`}
+                          >{confirming ? "confirm?" : "delete"}</button>
+                        </div>
                       </div>
+                      {#if inspecting}
+                        <div class="inspect-body">
+                          <dl class="meta-list">
+                            <dt>description</dt>
+                            <dd>{row.description || "—"}</dd>
+                            <dt>source</dt>
+                            <dd>{row.source}</dd>
+                            <dt>recommended α</dt>
+                            <dd>{recommendedAlpha(row).toFixed(2)}</dd>
+                            {#if row.tags && row.tags.length > 0}
+                              <dt>tags</dt>
+                              <dd>{row.tags.join(", ")}</dd>
+                            {/if}
+                            {#if models.length > 0}
+                              <dt>tensor models</dt>
+                              <dd class="model-list">{models.join(", ")}</dd>
+                            {/if}
+                          </dl>
+                          <button
+                            type="button"
+                            class="deep-link"
+                            onclick={() => gotoLayerNorms(row)}
+                            title="open the per-layer ||baked|| histogram + extraction diagnostics"
+                          >show layer norms →</button>
+                        </div>
+                      {/if}
                     </li>
                   {/each}
                 </ul>
@@ -464,31 +552,33 @@
                     {@const mono = poles.negative === null}
                     {@const confirming = confirmKeys.has(sel)}
                     <li class="row" title={row.description || sel}>
-                      <span class="concept">
-                        {#if !mono}
-                          <span class="pole neg">{poles.negative}</span>
-                          <span class="axis-sep" aria-hidden="true">↔</span>
-                        {/if}
-                        <span class="pole pos">{poles.positive}</span>
-                      </span>
-                      <div class="actions">
-                        <button
-                          type="button"
-                          class="act extract"
-                          disabled={inFlight}
-                          onclick={() => onExtract(row)}
-                          title={`extract ${sel} for the current model`}
-                        >{inFlight ? "…" : "extract"}</button>
-                        <button
-                          type="button"
-                          class="act del"
-                          class:confirm={confirming}
-                          disabled={inFlight}
-                          onclick={() => onDeleteClick(row)}
-                          title={confirming
-                            ? "click again to confirm"
-                            : `delete ${sel}`}
-                        >{confirming ? "confirm?" : "delete"}</button>
+                      <div class="row-line">
+                        <span class="concept">
+                          {#if !mono}
+                            <span class="pole neg">{poles.negative}</span>
+                            <span class="axis-sep" aria-hidden="true">↔</span>
+                          {/if}
+                          <span class="pole pos">{poles.positive}</span>
+                        </span>
+                        <div class="actions">
+                          <button
+                            type="button"
+                            class="act extract"
+                            disabled={inFlight}
+                            onclick={() => onExtract(row)}
+                            title={`extract ${sel} for the current model`}
+                          >{inFlight ? "…" : "extract"}</button>
+                          <button
+                            type="button"
+                            class="act del"
+                            class:confirm={confirming}
+                            disabled={inFlight}
+                            onclick={() => onDeleteClick(row)}
+                            title={confirming
+                              ? "click again to confirm"
+                              : `delete ${sel}`}
+                          >{confirming ? "confirm?" : "delete"}</button>
+                        </div>
                       </div>
                     </li>
                   {/each}
@@ -726,10 +816,9 @@
     gap: var(--space-2);
   }
   .row {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    align-items: center;
-    gap: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
     background: var(--bg-deep);
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -740,6 +829,15 @@
   }
   .row:hover {
     border-color: var(--accent);
+  }
+  /* Top line of a row — keeps the historical concept-on-left,
+   * actions-on-right shape so existing rows look unchanged when the
+   * inspect body is collapsed. */
+  .row-line {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: var(--space-3);
   }
   .concept {
     display: inline-flex;
@@ -792,12 +890,22 @@
     opacity: 0.45;
     cursor: not-allowed;
   }
-  .act.extract {
+  .act.extract,
+  .act.refit {
     color: var(--accent);
     border-color: var(--border);
   }
-  .act.extract:hover:not(:disabled) {
+  .act.extract:hover:not(:disabled),
+  .act.refit:hover:not(:disabled) {
     background: var(--accent-subtle);
+    border-color: var(--accent);
+  }
+  .act.inspect {
+    color: var(--fg-dim);
+    min-width: 2.2em;
+  }
+  .act.inspect:hover:not(:disabled) {
+    color: var(--accent);
     border-color: var(--accent);
   }
   .act.del:hover:not(:disabled) {
@@ -808,5 +916,53 @@
     color: var(--accent-red);
     border-color: var(--accent-red);
     background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+  }
+
+  /* ---- inspect body ---- */
+  .inspect-body {
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .meta-list {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: var(--space-4);
+    row-gap: var(--space-1);
+    font-size: var(--text-xs);
+  }
+  .meta-list dt {
+    color: var(--fg-muted);
+    text-transform: lowercase;
+  }
+  .meta-list dd {
+    margin: 0;
+    color: var(--fg-strong);
+    word-break: break-word;
+  }
+  .meta-list dd.model-list {
+    color: var(--fg-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .deep-link {
+    align-self: flex-start;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-3);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    transition: border-color var(--dur) var(--ease-out),
+      background var(--dur) var(--ease-out);
+  }
+  .deep-link:hover {
+    border-color: var(--accent);
+    background: var(--accent-subtle);
   }
 </style>

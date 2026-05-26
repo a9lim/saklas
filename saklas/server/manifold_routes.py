@@ -179,6 +179,35 @@ def _intrinsic_dim(spec: dict[str, Any]) -> int:
         return 0
 
 
+def _resolve_intrinsic_dim(mf: ManifoldFolder, session_stem: str) -> tuple[int, dict[str, Any]]:
+    """Resolve the manifold's intrinsic dimension + effective domain spec.
+
+    Authored folders carry the domain inline on ``manifold.json``; the
+    answer is just ``_intrinsic_dim(mf.domain)`` and ``mf.domain`` itself.
+
+    Discover folders carry an empty top-level ``domain`` — the real
+    ``CustomDomain(picked_k)`` is materialized at fit time and lives on
+    the per-model sidecar.  When a fit exists for the loaded model we
+    read the sidecar's ``domain`` so the wire reports the actual dim
+    (otherwise the webui's manifold strip renders zero controls on an
+    otherwise-fitted persona manifold).
+
+    Returns ``(intrinsic_dim, domain_spec)``.  When no fit is available
+    on a discover folder we still report 0 / ``{}`` — the strip's
+    "unfitted" warning covers that state.
+    """
+    n = _intrinsic_dim(mf.domain)
+    if n > 0:
+        return n, mf.domain
+    if mf.is_discover and session_stem in mf.tensor_models():
+        try:
+            sc_domain = mf.sidecar(session_stem).domain
+            return _intrinsic_dim(sc_domain), sc_domain
+        except (KeyError, ManifoldFormatError):
+            pass
+    return 0, mf.domain
+
+
 def _manifold_json(
     namespace: str,
     mf: ManifoldFolder,
@@ -191,10 +220,10 @@ def _manifold_json(
     ``full`` adds per-node statements and per-tensor fit detail — the
     list route omits both to stay light.
     """
-    n = _intrinsic_dim(mf.domain)
     session_stem = safe_model_id(session.model_id)
     fitted_models = mf.tensor_models()
     fitted_for_session = session_stem in fitted_models
+    n, effective_domain = _resolve_intrinsic_dim(mf, session_stem)
 
     stale = False
     if fitted_for_session:
@@ -211,17 +240,47 @@ def _manifold_json(
     node_roles_padded = list(mf.node_roles) + [None] * (
         len(mf.node_labels) - len(mf.node_roles)
     )
+
+    # For fitted discover folders the derived per-model coords live in
+    # the safetensors, not on the folder.  Load them once and share
+    # between the list-level ``node_coords`` field and the detail-level
+    # ``nodes`` block — the list shape needs them so the manifold rack
+    # strip's snap-to-node action can sync the position sliders to the
+    # picked node's actual coords (otherwise label-form selections show
+    # zeros on every axis).  Cheap (one safetensors header read).
+    derived_coords: list[list[float]] = []
+    if fitted_for_session and mf.is_discover:
+        from saklas.core.manifold import load_manifold
+        try:
+            m = load_manifold(mf.tensor_path(session_stem))
+            derived_coords = [
+                [float(x) for x in row]
+                for row in m.node_coords.tolist()
+            ]
+        except (FileNotFoundError, KeyError, ValueError):
+            derived_coords = []
+
+    if mf.is_discover:
+        node_coords_wire = derived_coords
+    else:
+        node_coords_wire = [list(c) for c in mf.node_coords]
+
     out: dict[str, Any] = {
         "namespace": namespace,
         "name": mf.name,
         "description": mf.description,
-        "domain": mf.domain,
-        "domain_label": _domain_label(mf.domain),
+        # ``domain`` is the effective spec the frontend needs to render
+        # controls — for an unfitted discover folder this stays the
+        # empty ``{}`` from ``manifold.json``; for a fitted one we
+        # surface the materialized ``CustomDomain(picked_k)`` spec so
+        # the rack strip can build N sliders.
+        "domain": effective_domain,
+        "domain_label": _domain_label(effective_domain) if effective_domain else _domain_label(mf.domain),
         "intrinsic_dim": n,
         "min_nodes": min_nodes(n) if n > 0 else None,
         "node_count": len(mf.node_labels),
         "node_labels": list(mf.node_labels),
-        "node_coords": [list(c) for c in mf.node_coords],
+        "node_coords": node_coords_wire,
         "node_roles": node_roles_padded,
         "fit_mode": mf.fit_mode,
         "hyperparams": dict(mf.hyperparams),
@@ -245,24 +304,8 @@ def _manifold_json(
                 )
             ]
         else:
-            # Discover: no per-node coords in the folder; if a fit is
-            # present for this session's model, include the derived
-            # coords from the sidecar so the inspector can render the
-            # layout.
-            derived_coords: list[list[float]] = []
-            if fitted_for_session:
-                # The per-model safetensors carries the derived
-                # ``node_coords`` tensor for discover fits; load it on
-                # demand.  Cheap (one safetensors header read).
-                from saklas.core.manifold import load_manifold
-                try:
-                    m = load_manifold(mf.tensor_path(session_stem))
-                    derived_coords = [
-                        [float(x) for x in row]
-                        for row in m.node_coords.tolist()
-                    ]
-                except (FileNotFoundError, KeyError, ValueError):
-                    derived_coords = []
+            # Discover: nodes carry the derived per-model coords loaded
+            # above (or ``None`` per node when no fit exists yet).
             out["nodes"] = [
                 {
                     "label": label,
