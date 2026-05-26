@@ -1218,16 +1218,17 @@ class SaklasSession:
     ) -> list[str]:
         """Ask the generator for ``n`` broad situational domains shared across the axis.
 
-        Each domain is 2–6 words, broad enough to contain many specific
-        moments, shared across both poles so within-pair variance stays
-        pure-pole while cross-pair variance is domain-diverse.
+        Uses the same slim concept-list prompt as the inline scenario
+        path in :meth:`generate_statements` — for a bipolar axis the
+        two poles ride as a two-concept list; for a monopolar concept
+        the second slot is humanized to "the opposite of <concept>"
+        (mirroring how :class:`ExtractionPipeline` handles monopolar
+        downstream).
 
-        The anti-allegory clause ("do not force human-social framing
-        onto concepts that aren't about humans") is load-bearing for
-        non-human concepts (deer/wolf, brick/feather) — without it
-        the model defaults its pool to workplace/relationship
-        situations and extracted vectors read everything as
-        allegorical human-person statements.
+        The "literal concept" anchor is the load-bearing piece for
+        non-human axes (deer/wolf, brick/feather) — without it the
+        model defaults to workplace/relationship framing and extracted
+        vectors read everything as human-social allegory.
 
         Pure function, no disk side effects. Callers that want
         persistence (``extract()``) write the result to scenarios.json
@@ -1240,38 +1241,19 @@ class SaklasSession:
         # intelligence") so the generator treats the axis as the
         # underlying phrase rather than a literal token.
         concept_h = _humanize_concept(concept)
-        baseline_h = _humanize_concept(baseline) if baseline is not None else None
-        if baseline_h is not None:
-            axis_phrase = f'"{concept_h}" vs "{baseline_h}"'
-            poles_line = (
-                f'Both "{concept_h}" and "{baseline_h}" should have natural, '
-                f'distinct responses within every domain you list.'
-            )
+        if baseline is not None:
+            baseline_h = _humanize_concept(baseline)
         else:
-            axis_phrase = f'"{concept_h}" vs its semantic opposite'
-            poles_line = (
-                f'Both "{concept_h}" and its semantic opposite should have '
-                f'natural, distinct responses within every domain you list.'
-            )
+            # Mirrors ExtractionPipeline's monopolar negative slot —
+            # humanizes to "the opposite of <concept>".
+            baseline_h = f"the opposite of {concept_h}"
+        concept_list_str = f'"{concept_h}", "{baseline_h}"'
         prompt = (
-            f"For the axis {axis_phrase}, list exactly {n} broad "
-            f"situational domains where the axis naturally expresses "
-            f"itself.\n\n"
-            f"A domain is a *category of experience*, not a specific "
-            f"scenario. It should be 2 to 6 words, concrete enough to "
-            f"be evocative, broad enough to contain many specific "
-            f"situations. Cover the full range of contexts where the "
-            f"axis lives — internal states, social or relational "
-            f"contact, physical environment, routine moments, high-"
-            f"stakes moments — whatever is natural to the axis itself. "
-            f"Do not force human-social framing onto concepts that "
-            f"aren't about humans.\n\n"
-            f"{poles_line}\n\n"
-            f"The {n} domains together should span the axis without "
-            f"overlap. No meta-commentary, no explanations, no sub-"
-            f"bullets.\n\n"
-            f"Format: number, period, then the domain name. Nothing "
-            f"else.\n\n"
+            f"Concepts: {concept_list_str}.\n\n"
+            f"List {n} varied, distinctive situational domains. Every "
+            f"literal concept should have a distinct perspective on "
+            f"each domain. List only the domains.\n\n"
+            f"Format:\n"
             f"1. [domain]\n"
             f"2. [domain]\n"
             f"...\n"
