@@ -1560,28 +1560,31 @@ class SaklasSession:
                             f"for '{h}'..."
                         )
                     if len(concepts) == 1:
-                        # Neutrals: no concept anchor in the prompt so
-                        # the model writes from its default first-person
-                        # voice.  ``stated plainly`` biases toward
-                        # observational register rather than reflective
-                        # / affect-laden.  Tried ``neutral`` as a
-                        # qualifier — the model interpreted that as
-                        # "moderate / balanced" and produced uniformly
-                        # mild-positive statements (its default voice).
-                        # ``stated plainly`` reads as "without
-                        # commentary" so the model describes the actual
-                        # domain reality — sometimes positive (a
-                        # pleasant walk), sometimes negative (rush-hour
-                        # stress), often factual — and the valences
-                        # cancel across the n=90 average, landing
-                        # mu_neutral closer to true center than the
-                        # uniformly-mild-positive ``neutral`` variant.
+                        # Neutrals: no concept anchor, no qualifier
+                        # nudging affect-register.  The principled
+                        # definition of ``mu_neutral`` is "where the
+                        # model sits when not pushed by a concept" —
+                        # engineering the prompt toward a theoretical
+                        # affect-zero point ("stated plainly" /
+                        # "neutral") substitutes a different artificial
+                        # baseline (the model's response to *being told*
+                        # to be neutral) for the genuine one (the
+                        # model's natural unmodified output).  Letting
+                        # the model speak naturally across diverse
+                        # domains and accepting that as the baseline is
+                        # the actual operational definition.  On
+                        # symmetric axes (happy.sad) any residual
+                        # default-voice tilt cancels in the contrastive
+                        # direction; on axes where the model's default
+                        # is concept-loaded (e.g. ai.human, where the
+                        # model IS the AI side), DLS is slightly biased
+                        # — but a qualifier wouldn't fix that since the
+                        # model would default-voice the same way anyway.
                         statement_prompt = (
                             f"Domain: {scenario}.\n\n"
                             f"Write {K} first-person statements about "
-                            f"this domain, stated plainly. Each "
-                            f"statement should be a rich and complete "
-                            f"sentence.\n\n"
+                            f"this domain. Each statement should be a "
+                            f"rich and complete sentence.\n\n"
                             f"Format:\n"
                             f"1. [statement]\n"
                             f"2. [statement]\n"
