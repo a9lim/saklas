@@ -43,15 +43,26 @@
       <div class="empty">
         <p class="empty-copy">
           Steering shapes how the model responds.
-          Add a concept to begin.
+          Add a vector or a manifold to begin.
         </p>
-        <button
-          type="button"
-          class="add-steering"
-          onclick={() => openDrawer("vectors")}
-        >
-          + add steering
-        </button>
+        <div class="empty-actions">
+          <button
+            type="button"
+            class="add-steering"
+            onclick={() => openDrawer("vectors")}
+            title="Browse the concept catalog or extract a custom vector"
+          >
+            + add steering
+          </button>
+          <button
+            type="button"
+            class="add-manifold"
+            onclick={() => openDrawer("manifolds")}
+            title="Rack a fitted steering manifold or build a new one"
+          >
+            + add manifold
+          </button>
+        </div>
       </div>
     {:else}
       {#each sortedEntries as [name, entry] (name)}
@@ -165,6 +176,14 @@
     line-height: 1.5;
     max-width: 28ch;
   }
+  /* Empty-state stacks the two entry points vertically so the manifold
+   * launcher reads as the second way in, not buried in an actions row. */
+  .empty-actions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: 14em;
+  }
 
   /* Anchored at the bottom of the rack.  Border-top mirrors the probe
    * rack's actions row for visual symmetry. */
@@ -193,9 +212,9 @@
   .actions .add-steering {
     flex: 1 1 0;
   }
-  .empty .add-steering {
-    width: auto;
-    min-width: 14em;
+  .empty-actions .add-steering,
+  .empty-actions .add-manifold {
+    width: 100%;
   }
   .add-steering:hover {
     background: var(--accent-glow);

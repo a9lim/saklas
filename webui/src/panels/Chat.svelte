@@ -67,6 +67,8 @@
     surpriseScore,
     SURPRISE_TARGET,
   } from "../lib/tokens";
+  import Select from "../lib/Select.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
 
   // --------------------------------------------------------------- input --
 
@@ -378,19 +380,47 @@
    * the live probe-rack — same source the ProbeRack panel uses. */
   const probeNames = $derived([...probeRack.active]);
 
-  function onHighlightChange(ev: Event): void {
-    const value = (ev.currentTarget as HTMLSelectElement).value;
+  function onHighlightChange(value: string): void {
     setHighlightTarget(value === "" ? null : value);
   }
 
-  function onCompareChange(ev: Event): void {
-    const value = (ev.currentTarget as HTMLSelectElement).value;
+  function onCompareChange(value: string): void {
     setCompareTarget(value === "" ? null : value);
   }
 
   function onCompareToggle(): void {
     toggleCompareTwo();
   }
+
+  /** Highlight-target picker options: "(off)" + surprise sentinel + live
+   *  probe names. */
+  const highlightOptions = $derived.by<{ value: string; label: string }[]>(
+    () => {
+      const opts: { value: string; label: string }[] = [
+        { value: "", label: "(off)" },
+        { value: SURPRISE_TARGET, label: "surprise (logprob)" },
+      ];
+      for (const name of probeNames) opts.push({ value: name, label: name });
+      return opts;
+    },
+  );
+
+  /** Compare-target picker — same shape but filtered so the A and B
+   *  targets don't pick the same probe. */
+  const compareOptions = $derived.by<{ value: string; label: string }[]>(() => {
+    const opts: { value: string; label: string }[] = [
+      { value: "", label: "(off)" },
+    ];
+    if (highlightState.target !== SURPRISE_TARGET) {
+      opts.push({ value: SURPRISE_TARGET, label: "surprise (logprob)" });
+    }
+    for (const name of probeNames) {
+      if (name !== highlightState.target) {
+        opts.push({ value: name, label: name });
+      }
+    }
+    return opts;
+  });
 
   // -------------------------------------------------- conversation actions --
   //
@@ -474,10 +504,8 @@
   // fan-out used to sit here too — both were redundant (the loom right-
   // click menu carries "regenerate…" and "fan out…", and the experiment
   // lab is one click away in the analysis menu) so they were removed.
-  function onAutoRegenModeChange(ev: Event): void {
-    setAutoRegenMode(
-      (ev.currentTarget as HTMLSelectElement).value as AutoRegenMode,
-    );
+  function onAutoRegenModeChange(v: AutoRegenMode): void {
+    setAutoRegenMode(v);
   }
 
   // ------------------------------------------------------------- A/B split --
@@ -817,56 +845,44 @@
   <header class="chat-header">
     <label class="ctl">
       <span class="ctl-label">highlight</span>
-      <select
-        class="ctl-select"
-        value={highlightState.target ?? ""}
-        onchange={onHighlightChange}
-        aria-label="Highlight probe"
-      >
-        <option value="">(off)</option>
-        <!-- Logit-pass: ``surprise`` tints tokens by ``-logprob /
-             (1 - logprob)`` per Decision 4.  Sentinel value sits next to
-             real probe names in the same picker so a single dropdown
-             covers both axes. -->
-        <option value={SURPRISE_TARGET}>surprise (logprob)</option>
-        {#each probeNames as name (name)}
-          <option value={name}>{name}</option>
-        {/each}
-      </select>
+      <!-- Logit-pass: ``surprise`` tints tokens by ``-logprob /
+           (1 - logprob)`` per Decision 4.  Sentinel value sits next to
+           real probe names in the same picker so a single dropdown
+           covers both axes. -->
+      <span class="ctl-select">
+        <Select
+          value={highlightState.target ?? ""}
+          options={highlightOptions}
+          onchange={onHighlightChange}
+          ariaLabel="Highlight probe"
+        />
+      </span>
     </label>
 
-    <label class="ctl ctl-inline">
-      <input
-        type="checkbox"
+    <span class="ctl ctl-inline">
+      <Checkbox
         checked={highlightState.compareTwo}
         onchange={onCompareToggle}
+        ariaLabel="compare-two"
       />
       <span class="ctl-label">compare-two</span>
-    </label>
+    </span>
 
     {#if highlightState.compareTwo}
       <label class="ctl">
         <span class="ctl-label">vs.</span>
-        <select
-          class="ctl-select"
-          value={highlightState.compareTarget ?? ""}
-          onchange={onCompareChange}
-          disabled={!highlightState.compareTwo}
-          aria-label="Compare probe"
-        >
-          <option value="">(off)</option>
-          <!-- Allow surprise as the B-stripe target too — "probe X vs.
-               surprise" is a useful axis ("does probe X light up at the
-               surprising tokens?"). -->
-          {#if highlightState.target !== SURPRISE_TARGET}
-            <option value={SURPRISE_TARGET}>surprise (logprob)</option>
-          {/if}
-          {#each probeNames as name (name)}
-            {#if name !== highlightState.target}
-              <option value={name}>{name}</option>
-            {/if}
-          {/each}
-        </select>
+        <!-- Allow surprise as the B-stripe target too — "probe X vs.
+             surprise" is a useful axis ("does probe X light up at the
+             surprising tokens?"). -->
+        <span class="ctl-select">
+          <Select
+            value={highlightState.compareTarget ?? ""}
+            options={compareOptions}
+            onchange={onCompareChange}
+            disabled={!highlightState.compareTwo}
+            ariaLabel="Compare probe"
+          />
+        </span>
       </label>
     {/if}
 
@@ -910,25 +926,23 @@
       <button type="button" class="hbtn" onclick={openTranscript}>
         transcript…
       </button>
-      <label class="ctl ctl-inline">
-        <input
-          type="checkbox"
+      <span class="ctl ctl-inline">
+        <Checkbox
           checked={autoRegenState.enabled}
           onchange={toggleAutoRegen}
+          ariaLabel="auto-regen"
         />
         <span class="ctl-label">auto-regen</span>
-      </label>
+      </span>
       {#if autoRegenState.enabled}
-        <select
-          class="ctl-select"
-          value={autoRegenState.mode}
-          onchange={onAutoRegenModeChange}
-          aria-label="Auto-regen mode"
-        >
-          {#each AUTO_REGEN_MODES as opt (opt.value)}
-            <option value={opt.value}>{opt.label}</option>
-          {/each}
-        </select>
+        <span class="ctl-select">
+          <Select
+            value={autoRegenState.mode}
+            options={AUTO_REGEN_MODES}
+            onchange={onAutoRegenModeChange}
+            ariaLabel="Auto-regen mode"
+          />
+        </span>
         {#if autoRegenState.mode === "custom"}
           <input
             type="text"
@@ -1160,25 +1174,15 @@
     cursor: pointer;
     user-select: none;
   }
-  .ctl-inline input {
-    accent-color: var(--accent);
-  }
   .ctl-label {
     color: var(--fg-muted);
     text-transform: lowercase;
     letter-spacing: 0;
   }
+  /* Layout host for the themed Select — Select owns its own theme. */
   .ctl-select {
-    background: var(--bg-alt);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-3);
-    font: inherit;
-    font-family: var(--font-mono);
-  }
-  .ctl-select:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+    display: inline-flex;
+    min-width: 9em;
   }
 
   /* Render-mode badge — compact raw/chat pill.  Sits between the

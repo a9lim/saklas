@@ -29,6 +29,11 @@
     updateToast,
   } from "../lib/stores/toasts.svelte";
   import type { ExtractRequest, StatementPair } from "../lib/types";
+  import Radio from "../lib/Radio.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
+  import ModeTabs from "../lib/builder/ModeTabs.svelte";
+  import AdvancedSection from "../lib/builder/AdvancedSection.svelte";
+  import ValidationBlock from "../lib/builder/ValidationBlock.svelte";
 
   interface ExtractParams {
     /** Optional pre-fill for concept A — seeded when the vectors
@@ -59,6 +64,12 @@
   // the server uses (``[a-z0-9._-]+``); a non-empty role with
   // ``sae`` set is refused at submit time (engine-mutually-exclusive).
   let role = $state("");
+  // Destination namespace + force-overwrite.  Parity with the manifold
+  // builder's identity-block controls; both live in Advanced because
+  // the defaults (``local`` / no-overwrite) are what 90% of users
+  // want — the controls are escape hatches.
+  let namespace = $state("local");
+  let force = $state(false);
   let errorMsg: string | null = $state(null);
 
   const roleTrim = $derived(role.trim());
@@ -243,6 +254,11 @@
     const saeTrim = sae.trim();
     if (saeTrim) req.sae = saeTrim;
     if (roleTrim) req.role = roleTrim;
+    const namespaceTrim = namespace.trim();
+    if (namespaceTrim && namespaceTrim !== "local") {
+      req.namespace = namespaceTrim;
+    }
+    if (force) req.force = true;
 
     // Source resolution:
     //   * custom mode, or poles mode where the user generated and
@@ -272,32 +288,22 @@
   }
 </script>
 
-<section class="drawer-shell" aria-label="Custom vector extraction">
+<section class="drawer-shell" aria-label="Extract vector">
   <header class="header">
-    <span class="title">custom vector</span>
+    <span class="title">extract vector</span>
     <button type="button" class="close" aria-label="Close" onclick={cancel}
       >✕</button>
   </header>
 
   <div class="body">
-    <div class="mode-switch" role="tablist" aria-label="Input mode">
-      <button
-        type="button"
-        role="tab"
-        class="mode-btn"
-        class:active={inputMode === "poles"}
-        aria-selected={inputMode === "poles"}
-        onclick={() => (inputMode = "poles")}
-      >poles</button>
-      <button
-        type="button"
-        role="tab"
-        class="mode-btn"
-        class:active={inputMode === "custom"}
-        aria-selected={inputMode === "custom"}
-        onclick={() => (inputMode = "custom")}
-      >custom statements</button>
-    </div>
+    <ModeTabs
+      bind:value={inputMode}
+      tabs={[
+        { value: "poles", label: "auto-generated" },
+        { value: "custom", label: "custom statements" },
+      ]}
+      ariaLabel="Input mode"
+    />
 
     <p class="hint">
       {#if inputMode === "poles"}
@@ -421,79 +427,97 @@
         </section>
       {/if}
 
-      <section class="advanced" class:open={advancedOpen}>
-        <button
-          type="button"
-          class="advanced-header"
-          aria-expanded={advancedOpen}
-          onclick={() => (advancedOpen = !advancedOpen)}
-        >
-          <span class="caret" aria-hidden="true"
-            >{advancedOpen ? "▾" : "▸"}</span>
-          <span class="advanced-name">Advanced options</span>
-        </button>
+      <AdvancedSection bind:expanded={advancedOpen}>
+        <fieldset class="field method">
+          <legend class="label">method</legend>
+          <span class="radio">
+            <Radio
+              bind:group={method}
+              value="dim"
+              label="difference-of-means"
+            />
+          </span>
+          <span class="radio">
+            <Radio
+              bind:group={method}
+              value="pca"
+              label="contrastive PCA"
+            />
+          </span>
+        </fieldset>
 
-        {#if advancedOpen}
-          <div class="advanced-body">
-            <fieldset class="field method">
-              <legend class="label">method</legend>
-              <label class="radio">
-                <input type="radio" bind:group={method} value="dim" />
-                <span>difference-of-means</span>
-              </label>
-              <label class="radio">
-                <input type="radio" bind:group={method} value="pca" />
-                <span>contrastive PCA</span>
-              </label>
-            </fieldset>
+        <label class="field">
+          <span class="label"
+            >SAE release <span class="opt">optional</span></span>
+          <input
+            type="text"
+            class="input"
+            bind:value={sae}
+            placeholder="e.g. gemma-scope-2b-pt-res"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
 
-            <label class="field">
-              <span class="label"
-                >SAE release <span class="opt">optional</span></span>
-              <input
-                type="text"
-                class="input"
-                bind:value={sae}
-                placeholder="e.g. gemma-scope-2b-pt-res"
-                autocomplete="off"
-                spellcheck="false"
-              />
-            </label>
+        <label class="field">
+          <span class="label">
+            role <span class="opt">optional — role-augmented extraction</span>
+          </span>
+          <input
+            type="text"
+            class="input"
+            bind:value={role}
+            placeholder="e.g. pirate — replaces the assistant-role label"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="field-hint">
+            Renders contrastive pairs with the chat template's
+            assistant role substituted by this slug, and re-applies
+            the substitution at steer time so baselines match.
+            Steer the result with the matching <code>:role-{
+              roleTrim || "&lt;slug&gt;"
+            }</code> variant. Mistral-3 / talkie families don't
+            support role substitution.
+          </span>
+        </label>
 
-            <label class="field">
-              <span class="label">
-                role <span class="opt">optional — role-augmented extraction</span>
-              </span>
-              <input
-                type="text"
-                class="input"
-                bind:value={role}
-                placeholder="e.g. pirate — replaces the assistant-role label"
-                autocomplete="off"
-                spellcheck="false"
-              />
-              <span class="field-hint">
-                Renders contrastive pairs with the chat template's
-                assistant role substituted by this slug, and re-applies
-                the substitution at steer time so baselines match.
-                Steer the result with the matching <code>:role-{
-                  roleTrim || "&lt;slug&gt;"
-                }</code> variant. Mistral-3 / talkie families don't
-                support role substitution.
-              </span>
-            </label>
+        <label class="field">
+          <span class="label">
+            namespace <span class="opt">optional — default "local"</span>
+          </span>
+          <input
+            type="text"
+            class="input"
+            bind:value={namespace}
+            placeholder="local"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="field-hint">
+            Destination folder under <code>~/.saklas/vectors/</code>.
+            Parallel to the manifold builder's namespace control.
+          </span>
+        </label>
 
-            <label class="check">
-              <input type="checkbox" bind:checked={dls} />
-              <span>centered DLS layer selection</span>
-            </label>
-          </div>
-        {/if}
-      </section>
+        <span class="check">
+          <Checkbox
+            bind:checked={dls}
+            label="centered DLS layer selection"
+          />
+        </span>
+        <span class="check">
+          <Checkbox
+            bind:checked={force}
+            label="overwrite an existing vector with this name"
+          />
+        </span>
+      </AdvancedSection>
 
-      {#if !valid.ok}
-        <p class="validation">{valid.reason}</p>
-      {/if}
+      <ValidationBlock
+        verb="extract"
+        messages={valid.ok ? [] : [valid.reason]}
+      />
 
       <button type="submit" class="extract-btn" disabled={!valid.ok}>
         extract → return to vectors
@@ -612,47 +636,6 @@
     border-radius: var(--radius);
   }
 
-  .advanced {
-    border-top: 1px solid var(--border);
-    padding-top: var(--space-3);
-    display: flex;
-    flex-direction: column;
-  }
-  .advanced-header {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    width: 100%;
-    text-align: left;
-    background: transparent;
-    border: 0;
-    padding: var(--space-2) var(--space-1);
-    color: var(--fg-muted);
-    cursor: pointer;
-    transition: color var(--dur) var(--ease-out);
-  }
-  .advanced-header:hover {
-    color: var(--fg-strong);
-  }
-  .advanced.open .advanced-name {
-    color: var(--accent);
-  }
-  .caret {
-    font-size: var(--text-xs);
-  }
-  .advanced-name {
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    font-size: var(--text-sm);
-    font-weight: var(--weight-medium);
-  }
-  .advanced-body {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-4);
-    padding: var(--space-3) var(--space-1) var(--space-1);
-  }
-
   .method {
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -674,17 +657,6 @@
     font-size: var(--text-sm);
     cursor: pointer;
   }
-  .radio input,
-  .check input {
-    accent-color: var(--accent);
-  }
-
-  .validation {
-    color: var(--accent-yellow);
-    font-size: var(--text-sm);
-    margin: 0;
-  }
-
   .field-hint {
     color: var(--fg-dim);
     font-size: var(--text-xs);
@@ -696,37 +668,6 @@
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius);
     font-family: var(--font-mono);
-  }
-
-  /* ---- input-mode switch ---- */
-  .mode-switch {
-    display: flex;
-    gap: var(--space-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-1);
-  }
-  .mode-btn {
-    flex: 1 1 0;
-    background: transparent;
-    color: var(--fg-dim);
-    border: 0;
-    border-radius: var(--radius);
-    padding: var(--space-2) var(--space-3);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    cursor: pointer;
-    transition:
-      background var(--dur) var(--ease-out),
-      color var(--dur) var(--ease-out);
-  }
-  .mode-btn:hover {
-    color: var(--fg-strong);
-  }
-  .mode-btn.active {
-    background: var(--accent-subtle);
-    color: var(--accent);
   }
 
   /* ---- preview button ---- */

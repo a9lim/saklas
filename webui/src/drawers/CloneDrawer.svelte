@@ -10,6 +10,7 @@
     addVectorToRack,
     closeDrawer,
   } from "../lib/stores.svelte";
+  import NumberInput from "../lib/NumberInput.svelte";
 
   // Drawer host forwards { params } — unused.
   let _drawerProps: { params?: unknown } = $props();
@@ -194,24 +195,26 @@
     <div class="row">
       <label class="field grow">
         <span class="label">n_pairs</span>
-        <input
-          type="number"
-          min="2"
-          step="1"
-          placeholder="90"
+        <NumberInput
           bind:value={nPairs}
+          min={2}
+          step={1}
+          placeholder="90"
+          allowEmpty
           disabled={running}
+          ariaLabel="n_pairs"
         />
       </label>
       <label class="field grow seed-field">
         <span class="label">seed</span>
         <div class="seed-row">
-          <input
-            type="number"
-            step="1"
-            placeholder="(random)"
+          <NumberInput
             bind:value={seed}
+            step={1}
+            placeholder="(random)"
+            allowEmpty
             disabled={running}
+            ariaLabel="seed"
           />
           <button
             type="button"
@@ -340,8 +343,7 @@
     font-style: normal;
     margin-left: var(--space-3);
   }
-  input[type="text"],
-  input[type="number"] {
+  input[type="text"] {
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);

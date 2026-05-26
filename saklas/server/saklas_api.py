@@ -89,6 +89,19 @@ class ExtractRequest(BaseModel):
     # substitutable role header (Qwen / Gemma / Llama / GLM / gpt-oss).
     # Mutually exclusive with ``sae`` at the engine layer.
     role: str | None = None
+    # Destination namespace for the extracted vector folder.  ``None``
+    # (default) lands the vector under ``~/.saklas/vectors/local/<canonical>/``
+    # — the historical behavior.  Any other namespace value relocates the
+    # folder to ``~/.saklas/vectors/<namespace>/<canonical>/``; parity
+    # with the manifold builder's namespace control.
+    namespace: str | None = None
+    # Force a fresh extraction even if a cached tensor / statements file
+    # exists at the destination.  Wires through to the engine's
+    # ``force_statements`` flag, which definitionally invalidates any
+    # tensor trained on the old pairs.  Default ``False`` keeps the
+    # cache-hit short-circuit (instant, no work).  Parity with the
+    # manifold builder's ``force`` overwrite control.
+    force: bool = False
     auto_register: bool = Field(True, alias="register")
 
     model_config = {"populate_by_name": True}
@@ -1653,6 +1666,8 @@ def register_saklas_routes(app: FastAPI) -> None:
                                 method=req.method,
                                 dls=req.dls,
                                 role=req.role,
+                                namespace=req.namespace,
+                                force_statements=req.force,
                             )
                             if req.auto_register:
                                 session.steer(req.name, profile)
@@ -1747,6 +1762,8 @@ def register_saklas_routes(app: FastAPI) -> None:
                 method=req.method,
                 dls=req.dls,
                 role=req.role,
+                namespace=req.namespace,
+                force_statements=req.force,
             )
             if req.auto_register:
                 session.steer(req.name, profile)

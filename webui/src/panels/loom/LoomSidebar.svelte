@@ -50,6 +50,8 @@
   import LoomEdge from "./LoomEdge.svelte";
   import WorkbenchCard from "../WorkbenchCard.svelte";
   import SamplingStrip from "../SamplingStrip.svelte";
+  import Select from "../../lib/Select.svelte";
+  import NumberInput from "../../lib/NumberInput.svelte";
   import type { LoomNodeJSON } from "../../lib/types";
 
   // ----------------------------------------- flat tree walk + depth --
@@ -376,7 +378,16 @@
     mode: "unsteered",
     error: "",
   });
-  let modalInput: HTMLInputElement | HTMLTextAreaElement | null = $state(null);
+  /** Focusable ref shared by every modal input variant — the regenerate
+   *  / regen_mode number-of-siblings field swaps in a themed
+   *  ``NumberInput`` which exposes a structurally-matching
+   *  ``focus()`` / ``select()`` pair, so the modal-open auto-focus
+   *  works regardless of which branch is rendered. */
+  type FocusableRef = {
+    focus: () => void;
+    select?: () => void;
+  };
+  let modalInput: FocusableRef | null = $state(null);
 
   async function openModal(
     kind: ModalState["kind"],
@@ -1104,12 +1115,13 @@
       {#if modal.kind === "regenerate"}
         <label>
           <span>N siblings</span>
-          <input
-            bind:this={modalInput as HTMLInputElement}
-            bind:value={modal.n}
-            type="number"
-            min="1"
-            max="16"
+          <NumberInput
+            bind:this={modalInput}
+            value={modal.n}
+            min={1}
+            max={16}
+            step={1}
+            oninput={(v) => { if (v !== null) modal.n = v; }}
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
@@ -1149,22 +1161,28 @@
       {:else if modal.kind === "regen_mode"}
         <label>
           <span>mode</span>
-          <select bind:value={modal.mode}>
-            <option value="unsteered">unsteered</option>
-            <option value="inverted">inverted</option>
-            <option value="reseed">reseed</option>
-            <option value="cool">cool</option>
-            <option value="hot">hot</option>
-          </select>
+          <Select
+            value={modal.mode ?? "unsteered"}
+            options={[
+              { value: "unsteered", label: "unsteered" },
+              { value: "inverted", label: "inverted" },
+              { value: "reseed", label: "reseed" },
+              { value: "cool", label: "cool" },
+              { value: "hot", label: "hot" },
+            ]}
+            onchange={(v) => { modal.mode = v; }}
+            ariaLabel="regen mode"
+          />
         </label>
         <label>
           <span>N siblings</span>
-          <input
-            bind:this={modalInput as HTMLInputElement}
-            bind:value={modal.n}
-            type="number"
-            min="1"
-            max="16"
+          <NumberInput
+            bind:this={modalInput}
+            value={modal.n}
+            min={1}
+            max={16}
+            step={1}
+            oninput={(v) => { if (v !== null) modal.n = v; }}
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>

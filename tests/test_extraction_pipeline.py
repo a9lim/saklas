@@ -94,9 +94,9 @@ class _StubHandle:
 
     # PackWriter surface -------------------------------------------------
 
-    def _local_concept_folder(self, canonical):
+    def _local_concept_folder(self, canonical, *, namespace="local"):
         from saklas.io.packs import PackMetadata
-        folder = self._tmp / "vectors" / "local" / canonical
+        folder = self._tmp / "vectors" / namespace / canonical
         folder.mkdir(parents=True, exist_ok=True)
         if not (folder / "pack.json").exists():
             PackMetadata(

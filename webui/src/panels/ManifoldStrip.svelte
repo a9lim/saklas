@@ -18,6 +18,7 @@
     removeManifoldFromRack,
   } from "../lib/stores.svelte";
   import Slider from "../lib/Slider.svelte";
+  import Select from "../lib/Select.svelte";
   import XYPad from "./manifold/XYPad.svelte";
 
   interface Props {
@@ -78,11 +79,21 @@
   // manifold's node list, which switches the term to label-form
   // (``persona%pirate``).  An empty selection clears the label binding
   // — the position becomes free-form, drag on the XYPad to author.
-  function onSnapToNode(ev: Event): void {
-    const t = ev.currentTarget as HTMLSelectElement;
-    const val = t.value;
+  function onSnapToNode(val: string): void {
     setManifoldLabel(name, val === "" ? null : val);
   }
+
+  /** Build the node-list option set, prefixed with the "(free position)"
+   *  escape hatch.  Recomputed reactively when ``info`` changes. */
+  const snapOptions = $derived.by<{ value: string; label: string }[]>(() => {
+    const labels = info?.node_labels ?? [];
+    const roles = info?.node_roles;
+    const opts = labels.map((nl, i) => {
+      const role = roles?.[i];
+      return { value: nl, label: nl + (role ? ` [role=${role}]` : "") };
+    });
+    return [{ value: "", label: "(free position)" }, ...opts];
+  });
 
   // A manifold needs a tensor for the loaded model to actually steer.
   const fitted = $derived(info?.fitted_for_session === true);
@@ -171,20 +182,15 @@
         {#if info.node_labels.length > 0}
           <label class="snap-row">
             <span class="snap-label">snap to node</span>
-            <select
-              class="snap-select"
-              value={entry.label ?? ""}
-              onchange={onSnapToNode}
-              title="pick a node to switch to label-form, or '(free)' to drag the pad"
-            >
-              <option value="">(free position)</option>
-              {#each info.node_labels as nl, i (nl)}
-                {@const role = info.node_roles?.[i]}
-                <option value={nl}>
-                  {nl}{role ? ` [role=${role}]` : ""}
-                </option>
-              {/each}
-            </select>
+            <span class="snap-select">
+              <Select
+                value={entry.label ?? ""}
+                options={snapOptions}
+                onchange={onSnapToNode}
+                ariaLabel="snap to node"
+                title="pick a node to switch to label-form, or '(free position)' to drag the pad"
+              />
+            </span>
           </label>
         {/if}
         <XYPad manifold={info} coords={entry.coords} onchange={onCoordsChange} />
@@ -355,19 +361,10 @@
     color: var(--fg-muted);
     flex: 0 0 auto;
   }
+  /* Layout host for the themed Select — Select owns its own theme. */
   .snap-select {
     flex: 1 1 auto;
-    background: var(--bg-deep);
-    color: var(--fg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-1) var(--space-2);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-  }
-  .snap-select:focus {
-    outline: none;
-    border-color: var(--accent-purple);
+    display: inline-flex;
   }
   .node-pill {
     background: color-mix(in srgb, var(--accent-purple) 14%, transparent);

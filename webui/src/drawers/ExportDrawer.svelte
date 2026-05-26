@@ -12,6 +12,7 @@
 
   import { chatLog, samplingState, closeDrawer } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
+  import Radio from "../lib/Radio.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -177,26 +178,8 @@
       </p>
 
       <div class="mode-row" role="radiogroup" aria-label="Format">
-        <label class="mode-opt">
-          <input
-            type="radio"
-            name="exp-fmt"
-            value="jsonl"
-            checked={format === "jsonl"}
-            onchange={() => (format = "jsonl")}
-          />
-          <span>JSONL</span>
-        </label>
-        <label class="mode-opt">
-          <input
-            type="radio"
-            name="exp-fmt"
-            value="csv"
-            checked={format === "csv"}
-            onchange={() => (format = "csv")}
-          />
-          <span>CSV</span>
-        </label>
+        <Radio bind:group={format} value="jsonl" label="JSONL" />
+        <Radio bind:group={format} value="csv" label="CSV" />
       </div>
 
       <label class="field">
@@ -311,14 +294,6 @@
   .mode-row {
     display: flex;
     gap: var(--space-6);
-  }
-  .mode-opt {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    color: var(--fg-strong);
-    font-size: var(--text-sm);
-    cursor: pointer;
   }
   .field {
     display: flex;

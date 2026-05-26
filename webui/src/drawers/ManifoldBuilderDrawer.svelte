@@ -29,10 +29,18 @@
   } from "../lib/stores/toasts.svelte";
   import type {
     AxisSpec,
+    CreateDiscoverManifoldRequest,
     CreateManifoldRequest,
     GenerateManifoldRequest,
     ManifoldDomain,
   } from "../lib/types";
+  import Select from "../lib/Select.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
+  import Radio from "../lib/Radio.svelte";
+  import NumberInput from "../lib/NumberInput.svelte";
+  import ModeTabs from "../lib/builder/ModeTabs.svelte";
+  import AdvancedSection from "../lib/builder/AdvancedSection.svelte";
+  import ValidationBlock from "../lib/builder/ValidationBlock.svelte";
 
   let { params: _params }: { params?: unknown } = $props();
   $effect(() => { void _params; });
@@ -53,6 +61,17 @@
   // unchanged from there on.
   type AuthoringMode = "authored" | "discover";
   let authoringMode: AuthoringMode = $state("authored");
+
+  // ---------- custom-nodes auto-domain switch ----------
+  //
+  // The custom-nodes (authored) tab carries a single ``auto-domain``
+  // toggle: when on, the user supplies labelled corpora only (no coords,
+  // no domain picker), and submission routes through the discover-create
+  // endpoint where the fitter derives coords per-model via the same
+  // pca / spectral hyperparams the auto-generated tab exposes.  When
+  // off, the historical authored flow runs unchanged (box / sphere
+  // picker + per-node coord inputs + ``apiManifolds.create``).
+  let autoDomain = $state(false);
 
   // ---------- domain ----------
 
@@ -201,7 +220,10 @@
     if (!slug(manifoldName)) {
       messages.push("a manifold name is required");
     }
-    if (domainKind === "box") {
+    // Domain-shape validation only fires when the user is hand-authoring
+    // coordinates.  auto-domain skips the box / sphere picker entirely
+    // — the fitter derives the layout per-model.
+    if (!autoDomain && domainKind === "box") {
       for (let i = 0; i < boxDim; i++) {
         const a = axisDrafts[i];
         if (a.hi <= a.lo) {
@@ -209,7 +231,16 @@
         }
       }
     }
-    if (nodes.length < minNodes) {
+    // Min-node count: hand-authored coords need ``2n+1`` for poisedness;
+    // auto-domain only needs >=2 nodes (shared-structure requirement,
+    // matching the auto-generated tab's discoverValidation).
+    if (autoDomain) {
+      if (nodes.length < 2) {
+        messages.push(
+          `need at least 2 nodes for auto-domain (have ${nodes.length})`,
+        );
+      }
+    } else if (nodes.length < minNodes) {
       messages.push(
         `need at least ${minNodes} nodes for an ${intrinsicDim}D domain (have ${nodes.length})`,
       );
@@ -224,7 +255,7 @@
       } else {
         seenLabels.add(lbl);
       }
-      if (!coordsInDomain(nd.coords)) {
+      if (!autoDomain && !coordsInDomain(nd.coords)) {
         messages.push(`node "${nd.label}" has out-of-domain coordinates`);
       }
       if (statementsOf(nd).length === 0) {
@@ -237,14 +268,68 @@
         );
       }
     }
+    // auto-domain shares hyperparam validation with the auto-generated tab.
+    if (autoDomain) {
+      if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
+      if (
+        discoverFitMode === "pca" &&
+        (discoverVarThreshold <= 0 || discoverVarThreshold > 1)
+      ) {
+        messages.push("var_threshold must be in (0, 1]");
+      }
+    }
     return { ok: messages.length === 0, messages };
   });
 
   let submitting = $state(false);
 
+  /** Per-tab AdvancedSection open state.  Kept separate so toggling one
+   *  tab's advanced flyout doesn't carry across to the other. */
+  let advancedAuthoredOpen = $state(false);
+  let advancedDiscoverOpen = $state(false);
+
   async function save(): Promise<void> {
     if (!validation.ok || submitting) return;
     submitting = true;
+    // auto-domain split: bring-your-own-corpora discover (the fitter
+    // derives coords per-model via pca / spectral) routes through
+    // createDiscover; the historical authored path with hand-placed
+    // coords keeps using create.
+    if (autoDomain) {
+      const namespaceSlug = slug(namespace) || "local";
+      const nameSlug = slug(manifoldName);
+      const req: CreateDiscoverManifoldRequest = {
+        namespace: namespaceSlug,
+        name: nameSlug,
+        description: description.trim(),
+        fit_mode: discoverFitMode,
+        hyperparams: buildDiscoverHyperparams(),
+        nodes: nodes.map((nd) => {
+          const r = nd.role.trim();
+          return {
+            label: slug(nd.label),
+            statements: statementsOf(nd),
+            ...(r ? { role: r } : {}),
+          };
+        }),
+      };
+      try {
+        await apiManifolds.createDiscover(req);
+        await refreshManifoldList();
+        pushToast(
+          `built ${namespaceSlug}/${nameSlug} (auto-domain ${discoverFitMode}) — open the manifolds drawer to fit`,
+          { kind: "info" },
+        );
+        closeDrawer();
+        openDrawer("manifolds");
+      } catch (e) {
+        const msg = describeFitError(e);
+        pushToast(`build failed — ${msg}`, { kind: "error", ttlMs: null });
+      } finally {
+        submitting = false;
+      }
+      return;
+    }
     const req: CreateManifoldRequest = {
       namespace: slug(namespace) || "local",
       name: slug(manifoldName),
@@ -517,25 +602,16 @@
   </header>
 
   <div class="body">
-    <!-- mode picker — authored vs discover -->
-    <div class="mode-tabs" role="tablist" aria-label="Authoring mode">
-      <button
-        type="button"
-        role="tab"
-        aria-selected={authoringMode === "authored"}
-        class="mode-tab"
-        class:active={authoringMode === "authored"}
-        onclick={() => (authoringMode = "authored")}
-      >authored</button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={authoringMode === "discover"}
-        class="mode-tab"
-        class:active={authoringMode === "discover"}
-        onclick={() => (authoringMode = "discover")}
-      >discover</button>
-    </div>
+    <!-- mode picker — "custom nodes" (user-authored coords + corpora)
+         vs "auto-generated" (LLM-authored corpora; coords derived). -->
+    <ModeTabs
+      bind:value={authoringMode}
+      tabs={[
+        { value: "discover", label: "auto-generated" },
+        { value: "authored", label: "custom nodes" },
+      ]}
+      ariaLabel="Authoring mode"
+    />
 
     {#if authoringMode === "authored"}
       <p class="hint">
@@ -590,9 +666,38 @@
     </label>
 
     {#if authoringMode === "authored"}
+    <!-- auto-domain switch: when on, skip the box/sphere picker and the
+         per-node coord inputs; the fitter derives the layout per-model
+         via pca / spectral.  When off, hand-author coords as before. -->
+    <span class="auto-domain-toggle">
+      <Checkbox
+        bind:checked={autoDomain}
+        label="auto-domain (let the fitter derive coords from corpora)"
+      />
+    </span>
+
+    {#if autoDomain}
+      <!-- fit-method picker — mirrors the auto-generated tab's choice. -->
+      <section class="step">
+        <h2 class="step-title">fit method</h2>
+        <div class="radio-row">
+          <Radio bind:group={discoverFitMode} value="pca" label="pca" />
+          <Radio bind:group={discoverFitMode} value="spectral" label="spectral" />
+        </div>
+        <p class="dim-note">
+          {#if discoverFitMode === "pca"}
+            safe linear default — picks the smallest prefix whose
+            cumulative variance crosses the threshold, capped at max_dim.
+          {:else}
+            laplacian eigenmaps — recovers curved-manifold topology that
+            pca flattens. noisy below ~50 nodes.
+          {/if}
+        </p>
+      </section>
+    {:else}
     <!-- domain step -->
     <section class="step">
-      <h2 class="step-title">1 · domain</h2>
+      <h2 class="step-title">domain</h2>
       <div class="domain-kind">
         <button
           type="button"
@@ -638,54 +743,49 @@
               </label>
               <label class="axis-field">
                 <span class="mini-label">lo</span>
-                <input
-                  type="number"
-                  class="input mini"
+                <NumberInput
                   value={axis.lo}
-                  step="0.1"
-                  oninput={(ev) => {
-                    axisDrafts[i].lo = Number((ev.currentTarget as HTMLInputElement).value);
+                  step={0.1}
+                  oninput={(v) => {
+                    if (v !== null) axisDrafts[i].lo = v;
                   }}
                 />
               </label>
               <label class="axis-field">
                 <span class="mini-label">hi</span>
-                <input
-                  type="number"
-                  class="input mini"
+                <NumberInput
                   value={axis.hi}
-                  step="0.1"
-                  oninput={(ev) => {
-                    axisDrafts[i].hi = Number((ev.currentTarget as HTMLInputElement).value);
+                  step={0.1}
+                  oninput={(v) => {
+                    if (v !== null) axisDrafts[i].hi = v;
                   }}
                 />
               </label>
-              <label class="axis-check">
-                <input
-                  type="checkbox"
+              <span class="axis-check">
+                <Checkbox
                   checked={axis.periodic}
-                  onchange={(ev) => {
-                    axisDrafts[i].periodic = (ev.currentTarget as HTMLInputElement).checked;
+                  label="periodic"
+                  onchange={(v) => {
+                    axisDrafts[i].periodic = v;
                   }}
                 />
-                <span>periodic</span>
-              </label>
+              </span>
             </div>
           {/each}
         </div>
       {:else}
         <label class="field sphere-field">
           <span class="label">sphere dimension (S^n)</span>
-          <select
-            class="input"
+          <Select
             value={sphereDim}
-            onchange={(ev) =>
-              onSphereDim(Number((ev.currentTarget as HTMLSelectElement).value))}
-          >
-            <option value={1}>S¹ — circle</option>
-            <option value={2}>S² — sphere</option>
-            <option value={3}>S³</option>
-          </select>
+            options={[
+              { value: 1, label: "S¹ — circle" },
+              { value: 2, label: "S² — sphere" },
+              { value: 3, label: "S³" },
+            ]}
+            ariaLabel="Sphere dimension"
+            onchange={onSphereDim}
+          />
         </label>
       {/if}
       <p class="dim-note">
@@ -693,12 +793,15 @@
         minimum nodes: <strong>{minNodes}</strong>
       </p>
     </section>
+    {/if}
 
     <!-- node editor -->
     <section class="step">
-      <h2 class="step-title">2 · nodes</h2>
+      <h2 class="step-title">nodes</h2>
       {#if nodes.length === 0}
-        <p class="muted">no nodes yet — add at least {minNodes}.</p>
+        <p class="muted">
+          no nodes yet — add at least {autoDomain ? 2 : minNodes}.
+        </p>
       {/if}
       <div class="node-list">
         {#each nodes as node, idx (idx)}
@@ -721,23 +824,20 @@
                 placeholder="label"
                 spellcheck="false"
               />
-              <div class="node-coords">
-                {#each node.coords as c, ci (ci)}
-                  <input
-                    type="number"
-                    class="input mini coord"
-                    value={c}
-                    step="0.1"
-                    title="coordinate {ci}"
-                    oninput={(ev) =>
-                      setNodeCoord(
-                        idx,
-                        ci,
-                        Number((ev.currentTarget as HTMLInputElement).value),
-                      )}
-                  />
-                {/each}
-              </div>
+              {#if !autoDomain}
+                <div class="node-coords">
+                  {#each node.coords as c, ci (ci)}
+                    <span class="coord-cell">
+                      <NumberInput
+                        value={c}
+                        step={0.1}
+                        title="coordinate {ci}"
+                        oninput={(v) => setNodeCoord(idx, ci, v ?? 0)}
+                      />
+                    </span>
+                  {/each}
+                </div>
+              {/if}
               <button
                 type="button"
                 class="node-remove"
@@ -787,16 +887,64 @@
       </button>
     </section>
 
-    {#if !validation.ok}
-      <div class="validation" role="alert">
-        <p class="validation-head">not ready to build:</p>
-        <ul>
-          {#each validation.messages as m (m)}
-            <li>{m}</li>
-          {/each}
-        </ul>
-      </div>
+    {#if autoDomain}
+      <AdvancedSection bind:expanded={advancedAuthoredOpen}>
+        <div class="grid2">
+          <label class="field">
+            <span class="label">max_dim</span>
+            <NumberInput
+              value={discoverMaxDim}
+              min={1}
+              step={1}
+              oninput={(v) => {
+                if (v !== null) discoverMaxDim = v;
+              }}
+            />
+          </label>
+          {#if discoverFitMode === "pca"}
+            <label class="field">
+              <span class="label">var_threshold</span>
+              <NumberInput
+                value={discoverVarThreshold}
+                min={0}
+                max={1}
+                step={0.05}
+                oninput={(v) => {
+                  if (v !== null) discoverVarThreshold = v;
+                }}
+              />
+            </label>
+          {:else}
+            <label class="field">
+              <span class="label">k_nn (blank → auto)</span>
+              <NumberInput
+                value={discoverKNN}
+                min={1}
+                step={1}
+                allowEmpty
+                placeholder="max(5, ⌈log K⌉)"
+                oninput={(v) => { discoverKNN = v; }}
+              />
+            </label>
+          {/if}
+        </div>
+        {#if discoverFitMode === "spectral"}
+          <label class="field">
+            <span class="label">bandwidth σ (blank → median k-NN distance)</span>
+            <NumberInput
+              value={discoverBandwidth}
+              min={0}
+              step={0.01}
+              allowEmpty
+              placeholder="median(k-NN edges)"
+              oninput={(v) => { discoverBandwidth = v; }}
+            />
+          </label>
+        {/if}
+      </AdvancedSection>
     {/if}
+
+    <ValidationBlock verb="build" messages={validation.messages} />
 
     <button
       type="button"
@@ -804,12 +952,17 @@
       disabled={!validation.ok || submitting}
       onclick={save}
     >
-      {submitting ? "building…" : "build manifold → return to list"}
+      {submitting
+        ? "building…"
+        : autoDomain
+          ? `build manifold (auto-domain ${discoverFitMode}) → return to list`
+          : "build manifold → return to list"}
     </button>
     {:else}
-      <!-- discover-mode authoring -->
+      <!-- auto-generated authoring: LLM-author corpora from a flat
+           concept list, fitter derives coords. -->
       <section class="step">
-        <h2 class="step-title">1 · concepts</h2>
+        <h2 class="step-title">concepts</h2>
         <label class="field">
           <span class="label">
             concept list <span class="req">required (≥2)</span>
@@ -828,22 +981,24 @@
         <div class="grid2">
           <label class="field">
             <span class="label">n_scenarios</span>
-            <input
-              type="number"
-              class="input mini"
-              min="1"
-              step="1"
-              bind:value={discoverNScenarios}
+            <NumberInput
+              value={discoverNScenarios}
+              min={1}
+              step={1}
+              oninput={(v) => {
+                if (v !== null) discoverNScenarios = v;
+              }}
             />
           </label>
           <label class="field">
             <span class="label">statements per concept × scenario</span>
-            <input
-              type="number"
-              class="input mini"
-              min="1"
-              step="1"
-              bind:value={discoverStatementsPerConcept}
+            <NumberInput
+              value={discoverStatementsPerConcept}
+              min={1}
+              step={1}
+              oninput={(v) => {
+                if (v !== null) discoverStatementsPerConcept = v;
+              }}
             />
           </label>
         </div>
@@ -857,20 +1012,10 @@
       </section>
 
       <section class="step">
-        <h2 class="step-title">2 · discovery method</h2>
-        <div class="domain-kind">
-          <button
-            type="button"
-            class="kind-btn"
-            class:active={discoverFitMode === "pca"}
-            onclick={() => (discoverFitMode = "pca")}
-          >pca</button>
-          <button
-            type="button"
-            class="kind-btn"
-            class:active={discoverFitMode === "spectral"}
-            onclick={() => (discoverFitMode = "spectral")}
-          >spectral</button>
+        <h2 class="step-title">fit method</h2>
+        <div class="radio-row">
+          <Radio bind:group={discoverFitMode} value="pca" label="pca" />
+          <Radio bind:group={discoverFitMode} value="spectral" label="spectral" />
         </div>
         <p class="dim-note">
           {#if discoverFitMode === "pca"}
@@ -882,42 +1027,45 @@
             that pca flattens. noisy below ~50 nodes.
           {/if}
         </p>
+      </section>
+
+      <AdvancedSection bind:expanded={advancedDiscoverOpen}>
         <div class="grid2">
           <label class="field">
             <span class="label">max_dim</span>
-            <input
-              type="number"
-              class="input mini"
-              min="1"
-              step="1"
-              bind:value={discoverMaxDim}
+            <NumberInput
+              value={discoverMaxDim}
+              min={1}
+              step={1}
+              oninput={(v) => {
+                if (v !== null) discoverMaxDim = v;
+              }}
             />
           </label>
           {#if discoverFitMode === "pca"}
             <label class="field">
               <span class="label">var_threshold</span>
-              <input
-                type="number"
-                class="input mini"
-                min="0"
-                max="1"
-                step="0.05"
-                bind:value={discoverVarThreshold}
+              <NumberInput
+                value={discoverVarThreshold}
+                min={0}
+                max={1}
+                step={0.05}
+                oninput={(v) => {
+                  if (v !== null) discoverVarThreshold = v;
+                }}
               />
             </label>
           {:else}
             <label class="field">
               <span class="label">k_nn (blank → auto)</span>
-              <input
-                type="number"
-                class="input mini"
-                min="1"
-                step="1"
+              <NumberInput
+                value={discoverKNN}
+                min={1}
+                step={1}
+                allowEmpty
                 placeholder="max(5, ⌈log K⌉)"
-                value={discoverKNN ?? ""}
-                oninput={(ev) => {
-                  const v = (ev.currentTarget as HTMLInputElement).value;
-                  discoverKNN = v === "" ? null : Number(v);
+                oninput={(v) => {
+                  discoverKNN = v;
                 }}
               />
             </label>
@@ -926,63 +1074,49 @@
         {#if discoverFitMode === "spectral"}
           <label class="field">
             <span class="label">bandwidth σ (blank → median k-NN distance)</span>
-            <input
-              type="number"
-              class="input mini"
-              min="0"
-              step="0.01"
+            <NumberInput
+              value={discoverBandwidth}
+              min={0}
+              step={0.01}
+              allowEmpty
               placeholder="median(k-NN edges)"
-              value={discoverBandwidth ?? ""}
-              oninput={(ev) => {
-                const v = (ev.currentTarget as HTMLInputElement).value;
-                discoverBandwidth = v === "" ? null : Number(v);
+              oninput={(v) => {
+                discoverBandwidth = v;
               }}
             />
           </label>
         {/if}
-      </section>
-
-      <section class="step">
-        <label class="axis-check">
-          <input type="checkbox" bind:checked={alsoFit} />
-          <span>fit immediately after generating corpora</span>
-        </label>
-        <label class="axis-check">
-          <input type="checkbox" bind:checked={discoverRolePerNode} />
-          <span>
-            persona manifold (use each concept slug as that node's role)
-          </span>
-        </label>
-        {#if discoverRolePerNode}
-          <p class="role-hint">
-            Each node's centroid will be pooled with the chat template's
-            assistant-role label replaced by the concept slug. The fitted
-            manifold lives in persona-baseline activation space; steering
-            through it implies the nearest node's role at decode time.
-            Mistral-3 / talkie families don't support role substitution
-            and raise at fit time.
-          </p>
-        {/if}
-        <label class="axis-check">
-          <input type="checkbox" bind:checked={discoverForce} />
-          <span>overwrite an existing manifold with this name</span>
-        </label>
-      </section>
+        <div class="check-stack">
+          <Checkbox
+            bind:checked={alsoFit}
+            label="fit immediately after generating corpora"
+          />
+          <Checkbox
+            bind:checked={discoverRolePerNode}
+            label="persona manifold (use each concept slug as that node's role)"
+          />
+          {#if discoverRolePerNode}
+            <p class="role-hint">
+              Each node's centroid will be pooled with the chat template's
+              assistant-role label replaced by the concept slug. The fitted
+              manifold lives in persona-baseline activation space; steering
+              through it implies the nearest node's role at decode time.
+              Mistral-3 / talkie families don't support role substitution
+              and raise at fit time.
+            </p>
+          {/if}
+          <Checkbox
+            bind:checked={discoverForce}
+            label="overwrite an existing manifold with this name"
+          />
+        </div>
+      </AdvancedSection>
 
       {#if discoverProgress}
         <p class="progress">{discoverProgress}</p>
       {/if}
 
-      {#if !discoverValidation.ok}
-        <div class="validation" role="alert">
-          <p class="validation-head">not ready to discover:</p>
-          <ul>
-            {#each discoverValidation.messages as m (m)}
-              <li>{m}</li>
-            {/each}
-          </ul>
-        </div>
-      {/if}
+      <ValidationBlock verb="discover" messages={discoverValidation.messages} />
 
       <button
         type="button"
@@ -1168,9 +1302,6 @@
     font-size: var(--text-xs);
     padding-bottom: var(--space-1);
   }
-  .axis-check input {
-    accent-color: var(--accent);
-  }
   .node-role {
     display: flex;
     flex-direction: column;
@@ -1230,8 +1361,23 @@
     gap: var(--space-1);
     flex: 1 1 auto;
   }
-  .coord {
+  /* Wraps the themed NumberInput in the node-coords flex row. */
+  .coord-cell {
+    flex: 0 0 auto;
     width: 4.5em;
+    display: inline-flex;
+  }
+  /* Discover-tab radio pair (was .domain-kind / .kind-btn). */
+  .radio-row {
+    display: flex;
+    gap: var(--space-5);
+    padding: var(--space-1) 0 var(--space-3);
+  }
+  /* Discover-tab checkbox group at the bottom of the form. */
+  .check-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
   }
   .node-remove {
     background: transparent;
@@ -1277,24 +1423,6 @@
     background: var(--accent-glow);
   }
 
-  .validation {
-    border: 1px solid var(--accent-yellow);
-    border-radius: var(--radius);
-    padding: var(--space-3) var(--space-4);
-    background: color-mix(in srgb, var(--accent-yellow) 8%, transparent);
-  }
-  .validation-head {
-    margin: 0 0 var(--space-2);
-    color: var(--accent-yellow);
-    font-size: var(--text-sm);
-  }
-  .validation ul {
-    margin: 0;
-    padding-left: var(--space-5);
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-  }
-
   .save-btn {
     background: var(--accent);
     color: var(--text-on-accent);
@@ -1316,37 +1444,10 @@
     cursor: not-allowed;
   }
 
-  .mode-tabs {
-    display: flex;
-    gap: var(--space-1);
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 2px;
-    align-self: flex-start;
-  }
-  .mode-tab {
-    background: transparent;
-    color: var(--fg-muted);
-    border: 0;
-    padding: var(--space-2) var(--space-4);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    cursor: pointer;
-    border-radius: calc(var(--radius) - 2px);
-    transition:
-      background var(--dur) var(--ease-out),
-      color var(--dur) var(--ease-out);
-  }
-  .mode-tab:hover {
-    color: var(--fg-strong);
-  }
-  .mode-tab.active {
-    background: var(--accent-subtle);
-    color: var(--accent);
+  /* Spacing for the auto-domain checkbox row inside the custom-nodes tab. */
+  .auto-domain-toggle {
+    display: inline-flex;
+    padding: var(--space-3) 0;
   }
   textarea.input {
     resize: vertical;

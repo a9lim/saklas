@@ -15,6 +15,7 @@
   // home (docs/plans/webui-overhaul.md §"Panel & drawer notes").
 
   import ProbeStrip from "./ProbeStrip.svelte";
+  import Select from "../lib/Select.svelte";
   import {
     activeProbeNames,
     openDrawer,
@@ -31,9 +32,14 @@
   // $state-tracked, so this $derived re-runs on any of those changes.
   const sortedProbes = $derived(activeProbeNames());
 
-  function onSortChange(ev: Event): void {
-    const value = (ev.currentTarget as HTMLSelectElement).value as ProbeSortMode;
-    setProbeSortMode(value);
+  const SORT_OPTIONS: { value: ProbeSortMode; label: string }[] = [
+    { value: "name", label: "name" },
+    { value: "value", label: "value" },
+    { value: "change", label: "change" },
+  ];
+
+  function onSortChange(v: ProbeSortMode): void {
+    setProbeSortMode(v);
   }
 
   function onAddProbe(): void {
@@ -48,16 +54,14 @@
     </div>
     <label class="sort">
       <span class="sort-label">sort</span>
-      <select
-        class="sort-select"
-        value={sortMode}
-        onchange={onSortChange}
-        aria-label="Sort probes by"
-      >
-        <option value="name">name</option>
-        <option value="value">value</option>
-        <option value="change">change</option>
-      </select>
+      <span class="sort-select">
+        <Select
+          value={sortMode}
+          options={SORT_OPTIONS}
+          onchange={onSortChange}
+          ariaLabel="Sort probes by"
+        />
+      </span>
     </label>
   </header>
 
@@ -144,14 +148,10 @@
     color: var(--fg-muted);
     font-size: var(--text-sm);
   }
+  /* Layout host for the themed Select. */
   .sort-select {
-    background: var(--bg-elev);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-2);
-    border-radius: var(--radius);
-    font: inherit;
-    font-size: var(--text-sm);
+    display: inline-flex;
+    min-width: 8em;
   }
 
   /* Strips own the scroll inside the rack — with 26 auto-loaded probes

@@ -25,6 +25,8 @@
     serializeExpression,
   } from "../lib/expression";
   import type { Variant, VectorRackEntry } from "../lib/types";
+  import Radio from "../lib/Radio.svelte";
+  import Disclosure from "../lib/Disclosure.svelte";
 
   // Drawer host forwards { params } — unused.
   let _drawerProps: { params?: unknown } = $props();
@@ -36,11 +38,27 @@
   let variant: Variant = $state("raw");
   let saeRelease = $state("");
 
+  // ----- variant radio bridge -----
+  //
+  // The variant radio surface has three slots — raw, sae (unique), sae-
+  // release — but ``variant`` itself is a string union where the third
+  // slot is open-ended ("sae-<release>").  ``variantKind`` is the
+  // bindable radio group; an effect projects it (plus ``saeRelease``)
+  // back onto ``variant``.
+  type VariantKind = "raw" | "sae" | "sae-release";
+  let variantKind: VariantKind = $state("raw");
+  $effect(() => {
+    if (variantKind === "raw") variant = "raw";
+    else if (variantKind === "sae") variant = "sae";
+    else variant = ("sae-" + saeRelease.trim()) as Variant;
+  });
+
   // ----- validation -----
   let parseError: string | null = $state(null);
   let parseCol: number | null = $state(null);
   let preview: string | null = $state(null);
   let unknownTerms: string[] = $state([]);
+  let grammarOpen = $state(false);
 
   // Datalist source: the user's current rack.
   const rackNames = $derived(Array.from(vectorRack.entries.keys()));
@@ -205,47 +223,21 @@
 
     <fieldset class="field variant">
       <legend class="label">variant</legend>
-      <label class="radio">
-        <input
-          type="radio"
-          name="variant"
-          value="raw"
-          checked={variant === "raw"}
-          onchange={() => (variant = "raw")}
-        />
-        raw
-      </label>
-      <label class="radio">
-        <input
-          type="radio"
-          name="variant"
-          value="sae"
-          checked={variant === "sae"}
-          onchange={() => (variant = "sae")}
-        />
-        sae (unique)
-      </label>
-      <label class="radio">
-        <input
-          type="radio"
-          name="variant"
+      <Radio bind:group={variantKind} value="raw" label="raw" />
+      <Radio bind:group={variantKind} value="sae" label="sae (unique)" />
+      <span class="radio sae-release-row">
+        <Radio
+          bind:group={variantKind}
           value="sae-release"
-          checked={variant !== "raw" && variant !== "sae"}
-          onchange={() => (variant = ("sae-" + saeRelease.trim()) as Variant)}
+          label="sae-"
         />
-        sae-
         <input
           type="text"
           class="release-input"
           placeholder="gemma-scope-2b-pt-res"
           bind:value={saeRelease}
-          oninput={() => {
-            if (variant !== "raw" && variant !== "sae") {
-              variant = ("sae-" + saeRelease.trim()) as Variant;
-            }
-          }}
         />
-      </label>
+      </span>
       <button
         type="button"
         class="apply-variant"
@@ -257,8 +249,7 @@
       </button>
     </fieldset>
 
-    <details class="hint">
-      <summary>grammar reference</summary>
+    <Disclosure summary="grammar reference" bind:expanded={grammarOpen} flush>
       <p class="muted">
         <code>0.3 honest</code> · <code>0.4 warm@after</code> ·
         <code>0.5 wolf~deer</code> (project onto) ·
@@ -266,7 +257,7 @@
         <code>!hallucinating</code> (mean-ablate) ·
         <code>0.3 honest:sae</code> (SAE variant)
       </p>
-    </details>
+    </Disclosure>
 
     <datalist id="rack-names-merge">
       {#each rackNames as n}
@@ -448,16 +439,8 @@
     font-size: var(--text-sm);
     margin: 0;
   }
-  .hint summary {
-    color: var(--fg-muted);
-    font-size: var(--text-sm);
-    cursor: pointer;
-    list-style: revert;
-  }
-  .hint summary:hover {
-    color: var(--fg-dim);
-  }
-  .hint code {
+  /* Grammar-reference code chips inside the Disclosure body. */
+  .muted code {
     color: var(--accent);
     background: var(--bg-deep);
     padding: var(--space-1) var(--space-2);

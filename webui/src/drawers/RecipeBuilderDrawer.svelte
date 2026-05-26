@@ -15,6 +15,8 @@
     vectorsState,
   } from "../lib/stores.svelte";
   import type { Trigger, Variant } from "../lib/types";
+  import Select from "../lib/Select.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -101,14 +103,14 @@
         {#each entries as [name, entry] (name)}
           <article class="term" class:disabled={!entry.enabled}>
             <header>
-              <label class="enable">
-                <input
-                  type="checkbox"
+              <span class="enable">
+                <Checkbox
                   checked={entry.enabled}
-                  onchange={(ev) => setVectorEnabled(name, (ev.currentTarget as HTMLInputElement).checked)}
+                  onchange={(v) => setVectorEnabled(name, v)}
+                  ariaLabel="enabled"
                 />
                 <span>{name}</span>
-              </label>
+              </span>
               <button type="button" class="remove" aria-label={`Remove ${name}`} onclick={() => removeVectorFromRack(name)}>×</button>
             </header>
 
@@ -130,11 +132,12 @@
             <div class="control-grid">
               <label class="field">
                 <span>trigger</span>
-                <select value={entry.trigger} onchange={(ev) => setVectorTrigger(name, (ev.currentTarget as HTMLSelectElement).value as Trigger)}>
-                  {#each triggers as trigger (trigger.value)}
-                    <option value={trigger.value}>{trigger.label}</option>
-                  {/each}
-                </select>
+                <Select
+                  value={entry.trigger}
+                  options={triggers}
+                  onchange={(v) => setVectorTrigger(name, v)}
+                  ariaLabel="trigger"
+                />
               </label>
 
               <label class="field">
@@ -153,19 +156,20 @@
 
               <label class="field">
                 <span>projection</span>
-                <select
+                <Select
                   value={entry.projection?.op ?? ""}
-                  onchange={(ev) => {
-                    const op = (ev.currentTarget as HTMLSelectElement).value as "~" | "|" | "";
+                  options={[
+                    { value: "", label: "none" },
+                    { value: "~", label: "keep shared (~)" },
+                    { value: "|", label: "remove shared (|)" },
+                  ]}
+                  onchange={(op) => {
                     if (!op) setVectorProjection(name, null);
                     else setProjection(name, op, entry.projection?.target ?? "");
                   }}
                   disabled={entry.ablate}
-                >
-                  <option value="">none</option>
-                  <option value="~">keep shared (~)</option>
-                  <option value="|">remove shared (|)</option>
-                </select>
+                  ariaLabel="projection"
+                />
               </label>
 
               <label class="field">
@@ -182,14 +186,14 @@
               </label>
             </div>
 
-            <label class="ablate">
-              <input
-                type="checkbox"
+            <span class="ablate">
+              <Checkbox
                 checked={entry.ablate}
-                onchange={(ev) => setVectorAblate(name, (ev.currentTarget as HTMLInputElement).checked)}
+                onchange={(v) => setVectorAblate(name, v)}
+                ariaLabel="mean-ablate"
               />
               <span>mean-ablate this concept instead of steering toward it</span>
-            </label>
+            </span>
           </article>
         {/each}
       {/if}
@@ -212,8 +216,8 @@
   button { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); color: var(--fg); padding: var(--space-4) var(--space-5); }
   button:hover { border-color: var(--accent); color: var(--accent); }
   .add-card input { flex: 1; }
-  input, select { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); }
-  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); }
+  input:focus { outline: none; border-color: var(--accent); }
   .terms { display: grid; gap: var(--space-5); }
   .term { display: grid; gap: var(--space-5); }
   .term.disabled { opacity: 0.58; }

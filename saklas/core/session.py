@@ -1112,14 +1112,21 @@ class SaklasSession:
 
     # -- Extraction --
 
-    def _local_concept_folder(self, canonical: str) -> pathlib.Path:
-        """Return the local/<canonical>/ folder, creating pack.json if needed.
+    def _local_concept_folder(
+        self, canonical: str, *, namespace: str = "local",
+    ) -> pathlib.Path:
+        """Return the ``<namespace>/<canonical>/`` folder, creating pack.json if needed.
 
-        User-extracted vectors and generated statements live under
-        ~/.saklas/vectors/local/<canonical>/. A minimal pack.json with
-        source=local is written on first access.
+        User-extracted vectors and generated statements default to
+        ``~/.saklas/vectors/local/<canonical>/``.  Passing ``namespace=``
+        relocates the destination — the webui's vector-extract drawer
+        uses this for the namespace-of-the-vector field (parity with
+        the manifold builder's namespace control).  A minimal pack.json
+        with ``source=local`` is written on first access regardless of
+        namespace — the source field tracks provenance (user-extracted),
+        not folder location.
         """
-        folder = concept_dir("local", canonical)
+        folder = concept_dir(namespace, canonical)
         folder.mkdir(parents=True, exist_ok=True)
         if not (folder / "pack.json").exists():
             PackMetadata(

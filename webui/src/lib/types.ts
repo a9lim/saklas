@@ -321,6 +321,18 @@ export interface ExtractRequest {
    * ``:role-<slug>`` variant.  Slug must match ``[a-z0-9._-]+``;
    * mutually exclusive with ``sae``. */
   role?: string | null;
+  /** Destination namespace for the extracted vector folder.  ``null`` /
+   *  unset lands the vector under ``~/.saklas/vectors/local/<canonical>/``
+   *  — the historical behavior.  Any other value relocates the folder
+   *  to ``~/.saklas/vectors/<namespace>/<canonical>/``.  Parity with
+   *  the manifold builder's namespace control. */
+  namespace?: string | null;
+  /** Force a fresh extraction even if a cached tensor / statements
+   *  file exists at the destination.  Wires to the engine's
+   *  ``force_statements`` flag.  Default ``false`` keeps the cache-hit
+   *  short-circuit.  Parity with the manifold builder's overwrite
+   *  control. */
+  force?: boolean;
   register?: boolean;
 }
 

@@ -157,8 +157,16 @@ class ModelHandle(Protocol):
 class PackWriter(Protocol):
     """Local-pack mutations the pipeline performs."""
 
-    def _local_concept_folder(self, canonical: str) -> pathlib.Path:
-        """Return ``local/<canonical>/`` with a placeholder ``pack.json``."""
+    def _local_concept_folder(
+        self, canonical: str, *, namespace: str = "local",
+    ) -> pathlib.Path:
+        """Return ``<namespace>/<canonical>/`` with a placeholder ``pack.json``.
+
+        ``namespace="local"`` (default) preserves the historical
+        destination; the extract pipeline threads a non-default
+        namespace through when the caller wants to land the vector
+        outside ``local/``.
+        """
         ...
 
     def _promote_profile(
@@ -482,7 +490,11 @@ class ExtractionPipeline:
                 ds = DataSource(pairs=source)
             else:
                 ds = source
-            folder = self._packs._local_concept_folder(canonical)
+            # User-supplied namespace controls the destination folder; the
+            # default ``"local"`` preserves the historical landing site.
+            folder = self._packs._local_concept_folder(
+                canonical, namespace=namespace or "local",
+            )
             cache_path = _path_for(folder)
             try:
                 profile, _meta = _load_profile(cache_path)
@@ -526,8 +538,12 @@ class ExtractionPipeline:
         if pack_folder is not None:
             cache_path = _path_for(pack_folder)
         else:
+            # No installed match — land the vector under the
+            # user-supplied namespace (or ``"local"`` by default).
             cache_path = _path_for(
-                pathlib.Path(self._packs._local_concept_folder(canonical))
+                pathlib.Path(self._packs._local_concept_folder(
+                    canonical, namespace=namespace or "local",
+                ))
             )
 
         # 1. Vector cache — short-circuits unless a regen path is requested.
@@ -577,7 +593,9 @@ class ExtractionPipeline:
                 return _build_return(profile, diagnostics)
 
         # 3. Local statements cache — default reuses if present.
-        local_folder = self._packs._local_concept_folder(canonical)
+        local_folder = self._packs._local_concept_folder(
+            canonical, namespace=namespace or "local",
+        )
         stmt_cache_path = str(local_folder / "statements.json")
         local_folder = pathlib.Path(stmt_cache_path).parent
         pairs = None

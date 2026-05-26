@@ -21,6 +21,8 @@
     openDrawer,
   } from "../lib/stores.svelte";
   import Slider from "../lib/Slider.svelte";
+  import NumberInput from "../lib/NumberInput.svelte";
+  import Checkbox from "../lib/Checkbox.svelte";
 
   // ------------------------------------------------------------------- consts
 
@@ -86,9 +88,9 @@
   const maxView = $derived(samplingState.max_tokens || PLACEHOLDER.max_tokens);
   const presenceView = $derived(samplingState.presence_penalty);
   const frequencyView = $derived(samplingState.frequency_penalty);
-  const seedView = $derived(
-    samplingState.seed === null ? "" : String(samplingState.seed),
-  );
+  /** Bindable raw seed value for the NumberInput.  null = no per-call
+   *  seed pin (the placeholder dash shows). */
+  const seedView = $derived<number | null>(samplingState.seed);
   const thinkingView = $derived(samplingState.thinking ?? false);
 
   // ------------------------------------------------------------------- writes
@@ -122,17 +124,15 @@
     void persistDefault({ top_p: v });
   }
 
-  function onTopK(ev: Event): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+  function onTopK(raw: number | null): void {
+    if (raw === null) return;
     const v = Math.max(TOP_K_MIN, Math.min(TOP_K_MAX, Math.floor(raw)));
     setSampling("top_k", v);
     void persistDefault({ top_k: v });
   }
 
-  function onMax(ev: Event): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+  function onMax(raw: number | null): void {
+    if (raw === null) return;
     const v = Math.max(MAX_TOK_MIN, Math.min(MAX_TOK_MAX, Math.floor(raw)));
     setSampling("max_tokens", v);
     void persistDefault({ max_tokens: v });
@@ -140,25 +140,21 @@
 
   function onPenalty(
     key: "presence_penalty" | "frequency_penalty",
-    ev: Event,
+    raw: number | null,
   ): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+    if (raw === null) return;
     const v = Math.max(PENALTY_MIN, Math.min(PENALTY_MAX, raw));
     setSampling(key, v);
     // No session-PATCH path: the penalties ride on the per-call sampling
     // payload only, same as the (now-removed) advanced-drawer control.
   }
 
-  function onSeed(ev: Event): void {
-    const raw = (ev.currentTarget as HTMLInputElement).value.trim();
-    if (raw === "") {
+  function onSeed(raw: number | null): void {
+    if (raw === null) {
       setSampling("seed", null);
       return;
     }
-    const v = Number(raw);
-    if (!Number.isFinite(v)) return;
-    setSampling("seed", Math.floor(v));
+    setSampling("seed", Math.floor(raw));
     // There's no PATCH-able ``seed`` on the session — seed always rides
     // per-call (``buildSamplingPayload``).  A set seed pins every
     // generation to that number; clear it (✕) to unpin.
@@ -173,8 +169,7 @@
     setSampling("seed", null);
   }
 
-  function onThinking(ev: Event): void {
-    const v = (ev.currentTarget as HTMLInputElement).checked;
+  function onThinking(v: boolean): void {
     setSampling("thinking", v);
     void persistDefault({ thinking: v });
   }
@@ -186,9 +181,8 @@
    *  ``return_top_k``; it rides the WS sampling payload directly (see
    *  ``stores.svelte.ts::sendGenerate``).  Effective on the next
    *  generation; running gens keep their captured shape. */
-  function onAlts(ev: Event): void {
-    const raw = Number((ev.currentTarget as HTMLInputElement).value);
-    if (!Number.isFinite(raw)) return;
+  function onAlts(raw: number | null): void {
+    if (raw === null) return;
     const v = Math.max(0, Math.min(ALTS_MAX, Math.floor(raw)));
     setSampling("return_top_k", v);
   }
@@ -240,31 +234,33 @@
   <!-- Top-k -->
   <label class="control narrow" title="Top-k hard cap on candidate vocab size">
     <span class="label">K</span>
-    <input
-      type="number"
-      min={TOP_K_MIN}
-      max={TOP_K_MAX}
-      step="1"
-      value={topKView}
-      disabled={!ready}
-      onchange={onTopK}
-      aria-label="top-k"
-    />
+    <span class="num-cell">
+      <NumberInput
+        value={topKView}
+        min={TOP_K_MIN}
+        max={TOP_K_MAX}
+        step={1}
+        disabled={!ready}
+        onchange={onTopK}
+        ariaLabel="top-k"
+      />
+    </span>
   </label>
 
   <!-- Max tokens -->
   <label class="control narrow" title="Maximum tokens to generate">
     <span class="label">max</span>
-    <input
-      type="number"
-      min={MAX_TOK_MIN}
-      max={MAX_TOK_MAX}
-      step="1"
-      value={maxView}
-      disabled={!ready}
-      onchange={onMax}
-      aria-label="max tokens"
-    />
+    <span class="num-cell">
+      <NumberInput
+        value={maxView}
+        min={MAX_TOK_MIN}
+        max={MAX_TOK_MAX}
+        step={1}
+        disabled={!ready}
+        onchange={onMax}
+        ariaLabel="max tokens"
+      />
+    </span>
   </label>
 
   <!-- Presence penalty -->
@@ -273,16 +269,17 @@
     title="Presence penalty: discourages tokens already present (−2…2)"
   >
     <span class="label">pres</span>
-    <input
-      type="number"
-      min={PENALTY_MIN}
-      max={PENALTY_MAX}
-      step="0.05"
-      value={presenceView}
-      disabled={!ready}
-      onchange={(ev) => onPenalty("presence_penalty", ev)}
-      aria-label="presence penalty"
-    />
+    <span class="num-cell">
+      <NumberInput
+        value={presenceView}
+        min={PENALTY_MIN}
+        max={PENALTY_MAX}
+        step={0.05}
+        disabled={!ready}
+        onchange={(v) => onPenalty("presence_penalty", v)}
+        ariaLabel="presence penalty"
+      />
+    </span>
   </label>
 
   <!-- Frequency penalty -->
@@ -291,31 +288,34 @@
     title="Frequency penalty: discourages tokens by repeat count (−2…2)"
   >
     <span class="label">freq</span>
-    <input
-      type="number"
-      min={PENALTY_MIN}
-      max={PENALTY_MAX}
-      step="0.05"
-      value={frequencyView}
-      disabled={!ready}
-      onchange={(ev) => onPenalty("frequency_penalty", ev)}
-      aria-label="frequency penalty"
-    />
+    <span class="num-cell">
+      <NumberInput
+        value={frequencyView}
+        min={PENALTY_MIN}
+        max={PENALTY_MAX}
+        step={0.05}
+        disabled={!ready}
+        onchange={(v) => onPenalty("frequency_penalty", v)}
+        ariaLabel="frequency penalty"
+      />
+    </span>
   </label>
 
   <!-- Seed -->
   <div class="control seed" title="RNG seed: empty means the model picks">
     <span class="label">seed</span>
-    <input
-      type="number"
-      min="0"
-      step="1"
-      placeholder="—"
-      value={seedView}
-      disabled={!ready}
-      onchange={onSeed}
-      aria-label="seed"
-    />
+    <span class="num-cell seed-cell">
+      <NumberInput
+        value={seedView}
+        min={0}
+        step={1}
+        placeholder="—"
+        allowEmpty
+        disabled={!ready}
+        onchange={onSeed}
+        ariaLabel="seed"
+      />
+    </span>
     <button
       type="button"
       class="icon-btn"
@@ -351,12 +351,11 @@
         : "Force chain-of-thought thinking on/off (overrides auto)"}
   >
     <span class="label">think{thinkingForced ? " (forced)" : ""}</span>
-    <input
-      type="checkbox"
+    <Checkbox
       checked={thinkingForced ? true : thinkingView}
       disabled={!ready || !thinkingSupported || thinkingForced}
       onchange={onThinking}
-      aria-label="thinking mode"
+      ariaLabel="thinking mode"
     />
   </label>
 
@@ -368,16 +367,17 @@
     title="Top-K alternative tokens to capture per position (0 disables; feeds the drilldown logits tab + surprise highlight)"
   >
     <span class="label">alts</span>
-    <input
-      type="number"
-      min="0"
-      max={ALTS_MAX}
-      step="1"
-      value={samplingState.return_top_k}
-      disabled={!ready}
-      onchange={onAlts}
-      aria-label="top-K alternatives to capture"
-    />
+    <span class="num-cell">
+      <NumberInput
+        value={samplingState.return_top_k}
+        min={0}
+        max={ALTS_MAX}
+        step={1}
+        disabled={!ready}
+        onchange={onAlts}
+        ariaLabel="top-K alternatives to capture"
+      />
+    </span>
   </label>
 
   <button
@@ -423,11 +423,13 @@
     white-space: nowrap;
   }
 
-  .control.narrow input[type="number"] {
+  /* Width control for the themed NumberInput cells.  The inner input
+   * fills the cell, so the cell owns the sizing. */
+  .num-cell {
+    display: inline-flex;
     width: 5em;
   }
-
-  .control.seed input[type="number"] {
+  .seed-cell {
     width: 7em;
   }
 
@@ -459,47 +461,6 @@
   .slider-cell {
     display: flex;
     width: 8em;
-  }
-
-  /* Number inputs */
-  input[type="number"] {
-    background: var(--bg);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-1) var(--space-2);
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    font-variant-numeric: tabular-nums;
-  }
-  input[type="number"]:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  input[type="number"]:disabled {
-    color: var(--fg-muted);
-    border-color: var(--border);
-    cursor: not-allowed;
-  }
-  /* Trim Firefox / Chrome spinners — they steal width and the design tokens
-   * already make values legible. */
-  input[type="number"]::-webkit-outer-spin-button,
-  input[type="number"]::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
-  input[type="number"] {
-    -moz-appearance: textfield;
-    appearance: textfield;
-  }
-
-  /* Checkbox sits flush with its label. */
-  input[type="checkbox"] {
-    accent-color: var(--accent);
-    cursor: pointer;
-  }
-  input[type="checkbox"]:disabled {
-    cursor: not-allowed;
   }
 
   /* Tiny inline buttons (🎲, ✕) */

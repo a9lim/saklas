@@ -17,6 +17,7 @@
     refreshVectorList,
   } from "../lib/stores.svelte";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
+  import Select from "../lib/Select.svelte";
   import type { PairwiseCompareResponse } from "../lib/types";
 
   // Drawer host forwards { params } — unused here, but the prop must
@@ -38,6 +39,14 @@
 
   let conceptA = $state<string>("");
   let conceptB = $state<string>("");
+
+  /** Options for the A / B pickers — same list both sides; the
+   *  "(empty)" fallback only renders when the catalog is empty. */
+  const nameOptions = $derived(
+    names.length === 0
+      ? [{ value: "", label: "(empty)" }]
+      : names.map((n) => ({ value: n, label: n })),
+  );
   let data = $state<PairwiseCompareResponse | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
@@ -144,27 +153,21 @@
   <div class="picker-row">
     <label class="picker">
       <span class="picker-label">a</span>
-      <select bind:value={conceptA} disabled={names.length === 0}>
-        {#if names.length === 0}
-          <option value="">(empty)</option>
-        {:else}
-          {#each names as name (name)}
-            <option value={name}>{name}</option>
-          {/each}
-        {/if}
-      </select>
+      <Select
+        bind:value={conceptA}
+        options={nameOptions}
+        disabled={names.length === 0}
+        ariaLabel="Concept A"
+      />
     </label>
     <label class="picker">
       <span class="picker-label">b</span>
-      <select bind:value={conceptB} disabled={names.length === 0}>
-        {#if names.length === 0}
-          <option value="">(empty)</option>
-        {:else}
-          {#each names as name (name)}
-            <option value={name}>{name}</option>
-          {/each}
-        {/if}
-      </select>
+      <Select
+        bind:value={conceptB}
+        options={nameOptions}
+        disabled={names.length === 0}
+        ariaLabel="Concept B"
+      />
     </label>
   </div>
 
@@ -295,20 +298,8 @@
     font-size: var(--text-sm);
     text-transform: lowercase;
   }
-  .picker select {
-    background: var(--bg-alt);
-    color: var(--fg);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-2);
-    font: inherit;
-    font-size: var(--text-sm);
-    flex: 1 1 auto;
-    min-width: 0;
-  }
-  .picker select:focus {
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
-  }
+  /* The themed Select owns its own chrome — the picker label provides
+   * the only host styling. */
 
   .body {
     flex: 1 1 auto;
