@@ -64,13 +64,18 @@ echo ""
 echo "=== STAGE 3/4: vector extraction loop ==="
 date
 s3=0
+# Explicit `default/<c>` namespacing: bare names hit
+# ``AmbiguousSelectorError`` when the user keeps a sibling namespace
+# (`default-archive/`, `local/`, etc.) populated with the same concept
+# slugs.  The bundled vectors always live under `default/`, so qualify
+# at the source rather than depend on disambiguation.
 for c in $(ls saklas/data/vectors); do
     echo ""
-    echo "--- extracting: $c ---"
-    saklas vector extract "$c" -m "$MODEL" -f
+    echo "--- extracting: default/$c ---"
+    saklas vector extract "default/$c" -m "$MODEL" -f
     rc=$?
     if [ "$rc" -ne 0 ]; then
-        echo "vector extract failed for $c (rc=$rc) — continuing"
+        echo "vector extract failed for default/$c (rc=$rc) — continuing"
         s3="$rc"
     fi
 done
