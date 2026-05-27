@@ -30,9 +30,11 @@ binding constraint rather than corpus quality).  Anthropic's
 our compromise between paper-fidelity and a tractable one-time
 generation budget.  Coverage across the PSM trichotomy:
 
-- assistant-cluster (13): assistant, consultant, analyst, evaluator,
-  reviewer, auditor, advisor, examiner, mediator, facilitator,
-  coordinator, secretary, assessor
+- "assistant-spirit" (13, was assistant-cluster): assistant, consultant,
+  analyst, evaluator, reviewer, auditor, advisor, researcher, mediator,
+  impostor, conservative, secretary, liberal — mixes the original
+  examines / reports roles with an impostor archetype and two political
+  identities after the 2026-05-26 audit
 - everyday human roles (25): teacher, doctor, librarian, farmer,
   soldier, nurse, lawyer, chef, journalist, mechanic, electrician,
   carpenter, plumber, accountant, baker, gardener, fisherman, pilot,
@@ -40,12 +42,17 @@ generation budget.  Coverage across the PSM trichotomy:
 - pre-modern roles (12): caveman, monk, knight, scribe, alchemist,
   blacksmith, peasant, samurai, viking, gladiator, druid, shaman
 - creative / expressive (13): poet, bard, jester, philosopher, painter,
-  sculptor, dancer, novelist, comedian, musician, storyteller,
-  playwright, sage
-- fantastical (12): oracle, ghost, leviathan, wizard, vampire, mermaid,
+  sculptor, dancer, novelist, comedian, musician, actor, playwright,
+  sage
+- fantastical (12): oracle, ghost, phoenix, wizard, vampire, mermaid,
   dragon, centaur, sphinx, banshee, golem, witch
-- AI / non-human (12): robot, hive, chatbot, npc, android, drone,
-  hologram, alien, copilot, satellite, simulation, swarm
+- AI / non-human / mixed (12, was AI / non-human): robot, cyborg,
+  chatbot, probe, android, drone, loner, alien, mecha, deer, trickster,
+  goblin — the original cluster was the weakest (7 of 12 entries were
+  systems or hardware, not characters).  Now mixes sci-fi character
+  archetypes with an animal cross-reference (deer, matches saklas's
+  deer.wolf bipolar vector), a fantastical mischief-creature (goblin),
+  and two psych archetypes (loner, trickster) that didn't fit elsewhere
 - harmful cluster (13): virus, saboteur, spy, narcissist, demon,
   assassin, thief, conman, hacker, cultist, tyrant, traitor, vandal
 
@@ -94,15 +101,25 @@ STATEMENTS_PER_CONCEPT = 5
 # Roster — order is grouped by cluster for readability; the on-disk
 # order follows this list (NN_<label>.json zero-padded indices).
 PERSONAS: list[str] = [
-    # assistant-cluster (13) — anchors PC1's assistant pole if the axis
-    # falls out cleanly; beefed up from 4 to give the pole real
-    # centroid mass.
+    # Audit pass 2026-05-26 swapped out 13 abstract / non-character /
+    # near-synonym entries from the original 2026-04 roster, replacing
+    # them with concrete personas that span more semantic dimensions:
+    # psychological archetypes (impostor, loner, trickster), political
+    # identities (conservative, liberal), and an animal cross-reference
+    # (deer, matches saklas's bundled deer.wolf vector).  The original
+    # by-cluster grouping is preserved as a reading aid below, but each
+    # cluster now carries at least one off-theme entry — the per-cluster
+    # mass argument for PC1 anchoring is correspondingly weaker.  PCA
+    # over per-node centroids doesn't see cluster labels; the labels
+    # were always just for the file's reader.
+
+    # was "assistant-cluster" — now mixes "examines / reports" roles
+    # with two political identities and an impostor archetype.
     "assistant", "consultant", "analyst", "evaluator", "reviewer",
-    "auditor", "advisor", "examiner", "mediator", "facilitator",
-    "coordinator", "secretary", "assessor",
+    "auditor", "advisor", "researcher", "mediator", "impostor",
+    "conservative", "secretary", "liberal",
     # everyday human roles (25) — largest cluster; covers PSM's "real
-    # humans" leg with breadth across professions.  PC2 should still
-    # come out as human-vs-non-human cleanly.
+    # humans" leg with breadth across professions.
     "teacher", "doctor", "librarian", "farmer", "soldier", "nurse",
     "lawyer", "chef", "journalist", "mechanic", "electrician",
     "carpenter", "plumber", "accountant", "baker", "gardener",
@@ -113,21 +130,27 @@ PERSONAS: list[str] = [
     # anchors).
     "caveman", "monk", "knight", "scribe", "alchemist", "blacksmith",
     "peasant", "samurai", "viking", "gladiator", "druid", "shaman",
-    # creative / expressive (13) — bridges assistant-cluster to
-    # fantastical end on PC1; covers verbal/visual/performative arts.
+    # creative / expressive (13) — verbal / visual / performative arts.
+    # storyteller swapped for actor (performative, distinct from
+    # playwright + bard + novelist).
     "poet", "bard", "jester", "philosopher", "painter", "sculptor",
-    "dancer", "novelist", "comedian", "musician", "storyteller",
+    "dancer", "novelist", "comedian", "musician", "actor",
     "playwright", "sage",
-    # fantastical (12) — anchors PC1's fantastical pole.  Direct
-    # paper-anchors (oracle, ghost, leviathan) plus broader
-    # mythological-creature coverage.
-    "oracle", "ghost", "leviathan", "wizard", "vampire", "mermaid",
+    # fantastical (12) — mythological creatures.  leviathan swapped
+    # for phoenix (clearer first-person voice; biblical anchors are
+    # harder to inhabit than broadly-mythological ones).
+    "oracle", "ghost", "phoenix", "wizard", "vampire", "mermaid",
     "dragon", "centaur", "sphinx", "banshee", "golem", "witch",
-    # AI / non-human (12) — PSM's "fictional AI systems" leg.  Mix of
-    # paper-faithful (robot, chatbot) and saklas-user-relevant
-    # (copilot, simulation, swarm).
-    "robot", "hive", "chatbot", "npc", "android", "drone", "hologram",
-    "alien", "copilot", "satellite", "simulation", "swarm",
+    # was "AI / non-human" — was the weakest cluster (7 of 12 entries
+    # were systems or hardware, not characters).  Now mixes robot/
+    # chatbot/android/drone/alien with sci-fi character archetypes
+    # (cyborg, mecha, probe), plus three off-cluster picks (goblin —
+    # mischief-creature fantastical; deer — animal cross-referencing
+    # saklas's deer.wolf bipolar vector; loner + trickster — psych
+    # archetypes that didn't fit anywhere else and didn't seem worth
+    # creating a one-off cluster for).
+    "robot", "cyborg", "chatbot", "probe", "android", "drone", "loner",
+    "alien", "mecha", "deer", "trickster", "goblin",
     # harmful cluster (13) — proportional expansion of Anthropic's
     # named harmful slots.  Anti-allegory clause keeps them as
     # character archetypes, not harm instructions.
@@ -139,11 +162,14 @@ PERSONAS: list[str] = [
 DESCRIPTION = (
     "Persona archetypes drawn from Anthropic's Assistant Axis paper "
     "(arXiv 2601.10387) and the Persona Selection Model framing. 100 "
-    "nodes spanning assistant-cluster, everyday human roles, pre-modern "
-    "roles, creative archetypes, fantastical characters, AI / non-human "
-    "personas, and the named harmful cluster. PCA over per-node "
-    "centroids recovers the assistant-axis structure as the leading "
-    "component on any role-supporting model family."
+    "nodes spanning everyday human roles, pre-modern roles, creative "
+    "archetypes, fantastical characters, AI / sci-fi non-human "
+    "personas, the named harmful cluster, plus psychological "
+    "archetypes (impostor, loner, trickster) and political identities "
+    "(conservative, liberal) added in the 2026-05-26 audit to broaden "
+    "semantic coverage beyond profession/genre. PCA over per-node "
+    "centroids recovers a low-dim persona structure as the leading "
+    "components on role-supporting model families."
 )
 
 
