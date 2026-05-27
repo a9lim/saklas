@@ -10,7 +10,7 @@
   "recommended_alpha": 0.5,
   "source": "bundled",
   "files": {
-    "scenarios.json": "048aefed3dc1262562126cb2ef5614450fc6694a88ac08a129200ae379ec0ac5",
-    "statements.json": "fc66e3b209ea43fd7402310af64b03c2bf06ec099a9598bef6badff43d20f1a3"
+    "scenarios.json": "25dabc6347270d470eaae93d4b2afd61880adab7a89e8c41ca140f3e0a2eddd5",
+    "statements.json": "f9c6f5e8dcca35d912506b4e7486ec30abe29a1a4be28e8cd280b89bc49bc0ce"
   }
 }
