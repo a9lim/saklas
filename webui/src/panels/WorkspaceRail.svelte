@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Workspace rail — the primary navigation surface.  A slim 64px icon
+  // Workspace rail — the primary navigation surface.  A slim 48px icon
   // strip: three category icons, each opening a fly-out list of that
   // category's tools.  This is where the old Topbar "tools ▾" menu's
   // ~19 drawer launchers now live, so the topbar can stay a thin
@@ -33,7 +33,6 @@
         { label: "load vector…", drawer: "load" },
         { label: "merge vector…", drawer: "merge" },
         { label: "clone vector…", drawer: "clone" },
-        { label: "manifolds…", drawer: "manifolds" },
         { label: "packs…", drawer: "pack" },
       ],
     },

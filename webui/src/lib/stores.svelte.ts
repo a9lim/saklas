@@ -161,6 +161,28 @@ export async function resetChatToRoot(): Promise<void> {
   }
 }
 
+/** Clear the chat back to root.  Lifted out of Chat.svelte so the
+ *  threads-column action button can call the same code path the chat
+ *  header used to — queue-aware when generation is in flight, direct
+ *  when idle. */
+export function clearChat(): void {
+  if (genStatus.active || pendingActions.queue.length > 0) {
+    enqueuePending({
+      label: "/clear",
+      text: null,
+      apply: () => void resetChatToRoot(),
+      awaitsGen: false,
+      rebuild: null,
+      // /clear navigates to the synthetic root (system role) — not a
+      // user node, so the next submission goes through "message" mode
+      // and lands a fresh user branch off root.
+      endsOnUserNode: false,
+    });
+  } else {
+    void resetChatToRoot();
+  }
+}
+
 export async function rewindSession(): Promise<void> {
   await apiSessions.rewind();
   await refreshSession();

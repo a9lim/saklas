@@ -113,7 +113,10 @@
         {#if !monopolar}{poles.negative}{/if}
       </span>
       <div class="bar-cell" aria-hidden="true">
-        <Bar value={current} max={1} width={160} height={8} bipolar={!monopolar} />
+        <!-- Always center-anchored — monopolar probes share the same
+             0-in-the-middle axis as bipolar rows so the reader doesn't
+             have to switch mental models between adjacent rows. -->
+        <Bar value={current} max={1} width={160} height={8} bipolar />
       </div>
       <span class="pole pos" title={`positive pole (${poles.positive})`}>
         {poles.positive}

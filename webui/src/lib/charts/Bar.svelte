@@ -106,6 +106,14 @@
     fill: var(--bg-elev);
   }
   .fill {
-    transition: width var(--dur) var(--ease-out);
+    /* Animate both x and width together — the bipolar bar encodes
+     * negative values as (x = mid − filled, width = filled), so width-
+     * only transitions left the right edge detaching from the center
+     * tick mid-transition (visible as left/right jitter at the 0 line).
+     * Transitioning both keeps x + width = mid at every animation
+     * frame; positive bars (x ≡ 0) are unaffected. */
+    transition:
+      width var(--dur) var(--ease-out),
+      x var(--dur) var(--ease-out);
   }
 </style>

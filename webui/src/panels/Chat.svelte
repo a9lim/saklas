@@ -40,7 +40,6 @@
     navigateInputHistory,
     cancelInputPull,
     consumePulledSlot,
-    resetChatToRoot,
     rewindSession,
     sendPrefill,
     sendCommit,
@@ -452,24 +451,6 @@
   async function regen(input: string): Promise<void> {
     await rewindSession();
     void sendGenerate(input);
-  }
-
-  function clearChat(): void {
-    if (genStatus.active || pendingActions.queue.length > 0) {
-      enqueuePending({
-        label: "/clear",
-        text: null,
-        apply: () => void resetChatToRoot(),
-        awaitsGen: false,
-        rebuild: null,
-        // /clear navigates to the synthetic root (system role) — not a
-        // user node, so the next submission goes through "message" mode
-        // and lands a fresh user branch off root.
-        endsOnUserNode: false,
-      });
-    } else {
-      void resetChatToRoot();
-    }
   }
 
   function regenAction(): void {
@@ -900,31 +881,12 @@
       {genUiMode.mode}
     </button>
 
-    <!-- Conversation actions — clear / save / load / transcript / auto-
-         regen sit inline at the end of the header so they're one click
-         away. -->
+    <!-- Conversation actions — transcript + auto-regen.  Clear / save /
+         load moved up to the threads-column header (they act on the
+         whole tree, not on the active chat path). -->
     <div class="header-actions">
-      <button type="button" class="hbtn" onclick={clearChat}>
-        clear chat
-      </button>
-      <button
-        type="button"
-        class="hbtn"
-        onclick={() => openDrawer("save_conversation")}
-        title="Save this conversation tree to disk"
-      >
-        save conversation…
-      </button>
-      <button
-        type="button"
-        class="hbtn"
-        onclick={() => openDrawer("load_conversation")}
-        title="Load a saved conversation tree"
-      >
-        load conversation…
-      </button>
       <button type="button" class="hbtn" onclick={openTranscript}>
-        transcript…
+        transcript
       </button>
       <span class="ctl ctl-inline">
         <Checkbox

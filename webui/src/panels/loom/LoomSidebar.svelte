@@ -23,6 +23,7 @@
   import {
     applyTreeFilter,
     autoRegenState,
+    clearChat,
     clearNodeSelection,
     clearTreeFilter,
     currentRecipeOverride,
@@ -852,6 +853,33 @@
 >
   <header class="loom-header">
     <span class="title">threads</span>
+    <!-- Tree-scope actions — clear / save / load act on the whole
+         conversation tree, not on the active chat path, so they live in
+         the threads-column header rather than buried in the chat. -->
+    <button
+      type="button"
+      class="action-btn"
+      onclick={clearChat}
+      title="Clear chat back to root"
+    >
+      clear
+    </button>
+    <button
+      type="button"
+      class="action-btn"
+      onclick={() => openDrawer("save_conversation")}
+      title="Save this conversation tree to disk"
+    >
+      save
+    </button>
+    <button
+      type="button"
+      class="action-btn"
+      onclick={() => openDrawer("load_conversation")}
+      title="Load a saved conversation tree"
+    >
+      load
+    </button>
     <button
       type="button"
       class="icon-btn"
@@ -1348,9 +1376,10 @@
 
   .loom-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-2) var(--space-4);
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--border);
   }
   .title {
