@@ -1,9 +1,10 @@
 <script lang="ts">
-  // Workspace rail — the primary navigation surface.  A slim 48px icon
+  // Workspace rail — the primary navigation surface.  A slim 56px icon
   // strip: three category icons, each opening a fly-out list of that
   // category's tools.  This is where the old Topbar "tools ▾" menu's
   // ~19 drawer launchers now live, so the topbar can stay a thin
-  // brand + status strip.
+  // brand + status strip.  Width is sized to fit the longest category
+  // label ("ANALYSIS") at ``--text-2xs`` without right-edge clipping.
   //
   // Fly-outs are ``position: fixed`` (the rail-zone clips overflow) and
   // anchored off the clicked icon's bounding rect.
@@ -155,7 +156,7 @@
   .rail {
     display: flex;
     flex-direction: column;
-    padding: var(--space-5) var(--space-4);
+    padding: var(--space-5) var(--space-2);
     background: var(--bg-deep);
     border-right: 1px solid var(--border);
     min-height: 0;
@@ -170,6 +171,9 @@
   .rail-btn {
     min-height: 3.25rem;
     width: 100%;
+    /* Allow the grid item (label span) to overflow centered without
+     * forcing the cell to grow past the rail's content width. */
+    min-width: 0;
     display: grid;
     place-items: center;
     gap: var(--space-1);
@@ -177,7 +181,7 @@
     border-radius: var(--radius);
     background: transparent;
     color: var(--fg-subtle);
-    padding: var(--space-2) var(--space-1);
+    padding: var(--space-2) 0;
     font-family: var(--font-ui);
     cursor: pointer;
     transition:

@@ -603,10 +603,15 @@ export function setProbeSortMode(mode: ProbeSortMode): void {
   probeRack.sortMode = mode;
 }
 
-/** Update probe rows from a streaming token's full per-layer × per-probe
- * map.  Each entry records:
- *   - ``current`` / ``sparkline`` — deepest-layer value, used by the row's
- *     value bar + sparkline (proxy for "live trait reading").
+/** Update probe rows from a streaming token's aggregate scores plus full
+ * per-layer × per-probe map.  Each entry records:
+ *   - ``current`` / ``sparkline`` — the magnitude-weighted aggregate
+ *     (``||baked_L||``-weighted mean of per-layer cosines, the same value
+ *     the TUI trait panel and the post-generation projected pass display).
+ *     Reading from a single deepest-layer slice would freeze the meter at
+ *     zero for any probe whose profile doesn't cover that layer — DLS
+ *     routinely drops late layers for affect / social-stance probes — so
+ *     the aggregate is the only honest read.
  *   - ``perLayer`` — the full per-layer column for that probe at this
  *     token, used by the expanded layer strip.
  *
@@ -615,18 +620,14 @@ export function setProbeSortMode(mode: ProbeSortMode): void {
 const MAX_SPARKLINE = 60;
 export function updateProbeFromScores(
   perLayerScores: Record<string, Record<string, number>>,
+  aggregateScores: Record<string, number>,
 ): void {
-  // Layer keys are zero-padded ints from the server; sort numerically so
-  // "deepest" really means highest index regardless of insertion order.
-  const layers = Object.keys(perLayerScores).sort(
-    (a, b) => Number(a) - Number(b),
-  );
+  const layers = Object.keys(perLayerScores);
   if (layers.length === 0) return;
-  const deepest = layers[layers.length - 1];
 
   // Pivot: gather per-probe column across all layers in one pass so the
   // hot WS handler doesn't iterate L × P twice per token.
-  const probeNames = new Set<string>();
+  const probeNames = new Set<string>(Object.keys(aggregateScores));
   const perProbeLayer: Record<string, Record<string, number>> = {};
   for (const layer of layers) {
     const row = perLayerScores[layer] ?? {};
@@ -643,7 +644,7 @@ export function updateProbeFromScores(
   // strips frozen at zero throughout a generation.
   for (const name of probeNames) {
     const prev = probeRack.entries.get(name);
-    const val = perLayerScores[deepest]?.[name] ?? 0;
+    const val = aggregateScores[name] ?? 0;
     const previous = prev?.current ?? 0;
     const sparkline = prev ? prev.sparkline.slice() : [];
     sparkline.push(val);
@@ -1925,13 +1926,15 @@ function handleWsMessage(msg: WSServerMessage): void {
           }
         }
       }
-      // Update probe rack from the full per-layer × per-probe map.  The
-      // store derives the deepest-layer scalar for ``current``/sparkline
-      // and keeps the per-layer column on each entry for the expanded
+      // Update probe rack from the aggregate + per-layer × per-probe map.
+      // ``current`` / sparkline ride the magnitude-weighted aggregate (the
+      // TUI-equivalent scalar); the per-layer column feeds the expanded
       // layer-strip view.  Skip during shadow runs so the rack stays
-      // anchored to the steered branch's signal.
-      if (msg.per_layer_scores && !abState.processingAb) {
-        updateProbeFromScores(msg.per_layer_scores);
+      // anchored to the steered branch's signal.  The server emits
+      // ``per_layer_scores`` and ``scores`` together whenever probes are
+      // loaded, so both are present or both are absent.
+      if (msg.per_layer_scores && msg.scores && !abState.processingAb) {
+        updateProbeFromScores(msg.per_layer_scores, msg.scores);
       }
       return;
     }
