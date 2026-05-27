@@ -592,7 +592,7 @@ def fit_layer_subspace(
     node_params: torch.Tensor,
     *,
     n_components: int = DEFAULT_N_COMPONENTS,
-) -> LayerSubspace:
+) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer.
 
     ``centroids`` is ``(K, D)`` -- one per-node mean activation -- and
@@ -602,6 +602,14 @@ def fit_layer_subspace(
     the embedded coordinates are normalized to the unit box; an ``r**3``
     RBF is fitted from the normalized coordinates to the reduced
     activations.
+
+    Returns ``(LayerSubspace, explained_variance_ratio)``.  The EV ratio
+    is ``Σ σ_i² (retained) / Σ σ_i² (all)``, capturing the fraction of
+    inter-node centroid variance the chosen ``R``-dim subspace retains
+    — a per-layer fit-quality signal.  Used by manifold-steering's
+    additive-mode α normalization (poorly-fitted layers under-blend at
+    a given α, the ratio compensates).  Computed from the SVD that
+    already runs, so this is free.
     """
     centroids = centroids.to(torch.float32)
     node_params = node_params.to(torch.float32)
@@ -616,6 +624,18 @@ def fit_layer_subspace(
     basis = Vh[:R].contiguous()  # (R, D)
     coords = X @ basis.T          # (K, R) -- the values the RBF interpolates
 
+    # Per-layer explained variance ratio.  Total variance is
+    # ``Σ σ²`` (full spectrum); retained is ``Σ σ²[:R]``.  Falls back
+    # to 1.0 on a degenerate (all-zero singular values) layer rather
+    # than NaN — the downstream normalizer will treat it as
+    # "well-fitted" and skip the boost.
+    total_var = float(S.pow(2).sum().item())
+    retained_var = float(S[:R].pow(2).sum().item())
+    if total_var > 1e-12:
+        ev_ratio = retained_var / total_var
+    else:
+        ev_ratio = 1.0
+
     lo = node_params.min(dim=0).values
     hi = node_params.max(dim=0).values
     coord_offset = lo
@@ -623,11 +643,12 @@ def fit_layer_subspace(
     normalized = (node_params - coord_offset) / coord_scale
 
     rbf_weights, poly_coeffs = fit_rbf_interpolant(normalized, coords)
-    return LayerSubspace(
+    sub = LayerSubspace(
         mean=mean, basis=basis, node_params=normalized,
         rbf_weights=rbf_weights, poly_coeffs=poly_coeffs,
         coord_offset=coord_offset, coord_scale=coord_scale,
     )
+    return sub, ev_ratio
 
 
 # =============================================================== manifold ===
@@ -659,6 +680,15 @@ class Manifold:
     # non-role manifold carries).  Used by
     # :meth:`Manifold.nearest_node_role` for role-paired steering.
     node_roles: list[str | None] = field(default_factory=list)
+    # Per-layer PCA explained-variance ratio recorded at fit time.
+    # ``explained_variance[L] = Σ σ²[:R] / Σ σ² (all)`` where ``R`` is
+    # the retained subspace rank — a per-layer fit-quality signal used
+    # by additive-mode manifold steering to normalize per-α behavioral
+    # magnitude across manifolds of varying quality.  Empty dict on
+    # pre-v4 manifolds (no EV recorded at fit time) — the additive
+    # normalization falls back to "no quality correction" so legacy
+    # fits keep their pre-v4 behavior.
+    explained_variance: dict[int, float] = field(default_factory=dict)
 
     @property
     def layer_indices(self) -> list[int]:
@@ -678,6 +708,7 @@ class Manifold:
             feature_space=self.feature_space,
             metadata=dict(self.metadata),
             node_roles=list(self.node_roles),
+            explained_variance=dict(self.explained_variance),
         )
 
     def _position_tensor(
@@ -851,6 +882,13 @@ class Manifold:
         return j_act_authoring.T.contiguous()              # (n, D)
 
 
+# Per-position guard against degenerate rotation planes in
+# :func:`subspace_rotate` — matches the hot-path
+# ``_ANGULAR_PERP_EPSILON`` in :mod:`saklas.core.hooks` but defined
+# locally so this module stays free of inter-core imports.
+_ROTATE_EPSILON: float = 1e-6
+
+
 def subspace_replace(
     h: torch.Tensor,
     mean: torch.Tensor,
@@ -878,6 +916,11 @@ def subspace_replace(
     hook.  This generalizes the ``~`` / ``|`` line-projection operators
     from a 1-D direction to an R-dimensional subspace.
 
+    Pairs with the ``"additive"`` session injection mode for manifold
+    terms — the destructive linear blend matches additive vector
+    steering's overwrite-and-rescale shape.  Under ``"angular"`` the
+    manifold hook routes to :func:`subspace_rotate` instead.
+
     Returns a new tensor; the caller copies it in place.  fp32
     intermediates throughout (fp16 sum-of-squares overflows at large
     hidden dim).
@@ -898,6 +941,126 @@ def subspace_replace(
         h_new, dim=-1, keepdim=True,
     ).clamp(min=1e-6)
     h_new = h_new * (norm_pre / norm_post)
+    return h_new.to(h.dtype)
+
+
+def subspace_rotate(
+    h: torch.Tensor,
+    mean: torch.Tensor,
+    basis: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float | torch.Tensor,
+    theta_max: float,
+) -> torch.Tensor:
+    """Angular-in-subspace: rotate ``h``'s in-subspace component toward ``target``.
+
+    The angular analogue of :func:`subspace_replace` and the manifold-
+    side companion to the angular vector-steering hot path.  Decomposes
+    ``h = mean + h_par_c + h_perp`` where ``h_par_c`` is the centered
+    in-subspace component and ``h_perp`` the orthogonal residual.  In the
+    2-D plane spanned (within the subspace) by ``h_par_c`` and the
+    centered target ``target - mean``, ``h_par_c`` is rotated toward the
+    target by angle ``θ = α · θ_max`` -- a Givens rotation that preserves
+    ``||h_par_c||`` exactly.  ``h_perp`` is left untouched, so
+    ``||h - mean|| = ||h' - mean||`` by construction and no norm-restore
+    is needed.
+
+    Compared to :func:`subspace_replace`:
+
+    - **Magnitude of the in-subspace component** is preserved here;
+      replace overrides it (the target's magnitude wins at ``α=1``).
+    - **No global norm-restore.**  Replace has to rescale ``h`` because
+      the linear blend changes ``||h_par||``; the rotation doesn't.
+    - **At α=1** rotate lands at a full ``θ_max`` rotation toward the
+      target (default ``π/2``), not at the target itself.  The target's
+      *direction* in subspace coordinates is matched (under a sign /
+      anti-alignment caveat); the magnitude stays the running
+      activation's.
+
+    Suitable for manifolds whose intrinsic geometry is flat (open
+    :class:`BoxDomain`, :class:`CustomDomain` -- including every
+    discover-mode fit), where the in-subspace direction toward a node
+    is what carries persona / state identity rather than its absolute
+    magnitude.  For curved domains :func:`subspace_replace` keeps the
+    "land on the surface" semantics; the hook dispatches by session
+    injection mode rather than by domain class so the user gets the
+    same angular ↔ additive knob they have for vector steering.
+
+    Returns a new tensor; the caller copies it in place.  fp32
+    intermediates throughout (fp16 sum-of-squares overflows at large
+    hidden dim).  Per-position degeneracies -- ``||h_par_c|| < ε`` (we
+    are at the manifold origin) or ``||w|| < ε`` (h_par already
+    (anti-)aligned with the target) -- fall back to identity through a
+    ``torch.where`` mask, matching the angular vector hot path's
+    near-aligned guard.
+    """
+    h_f32 = h.to(torch.float32)
+    mean_f32 = mean.to(torch.float32)
+    basis_f32 = basis.to(torch.float32)
+    target_f32 = target.to(torch.float32)
+
+    centered = h_f32 - mean_f32                          # (.., D)
+    coords = centered @ basis_f32.T                      # (.., R)
+    h_par_c = coords @ basis_f32                         # (.., D) in subspace
+    h_perp = centered - h_par_c                          # (.., D) orthogonal
+
+    target_c = target_f32 - mean_f32                     # (D,) in subspace
+    target_norm = torch.linalg.vector_norm(target_c).clamp(min=_ROTATE_EPSILON)
+    target_unit = target_c / target_norm                 # (D,)
+
+    h_par_norm = torch.linalg.vector_norm(
+        h_par_c, dim=-1, keepdim=True,
+    )                                                    # (.., 1)
+    safe_par_norm = h_par_norm.clamp(min=_ROTATE_EPSILON)
+    u = h_par_c / safe_par_norm                          # (.., D) per-position unit
+
+    # In-plane orthogonal axis pointing from u toward target_unit.
+    cos0 = (u * target_unit).sum(dim=-1, keepdim=True)   # (.., 1)
+    w = target_unit - cos0 * u                           # (.., D)
+    w_norm = torch.linalg.vector_norm(w, dim=-1, keepdim=True)
+    safe_w_norm = w_norm.clamp(min=_ROTATE_EPSILON)
+    w_unit = w / safe_w_norm                             # (.., D)
+
+    # ``theta`` accepts a Python scalar or a 0-dim tensor; the hook calls
+    # us with a Python float since ``theta_max`` is stamped at recompose
+    # time, but allow tensor inputs for callers that want a per-position
+    # angle (e.g. tests, or a future per-layer-share schedule).
+    cos_t: float | torch.Tensor
+    sin_t: float | torch.Tensor
+    if isinstance(alpha, torch.Tensor) or isinstance(theta_max, torch.Tensor):
+        theta_t = (
+            alpha if isinstance(alpha, torch.Tensor) else torch.as_tensor(alpha)
+        ) * (
+            theta_max
+            if isinstance(theta_max, torch.Tensor)
+            else torch.as_tensor(theta_max)
+        )
+        cos_t = torch.cos(theta_t)
+        sin_t = torch.sin(theta_t)
+    else:
+        theta = float(alpha) * float(theta_max)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+
+    rotated_unit = cos_t * u + sin_t * w_unit            # (.., D)
+    h_par_new = h_par_norm * rotated_unit                # (.., D)
+
+    # Identity fallback at ill-defined rotation planes:
+    #   - h_par_c ≈ 0: we are at the manifold origin, no "direction
+    #     from which to rotate" — leave hidden alone (a separate
+    #     translation toward the target is what subspace_replace
+    #     would do; angular preserves the centered magnitude).
+    #   - w ≈ 0: h_par already (anti-)aligned with target; the 2-D
+    #     rotation plane is undefined.  Anti-aligned is the case where
+    #     a rotation could most aggressively flip the persona signal,
+    #     but the plane to do it in isn't determined by geometry alone
+    #     — identity is the conservative fallback.
+    degenerate = (
+        (h_par_norm < _ROTATE_EPSILON) | (w_norm < _ROTATE_EPSILON)
+    )                                                    # (.., 1)
+    h_par_new = torch.where(degenerate, h_par_c, h_par_new)
+
+    h_new = mean_f32 + h_par_new + h_perp
     return h_new.to(h.dtype)
 
 
@@ -1334,6 +1497,15 @@ def save_manifold(
         "node_count": len(manifold.node_labels),
         "feature_space": manifold.feature_space,
     }
+    # Per-layer explained-variance ratio (v4+).  Stored as
+    # ``{str(idx): float}`` for JSON compatibility; loaded back into
+    # an ``int``-keyed dict.  Older fits without EV simply skip the
+    # field and load with an empty dict downstream.
+    if manifold.explained_variance:
+        sidecar["explained_variance_per_layer"] = {
+            str(idx): float(v)
+            for idx, v in manifold.explained_variance.items()
+        }
     for key in (
         "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
         # Discover-mode fields.  ``fit_mode`` discriminates authored vs
@@ -1394,6 +1566,11 @@ def load_manifold(path: str | Path) -> Manifold:
     if node_coords is None:
         node_coords = torch.zeros(0, domain.intrinsic_dim)
 
+    ev_raw = sidecar.get("explained_variance_per_layer") or {}
+    explained_variance: dict[int, float] = {
+        int(k): float(v) for k, v in ev_raw.items()
+    }
+
     return Manifold(
         name=sidecar.get("name", path.parent.name),
         domain=domain,
@@ -1405,6 +1582,7 @@ def load_manifold(path: str | Path) -> Manifold:
         # ``node_roles`` is absent on non-role manifolds (every
         # pre-Phase-A fit); the loaded list stays empty in that case.
         node_roles=list(sidecar.get("node_roles", [])),
+        explained_variance=explained_variance,
     )
 
 
@@ -1507,9 +1685,10 @@ def fit_behavior_manifold(
     applied there.  Returns the fitted :class:`LayerSubspace` (the
     behavior manifold).
     """
-    return fit_layer_subspace(
+    sub, _ev = fit_layer_subspace(
         to_hellinger(centroid_dists), node_params, n_components=n_components,
     )
+    return sub
 
 
 def trajectory_naturalness(
@@ -1624,6 +1803,7 @@ __all__ = [
     "eval_rbf_jacobian",
     "fit_layer_subspace",
     "subspace_replace",
+    "subspace_rotate",
     "PcaDiagnostics",
     "SpectralDiagnostics",
     "derive_pca_coords",

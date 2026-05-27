@@ -1086,6 +1086,7 @@ class ManifoldExtractionPipeline:
             f"Fitting RBF interpolant across {len(fit_layers)} layers..."
         )
         layer_subs = {}
+        explained_variance: dict[int, float] = {}
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
             fit_kwargs["n_components"] = max_subspace_dim_override
@@ -1098,9 +1099,11 @@ class ManifoldExtractionPipeline:
                     feat = sae_backend.encode_layer(idx, stacked.to(device))
                     recon = sae_backend.decode_layer(idx, feat)
                 stacked = recon.detach().to("cpu", torch.float32)
-            layer_subs[idx] = fit_layer_subspace(
+            sub, ev_ratio = fit_layer_subspace(
                 stacked, node_params, **fit_kwargs,
             )
+            layer_subs[idx] = sub
+            explained_variance[idx] = ev_ratio
 
         manifold = Manifold(
             name=mf.name,
@@ -1109,6 +1112,7 @@ class ManifoldExtractionPipeline:
             node_coords=node_coords,
             layers=layer_subs,
             feature_space=feature_space,
+            explained_variance=explained_variance,
         )
 
         # 5. Persist + refresh the folder integrity manifest.

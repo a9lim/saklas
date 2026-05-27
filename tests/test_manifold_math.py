@@ -19,16 +19,25 @@ from saklas.core.manifold import (
     domain_from_spec,
     eval_rbf,
     eval_rbf_jacobian,
-    fit_layer_subspace,
+    fit_layer_subspace as _fit_layer_subspace_with_ev,  # returns (LayerSubspace, ev_ratio)
     fit_rbf_interpolant,
     invert_parameterization,
     load_manifold,
     save_manifold,
     subspace_replace,
+    subspace_rotate,
 )
 
 
 # ------------------------------------------------------------------ domains ---
+
+def fit_layer_subspace(*args, **kwargs):
+    """Test alias dropping the EV ratio.  ``core.manifold.fit_layer_subspace``
+    returns ``(LayerSubspace, ev_ratio)``; most tests don't care about the
+    second half, so unpack here once."""
+    sub, _ev = _fit_layer_subspace_with_ev(*args, **kwargs)
+    return sub
+
 
 def test_box_domain_dims():
     d = BoxDomain([
@@ -272,6 +281,46 @@ def test_fit_layer_subspace_rejects_too_few_nodes():
         fit_layer_subspace(torch.randn(2, 8), torch.rand(2, 1))
 
 
+def test_fit_layer_subspace_returns_ev_ratio():
+    """The new tuple-return shape carries an explained-variance ratio
+    alongside the LayerSubspace.  EV ∈ [0, 1]: when the chosen R
+    captures all of the centered centroid variance EV ≈ 1.0; when R
+    is capped below the centroids' effective rank, EV drops below 1.
+
+    K centroids in any D form a rank-at-most-(K-1) centered matrix,
+    so the default ``n_components=64`` retains everything at small K.
+    To get EV < 1 we need to cap ``n_components`` below the centroids'
+    effective rank — that's exactly the regime the bundled
+    ``personas`` manifold uses (R=8, retained < total variance).
+    """
+    # Clean case: rank-2 planar circle, default R cap → EV = 1.0.
+    centroids, _domain, node_params = _circle(8, dim=16)
+    sub, ev = _fit_layer_subspace_with_ev(centroids, node_params)
+    assert sub.rank == 2
+    assert 0.99 <= ev <= 1.000001
+
+    # Capped case: 9 centroids in dim=32, capped at R=2.  The full
+    # centered rank is min(K-1, D) = 8, so retaining only the top 2
+    # singular values discards the remaining 6 → EV well below 1.
+    torch.manual_seed(11)
+    K, D = 9, 32
+    isotropic_centroids = torch.randn(K, D)
+    _grid_coords = torch.tensor([[x, y] for x in (0.0, 0.5, 1.0)
+                                          for y in (0.0, 0.5, 1.0)])
+    _domain_g = BoxDomain([
+        BoxAxis("u", periodic=False, lo=0.0, hi=1.0),
+        BoxAxis("v", periodic=False, lo=0.0, hi=1.0),
+    ])
+    _node_params_g = _domain_g.embed(_grid_coords)
+    _sub_capped, ev_capped = _fit_layer_subspace_with_ev(
+        isotropic_centroids, _node_params_g, n_components=2,
+    )
+    assert 0.0 < ev_capped < 0.9   # 2/8 ≈ 25% on average for isotropic
+    # The capped case retains less of the total centroid variance —
+    # fit quality is captured by EV.
+    assert ev_capped < ev
+
+
 # ------------------------------------------------------------------- tangent ---
 
 def test_tangent_matches_finite_difference():
@@ -355,6 +404,112 @@ def test_subspace_replace_alpha_one_lands_on_target():
     expected_dir = h_perp + target
     cos = torch.dot(out, expected_dir) / (out.norm() * expected_dir.norm())
     assert cos.item() == pytest.approx(1.0, abs=1e-4)
+
+
+# ------------------------------------------------------------ subspace_rotate ---
+
+def test_subspace_rotate_alpha_zero_is_identity():
+    torch.manual_seed(0)
+    dim = 32
+    h = torch.randn(4, dim)
+    mean = torch.randn(dim)
+    basis = _ortho_basis(3, dim)
+    target = torch.randn(3) @ basis + mean
+    out = subspace_rotate(h, mean, basis, target, alpha=0.0, theta_max=math.pi / 2)
+    assert torch.allclose(out, h, atol=1e-5)
+
+
+def test_subspace_rotate_preserves_centered_norm():
+    """``||h - mean||`` is invariant — rotation in the subspace plane
+    leaves ``||h_par||`` exact and ``h_perp`` untouched, so the centered
+    magnitude is conserved without a norm-restore step."""
+    torch.manual_seed(1)
+    dim = 48
+    h = torch.randn(5, dim)
+    mean = torch.randn(dim)
+    basis = _ortho_basis(4, dim)
+    target = torch.randn(4) @ basis + mean
+    centered_before = (h - mean).norm(dim=-1)
+    for alpha in (0.1, 0.25, 0.5, 1.0):
+        out = subspace_rotate(
+            h, mean, basis, target, alpha=alpha, theta_max=math.pi / 2,
+        )
+        centered_after = (out - mean).norm(dim=-1)
+        assert torch.allclose(centered_after, centered_before, atol=1e-4)
+
+
+def test_subspace_rotate_preserves_h_perp():
+    """The orthogonal-to-subspace component is the part the manifold has
+    no opinion about — keep it bit-stable through the rotation."""
+    torch.manual_seed(2)
+    dim = 40
+    h = torch.randn(3, dim)
+    mean = torch.randn(dim)
+    basis = _ortho_basis(3, dim)
+    target = torch.randn(3) @ basis + mean
+    centered = h - mean
+    h_par_before = (centered @ basis.T) @ basis
+    h_perp_before = centered - h_par_before
+    out = subspace_rotate(
+        h, mean, basis, target, alpha=0.6, theta_max=math.pi / 2,
+    )
+    centered_after = out - mean
+    h_par_after = (centered_after @ basis.T) @ basis
+    h_perp_after = centered_after - h_par_after
+    assert torch.allclose(h_perp_after, h_perp_before, atol=1e-4)
+
+
+def test_subspace_rotate_alpha_one_aligns_h_par_with_target():
+    """At α=1 with θ_max=π/2 the rotation lands ``h_par`` orthogonal to
+    its starting direction, in the plane toward the target — its
+    *centered direction* coincides with the in-plane perpendicular axis
+    pointing from ``h_par`` toward the target.  This is the angular
+    analogue of subspace_replace's "snap onto target" — magnitudes are
+    preserved (h_par magnitude stays), directions are matched modulo the
+    rotation plane's in-plane orthogonal vector."""
+    torch.manual_seed(3)
+    dim = 24
+    h = torch.randn(dim)
+    mean = torch.randn(dim)
+    basis = _ortho_basis(3, dim)
+    target = torch.randn(3) @ basis + mean
+
+    centered = h - mean
+    h_par_c = (centered @ basis.T) @ basis
+    target_c = target - mean
+    u = h_par_c / h_par_c.norm()
+    target_unit = target_c / target_c.norm()
+    cos0 = (u * target_unit).sum()
+    w = target_unit - cos0 * u
+    w_unit = w / w.norm()
+
+    out = subspace_rotate(
+        h, mean, basis, target, alpha=1.0, theta_max=math.pi / 2,
+    )
+    centered_after = out - mean
+    h_par_after = (centered_after @ basis.T) @ basis
+    # h_par_after should be norm * w_unit (cos(π/2)=0, sin(π/2)=1).
+    cos = torch.dot(h_par_after, w_unit) / h_par_after.norm()
+    assert cos.item() == pytest.approx(1.0, abs=1e-3)
+    assert h_par_after.norm().item() == pytest.approx(
+        h_par_c.norm().item(), abs=1e-3,
+    )
+
+
+def test_subspace_rotate_degenerate_h_par_is_identity():
+    """At the manifold origin (h ≈ mean) the rotation plane is
+    undefined — fall back to identity rather than emit NaN."""
+    torch.manual_seed(4)
+    dim = 16
+    mean = torch.randn(dim)
+    basis = _ortho_basis(3, dim)
+    # Put h exactly on the manifold mean -- h_par_c is zero.
+    h = mean.clone().unsqueeze(0)
+    target = torch.randn(3) @ basis + mean
+    out = subspace_rotate(
+        h, mean, basis, target, alpha=0.7, theta_max=math.pi / 2,
+    )
+    assert torch.allclose(out, h, atol=1e-5)
 
 
 # ----------------------------------------------------------------- save/load ---

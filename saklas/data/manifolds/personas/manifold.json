@@ -1,5 +1,5 @@
 {
-  "format_version": 3,
+  "format_version": 4,
   "name": "personas",
   "description": "Persona archetypes drawn from Anthropic's Assistant Axis paper (arXiv 2601.10387) and the Persona Selection Model framing. 100 nodes spanning everyday human roles, pre-modern roles, creative archetypes, fantastical characters, AI / sci-fi non-human personas, the named harmful cluster, plus psychological archetypes (impostor, loner, trickster) and political identities (conservative, liberal) added in the 2026-05-26 audit to broaden semantic coverage beyond profession/genre. PCA over per-node centroids recovers a low-dim persona structure as the leading components on role-supporting model families.",
   "fit_mode": "pca",

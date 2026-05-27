@@ -7,7 +7,7 @@ from typing import Literal
 
 import torch
 
-from saklas.core.manifold import subspace_replace
+from saklas.core.manifold import eval_rbf, subspace_replace, subspace_rotate
 from saklas.core.triggers import Trigger, TriggerContext
 
 
@@ -608,20 +608,42 @@ class SteeringHook:
     def _apply_manifold_groups(
         self, hidden: torch.Tensor, ctx: TriggerContext,
     ) -> None:
-        """Apply every active manifold group as a soft subspace-replace.
+        """Apply every active manifold group as a subspace blend or rotation.
 
-        Each group blends ``hidden``'s projection onto the manifold's PCA
-        subspace toward the precomputed spline target by ``alpha`` and
-        restores the original per-position norm.  Runs after ablation and
-        additive so the destructive in-subspace overwrite wins at the
-        layers it covers.
+        Dispatches on :attr:`injection_mode`:
+
+        - ``"additive"`` -> :func:`subspace_replace`: blend ``hidden``'s
+          projection onto the manifold's PCA subspace toward the
+          precomputed spline target by ``alpha`` and restore the original
+          per-position norm.  Destructive in-subspace overwrite.
+        - ``"angular"`` -> :func:`subspace_rotate`: Givens-rotate
+          ``hidden``'s in-subspace component toward the target by
+          ``α · θ_max`` inside the subspace plane; the orthogonal
+          residual is kept verbatim, ``||hidden - mean||`` is preserved
+          by construction, no rescale.
+
+        Runs after ablation and additive so the in-subspace operation
+        wins at the layers it covers, regardless of mode.
         """
-        for trig, basis, mean, target, alpha in self.manifold_groups:
-            if not trig.active(ctx):
-                continue
-            hidden.copy_(
-                subspace_replace(hidden, mean, basis, target, alpha)
-            )
+        if not self.manifold_groups:
+            return
+        if self.injection_mode == "angular":
+            theta_max = self.theta_max
+            for trig, basis, mean, target, alpha in self.manifold_groups:
+                if not trig.active(ctx):
+                    continue
+                hidden.copy_(
+                    subspace_rotate(
+                        hidden, mean, basis, target, alpha, theta_max,
+                    )
+                )
+        else:
+            for trig, basis, mean, target, alpha in self.manifold_groups:
+                if not trig.active(ctx):
+                    continue
+                hidden.copy_(
+                    subspace_replace(hidden, mean, basis, target, alpha)
+                )
 
     def attach(self, layer_module: torch.nn.Module) -> None:
         """Register forward hook on a layer module."""
@@ -676,6 +698,39 @@ class SteeringHook:
 # intensity and leaving generous headroom for the long tail of untested
 # architectures.
 _STEER_GAIN = 2.0
+
+
+# Per-mode gains that pin the user-facing alpha scale for manifold
+# steering, analogous to :data:`_STEER_GAIN` for vector steering.
+# Manifold injection rotates / blends only ``h_par`` (the projection
+# of ``h`` into the manifold's R-dim affine subspace, where ``R`` is
+# typically 8) — roughly ``sqrt(R/D) ≈ 4%`` of ``||h||`` at typical
+# hidden dims.  The per-α behavioral effect is therefore far smaller
+# than vector steering's full-residual rotation, and the gain
+# compensates for the geometry.  Without it, share-weighted manifold
+# steering at ``α ≤ 1`` produces no visible behavioral change; the
+# layer-compounding in the pre-share-weighted hook was implicitly
+# serving as a gain.
+#
+# Calibrated so ``α ≈ 0.5`` on the bundled ``personas`` manifold
+# (gemma-4-31b-it, R=8, ~30 manifold-covered layers) lands in the
+# coherent persona-expression band — vector-comparable so users don't
+# carry two α-regimes in their head.
+#
+# Per-mode because the operators are differently lossy.  Angular
+# (``subspace_rotate``) is geometrically clean: rotate ``h_par`` toward
+# the target by an exact angle, no rescale.  Additive
+# (``subspace_replace``) blends ``h_par`` toward target then
+# norm-restores ``||h||``, which partially undoes the steering —
+# empirically replace needs ~2× the cumulative budget rotate does to
+# produce comparable behavior.  Mirrors vector steering's pattern of
+# ``_STEER_GAIN`` applying only to additive vector mode (here both
+# modes need a gain, additive needs more); the additive gain is
+# stamped as ``angular × _STEER_GAIN`` so the multiplicative
+# relationship between the operators stays consistent across
+# vector/manifold steering.
+_MANIFOLD_GAIN_ANGULAR = 8.0
+_MANIFOLD_GAIN_ADDITIVE = _MANIFOLD_GAIN_ANGULAR * _STEER_GAIN  # = 16.0
 
 
 class SteeringManager:
@@ -913,6 +968,25 @@ class SteeringManager:
         # never reaches the hot path.  Only one manifold may cover a
         # given layer — two would each destructively overwrite the
         # in-subspace component, so their composition is ill-defined.
+        #
+        # Per-layer α is share-weighted, exactly analogous to vector
+        # steering's ``share_L = ||baked_L|| / Σ ||baked||``.  The
+        # manifold's per-layer "signal strength" is the Frobenius norm
+        # of the centered node centroids in subspace coords — i.e. how
+        # widely the per-node centroids spread inside this layer's
+        # affine PCA subspace, which is the manifold analogue of "how
+        # discriminative is this layer for the steered concept."  We
+        # recover that by evaluating the RBF interpolant at the node
+        # parameters themselves: the RBF is exact at fit points, so
+        # ``eval_rbf(node_params, ..., node_params) == centered
+        # centroid coords`` by construction, with no need to store the
+        # singular values separately.  Layers with weak persona
+        # separation get a small slice of α; the cumulative budget
+        # ``Σ_L α · share_L = α`` regardless of how many layers the
+        # manifold covers, so the user-facing α-regime is
+        # layer-count-invariant and matches the vector-steering
+        # idiom.  Degenerate (all-zero) shares fall back to uniform
+        # ``1/N`` so behavior stays defined even on a pathological fit.
         manifold_by_layer: dict[
             int,
             list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, Trigger]],
@@ -923,6 +997,68 @@ class SteeringManager:
             position = m["position"]
             trigger = m["trigger"]
             alpha = max(0.0, min(1.0, float(m["alpha"])))
+
+            layer_scores: dict[int, float] = {}
+            for layer_idx, sub in manifold.layers.items():
+                node_coords = eval_rbf(
+                    sub.node_params, sub.rbf_weights, sub.poly_coeffs,
+                    sub.node_params,
+                )  # (K, R) — exact centered coords at the fit nodes
+                layer_scores[layer_idx] = float(
+                    torch.linalg.vector_norm(node_coords).item()
+                )
+            total_score = sum(layer_scores.values())
+            if total_score <= 1e-12:
+                # Degenerate manifold (all centroids collapse to mean);
+                # fall back to flat per-layer share so we still ship a
+                # layer-count-invariant budget rather than NaNs.
+                n_layers = max(1, len(manifold.layers))
+                shares = {L: 1.0 / n_layers for L in manifold.layers}
+            else:
+                shares = {
+                    L: s / total_score for L, s in layer_scores.items()
+                }
+
+            # Dispatch the per-mode gain.  Angular and additive
+            # manifold injections have different per-α behavioral
+            # magnitudes (see the gain constants' docstring); the
+            # session injection mode determines which one we calibrate
+            # against here.  Per-call ``Steering.injection_mode``
+            # overrides flow through ``self.injection_mode`` already.
+            if self.injection_mode == "angular":
+                manifold_gain = _MANIFOLD_GAIN_ANGULAR
+            else:
+                manifold_gain = _MANIFOLD_GAIN_ADDITIVE
+
+            # Additive-mode fit-quality normalization (v4+ manifolds
+            # only).  The replace operator's per-α behavioral magnitude
+            # scales with the per-layer centroid magnitude ``||target
+            # - h_par||``, which in turn reflects how much of the
+            # inter-node variance the chosen R-dim subspace captured.
+            # A poorly-fitted manifold (mean EV ratio ≪ 1) blends
+            # weakly at a given α; ``1/√mean_EV`` boosts α to roughly
+            # equalize behavioral strength across manifolds of varying
+            # fit quality.  Angular mode skips this — ``subspace_rotate``
+            # is direction-only (the rotation angle is α·θ_max
+            # independent of ``||target||``), so EV affects coherence
+            # of the rotation direction but not its magnitude, and no
+            # α correction can help with that.  Falls back to 1.0 on
+            # pre-v4 manifolds with no EV recorded — legacy fits
+            # behave as they did before this change.
+            if (
+                self.injection_mode == "additive"
+                and manifold.explained_variance
+            ):
+                mean_ev = sum(manifold.explained_variance.values()) / len(
+                    manifold.explained_variance
+                )
+                # Clamp the boost so a degenerate near-zero-EV manifold
+                # doesn't multiply α by ∞.  At mean_ev=0.01 the factor
+                # caps at 10×, well past any sensible regime.
+                quality_factor = 1.0 / math.sqrt(max(mean_ev, 0.01))
+            else:
+                quality_factor = 1.0
+
             for layer_idx, sub in manifold.layers.items():
                 if layer_idx in manifold_owner:
                     from saklas.core.steering_expr import SteeringExprError
@@ -933,8 +1069,18 @@ class SteeringManager:
                     )
                 manifold_owner[layer_idx] = mname
                 target = manifold.manifold_point(layer_idx, position)
+                # ``_MANIFOLD_GAIN_*`` pin the user-facing α scale into
+                # vector-comparable territory; share-weighting alone
+                # leaves the cumulative budget at ``α · θ_max`` which
+                # is too small to drive a visible effect through the
+                # manifold's ``h_par``-only injection geometry.  The
+                # ``quality_factor`` is 1.0 outside additive-mode +
+                # v4-manifold combinations.
+                effective_alpha = (
+                    alpha * shares[layer_idx] * manifold_gain * quality_factor
+                )
                 manifold_by_layer.setdefault(layer_idx, []).append(
-                    (sub.basis, sub.mean, target, alpha, trigger),
+                    (sub.basis, sub.mean, target, effective_alpha, trigger),
                 )
 
         active_layers = (

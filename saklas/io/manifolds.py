@@ -116,7 +116,15 @@ def _sanitize_hyperparams(
 # v3 is the arbitrary-dimensional / arbitrary-topology format (domain
 # spec + per-node coordinates); v2 and earlier were the 1-D cyclic-spline
 # format and must be converted with ``scripts/upgrade_manifolds.py``.
-MANIFOLD_FORMAT_VERSION = 3
+# v4 adds the per-layer ``explained_variance_per_layer`` sidecar field
+# used by additive-mode manifold steering's quality normalization — the
+# field rides on optional sidecar metadata, so a v3 manifold loads at
+# v4 fine *except* that we want users to refit so the EV value is
+# populated and the normalizer can kick in.  Bumping the version forces
+# materialize_bundled_manifolds to refresh the bundled fit on next
+# session start; user-fit v3 manifolds will need ``saklas vector
+# manifold fit`` to pick up the new field.
+MANIFOLD_FORMAT_VERSION = 4
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
