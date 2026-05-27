@@ -965,6 +965,31 @@ class ManifoldExtractionPipeline:
             # the dispatcher doesn't get an unexpected kwarg.
             if "max_subspace_dim" in hyperparams:
                 max_subspace_dim_override = int(hyperparams.pop("max_subspace_dim"))
+            # ``anchor_origin`` is the post-discover origin-anchoring
+            # toggle (see ``_HYPERPARAMS_BY_MODE`` in ``io/manifolds.py``
+            # for the semantics).  We pop it here so the discover
+            # dispatcher doesn't see it, and apply the translation after
+            # ``discover_coords`` returns.  Spectral mode rejects it at
+            # the sanitization gate; assert here for defense in depth.
+            anchor_origin_raw = hyperparams.pop("anchor_origin", None)
+            if anchor_origin_raw is not None and mf.fit_mode != "pca":
+                raise ValueError(
+                    f"discover manifold {mf.name!r}: anchor_origin is "
+                    f"only supported for fit_mode='pca' (got {mf.fit_mode!r})"
+                )
+            anchor_label: str | None
+            if anchor_origin_raw in (None, False):
+                anchor_label = None
+            elif anchor_origin_raw is True:
+                anchor_label = "default"
+            elif isinstance(anchor_origin_raw, str) and anchor_origin_raw:
+                anchor_label = anchor_origin_raw
+            else:
+                raise ValueError(
+                    f"discover manifold {mf.name!r}: anchor_origin must "
+                    f"be a bool or non-empty string label, got "
+                    f"{anchor_origin_raw!r}"
+                )
             if ref_layer not in fit_layers:
                 raise ValueError(
                     f"discover manifold {mf.name!r}: reference_layer "
@@ -994,6 +1019,30 @@ class ManifoldExtractionPipeline:
                     f"discover manifold {mf.name!r}: picked k={k} needs "
                     f">= {floor} nodes for the RBF fit, got K={K}"
                 )
+            # Origin anchoring (pca-discover only).  Find the anchor
+            # node by label, take its row from ``derived_coords`` as the
+            # pre-translate authoring coord, and shift every coord by
+            # ``-anchor_coord`` — the anchor lands at ``(0, ..., 0)`` in
+            # the user-facing coord system.  RBF interpolation is exact
+            # at fit nodes, so steering ``<manifold>%0,...,0`` reproduces
+            # the anchor's per-layer behavior (its corpus pools to the
+            # value the interpolant emits at origin).
+            anchor_authoring_coord: list[float] | None = None
+            if anchor_label is not None:
+                node_labels_for_anchor = [
+                    label for label, _ in node_groups
+                ]
+                if anchor_label not in node_labels_for_anchor:
+                    raise ValueError(
+                        f"discover manifold {mf.name!r}: anchor_origin "
+                        f"requires a node labeled {anchor_label!r}, but "
+                        f"the corpus has nodes "
+                        f"{node_labels_for_anchor!r}"
+                    )
+                anchor_idx = node_labels_for_anchor.index(anchor_label)
+                anchor_coord = derived_coords[anchor_idx].clone()
+                anchor_authoring_coord = anchor_coord.tolist()
+                derived_coords = derived_coords - anchor_coord
             domain = CustomDomain(k)
             node_coords = derived_coords
             node_params = derived_coords  # identity embedding
@@ -1014,11 +1063,22 @@ class ManifoldExtractionPipeline:
                 resolved_hyperparams["bandwidth"] = float(
                     diagnostics.bandwidth,
                 )
+            if anchor_label is not None:
+                resolved_hyperparams["anchor_origin"] = anchor_label
             discover_metadata = {
                 "fit_mode": mf.fit_mode,
                 "hyperparams": resolved_hyperparams,
                 "diagnostics": _diagnostics_to_dict(diagnostics),
             }
+            if anchor_label is not None and anchor_authoring_coord is not None:
+                # Stamp the pre-translate authoring coord into metadata
+                # so post-hoc inspection can verify the translation and
+                # measure how far the anchor sat from the K-centroid mean
+                # in the original PCA space.  Not consumed by any runtime
+                # path — purely diagnostic.
+                discover_metadata["anchor_pre_translate_coord"] = (
+                    anchor_authoring_coord
+                )
 
         # 4. Per-layer fit.  Stack centroids -> (K, D); for the SAE
         #    variant reconstruct through the SAE before fitting.

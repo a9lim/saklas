@@ -72,6 +72,19 @@ _FIT_MODES_ALL: frozenset[str] = frozenset({"authored"}) | _FIT_MODES_DISCOVER
 _HYPERPARAMS_BY_MODE: dict[str, frozenset[str]] = {
     "pca": frozenset({
         "max_dim", "var_threshold", "reference_layer", "max_subspace_dim",
+        # ``anchor_origin`` is the discover-pca origin-anchoring toggle.
+        # When set to a node label (or the literal ``true`` — sugar for
+        # the canonical ``"default"`` label), the fit pipeline locates
+        # that label among the K nodes, takes its derived authoring coord
+        # as the anchor, and translates *all* node coords so the anchor
+        # sits at ``(0, ..., 0)``.  The RBF interpolant is exact at fit
+        # nodes, so steering ``<manifold>%0,0,...`` reproduces the
+        # anchor's per-layer behavior — giving the manifold's origin a
+        # principled meaning ("no behavioral shift from the anchor")
+        # instead of "centroid of the K corpora in PCA space".  Spectral
+        # mode is not yet supported — Laplacian eigenmaps need Nyström-
+        # style out-of-sample extension to project a held-out anchor.
+        "anchor_origin",
     }),
     "spectral": frozenset({
         "max_dim", "k_nn", "bandwidth", "reference_layer", "max_subspace_dim",

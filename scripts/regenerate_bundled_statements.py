@@ -275,13 +275,26 @@ def main() -> int:
                         help="Regenerate only the listed concept names")
     parser.add_argument("--skip-neutrals", action="store_true",
                         help="Skip neutral_statements.json regeneration")
+    parser.add_argument("--only-neutrals", action="store_true",
+                        help="Regenerate neutral_statements.json only "
+                             "(skip all vector concept folders). Useful when "
+                             "the vector statements are already fresh and "
+                             "only the neutrals need a refresh — e.g. when "
+                             "the persona manifold's anchor node sources its "
+                             "corpus from this file (see "
+                             "scripts/regenerate_bundled_manifold.py).")
     args = parser.parse_args()
+
+    if args.only_neutrals and args.skip_neutrals:
+        print("--only-neutrals conflicts with --skip-neutrals",
+              file=sys.stderr)
+        return 2
 
     if args.purge:
         print("Purging existing concept folders...")
         purge_vectors_dir()
 
-    names = args.only if args.only else _manifest_names()
+    names = [] if args.only_neutrals else (args.only or _manifest_names())
     unknown = [n for n in names if n not in BIPOLAR and n not in MONOPOLAR]
     if unknown:
         print(f"Unknown concepts: {unknown}", file=sys.stderr)
@@ -291,12 +304,13 @@ def main() -> int:
     session = SaklasSession.from_pretrained(MODEL_ID, device="auto", probes=[])
     print(f"Loaded on {session._device} ({session._dtype})", flush=True)
 
-    print(f"\nRegenerating {len(names)} concepts...")
-    for name in names:
-        try:
-            regenerate_concept(session, name, force=args.force or args.purge)
-        except Exception as e:
-            print(f"  [error] {name}: {e}")
+    if names:
+        print(f"\nRegenerating {len(names)} concepts...")
+        for name in names:
+            try:
+                regenerate_concept(session, name, force=args.force or args.purge)
+            except Exception as e:
+                print(f"  [error] {name}: {e}")
 
     if not args.skip_neutrals:
         print(f"\nRegenerating neutral statements ({N_NEUTRALS})...")

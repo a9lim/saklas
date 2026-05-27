@@ -76,6 +76,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -93,10 +94,22 @@ import torch
 
 REPO = Path(__file__).resolve().parent.parent
 MANIFOLDS_DIR = REPO / "saklas" / "data" / "manifolds"
+NEUTRALS_PATH = REPO / "saklas" / "data" / "neutral_statements.json"
 MANIFOLD_NAME = "personas"
 DEFAULT_MODEL_ID = "google/gemma-4-31b-it"
 N_SCENARIOS = 9
 STATEMENTS_PER_CONCEPT = 5
+
+# Anchor node — its corpus is the bundled neutrals (saklas/data/
+# neutral_statements.json), the same artifact that defines mu_neutral
+# for DLS layer selection, probe centering, and the Mahalanobis
+# whitener.  At fit time the discover-pca pipeline reads
+# `hyperparams.anchor_origin` from `manifold.json`, finds this node by
+# label, and translates all node coords so it sits at (0, ..., 0) in
+# authoring-coord space.  Steering `personas%0,0,...` (or
+# `personas%default` via label form) then reproduces the anchor's
+# per-layer behavior — origin = "no behavioral shift from default".
+ANCHOR_LABEL = "default"
 
 # Roster — order is grouped by cluster for readability; the on-disk
 # order follows this list (NN_<label>.json zero-padded indices).
@@ -246,12 +259,57 @@ def main() -> None:
         )
         print(f"generation finished in {time.time() - t0:.1f}s")
 
+        # Inject the anchor node.  Its corpus is the bundled neutrals
+        # verbatim — single source of truth for "where the model sits
+        # when not pushed by a concept".  Pooled through the same
+        # `compute_node_centroid` path as every other node, so its
+        # centroid lands in standard assistant-baseline activation space
+        # alongside the 100 personas.  Stage 4's `anchor_origin: true`
+        # hyperparam then makes the fit translate origin to this node.
+        if not NEUTRALS_PATH.exists():
+            raise SystemExit(
+                f"neutrals missing at {NEUTRALS_PATH} — run "
+                f"scripts/regenerate_bundled_statements.py "
+                f"--only-neutrals first (anchor node sources its corpus "
+                f"from this file)"
+            )
+        neutrals = json.loads(NEUTRALS_PATH.read_text())
+        if not isinstance(neutrals, list) or len(neutrals) < 9:
+            raise SystemExit(
+                f"neutrals at {NEUTRALS_PATH} malformed or too short "
+                f"(got {type(neutrals).__name__}, "
+                f"len={len(neutrals) if hasattr(neutrals, '__len__') else '?'})"
+            )
+        if ANCHOR_LABEL in corpora:
+            raise SystemExit(
+                f"persona roster collides with anchor label "
+                f"{ANCHOR_LABEL!r} — rename the persona or pick a "
+                f"different ANCHOR_LABEL"
+            )
+        corpora[ANCHOR_LABEL] = neutrals
+        print(
+            f"injected anchor node {ANCHOR_LABEL!r} with "
+            f"{len(neutrals)} statements from {NEUTRALS_PATH.name}"
+        )
+
         # Write the manifold via the canonical writer.  Namespace is
         # arbitrary here — only the corpus contents move to package data.
+        # `hyperparams.anchor_origin=True` lights up the discover-pca
+        # origin-anchoring path; the fit pipeline reads it back and
+        # locates the anchor node by its canonical label.
         folder = create_discover_manifold_folder(
             "local", MANIFOLD_NAME, DESCRIPTION,
             fit_mode="pca",
             node_corpora=corpora,
+            # `anchor_origin: true` -> stage-4 fit translates origin onto
+            # the anchor node (canonical label `"default"`).
+            # `max_subspace_dim: 8` pins per-layer PCA at R=8 to match
+            # the manifold's intrinsic dimension and keep the α-regime
+            # comparable to the pre-anchor bundled state (recommended
+            # alpha ~0.20, see AGENTS.md "Bundled manifolds + steering-
+            # coefficient regime").  Without this pin R defaults to 64
+            # and the per-α activation displacement scales accordingly.
+            hyperparams={"anchor_origin": True, "max_subspace_dim": 8},
         )
 
         # Copy the generated folder out to the package data tree.
@@ -266,13 +324,16 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     total = sum(len(s) for s in corpora.values())
+    n_personas = len(corpora) - (1 if ANCHOR_LABEL in corpora else 0)
     print(
         f"[done] wrote {target.relative_to(REPO)} "
-        f"({len(corpora)} personas, {total} statements)"
+        f"({n_personas} personas + 1 anchor node "
+        f"({ANCHOR_LABEL!r}), {total} statements total)"
     )
     print(
         f"  -> run `saklas vector manifold discover default/{MANIFOLD_NAME}` "
-        f"to fit against a model"
+        f"to fit against a model "
+        f"(origin anchors to {ANCHOR_LABEL!r} automatically)"
     )
 
 
