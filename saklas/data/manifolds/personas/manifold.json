@@ -1,9 +1,12 @@
 {
   "format_version": 3,
   "name": "personas",
-  "description": "Persona archetypes drawn from Anthropic's Assistant Axis paper (arXiv 2601.10387) and the Persona Selection Model framing. 100 nodes spanning assistant-cluster, everyday human roles, pre-modern roles, creative archetypes, fantastical characters, AI / non-human personas, and the named harmful cluster. PCA over per-node centroids recovers the assistant-axis structure as the leading component on any role-supporting model family.",
+  "description": "Persona archetypes drawn from Anthropic's Assistant Axis paper (arXiv 2601.10387) and the Persona Selection Model framing. 100 nodes spanning everyday human roles, pre-modern roles, creative archetypes, fantastical characters, AI / sci-fi non-human personas, the named harmful cluster, plus psychological archetypes (impostor, loner, trickster) and political identities (conservative, liberal) added in the 2026-05-26 audit to broaden semantic coverage beyond profession/genre. PCA over per-node centroids recovers a low-dim persona structure as the leading components on role-supporting model families.",
   "fit_mode": "pca",
-  "hyperparams": {},
+  "hyperparams": {
+    "anchor_origin": true,
+    "max_subspace_dim": 8
+  },
   "nodes": [
     {
       "label": "assistant"
@@ -27,22 +30,22 @@
       "label": "advisor"
     },
     {
-      "label": "examiner"
+      "label": "researcher"
     },
     {
       "label": "mediator"
     },
     {
-      "label": "facilitator"
+      "label": "impostor"
     },
     {
-      "label": "coordinator"
+      "label": "conservative"
     },
     {
       "label": "secretary"
     },
     {
-      "label": "assessor"
+      "label": "liberal"
     },
     {
       "label": "teacher"
@@ -186,7 +189,7 @@
       "label": "musician"
     },
     {
-      "label": "storyteller"
+      "label": "actor"
     },
     {
       "label": "playwright"
@@ -201,7 +204,7 @@
       "label": "ghost"
     },
     {
-      "label": "leviathan"
+      "label": "phoenix"
     },
     {
       "label": "wizard"
@@ -234,13 +237,13 @@
       "label": "robot"
     },
     {
-      "label": "hive"
+      "label": "cyborg"
     },
     {
       "label": "chatbot"
     },
     {
-      "label": "npc"
+      "label": "probe"
     },
     {
       "label": "android"
@@ -249,22 +252,22 @@
       "label": "drone"
     },
     {
-      "label": "hologram"
+      "label": "loner"
     },
     {
       "label": "alien"
     },
     {
-      "label": "copilot"
+      "label": "mecha"
     },
     {
-      "label": "satellite"
+      "label": "deer"
     },
     {
-      "label": "simulation"
+      "label": "trickster"
     },
     {
-      "label": "swarm"
+      "label": "goblin"
     },
     {
       "label": "virus"
@@ -304,6 +307,9 @@
     },
     {
       "label": "vandal"
+    },
+    {
+      "label": "default"
     }
   ],
   "files": {}
