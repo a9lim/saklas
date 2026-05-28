@@ -7,6 +7,7 @@
 // page injects a key after load, call ``setApiKey()`` to refresh it.
 
 import type {
+  AttachManifoldProbeRequest,
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
@@ -29,6 +30,8 @@ import type {
   LoomTreeJSON,
   ManifoldInfo,
   ManifoldListResponse,
+  ManifoldProbeInfo,
+  ManifoldProbeListResponse,
   MergeVectorRequest,
   MergeVectorResponse,
   NodeDiffJSON,
@@ -54,6 +57,7 @@ import type {
 // rather than via barrel-export keeps `import { ApiError, getSession }`
 // consumers one-stop without a separate type import line.
 export type {
+  AttachManifoldProbeRequest,
   CloneVectorRequest,
   CloneVectorResponse,
   CorrelationData,
@@ -76,6 +80,8 @@ export type {
   LoomTreeJSON,
   ManifoldInfo,
   ManifoldListResponse,
+  ManifoldProbeInfo,
+  ManifoldProbeListResponse,
   MergeVectorRequest,
   MergeVectorResponse,
   NodeDiffJSON,
@@ -117,6 +123,7 @@ export const API = `/saklas/v1/sessions/${SESSION}`;
 const SESSION_BASE = (id: string = SESSION) => `/saklas/v1/sessions/${id}`;
 const PACKS_BASE = "/saklas/v1/packs";
 const MANIFOLDS_BASE = "/saklas/v1/manifolds";
+const MANIFOLD_PROBES_BASE = "/saklas/v1/manifold-probes";
 
 // --------------------------------------------------------- auth --
 
@@ -466,6 +473,31 @@ export const apiManifolds = {
   ): Promise<{ namespace: string; name: string; removed: boolean }> {
     return request(
       `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
+  },
+};
+
+// =================================================== manifold probes ==
+
+/** Manifold-probe endpoints — top-level (not session-scoped), parallel
+ *  to the manifold catalog itself.  The read-side counterpart to
+ *  manifold steering: attach a fitted manifold by selector to get
+ *  per-token ``fraction`` + nearest-node readings, end-of-generation
+ *  ``coords`` recovery, and ``@when:<probe>:fraction`` gate support
+ *  server-side.  All routes 404 on a server that pre-dates the read
+ *  side; callers should catch ``ApiError`` with status 404 and treat
+ *  manifold probes as unavailable. */
+export const apiManifoldProbes = {
+  list(): Promise<ManifoldProbeListResponse> {
+    return request(MANIFOLD_PROBES_BASE);
+  },
+  attach(req: AttachManifoldProbeRequest): Promise<ManifoldProbeInfo> {
+    return request(MANIFOLD_PROBES_BASE, jsonBody(req));
+  },
+  detach(name: string): Promise<void> {
+    return request<void>(
+      `${MANIFOLD_PROBES_BASE}/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     );
   },

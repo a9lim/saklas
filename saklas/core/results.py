@@ -38,6 +38,68 @@ class ProbeReadings:
 
 
 @dataclass
+class ManifoldTokenReading:
+    """Per-token manifold-probe reading for one attached manifold.
+
+    Hot-path-cheap channels only: ``fraction`` is
+    ``||h_par_c|| / ||h - mean||`` aggregated EV-weighted across the
+    manifold's layers (the share of the centered activation that lives in
+    the manifold's PCA subspace), and ``nearest`` is the top-N node
+    labels by distance to the running activation in activation space
+    (not domain space), sorted ascending by distance.  Mirrors what
+    ``ManifoldMonitor.score_single_token`` returns per probe.
+    """
+    fraction: float
+    nearest: list[tuple[str, float]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fraction": self.fraction,
+            "nearest": [[label, dist] for label, dist in self.nearest],
+        }
+
+
+@dataclass
+class ManifoldAggregate:
+    """End-of-generation manifold-probe aggregate for one attached manifold.
+
+    ``fraction_mean`` is the EV-weighted per-layer subspace fraction over
+    the mean-across-generated-tokens activation; ``fraction_per_layer``
+    is the same quantity reported per layer.  ``nearest`` is the top-N
+    node labels by EV-weighted distance vote across layers.  ``coords``
+    is the EV-weighted mean of the per-layer inverse-projection
+    coordinates (coords share the domain, so the mean is meaningful);
+    ``residual_mean`` and ``residual_per_layer`` are the EV-weighted
+    mean of the normalized off-manifold residual
+    ``dist_L / ||h_par_c_L||`` and its per-layer trace.
+    """
+    fraction_mean: float
+    fraction_per_layer: dict[int, float]
+    nearest: list[tuple[str, float]]
+    coords: tuple[float, ...]
+    coords_per_layer: dict[int, tuple[float, ...]]
+    residual_mean: float
+    residual_per_layer: dict[int, float]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fraction_mean": self.fraction_mean,
+            "fraction_per_layer": {
+                str(k): float(v) for k, v in self.fraction_per_layer.items()
+            },
+            "nearest": [[label, dist] for label, dist in self.nearest],
+            "coords": list(self.coords),
+            "coords_per_layer": {
+                str(k): list(v) for k, v in self.coords_per_layer.items()
+            },
+            "residual_mean": self.residual_mean,
+            "residual_per_layer": {
+                str(k): float(v) for k, v in self.residual_per_layer.items()
+            },
+        }
+
+
+@dataclass
 class GenerationResult:
     """Result of a generation call."""
     text: str
@@ -71,6 +133,12 @@ class GenerationResult:
     # deliberately omits this field — tensors don't serialize cleanly to
     # the JSON path; persist explicitly with ``torch.save`` if needed.
     hidden_states: dict[int, torch.Tensor] | None = None
+    # End-of-generation manifold-probe aggregates, populated by
+    # ``ManifoldMonitor.score_aggregate`` when at least one manifold
+    # probe is attached.  Empty dict otherwise (no aggregates were
+    # computed).  Keyed by registered probe name; round-trips through
+    # ``to_dict`` as a nested mapping.
+    manifold_readings: dict[str, "ManifoldAggregate"] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +152,9 @@ class GenerationResult:
             "prompt_tokens": self.prompt_tokens,
             "finish_reason": self.finish_reason,
             "applied_steering": self.applied_steering,
+            "manifold_readings": {
+                k: v.to_dict() for k, v in self.manifold_readings.items()
+            },
         }
 
 
@@ -191,6 +262,10 @@ class TokenEvent:
     # Bounded above by sampler support size; a confident prediction
     # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
+    # Per-token manifold-probe readings, populated by ``generate_stream``
+    # only when at least one manifold probe is attached and ``live_scores``
+    # is True; otherwise ``None``.  Keyed by registered probe name.
+    manifold_readings: dict[str, "ManifoldTokenReading"] | None = None
 
 
 class ResultCollector:

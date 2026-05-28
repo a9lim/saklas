@@ -51,6 +51,8 @@ from saklas.core.mahalanobis import LayerWhitener, WhitenerError
 from saklas.core.profile import Profile, ProfileError
 from saklas.core.results import (
     GenerationResult,
+    ManifoldAggregate,
+    ManifoldTokenReading,
     ProbeReadings,
     ResultCollector,
     RunSet,
@@ -87,6 +89,8 @@ __all__ = [
     "TokenAlt",
     "TokenEvent",
     "ProbeReadings",
+    "ManifoldTokenReading",
+    "ManifoldAggregate",
     "ResultCollector",
     # Loom (v2.3) — engine-side tree of conversation nodes
     "LoomTree",

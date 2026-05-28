@@ -35,7 +35,7 @@ from saklas.core.loom import (
     derive_seed_schedule,
 )
 from saklas.core.model import load_model, get_layers, get_model_info
-from saklas.core.monitor import TraitMonitor
+from saklas.core.monitor import ManifoldMonitor, TraitMonitor
 from saklas.io.packs import PackFormatError, PackMetadata, hash_folder_files
 from saklas.io.paths import concept_dir
 from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
@@ -883,6 +883,14 @@ class SaklasSession:
             )
 
         self._monitor = TraitMonitor(probe_profiles, self._layer_means)
+        # Read-side counterpart to manifold steering.  Peer to
+        # ``self._monitor``: vector probes and manifold probes attach
+        # independently; per-token score callbacks merge their flat
+        # scalars into a single ``TriggerContext.probe_scores`` dict so
+        # ``@when:`` gates can fire on either tier without grammar
+        # changes.  ``layer_means`` is passed for symmetry but the
+        # manifold-side math uses each fit's per-layer mean.
+        self._manifold_monitor = ManifoldMonitor(layer_means=self._layer_means)
 
         # Prefix KV cache (opt-in, off by default).  Populated by
         # :meth:`cache_prefix`; consumed by :meth:`_generate_core` when the
@@ -2613,9 +2621,15 @@ class SaklasSession:
         The closure pulls ``self._capture.latest_per_layer()`` (the
         most-recent ``[D]`` slice per layer the steering hooks
         captured) and runs it through :meth:`TraitMonitor.score_single_token`.
-        Returns an empty dict when the capture is empty (e.g. before
-        the first forward) so probe gates report inactive instead of
-        seeing stale values from a previous gen.
+        When at least one manifold probe is attached, the same captures
+        also pass through
+        :meth:`ManifoldMonitor.score_single_token` and the flat-scalar
+        adapter; the two dicts merge with manifold scalars second so a
+        naming collision (vector probe and manifold probe sharing a
+        bare name) lets the manifold side win for the gate.  Returns
+        an empty dict when the capture is empty (e.g. before the first
+        forward) so probe gates report inactive instead of seeing
+        stale values from a previous gen.
 
         Caller-side guard: only invoked when
         :meth:`_steering_needs_probe_gating` is True, so the no-gate
@@ -2623,12 +2637,17 @@ class SaklasSession:
         """
         capture = self._capture
         monitor = self._monitor
+        manifold_monitor = self._manifold_monitor
 
         def _score() -> dict[str, float]:
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
-            return monitor.score_single_token(latest)
+            out = monitor.score_single_token(latest)
+            if manifold_monitor.probe_names:
+                manifold_readings = manifold_monitor.score_single_token(latest)
+                out.update(manifold_monitor.flat_scalars(manifold_readings))
+            return out
 
         return _score
 
@@ -2731,24 +2750,27 @@ class SaklasSession:
     def _begin_capture(self, *, widen: bool = False) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
-        ``widen=False`` (default): cover only probe-layer union — what
-        the monitor needs.  Fast path; matches v1 behavior.
+        ``widen=False`` (default): cover the union of vector-probe
+        layers and manifold-probe layers — what both monitors need.
+        Fast path; matches v1 behavior when only vector probes are
+        attached.
 
         ``widen=True``: cover every model layer.  Used when the caller
-        asked for ``SamplingConfig.return_hidden=True`` — the monitor
-        still reads its subset, but the full dict is available on
-        ``GenerationResult.hidden_states`` after the run.
+        asked for ``SamplingConfig.return_hidden=True`` — both monitors
+        still read their respective subsets, but the full dict is
+        available on ``GenerationResult.hidden_states`` after the run.
         """
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
-            if not self._monitor.probe_names:
-                return False
-            layer_idxs = sorted({
+            vector_layers: set[int] = {
                 idx for prof in self._monitor.profiles.values() for idx in prof
-            })
-            if not layer_idxs:
+            }
+            manifold_layers = self._manifold_monitor.attached_layers()
+            union = vector_layers | manifold_layers
+            if not union:
                 return False
+            layer_idxs = sorted(union)
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
         return True
@@ -2914,6 +2936,45 @@ class SaklasSession:
         self._monitor.remove_probe(name)
         self._invalidate_prefix_cache()
         self._probe_hash_cache.pop(name, None)
+
+    # -- Manifold probes (read-side counterpart to manifold steering) --
+
+    @property
+    def manifold_monitor(self) -> ManifoldMonitor:
+        """Live :class:`ManifoldMonitor` — read-only handle for the TUI/server."""
+        return self._manifold_monitor
+
+    def add_manifold_probe(
+        self,
+        selector: str,
+        *,
+        as_name: str | None = None,
+        top_n: int = 3,
+    ) -> str:
+        """Attach a manifold probe by selector and return the registered name.
+
+        ``selector`` rides the same ``[ns/]name[:variant]`` shape the
+        steering grammar uses for ``%`` operands; the artifact is
+        loaded through :meth:`_ensure_manifold_loaded`, so a probe
+        attached here participates in the same cache as a manifold
+        steered with ``<selector>%<position>``.  ``as_name`` overrides
+        the registered name (defaults to ``selector``).  ``top_n``
+        controls the per-token nearest-node list length.
+        """
+        self._ensure_manifold_loaded(selector)
+        manifold = self._manifolds[selector]
+        name = as_name if as_name is not None else selector
+        self._manifold_monitor.add_probe(name, manifold, top_n=top_n)
+        # Manifold probes widen the capture-layer set in the same way
+        # vector probes do; drop the prefix cache so the next gen
+        # re-prefills with the broadened capture in place.
+        self._invalidate_prefix_cache()
+        return name
+
+    def remove_manifold_probe(self, name: str) -> None:
+        """Detach a previously-attached manifold probe."""
+        self._manifold_monitor.remove_probe(name)
+        self._invalidate_prefix_cache()
 
     def _probe_hash(self, name: str) -> str | None:
         """Return sha256 hex of the baked tensor bytes for ``name``.
@@ -3729,6 +3790,30 @@ class SaklasSession:
                 trimmed[layer_idx] = h.detach().to("cpu")
             hidden_states = trimmed
 
+        # Manifold-probe aggregate over the pooled captures.  Skipped
+        # when no manifold probe is attached or generation produced no
+        # tokens.  Reuses the captured stack the vector path consumed —
+        # no second forward pass.
+        manifold_aggregates: dict[str, Any] = {}
+        if (
+            self._manifold_monitor.probe_names
+            and generated_ids
+        ):
+            stacked_caps = self._capture.stacked()
+            if stacked_caps:
+                n = len(generated_ids)
+                trimmed_caps: dict[int, torch.Tensor] = {}
+                for layer_idx, h in stacked_caps.items():
+                    if h.shape[0] > n:
+                        h = h[:n]
+                    elif h.shape[0] < n:
+                        continue
+                    trimmed_caps[layer_idx] = h
+                if trimmed_caps:
+                    manifold_aggregates = self._manifold_monitor.score_aggregate(
+                        trimmed_caps,
+                    )
+
         result = GenerationResult(
             text=text, tokens=list(generated_ids), token_count=token_count,
             tok_per_sec=tok_per_sec, elapsed=elapsed,
@@ -3738,6 +3823,7 @@ class SaklasSession:
             logprobs=logprobs_list,
             applied_steering=applied_steering,
             hidden_states=hidden_states,
+            manifold_readings=manifold_aggregates,
         )
         self._last_result = result
 
@@ -4584,19 +4670,31 @@ class SaklasSession:
 
         def _push(text, is_thinking, tid, lp, top_alts, perplexity):
             scores: dict[str, float] | None = None
-            if live_scores and self._monitor.probe_names:
+            manifold_readings = None
+            if live_scores and (
+                self._monitor.probe_names
+                or self._manifold_monitor.probe_names
+            ):
                 latest_hidden = {
                     layer_idx: bucket[-1]
                     for layer_idx, bucket in self._capture._per_layer.items()
                     if bucket
                 }
                 if latest_hidden:
-                    scores = self._monitor.score_single_token(latest_hidden)
-                    self._monitor.update_live(scores)
+                    if self._monitor.probe_names:
+                        scores = self._monitor.score_single_token(latest_hidden)
+                        self._monitor.update_live(scores)
+                    if self._manifold_monitor.probe_names:
+                        manifold_readings = (
+                            self._manifold_monitor.score_single_token(
+                                latest_hidden,
+                            )
+                        )
             event = TokenEvent(
                 text=text, token_id=tid, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
                 scores=scores, perplexity=perplexity,
+                manifold_readings=manifold_readings,
             )
             idx_counter[0] += 1
             q.put(event)

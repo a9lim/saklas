@@ -14,7 +14,9 @@ Grammar::
     preset      := "before" | "after" | "both" | "thinking" | "response"
                  | "prompt" | "generated"
     gate        := "when" ":" probe_atom op NUM
-    probe_atom  := NAME ["." NAME]    # canonical concept (e.g. "angry.calm")
+    probe_atom  := NAME ["." NAME]                     # vector probe (e.g. "angry.calm")
+                 | NAME ":" "fraction"                 # manifold subspace fraction
+                 | NAME "@" NAME                       # manifold label similarity
     op          := ">" | ">=" | "<" | "<="
     coeff       := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
     variant     := "raw" | "sae" | "sae-" ID | "role-" ID
@@ -24,6 +26,17 @@ on decode steps where the named probe's last reading satisfies the
 comparison.  Implicit ``prompt=False`` (no probe reading during prefill).
 Compose with other windows via the programmatic surface — the v1
 grammar accepts a single ``@`` clause per term.
+
+Manifold-probe gates extend the same shape over the two scalar channels
+:class:`ManifoldMonitor` exposes: ``@when:<manifold>:fraction <op> N``
+fires on the subspace-fraction reading (the share of the centered
+activation living in the manifold's PCA subspace), and
+``@when:<manifold>@<label> <op> N`` fires on the negated distance to a
+named node (larger = closer; label-similarity gates routinely use
+negative thresholds).  The gate's probe string is stored verbatim
+(``"circumplex:fraction"``, ``"circumplex@elated"``) so it matches the
+key ``ManifoldMonitor.flat_scalars`` already merges into
+``TriggerContext.probe_scores``; no runtime gate machinery changes.
 
 Concept names are ASCII identifiers: letter followed by any of
 ``[a-z0-9_-]``.  Multi-word concepts use underscores
@@ -425,19 +438,73 @@ class _Parser:
     def _parse_when_gate(self, when_col: int) -> Trigger:
         """Parse the ``when:`` payload into a probe-gated :class:`Trigger`.
 
-        Already consumed: ``@`` ``when`` ``:``.  Expects the probe
-        identifier (with optional ``.<pole>`` for bipolar concepts), one
-        of ``>``/``>=``/``<``/``<=``, then a numeric threshold.
+        Already consumed: ``@`` ``when`` ``:``.  Expects a probe
+        identifier, one of ``>``/``>=``/``<``/``<=``, then a numeric
+        threshold.
 
-        Probe atoms are simple identifiers — no namespace prefix in v2.1
-        (the monitor is keyed by canonical concept name regardless of
-        which pack the probe came from).  No SAE variant suffix
-        either: gates fire on the live monitor reading, which is
-        already a single number per probe, not a per-variant tensor.
+        Three probe identifier shapes are accepted:
+
+        - Vector probe: ``IDENT`` optionally followed by ``.IDENT`` for
+          a bipolar concept (e.g. ``angry.calm``).  No namespace prefix
+          in v2.1 (the monitor is keyed by canonical concept name
+          regardless of which pack the probe came from), and no SAE
+          variant suffix — gates fire on the live monitor reading,
+          which is already a single number per probe.
+        - Manifold subspace-fraction probe:
+          ``<manifold>:fraction`` — fires on the fraction of the
+          centered activation that lives in the manifold's PCA
+          subspace.  Stored verbatim as the gate's probe string
+          (e.g. ``"circumplex:fraction"``); the session's
+          :class:`ManifoldMonitor.flat_scalars` already emits a
+          matching namespaced key, so ``Trigger.active`` looks it up
+          unchanged.
+        - Manifold label-similarity probe:
+          ``<manifold>@<label>`` — fires on the negated distance to
+          the named node (larger = closer).  Stored verbatim as the
+          gate's probe string (e.g. ``"circumplex@elated"``); same
+          ``flat_scalars`` correspondence.
+
+        The discriminator on the trailing IDENT: a ``COLON`` after the
+        manifold name routes to the fraction form, an ``AT`` to the
+        label form, a ``DOT`` to the bipolar vector form, anything
+        else is a plain vector probe.  Within the ``when:`` body the
+        ``AT`` token cannot be a fresh trigger marker (one ``@`` clause
+        per term, already consumed), so the disambiguation is
+        unambiguous.
         """
         probe_tok = self._expect("IDENT")
         probe = str(probe_tok.value)
-        if self._peek().kind == "DOT":
+        nxt = self._peek().kind
+        if nxt == "COLON":
+            # Manifold subspace-fraction gate: ``<manifold>:fraction``.
+            # The suffix after the colon must be the literal slug
+            # ``fraction`` — the only fraction-channel scalar
+            # ``ManifoldMonitor.flat_scalars`` emits.  Any other slug
+            # would silently never match a probe score, so we surface
+            # the typo here rather than letting the gate report
+            # inactive forever.
+            self._consume()
+            suffix_tok = self._expect("IDENT")
+            suffix = str(suffix_tok.value)
+            if suffix != "fraction":
+                raise SteeringExprError(
+                    f"unknown manifold gate channel "
+                    f"'{probe}:{suffix}'; expected "
+                    f"'<manifold>:fraction' or "
+                    f"'<manifold>@<label>'",
+                    col=suffix_tok.col,
+                )
+            probe = f"{probe}:{suffix}"
+        elif nxt == "AT":
+            # Manifold label-similarity gate: ``<manifold>@<label>``.
+            # Label existence is not validated at parse time — the
+            # manifold artifact may not be loaded yet, and a stale
+            # gate against a removed label should report inactive (no
+            # matching key in ``flat_scalars``), not raise.
+            self._consume()
+            label_tok = self._expect("IDENT")
+            probe = f"{probe}@{label_tok.value}"
+        elif nxt == "DOT":
             self._consume()
             rhs = self._expect("IDENT")
             probe = f"{probe}.{rhs.value}"

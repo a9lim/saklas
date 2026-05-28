@@ -21,6 +21,7 @@ import {
   apiProbes,
   apiPacks,
   apiManifolds,
+  apiManifoldProbes,
   apiTree,
   ApiError,
   connectWs,
@@ -30,6 +31,7 @@ import type {
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
+  ManifoldProbeInfo,
   SessionInfo,
   VectorInfo,
   WSClientMessage,
@@ -39,7 +41,9 @@ import type {
   ChatTurn,
   GenStatus,
   LocalPackInfo,
+  ManifoldAggregateJSON,
   ManifoldRackEntry,
+  ManifoldTokenReadingJSON,
   PendingAction,
   ProbeRackEntry,
   ProbeSortMode,
@@ -505,6 +509,246 @@ export function setManifoldEnabled(name: string, enabled: boolean): void {
     const e = manifoldRack.entries.get(name);
     if (e) manifoldRack.entries.set(name, { ...e, enabled });
   });
+}
+
+// =================================================== manifold probes ====
+//
+// Read-side counterpart to manifold steering — peer to the vector probe
+// rack.  Each entry tracks one attached probe (metadata pulled from the
+// server's ``ManifoldProbeInfo``) plus per-token streaming state: the
+// EV-weighted ``fraction`` sparkline, the most-recent nearest-node tuple
+// for hover-readouts, and the aggregate-of-record from the final ``done``
+// event (``coords``, ``fraction_mean``, ``residual_mean``).
+//
+// For ≤2D ``BoxDomain`` manifolds we also accumulate a per-token
+// ``trajectory`` — each token's ``nearest[0]`` label looked up in the
+// probe row's ``node_coords`` and stored as a coord tuple, so the
+// inspector mini-map can render the inferred path through generation
+// alongside the final aggregate dot.  Higher-dimensional manifolds keep
+// the trajectory empty (we don't render a >2D path).
+
+/** Per-probe live state.  Mirrors ``ProbeRackEntry`` in shape:
+ *  ``sparkline`` for the fraction history, ``current`` / ``previous`` for
+ *  the sort-by-change idiom, plus the richer manifold-specific fields. */
+export interface ManifoldProbeRackEntry {
+  /** Server-side row (metadata, domain, node labels + coords).  Used to
+   *  read intrinsic dim + domain shape for the inspector strip + minimap. */
+  info: ManifoldProbeInfo;
+  /** EV-weighted subspace fraction sparkline.  Capped at ``MAX_SPARKLINE``
+   *  like the vector probe rack. */
+  sparkline: number[];
+  current: number;
+  previous: number;
+  /** Most-recent per-token nearest list (descending similarity =
+   *  ascending distance).  Drives the inline "nearest <label>" readout
+   *  and the mini-map hover tooltip; empty until the first token. */
+  nearest: [string, number][];
+  /** End-of-gen aggregate the ``done`` event lands.  Null between gens
+   *  and during a stream's lifetime — set on ``done`` and cleared on the
+   *  next ``started`` so the inspector reverts to "live only". */
+  aggregate: ManifoldAggregateJSON | null;
+  /** Inferred per-token coord trajectory for 2D mini-map rendering.
+   *  Each entry is the looked-up authoring-space position of
+   *  ``nearest[0]`` for that token (the true per-token inverse is too
+   *  expensive for the hot path; ``nearest[0].coords`` is a faithful
+   *  approximation when the probe sits over a labeled manifold).  Empty
+   *  for non-2D manifolds and for probes whose ``node_coords`` are
+   *  absent (unfitted discover). */
+  trajectory: number[][];
+}
+
+export interface ManifoldProbeRack {
+  /** Attached probes keyed by registered name.  SvelteMap so set/delete
+   *  trip Svelte 5 reactivity in the inspector strip list. */
+  entries: Map<string, ManifoldProbeRackEntry>;
+  /** True when the server's manifold-probe list route 404s — older
+   *  server pre-dates the read side.  Hides the rack section. */
+  unavailable: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
+export const manifoldProbeRack: ManifoldProbeRack = $state({
+  entries: new SvelteMap(),
+  unavailable: false,
+  loading: false,
+  error: null,
+});
+
+/** Look up ``node_coords`` for a label inside a probe row.  Returns
+ *  ``null`` when the label is absent or the row carries no coords (an
+ *  unfitted discover manifold).  Returns a shallow copy so callers can
+ *  push into trajectories without aliasing the metadata. */
+function _lookupNodeCoords(
+  info: ManifoldProbeInfo,
+  label: string,
+): number[] | null {
+  const coords = info.node_coords;
+  if (!coords) return null;
+  const idx = info.node_labels.indexOf(label);
+  if (idx < 0 || idx >= coords.length) return null;
+  const row = coords[idx];
+  if (!Array.isArray(row)) return null;
+  return [...row];
+}
+
+/** A probe targets a 2D-authored ``BoxDomain`` manifold — the regime the
+ *  inspector mini-map renders.  Higher-dim and sphere/custom domains
+ *  still attach, they just don't get the mini-map. */
+function _isMiniMapCandidate(info: ManifoldProbeInfo): boolean {
+  if (info.intrinsic_dim !== 2) return false;
+  const d = info.domain as { type?: string };
+  return d?.type === "box" && !!info.node_coords && info.node_coords.length > 0;
+}
+
+const MAX_MANIFOLD_TRAJECTORY = 240;
+
+function _emptyManifoldProbeEntry(
+  info: ManifoldProbeInfo,
+): ManifoldProbeRackEntry {
+  return {
+    info,
+    sparkline: [],
+    current: 0,
+    previous: 0,
+    nearest: [],
+    aggregate: null,
+    trajectory: [],
+  };
+}
+
+/** Fetch the attached-probe catalog.  Tolerates a 404 from an older
+ *  server — flips ``unavailable`` and leaves the rack empty so the
+ *  inspector section can hide cleanly. */
+export async function refreshManifoldProbeList(): Promise<void> {
+  manifoldProbeRack.loading = true;
+  try {
+    const r = await apiManifoldProbes.list();
+    const seen = new Set<string>();
+    for (const info of r.probes) {
+      seen.add(info.name);
+      const prev = manifoldProbeRack.entries.get(info.name);
+      if (prev) {
+        // Refresh metadata in place; preserve live sparkline / aggregate.
+        manifoldProbeRack.entries.set(info.name, { ...prev, info });
+      } else {
+        manifoldProbeRack.entries.set(info.name, _emptyManifoldProbeEntry(info));
+      }
+    }
+    // Drop entries the server no longer reports — they were detached
+    // out-of-band (e.g. via the TUI or another client).
+    for (const name of [...manifoldProbeRack.entries.keys()]) {
+      if (!seen.has(name)) manifoldProbeRack.entries.delete(name);
+    }
+    manifoldProbeRack.unavailable = false;
+    manifoldProbeRack.error = null;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) {
+      manifoldProbeRack.unavailable = true;
+      manifoldProbeRack.entries.clear();
+    } else {
+      manifoldProbeRack.error = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    manifoldProbeRack.loading = false;
+  }
+}
+
+/** Attach a manifold probe.  ``selector`` rides the same ``[ns/]name``
+ *  shape the steering ``%`` term consumes; ``name`` defaults to the
+ *  selector server-side.  ``top_n`` caps the per-token nearest list. */
+export async function attachManifoldProbe(
+  selector: string,
+  opts: { name?: string; top_n?: number } = {},
+): Promise<ManifoldProbeInfo> {
+  const info = await apiManifoldProbes.attach({
+    selector,
+    name: opts.name,
+    top_n: opts.top_n,
+  });
+  const prev = manifoldProbeRack.entries.get(info.name);
+  if (prev) {
+    manifoldProbeRack.entries.set(info.name, { ...prev, info });
+  } else {
+    manifoldProbeRack.entries.set(info.name, _emptyManifoldProbeEntry(info));
+  }
+  return info;
+}
+
+/** Detach a probe by registered name.  Refreshes the catalog after — the
+ *  server may have synthesized aliases the client doesn't know about. */
+export async function detachManifoldProbe(name: string): Promise<void> {
+  await apiManifoldProbes.detach(name);
+  manifoldProbeRack.entries.delete(name);
+}
+
+/** Reset all attached probes' streaming state at the start of a fresh
+ *  generation.  Trajectory + aggregate + nearest live with one gen each;
+ *  the sparkline carries across so the inspector shows the rolling
+ *  history.  Called from the WS ``started`` handler. */
+export function resetManifoldProbeStreams(): void {
+  for (const [name, e] of manifoldProbeRack.entries) {
+    manifoldProbeRack.entries.set(name, {
+      ...e,
+      nearest: [],
+      aggregate: null,
+      trajectory: [],
+    });
+  }
+}
+
+/** Append one per-token reading per attached probe.  Drives the
+ *  sparkline + nearest hover + (for 2D box manifolds) the trajectory.
+ *  Tolerates the wire-shape's optional ``manifold_readings`` field being
+ *  absent entirely. */
+export function updateManifoldProbesFromToken(
+  readings: Record<string, ManifoldTokenReadingJSON> | undefined,
+): void {
+  if (!readings) return;
+  for (const [name, reading] of Object.entries(readings)) {
+    const prev = manifoldProbeRack.entries.get(name);
+    if (!prev) continue;
+    const sparkline = prev.sparkline.slice();
+    sparkline.push(reading.fraction);
+    if (sparkline.length > MAX_SPARKLINE) {
+      sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
+    }
+    const trajectory =
+      _isMiniMapCandidate(prev.info) && reading.nearest.length > 0
+        ? prev.trajectory.slice()
+        : prev.trajectory;
+    if (trajectory !== prev.trajectory) {
+      const label = reading.nearest[0][0];
+      const xy = _lookupNodeCoords(prev.info, label);
+      if (xy) {
+        trajectory.push(xy);
+        if (trajectory.length > MAX_MANIFOLD_TRAJECTORY) {
+          trajectory.splice(0, trajectory.length - MAX_MANIFOLD_TRAJECTORY);
+        }
+      }
+    }
+    manifoldProbeRack.entries.set(name, {
+      ...prev,
+      sparkline,
+      current: reading.fraction,
+      previous: prev.current,
+      nearest: reading.nearest,
+      trajectory,
+    });
+  }
+}
+
+/** Land the end-of-gen aggregate.  Drives the inspector's "fraction_mean"
+ *  + "settled coords" readout and the bold final dot on the mini-map. */
+export function setManifoldProbeAggregates(
+  aggregates: Record<string, ManifoldAggregateJSON> | undefined,
+): void {
+  if (!aggregates) return;
+  for (const [name, agg] of Object.entries(aggregates)) {
+    const prev = manifoldProbeRack.entries.get(name);
+    if (!prev) continue;
+    manifoldProbeRack.entries.set(name, { ...prev, aggregate: agg });
+  }
 }
 
 // =========================================================== probes =====
@@ -1817,6 +2061,9 @@ function handleWsMessage(msg: WSServerMessage): void {
       genStatus.finishReason = null;
       liveTokenStream.responseTokens = [];
       liveTokenStream.thinkingTokens = [];
+      // Manifold probes: drop the previous gen's trajectory + aggregate so
+      // the inspector mini-map starts blank.  Sparkline carries across.
+      if (!abState.processingAb) resetManifoldProbeStreams();
       // Loom: record the target node so tree-driven sync attaches the
       // streaming turn to the right active-path entry, and so the chat
       // panel's "streaming" highlight fires on the right turn.
@@ -1936,12 +2183,24 @@ function handleWsMessage(msg: WSServerMessage): void {
       if (msg.per_layer_scores && msg.scores && !abState.processingAb) {
         updateProbeFromScores(msg.per_layer_scores, msg.scores);
       }
+      // Manifold probes — per-token streaming reading.  Field is omitted
+      // entirely when no manifold probe is attached, so the helper
+      // no-ops on undefined.  Skip during shadow runs so the inspector
+      // stays anchored on the steered branch.
+      if (!abState.processingAb) {
+        updateManifoldProbesFromToken(msg.manifold_readings);
+      }
       return;
     }
     case "done": {
       adoptStreamingNode(msg.node_id);
       genStatus.active = false;
       genStatus.finishReason = msg.result?.finish_reason ?? "stop";
+      // Manifold probes — end-of-gen aggregate (coords + fraction_mean +
+      // residual + per-layer traces).  Same omitted-when-absent rule.
+      if (!abState.processingAb) {
+        setManifoldProbeAggregates(msg.result?.manifold_readings);
+      }
       const perToken = msg.result?.per_token_probes ?? [];
       const turn = _currentWriteTurn();
       if (turn?.tokens && perToken.length) {
@@ -3214,6 +3473,10 @@ export async function bootstrap(): Promise<void> {
     // Manifold catalog — 404 tolerated (server pre-dates the manifold
     // HTTP surface); ``refreshManifoldList`` flips ``unavailable``.
     refreshManifoldList(),
+    // Manifold probes — read-side counterpart; same 404-tolerated
+    // pattern, flips ``manifoldProbeRack.unavailable`` on an old
+    // server so the inspector section hides cleanly.
+    refreshManifoldProbeList(),
     // Server tree wins — fetch and reconcile.  404 is a quiet no-op
     // (server pre-loom); other failures surface via loomTree.error.
     refreshLoomTree(),

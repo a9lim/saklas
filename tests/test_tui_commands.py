@@ -38,6 +38,15 @@ def _make_app():
     session._monitor = MagicMock()
     session._monitor.probe_names = []
     session._monitor.profiles = {}
+    # Manifold monitor — peer to ``_monitor`` per Phase 1.  Tests that
+    # exercise manifold-probe slash commands populate ``probe_names`` /
+    # ``attached_probes`` directly on the mock; the default empty state
+    # makes the trait-panel manifold section a no-op renderer.
+    session._manifold_monitor = MagicMock()
+    session._manifold_monitor.probe_names = []
+    session._manifold_monitor.attached_probes = MagicMock(return_value={})
+    session._manifold_monitor.has_pending_per_token = MagicMock(return_value=False)
+    session.manifold_monitor = session._manifold_monitor
     session._last_result = None
     session._last_per_token_scores = None
     session._tokenizer = MagicMock()
@@ -2052,6 +2061,283 @@ def test_pairs_modal_parses_pair_lines():
     assert pairs == []
     assert len(errors) == 3
     assert "line 1" in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# /manifold-probe attach / remove + trait panel rendering
+# ---------------------------------------------------------------------------
+
+
+def test_manifold_probe_requires_selector():
+    app = _make_app()
+    app._handle_command("/manifold-probe")
+    assert "Usage: /manifold-probe" in _msgs(app)
+
+
+def test_manifold_probe_remove_requires_name():
+    app = _make_app()
+    app._handle_command("/manifold-probe-remove")
+    assert "Usage: /manifold-probe-remove" in _msgs(app)
+
+
+def test_manifold_probe_attach_routes_through_session(monkeypatch):
+    """``/manifold-probe <selector>`` calls ``session.add_manifold_probe``
+    on a worker; on success the trait panel is refreshed with the
+    attached probe's manifold artifact."""
+    app = _make_app()
+    captured = {}
+
+    def _fake_add(selector, **kwargs):
+        captured["selector"] = selector
+        # Pretend the session registered the probe under the selector
+        # name and populated the monitor.
+        manifold = SimpleNamespace(
+            domain=SimpleNamespace(intrinsic_dim=1),
+            node_labels=["a"], node_coords=None,
+        )
+        app._session._manifold_monitor.probe_names = [selector]
+        app._session._manifold_monitor.attached_probes = MagicMock(
+            return_value={selector: SimpleNamespace(manifold=manifold)},
+        )
+        return selector
+    app._session.add_manifold_probe = _fake_add
+    app._trait_panel.set_active_manifold_probes = MagicMock()
+    app.run_worker = lambda fn, thread=True: fn()
+    app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
+
+    app._handle_command("/manifold-probe circumplex")
+
+    assert captured["selector"] == "circumplex"
+    app._trait_panel.set_active_manifold_probes.assert_called()
+    pushed = app._trait_panel.set_active_manifold_probes.call_args.args[0]
+    assert "circumplex" in pushed
+    assert "Manifold probe 'circumplex' active" in _msgs(app)
+
+
+def test_manifold_probe_remove_routes_through_session():
+    app = _make_app()
+    app._session._manifold_monitor.probe_names = ["circumplex"]
+    app._session._manifold_monitor.attached_probes = MagicMock(return_value={})
+
+    def _fake_remove(name):
+        app._session._manifold_monitor.probe_names = []
+    app._session.remove_manifold_probe = _fake_remove
+    app._trait_panel.set_active_manifold_probes = MagicMock()
+
+    app._handle_command("/manifold-probe-remove circumplex")
+
+    assert app._session._manifold_monitor.probe_names == []
+    app._trait_panel.set_active_manifold_probes.assert_called_with({})
+    assert "removed" in _msgs(app).lower()
+
+
+def test_manifold_probe_remove_missing_reports():
+    app = _make_app()
+    app._session._manifold_monitor.probe_names = []
+    app._handle_command("/manifold-probe-remove ghost")
+    assert "not active" in _msgs(app)
+
+
+def test_manifold_probe_mid_gen_enqueues_pending():
+    from saklas.tui.chat_panel import PendingItem
+
+    app = _make_app()
+    app._session.is_generating = True
+    app._handle_command("/manifold-probe circumplex")
+    assert app._pending_queue == [
+        PendingItem(
+            "manifold_probe", "/manifold-probe circumplex", ("circumplex",),
+        ),
+    ]
+
+
+def test_manifold_probe_during_ab_shadow_is_refused():
+    app = _make_app()
+    app._ab_shadow_active = True
+    app._handle_command("/manifold-probe circumplex")
+    assert "A/B shadow" in _msgs(app)
+    assert app._pending_queue == []
+
+
+def test_pull_manifold_aggregates_pushes_from_last_result():
+    """``_finalize_widget_highlight`` calls ``_pull_manifold_aggregates``,
+    which reads ``session.last_result.manifold_readings`` and pushes the
+    aggregate map to the trait panel."""
+    from saklas.core.results import GenerationResult, ManifoldAggregate
+
+    app = _make_app()
+    agg = ManifoldAggregate(
+        fraction_mean=0.4,
+        fraction_per_layer={0: 0.4},
+        nearest=[("happy", 0.1), ("calm", 0.2)],
+        coords=(0.3, 0.5),
+        coords_per_layer={0: (0.3, 0.5)},
+        residual_mean=0.05,
+        residual_per_layer={0: 0.05},
+    )
+    result = GenerationResult(
+        text="x", tokens=[], token_count=0, tok_per_sec=0.0, elapsed=0.0,
+        manifold_readings={"circumplex": agg},
+    )
+    app._session.last_result = result
+    # Pretend a probe is attached so the early-out guard lets us through.
+    app._session._manifold_monitor.probe_names = ["circumplex"]
+    app._trait_panel.update_manifold_readings = MagicMock()
+
+    app._pull_manifold_aggregates()
+
+    app._trait_panel.update_manifold_readings.assert_called_once_with(
+        aggregates={"circumplex": agg},
+    )
+
+
+def test_trait_panel_renders_manifold_section_empty_state():
+    """An attached probe with no readings renders the bar at zero and
+    the nearest-list as empty without crashing."""
+    from saklas.tui.trait_panel import TraitPanel
+
+    panel = object.__new__(TraitPanel)
+    panel._categories = {}
+    panel._current_values = {}
+    panel._previous_values = {}
+    panel._sparklines = {}
+    panel._active_probes = set()
+    panel._sort_mode = "name"
+    panel._nav_items = []
+    panel._nav_idx = 0
+    panel._cached_render_text = ""
+    panel._manifold_probes = {}
+    panel._manifold_readings = {}
+    panel._manifold_aggregates = {}
+    panel._cached_manifold_text = ""
+    # Capture writes to the static targets.
+    header_writes: list[str] = []
+    content_writes: list[str] = []
+    panel._manifold_header = SimpleNamespace(update=header_writes.append)
+    panel._manifold_content = SimpleNamespace(update=content_writes.append)
+
+    # Empty registry — section is hidden.
+    panel._render_manifold_probes()
+    assert header_writes[-1] == ""
+    assert content_writes[-1] == ""
+
+    # Register a 1-D BoxDomain manifold without readings.
+    manifold = SimpleNamespace(
+        domain=SimpleNamespace(intrinsic_dim=1),
+        node_labels=["a"], node_coords=None,
+    )
+    panel._manifold_probes = {"toy": manifold}
+    panel._render_manifold_probes()
+    # Header appears, content has the probe name and a zero-filled bar.
+    assert "MANIFOLD PROBES" in header_writes[-1]
+    assert "toy" in content_writes[-1]
+    assert "0.00" in content_writes[-1]
+
+
+def test_trait_panel_renders_manifold_minimap_for_2d_box():
+    """A 2-D BoxDomain manifold draws an ASCII mini-map.  The coord dot
+    from the aggregate lands on a row that contains the ``●`` marker."""
+    import torch
+    from saklas.core.results import ManifoldAggregate
+    from saklas.tui.trait_panel import TraitPanel, MINIMAP_H, MINIMAP_W
+
+    panel = object.__new__(TraitPanel)
+    panel._categories = {}
+    panel._current_values = {}
+    panel._previous_values = {}
+    panel._sparklines = {}
+    panel._active_probes = set()
+    panel._sort_mode = "name"
+    panel._nav_items = []
+    panel._nav_idx = 0
+    panel._cached_render_text = ""
+    panel._manifold_probes = {}
+    panel._manifold_readings = {}
+    panel._manifold_aggregates = {}
+    panel._cached_manifold_text = ""
+    header_writes: list[str] = []
+    content_writes: list[str] = []
+    panel._manifold_header = SimpleNamespace(update=header_writes.append)
+    panel._manifold_content = SimpleNamespace(update=content_writes.append)
+
+    # Russell-style 2-D box: valence x arousal, each in [-1, 1].
+    ax = SimpleNamespace(periodic=False, period=1.0, lo=-1.0, hi=1.0)
+    domain = SimpleNamespace(intrinsic_dim=2, axes=(ax, ax))
+    # Five nodes: corners + origin.  Use a real tensor so .tolist() works.
+    coords = torch.tensor([
+        [-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0], [0.0, 0.0],
+    ])
+    manifold = SimpleNamespace(
+        domain=domain, node_labels=["a", "b", "c", "d", "e"],
+        node_coords=coords,
+    )
+    panel._manifold_probes = {"circ": manifold}
+    panel._manifold_aggregates = {"circ": ManifoldAggregate(
+        fraction_mean=0.5,
+        fraction_per_layer={0: 0.5},
+        nearest=[("e", 0.1)],
+        coords=(0.0, 0.0),  # origin — center of map
+        coords_per_layer={0: (0.0, 0.0)},
+        residual_mean=0.0,
+        residual_per_layer={0: 0.0},
+    )}
+
+    panel._render_manifold_probes()
+    rendered = content_writes[-1]
+    # Mini-map markers present.
+    assert "●" in rendered  # coord dot
+    assert "·" in rendered  # at least one node marker
+    # Bar reading shows the fraction.
+    assert "0.50" in rendered
+
+
+def test_trait_panel_skips_minimap_for_higher_dim():
+    """An 8-D CustomDomain (like ``personas``) renders the bar + labels
+    but no mini-map."""
+    from saklas.core.results import ManifoldTokenReading
+    from saklas.tui.trait_panel import TraitPanel
+
+    panel = object.__new__(TraitPanel)
+    panel._categories = {}
+    panel._current_values = {}
+    panel._previous_values = {}
+    panel._sparklines = {}
+    panel._active_probes = set()
+    panel._sort_mode = "name"
+    panel._nav_items = []
+    panel._nav_idx = 0
+    panel._cached_render_text = ""
+    panel._manifold_probes = {}
+    panel._manifold_readings = {}
+    panel._manifold_aggregates = {}
+    panel._cached_manifold_text = ""
+    content_writes: list[str] = []
+    panel._manifold_header = SimpleNamespace(update=lambda _t: None)
+    panel._manifold_content = SimpleNamespace(update=content_writes.append)
+
+    domain = SimpleNamespace(intrinsic_dim=8)  # no axes attribute
+    manifold = SimpleNamespace(
+        domain=domain, node_labels=["hacker", "pirate"], node_coords=None,
+    )
+    panel._manifold_probes = {"personas": manifold}
+    panel._manifold_readings = {"personas": ManifoldTokenReading(
+        fraction=0.3, nearest=[("hacker", 0.1)],
+    )}
+    panel._render_manifold_probes()
+    rendered = content_writes[-1]
+    assert "personas" in rendered
+    assert "hacker" in rendered
+    # No mini-map markers (markers only appear in the 2-D code path).
+    assert "●" not in rendered
+    assert "·" not in rendered
+
+
+def test_help_lists_manifold_probe_commands():
+    app = _make_app()
+    app._handle_command("/help")
+    msg = _msgs(app)
+    assert "/manifold-probe" in msg
+    assert "/manifold-probe-remove" in msg
 
 
 def test_pairs_extract_routes_through_session_extract():

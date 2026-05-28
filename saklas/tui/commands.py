@@ -213,6 +213,24 @@ def _build_registry() -> dict[str, SlashCommand]:
             max_args=None,  # folder paths may contain whitespace
         ),
         SlashCommand(
+            name="/manifold-probe",
+            handler=SaklasApp._handle_manifold_probe,
+            usage=(
+                "Usage: /manifold-probe <selector>\n"
+                "  e.g. /manifold-probe circumplex\n"
+                "       /manifold-probe alice/affect"
+            ),
+            min_args=1,
+            max_args=None,  # selectors are single tokens but allow trailing
+        ),
+        SlashCommand(
+            name="/manifold-probe-remove",
+            handler=SaklasApp._handle_manifold_probe_remove,
+            usage="Usage: /manifold-probe-remove <name>",
+            min_args=1,
+            max_args=1,
+        ),
+        SlashCommand(
             name="/seed",
             handler=SaklasApp._handle_seed,
             usage="Usage: /seed [n|clear]",

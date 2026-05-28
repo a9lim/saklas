@@ -889,6 +889,31 @@ class Manifold:
 _ROTATE_EPSILON: float = 1e-6
 
 
+def decompose(
+    h: torch.Tensor,
+    mean: torch.Tensor,
+    basis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decompose a centered activation into in-subspace + orthogonal parts.
+
+    ``h`` is ``(.., D)``, ``mean`` ``(D,)``, ``basis`` ``(R, D)``.
+    Returns ``(h_par_c, h_perp)``: ``h_par_c`` is the reconstruction of
+    the centered activation inside the manifold's affine subspace,
+    ``h_perp`` is the orthogonal residual; together they sum to
+    ``h - mean`` exactly.
+
+    The shared decomposition step that backs :func:`subspace_replace`,
+    :func:`subspace_rotate`, and the read-side ``ManifoldMonitor``.  All
+    three intermediates are kept in the input's dtype — callers that need
+    fp32 (the injection functions, the monitor) cast their inputs first.
+    """
+    centered = h - mean
+    coords = centered @ basis.T          # (.., R)
+    h_par_c = coords @ basis             # (.., D)
+    h_perp = centered - h_par_c          # (.., D)
+    return h_par_c, h_perp
+
+
 def subspace_replace(
     h: torch.Tensor,
     mean: torch.Tensor,
@@ -930,9 +955,8 @@ def subspace_replace(
     basis_f32 = basis.to(torch.float32)
     target_f32 = target.to(torch.float32)
 
-    centered = h_f32 - mean_f32
-    coords = centered @ basis_f32.T          # (.., R)
-    h_par = coords @ basis_f32 + mean_f32    # (.., D) in-subspace part
+    h_par_c, _h_perp = decompose(h_f32, mean_f32, basis_f32)
+    h_par = h_par_c + mean_f32               # (.., D) in-subspace part
     delta = target_f32 - h_par               # (.., D) in-subspace correction
     h_new = h_f32 + alpha * delta
 
@@ -999,10 +1023,7 @@ def subspace_rotate(
     basis_f32 = basis.to(torch.float32)
     target_f32 = target.to(torch.float32)
 
-    centered = h_f32 - mean_f32                          # (.., D)
-    coords = centered @ basis_f32.T                      # (.., R)
-    h_par_c = coords @ basis_f32                         # (.., D) in subspace
-    h_perp = centered - h_par_c                          # (.., D) orthogonal
+    h_par_c, h_perp = decompose(h_f32, mean_f32, basis_f32)
 
     target_c = target_f32 - mean_f32                     # (D,) in subspace
     target_norm = torch.linalg.vector_norm(target_c).clamp(min=_ROTATE_EPSILON)
@@ -1802,6 +1823,7 @@ __all__ = [
     "eval_rbf",
     "eval_rbf_jacobian",
     "fit_layer_subspace",
+    "decompose",
     "subspace_replace",
     "subspace_rotate",
     "PcaDiagnostics",

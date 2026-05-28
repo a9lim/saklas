@@ -412,6 +412,75 @@ export interface ProbeListResponse {
   probes: ProbeInfo[];
 }
 
+// ------------------------------------------------- manifold probes --
+
+/** Row returned by the manifold-probes list / create routes.  Carries
+ *  enough manifold geometry for the client to render the node layout
+ *  (labels + intrinsic dim + domain spec) without re-fetching the source
+ *  artifact.  Mirrors ``saklas.core.monitor.ManifoldProbeInfo``. */
+export interface ManifoldProbeInfo {
+  /** Registered probe name (defaults to the selector when ``name`` was
+   *  omitted at attach time). */
+  name: string;
+  /** Underlying manifold display name (``ns/name`` or bare). */
+  manifold: string;
+  /** Per-token nearest-node list length. */
+  top_n: number;
+  /** Sorted ascending list of layer indices the probe reads from. */
+  layers: number[];
+  /** Authoring node labels.  Aligned with the manifold's ``node_coords``
+   *  when the geometry is authored / fitted. */
+  node_labels: string[];
+  node_count: number;
+  /** Manifold domain spec — same shape as ``ManifoldInfo.domain``.  May
+   *  be ``{}`` for an unfitted discover manifold (the server reports
+   *  ``intrinsic_dim = 0`` then). */
+  domain: ManifoldDomain | Record<string, never>;
+  intrinsic_dim: number;
+  /** ``"raw"`` for plain activation space, ``"sae-<release>"`` for an
+   *  SAE-reconstructed manifold. */
+  feature_space: string;
+  /** Per-node authoring coordinates the server attached to the probe row.
+   *  Aligned with ``node_labels``; populated when the manifold carries a
+   *  per-model layout (authored or fitted-discover).  Empty / absent on
+   *  unfitted discover probes. */
+  node_coords?: number[][];
+}
+
+export interface ManifoldProbeListResponse {
+  probes: ManifoldProbeInfo[];
+}
+
+export interface AttachManifoldProbeRequest {
+  selector: string;
+  name?: string;
+  top_n?: number;
+}
+
+/** Per-token streaming reading for one manifold probe.  Mirrors
+ *  ``ManifoldTokenReading.to_dict()``.  ``fraction`` is the
+ *  EV-weighted subspace-fraction across layers; ``nearest`` is the
+ *  top-N nearest-node list as ``(label, distance)`` pairs sorted
+ *  ascending. */
+export interface ManifoldTokenReadingJSON {
+  fraction: number;
+  nearest: [string, number][];
+}
+
+/** End-of-generation aggregate reading for one manifold probe.  Mirrors
+ *  ``ManifoldAggregate.to_dict()``.  ``coords`` is the EV-weighted mean
+ *  authoring-space position recovered by ``invert_parameterization``;
+ *  ``coords_per_layer`` exposes the same per-layer trace. */
+export interface ManifoldAggregateJSON {
+  fraction_mean: number;
+  fraction_per_layer: Record<string, number>;
+  nearest: [string, number][];
+  coords: number[];
+  coords_per_layer: Record<string, number[]>;
+  residual_mean: number;
+  residual_per_layer: Record<string, number>;
+}
+
 export interface ProbeDefaultsResponse {
   defaults: string[];
 }
@@ -653,6 +722,11 @@ export interface WSTokenEvent {
   /** Loom: node id this token belongs to.  Routes the token to the right
    * sibling render during n-way regen.  Optional. */
   node_id?: string | null;
+  /** Per-attached-probe manifold reading for this token.  Keys are probe
+   *  names; values carry ``fraction`` (EV-weighted subspace fraction) and
+   *  ``nearest`` (top-N node-label distances).  Field is omitted entirely
+   *  when no manifold probe is attached, so legacy clients see no change. */
+  manifold_readings?: Record<string, ManifoldTokenReadingJSON>;
 }
 
 export interface WSDoneResultPerToken {
@@ -674,6 +748,11 @@ export interface WSDoneResult {
    *  response span (thinking tokens excluded by construction).  Null when
    *  logprob capture wasn't live (replay / no on_token consumer). */
   mean_logprob?: number | null;
+  /** End-of-generation per-attached-probe aggregate.  Keys are probe
+   *  names; values carry ``fraction_mean``, ``coords``, ``nearest`` and
+   *  the per-layer traces.  Field is omitted entirely when no manifold
+   *  probe is attached — read defensively. */
+  manifold_readings?: Record<string, ManifoldAggregateJSON>;
 }
 
 export interface WSDoneEvent {

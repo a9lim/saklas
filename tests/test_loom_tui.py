@@ -746,11 +746,11 @@ def test_fire_auto_regen_streams_into_shadow_column():
         items.append(app._ui_token_queue.get_nowait())
     tok_items = [it for it in items if it[0] == "tok"]
     assert len(tok_items) == 2, items
-    # Position 7 (trailing flag) is the ``is_shadow`` tag.  Tuple shape
-    # post-Phase 3: (kind, text, thinking, scores, perplexity, logprob,
-    # widget, is_shadow) — eight elements after the logit-pass logprob
-    # field landed between perplexity and widget.
-    assert all(it[-1] is True for it in tok_items)
+    # Position 7 is the ``is_shadow`` tag.  Tuple shape post-Phase 3b:
+    # (kind, text, thinking, scores, perplexity, logprob, widget,
+    # is_shadow, manifold_readings) — nine elements after the
+    # manifold-probe per-token readings slot landed at the tail.
+    assert all(it[7] is True for it in tok_items)
     # And the right column had its shadow widget mounted.
     app._chat_panel.start_shadow_message.assert_called_once_with(row)
 

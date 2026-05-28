@@ -1,11 +1,35 @@
+from __future__ import annotations
+
 from collections import deque
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
+
+from saklas.core.manifold import decompose, invert_parameterization
+from saklas.core.results import ManifoldAggregate, ManifoldTokenReading
+
+if TYPE_CHECKING:
+    from saklas.core.manifold import Manifold
 
 _MAX_HISTORY = 8
 
 _EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
                 "min": float("inf"), "max": float("-inf")}
+
+# Default top-N nearest-node count for manifold probes.  Per-probe
+# override available on ``ManifoldMonitor.add_probe``.
+DEFAULT_NEAREST_TOP_N: int = 3
+
+# Floor for the EV weight on a manifold layer with degenerate fit
+# quality — keeps the EV-weighted aggregation from collapsing to NaN
+# on a manifold whose every layer reports EV ≈ 0.  Matches the
+# ``min_ev`` floor on additive-mode manifold steering's quality_factor.
+_MIN_EV_WEIGHT: float = 1e-6
+
+# Guard against division by zero in the subspace_fraction numerator —
+# matches the hot-path ``_ANGULAR_PERP_EPSILON`` in hooks.py.
+_FRACTION_EPSILON: float = 1e-8
 
 
 class TraitMonitor:
@@ -557,3 +581,450 @@ class TraitMonitor:
             self._stats[name] = self._empty_stats()
         self._pending_aggregate = False
         self._pending_per_token = False
+
+
+@dataclass
+class AttachedManifoldProbe:
+    """One manifold registered on a :class:`ManifoldMonitor`.
+
+    Pairs the loaded :class:`Manifold` artifact with per-layer caches the
+    monitor uses on the hot path: ``node_values_world`` is the per-layer
+    ``(K, D)`` tensor of world-space node activations
+    (``sub.eval_at(domain.embed(node_coords))``), pre-computed once at
+    attach so per-token distance computations are one batched cdist in
+    R-dim per layer.  ``node_values_reduced`` is the same data in the
+    per-layer subspace coords (also ``(K, R)``).  ``ev_weights`` is the
+    per-layer EV ratio used to weight cross-layer aggregation; floored
+    at :data:`_MIN_EV_WEIGHT` so a degenerate layer doesn't crash the
+    aggregator.
+    """
+
+    name: str
+    manifold: "Manifold"
+    top_n: int = DEFAULT_NEAREST_TOP_N
+    # Per-layer caches, indexed by layer index — same set of layers as
+    # ``manifold.layers``.
+    node_values_world: dict[int, torch.Tensor] = field(default_factory=dict)
+    node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
+    # Cached node coords on the device.  ``(K, n)`` shared across layers.
+    embedded_node_coords: torch.Tensor | None = None
+    # Per-layer EV weight, normalized to sum to 1 across attached layers.
+    ev_weights: dict[int, float] = field(default_factory=dict)
+
+
+class ManifoldMonitor:
+    """Read-side counterpart to manifold steering.
+
+    For each attached manifold the monitor exposes three channels: the
+    fraction of the centered activation that lives in the manifold's PCA
+    subspace (hot path, scored per token), the top-N node labels nearest
+    the running activation in activation space (hot path, EV-weighted
+    across layers), and the inverse-projection of the pooled
+    end-of-generation activation onto the manifold (slow path, run once
+    in ``_finalize_generation``).
+
+    Peer to :class:`TraitMonitor` — vector probes and manifold probes
+    compose independently; ``flat_scalars`` flattens the rich per-token
+    readings into namespaced scalars (``<probe>:fraction`` and
+    ``<probe>@<label>``, the latter as ``-distance`` so larger means
+    closer) that merge cleanly into ``TriggerContext.probe_scores`` for
+    ``@when:`` gates.
+
+    Hot-path discipline: no ``.item()`` per token, fp32 norms (fp16
+    sum-of-squares overflows at hidden_dim >= 2048), pre-cached node
+    values in subspace coords so per-token distance computations are one
+    batched cdist in R-dim per layer.  ``layer_means`` is accepted for
+    parity with :class:`TraitMonitor`'s init signature but not consulted
+    — manifold fraction uses the per-fit ``LayerSubspace.mean`` (the
+    centroid of the node centroids), not the global layer mean.
+    """
+
+    def __init__(
+        self,
+        layer_means: dict[int, torch.Tensor] | None = None,
+    ) -> None:
+        # Stashed for symmetry with TraitMonitor; the manifold-side math
+        # never reads global layer means — fraction centers on each
+        # manifold's own per-fit mean.
+        self._layer_means: dict[int, torch.Tensor] = (
+            dict(layer_means) if layer_means else {}
+        )
+        self._probes: dict[str, AttachedManifoldProbe] = {}
+        # Mirror TraitMonitor's pending-flag pattern so the TUI / webui
+        # streaming surfaces can poll for "is a new per-token reading
+        # available."
+        self._pending_per_token: bool = False
+
+    @property
+    def probe_names(self) -> list[str]:
+        """Attached manifold-probe names in insertion order."""
+        return list(self._probes.keys())
+
+    @property
+    def layer_means(self) -> dict[int, torch.Tensor]:
+        return self._layer_means
+
+    @layer_means.setter
+    def layer_means(self, value: dict[int, torch.Tensor] | None) -> None:
+        if value is not None and not isinstance(value, dict):
+            raise TypeError(
+                f"layer_means must be a dict, got {type(value).__name__}"
+            )
+        self._layer_means = dict(value) if value else {}
+
+    def attached_probes(self) -> dict[str, AttachedManifoldProbe]:
+        """Return the live attached-probe map (read-only view)."""
+        return dict(self._probes)
+
+    def attached_layers(self) -> set[int]:
+        """Union of layer indices across every attached manifold.
+
+        Used by ``session._begin_capture`` to widen the per-token
+        hidden-state capture so manifold scoring sees every layer the
+        manifold covers, not just the vector-probe layer union.
+        """
+        out: set[int] = set()
+        for probe in self._probes.values():
+            out.update(probe.manifold.layers.keys())
+        return out
+
+    def add_probe(
+        self,
+        name: str,
+        manifold: "Manifold",
+        *,
+        top_n: int = DEFAULT_NEAREST_TOP_N,
+    ) -> None:
+        """Register a manifold under ``name`` and pre-cache per-layer node values.
+
+        ``top_n`` controls the ``nearest`` list length; default
+        :data:`DEFAULT_NEAREST_TOP_N` (3).  The pre-cache runs once at
+        attach: for every layer the manifold covers, compute the
+        per-node world-space activation
+        (``sub.eval_at(domain.embed(node_coords))``) and its reduced
+        in-subspace form (``(K, R)`` for the per-token cdist), and the
+        normalized EV weight (per-layer EV ratio over the layer-union
+        sum, floored at :data:`_MIN_EV_WEIGHT`).
+        """
+        if not manifold.layers:
+            raise ValueError(
+                f"manifold {manifold.name!r} carries no fitted layers"
+            )
+        if manifold.node_coords.numel() == 0 or not manifold.node_labels:
+            raise ValueError(
+                f"manifold {manifold.name!r} carries no node coords / labels"
+            )
+        node_values_world: dict[int, torch.Tensor] = {}
+        node_values_reduced: dict[int, torch.Tensor] = {}
+        ev_weights_raw: dict[int, float] = {}
+        # Cache the embedded node coords once — they ride with the
+        # manifold's domain, not per layer.
+        coords = manifold.node_coords.to(torch.float32)
+        clamped = manifold.domain.clamp_position(coords)
+        embedded = manifold.domain.embed(clamped)  # (K, m)
+        for layer_idx, sub in manifold.layers.items():
+            sub_f32 = sub.to(device=sub.mean.device, dtype=torch.float32)
+            embedded_dev = embedded.to(
+                device=sub_f32.mean.device, dtype=torch.float32,
+            )
+            # World-space per-node activation: ``(K, D)`` in fp32.
+            v_world = sub_f32.eval_at(embedded_dev)  # (K, D)
+            # Reduced (in-subspace) per-node activation: ``(K, R)`` — the
+            # working space for the hot-path cdist against the running
+            # activation's in-subspace projection.  Centered through
+            # ``sub.mean`` so it matches the centered ``h_par_c`` slice
+            # ``decompose`` returns.
+            v_centered = v_world - sub_f32.mean
+            v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
+            node_values_world[layer_idx] = v_world.contiguous()
+            node_values_reduced[layer_idx] = v_reduced.contiguous()
+            ev_weights_raw[layer_idx] = float(
+                manifold.explained_variance.get(layer_idx, 1.0)
+            )
+        # Normalize EV weights to sum to 1 across attached layers, with
+        # the per-layer floor.  Empty EV dict (pre-v4 manifolds) falls
+        # back to uniform weighting.
+        total = sum(max(_MIN_EV_WEIGHT, w) for w in ev_weights_raw.values())
+        if total <= 0.0:
+            n_layers = max(1, len(ev_weights_raw))
+            ev_weights = {idx: 1.0 / n_layers for idx in ev_weights_raw}
+        else:
+            ev_weights = {
+                idx: max(_MIN_EV_WEIGHT, w) / total
+                for idx, w in ev_weights_raw.items()
+            }
+        probe = AttachedManifoldProbe(
+            name=name,
+            manifold=manifold,
+            top_n=int(top_n),
+            node_values_world=node_values_world,
+            node_values_reduced=node_values_reduced,
+            embedded_node_coords=embedded,
+            ev_weights=ev_weights,
+        )
+        self._probes[name] = probe
+
+    def remove_probe(self, name: str) -> None:
+        self._probes.pop(name, None)
+
+    def reset(self) -> None:
+        """Clear every attached manifold probe (TUI ``/unsteer``-style reset)."""
+        self._probes.clear()
+        self._pending_per_token = False
+
+    def has_pending_per_token(self) -> bool:
+        return self._pending_per_token
+
+    def consume_pending_per_token(self) -> None:
+        self._pending_per_token = False
+
+    # ----------------------------------------------- hot-path scoring ---
+
+    def score_single_token(
+        self,
+        hidden_per_layer: dict[int, torch.Tensor],
+    ) -> dict[str, ManifoldTokenReading]:
+        """Per-token manifold readings — hot path.
+
+        For each attached probe, walks the shared layer set between
+        ``hidden_per_layer`` and the probe's manifold layers, computes
+        the per-layer subspace fraction and per-node distance, then
+        EV-weighted-aggregates across layers.  Returns one
+        :class:`ManifoldTokenReading` per probe; the empty
+        ``hidden_per_layer`` case returns an empty dict.
+
+        Each ``ManifoldTokenReading.fraction`` is in ``[0, 1]``; the
+        nearest list is top-N ``(label, distance)`` ascending by
+        distance.
+        """
+        out: dict[str, ManifoldTokenReading] = {}
+        if not hidden_per_layer or not self._probes:
+            return out
+
+        for name, probe in self._probes.items():
+            manifold = probe.manifold
+            ev = probe.ev_weights
+            shared = [
+                idx for idx in manifold.layers
+                if idx in hidden_per_layer
+            ]
+            if not shared:
+                out[name] = ManifoldTokenReading(fraction=0.0, nearest=[])
+                continue
+            # EV weights restricted to the shared set, re-normalized.
+            total_w = sum(ev.get(idx, 0.0) for idx in shared)
+            if total_w <= _MIN_EV_WEIGHT:
+                w_shared = {idx: 1.0 / len(shared) for idx in shared}
+            else:
+                w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
+
+            # Per-node EV-weighted distance accumulator (CPU scalars —
+            # K is on the order of tens, the sync cost is one
+            # ``.tolist()`` per layer per probe).
+            K = probe.node_values_reduced[shared[0]].shape[0]
+            dist_acc = [0.0] * K
+            frac_sum = 0.0
+            for layer_idx in shared:
+                sub = manifold.layers[layer_idx]
+                h = hidden_per_layer[layer_idx].to(torch.float32)
+                if h.ndim > 1:
+                    # Hot-path captures are 1-D ``[D]`` slices, but
+                    # defensively flatten to the last dim.
+                    h = h.reshape(-1, h.shape[-1])[-1]
+                mean = sub.mean.to(device=h.device, dtype=torch.float32)
+                basis = sub.basis.to(device=h.device, dtype=torch.float32)
+                h_par_c, h_perp = decompose(h, mean, basis)
+                # Subspace fraction.
+                num = torch.linalg.vector_norm(h_par_c)
+                denom = torch.linalg.vector_norm(h - mean).clamp(
+                    min=_FRACTION_EPSILON,
+                )
+                frac = float((num / denom).clamp(min=0.0, max=1.0).item())
+                frac_sum += w_shared[layer_idx] * frac
+                # Per-node distance in reduced-subspace coords.  ``h_par_c``
+                # in world-space coords; project to reduced via the same
+                # ``basis`` so the cdist runs in R-dim, K is small.
+                h_reduced = (h_par_c @ basis.T).reshape(1, -1)  # (1, R)
+                v_reduced = probe.node_values_reduced[layer_idx].to(
+                    device=h.device, dtype=torch.float32,
+                )  # (K, R)
+                dists = torch.cdist(h_reduced, v_reduced).reshape(-1)  # (K,)
+                dist_list = dists.cpu().tolist()
+                w = w_shared[layer_idx]
+                for k in range(K):
+                    dist_acc[k] += w * dist_list[k]
+            # Top-N by ascending EV-weighted distance.
+            order = sorted(range(K), key=lambda k: dist_acc[k])
+            top = order[: probe.top_n]
+            nearest = [
+                (manifold.node_labels[k], dist_acc[k]) for k in top
+            ]
+            out[name] = ManifoldTokenReading(
+                fraction=frac_sum,
+                nearest=nearest,
+            )
+        self._pending_per_token = True
+        return out
+
+    def flat_scalars(
+        self,
+        readings: dict[str, ManifoldTokenReading],
+    ) -> dict[str, float]:
+        """Flatten per-probe readings into namespaced gate-callback scalars.
+
+        Emits ``"<probe>:fraction"`` for the subspace-fraction channel
+        and ``"<probe>@<label>"`` for each node-distance channel; the
+        latter uses ``-distance`` so the convention "larger = closer"
+        holds across both channel types and ``@when:<probe>@<label> > x``
+        reads like a similarity gate.  The output dict merges directly
+        into ``TriggerContext.probe_scores`` alongside vector-probe
+        scalars from :class:`TraitMonitor`.
+        """
+        out: dict[str, float] = {}
+        for name, reading in readings.items():
+            out[f"{name}:fraction"] = reading.fraction
+            for label, dist in reading.nearest:
+                out[f"{name}@{label}"] = -dist
+        return out
+
+    # ----------------------------------------------- slow-path aggregate ---
+
+    def score_aggregate(
+        self,
+        captured_per_layer: dict[int, torch.Tensor],
+    ) -> dict[str, ManifoldAggregate]:
+        """End-of-generation manifold aggregates over pooled captures.
+
+        ``captured_per_layer[L]`` is the per-layer ``[T, D]`` stack of
+        per-token captures the session collected during generation.  The
+        per-layer pooled activation is the mean across tokens; the
+        aggregator computes (1) per-layer + EV-weighted subspace
+        fraction, (2) the EV-weighted nearest-node vote (same shape as
+        the per-token channel, top-N), and (3) per-layer
+        ``invert_parameterization`` to recover authoring coords +
+        normalized residual.  Coords are EV-weighted-meaned across
+        layers (they share the manifold's domain so the mean is
+        meaningful); residual is reported as
+        ``dist_L / ||h_par_c_L||`` per layer and EV-weighted-meaned.
+        """
+        out: dict[str, ManifoldAggregate] = {}
+        if not captured_per_layer or not self._probes:
+            return out
+
+        # Pool per-layer once — every probe reads the same captures.
+        pooled: dict[int, torch.Tensor] = {}
+        for layer_idx, stack in captured_per_layer.items():
+            if stack is None or stack.numel() == 0:
+                continue
+            if stack.ndim == 1:
+                pooled[layer_idx] = stack.to(torch.float32)
+            else:
+                pooled[layer_idx] = stack.to(torch.float32).mean(dim=0)
+
+        for name, probe in self._probes.items():
+            manifold = probe.manifold
+            ev = probe.ev_weights
+            shared = [
+                idx for idx in manifold.layers
+                if idx in pooled
+            ]
+            if not shared:
+                out[name] = ManifoldAggregate(
+                    fraction_mean=0.0,
+                    fraction_per_layer={},
+                    nearest=[],
+                    coords=tuple(),
+                    coords_per_layer={},
+                    residual_mean=0.0,
+                    residual_per_layer={},
+                )
+                continue
+            total_w = sum(ev.get(idx, 0.0) for idx in shared)
+            if total_w <= _MIN_EV_WEIGHT:
+                w_shared = {idx: 1.0 / len(shared) for idx in shared}
+            else:
+                w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
+
+            K = probe.node_values_reduced[shared[0]].shape[0]
+            dist_acc = [0.0] * K
+            frac_per_layer: dict[int, float] = {}
+            coords_per_layer: dict[int, tuple[float, ...]] = {}
+            residual_per_layer: dict[int, float] = {}
+            frac_mean = 0.0
+            residual_mean = 0.0
+            coords_mean: list[float] | None = None
+            n_dim = manifold.domain.intrinsic_dim
+
+            for layer_idx in shared:
+                sub = manifold.layers[layer_idx]
+                h = pooled[layer_idx].to(torch.float32)
+                if h.ndim > 1:
+                    h = h.reshape(-1, h.shape[-1])[-1]
+                mean = sub.mean.to(device=h.device, dtype=torch.float32)
+                basis = sub.basis.to(device=h.device, dtype=torch.float32)
+                h_par_c, _h_perp = decompose(h, mean, basis)
+                num = torch.linalg.vector_norm(h_par_c)
+                centered_norm = torch.linalg.vector_norm(h - mean).clamp(
+                    min=_FRACTION_EPSILON,
+                )
+                frac = float(
+                    (num / centered_norm).clamp(min=0.0, max=1.0).item()
+                )
+                frac_per_layer[layer_idx] = frac
+                w = w_shared[layer_idx]
+                frac_mean += w * frac
+
+                # Nearest-node distances in reduced-subspace coords.
+                h_reduced = (h_par_c @ basis.T).reshape(1, -1)  # (1, R)
+                v_reduced = probe.node_values_reduced[layer_idx].to(
+                    device=h.device, dtype=torch.float32,
+                )
+                dists = torch.cdist(h_reduced, v_reduced).reshape(-1)
+                dist_list = dists.cpu().tolist()
+                for k in range(K):
+                    dist_acc[k] += w * dist_list[k]
+
+                # Inverse projection — coords + residual per layer.
+                pos, res = invert_parameterization(
+                    sub, manifold.domain, h_reduced,
+                )
+                pos_t = pos.reshape(-1)
+                res_val = float(res.reshape(-1)[0].item())
+                # Normalize residual by the in-subspace magnitude so the
+                # number is comparable across layers / generations.
+                par_norm_val = float(num.item())
+                if par_norm_val < _FRACTION_EPSILON:
+                    norm_residual = 0.0
+                else:
+                    norm_residual = res_val / par_norm_val
+                residual_per_layer[layer_idx] = norm_residual
+                residual_mean += w * norm_residual
+                coord_tup = tuple(
+                    float(c) for c in pos_t.tolist()[:n_dim]
+                )
+                coords_per_layer[layer_idx] = coord_tup
+                if coords_mean is None:
+                    coords_mean = [w * c for c in coord_tup]
+                else:
+                    for i, c in enumerate(coord_tup):
+                        if i < len(coords_mean):
+                            coords_mean[i] += w * c
+
+            order = sorted(range(K), key=lambda k: dist_acc[k])
+            top = order[: probe.top_n]
+            nearest = [
+                (manifold.node_labels[k], dist_acc[k]) for k in top
+            ]
+            coords_tuple = (
+                tuple(coords_mean) if coords_mean is not None else tuple()
+            )
+            out[name] = ManifoldAggregate(
+                fraction_mean=frac_mean,
+                fraction_per_layer=frac_per_layer,
+                nearest=nearest,
+                coords=coords_tuple,
+                coords_per_layer=coords_per_layer,
+                residual_mean=residual_mean,
+                residual_per_layer=residual_per_layer,
+            )
+        return out

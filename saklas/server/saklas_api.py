@@ -317,6 +317,24 @@ class CloneVectorRequest(BaseModel):
     baseline: str | None = None
 
 
+class ManifoldProbeRequest(BaseModel):
+    """Body for ``POST /saklas/v1/manifold-probes``.
+
+    ``selector`` rides the same ``[ns/]name[:variant]`` shape the
+    steering grammar's ``%`` operator consumes — the artifact loads
+    through :meth:`SaklasSession._ensure_manifold_loaded`, so a probe
+    registered here shares the cache with any matching ``%`` steering
+    term.  ``name`` overrides the registered probe name (defaults to
+    ``selector``); ``top_n`` controls the per-token nearest-node list
+    length (defaults to :data:`saklas.core.monitor.DEFAULT_NEAREST_TOP_N`,
+    currently 3).
+    """
+
+    selector: str
+    name: str | None = None
+    top_n: int | None = None
+
+
 class ExperimentFanRequest(BaseModel):
     """Body for ``POST /saklas/v1/sessions/{id}/experiments/fan``.
 
@@ -711,6 +729,63 @@ def _yaml_inline(value: Any) -> str:
     return json.dumps(value)
 
 
+def _manifold_probe_info(name: str, probe: Any) -> dict[str, Any]:
+    """Serialize one :class:`AttachedManifoldProbe` to JSON for the wire.
+
+    Carries enough metadata for a client to render the manifold's
+    intrinsic structure — domain spec + intrinsic dimension, node
+    labels, the layer set the probe covers, and the configured
+    ``top_n`` nearest-node depth.  Mirrors the shape
+    ``GET /saklas/v1/manifolds`` ships for an artifact, restricted to
+    the fields a read-side probe needs (no per-node statements, no fit
+    diagnostics — the probe is the *runtime* view).
+    """
+    manifold = probe.manifold
+    try:
+        domain_spec = manifold.domain.to_spec()
+    except Exception:
+        domain_spec = {}
+    try:
+        intrinsic_dim = int(manifold.domain.intrinsic_dim)
+    except Exception:
+        intrinsic_dim = 0
+    return {
+        "name": name,
+        "manifold": manifold.name,
+        "top_n": int(probe.top_n),
+        "layers": sorted(manifold.layers.keys()),
+        "node_labels": list(manifold.node_labels),
+        "node_count": len(manifold.node_labels),
+        "domain": domain_spec,
+        "intrinsic_dim": intrinsic_dim,
+        "feature_space": manifold.feature_space,
+    }
+
+
+def _manifold_aggregate_dict(session: SaklasSession) -> dict[str, Any]:
+    """Build ``{probe_name: ManifoldAggregate.to_dict()}`` from ``_last_result``.
+
+    Returns ``{}`` when no result is recorded or no manifold probes are
+    attached.  Cross-checks attached probe names so a stale aggregate
+    from a detached probe never leaks to the wire.
+    """
+    result = getattr(session, "_last_result", None)
+    if result is None:
+        return {}
+    readings = getattr(result, "manifold_readings", None) or {}
+    if not readings:
+        return {}
+    try:
+        attached = set(session._manifold_monitor.probe_names)
+    except Exception:
+        attached = set(readings.keys())
+    return {
+        name: agg.to_dict()
+        for name, agg in readings.items()
+        if name in attached
+    }
+
+
 def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict[str, Any]]:
     scores = session.last_per_token_scores
     if not scores:
@@ -744,6 +819,80 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     from saklas.server.manifold_routes import register_manifold_routes
     register_manifold_routes(app)
+
+    # ----- manifold probes (read-side counterpart to manifold steering) --
+
+    @app.get("/saklas/v1/manifold-probes")
+    def list_manifold_probes():
+        """List every manifold probe currently attached to the session.
+
+        Probes are top-level rather than session-scoped on the wire
+        (mirroring the manifold-artifact routes) because the single
+        session is implicit.  Each row carries the manifold's domain
+        spec, intrinsic dimension, layer coverage, and node labels —
+        enough for a client to render the manifold's geometry without
+        a follow-up fetch of the source artifact.
+        """
+        try:
+            attached = session.manifold_monitor.attached_probes()
+        except Exception:
+            attached = {}
+        return {
+            "probes": [
+                _manifold_probe_info(name, probe)
+                for name, probe in attached.items()
+            ],
+        }
+
+    @app.post("/saklas/v1/manifold-probes", status_code=201)
+    def add_manifold_probe(req: ManifoldProbeRequest):
+        """Attach a manifold probe by selector.
+
+        Wraps :meth:`SaklasSession.add_manifold_probe`; the selector
+        rides the same ``[ns/]name[:variant]`` shape the ``%`` steering
+        operator consumes, so a probe attached here participates in
+        the same lazy-load cache as a manifold steered with
+        ``<selector>%<position>``.  Returns the registered probe info
+        in the same shape ``GET /saklas/v1/manifold-probes`` rows use.
+        """
+        if not req.selector or not req.selector.strip():
+            raise HTTPException(400, "selector must not be empty")
+        top_n = req.top_n if req.top_n and req.top_n > 0 else 3
+        try:
+            registered_name = session.add_manifold_probe(
+                req.selector, as_name=req.name, top_n=top_n,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        attached = session.manifold_monitor.attached_probes()
+        probe = attached.get(registered_name)
+        if probe is None:
+            raise HTTPException(
+                500,
+                f"manifold probe '{registered_name}' attach did not register",
+            )
+        return _manifold_probe_info(registered_name, probe)
+
+    @app.delete(
+        "/saklas/v1/manifold-probes/{name}",
+        status_code=204,
+    )
+    def remove_manifold_probe(name: str):
+        """Detach a previously-attached manifold probe.
+
+        404 when ``name`` is not currently registered.  Mirrors the
+        ``DELETE /probes/{name}`` shape for vector probes.
+        """
+        try:
+            attached_names = session.manifold_monitor.probe_names
+        except Exception:
+            attached_names = []
+        if name not in attached_names:
+            raise HTTPException(404, f"manifold probe '{name}' not attached")
+        session.remove_manifold_probe(name)
+        return JSONResponse(status_code=204, content=None)
 
     # ----- packs (top-level, not under a session) ------------------------
 
@@ -3038,6 +3187,16 @@ async def _ws_handle_generate(
                 result_json["per_token_probes"] = _per_token_probes(
                     session, getattr(result, "token_count", 0) or 0,
                 )
+                # Per-attached-manifold-probe aggregate readings ride on
+                # the ``done`` event so a WS client picks up the
+                # geometric channel alongside the existing vector-probe
+                # ``per_token_probes`` block.  Empty dict when no
+                # manifold probe is attached.
+                mf_readings = getattr(result, "manifold_readings", None) or {}
+                if mf_readings:
+                    result_json["manifold_readings"] = {
+                        k: v.to_dict() for k, v in mf_readings.items()
+                    }
             else:
                 result_json["per_token_probes"] = []
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the

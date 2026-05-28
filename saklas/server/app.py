@@ -279,6 +279,56 @@ def _probe_reading_dict(session: SaklasSession) -> dict[str, Any]:
     return out
 
 
+def _manifold_reading_aggregate(session: SaklasSession) -> dict[str, Any]:
+    """Per-attached-probe ``ManifoldAggregate.to_dict()`` from ``_last_result``.
+
+    Returns ``{}`` when no result is recorded or no manifold probes are
+    attached.  Surfaced under the ``x-saklas-manifold-readings`` extension
+    on OpenAI and Ollama responses so vector-probe clients keep working
+    unchanged and manifold-aware clients pick up the geometric channel.
+    """
+    result = getattr(session, "_last_result", None)
+    if result is None:
+        return {}
+    readings = getattr(result, "manifold_readings", None) or {}
+    if not readings:
+        return {}
+    try:
+        attached = set(session._manifold_monitor.probe_names)
+    except Exception:
+        attached = set(readings.keys())
+    out: dict[str, Any] = {}
+    for name, agg in readings.items():
+        if name not in attached:
+            continue
+        try:
+            out[name] = agg.to_dict()
+        except Exception:
+            continue
+    return out
+
+
+def _manifold_token_readings(event: Any) -> dict[str, Any] | None:
+    """Serialize a :class:`TokenEvent`'s ``manifold_readings`` for the wire.
+
+    Returns ``None`` when the event carries no manifold readings (no
+    probes attached, or ``live_scores=False`` was passed to
+    ``generate_stream``).  Used by both OpenAI and Ollama streaming
+    paths so the per-token geometric channel rides on each chunk
+    without breaking clients that ignore the field.
+    """
+    readings = getattr(event, "manifold_readings", None)
+    if not readings:
+        return None
+    out: dict[str, Any] = {}
+    for name, reading in readings.items():
+        try:
+            out[name] = reading.to_dict()
+        except Exception:
+            continue
+    return out or None
+
+
 def _sampling_kwargs(
     req: _SamplingBase, default_steering: "Steering | None",
 ) -> dict[str, Any]:
@@ -439,12 +489,23 @@ async def _stream_generation(
                 yield f"data: {json.dumps(chunk)}\n\n"
             try:
                 for event in stream_iter:
+                    choice: dict[str, Any] = {
+                        "index": 0, **format_delta(event), "finish_reason": None,
+                    }
+                    # Per-token manifold readings ride under a vendor-
+                    # prefixed extension on the choice so OpenAI clients
+                    # that don't read the field stay unaffected.  Populated
+                    # only when at least one manifold probe is attached
+                    # and ``live_scores`` is True on the stream.
+                    mf_token = _manifold_token_readings(event)
+                    if mf_token is not None:
+                        choice["x-saklas-manifold-readings"] = mf_token
                     chunk = {
                         "id": rid,
                         "object": object_type,
                         "created": created_ts,
                         "model": model_id,
-                        "choices": [{"index": 0, **format_delta(event), "finish_reason": None}],
+                        "choices": [choice],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
             except ConcurrentGenerationError:
@@ -469,12 +530,18 @@ async def _stream_generation(
                 return
 
             finish_reason = session._gen_state.finish_reason
+            final_choice: dict[str, Any] = {
+                "index": 0, **empty_delta, "finish_reason": finish_reason,
+            }
+            mf_agg = _manifold_reading_aggregate(session)
+            if mf_agg:
+                final_choice["x-saklas-manifold-readings"] = mf_agg
             final = {
                 "id": rid,
                 "object": object_type,
                 "created": created_ts,
                 "model": model_id,
-                "choices": [{"index": 0, **empty_delta, "finish_reason": finish_reason}],
+                "choices": [final_choice],
                 "probe_readings": _probe_reading_dict(session),
             }
             yield f"data: {json.dumps(final)}\n\n"
@@ -683,19 +750,21 @@ def _register_routes(app: FastAPI) -> None:
         except ConcurrentGenerationError:
             return _error(409, "Generation already in progress", "conflict")
 
+        chat_choice: dict[str, Any] = {
+            "index": 0,
+            "message": {"role": "assistant", "content": result.text},
+            "logprobs": _render_logprobs_chat(result, session),
+            "finish_reason": result.finish_reason,
+        }
+        mf_chat = _manifold_reading_aggregate(session)
+        if mf_chat:
+            chat_choice["x-saklas-manifold-readings"] = mf_chat
         return {
             "id": rid,
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": result.text},
-                    "logprobs": _render_logprobs_chat(result, session),
-                    "finish_reason": result.finish_reason,
-                }
-            ],
+            "choices": [chat_choice],
             "usage": _usage_dict(result),
             "probe_readings": _probe_reading_dict(session),
         }
@@ -726,19 +795,21 @@ def _register_routes(app: FastAPI) -> None:
         except ConcurrentGenerationError:
             return _error(409, "Generation already in progress", "conflict")
 
+        completion_choice: dict[str, Any] = {
+            "index": 0,
+            "text": result.text,
+            "logprobs": _render_logprobs_completions(result, session),
+            "finish_reason": result.finish_reason,
+        }
+        mf_completion = _manifold_reading_aggregate(session)
+        if mf_completion:
+            completion_choice["x-saklas-manifold-readings"] = mf_completion
         return {
             "id": rid,
             "object": "text_completion",
             "created": int(time.time()),
             "model": model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "text": result.text,
-                    "logprobs": _render_logprobs_completions(result, session),
-                    "finish_reason": result.finish_reason,
-                }
-            ],
+            "choices": [completion_choice],
             "usage": _usage_dict(result),
             "probe_readings": _probe_reading_dict(session),
         }

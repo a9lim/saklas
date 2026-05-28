@@ -471,6 +471,10 @@ class SaklasApp(App[None]):
         if self._session._monitor:
             self._trait_panel.set_active_probes(set(self._session._monitor.probe_names))
             self._refresh_trait_why()
+        # Manifold-probe rack — empty by default, but call through the
+        # set helper so any pre-attached probes (e.g. test stubs) show
+        # up in the panel immediately.
+        self._refresh_manifold_probes()
 
         self._poll_timer = self.set_interval(1 / _POLL_FPS, self._poll_generation)
         self._update_panel_focus()
@@ -763,6 +767,8 @@ class SaklasApp(App[None]):
             "Manifold:\n"
             "  /steer <c> manifold%x,y     — steer toward a manifold point\n"
             "  /manifold fit <folder>      — fit a manifold pack folder\n"
+            "  /manifold-probe <selector>  — attach a read-side manifold probe\n"
+            "  /manifold-probe-remove <n>  — detach an attached probe\n"
             "Highlight:\n"
             "  ⌃Y / ⌃⇧Y                    — cycle {off → probe → surprise}\n"
             "Commit (no-gen send):\n"
@@ -1384,6 +1390,110 @@ class SaklasApp(App[None]):
 
         self.run_worker(_worker, thread=True)
 
+    def _handle_manifold_probe(self, text: str) -> None:
+        """``/manifold-probe <selector>`` — attach a manifold probe.
+
+        Routes through ``session.add_manifold_probe`` (Phase 1 engine
+        wiring) — the selector can be a bundled name (``circumplex``,
+        ``personas``), an ``ns/name`` form, or an already-loaded
+        manifold's registered name; the session's lazy-load path
+        (``_ensure_manifold_loaded``) handles resolution.  Refused
+        during A/B shadow gen for the same reason ``/probe`` is —
+        modifying the monitor set mid-shadow would interleave readings
+        across the steered/unsteered split.  Deferred behind an
+        in-flight gen via the pending queue (kind ``manifold_probe``).
+        """
+        chat = self._chat_panel
+        selector = (text or "").strip()
+        selector = _unquote(selector)
+        if not selector:
+            chat.add_system_message("Usage: /manifold-probe <selector>")
+            return
+        if self._ab_shadow_active:
+            chat.add_system_message(
+                "Cannot attach a manifold probe during A/B shadow gen."
+            )
+            return
+        if self._is_busy:
+            self._enqueue_pending(
+                PendingItem(
+                    "manifold_probe", f"/manifold-probe {selector}",
+                    (selector,),
+                )
+            )
+            return
+        self._start_manifold_probe_attach(selector)
+
+    def _start_manifold_probe_attach(self, selector: str) -> None:
+        """Run ``session.add_manifold_probe`` on a worker thread.
+
+        Mirrors ``_start_manifold_fit``'s worker structure — errors
+        surface as system messages and a ``done`` sentinel re-enters
+        the queue drain so a queued attach doesn't stall subsequent
+        items.
+        """
+        chat = self._chat_panel
+        chat.add_system_message(f"Attaching manifold probe '{selector}'...")
+
+        def _worker() -> None:
+            try:
+                name = self._session.add_manifold_probe(selector)
+            except SaklasError as e:
+                self.call_from_thread(self._steer_status, e.user_message()[1])
+                return
+            except Exception as e:
+                self.call_from_thread(
+                    self._steer_status, f"{type(e).__name__}: {e}",
+                )
+                return
+            finally:
+                self._ui_token_queue.put(("done", False))
+            self.call_from_thread(self._on_manifold_probe_added, name)
+
+        self.run_worker(_worker, thread=True)
+
+    def _on_manifold_probe_added(self, name: str) -> None:
+        """Mirror probe wiring — refresh the trait panel + announce."""
+        self._refresh_manifold_probes()
+        self._chat_panel.add_system_message(
+            f"Manifold probe '{name}' active."
+        )
+
+    def _handle_manifold_probe_remove(self, text: str) -> None:
+        """``/manifold-probe-remove <name>`` — detach an attached probe."""
+        chat = self._chat_panel
+        name = (text or "").strip()
+        name = _unquote(name)
+        if not name:
+            chat.add_system_message("Usage: /manifold-probe-remove <name>")
+            return
+        monitor = self._session.manifold_monitor
+        if name not in monitor.probe_names:
+            chat.add_system_message(f"Manifold probe '{name}' not active.")
+            return
+        try:
+            self._session.remove_manifold_probe(name)
+        except SaklasError as e:
+            chat.add_system_message(e.user_message()[1])
+            return
+        except Exception as e:
+            chat.add_system_message(f"{type(e).__name__}: {e}")
+            return
+        self._refresh_manifold_probes()
+        chat.add_system_message(f"Manifold probe '{name}' removed.")
+
+    def _refresh_manifold_probes(self) -> None:
+        """Push the attached-probe map down to the trait panel.
+
+        The trait panel needs each attached probe's :class:`Manifold`
+        artifact (not just the name) so it can introspect the domain
+        for the 2-D mini-map at render time.  Pulled from the
+        ``AttachedManifoldProbe`` records on the live monitor.
+        """
+        attached = self._session.manifold_monitor.attached_probes()
+        probes = {name: p.manifold for name, p in attached.items()}
+        self._trait_panel.set_active_manifold_probes(probes)
+
     def _handle_pairs(self, text: str) -> None:
         """`/pairs <name>` — open the custom-statement extraction modal.
 
@@ -1507,6 +1617,7 @@ class SaklasApp(App[None]):
         if self._raw_mode:
             self._sync_raw_buffer_from_tree()
         self._trait_panel.update_values({}, {}, {})
+        self._trait_panel.clear_manifold_readings()
         self._refresh_trait_why()
         self._chat_panel.add_system_message("Chat history cleared.")
 
@@ -1805,8 +1916,14 @@ class SaklasApp(App[None]):
                         # ``logprobs=0``; ``None`` only on the prefill /
                         # partial-UTF-8 flush steps the engine never
                         # assigns a chosen-token logprob to.
+                        # Manifold readings (``event.manifold_readings``)
+                        # ride alongside scalar scores — ``None`` when no
+                        # manifold probe is attached or ``live_scores`` is
+                        # off; otherwise a per-probe ``ManifoldTokenReading``
+                        # the trait panel renders mid-gen.
                         ("tok", event.text, event.thinking, event.scores,
-                         event.perplexity, event.logprob, widget, False),
+                         event.perplexity, event.logprob, widget, False,
+                         event.manifold_readings),
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
@@ -2026,10 +2143,13 @@ class SaklasApp(App[None]):
             # from a ``TokenEvent``.  ``prefill_assistant``'s on_token
             # carries no probe scores (no streaming monitor hook on this
             # path) — pass ``None``; ``_finalize_widget_highlight`` fills
-            # the canonical per-token scores in at finalize.
+            # the canonical per-token scores in at finalize.  Manifold
+            # readings (final tuple slot) are also unsourced on the
+            # prefill path; the trait-panel manifold section refreshes
+            # from the end-of-gen aggregate via ``_finalize_widget_highlight``.
             self._ui_token_queue.put(
                 ("tok", text, bool(is_thinking), None, perplexity, lp,
-                 widget, False),
+                 widget, False, None),
             )
             self._gen_token_count += 1
 
@@ -2286,10 +2406,31 @@ class SaklasApp(App[None]):
                 # Logit-pass: 7-element tuple now (logprob between
                 # perplexity and widget).  Drives the surprise highlight
                 # mode + the per-token logprob storage on the widget.
-                (
-                    _, token, is_thinking, scores, perplexity, logprob,
-                    widget, is_shadow,
-                ) = item
+                # Manifold-probe pass: optional 9th slot carries
+                # ``event.manifold_readings`` — ``None`` when no manifold
+                # probe is attached or ``live_scores`` is off; otherwise
+                # a per-probe ``ManifoldTokenReading`` the trait panel
+                # renders mid-gen.  Falls back to ``None`` for legacy
+                # producers (e.g. test stubs) that emit the 8-element form.
+                manifold_readings = None
+                if len(item) >= 9:
+                    (
+                        _, token, is_thinking, scores, perplexity, logprob,
+                        widget, is_shadow, manifold_readings,
+                    ) = item
+                else:
+                    (
+                        _, token, is_thinking, scores, perplexity, logprob,
+                        widget, is_shadow,
+                    ) = item
+                if manifold_readings is not None and not is_shadow:
+                    # Push live readings to the trait panel.  Shadow
+                    # streams skip this — their readings describe the
+                    # unsteered baseline and would clobber the steered
+                    # rack mid-gen.
+                    self._trait_panel.update_manifold_readings(
+                        per_token=manifold_readings,
+                    )
                 if widget is not None:
                     if is_thinking:
                         widget.append_thinking_token(token)
@@ -2451,6 +2592,15 @@ class SaklasApp(App[None]):
             self._trait_panel.update_values(
                 current, previous, sparklines,
             )
+
+        # Manifold-monitor pending-flag pass — mirrors the vector path
+        # so a per-token reading flushed by the engine clears the
+        # pending bit on the next poll tick.  Aggregates land via
+        # ``_pull_manifold_aggregates`` at finalize; this drain is the
+        # mid-gen "tick" so the bit doesn't stall forever.
+        mm = getattr(self._session, "manifold_monitor", None)
+        if mm is not None and mm.has_pending_per_token():
+            mm.consume_pending_per_token()
 
     # -- Actions --
 
@@ -2684,6 +2834,23 @@ class SaklasApp(App[None]):
         if self._highlighting:
             widget.apply_highlight(True, self._highlight_probe)
         self._refresh_trait_why()
+        self._pull_manifold_aggregates()
+
+    def _pull_manifold_aggregates(self) -> None:
+        """Push end-of-gen manifold aggregates to the trait panel.
+
+        Reads ``session.last_result.manifold_readings`` — populated by
+        ``ManifoldMonitor.score_aggregate`` in ``_finalize_generation``
+        when at least one probe is attached.  No-op when no result is
+        cached or no probes are attached.
+        """
+        last = getattr(self._session, "last_result", None)
+        if last is None:
+            return
+        aggregates = getattr(last, "manifold_readings", None) or {}
+        if not aggregates and not self._session.manifold_monitor.probe_names:
+            return
+        self._trait_panel.update_manifold_readings(aggregates=aggregates)
 
     # -- New slash command handlers --
 
@@ -3587,6 +3754,12 @@ class SaklasApp(App[None]):
                 # ``payload[0]`` is the folder path; the fit runs on a
                 # worker that enqueues its own ``done`` sentinel.
                 self._start_manifold_fit(payload[0] if payload else text)
+            elif kind == "manifold_probe":
+                # ``payload[0]`` is the selector; attach runs on a
+                # worker that enqueues its own ``done`` sentinel.
+                self._start_manifold_probe_attach(
+                    payload[0] if payload else text,
+                )
             elif kind == "regen_n":
                 # N-way regen after an interrupting gen completes; phase
                 # 1's engine serializes via ``session.generate(n=N)``.
@@ -3804,7 +3977,8 @@ class SaklasApp(App[None]):
                 for event in stream:
                     self._ui_token_queue.put(
                         ("tok", event.text, event.thinking, event.scores,
-                         event.perplexity, event.logprob, widget, True),
+                         event.perplexity, event.logprob, widget, True,
+                         event.manifold_readings),
                     )
                 self._ui_token_queue.put(("finalize", widget, True))
             except BaseException as e:
@@ -4554,7 +4728,8 @@ class SaklasApp(App[None]):
                 for event in stream:
                     self._ui_token_queue.put(
                         ("tok", event.text, event.thinking, event.scores,
-                         event.perplexity, event.logprob, widget, True),
+                         event.perplexity, event.logprob, widget, True,
+                         event.manifold_readings),
                     )
                 self._ui_token_queue.put(("finalize", widget, True))
             except BaseException as e:

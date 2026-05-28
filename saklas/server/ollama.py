@@ -20,7 +20,11 @@ Key differences from real Ollama:
 
 from __future__ import annotations
 
-from saklas.server.app import acquire_session_lock
+from saklas.server.app import (
+    acquire_session_lock,
+    _manifold_reading_aggregate,
+    _manifold_token_readings,
+)
 
 import hashlib
 import json
@@ -626,8 +630,16 @@ def register_ollama_routes(app: FastAPI) -> None:
         done_reason = _finish_to_done_reason(session._gen_state.finish_reason)
         stats = _duration_stats(result, elapsed_ns)
 
+        # Saklas-specific extension: per-attached-manifold-probe aggregate
+        # readings ride alongside the Ollama wire fields under a vendor-
+        # prefixed top-level key so Ollama clients that don't read it stay
+        # unaffected.  Mirrors the OpenAI extension shape on the choice
+        # ("x-saklas-manifold-readings"), at the top level here because
+        # Ollama responses have no per-choice container to hang it off.
+        mf_agg = _manifold_reading_aggregate(session)
+
         if is_chat:
-            return {
+            payload: dict[str, Any] = {
                 "model": model_name,
                 "created_at": created_at,
                 "message": {"role": "assistant", "content": result.text},
@@ -635,10 +647,13 @@ def register_ollama_routes(app: FastAPI) -> None:
                 "done": True,
                 **stats,
             }
+            if mf_agg:
+                payload["x-saklas-manifold-readings"] = mf_agg
+            return payload
         # Note: Ollama's /api/generate returns a `context` field of tokenized
         # state for stateless continuation.  Saklas doesn't round-trip that,
         # so we omit the field entirely rather than lie with an empty list.
-        return {
+        payload = {
             "model": model_name,
             "created_at": created_at,
             "response": result.text,
@@ -646,6 +661,9 @@ def register_ollama_routes(app: FastAPI) -> None:
             "done": True,
             **stats,
         }
+        if mf_agg:
+            payload["x-saklas-manifold-readings"] = mf_agg
+        return payload
 
     async def _stream_chat_or_generate(
         body: dict,
@@ -730,6 +748,13 @@ def register_ollama_routes(app: FastAPI) -> None:
                                     "response": event.text,
                                     "done": False,
                                 }
+                        # Per-token manifold readings ride under the same
+                        # vendor-prefixed extension as the non-streaming
+                        # path; populated only when at least one manifold
+                        # probe is attached and ``live_scores`` is on.
+                        mf_token = _manifold_token_readings(event)
+                        if mf_token is not None:
+                            chunk["x-saklas-manifold-readings"] = mf_token
                         yield json.dumps(chunk) + "\n"
                 except ConcurrentGenerationError:
                     yield json.dumps({
@@ -754,6 +779,7 @@ def register_ollama_routes(app: FastAPI) -> None:
                     "prompt_eval_count": 0, "prompt_eval_duration": 0,
                     "eval_count": 0, "eval_duration": elapsed_ns,
                 }
+                mf_agg = _manifold_reading_aggregate(session)
                 if is_chat:
                     final = {
                         "model": model_name,
@@ -774,6 +800,8 @@ def register_ollama_routes(app: FastAPI) -> None:
                         "done": True,
                         **stats,
                     }
+                if mf_agg:
+                    final["x-saklas-manifold-readings"] = mf_agg
                 yield json.dumps(final) + "\n"
 
     @app.post("/api/chat")

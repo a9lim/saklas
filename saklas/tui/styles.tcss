@@ -345,6 +345,20 @@ ChatPanel.ab-on .turn-col.shadow {
     overflow-y: auto;
 }
 
+#manifold-header {
+    height: auto;
+}
+
+#manifold-scroll {
+    height: auto;
+    max-height: 18;
+    overflow-y: auto;
+}
+
+#manifold-content {
+    height: auto;
+}
+
 #why-header {
     height: 1;
 }
