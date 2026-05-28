@@ -21,6 +21,7 @@ import type {
   FilterMatchesJSON,
   FitManifoldRequest,
   GenerateManifoldRequest,
+  InstallManifoldRequest,
   InstallPackRequest,
   InstallPackResponse,
   JointLogprobRowJSON,
@@ -32,6 +33,7 @@ import type {
   ManifoldListResponse,
   ManifoldProbeInfo,
   ManifoldProbeListResponse,
+  MergeManifoldRequest,
   MergeVectorRequest,
   MergeVectorResponse,
   NodeDiffJSON,
@@ -40,6 +42,7 @@ import type {
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
   ProbeListResponse,
+  RemoteManifoldInfo,
   ScoreProbeRequest,
   ScoreProbeResponse,
   SessionInfo,
@@ -71,6 +74,7 @@ export type {
   ExtractRequest,
   ExtractResponse,
   FilterMatchesJSON,
+  InstallManifoldRequest,
   InstallPackRequest,
   InstallPackResponse,
   JointLogprobRowJSON,
@@ -82,6 +86,7 @@ export type {
   ManifoldListResponse,
   ManifoldProbeInfo,
   ManifoldProbeListResponse,
+  MergeManifoldRequest,
   MergeVectorRequest,
   MergeVectorResponse,
   NodeDiffJSON,
@@ -90,6 +95,7 @@ export type {
   PairwiseCompareResponse,
   ProbeDefaultsResponse,
   ProbeListResponse,
+  RemoteManifoldInfo,
   ScoreProbeRequest,
   ScoreProbeResponse,
   SessionInfo,
@@ -475,6 +481,35 @@ export const apiManifolds = {
       `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     );
+  },
+  /** Search HF hub for ``saklas-manifold``-tagged repos.  Mirrors
+   *  ``apiPacks.search`` — same row shape plus the manifold-specific
+   *  ``domain_label`` / ``node_count`` / ``fit_mode`` fields.  503 when
+   *  the server lacks ``huggingface_hub``, 502 on HF transport error. */
+  search(
+    query: string,
+    limit?: number,
+  ): Promise<{ results: RemoteManifoldInfo[] }> {
+    const q = new URLSearchParams({ q: query });
+    if (limit !== undefined) q.set("limit", String(limit));
+    return request(`${MANIFOLDS_BASE}/search?${q.toString()}`);
+  },
+  /** Install a manifold from an HF coord or local folder.  Mirrors
+   *  ``apiPacks.install``; under the session lock server-side.
+   *  409 on conflict, 404 on missing source, 503/502 on HF surface
+   *  failures. */
+  install(req: InstallManifoldRequest): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/install`, jsonBody(req));
+  },
+  /** Union N discover-mode manifolds' nodes into one fresh discover
+   *  folder.  Restricted to discover sources (autofitted) — authored
+   *  manifolds carry user-declared geometry and refuse merging.  The
+   *  merged folder is unfitted on disk; call ``apiManifoldFitStream``
+   *  next to derive coords + fit.  400 on mixed fit_modes (without
+   *  override) or label collisions, 404 on missing source, 409 on
+   *  destination conflict. */
+  merge(req: MergeManifoldRequest): Promise<ManifoldInfo> {
+    return request(`${MANIFOLDS_BASE}/merge`, jsonBody(req));
   },
 };
 

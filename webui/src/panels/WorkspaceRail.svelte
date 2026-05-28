@@ -38,6 +38,21 @@
       ],
     },
     {
+      // Manifold peer of "vectors" — same fan-out shape so the two
+      // steering surfaces feel parallel.  Catalog (ManifoldDrawer) is
+      // reached from rack "+" buttons, same as vectors → VectorsDrawer.
+      key: "manifolds",
+      label: "Steering manifolds",
+      // Undulating spline curve — reads as "manifold" and is visually
+      // distinct from vectors' arrow and analysis' line graph.
+      icon: "M3 17c4-8 6-8 9-4s2 8 9 0",
+      tools: [
+        { label: "build manifold…", drawer: "manifold_builder" },
+        { label: "merge manifolds…", drawer: "manifold_merge" },
+        { label: "packs…", drawer: "manifold_pack" },
+      ],
+    },
+    {
       key: "analysis",
       label: "Analysis",
       icon: "M4 18l5-12 4 8 3-5 4 9",

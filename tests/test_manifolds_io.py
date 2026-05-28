@@ -15,6 +15,7 @@ from saklas.io.manifolds import (
     create_manifold_folder,
     hash_manifold_files,
     iter_manifold_folders,
+    merge_discover_manifolds,
     min_nodes,
     update_manifold_folder,
 )
@@ -669,4 +670,174 @@ def test_authored_fit_mode_defaults_when_field_absent(tmp_path, monkeypatch):
     mf = ManifoldFolder.load(folder)
     assert mf.fit_mode == "authored"
     assert not mf.is_discover
+
+
+# ---------------------------------------------------------------------------
+# merge_discover_manifolds
+# ---------------------------------------------------------------------------
+
+
+def test_merge_discover_unions_nodes(tmp_path, monkeypatch):
+    """Two discover sources merge into a fresh discover folder whose
+    node corpus is the union (in source order) of both inputs.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "src_a", "first heap",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["alpha", "beta"]),
+        hyperparams={"max_dim": 8, "var_threshold": 0.7},
+    )
+    create_discover_manifold_folder(
+        "local", "src_b", "second heap",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["gamma", "delta"]),
+        hyperparams={"max_dim": 8, "var_threshold": 0.7},
+    )
+    target = merge_discover_manifolds(
+        "local", "combined", "merged heap",
+        sources=[("local", "src_a"), ("local", "src_b")],
+    )
+    mf = ManifoldFolder.load(target)
+    assert mf.is_discover
+    assert mf.fit_mode == "pca"
+    assert mf.description == "merged heap"
+    # Source order preserved, then per-source label order.
+    assert mf.node_labels == ["alpha", "beta", "gamma", "delta"]
+    # Hyperparams inherited from the first source.
+    assert mf.hyperparams == {"max_dim": 8, "var_threshold": 0.7}
+    # Every node carries the source corpus statements (3 each from
+    # ``_discover_corpora``).
+    groups = dict(mf.node_groups())
+    for label in mf.node_labels:
+        assert len(groups[label]) == 3
+
+
+def test_merge_discover_refuses_authored_source(tmp_path, monkeypatch):
+    """Authored manifolds carry user-declared geometry; merge refuses
+    them because there's no shared coordinate system to reconcile.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _author_manifold(tmp_path / "manifolds" / "local", name="authored_src")
+    create_discover_manifold_folder(
+        "local", "discover_src", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b", "c"]),
+    )
+    with pytest.raises(ManifoldFormatError, match="authored"):
+        merge_discover_manifolds(
+            "local", "combined", "",
+            sources=[("local", "authored_src"), ("local", "discover_src")],
+        )
+
+
+def test_merge_discover_refuses_label_collision(tmp_path, monkeypatch):
+    """Same label in two sources isn't auto-renamed — refuse so the
+    user resolves the collision deliberately (renaming hides
+    provenance otherwise).
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "src_a", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["shared", "a_only"]),
+    )
+    create_discover_manifold_folder(
+        "local", "src_b", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["shared", "b_only"]),
+    )
+    with pytest.raises(ManifoldFormatError, match="collision"):
+        merge_discover_manifolds(
+            "local", "combined", "",
+            sources=[("local", "src_a"), ("local", "src_b")],
+        )
+
+
+def test_merge_discover_refuses_mixed_fit_modes_without_override(
+    tmp_path, monkeypatch,
+):
+    """Sources with different fit_modes require an explicit override —
+    the merged folder has one ``fit_mode``, so picking implicitly
+    would silently lose information.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "src_pca", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b"]),
+    )
+    create_discover_manifold_folder(
+        "local", "src_spec", "",
+        fit_mode="spectral",
+        node_corpora=_discover_corpora(["c", "d"]),
+    )
+    with pytest.raises(ManifoldFormatError, match="mixed fit_modes"):
+        merge_discover_manifolds(
+            "local", "combined", "",
+            sources=[("local", "src_pca"), ("local", "src_spec")],
+        )
+
+    # Explicit override succeeds.
+    target = merge_discover_manifolds(
+        "local", "combined", "",
+        sources=[("local", "src_pca"), ("local", "src_spec")],
+        fit_mode="pca",
+    )
+    mf = ManifoldFolder.load(target)
+    assert mf.fit_mode == "pca"
+
+
+def test_merge_discover_refuses_missing_source(tmp_path, monkeypatch):
+    """A non-existent source raises FileNotFoundError before any folder
+    is written — atomic-on-failure discipline."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "exists", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b"]),
+    )
+    with pytest.raises(FileNotFoundError):
+        merge_discover_manifolds(
+            "local", "combined", "",
+            sources=[("local", "exists"), ("local", "missing")],
+        )
+
+
+def test_merge_discover_force_overwrites(tmp_path, monkeypatch):
+    """An existing destination raises FileExistsError without
+    ``force=True``; with ``force=True`` it's rebuilt clean.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    for nm, labels in (("src_a", ["a", "b"]), ("src_b", ["c", "d"])):
+        create_discover_manifold_folder(
+            "local", nm, "",
+            fit_mode="pca",
+            node_corpora=_discover_corpora(labels),
+        )
+    sources = [("local", "src_a"), ("local", "src_b")]
+    merge_discover_manifolds("local", "combined", "v1", sources=sources)
+    with pytest.raises(FileExistsError):
+        merge_discover_manifolds("local", "combined", "v2", sources=sources)
+    # force=True rebuilds.
+    target = merge_discover_manifolds(
+        "local", "combined", "v2", sources=sources, force=True,
+    )
+    mf = ManifoldFolder.load(target)
+    assert mf.description == "v2"
+
+
+def test_merge_discover_refuses_under_two_sources(tmp_path, monkeypatch):
+    """Single-source 'merge' is meaningless — refuse with a clear error."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "only", "",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(["a", "b"]),
+    )
+    with pytest.raises(ValueError, match=">= 2"):
+        merge_discover_manifolds(
+            "local", "combined", "",
+            sources=[("local", "only")],
+        )
 

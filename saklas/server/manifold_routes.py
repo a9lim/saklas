@@ -26,6 +26,13 @@ from pydantic import BaseModel
 from saklas.core.manifold import domain_from_spec
 from saklas.core.session import ConcurrentExtractionError, SaklasSession
 from saklas.io.atomic import write_json_atomic
+from saklas.io.hf_manifolds import (
+    HFError as ManifoldHFError,
+    ManifoldInstallConflict,
+    fetch_manifold_info,
+    install_manifold,
+    search_manifolds,
+)
 from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
@@ -33,6 +40,7 @@ from saklas.io.manifolds import (
     create_discover_manifold_folder,
     create_manifold_folder,
     iter_manifold_folders,
+    merge_discover_manifolds,
     min_nodes,
     update_manifold_folder,
 )
@@ -154,6 +162,49 @@ class FitManifoldRequest(BaseModel):
     # Discover-mode override fields — ignored when the folder is authored.
     fit_mode: Literal["pca", "spectral"] | None = None
     hyperparams: dict[str, Any] | None = None
+
+
+class InstallManifoldRequest(BaseModel):
+    """Body for ``POST /manifolds/install``.
+
+    Mirrors :class:`InstallPackRequest` for parity with the vector pack
+    side.  ``target`` is an HF coord (``owner/name[@revision]``) or a
+    local folder path; ``as_`` re-namespaces the destination; ``force``
+    overwrites an existing folder at the destination.
+    """
+
+    target: str
+    as_: str | None = None
+    force: bool = False
+
+
+class MergeManifoldSource(BaseModel):
+    """One source folder in a manifold merge — fully qualified ``ns/name``."""
+
+    namespace: str
+    name: str
+
+
+class MergeManifoldRequest(BaseModel):
+    """Body for ``POST /manifolds/merge``.
+
+    Restricted to discover-mode (autofitted) sources by design — see
+    :func:`saklas.io.manifolds.merge_discover_manifolds`.  Pools the
+    sources' node corpora + roles into one heap, writes a fresh
+    discover folder; the next ``POST .../fit`` derives coords from the
+    combined heap.
+    """
+
+    namespace: str = "local"
+    name: str
+    description: str = ""
+    sources: list[MergeManifoldSource]
+    # Defaults to the sources' shared fit_mode if they agree, else
+    # required.  Server-side reconciliation lives in
+    # ``merge_discover_manifolds``.
+    fit_mode: Literal["pca", "spectral"] | None = None
+    hyperparams: dict[str, Any] | None = None
+    force: bool = False
 
 
 # ------------------------------------------------------------------ helpers ---
@@ -460,6 +511,125 @@ def register_manifold_routes(app: FastAPI) -> None:
             raise HTTPException(400, str(e))
         mf = ManifoldFolder.load(folder)
         return _manifold_json(req.namespace, mf, session, full=True)
+
+    @app.get("/saklas/v1/manifolds/search")
+    def search_remote_manifolds(q: str = "", limit: int = 20):
+        """Search HF for ``saklas-manifold``-tagged repos matching ``q``.
+
+        The manifold-side counterpart to ``GET /saklas/v1/packs/search``:
+        delegates to :func:`saklas.io.hf_manifolds.search_manifolds`,
+        returns the same row shape vector packs use plus the manifold-
+        specific ``domain_label`` / ``node_count`` / ``fit_mode`` fields
+        a frontend needs to render a search result without an extra
+        round-trip.  Missing ``huggingface_hub`` → 503, HF transport
+        error → 502.
+        """
+        try:
+            rows = search_manifolds(q or None)
+        except ImportError as e:
+            raise HTTPException(503, f"huggingface_hub not installed: {e}")
+        except ManifoldHFError as e:
+            raise HTTPException(502, str(e))
+        # ``limit`` defaults to the search cap; callers can request
+        # fewer rows for narrow pickers but the server still respects
+        # the cap when ``limit`` is omitted or oversized.
+        if limit and limit > 0:
+            rows = rows[: int(limit)]
+        return {"results": rows}
+
+    @app.post("/saklas/v1/manifolds/merge", status_code=201)
+    async def merge_manifold(req: MergeManifoldRequest):
+        """Union N discover-mode manifolds' nodes into a fresh discover folder.
+
+        The manifold-side counterpart to ``POST /saklas/v1/vectors/merge``,
+        but operating on *node corpora* rather than steering directions:
+        pools the sources' nodes into one heap and writes an unfitted
+        discover folder.  The next ``POST .../fit`` derives coords from
+        the combined heap.
+
+        Restricted to discover-mode sources by design — authored manifolds
+        carry user-declared geometry and aren't mergeable without a
+        shared coordinate system.  Label collisions across sources are
+        refused with a clear error (rename in source folders first).
+
+        Held under the session lock so a parallel fit on one of the
+        sources can't race the corpus read; ``_refuse_if_busy`` guards
+        against an in-flight engine operation holding the gen-lock.
+        """
+        if len(req.sources) < 2:
+            raise HTTPException(
+                400,
+                f"manifold merge: need >= 2 sources, got {len(req.sources)}",
+            )
+        source_tuples = [(s.namespace, s.name) for s in req.sources]
+        async with session.lock:
+            _refuse_if_busy(session)
+            try:
+                folder = await asyncio.to_thread(
+                    merge_discover_manifolds,
+                    req.namespace,
+                    req.name,
+                    req.description,
+                    sources=source_tuples,
+                    fit_mode=req.fit_mode,
+                    hyperparams=req.hyperparams,
+                    force=req.force,
+                )
+            except FileExistsError as e:
+                raise HTTPException(409, str(e))
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e))
+            except ManifoldFormatError as e:
+                raise HTTPException(400, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            # Evict any cached in-memory ``Manifold`` for the merged
+            # target — paranoia in case the user is merging-over an
+            # existing folder with the same name (force=True path).
+            _evict_manifold(session, req.namespace, req.name)
+        ns, mf = _find_manifold(folder.parent.name, folder.name)
+        return _manifold_json(ns, mf, session, full=True)
+
+    @app.post("/saklas/v1/manifolds/install", status_code=201)
+    async def install_remote_manifold(req: InstallManifoldRequest):
+        """Install a manifold from an HF coord or local folder.
+
+        Mirrors ``POST /saklas/v1/packs`` for parity with the vector
+        pack side.  ``target`` is an HF coord (``owner/name[@revision]``)
+        or a local folder path; ``as_`` overrides the destination
+        namespace+name (must be fully qualified); ``force`` overwrites
+        an existing folder.  Held under the session lock so a parallel
+        delete / fit can't race the swap-into-place.  Returns the same
+        manifold-detail JSON shape ``GET /saklas/v1/manifolds/{ns}/{name}``
+        ships.
+        """
+        async with session.lock:
+            _refuse_if_busy(session)
+            try:
+                folder = await asyncio.to_thread(
+                    install_manifold,
+                    req.target,
+                    req.as_,
+                    force=req.force,
+                )
+            except ManifoldInstallConflict as e:
+                raise HTTPException(409, str(e))
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            except ImportError as e:
+                raise HTTPException(503, f"huggingface_hub not installed: {e}")
+            except ManifoldHFError as e:
+                raise HTTPException(502, str(e))
+
+        # The just-installed folder lives at ``manifolds/<ns>/<name>/`` —
+        # derive namespace/name from the resolved path so the response
+        # carries the destination identity even when ``as_`` re-routed it.
+        dst_namespace = folder.parent.name
+        dst_name = folder.name
+        ns, mf = _find_manifold(dst_namespace, dst_name)
+        return _manifold_json(ns, mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds/generate", status_code=201)
     async def generate_manifold(req: GenerateManifoldRequest, request: Request):

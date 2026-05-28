@@ -207,6 +207,69 @@ export interface ManifoldListResponse {
   manifolds: ManifoldInfo[];
 }
 
+/** One HF search-row carrying enough metadata to render a result row
+ *  without an extra round-trip.  Mirrors the pack-side ``RemotePackInfo``
+ *  but trades pack-specific fields (``recommended_alpha``,
+ *  ``tensor_models``-via-pack-format) for the manifold-specific ones
+ *  the picker needs (``domain_label``, ``node_count``, ``fit_mode``). */
+export interface RemoteManifoldInfo {
+  /** Concept slug on HF (``<name>`` half of ``<ns>/<name>``). */
+  name: string;
+  /** HF owner (``<ns>`` half of ``<ns>/<name>``). */
+  namespace: string;
+  description: string;
+  tags: string[];
+  node_count: number;
+  /** Short ``type(Nd)`` label — ``box(2d)``, ``sphere(3d)``,
+   *  ``discover-pca``, etc. */
+  domain_label: string;
+  /** ``"authored"``/``"pca"``/``"spectral"`` — the folder's fit-mode
+   *  discriminator. */
+  fit_mode: string;
+  /** Safe-model-id stems with a fitted tensor in the HF repo.  Same
+   *  shape ``RemotePackInfo.tensor_models`` carries. */
+  tensor_models: string[];
+}
+
+/** Body for POST /saklas/v1/manifolds/install. */
+export interface InstallManifoldRequest {
+  /** HF coord (``owner/repo[@revision]``) or local folder path. */
+  target: string;
+  /** Override the install destination (``<ns>/<name>``).  Wire field is
+   *  ``as_`` since ``as`` is a Python keyword — matches the route
+   *  body model. */
+  as_?: string;
+  force?: boolean;
+}
+
+/** One source folder in a manifold merge — fully qualified ``ns/name``. */
+export interface MergeManifoldSource {
+  namespace: string;
+  name: string;
+}
+
+/** Body for POST /saklas/v1/manifolds/merge.
+ *
+ *  Restricted to discover-mode (autofitted) sources by design — the
+ *  server unions their node corpora into one heap and writes a fresh
+ *  unfitted discover folder.  Run ``apiManifoldFitStream`` against the
+ *  merged folder to derive coords from the combined heap.
+ */
+export interface MergeManifoldRequest {
+  /** Destination namespace (defaults to ``"local"`` server-side). */
+  namespace?: string;
+  /** Destination manifold name. */
+  name: string;
+  description?: string;
+  /** ≥ 2 discover-mode source folders. */
+  sources: MergeManifoldSource[];
+  /** Override the merged folder's fit_mode.  Required when sources
+   *  disagree; defaults to the shared mode otherwise. */
+  fit_mode?: "pca" | "spectral";
+  hyperparams?: Record<string, unknown>;
+  force?: boolean;
+}
+
 /** Body for POST /saklas/v1/manifolds. */
 export interface CreateManifoldRequest {
   namespace?: string;
@@ -1250,6 +1313,17 @@ export type DrawerName =
   /** Manifold authoring form — domain step + node editor.  Reached
    *  from the "+ build manifold" button inside ``manifolds``. */
   | "manifold_builder"
+  /** Manifold-side counterpart to ``MergeDrawer``.  Unions the node
+   *  corpora of two or more discover-mode manifolds into a fresh
+   *  discover folder; restricted to discover sources by design.
+   *  Reached from the workspace rail's "manifolds → merge…" entry,
+   *  parallel to "vectors → merge vector…". */
+  | "manifold_merge"
+  /** Manifold-side counterpart to ``PackDrawer``.  Two tabs: local
+   *  catalog, plus HF search/install for ``saklas-manifold``-tagged
+   *  repos.  Reached from the workspace rail's "manifolds → packs…"
+   *  entry, parallel to "vectors → packs…". */
+  | "manifold_pack"
   | "save_conversation"
   | "load_conversation"
   | "compare"

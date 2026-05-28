@@ -76,6 +76,8 @@ On-disk format for manifold-steering artifacts — `~/.saklas/manifolds/<ns>/<na
 
 `iter_manifold_folders(namespace=None)` is the shared discovery walk — yields `(namespace, ManifoldFolder)` for every installed manifold, skipping malformed folders; both the CLI (`_iter_manifold_folders` is a thin wrapper) and the server share it so neither re-implements the walk. `create_manifold_folder(namespace, name, description, domain_spec, nodes)` is the authored webui/HTTP path: it validates name/namespace/labels against `NAME_REGEX`, builds the domain via `domain_from_spec`, enforces `min_nodes` and per-node coord arity + non-empty statement lists, writes `manifold.json` (with an empty `files` manifest) + the `nodes/` corpus, and returns `(folder, advisories)` — the captured `_warn_authoring_quality` warnings so the UI can flag a poisedness-deficient layout before a fit. `create_discover_manifold_folder(namespace, name, description, *, fit_mode, node_corpora, hyperparams=None, node_roles=None)` is the discover-mode authoring path: nodes are `{label: [statements]}` with no coords, `fit_mode in {"pca","spectral"}` is the discriminator, and `_sanitize_hyperparams(fit_mode, hyperparams)` drops cross-method keys (e.g. `k_nn` on a PCA folder) at the IO boundary so a stray hyperparam never lands in the manifest and crashes the dispatcher at fit time. `update_manifold_folder(folder, *, description=None, nodes=None)` re-authors authored folders in place — a `nodes` argument fully replaces the node list and corpus; existing fitted tensors are kept (they go stale, the next fit overwrites). `FileExistsError` on an existing folder, `ManifoldFormatError` on bad input. Procrustes cross-model alignment for discover-mode coords is deferred — see the TODO in `create_discover_manifold_folder` pointing at `alignment.py` and `vector transfer`.
 
+`merge_discover_manifolds(target_namespace, target_name, target_description, *, sources, fit_mode=None, hyperparams=None, force=False)` unions the *nodes* of two or more discover-mode source folders into a fresh discover folder — the manifold analogue of `merge_into_pack` for vectors, but on node corpora rather than steering directions. Restricted to discover sources by design: authored manifolds carry user-declared geometry that isn't mergeable without a shared coordinate system. Label collisions across sources raise `ManifoldFormatError` (refuse over silent renames — labels carry provenance the user cares about). `fit_mode` defaults to the sources' shared mode when they agree; sources with mixed modes require an explicit override. `hyperparams=None` inherits from the first source; an explicit dict replaces wholesale. `_sanitize_hyperparams` runs at the IO boundary through the inner `create_discover_manifold_folder` call. The merged folder is written *unfitted* — the natural next step is `saklas vector manifold discover <merged>` (or `POST .../fit`) to derive coords from the combined heap. `FileNotFoundError` on missing source, `FileExistsError` on destination conflict without `force=True`, `ManifoldFormatError` for authored sources / collisions / mixed-mode-without-override.
+
 Nodes optionally carry a per-node `role` field (slug `[a-z0-9._-]+`). Authored nodes: `{label, coords, statements, role?}`. Discover nodes: `{label}` on disk plus `role?` (the `node_roles` kwarg on `create_discover_manifold_folder` is the `{label: role|None}` mapping). When set, the role rides through `ManifoldExtractionPipeline.fit` → `compute_node_centroid(role=...)` → `_encode_and_capture_all` for chat-template substitution, producing role-baselined centroids — the persona-manifold geometry. `nodes_sha256` folds in any non-`None` role so a role edit invalidates a cached fit. `ManifoldFolder.node_roles` is the index-aligned in-memory list (defaults all-`None` for legacy folders); `_node_payload_authored` / `_node_payload_discover` emit the field only when non-`None` so non-role folders are byte-identical to the pre-A-phase shape. `_validate_node_role` is the shared slug-shape gate; family-unsupported (Mistral-3 / talkie) raises `RoleSubstitutionUnsupportedError` at fit time, not at folder write time (the folder is model-agnostic).
 
 ## atomic.py
@@ -172,6 +174,33 @@ model_scope, tag_version, dry_run, variant="all")` stages a filtered copy
 `base_model_relation: adapter`. `resolve_target_coord` picks `<whoami>/<name>`
 unless `--as` overrides. `search_packs` / `fetch_info` query the hub without a
 full download.
+
+## hf_manifolds.py
+
+The manifold-side counterpart to `hf.py` — HF *model*-repo convention again, but
+the tagging convention diverges (`saklas-manifold` instead of `saklas-pack`).
+`pull_manifold(coord, target_folder, *, force, revision)` uses the same
+stage-verify-swap discipline `pull_pack` does: snapshot-download into
+`<target>.staging/`, validate the staged folder through `ManifoldFolder.load`
+(checks format version + `NAME_REGEX` + the `files` integrity manifest when
+populated), then atomic-rename into place. Unlike packs, a manifold repo with no
+`manifold.json` is rejected — the geometry can't be inferred from a bare
+safetensors dump, so refuse rather than synthesize. `_install_manifold` is the
+allow-listed file copier (`manifold.json`, `scenarios.json`, `*.safetensors`,
+`*.json` at root; `nodes/*.json` under `nodes/`; everything else like
+`README.md`/`.gitattributes` is skipped). `search_manifolds(query)` queries
+`HfApi.list_models` filtered by `saklas-manifold` (with the same legacy-arg
+fallback `search_packs` uses), then calls `fetch_manifold_info` per result to
+fill in the manifold-specific fields the picker needs (`domain_label`,
+`node_count`, `fit_mode`, `tensor_models`). `fetch_manifold_info(coord)` is the
+cheap probe: pulls only `manifold.json` plus the repo's file listing, computes
+`domain_label` from the parsed domain spec (or `discover-<fit_mode>` when the
+folder is discover-mode), returns row dicts ready for display. Top-level
+`install_manifold(target, as_, *, force)` orchestrates HF pulls and local
+folder copies — wraps `pull_manifold` for HF coords (`<ns>/<name>[@rev]`) and
+delegates to `_install_local_manifold` for local folder paths. `ManifoldInstallConflict`
+is the 409-shaped error mirroring `cache_ops.InstallConflict`. Push (HF upload)
+is deferred — once shipped it'll live here alongside pull.
 
 ## gguf_io.py
 

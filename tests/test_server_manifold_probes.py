@@ -253,6 +253,205 @@ class TestManifoldProbeRoutes:
         assert resp.status_code == 404
         session.remove_manifold_probe.assert_not_called()
 
+    def test_search_route_returns_results(self, session_and_client, monkeypatch):
+        """``GET /saklas/v1/manifolds/search`` proxies to
+        ``hf_manifolds.search_manifolds`` and returns the row shape the
+        webui's HF picker expects.  Mocks the HF call so the test runs
+        offline.
+        """
+        _, client = session_and_client
+        rows = [
+            {
+                "name": "personas",
+                "namespace": "a9lim",
+                "description": "100 persona archetypes",
+                "tags": ["saklas-manifold"],
+                "node_count": 100,
+                "domain_label": "discover-pca",
+                "fit_mode": "pca",
+                "tensor_models": ["google__gemma-3-4b-it"],
+            },
+        ]
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.search_manifolds",
+            lambda _q: rows,
+        )
+        resp = client.get("/saklas/v1/manifolds/search?q=persona")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["results"] == rows
+
+    def test_search_route_503_when_hf_missing(
+        self, session_and_client, monkeypatch,
+    ):
+        """``huggingface_hub`` missing surfaces as 503 (not 500) so the
+        webui can render a friendly install hint."""
+        _, client = session_and_client
+
+        def _raise(_q):
+            raise ImportError("huggingface_hub")
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.search_manifolds", _raise,
+        )
+        resp = client.get("/saklas/v1/manifolds/search?q=anything")
+        assert resp.status_code == 503
+
+    def test_merge_route_round_trip(self, session_and_client, monkeypatch):
+        """``POST /saklas/v1/manifolds/merge`` orchestrates the discover-
+        merge under the session lock and returns the same manifold-detail
+        JSON ``GET /saklas/v1/manifolds/{ns}/{name}`` ships."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        session, client = session_and_client
+
+        captured: dict[str, Any] = {}
+
+        def _merge(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            merged_dir = MagicMock(spec=Path)
+            merged_dir.parent.name = "local"
+            merged_dir.name = "combined"
+            return merged_dir
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.merge_discover_manifolds",
+            _merge,
+        )
+        fake_folder = MagicMock()
+        fake_folder.name = "combined"
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._find_manifold",
+            lambda ns, name: (ns, fake_folder),
+        )
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._manifold_json",
+            lambda ns, mf, sess, *, full=False: {
+                "namespace": ns, "name": mf.name, "fit_mode": "pca",
+            },
+        )
+
+        resp = client.post(
+            "/saklas/v1/manifolds/merge",
+            json={
+                "name": "combined",
+                "description": "fold heap",
+                "sources": [
+                    {"namespace": "local", "name": "a"},
+                    {"namespace": "local", "name": "b"},
+                ],
+                "fit_mode": "pca",
+            },
+        )
+        assert resp.status_code == 201
+        assert resp.json() == {
+            "namespace": "local",
+            "name": "combined",
+            "fit_mode": "pca",
+        }
+        # Inner call shape: target identity, source tuples, fit_mode
+        # ride through unchanged.
+        assert captured["args"] == ("local", "combined", "fold heap")
+        assert captured["kwargs"]["sources"] == [
+            ("local", "a"), ("local", "b"),
+        ]
+        assert captured["kwargs"]["fit_mode"] == "pca"
+
+    def test_merge_route_rejects_one_source(self, session_and_client):
+        """Single-source merge fails fast at the route layer."""
+        _, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/manifolds/merge",
+            json={
+                "name": "combined",
+                "sources": [{"namespace": "local", "name": "only"}],
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_install_route_round_trip(self, session_and_client, monkeypatch):
+        """``POST /saklas/v1/manifolds/install`` orchestrates the HF
+        pull under the session lock and returns the same detail JSON
+        ``GET /saklas/v1/manifolds/{ns}/{name}`` ships.
+        """
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        session, client = session_and_client
+        installed_dir = MagicMock(spec=Path)
+        installed_dir.parent.name = "local"
+        installed_dir.name = "personas"
+        installed_dir.parent.parent = Path("/tmp/.saklas/manifolds")
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.install_manifold",
+            lambda *_args, **_kwargs: installed_dir,
+        )
+        # _find_manifold + _manifold_json read the loaded folder back
+        # via ManifoldFolder.load — short-circuit both so we don't need
+        # an on-disk fixture.
+        fake_folder = MagicMock()
+        fake_folder.name = "personas"
+        fake_folder.description = "100 personas"
+        fake_folder.domain = {"type": "custom", "embed_dim": 8}
+        fake_folder.node_labels = ["hacker", "caveman"]
+        fake_folder.node_coords = []
+        fake_folder.node_roles = [None, None]
+        fake_folder.fit_mode = "pca"
+        fake_folder.hyperparams = {}
+        fake_folder.tensor_models.return_value = []
+        fake_folder.nodes_sha256.return_value = "x"
+        fake_folder.is_discover = True
+        fake_folder.node_groups.return_value = {}
+        # Make `_find_manifold` return our fake folder.  It does
+        # ManifoldFolder.load(folder) where folder is via
+        # manifold_dir(ns, name); the simpler route is patching the
+        # _find_manifold helper itself.
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._find_manifold",
+            lambda ns, name: (ns, fake_folder),
+        )
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._manifold_json",
+            lambda ns, mf, sess, *, full=False: {
+                "namespace": ns, "name": mf.name, "fitted": [],
+            },
+        )
+
+        resp = client.post(
+            "/saklas/v1/manifolds/install",
+            json={"target": "a9lim/personas"},
+        )
+        assert resp.status_code == 201
+        assert resp.json() == {
+            "namespace": "local",
+            "name": "personas",
+            "fitted": [],
+        }
+
+    def test_delete_qualified_namespaced_name(self, session_and_client):
+        """Probes attached by qualified selector (``default/personas``)
+        carry a registered name containing ``/`` — the DELETE route
+        must accept that via ``{name:path}`` or the webui ✕ button 404s.
+        """
+        session, client = session_and_client
+        session._manifold_monitor.probe_names = ["default/personas"]
+
+        # Both raw-slash and percent-encoded forms must reach the
+        # handler with the slash intact.  encodeURIComponent in the
+        # webui sends the percent-encoded form.
+        resp = client.delete("/saklas/v1/manifold-probes/default/personas")
+        assert resp.status_code == 204
+        session.remove_manifold_probe.assert_called_once_with("default/personas")
+
+        session.remove_manifold_probe.reset_mock()
+        session._manifold_monitor.probe_names = ["default/personas"]
+        resp = client.delete("/saklas/v1/manifold-probes/default%2Fpersonas")
+        assert resp.status_code == 204
+        session.remove_manifold_probe.assert_called_once_with("default/personas")
+
 
 # ---------------------------------------------------------------------------
 # OpenAI extension: x-saklas-manifold-readings

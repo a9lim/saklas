@@ -1011,6 +1011,151 @@ def create_discover_manifold_folder(
     return folder
 
 
+def merge_discover_manifolds(
+    target_namespace: str,
+    target_name: str,
+    target_description: str,
+    *,
+    sources: list[tuple[str, str]],
+    fit_mode: Optional[str] = None,
+    hyperparams: Optional[dict[str, Any]] = None,
+    force: bool = False,
+) -> Path:
+    """Union N discover-mode manifolds' nodes into one fresh discover folder.
+
+    The vector-side counterpart is :func:`saklas.io.merge.merge_into_pack`,
+    but the manifold semantics are different: vector merge composes a
+    new direction from a steering expression; manifold merge unions
+    *node corpora* and lets the next fit derive coords from the
+    combined heap.
+
+    Restricted to discover-mode sources by design — authored manifolds
+    carry user-declared geometry (a specific ``BoxDomain`` / ``SphereDomain``
+    + per-node coords on that domain), and reconciling two unrelated
+    coordinate systems without a shared frame isn't meaningful.  Discover
+    folders derive coords per-model from centroids at fit time, so the
+    merge is just "pool the centroids" — the operation that's natural
+    for the autofit pipeline.
+
+    Source label collisions raise :class:`ManifoldFormatError`; the
+    caller should rename in source folders before merging (we don't
+    auto-prefix since labels are user-visible and silent renames hide
+    provenance).
+
+    Fit-mode reconciliation:
+      * sources agree → that's the default
+      * sources disagree → an explicit ``fit_mode`` is required
+      * caller supplies ``fit_mode`` → that wins
+
+    Hyperparams default to the first source's; an explicit
+    ``hyperparams`` arg replaces them wholesale (matches
+    ``create_discover_manifold_folder``'s shape).  ``_sanitize_hyperparams``
+    drops cross-method keys at the IO boundary.
+
+    The merged folder is written *unfitted* — no per-model tensor is
+    materialized.  Run ``saklas vector manifold discover`` or
+    ``POST .../fit`` against the merged folder to derive coords + fit.
+    """
+    if len(sources) < 2:
+        raise ValueError(
+            f"merge needs >= 2 sources, got {len(sources)}: {sources!r}",
+        )
+
+    folders: list[tuple[str, str, ManifoldFolder]] = []
+    for ns, name in sources:
+        folder_path = manifold_dir(ns, name)
+        if not (folder_path / "manifold.json").exists():
+            raise FileNotFoundError(
+                f"merge source {ns}/{name} not found at {folder_path}",
+            )
+        mf = ManifoldFolder.load(folder_path)
+        if not mf.is_discover:
+            raise ManifoldFormatError(
+                f"merge source {ns}/{name} is authored ({mf.fit_mode!r}); "
+                f"merge supports discover-mode (autofitted) manifolds only — "
+                f"authored manifolds carry user-declared geometry that "
+                f"isn't mergeable without a shared coordinate system.",
+            )
+        folders.append((ns, name, mf))
+
+    # Detect label collisions across the union.  Refuse rather than
+    # silently rename — labels carry provenance the user cares about.
+    seen: dict[str, str] = {}
+    collisions: list[tuple[str, str, str]] = []
+    for ns, name, mf in folders:
+        src_key = f"{ns}/{name}"
+        for label in mf.node_labels:
+            if label in seen and seen[label] != src_key:
+                collisions.append((label, seen[label], src_key))
+            seen[label] = src_key
+    if collisions:
+        details = "; ".join(
+            f"{label!r} in {a} and {b}" for label, a, b in collisions
+        )
+        raise ManifoldFormatError(
+            f"merge {target_namespace}/{target_name}: label collisions — "
+            f"{details}. Rename one side before merging.",
+        )
+
+    # Reconcile fit_mode.
+    source_modes = sorted({mf.fit_mode for _, _, mf in folders})
+    if fit_mode is None:
+        if len(source_modes) > 1:
+            raise ManifoldFormatError(
+                f"merge {target_namespace}/{target_name}: sources have "
+                f"mixed fit_modes ({source_modes}); pass fit_mode= to pick one.",
+            )
+        fit_mode = source_modes[0]
+    elif fit_mode not in _FIT_MODES_DISCOVER:
+        raise ManifoldFormatError(
+            f"merge {target_namespace}/{target_name}: fit_mode "
+            f"{fit_mode!r} invalid; expected one of "
+            f"{sorted(_FIT_MODES_DISCOVER)}.",
+        )
+
+    # Reconcile hyperparams — default to the first source's, caller may
+    # override wholesale.
+    effective_hyperparams: dict[str, Any]
+    if hyperparams is not None:
+        effective_hyperparams = dict(hyperparams)
+    else:
+        effective_hyperparams = dict(folders[0][2].hyperparams)
+
+    # Pool the corpus + roles.  Iteration order: source order, then
+    # per-source label order (matches how the source authored them).
+    node_corpora: dict[str, list[str]] = {}
+    node_roles: dict[str, str | None] = {}
+    for _ns, _name, mf in folders:
+        groups = dict(mf.node_groups())
+        for idx, label in enumerate(mf.node_labels):
+            node_corpora[label] = list(groups.get(label, []))
+            role = (
+                mf.node_roles[idx]
+                if idx < len(mf.node_roles)
+                else None
+            )
+            node_roles[label] = role
+
+    target_folder = manifold_dir(target_namespace, target_name)
+    if target_folder.exists():
+        if not force:
+            raise FileExistsError(
+                f"manifold {target_namespace}/{target_name} already exists; "
+                f"pass force=True to overwrite",
+            )
+        shutil.rmtree(target_folder)
+
+    return create_discover_manifold_folder(
+        target_namespace,
+        target_name,
+        target_description,
+        fit_mode=fit_mode,
+        node_corpora=node_corpora,
+        hyperparams=effective_hyperparams,
+        node_roles=node_roles,
+    )
+
+
 def update_manifold_folder(
     folder: Path,
     *,

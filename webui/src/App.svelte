@@ -219,6 +219,10 @@
             <Drawers.Manifolds params={drawerState.params} />
           {:else if drawerState.open === "manifold_builder"}
             <Drawers.ManifoldBuilder params={drawerState.params} />
+          {:else if drawerState.open === "manifold_merge"}
+            <Drawers.ManifoldMerge params={drawerState.params} />
+          {:else if drawerState.open === "manifold_pack"}
+            <Drawers.ManifoldPack params={drawerState.params} />
           {:else if drawerState.open === "save_conversation"}
             <Drawers.SaveConversation params={drawerState.params} />
           {:else if drawerState.open === "load_conversation"}

@@ -876,7 +876,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         return _manifold_probe_info(registered_name, probe)
 
     @app.delete(
-        "/saklas/v1/manifold-probes/{name}",
+        "/saklas/v1/manifold-probes/{name:path}",
         status_code=204,
     )
     def remove_manifold_probe(name: str):
@@ -884,6 +884,12 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         404 when ``name`` is not currently registered.  Mirrors the
         ``DELETE /probes/{name}`` shape for vector probes.
+
+        ``{name:path}`` (not the default single-segment ``{name}``) is
+        load-bearing — manifold probes are commonly registered under
+        their qualified selector (``default/personas``), and the ``/``
+        survives URL decoding before route matching.  A plain ``{name}``
+        won't match those probes and detach silently 404s.
         """
         try:
             attached_names = session.manifold_monitor.probe_names
