@@ -43,7 +43,6 @@
     rewindSession,
     sendPrefill,
     sendCommit,
-    loomRegenerateFromUser,
     enqueuePending,
     pendingActions,
     cancelPendingAction,
@@ -107,8 +106,11 @@
   // On an assistant / root node you write the next *user* message (the
   // normal chat flow).  On a *user* node the turn below it is the
   // assistant's — so the input composes the assistant reply instead:
-  //   empty + send → generate a fresh assistant child (re-roll / fan)
   //   text  + send → answer-prefill — seed the reply with that text
+  //   empty        → no-op (send button is grayed, mirroring an
+  //                  assistant node).  Re-rolling / fanning a user node
+  //                  lives on the loom sidebar's regenerate / fan-out
+  //                  menu and the dedicated regen button, not here.
   // Raw (flat completion) mode — base models, or an explicit override.
   // In raw mode the role-aware commit derivations short-circuit: there
   // are no roles, so the input box never enters prefill / commit mode.
@@ -174,7 +176,7 @@
   const sendLabel = $derived(
     commitMode
       ? (onUserNode ? "commit assistant" : "commit user")
-      : (onUserNode ? (input.trim() ? "prefill" : "generate") : "send"),
+      : (onUserNode ? "prefill" : "send"),
   );
 
   /** Shared commit dispatch — used by both Ctrl/Cmd/Option+Enter and a
@@ -182,7 +184,7 @@
    *  the action (including the empty-input no-op), so the caller knows
    *  not to fall through to the normal send/prefill path: the modifier
    *  explicitly means "don't generate," so an empty commit silently
-   *  consumes rather than degrading to a regenerate. */
+   *  consumes rather than falling through. */
   function tryCommit(): boolean {
     const text = input.trim();
     // Forward the pulled slot (if any) so a re-edited queued commit
@@ -250,12 +252,11 @@
       } else if (replaceSlot !== null) {
         // Empty prefill on a pulled slot cancels the queued item.
         cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
-      } else if (activeNodeId) {
-        // Empty + not pulled + live user node → re-roll the assistant.
-        // We can't re-roll a not-yet-existing queued user node, so this
-        // branch is gated to live ids only.
-        void loomRegenerateFromUser(activeNodeId);
       }
+      // Empty + not pulled → no-op.  The send button is grayed in this
+      // state (mirroring an assistant node); re-rolling the assistant
+      // for a selected user node lives on the loom sidebar's regenerate /
+      // fan-out menu, so the input bar no longer doubles as a regen.
       scrolledUp = false;
       queueScrollToBottom();
       queueMicrotask(autosize);
@@ -1001,9 +1002,9 @@
       <button
         type="submit"
         class="send"
-        disabled={!input.trim() && (commitMode || !onUserNode)}
+        disabled={!input.trim()}
         title={onUserNode
-          ? "⏎ prefill reply (empty = generate fresh) · ⌃-click commit assistant · ⇧⏎ newline"
+          ? "⏎ prefill reply · ⌃-click commit assistant · ⇧⏎ newline"
           : "⏎ send · ⌃-click commit user · ⇧⏎ newline"}
       >{sendLabel}</button>
       <button
