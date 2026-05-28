@@ -26,6 +26,7 @@
     openDrawer,
     refreshManifoldList,
     refreshManifoldProbeList,
+    setManifoldLabel,
   } from "../lib/stores.svelte";
   import {
     dismissToast,
@@ -70,12 +71,23 @@
   const detailLoading = new SvelteSet<string>();
   const detailErrors = new SvelteMap<string, string>();
 
+  // Free-text filter over manifolds *and* their node labels (mirrors
+  // VectorsDrawer's search).  ``searching`` auto-expands every node
+  // list so matches are visible without a manual unfold.
+  let query: string = $state("");
+  let searchInputRef: HTMLInputElement | null = $state(null);
+
+  // Per-row node-list collapse.  Node lists default OPEN, so a key
+  // present here means the user explicitly folded that row's nodes.
+  const collapsedNodes = new SvelteSet<string>();
+
   onMount(() => {
     void refreshManifoldList();
     // Pull the attached-probe list too — the +probe / detach-button
     // affordance is keyed on whether a fitted manifold is already
     // attached, so the drawer needs this fresh on mount.
     void refreshManifoldProbeList();
+    queueMicrotask(() => searchInputRef?.focus({ preventScroll: true }));
     return () => {
       for (const t of confirmTimers.values()) window.clearTimeout(t);
       confirmTimers.clear();
@@ -97,11 +109,75 @@
     return e instanceof Error ? e.message : String(e);
   }
 
+  const searching = $derived(query.trim().length > 0);
+
+  function nodeMatches(label: string, q: string): boolean {
+    return label.toLowerCase().includes(q);
+  }
+
+  /** A manifold matches the query on its key/name/namespace/description
+   *  OR on any of its node labels — so searching a node name surfaces
+   *  the card that owns it. */
+  function rowMatches(m: ManifoldInfo, q: string): boolean {
+    if (!q) return true;
+    const n = q.toLowerCase();
+    if (rowKey(m).toLowerCase().includes(n)) return true;
+    if (m.name.toLowerCase().includes(n)) return true;
+    if (m.namespace.toLowerCase().includes(n)) return true;
+    if (m.description && m.description.toLowerCase().includes(n)) return true;
+    return (m.node_labels ?? []).some((l) => nodeMatches(l, n));
+  }
+
+  /** Node labels to render for a row under the active query.  When
+   *  searching, narrow to matching labels — but if the row matched only
+   *  on its name/description (no node hit), keep the full list so the
+   *  card never renders an empty node block. */
+  function visibleNodes(m: ManifoldInfo): string[] {
+    const labels = m.node_labels ?? [];
+    const q = query.trim().toLowerCase();
+    if (!q) return labels;
+    const hits = labels.filter((l) => nodeMatches(l, q));
+    return hits.length > 0 ? hits : labels;
+  }
+
+  /** Per-node role slug (role-baselined manifolds), aligned with
+   *  ``node_labels``.  ``null`` when the manifold carries no roles. */
+  function nodeRoleFor(m: ManifoldInfo, label: string): string | null {
+    const roles = m.node_roles;
+    if (!roles) return null;
+    const idx = (m.node_labels ?? []).indexOf(label);
+    return idx >= 0 ? (roles[idx] ?? null) : null;
+  }
+
+  function nodesOpen(key: string): boolean {
+    return searching || !collapsedNodes.has(key);
+  }
+  function toggleNodes(key: string): void {
+    if (collapsedNodes.has(key)) collapsedNodes.delete(key);
+    else collapsedNodes.add(key);
+  }
+
+  /** Rack the manifold (if not already) and pin it to ``label`` as a
+   *  label-form term, then close — the one-click "steer to this node"
+   *  affordance.  A second node click on an already-racked manifold
+   *  just re-targets the existing term via ``setManifoldLabel``. */
+  function onSteerNode(m: ManifoldInfo, label: string): void {
+    if (!m.fitted_for_session) return;
+    const key = rowKey(m);
+    addManifoldToRack(key);
+    setManifoldLabel(key, label);
+    closeDrawer();
+  }
+
   const fitted = $derived(
-    manifoldRack.catalog.filter((m) => m.fitted_for_session),
+    manifoldRack.catalog.filter(
+      (m) => m.fitted_for_session && rowMatches(m, query.trim()),
+    ),
   );
   const unfitted = $derived(
-    manifoldRack.catalog.filter((m) => !m.fitted_for_session),
+    manifoldRack.catalog.filter(
+      (m) => !m.fitted_for_session && rowMatches(m, query.trim()),
+    ),
   );
 
   function isRacked(m: ManifoldInfo): boolean {
@@ -311,6 +387,49 @@
   </header>
 
   <div class="body">
+    {#snippet nodeSection(m: ManifoldInfo, steerable: boolean)}
+      {@const key = rowKey(m)}
+      {@const total = (m.node_labels ?? []).length}
+      {@const nodes = visibleNodes(m)}
+      {#if total > 0}
+        <div class="nodes-block">
+          <button
+            type="button"
+            class="nodes-toggle"
+            aria-expanded={nodesOpen(key)}
+            onclick={() => toggleNodes(key)}
+            title={nodesOpen(key) ? "collapse nodes" : "expand nodes"}
+          >
+            <span class="caret" aria-hidden="true">{nodesOpen(key) ? "▾" : "▸"}</span>
+            <span class="nodes-label">nodes</span>
+            <span class="nodes-count"
+              >{nodes.length}{#if nodes.length !== total}/{total}{/if}</span>
+          </button>
+          {#if nodesOpen(key)}
+            <ul class="node-chips" role="list">
+              {#each nodes as label (label)}
+                {@const role = nodeRoleFor(m, label)}
+                <li>
+                  <button
+                    type="button"
+                    class="node-chip"
+                    disabled={!steerable}
+                    onclick={() => onSteerNode(m, label)}
+                    title={steerable
+                      ? `steer ${key} → ${label}`
+                      : `fit ${key} first to steer to ${label}`}
+                  >
+                    <span class="node-name">{label}</span>
+                    {#if role}<span class="node-role" title="role-baselined node">{role}</span>{/if}
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
+    {/snippet}
+
     {#if errorMsg}
       <p class="error" role="alert">{errorMsg}</p>
     {/if}
@@ -373,6 +492,28 @@
       <span class="build-label">build manifold</span>
       <span class="build-hint">author a domain and node corpus</span>
     </button>
+
+    {#if !manifoldRack.unavailable && manifoldRack.catalog.length > 0}
+      <div class="search-row">
+        <input
+          type="search"
+          class="search"
+          bind:this={searchInputRef}
+          bind:value={query}
+          placeholder="search manifolds & nodes…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button
+          type="button"
+          class="refresh"
+          onclick={() => void refreshManifoldList()}
+          disabled={manifoldRack.loading}
+          title="re-fetch manifolds"
+          aria-label="Refresh"
+        >{manifoldRack.loading ? "…" : "↻"}</button>
+      </div>
+    {/if}
 
     {#if manifoldRack.unavailable}
       <p class="muted">
@@ -478,6 +619,7 @@
                   {/if}
                 </div>
               {/if}
+              {@render nodeSection(m, true)}
             </li>
           {/each}
         </ul>
@@ -521,9 +663,14 @@
                   >{confirming ? "confirm?" : "delete"}</button>
                 </div>
               </div>
+              {@render nodeSection(m, false)}
             </li>
           {/each}
         </ul>
+      {/if}
+
+      {#if fitted.length === 0 && unfitted.length === 0}
+        <p class="muted">no manifold or node matches "{query.trim()}".</p>
       {/if}
     {/if}
   </div>
@@ -880,5 +1027,133 @@
     color: var(--accent-red);
     border-color: var(--accent-red);
     background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+  }
+
+  /* ---- search row (mirrors VectorsDrawer) ---- */
+  .search-row {
+    display: flex;
+    gap: var(--space-3);
+    align-items: stretch;
+  }
+  .search {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: var(--bg-deep);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+    font-family: var(--font-mono);
+    font-size: var(--text);
+    transition: border-color var(--dur) var(--ease-out);
+  }
+  .search:focus {
+    outline: none;
+    border-color: var(--accent-purple);
+  }
+  .refresh {
+    flex: 0 0 auto;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    padding: 0 var(--space-4);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: var(--text);
+    cursor: pointer;
+    transition:
+      color var(--dur) var(--ease-out),
+      border-color var(--dur) var(--ease-out);
+  }
+  .refresh:hover:not(:disabled) {
+    border-color: var(--fg-muted);
+    color: var(--fg);
+  }
+  .refresh:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  /* ---- per-row node list ---- */
+  .nodes-block {
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border);
+  }
+  .nodes-toggle {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: var(--fg-dim);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    transition: color var(--dur) var(--ease-out);
+  }
+  .nodes-toggle:hover {
+    color: var(--accent-purple);
+  }
+  .caret {
+    color: var(--fg-muted);
+  }
+  .nodes-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .nodes-count {
+    color: var(--fg-muted);
+  }
+  .node-chips {
+    list-style: none;
+    margin: var(--space-2) 0 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .node-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    background: var(--bg-alt);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-3);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    transition:
+      background var(--dur) var(--ease-out),
+      border-color var(--dur) var(--ease-out),
+      color var(--dur) var(--ease-out);
+  }
+  .node-chip:hover:not(:disabled) {
+    color: var(--accent-purple);
+    border-color: var(--accent-purple);
+    background: rgba(167, 139, 250, 0.12);
+  }
+  .node-chip:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .node-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 16em;
+  }
+  .node-role {
+    padding: 0 var(--space-2);
+    border-radius: var(--radius);
+    font-size: var(--text-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent-purple);
+    background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
   }
 </style>
