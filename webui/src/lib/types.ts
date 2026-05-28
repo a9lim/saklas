@@ -70,6 +70,14 @@ export interface SessionInfo {
    *  as flat completion (no roles, no bubbles).  Older servers omit
    *  this; clients treat ``undefined`` as ``false`` (chat model). */
   is_base_model?: boolean;
+  /** True iff the loaded model family supports assistant-role
+   *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
+   *  talkie no). Drives whether the roles control is enabled. Older
+   *  servers omit this; treat ``undefined`` as ``false``. */
+  role_substitution_supported?: boolean;
+  /** True iff the family supports *user*-role substitution. Same family
+   *  set as the assistant side today. Treat ``undefined`` as ``false``. */
+  user_role_supported?: boolean;
 }
 
 // ----------------------------------------------------- manifolds --
@@ -676,6 +684,11 @@ export interface WSSampling {
    *  when any on_token consumer is live, just no top alternatives.
    *  Default 0 keeps the wire shape unchanged for opt-out users. */
   return_top_k?: number | null;
+  /** Per-message role-substitution labels (roleplay scaffold).  Ride each
+   *  generate / commit like ``seed``; stamped onto the produced loom nodes
+   *  and rendered per-turn.  null/empty = standard role label. */
+  user_role?: string | null;
+  assistant_role?: string | null;
 }
 
 export interface WSGenerateRequest {
@@ -861,6 +874,11 @@ export interface LoomNodeJSON {
   parent_id: string | null;
   role: "user" | "assistant" | "system";
   text: string;
+  /** Per-turn role-substitution label (roleplay scaffold) — the custom
+   *  role this turn was *sent* with (e.g. "captain" / "pirate"), or null
+   *  for the standard role.  Drives the bubble heading + loom glyph.
+   *  Older servers omit this; treat undefined as null. */
+  role_label?: string | null;
   /** Assistant nodes only.  Mirrors saklas.core.loom.Recipe. */
   recipe?: {
     steering?: string | null;
@@ -1122,6 +1140,10 @@ export interface TokenScore {
 export interface ChatTurn {
   role: "user" | "assistant" | "system";
   text: string;
+  /** Per-turn role-substitution label (roleplay scaffold) carried from the
+   *  backing loom node — drives the bubble heading.  null/undefined =
+   *  standard role label. */
+  roleLabel?: string | null;
   /** Loom node backing this turn, when the server tree is active. */
   nodeId?: string | null;
   /** True iff any thinking content was emitted. */

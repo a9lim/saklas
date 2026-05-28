@@ -53,6 +53,15 @@ class SamplingConfig:
     # ``__post_init__`` — beyond 256 is data nobody can act on and bytes
     # nobody wants on the wire.
     return_top_k: int = 0
+    # Per-message role-substitution labels (roleplay scaffold).  Like
+    # ``seed``, these are per-call and recorded on the produced loom nodes
+    # (the user turn gets ``user_role``, the generated assistant turn gets
+    # ``assistant_role``).  ``None`` leaves the family's standard label.
+    # A role-bearing steering scope (``:role-<slug>`` vectors / persona
+    # manifolds) still overrides ``assistant_role`` for the generation
+    # prompt so steer baseline matches extract baseline.
+    user_role: str | None = None
+    assistant_role: str | None = None
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
@@ -87,6 +96,8 @@ class SamplingConfig:
         "logprobs": None,
         "return_hidden": False,
         "return_top_k": 0,
+        "user_role": None,
+        "assistant_role": None,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

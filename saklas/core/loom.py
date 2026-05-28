@@ -345,6 +345,14 @@ class LoomNode:
     parent_id: str | None
     role: Role
     text: str = ""
+    # Per-turn role-substitution label (roleplay scaffold).  The custom
+    # label this turn was *sent* with — ``"captain"`` on a user node,
+    # ``"pirate"`` on an assistant node — or ``None`` for the family's
+    # standard label.  Stamped at send time (immutable afterward) so the
+    # chat-render walks each turn with its own role and the transcript /
+    # glyph display matches.  Distinct from the steering-driven
+    # ``_active_role`` (transient, never persisted here).
+    role_label: str | None = None
     tokens: list[TokenScoreDict] | None = None
     thinking_tokens: list[TokenScoreDict] | None = None
     recipe: Recipe | None = None
@@ -382,6 +390,7 @@ class LoomNode:
             "parent_id": self.parent_id,
             "role": self.role,
             "text": self.text,
+            "role_label": self.role_label,
             "aggregate_readings": dict(self.aggregate_readings),
             "applied_steering": self.applied_steering,
             "finish_reason": self.finish_reason,
@@ -411,6 +420,7 @@ class LoomNode:
             parent_id=data.get("parent_id"),
             role=data["role"],
             text=data.get("text", ""),
+            role_label=data.get("role_label"),
             tokens=data.get("tokens"),
             thinking_tokens=data.get("thinking_tokens"),
             recipe=recipe,
@@ -651,6 +661,7 @@ class LoomTree:
         leaf_id: str | None = None,
         *,
         include_system: bool = False,
+        with_labels: bool = False,
     ) -> list[dict[str, str]]:
         """Return the active-path (or path to ``leaf_id``) as chat messages.
 
@@ -658,6 +669,12 @@ class LoomTree:
         the rest of the engine + servers consume.  Skips the synthetic
         root by default (its empty text isn't a real system prompt) —
         callers wanting an explicit system prompt prepend it themselves.
+
+        ``with_labels`` adds each node's per-turn ``role_label`` under a
+        ``"label"`` key (the roleplay scaffold) so the chat-render path can
+        splice each turn with its own role.  Off by default to keep the
+        canonical ``{role, content}`` shape transcript / server / OpenAI
+        consumers expect.
         """
         target = leaf_id if leaf_id is not None else self.active_node_id
         path = self.path_to(target)
@@ -665,7 +682,10 @@ class LoomTree:
         for node in path:
             if node.id == self.root_id and not include_system:
                 continue
-            out.append({"role": node.role, "content": node.text})
+            msg: dict[str, str] = {"role": node.role, "content": node.text}
+            if with_labels:
+                msg["label"] = node.role_label  # type: ignore[assignment]
+            out.append(msg)
         return out
 
     def flat_text(self, leaf_id: str | None = None) -> str:
@@ -728,6 +748,7 @@ class LoomTree:
         parent_id: str | None = None,
         *,
         dedup_existing: bool = True,
+        role_label: str | None = None,
     ) -> str:
         """Add a user turn under ``parent_id`` (default: the active node).
 
@@ -735,6 +756,10 @@ class LoomTree:
         child with the exact same text, returns that existing child's id
         without growing the tree.  This spares users a redundant tree level
         for the regen workflow where the user re-sends the same prompt.
+
+        ``role_label`` stamps the per-turn role-substitution label (the
+        roleplay scaffold) onto a freshly-created node; a dedup hit keeps
+        the existing node's label unchanged.
         """
         with self._lock:
             parent = parent_id if parent_id is not None else self.active_node_id
@@ -752,7 +777,10 @@ class LoomTree:
                             active_node_id=self.active_node_id,
                         ))
                         return sib.id
-            node = LoomNode(id=_ulid(), parent_id=parent, role="user", text=text)
+            node = LoomNode(
+                id=_ulid(), parent_id=parent, role="user", text=text,
+                role_label=role_label,
+            )
             self._add_child(parent, node)
             self.active_node_id = node.id
             self.rev += 1
@@ -766,12 +794,17 @@ class LoomTree:
         self,
         parent_id: str,
         recipe: Recipe | None = None,
+        *,
+        role_label: str | None = None,
     ) -> str:
         """Create an empty assistant node under ``parent_id``.
 
         Returns the new node id.  The session calls this in the gen
         preamble; subsequent ``append_token`` / ``finalize_assistant``
         calls populate the node as the generation streams.
+
+        ``role_label`` stamps the per-turn role-substitution label the
+        model is generating under (the roleplay scaffold).
         """
         with self._lock:
             if parent_id not in self.nodes:
@@ -782,6 +815,7 @@ class LoomTree:
                 parent_id=parent_id,
                 role="assistant",
                 recipe=recipe,
+                role_label=role_label,
                 tokens=[],
                 thinking_tokens=[],
             )

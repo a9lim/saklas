@@ -257,7 +257,9 @@ class _StubSession:
         return result
 
     # ----- commit entry points (Ctrl+Enter on either surface) ----------
-    def append_user_turn(self, parent_node_id, text, *, allow_any_parent=False):
+    def append_user_turn(
+        self, parent_node_id, text, *, allow_any_parent=False, role_label=None
+    ):
         """Stub commit-user.
 
         Mirrors ``SaklasSession.append_user_turn``: refuses anchoring
@@ -287,9 +289,10 @@ class _StubSession:
                 f"({resolved_parent}): the active turn is already "
                 f"waiting for an assistant."
             )
-        return self.tree.add_user_turn(text, parent_id=parent_node_id)
+        return self.tree.add_user_turn(
+            text, parent_id=parent_node_id, role_label=role_label)
 
-    def append_assistant_turn(self, user_node_id, text):
+    def append_assistant_turn(self, user_node_id, text, *, role_label=None):
         """Stub commit-assistant.
 
         Mirrors ``SaklasSession.append_assistant_turn``: refuses non-user
@@ -316,7 +319,8 @@ class _StubSession:
                 f"append_assistant_turn: {text!r} tokenized to an "
                 f"empty sequence"
             )
-        new_id = self.tree.begin_assistant(user_node_id, recipe=None)
+        new_id = self.tree.begin_assistant(
+            user_node_id, recipe=None, role_label=role_label)
         authored = self.tree.nodes[new_id]
         authored.tokens = None
         authored.thinking_tokens = None

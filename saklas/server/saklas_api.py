@@ -149,6 +149,12 @@ class WSSamplingParams(BaseModel):
     # SamplingConfig layer to ``[0, 256]``; pydantic accepts the int
     # and forwards as-is.
     return_top_k: int = 0
+    # Per-message role-substitution labels (roleplay scaffold).  Ride each
+    # generate like ``seed``; stamped onto the produced loom nodes (user
+    # turn ← ``user_role``, generated assistant turn ← ``assistant_role``)
+    # and rendered per-turn.  ``None`` / empty leaves the standard label.
+    user_role: str | None = None
+    assistant_role: str | None = None
 
 
 class WSGenerateMessage(BaseModel):
@@ -380,6 +386,31 @@ def _session_config_dict(session: SaklasSession) -> dict[str, Any]:
     }
 
 
+def _session_model_type(session: SaklasSession) -> str | None:
+    """Resolve the loaded model's ``model_type`` (unwrapping multimodal
+    ``text_config``) — the key both role-header registries are indexed by."""
+    model_cfg = getattr(getattr(session, "_model", None), "config", None)
+    if model_cfg is None:
+        return None
+    text_cfg = getattr(model_cfg, "text_config", None)
+    mt = getattr(text_cfg, "model_type", None) if text_cfg is not None else None
+    return mt or getattr(model_cfg, "model_type", None)
+
+
+def _role_support(session: SaklasSession) -> tuple[bool, bool]:
+    """``(assistant_supported, user_supported)`` for the loaded family —
+    a non-``None`` entry in the respective role-header registry."""
+    from saklas.core.role_templates import ROLE_HEADERS, USER_ROLE_HEADERS
+
+    mt = _session_model_type(session)
+    if mt is None:
+        return (False, False)
+    return (
+        ROLE_HEADERS.get(mt) is not None,
+        USER_ROLE_HEADERS.get(mt) is not None,
+    )
+
+
 def _device_dtype(session: SaklasSession) -> tuple[str, str]:
     info = session.model_info or {}
     device = str(info.get("device", getattr(session, "_device", "")))
@@ -403,6 +434,10 @@ def _session_info(
         is_base = False
     created = getattr(session, "_created_ts", None) or int(time.time())
     default_expr = str(default_steering) if default_steering is not None else None
+    try:
+        assistant_role_ok, user_role_ok = _role_support(session)
+    except Exception:
+        assistant_role_ok = user_role_ok = False
     return {
         "id": _SINGLE_SESSION_ID,
         "model_id": session.model_id,
@@ -417,6 +452,8 @@ def _session_info(
         "thinking_is_optional": thinks_optional,
         "is_base_model": is_base,
         "default_steering": default_expr,
+        "role_substitution_supported": assistant_role_ok,
+        "user_role_supported": user_role_ok,
     }
 
 
@@ -468,6 +505,8 @@ def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         presence_penalty=body.presence_penalty or 0.0,
         frequency_penalty=body.frequency_penalty or 0.0,
         return_top_k=body.return_top_k,
+        user_role=(body.user_role or None),
+        assistant_role=(body.assistant_role or None),
     )
 
 
@@ -2843,6 +2882,15 @@ async def _ws_handle_generate(
             "sibling_index": 0,
             "sibling_count": 1,
         })
+        # Per-message role labels ride the commit's sampling block too
+        # (roleplay scaffold).  Raw / flat commits carry no chat-template
+        # role, so labels are suppressed there.
+        commit_user_role = (
+            msg.sampling.user_role if msg.sampling is not None else None
+        ) or None
+        commit_asst_role = (
+            msg.sampling.assistant_role if msg.sampling is not None else None
+        ) or None
         async with session.lock:
             try:
                 if msg.commit_role == "user":
@@ -2854,6 +2902,7 @@ async def _ws_handle_generate(
                         parent_node_id,
                         commit_text,
                         allow_any_parent=msg.raw,
+                        role_label=None if msg.raw else commit_user_role,
                     )
                 else:
                     # ``parent_node_id`` is non-None here (validated above
@@ -2863,6 +2912,7 @@ async def _ws_handle_generate(
                         session.append_assistant_turn,
                         parent_node_id,
                         commit_text,
+                        role_label=None if msg.raw else commit_asst_role,
                     )
             except SaklasError as e:
                 status, message = e.user_message()

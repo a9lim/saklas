@@ -168,6 +168,26 @@ class TestSessions:
         assert session.config.temperature == 0.3
         assert session.config.system_prompt == "Be brief."
 
+    @staticmethod
+    def _set_family(session, model_type: str) -> None:
+        """Pin the mock session's resolved model_type so the role-header
+        registries (and thus role-support gating) see a real family."""
+        session._model = MagicMock()
+        session._model.config = MagicMock()
+        session._model.config.text_config = None
+        session._model.config.model_type = model_type
+
+    def test_session_info_exposes_role_support(self, session_and_client):
+        """Per-message role boxes gate on these flags — keep them on the wire."""
+        session, client = session_and_client
+        self._set_family(session, "gemma2")
+        with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
+            resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["role_substitution_supported"] is True
+        assert body["user_role_supported"] is True
+
     def test_clear(self, session_and_client):
         session, client = session_and_client
         resp = client.post("/saklas/v1/sessions/default/clear")
@@ -1450,3 +1470,28 @@ class TestManifoldRoutes:
         assert body["done"] is True
         assert body["layers_fitted"] == 3
         assert body["feature_space"] == "raw"
+
+
+# ---- per-message roles (sampling carrier) --------------------------------
+
+
+class TestRoleSampling:
+    def test_build_sampling_carries_roles(self):
+        """WS sampling roles map onto SamplingConfig (the per-send carrier)."""
+        from saklas.server.saklas_api import WSSamplingParams, _build_sampling
+
+        sc = _build_sampling(
+            WSSamplingParams(user_role="captain", assistant_role="oracle")
+        )
+        assert sc is not None
+        assert sc.user_role == "captain"
+        assert sc.assistant_role == "oracle"
+
+    def test_build_sampling_blank_roles_omitted(self):
+        """Empty-string role boxes are treated as "no label" (None)."""
+        from saklas.server.saklas_api import WSSamplingParams, _build_sampling
+
+        sc = _build_sampling(WSSamplingParams(user_role="", assistant_role=""))
+        assert sc is not None
+        assert sc.user_role is None
+        assert sc.assistant_role is None

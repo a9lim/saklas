@@ -983,3 +983,39 @@ def test_load_refuses_future_format(tmp_path: Path):
     path.write_text(json.dumps(raw))
     with pytest.raises(Exception):
         LoomTree.load(path)
+
+
+# ---------------------------------------------------------------------------
+# Per-turn role labels (roleplay scaffold)
+# ---------------------------------------------------------------------------
+
+
+def test_role_label_stamped_and_round_trips():
+    t = LoomTree()
+    u = t.add_user_turn("hi", role_label="captain")
+    a = t.begin_assistant(u, recipe=None, role_label="pirate")
+    assert t.nodes[u].role_label == "captain"
+    assert t.nodes[a].role_label == "pirate"
+    # to_dict / from_dict carry the label.
+    d = t.nodes[u].to_dict()
+    assert d["role_label"] == "captain"
+    assert LoomNode.from_dict(d).role_label == "captain"
+
+
+def test_role_label_defaults_none():
+    t = LoomTree()
+    u = t.add_user_turn("hi")
+    assert t.nodes[u].role_label is None
+
+
+def test_messages_for_with_labels():
+    t = LoomTree()
+    u = t.add_user_turn("hi", role_label="captain")
+    t.begin_assistant(u, recipe=None, role_label="pirate")
+    labeled = t.messages_for(with_labels=True)
+    assert labeled[0]["role"] == "user"
+    assert labeled[0]["label"] == "captain"
+    assert labeled[1]["label"] == "pirate"
+    # Default shape stays {role, content} — no label key.
+    plain = t.messages_for()
+    assert "label" not in plain[0]

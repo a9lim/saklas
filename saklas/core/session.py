@@ -1216,7 +1216,7 @@ class SaklasSession:
         input_ids = build_chat_input(
             self._tokenizer, messages, system_prompt=None,
             thinking=False,
-            role=role, model_type=model_type_for_role,
+            gen_role=role, model_type=model_type_for_role,
         ).to(self._device)
         attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
@@ -3287,6 +3287,7 @@ class SaklasSession:
         text: str,
         *,
         allow_any_parent: bool = False,
+        role_label: str | None = None,
     ) -> str:
         """Land a user turn under ``parent_node_id`` without generating.
 
@@ -3319,12 +3320,15 @@ class SaklasSession:
             )
         if not allow_any_parent:
             self._check_user_send_target(parent_node_id)
-        return self.tree.add_user_turn(text, parent_id=parent_node_id)
+        return self.tree.add_user_turn(
+            text, parent_id=parent_node_id, role_label=role_label)
 
     def append_assistant_turn(
         self,
         user_node_id: str,
         text: str,
+        *,
+        role_label: str | None = None,
     ) -> str:
         """Land a user-authored assistant turn under ``user_node_id``.
 
@@ -3363,7 +3367,8 @@ class SaklasSession:
                 f"empty sequence — nothing to commit"
             )
 
-        new_id = self.tree.begin_assistant(user_node_id, recipe=None)
+        new_id = self.tree.begin_assistant(
+            user_node_id, recipe=None, role_label=role_label)
         # Drop the empty token blobs ``begin_assistant`` seeded — an
         # authored turn has no per-token scores; ``None`` matches the
         # transcript-loaded shape so renderers/saves treat it the same.
@@ -3652,6 +3657,8 @@ class SaklasSession:
         self, input, raw: bool = False, thinking: bool = False,
         stateless: bool = False,
         parent_node_id: str | None = None,
+        user_role: str | None = None,
+        assistant_role: str | None = None,
     ) -> torch.Tensor:
         if raw and isinstance(input, str):
             # Flat (base-model / completion) path: no chat template, no
@@ -3665,25 +3672,36 @@ class SaklasSession:
             ).to(self._device)
         if isinstance(input, str):
             if stateless:
-                prior: list[dict[str, str]] = []
+                prior: list[dict[str, Any]] = []
             else:
                 # Walk the path to ``parent_node_id`` (or the active node).
                 # Loom: the model sees the conversation along whatever path
                 # the user is currently focused on, not a single flat log.
-                prior = self.tree.messages_for(parent_node_id)
-            messages = prior + [{"role": "user", "content": input}]
+                # ``with_labels`` carries each prior turn's stamped
+                # ``role_label`` so the render is faithful per-turn — earlier
+                # turns render with the roles they were *sent* with.
+                prior = self.tree.messages_for(parent_node_id, with_labels=True)
+            # The new user turn carries this send's user-role label.
+            messages = prior + [
+                {"role": "user", "content": input, "label": user_role}
+            ]
         elif isinstance(input, list):
             messages = list(input)
         else:
             raise TypeError(f"Unsupported input type: {type(input)}")
-        # Active role (role-extraction Phase 7): when a role-augmented
-        # steering scope is open, route the chat-template render through
-        # ``apply_with_role`` so the assistant turn opens with the
-        # substituted role label.  No active scope → zero-overhead
-        # standard render.
-        active_role = getattr(self, "_active_role", None)
+        # Generation-prompt assistant label: a role-augmented steering scope
+        # (``_active_role``, transient, set by ``_SteeringContext`` for
+        # ``:role-<slug>`` vectors / persona manifolds) wins so steer
+        # baseline matches extract baseline; otherwise this send's
+        # ``assistant_role`` box drives the to-be-generated turn.  Prior
+        # turns' labels ride on the messages themselves (above).
+        steer_role = getattr(self, "_active_role", None)
+        gen_role = steer_role if steer_role is not None else assistant_role
         model_type_for_role: str | None = None
-        if active_role is not None:
+        any_label = gen_role is not None or any(
+            isinstance(m, dict) and m.get("label") for m in messages
+        )
+        if any_label:
             model_cfg = getattr(self._model, "config", None)
             text_cfg = (
                 getattr(model_cfg, "text_config", None)
@@ -3699,7 +3717,8 @@ class SaklasSession:
         return build_chat_input(
             self._tokenizer, messages, self.config.system_prompt,
             thinking=thinking,
-            role=active_role, model_type=model_type_for_role,
+            gen_role=gen_role,
+            model_type=model_type_for_role,
         ).to(self._device)
 
     def build_readings(self) -> dict[str, ProbeReadings]:
@@ -3883,18 +3902,25 @@ class SaklasSession:
                 r_i += 1
 
     def _generation_preamble(self, input, raw, thinking, stateless=False,
-                             parent_node_id: str | None = None):
+                             parent_node_id: str | None = None,
+                             user_role: str | None = None,
+                             assistant_role: str | None = None):
         """Shared input prep + gen-state reset.
 
         Steering is NOT installed here — the caller is expected to hold a
         ``session.steering()`` scope open across the generation.
         ``parent_node_id`` selects which loom-tree path the input is
-        anchored against (default: the active path).
+        anchored against (default: the active path).  ``user_role`` /
+        ``assistant_role`` are this send's per-message role labels (the
+        roleplay scaffold): the new user turn renders under ``user_role``
+        and the generation prompt under ``assistant_role`` (a role-bearing
+        steering scope overrides the latter inside ``_prepare_input``).
         """
         use_thinking = thinking and supports_thinking(self._tokenizer)
         input_ids = self._prepare_input(
             input, raw=raw, thinking=use_thinking, stateless=stateless,
             parent_node_id=parent_node_id,
+            user_role=user_role, assistant_role=assistant_role,
         )
         self._gen_state.reset()
         return input_ids, use_thinking, int(input_ids.shape[1])
@@ -4074,6 +4100,15 @@ class SaklasSession:
         if stateless:
             return None
 
+        # Per-message role labels (roleplay scaffold) ride this send's
+        # SamplingConfig and are stamped onto the nodes at creation — the
+        # turn keeps its role regardless of later box changes.  Raw / flat
+        # mode has no chat template, so role labels don't apply there.
+        user_role = sampling.user_role if sampling is not None and not raw else None
+        assistant_role = (
+            sampling.assistant_role if sampling is not None and not raw else None
+        )
+
         if isinstance(input, str) and raw:
             # Flat (base-model) path: no user/assistant turn pairing.  A
             # non-empty ``input`` is a typed span recorded as its own
@@ -4089,7 +4124,8 @@ class SaklasSession:
                 user_node_id = parent_node_id or self.tree.active_node_id
         elif isinstance(input, str):
             self._check_user_send_target(parent_node_id)
-            user_node_id = self.tree.add_user_turn(input, parent_id=parent_node_id)
+            user_node_id = self.tree.add_user_turn(
+                input, parent_id=parent_node_id, role_label=user_role)
         else:
             user_node_id = parent_node_id or self.tree.active_node_id
 
@@ -4103,7 +4139,8 @@ class SaklasSession:
             probes=list(self._monitor.probe_names),
         )
         recipe = recipe._fill_probe_hashes(self)
-        return self.tree.begin_assistant(user_node_id, recipe=recipe)
+        return self.tree.begin_assistant(
+            user_node_id, recipe=recipe, role_label=assistant_role)
 
     def _run_generation_loop(
         self,
@@ -4385,6 +4422,10 @@ class SaklasSession:
             input_ids, use_thinking, prompt_tokens = self._generation_preamble(
                 input, raw, use_thinking_req, stateless=stateless,
                 parent_node_id=chat_history_anchor,
+                user_role=sampling.user_role if sampling is not None else None,
+                assistant_role=(
+                    sampling.assistant_role if sampling is not None else None
+                ),
             )
             # Refresh snapshot now that steering is pushed (first-scope case).
             vector_snapshot = self._snapshot_steering_alphas()

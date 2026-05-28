@@ -139,6 +139,28 @@ export async function patchSessionDefaults(
   _hydrateSamplingFromInfo();
 }
 
+/** Display label for a turn, honoring its per-message role-substitution
+ *  label (the roleplay scaffold stamped at send time).  ``roleLabel`` —
+ *  the node's ``role_label`` — wins when set; otherwise the structural
+ *  ``role`` (user / assistant / system) is shown verbatim. */
+export function roleDisplayLabel(
+  role: string,
+  roleLabel?: string | null,
+): string {
+  return roleLabel || role;
+}
+
+/** Single-character glyph for the loom node badge — first char of the
+ *  display label, uppercased.  Default roles reduce to ``U`` / ``A`` / ``S``;
+ *  a per-turn ``captain`` label yields ``C``. */
+export function roleGlyphLetter(
+  role: string,
+  roleLabel?: string | null,
+): string {
+  const label = roleDisplayLabel(role, roleLabel);
+  return (label.charAt(0) || role.charAt(0) || "?").toUpperCase();
+}
+
 /** "Clear chat" — preserves the loom tree and just navigates back to the
  *  synthetic system root.  The next submission lands a fresh user turn
  *  as a sibling branch off root rather than the legacy behaviour of
@@ -1041,6 +1063,7 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
   const turn: ChatTurn = {
     role: n.role,
     text: n.text ?? "",
+    roleLabel: n.role_label ?? null,
     nodeId: n.id,
     appliedSteering: n.applied_steering ?? null,
     aggregateReadings: n.aggregate_readings ?? undefined,
@@ -1546,6 +1569,12 @@ export interface SamplingState {
    *  "show alts" toggle in ``SamplingStrip``; the canonical "on" value
    *  is ``8`` per Decision 1 of ``docs/plans/logit-pass.md``. */
   return_top_k: number;
+  /** Per-message role-substitution labels (roleplay scaffold).  Sticky
+   *  client state like ``seed`` — whatever's in the boxes rides the next
+   *  send and is stamped onto that turn's loom node (immutable afterward).
+   *  Empty string = standard role label (nothing sent). */
+  user_role: string;
+  assistant_role: string;
 }
 
 export const samplingState: SamplingState = $state({
@@ -1559,6 +1588,8 @@ export const samplingState: SamplingState = $state({
   logit_bias_text: "",
   presence_penalty: 0,
   frequency_penalty: 0,
+  user_role: "",
+  assistant_role: "",
   // Initial thinking state: explicit ``false`` so an unchecked checkbox
   // on first paint actually sends ``thinking: false`` to the server.
   // The previous ``null`` (auto) state silently fell through to whatever
@@ -1679,6 +1710,14 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
       : {}),
     ...(samplingState.return_top_k > 0
       ? { return_top_k: samplingState.return_top_k }
+      : {}),
+    // Per-message role labels (roleplay scaffold) ride every send like
+    // ``seed`` — trimmed, empty = standard role (omitted).
+    ...(samplingState.user_role.trim()
+      ? { user_role: samplingState.user_role.trim() }
+      : {}),
+    ...(samplingState.assistant_role.trim()
+      ? { assistant_role: samplingState.assistant_role.trim() }
       : {}),
   };
 }
@@ -2683,11 +2722,17 @@ async function sendCommitNow(
   raw: boolean = false,
 ): Promise<void> {
   const sock = await ensureWebSocket();
+  // Per-message role labels ride the commit too (roleplay scaffold), so an
+  // authored turn is stamped with the box value just like a generated one.
+  // Raw / flat commits carry no chat-template role — the server suppresses
+  // labels there regardless, but we still omit them for clarity.
+  const commitSampling = raw ? null : buildSamplingPayload();
   const payload: WSClientMessage = {
     type: "generate",
     commit_role: role,
     commit_text: text,
     parent_node_id: parentNodeId,
+    ...(commitSampling ? { sampling: commitSampling } : {}),
     // ``raw`` lifts the user-under-user guard server-side — a flat
     // (base-model) commit's authored span may hang under any role.
     raw,

@@ -7,7 +7,7 @@ import logging
 import threading
 import warnings
 from enum import IntEnum
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 
@@ -511,62 +511,69 @@ class _PenaltyState:
 # cheaply to tuples so the per-lookup hash cost is negligible.
 _CHAT_INPUT_CACHE_MAX = 128
 _chat_input_cache: dict[
-    tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool, str | None],
+    tuple[
+        int, str | None, tuple[tuple[str, str, str | None], ...], bool, bool,
+        str | None,
+    ],
     torch.Tensor,
 ] = {}
 
 
 def _chat_input_cache_key(
     tokenizer,
-    chat: list[dict[str, str]],
+    chat: list[dict[str, Any]],
     system_prompt: str | None,
     thinking: bool,
     add_generation_prompt: bool,
-    role: str | None = None,
-) -> tuple[int, str | None, tuple[tuple[str, str], ...], bool, bool, str | None]:
+    gen_role: str | None = None,
+) -> tuple[
+    int, str | None, tuple[tuple[str, str, str | None], ...], bool, bool, str | None
+]:
     return (
         id(tokenizer),
         system_prompt,
-        tuple((m["role"], m["content"]) for m in chat),
+        tuple((m["role"], m["content"], m.get("label")) for m in chat),
         thinking,
         add_generation_prompt,
-        role,
+        gen_role,
     )
 
 
 def build_chat_input(
     tokenizer,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     system_prompt: str | None = None,
     thinking: bool = False,
     *,
     add_generation_prompt: bool = True,
-    role: str | None = None,
+    gen_role: str | None = None,
     model_type: str | None = None,
 ) -> torch.Tensor:
     """Render a chat history to ``input_ids``.
 
-    ``role`` (optional): substitute a custom assistant-role label into the
-    rendered chat template via
-    :func:`saklas.core.role_templates.apply_with_role`.  ``role=None`` (the
-    default) is a zero-overhead pass-through to
-    ``tokenizer.apply_chat_template``.  When ``role`` is set,
-    ``model_type`` is required so the family's role-header registry entry
-    can be looked up; pass ``model.config.model_type``.
+    Per-turn role substitution (the roleplay scaffold): each message may
+    carry a ``"label"`` key — a custom role label for *that* turn — and
+    ``gen_role`` is the label for the generation-prompt assistant header
+    (the turn about to be generated).  When no message carries a label and
+    ``gen_role`` is ``None`` (the common case) this is a zero-overhead
+    pass-through to ``tokenizer.apply_chat_template``.  When any label is
+    present, ``model_type`` is required so the family's role-header registry
+    entry can be looked up; pass ``model.config.model_type``.
     """
-    chat = []
+    chat: list[dict[str, Any]] = []
     if system_prompt:
         chat.append({"role": "system", "content": system_prompt})
     chat.extend(messages)
+    has_labels = gen_role is not None or any(m.get("label") for m in chat)
     if getattr(tokenizer, "chat_template", None) is not None:
         # Cache lookup: see _chat_input_cache docstring for invalidation
         # semantics.  Only the chat-template branch is cached — the
         # base-model fallback is sub-ms and not worth complicating.
-        # ``role`` participates in the key so role-tagged renders never
-        # collide with plain renders of the same chat.
+        # Per-turn labels + ``gen_role`` participate in the key so role-
+        # tagged renders never collide with plain renders of the same chat.
         key = _chat_input_cache_key(
             tokenizer, chat, system_prompt, thinking,
-            add_generation_prompt, role,
+            add_generation_prompt, gen_role,
         )
         cached = _chat_input_cache.get(key)
         if cached is not None:
@@ -576,22 +583,25 @@ def build_chat_input(
         kwargs: dict = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = thinking
-        if role is None:
+        if not has_labels:
+            # Strip any (None-valued) label keys so apply_chat_template sees
+            # the canonical message shape.
+            clean = [{"role": m["role"], "content": m.get("content", "")} for m in chat]
             result = tokenizer.apply_chat_template(
-                chat, add_generation_prompt=add_generation_prompt,
+                clean, add_generation_prompt=add_generation_prompt,
                 return_tensors="pt", **kwargs,
             )
         else:
             if model_type is None:
                 raise ValueError(
-                    "build_chat_input: role= requires model_type= "
-                    "(model.config.model_type) so the family's role-header "
-                    "registry entry can be looked up"
+                    "build_chat_input: per-turn role labels / gen_role= require "
+                    "model_type= (model.config.model_type) so the family's "
+                    "role-header registry entry can be looked up"
                 )
-            from saklas.core.role_templates import apply_with_role
-            result = apply_with_role(
+            from saklas.core.role_templates import apply_with_per_turn_roles
+            result = apply_with_per_turn_roles(
                 tokenizer, chat,
-                role=role, model_type=model_type,
+                gen_role=gen_role, model_type=model_type,
                 add_generation_prompt=add_generation_prompt,
                 tokenize=True, return_tensors="pt",
                 **kwargs,

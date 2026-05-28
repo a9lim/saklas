@@ -54,6 +54,7 @@
     effectiveRawMode,
     genUiMode,
     setGenUiMode,
+    roleDisplayLabel,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
@@ -968,7 +969,7 @@
                 {@render bubble(turn.abPair, turnIdx, true)}
               {:else}
                 <div class="msg assistant placeholder" aria-hidden="true">
-                  <span class="role">assistant (alt)</span>
+                  <span class="role">{roleDisplayLabel("assistant")} (alt)</span>
                   <span class="placeholder-text">— pending —</span>
                 </div>
               {/if}
@@ -1032,7 +1033,7 @@
     class:shadow={isShadow}
   >
     <span class="role">
-      {#if turn.role === "user"}user{:else if turn.role === "system"}system{:else}assistant{#if isShadow} (unsteered){/if}{/if}
+      {roleDisplayLabel(turn.role, turn.roleLabel)}{#if isShadow} (unsteered){/if}
     </span>
 
     {#if turn.role === "assistant"}

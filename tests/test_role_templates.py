@@ -24,10 +24,12 @@ from saklas.core.errors import SaklasError
 from saklas.core.role_templates import (
     InvalidRoleError,
     ROLE_HEADERS,
+    USER_ROLE_HEADERS,
     RoleHeader,
     RoleSubstitutionUnsupportedError,
     RoleTemplateDriftError,
     apply_with_role,
+    apply_with_per_turn_roles,
 )
 
 
@@ -662,47 +664,63 @@ def test_role_header_is_frozen():
 
 
 # ---------------------------------------------------------------------------
-# build_chat_input role plumbing (role-extraction Phase 7)
+# build_chat_input per-turn role plumbing
 # ---------------------------------------------------------------------------
 
 
-def test_build_chat_input_with_role():
-    """``build_chat_input(role=...)`` routes through ``apply_with_role``
-    so the rendered prompt opens with the substituted role label.
+def test_build_chat_input_with_gen_role():
+    """``build_chat_input(gen_role=...)`` routes through the per-turn render
+    so the generation prompt opens with the substituted assistant label.
     """
     from saklas.core.generation import build_chat_input
 
     tok = _qwen_tok()
-    # Patch chat_template so build_chat_input takes the templated branch.
     tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
 
     messages = [{"role": "user", "content": "hello"}]
     input_ids = build_chat_input(
         tok, messages, system_prompt="be brief.",
-        role="pirate", model_type="qwen3",
+        gen_role="pirate", model_type="qwen3",
     )
-    # build_chat_input returns a torch.Tensor; the FakeTokenizer's
-    # token id assignment is deterministic across pos.  Round-trip the
-    # ids back through the FakeTokenizer's text-side to confirm the
-    # substituted header bytes landed in the tokenized output.
-    rendered = apply_with_role(
+    rendered = apply_with_per_turn_roles(
         tok, [{"role": "system", "content": "be brief."}] + messages,
-        role="pirate", model_type="qwen3",
+        gen_role="pirate", model_type="qwen3",
         tokenize=False,
     )
-    # The pirate marker is in the rendered string; the standard
-    # assistant marker no longer appears for the generation prompt.
     assert "<|im_start|>pirate\n" in rendered
     assert "<|im_start|>assistant\n" not in rendered
-    # The tokens build_chat_input emitted are non-empty and match what
-    # the role-substituted render tokenizes to.
     expected_ids = tok._tokenize(rendered, return_tensors="pt")
     import torch
     assert torch.equal(input_ids, expected_ids)
 
 
-def test_build_chat_input_role_none_unchanged():
-    """``build_chat_input(role=None)`` is byte-identical to the prior path."""
+def test_build_chat_input_with_per_turn_labels():
+    """Per-message ``label`` keys drive a faithful per-turn render."""
+    from saklas.core.generation import build_chat_input
+
+    tok = _qwen_tok()
+    tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
+
+    messages = [
+        {"role": "user", "content": "hi", "label": "captain"},
+        {"role": "assistant", "content": "arr", "label": "pirate"},
+        {"role": "user", "content": "more", "label": None},
+    ]
+    rendered = apply_with_per_turn_roles(
+        tok, messages, gen_role="oracle", model_type="qwen3",
+        tokenize=False,
+    )
+    assert "<|im_start|>captain\n" in rendered   # labeled user turn
+    assert "<|im_start|>pirate\n" in rendered    # labeled assistant turn
+    assert "<|im_start|>user\n" in rendered      # unlabeled user turn stays
+    assert "<|im_start|>oracle\n" in rendered    # generation prompt
+    # build_chat_input takes the per-turn path when labels are present.
+    ids = build_chat_input(tok, messages, gen_role="oracle", model_type="qwen3")
+    assert ids.shape[1] > 0
+
+
+def test_build_chat_input_no_labels_unchanged():
+    """No labels + ``gen_role=None`` is byte-identical to the plain path."""
     from saklas.core.generation import build_chat_input
 
     tok = _qwen_tok()
@@ -710,15 +728,15 @@ def test_build_chat_input_role_none_unchanged():
 
     messages = [{"role": "user", "content": "hello"}]
     direct = build_chat_input(tok, messages, system_prompt="be brief.")
-    via_role_none = build_chat_input(
-        tok, messages, system_prompt="be brief.", role=None,
+    via_none = build_chat_input(
+        tok, messages, system_prompt="be brief.", gen_role=None,
     )
     import torch
-    assert torch.equal(direct, via_role_none)
+    assert torch.equal(direct, via_none)
 
 
-def test_build_chat_input_role_requires_model_type():
-    """Setting role= without model_type= raises — the family lookup is
+def test_build_chat_input_gen_role_requires_model_type():
+    """``gen_role=`` without ``model_type=`` raises — the family lookup is
     required to find the right role-header bytes to splice.
     """
     from saklas.core.generation import build_chat_input
@@ -729,5 +747,236 @@ def test_build_chat_input_role_requires_model_type():
     with pytest.raises(ValueError, match="model_type"):
         build_chat_input(
             tok, [{"role": "user", "content": "hi"}],
-            role="pirate",
+            gen_role="pirate",
         )
+
+
+# ---------------------------------------------------------------------------
+# User-role splice (both-sides relabeling)
+# ---------------------------------------------------------------------------
+
+
+# gpt-oss's real Harmony format renders user turns with ``<|message|>`` (not
+# the assistant ``<|channel|>``) — verified against ``openai/gpt-oss-20b``.
+# The simplified GPT_OSS_TEMPLATE above collapses both to ``<|channel|>``, so
+# the user-side splice needs a Harmony-accurate template to exercise the
+# real ``<|start|>user<|message|>`` byte sequence.
+GPT_OSS_HARMONY_TEMPLATE = (
+    "{% for m in messages %}"
+    "{% if m['role'] == 'assistant' %}"
+    "<|start|>assistant<|channel|>final<|message|>{{ m['content'] }}<|end|>"
+    "{% else %}"
+    "<|start|>{{ m['role'] }}<|message|>{{ m['content'] }}<|end|>"
+    "{% endif %}"
+    "{% endfor %}"
+    # Real Harmony emits a *bare* ``<|start|>assistant`` generation prompt
+    # (no ``<|channel|>``), distinct from a completed assistant turn — so a
+    # gen-prompt assistant relabel can't land there.
+    "{% if add_generation_prompt %}<|start|>assistant{% endif %}"
+)
+
+
+@pytest.mark.parametrize(
+    "tok_factory,model_type,expected",
+    [
+        (_qwen_tok, "qwen3", "<|im_start|>captain\n"),
+        (_gemma_tok, "gemma3", "<start_of_turn>captain\n"),
+        (_gemma4_tok, "gemma4", "<|turn>captain\n"),
+        (_llama_tok, "llama", "<|start_header_id|>captain<|end_header_id|>"),
+        (_glm_tok, "glm", "<|captain|>"),
+        (
+            lambda: FakeTokenizer(GPT_OSS_HARMONY_TEMPLATE),
+            "gpt_oss",
+            "<|start|>captain<|message|>",
+        ),
+    ],
+)
+def test_apply_with_user_role_per_family(tok_factory, model_type, expected):
+    """user_role relabels the user turn for every supported family."""
+    tok = tok_factory()
+    out = apply_with_role(
+        tok,
+        _sample_messages(),
+        role=None,
+        user_role="captain",
+        model_type=model_type,
+        tokenize=False,
+    )
+    assert expected in out
+
+
+def test_apply_with_user_role_leaves_assistant_alone():
+    """user_role swaps only the user header; the assistant generation
+    prompt keeps its standard label when role is None."""
+    tok = _qwen_tok()
+    out = apply_with_role(
+        tok,
+        _sample_messages(),
+        role=None,
+        user_role="captain",
+        model_type="qwen3",
+        tokenize=False,
+    )
+    assert "<|im_start|>captain\n" in out
+    assert "<|im_start|>user\n" not in out
+    # Assistant generation prompt untouched.
+    assert "<|im_start|>assistant\n" in out
+
+
+def test_apply_with_both_roles_at_once():
+    """role + user_role swap both headers independently."""
+    tok = _qwen_tok()
+    out = apply_with_role(
+        tok,
+        _sample_messages(),
+        role="oracle",
+        user_role="captain",
+        model_type="qwen3",
+        tokenize=False,
+    )
+    assert "<|im_start|>captain\n" in out          # user turn
+    assert "<|im_start|>oracle\n" in out           # generation prompt
+    assert "<|im_start|>user\n" not in out
+    assert "<|im_start|>assistant\n" not in out
+
+
+def test_apply_with_user_role_lenient_when_no_user_turn():
+    """A missing user header is a no-op, not a drift error — user turns
+    are data-dependent (here: a system-only history)."""
+    tok = _qwen_tok()
+    messages = [{"role": "system", "content": "be brief."}]
+    out = apply_with_role(
+        tok,
+        messages,
+        role=None,
+        user_role="captain",
+        model_type="qwen3",
+        tokenize=False,
+    )
+    # No user turn rendered → captain never appears, and nothing raised.
+    assert "captain" not in out
+    assert "<|im_start|>system\n" in out
+
+
+def test_apply_with_user_role_unsupported_family_raises():
+    """user_role on a label-free family raises, like the assistant side."""
+    tok = _mistral_tok()
+    with pytest.raises(RoleSubstitutionUnsupportedError):
+        apply_with_role(
+            tok,
+            _sample_messages(),
+            role=None,
+            user_role="captain",
+            model_type="mistral3",
+            tokenize=False,
+        )
+
+
+def test_apply_with_user_role_invalid_slug_raises():
+    """user_role slug validation matches the assistant side."""
+    tok = _qwen_tok()
+    with pytest.raises(InvalidRoleError):
+        apply_with_role(
+            tok,
+            _sample_messages(),
+            role=None,
+            user_role="Captain Ahab",
+            model_type="qwen3",
+            tokenize=False,
+        )
+
+
+def test_user_role_registry_covers_tested_archs():
+    """Every ``_TESTED_ARCHS`` member has a USER_ROLE_HEADERS entry
+    (RoleHeader or explicit None), mirroring the assistant registry."""
+    from saklas.core.model import _TESTED_ARCHS
+
+    for arch in _TESTED_ARCHS:
+        if arch in USER_ROLE_HEADERS:
+            continue
+        for suffix in ("_text", "_moe"):
+            if arch.endswith(suffix) and arch[: -len(suffix)] in USER_ROLE_HEADERS:
+                break
+        else:
+            raise AssertionError(
+                f"_TESTED_ARCHS member {arch!r} has no USER_ROLE_HEADERS entry"
+            )
+
+
+def test_user_role_registry_opt_outs_match_assistant():
+    """The label-free families opt out of *both* sides."""
+    for mt in ("mistral3", "ministral3", "talkie"):
+        assert ROLE_HEADERS[mt] is None
+        assert USER_ROLE_HEADERS[mt] is None
+
+
+def test_build_chat_input_user_label_distinct_from_plain():
+    """A per-turn user label produces a distinct render from the plain one
+    (cache key keeps them separate)."""
+    import torch
+
+    from saklas.core.generation import build_chat_input
+
+    tok = _qwen_tok()
+    tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
+
+    plain = build_chat_input(tok, [{"role": "user", "content": "hello"}])
+    with_user = build_chat_input(
+        tok, [{"role": "user", "content": "hello", "label": "captain"}],
+        model_type="qwen3",
+    )
+    assert not (
+        plain.shape == with_user.shape and torch.equal(plain, with_user)
+    )
+
+
+def test_apply_with_per_turn_no_labels_is_passthrough():
+    """No labels + no gen_role → byte-identical to apply_chat_template."""
+    tok = _qwen_tok()
+    messages = _sample_messages()
+    direct = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    via = apply_with_per_turn_roles(
+        tok, messages, gen_role=None, model_type="qwen3", tokenize=False)
+    assert via == direct
+
+
+def test_apply_with_per_turn_user_label_unsupported_family_raises():
+    """A user label on a label-free family raises."""
+    tok = _mistral_tok()
+    with pytest.raises(RoleSubstitutionUnsupportedError):
+        apply_with_per_turn_roles(
+            tok,
+            [{"role": "user", "content": "hi", "label": "captain"}],
+            gen_role=None, model_type="mistral3", tokenize=False,
+        )
+
+
+def test_apply_with_per_turn_gpt_oss_gen_role_graceful():
+    """gpt-oss's bare generation prompt has no <|channel|>, so gen_role
+    no-ops there while history labels still land (graceful degradation)."""
+    tok = FakeTokenizer(GPT_OSS_HARMONY_TEMPLATE)
+    msgs = [
+        {"role": "user", "content": "hi", "label": "captain"},
+        {"role": "assistant", "content": "yo", "label": "pirate"},
+        {"role": "user", "content": "more", "label": None},
+    ]
+    out = apply_with_per_turn_roles(
+        tok, msgs, gen_role="oracle", model_type="gpt_oss", tokenize=False)
+    assert "<|start|>captain<|message|>" in out   # user label lands
+    assert "<|start|>pirate<|channel|>" in out    # history assistant lands
+    assert "oracle" not in out                    # gen prompt no-ops
+
+
+def test_apply_with_per_turn_ordering():
+    """Two same-role turns get their own labels in render order."""
+    tok = _qwen_tok()
+    msgs = [
+        {"role": "user", "content": "a", "label": "alice"},
+        {"role": "assistant", "content": "x", "label": "bot"},
+        {"role": "user", "content": "b", "label": "bob"},
+    ]
+    out = apply_with_per_turn_roles(
+        tok, msgs, gen_role=None, model_type="qwen3", tokenize=False)
+    # alice precedes bob in the rendered string.
+    assert out.index("<|im_start|>alice\n") < out.index("<|im_start|>bob\n")

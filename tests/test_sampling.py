@@ -83,3 +83,21 @@ def test_sampling_config_return_hidden_merged_with_default_does_not_override():
     base = SamplingConfig(return_hidden=True)
     merged = base.merged_with(SamplingConfig())  # other is all-defaults
     assert merged.return_hidden is True  # other.return_hidden=False is the default; must not override
+
+
+def test_role_fields_default_none():
+    sc = SamplingConfig()
+    assert sc.user_role is None
+    assert sc.assistant_role is None
+
+
+def test_role_fields_set_and_merge():
+    sc = SamplingConfig(user_role="captain", assistant_role="pirate")
+    assert sc.user_role == "captain"
+    assert sc.assistant_role == "pirate"
+    # other's non-default role wins; unset role falls through to base.
+    merged = SamplingConfig(user_role="captain").merged_with(
+        SamplingConfig(assistant_role="ninja")
+    )
+    assert merged.user_role == "captain"
+    assert merged.assistant_role == "ninja"

@@ -7,6 +7,7 @@
   // doesn't need a structural rewrite when phase 5 lands.
 
   import type { LoomNodeJSON } from "../../lib/types";
+  import { roleGlyphLetter } from "../../lib/stores.svelte";
 
   interface Props {
     node: LoomNodeJSON;
@@ -49,10 +50,10 @@
 
   const PREVIEW_CHARS = 40;
 
-  function roleGlyph(role: LoomNodeJSON["role"]): string {
-    if (role === "user") return "u";
-    if (role === "assistant") return "a";
-    return "s";
+  // Glyph honors the node's per-turn role label (e.g. ``captain`` → ``C``);
+  // default roles reduce to ``U`` / ``A`` / ``S``.
+  function roleGlyph(node: LoomNodeJSON): string {
+    return roleGlyphLetter(node.role, node.role_label);
   }
 
   const preview = $derived.by(() => {
@@ -92,7 +93,7 @@
     }
   }}
 >
-  <span class="glyph" aria-hidden="true">{roleGlyph(node.role)}</span>
+  <span class="glyph" aria-hidden="true">{roleGlyph(node)}</span>
   {#if ringColor}
     <span class="ring" style="border-color: {ringColor}" aria-hidden="true"></span>
   {/if}
