@@ -405,11 +405,6 @@ export interface ExtractResponse {
   progress: string[];
 }
 
-export interface LoadVectorRequest {
-  name: string;
-  source_path: string;
-}
-
 /** Body for POST /sessions/{id}/vectors/merge — registered output is a
  * derived profile keyed by ``name``. */
 export interface MergeVectorRequest {
@@ -1295,7 +1290,6 @@ export interface PendingAction {
 // ----------------------------------------------------- drawers --
 
 export type DrawerName =
-  | "load"
   /** Unified vector management drawer (replaces the legacy
    *  ``vector_picker`` + ``probe_picker`` pair).  Two sections split
    *  on the server-supplied ``has_tensor`` flag: extracted rows get

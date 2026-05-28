@@ -8,7 +8,6 @@
 // Names match the DrawerName union in lib/types.ts (modulo the trivial
 // snake_case → PascalCase mapping):
 //
-//   "load"               → Load
 //   "save_conversation"  → SaveConversation
 //   "load_conversation"  → LoadConversation
 //   "compare"            → Compare
@@ -21,7 +20,6 @@
 // add" buttons open this; the ``ExtractDrawer`` is reached from a
 // "+ custom vector" launcher inside it.
 
-export { default as Load } from "./LoadDrawer.svelte";
 export { default as Vectors } from "./VectorsDrawer.svelte";
 export { default as Extract } from "./ExtractDrawer.svelte";
 export { default as Manifolds } from "./ManifoldDrawer.svelte";

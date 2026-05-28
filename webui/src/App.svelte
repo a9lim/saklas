@@ -40,7 +40,6 @@
     "extract",
     "manifolds",
     "manifold_builder",
-    "load",
     "merge",
     "clone",
     "system_prompt",
@@ -209,9 +208,7 @@
           class:narrow={NARROW_DRAWERS.has(drawerState.open)}
           aria-label="{drawerState.open} drawer"
         >
-          {#if drawerState.open === "load"}
-            <Drawers.Load params={drawerState.params} />
-          {:else if drawerState.open === "vectors"}
+          {#if drawerState.open === "vectors"}
             <Drawers.Vectors params={drawerState.params} />
           {:else if drawerState.open === "extract"}
             <Drawers.Extract params={drawerState.params} />

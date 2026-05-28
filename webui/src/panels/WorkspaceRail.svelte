@@ -30,8 +30,13 @@
       key: "vectors",
       label: "Steering & vectors",
       icon: "M5 19L19 5M19 5h-7M19 5v7",
+      // Shared op vocabulary with the manifolds category — build /
+      // merge / packs sit in the same slots and the same label format
+      // so the two steering surfaces read as one family.  ``clone`` is a
+      // vector-only extra (no manifold counterpart by design); it tucks
+      // in after merge.
       tools: [
-        { label: "load vector…", drawer: "load" },
+        { label: "build vector…", drawer: "extract" },
         { label: "merge vector…", drawer: "merge" },
         { label: "clone vector…", drawer: "clone" },
         { label: "packs…", drawer: "pack" },
@@ -46,6 +51,9 @@
       // Undulating spline curve — reads as "manifold" and is visually
       // distinct from vectors' arrow and analysis' line graph.
       icon: "M3 17c4-8 6-8 9-4s2 8 9 0",
+      // build / merge / packs mirror the vectors category's shared
+      // slots one-for-one.  No clone counterpart — corpus generation is
+      // folded into the manifold builder's discover tab.
       tools: [
         { label: "build manifold…", drawer: "manifold_builder" },
         { label: "merge manifolds…", drawer: "manifold_merge" },

@@ -138,12 +138,12 @@
 </script>
 
 <div class="drawer-shell">
-  <header class="head">
-    <h2>manifold packs</h2>
+  <header class="header">
+    <span class="title">manifold packs</span>
     <button
       type="button"
       class="close"
-      aria-label="Close drawer"
+      aria-label="Close"
       onclick={closeDrawer}
     >✕</button>
   </header>
@@ -281,18 +281,15 @@
     font-family: var(--font-mono);
     font-size: var(--text);
   }
-  .head {
+  .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: var(--space-4) var(--space-5);
     border-bottom: 1px solid var(--border);
   }
-  .head h2 {
-    margin: 0;
+  .title {
     color: var(--accent);
-    font-size: var(--text);
-    font-weight: var(--weight-medium);
     letter-spacing: 0;
   }
   .close {

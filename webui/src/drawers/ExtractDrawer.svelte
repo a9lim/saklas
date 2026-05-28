@@ -288,9 +288,9 @@
   }
 </script>
 
-<section class="drawer-shell" aria-label="Extract vector">
+<section class="drawer-shell" aria-label="Build vector">
   <header class="header">
-    <span class="title">extract vector</span>
+    <span class="title">build vector</span>
     <button type="button" class="close" aria-label="Close" onclick={cancel}
       >✕</button>
   </header>

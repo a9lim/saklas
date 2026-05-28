@@ -26,7 +26,6 @@ import type {
   InstallPackResponse,
   JointLogprobRowJSON,
   JointLogprobsJSON,
-  LoadVectorRequest,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
@@ -79,7 +78,6 @@ export type {
   InstallPackResponse,
   JointLogprobRowJSON,
   JointLogprobsJSON,
-  LoadVectorRequest,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
@@ -295,9 +293,6 @@ export const apiVectors = {
   },
   get(name: string, id: string = SESSION): Promise<VectorInfo> {
     return request(`${SESSION_BASE(id)}/vectors/${encodeURIComponent(name)}`);
-  },
-  load(req: LoadVectorRequest, id: string = SESSION): Promise<VectorInfo> {
-    return request(`${SESSION_BASE(id)}/vectors`, jsonBody(req));
   },
   delete(name: string, id: string = SESSION): Promise<void> {
     return request<void>(

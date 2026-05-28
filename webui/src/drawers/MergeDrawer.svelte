@@ -166,12 +166,12 @@
 </script>
 
 <div class="drawer-shell">
-  <header class="head">
-    <h2>merge vectors</h2>
+  <header class="header">
+    <span class="title">merge vectors</span>
     <button
       type="button"
       class="close"
-      aria-label="Close drawer"
+      aria-label="Close"
       onclick={closeDrawer}>✕</button
     >
   </header>
@@ -293,19 +293,16 @@
     font-family: var(--font-mono);
     font-size: var(--text);
   }
-  .head {
+  .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: var(--space-4) var(--space-5);
     border-bottom: 1px solid var(--border);
   }
-  .head h2 {
-    margin: 0;
-    font-size: var(--text);
+  .title {
     color: var(--accent);
     letter-spacing: 0;
-    text-transform: lowercase;
   }
   .close {
     background: transparent;

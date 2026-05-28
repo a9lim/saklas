@@ -178,22 +178,22 @@
           </ul>
         </fieldset>
 
-        <label class="row-label">
-          <span>target name</span>
+        <label class="field">
+          <span class="label">target name</span>
           <input
             type="text"
-            class="text-input"
             placeholder="combined"
             aria-label="merged manifold name (under local/)"
             bind:value={targetName}
             disabled={merging}
+            autocomplete="off"
+            spellcheck="false"
           />
         </label>
 
-        <label class="row-label">
-          <span>fit mode</span>
+        <label class="field">
+          <span class="label">fit mode</span>
           <select
-            class="text-input"
             aria-label="merged manifold fit mode"
             bind:value={fitMode}
             disabled={merging || selected.size === 0}
@@ -212,10 +212,12 @@
           </p>
         {/if}
 
-        <div class="actions">
+        <footer class="foot">
+          <button type="button" class="secondary" onclick={closeDrawer}
+            >cancel</button>
           <button
             type="submit"
-            class="act submit"
+            class="primary"
             disabled={!canSubmit}
             title={selected.size < 2
               ? "pick >= 2 sources"
@@ -223,11 +225,13 @@
                 ? "target name required"
                 : "merge into a fresh discover folder"}
           >
-            {merging
-              ? "merging…"
-              : `merge ${selected.size} → local/${targetName.trim() || "…"}`}
+            {#if merging}
+              <span class="spinner" aria-hidden="true"></span> merging…
+            {:else}
+              merge {selected.size} → local/{targetName.trim() || "…"}
+            {/if}
           </button>
-        </div>
+        </footer>
       </form>
     {/if}
   </div>
@@ -295,6 +299,8 @@
     font-weight: var(--weight-medium);
   }
   .form {
+    flex: 1 1 auto;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
@@ -345,62 +351,99 @@
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
-  .row-label {
+  /* Stacked form fields — label above control, matching MergeDrawer so
+   * the two merge surfaces share one field idiom. */
+  .field {
     display: flex;
-    align-items: center;
-    gap: var(--space-3);
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .label {
+    color: var(--fg-dim);
     font-size: var(--text-sm);
-    color: var(--fg-muted);
+    text-transform: lowercase;
+    letter-spacing: 0;
+    padding: 0;
   }
-  .row-label > span {
-    flex: 0 0 6em;
-  }
-  .text-input {
-    flex: 1 1 0;
-    min-width: 0;
+  input[type="text"],
+  select {
     background: var(--bg-deep);
     color: var(--fg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: var(--space-2) var(--space-3);
-    font: inherit;
+    padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
-    font-size: var(--text-sm);
+    font-size: var(--text);
+    box-sizing: border-box;
+    width: 100%;
   }
-  .text-input:focus-visible {
+  input[type="text"]:focus,
+  select:focus {
     outline: 1px solid var(--accent-purple);
-    outline-offset: -1px;
+    border-color: var(--accent-purple);
   }
   .warn {
     margin: 0;
     color: var(--accent-yellow);
     font-size: var(--text-xs);
   }
-  .actions {
+
+  /* Footer mirrors MergeDrawer: cancel (secondary) + primary submit
+   * pinned to the bottom.  Only the primary accent goes purple. */
+  .foot {
+    border-top: 1px solid var(--border);
+    padding-top: var(--space-4);
+    margin-top: auto;
     display: flex;
     justify-content: flex-end;
+    gap: var(--space-3);
   }
-  .act {
-    background: transparent;
-    color: var(--accent-purple);
-    border: 1px solid var(--border);
+  .primary {
+    background: var(--accent-purple);
+    color: var(--text-on-accent);
+    border: 1px solid var(--accent-purple);
+    padding: var(--space-2) var(--space-5);
     border-radius: var(--radius);
-    padding: var(--space-3) var(--space-4);
-    font: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     cursor: pointer;
-    transition:
-      background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
-      color var(--dur) var(--ease-out);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-3);
   }
-  .act:hover:not(:disabled) {
-    background: rgba(167, 139, 250, 0.12);
-    border-color: var(--accent-purple);
+  .primary:hover:not(:disabled) {
+    filter: brightness(1.1);
   }
-  .act:disabled {
+  .primary:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+  }
+  .secondary {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+  .secondary:hover {
+    border-color: var(--fg);
+    color: var(--fg);
+  }
+  .spinner {
+    width: 0.7em;
+    height: 0.7em;
+    border-radius: 50%;
+    border: 1px solid var(--bg-deep);
+    border-right-color: transparent;
+    animation: spin 0.7s linear infinite;
+    display: inline-block;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>

@@ -363,7 +363,7 @@
 
     <button type="button" class="custom-btn" onclick={gotoCustom}>
       <span class="plus" aria-hidden="true">+</span>
-      <span class="custom-label">custom vector</span>
+      <span class="custom-label">build vector</span>
       <span class="custom-hint">extract a concept the catalog doesn't carry</span>
     </button>
 
