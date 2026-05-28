@@ -18,10 +18,14 @@
   import { ApiError, apiManifolds, apiManifoldFitStream } from "../lib/api";
   import {
     addManifoldToRack,
+    attachManifoldProbe,
     closeDrawer,
+    detachManifoldProbe,
+    manifoldProbeRack,
     manifoldRack,
     openDrawer,
     refreshManifoldList,
+    refreshManifoldProbeList,
   } from "../lib/stores.svelte";
   import {
     dismissToast,
@@ -31,8 +35,23 @@
   import type { ManifoldInfo } from "../lib/types";
   import DiagnosticsPanel from "../lib/manifolds/DiagnosticsPanel.svelte";
 
-  let { params: _params }: { params?: unknown } = $props();
-  $effect(() => { void _params; });
+  // ``mode`` selects the visual emphasis: ``"steer"`` (default —
+  // matches the original drawer behaviour) or ``"probe"`` (opened from
+  // ProbeRack's "+ add manifold probe"; lands the user on the probe
+  // attach action and the inline custom-probe form).  ``params`` is
+  // typed as ``unknown`` so it round-trips through ``drawerState.params``
+  // (also typed loosely so each drawer owns its own shape); the mode
+  // derivation pulls the field defensively.
+  let { params }: { params?: unknown } = $props();
+  const mode = $derived.by<"steer" | "probe">(() => {
+    if (
+      params && typeof params === "object"
+      && (params as { mode?: unknown }).mode === "probe"
+    ) {
+      return "probe";
+    }
+    return "steer";
+  });
 
   let errorMsg: string | null = $state(null);
 
@@ -53,6 +72,10 @@
 
   onMount(() => {
     void refreshManifoldList();
+    // Pull the attached-probe list too — the +probe / detach-button
+    // affordance is keyed on whether a fitted manifold is already
+    // attached, so the drawer needs this fresh on mount.
+    void refreshManifoldProbeList();
     return () => {
       for (const t of confirmTimers.values()) window.clearTimeout(t);
       confirmTimers.clear();
@@ -86,10 +109,89 @@
       manifoldRack.entries.has(m.name);
   }
 
+  function isProbed(m: ManifoldInfo): boolean {
+    return manifoldProbeRack.entries.has(rowKey(m)) ||
+      manifoldProbeRack.entries.has(m.name);
+  }
+
   function onSteer(m: ManifoldInfo): void {
     if (isRacked(m)) return;
     addManifoldToRack(rowKey(m));
     closeDrawer();
+  }
+
+  async function onProbe(m: ManifoldInfo): Promise<void> {
+    if (isProbed(m)) return;
+    const key = rowKey(m);
+    busyKeys.add(key);
+    try {
+      const info = await attachManifoldProbe(key);
+      pushToast(`attached manifold probe ${info.name}`, { kind: "info" });
+      closeDrawer();
+    } catch (e) {
+      pushToast(`attach failed — ${describeError(e)}`, {
+        kind: "error",
+        ttlMs: null,
+      });
+    } finally {
+      busyKeys.delete(key);
+    }
+  }
+
+  // Custom-attach form state — for selectors not in the catalog
+  // (typed slugs, ns/name overrides, etc.).  Only rendered in probe
+  // mode so it doesn't clutter the steer flow.
+  let customSelector: string = $state("");
+  let customAlias: string = $state("");
+  let customTopN: number = $state(3);
+  let customAttaching: boolean = $state(false);
+
+  async function onCustomAttachSubmit(ev: SubmitEvent): Promise<void> {
+    ev.preventDefault();
+    const sel = customSelector.trim();
+    if (!sel) {
+      pushToast("selector required", { kind: "error" });
+      return;
+    }
+    customAttaching = true;
+    try {
+      const opts: { name?: string; top_n?: number } = {};
+      if (customAlias.trim()) opts.name = customAlias.trim();
+      if (customTopN && customTopN > 0) opts.top_n = customTopN;
+      const info = await attachManifoldProbe(sel, opts);
+      pushToast(`attached manifold probe ${info.name}`, { kind: "info" });
+      customSelector = "";
+      customAlias = "";
+    } catch (e) {
+      pushToast(`attach failed — ${describeError(e)}`, {
+        kind: "error",
+        ttlMs: null,
+      });
+    } finally {
+      customAttaching = false;
+    }
+  }
+
+  async function onProbeRemove(m: ManifoldInfo): Promise<void> {
+    const key = rowKey(m);
+    busyKeys.add(key);
+    try {
+      // Probe may have been registered under either qualified or bare
+      // name depending on the original selector — detach both forms
+      // defensively.  The store helper deletes the entry locally; the
+      // server route only knows the registered name, so try the
+      // qualified key first and fall back to the bare name.
+      const target = manifoldProbeRack.entries.has(key) ? key : m.name;
+      await detachManifoldProbe(target);
+      pushToast(`detached manifold probe ${target}`, { kind: "info" });
+    } catch (e) {
+      pushToast(`detach failed — ${describeError(e)}`, {
+        kind: "error",
+        ttlMs: null,
+      });
+    } finally {
+      busyKeys.delete(key);
+    }
   }
 
   function onFit(m: ManifoldInfo): void {
@@ -203,7 +305,7 @@
 
 <section class="drawer-shell" aria-label="Manifolds">
   <header class="header">
-    <span class="title">manifolds</span>
+    <span class="title">{mode === "probe" ? "manifolds · probe" : "manifolds"}</span>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
       >✕</button>
   </header>
@@ -211,6 +313,59 @@
   <div class="body">
     {#if errorMsg}
       <p class="error" role="alert">{errorMsg}</p>
+    {/if}
+
+    {#if mode === "probe"}
+      <p class="mode-hint">
+        Attach a fitted manifold as a read-side probe.
+        Use <strong>+probe</strong> on a fitted row, or attach by
+        selector below.
+      </p>
+      <details class="custom-attach">
+        <summary>attach by selector</summary>
+        <form class="attach-form" onsubmit={onCustomAttachSubmit}>
+          <label class="row-label">
+            <span>selector</span>
+            <input
+              type="text"
+              class="text-input"
+              placeholder="ns/name"
+              aria-label="Manifold selector"
+              bind:value={customSelector}
+              disabled={customAttaching}
+            />
+          </label>
+          <label class="row-label">
+            <span>name <span class="optional">(optional)</span></span>
+            <input
+              type="text"
+              class="text-input"
+              placeholder="registered name"
+              aria-label="Registered probe name (optional)"
+              bind:value={customAlias}
+              disabled={customAttaching}
+            />
+          </label>
+          <label class="row-label">
+            <span>top_n</span>
+            <input
+              type="number"
+              class="text-input small"
+              min="1"
+              max="32"
+              step="1"
+              aria-label="Per-token nearest-node list length"
+              bind:value={customTopN}
+              disabled={customAttaching}
+            />
+          </label>
+          <button
+            type="submit"
+            class="act probe"
+            disabled={customAttaching || !customSelector.trim()}
+          >+ attach</button>
+        </form>
+      </details>
     {/if}
 
     <button type="button" class="build-btn" onclick={gotoBuilder}>
@@ -268,6 +423,25 @@
                       ? `${key} is already racked`
                       : `rack ${key} for steering`}
                   >+steer</button>
+                  {#if !manifoldProbeRack.unavailable}
+                    {#if isProbed(m)}
+                      <button
+                        type="button"
+                        class="act probe attached"
+                        disabled={busy}
+                        onclick={() => void onProbeRemove(m)}
+                        title={`detach manifold probe ${key}`}
+                      >−probe</button>
+                    {:else}
+                      <button
+                        type="button"
+                        class="act probe"
+                        disabled={busy}
+                        onclick={() => void onProbe(m)}
+                        title={`attach ${key} as a read-side manifold probe`}
+                      >+probe</button>
+                    {/if}
+                  {/if}
                   <button
                     type="button"
                     class="act fit"
@@ -583,6 +757,113 @@
   .act.steer:hover:not(:disabled) {
     background: rgba(167, 139, 250, 0.12);
     border-color: var(--accent-purple);
+  }
+  /* Probe action mirrors steer's purple family so manifold surfaces
+   * (steering vs probing) keep one accent.  Attached state inverts so
+   * the row reads "active probe — click to detach". */
+  .act.probe {
+    color: var(--accent-purple);
+  }
+  .act.probe:hover:not(:disabled) {
+    background: rgba(167, 139, 250, 0.12);
+    border-color: var(--accent-purple);
+  }
+  .act.probe.attached {
+    background: rgba(167, 139, 250, 0.18);
+    border-color: var(--accent-purple);
+  }
+  .act.probe.attached:hover:not(:disabled) {
+    color: var(--accent-red);
+    border-color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+  }
+
+  /* Probe-mode hint banner — sits at the top of the drawer when the
+   * user landed here from the probe rack, naming the difference
+   * between +steer and +probe. */
+  .mode-hint {
+    margin: 0;
+    padding: var(--space-3) var(--space-4);
+    color: var(--fg-dim);
+    font-size: var(--text-sm);
+    line-height: 1.4;
+    background: rgba(167, 139, 250, 0.06);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent-purple);
+    border-radius: var(--radius);
+  }
+  .mode-hint strong {
+    color: var(--accent-purple);
+    font-weight: var(--weight-medium);
+  }
+
+  /* Custom-attach disclosure — collapsed by default so it doesn't
+   * compete with the catalog rows.  Opens to the same three-field
+   * form the old standalone ManifoldProbeRack carried. */
+  .custom-attach {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-deep);
+  }
+  .custom-attach > summary {
+    cursor: pointer;
+    padding: var(--space-3) var(--space-4);
+    color: var(--fg-dim);
+    font-size: var(--text-sm);
+    list-style: none;
+  }
+  .custom-attach > summary::-webkit-details-marker { display: none; }
+  .custom-attach > summary::before {
+    content: "▸ ";
+    color: var(--fg-muted);
+  }
+  .custom-attach[open] > summary::before { content: "▾ "; }
+  .attach-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-4) var(--space-4);
+    border-top: 1px solid var(--border);
+  }
+  .attach-form .row-label {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    font-size: var(--text-sm);
+    color: var(--fg-muted);
+  }
+  .attach-form .row-label > span {
+    flex: 0 0 5.5em;
+  }
+  .attach-form .optional {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+  }
+  .text-input {
+    flex: 1 1 0;
+    min-width: 0;
+    background: var(--bg-deep);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
+  .text-input.small {
+    flex: 0 0 5em;
+  }
+  .text-input:focus-visible {
+    outline: 1px solid var(--accent-purple);
+    outline-offset: -1px;
+  }
+  .text-input:disabled {
+    opacity: 0.6;
+  }
+  .attach-form .act.probe {
+    align-self: flex-end;
+    margin-top: var(--space-2);
   }
   .act.fit {
     color: var(--accent);

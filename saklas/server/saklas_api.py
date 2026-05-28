@@ -3015,6 +3015,51 @@ async def _ws_handle_generate(
                     # Inspector data is best-effort — never let a failure
                     # here break the streaming token path.
                     pass
+                # Inline manifold-probe readings for the live inspector.
+                # The vector-probe path above reads off the persisted loom
+                # row (the engine's ``_token_tap`` already scored against
+                # ``session._capture._per_layer``); manifold readings have
+                # no such persistence yet, so we score directly off the
+                # same capture buffer here.  Mirrors what
+                # ``generate_stream._push`` does for the OpenAI / Ollama
+                # streaming paths, lifted into the native WS frame so the
+                # webui's per-token mini-map cursor + fraction meter tick
+                # live instead of stalling at ``awaiting first token...``
+                # until the ``done`` event.  Shape matches the existing
+                # ``ManifoldTokenReading.to_dict()`` the OpenAI/Ollama
+                # paths emit per chunk and the webui's
+                # ``updateManifoldProbesFromToken`` already consumes.
+                try:
+                    mf_monitor = getattr(session, "_manifold_monitor", None)
+                    if (
+                        mf_monitor is not None
+                        and mf_monitor.probe_names
+                    ):
+                        capture = getattr(session, "_capture", None)
+                        per_layer = (
+                            getattr(capture, "_per_layer", None)
+                            if capture is not None
+                            else None
+                        )
+                        if per_layer:
+                            latest_hidden = {
+                                layer_idx: bucket[-1]
+                                for layer_idx, bucket in per_layer.items()
+                                if bucket
+                            }
+                            if latest_hidden:
+                                readings = mf_monitor.score_single_token(
+                                    latest_hidden,
+                                )
+                                if readings:
+                                    event["manifold_readings"] = {
+                                        name: r.to_dict()
+                                        for name, r in readings.items()
+                                    }
+                except Exception:
+                    # Inspector data is best-effort — never let a failure
+                    # here break the streaming token path.
+                    pass
                 loop.call_soon_threadsafe(token_queue.put_nowait, event)
 
             result_holder: list[GenerationResult | RunSet] = []

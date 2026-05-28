@@ -3,8 +3,10 @@
 Covers the native ``/saklas/v1/manifold-probes`` route family plus the
 ``x-saklas-manifold-readings`` extension surfaced on OpenAI chat /
 completions and Ollama chat / generate responses (streaming and
-non-streaming).  All exercises mock the session — the goal is to pin
-the wire shape, not re-run engine integration.
+non-streaming), plus per-token ``manifold_readings`` on the native WS
+``/saklas/v1/sessions/{id}/stream`` ``token`` frame.  All exercises
+mock the session — the goal is to pin the wire shape, not re-run
+engine integration.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -465,3 +468,184 @@ class TestOllamaManifoldExtension:
         agg = final.get("x-saklas-manifold-readings")
         assert agg is not None
         assert agg["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+
+
+# ---------------------------------------------------------------------------
+# Native WebSocket: per-token manifold_readings on token frames
+# ---------------------------------------------------------------------------
+
+
+class TestWebSocketManifoldReadings:
+    """The native ``/saklas/v1/sessions/{id}/stream`` WS must carry
+    ``manifold_readings`` on every ``token`` frame when manifold probes
+    are attached, and the final ``done`` event still carries the
+    aggregate.  Vector probes go through the persisted-loom-row path
+    (see ``test_saklas_api.TestWebSocket``); manifold readings have no
+    such persistence yet, so the server scores directly off
+    ``session._capture._per_layer`` inside the WS ``_on_token``
+    callback.
+
+    Regression for the Phase 3c bug where the webui mini-map cursor
+    stayed stuck at ``awaiting first token...`` because the WS ``token``
+    frame omitted the field entirely until ``done``.
+    """
+
+    def _attach_manifold(self, session, *, name="circumplex"):
+        manifold = _mock_manifold(name)
+        probe = _mock_probe(name, manifold)
+        session._manifold_monitor.probe_names = [name]
+        session._manifold_monitor.attached_probes.return_value = {name: probe}
+
+        # Per-token reading the monitor returns each time the WS
+        # callback hits the inline-score branch.
+        reading = ManifoldTokenReading(
+            fraction=0.51,
+            nearest=[("happy", 0.18), ("calm", 0.31)],
+        )
+
+        def _score(hidden):
+            return {name: reading}
+
+        session._manifold_monitor.score_single_token.side_effect = _score
+        return reading
+
+    def _wire_capture(self, session):
+        """Wire ``session._capture._per_layer`` so the inline manifold
+        scoring branch sees non-empty per-layer captures and therefore
+        actually runs.  The values themselves don't matter — the mocked
+        ``score_single_token`` ignores its input."""
+        capture = MagicMock()
+        capture._per_layer = {4: ["sentinel"], 8: ["sentinel"]}
+        session._capture = capture
+
+    def _attach_generate(self, session, tokens, aggregate=None):
+        """Install a fake ``session.generate`` that drives ``on_token``.
+
+        Mirrors the pattern in ``test_saklas_api.TestWebSocket``.  When
+        ``aggregate`` is provided it is stashed on the returned result's
+        ``manifold_readings`` so the ``done`` event surfaces the
+        aggregate alongside the per-token frames.
+        """
+        def _gen(input, *, steering=None, sampling=None, stateless=False,
+                 raw=False, thinking=None, on_token=None,
+                 parent_node_id=None, n=1, recipe_override=None):
+            for i, tok in enumerate(tokens):
+                on_token(tok, False, 1000 + i, None, None)
+                time.sleep(0.001)
+            result = GenerationResult(
+                text="".join(tokens),
+                tokens=list(range(1000, 1000 + len(tokens))),
+                token_count=len(tokens), tok_per_sec=50.0, elapsed=0.05,
+                finish_reason="stop",
+                manifold_readings=(
+                    {"circumplex": aggregate} if aggregate else {}
+                ),
+            )
+            session._last_result = result
+            session.last_result = result
+            session._last_per_token_scores = None
+            session.last_per_token_scores = None
+            return result
+
+        session.generate.side_effect = _gen
+
+    def test_token_frame_carries_manifold_readings(self, session_and_client):
+        session, client = session_and_client
+        self._attach_manifold(session)
+        self._wire_capture(session)
+        self._attach_generate(session, ["Hello", " ", "world"])
+
+        with client.websocket_connect(
+            "/saklas/v1/sessions/default/stream",
+        ) as ws:
+            ws.send_json({"type": "generate", "input": "hi"})
+            started = ws.receive_json()
+            assert started["type"] == "started"
+            token_frames = []
+            done = None
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "token":
+                    token_frames.append(msg)
+                elif msg["type"] == "done":
+                    done = msg
+                    break
+
+        assert len(token_frames) == 3
+        for frame in token_frames:
+            mf = frame.get("manifold_readings")
+            assert mf is not None, (
+                "per-token manifold_readings missing on WS token frame — "
+                "regression of the Phase 3c stall bug"
+            )
+            assert "circumplex" in mf
+            assert mf["circumplex"]["fraction"] == pytest.approx(0.51)
+            assert mf["circumplex"]["nearest"] == [
+                ["happy", 0.18], ["calm", 0.31],
+            ]
+        assert done is not None
+        # The done event carries the aggregate only when the result
+        # actually has one — this happy-path test omits the aggregate
+        # to isolate the per-token wire.  The full round-trip is
+        # covered by ``test_done_frame_carries_manifold_aggregate``
+        # below.
+
+    def test_done_frame_carries_manifold_aggregate(self, session_and_client):
+        session, client = session_and_client
+        self._attach_manifold(session)
+        self._wire_capture(session)
+        aggregate = ManifoldAggregate(
+            fraction_mean=0.42,
+            fraction_per_layer={4: 0.4, 8: 0.5},
+            nearest=[("happy", 0.13), ("calm", 0.22)],
+            coords=(0.61, 0.42),
+            coords_per_layer={4: (0.6, 0.4), 8: (0.62, 0.45)},
+            residual_mean=0.07,
+            residual_per_layer={4: 0.05, 8: 0.09},
+        )
+        self._attach_generate(session, ["Hello"], aggregate=aggregate)
+
+        with client.websocket_connect(
+            "/saklas/v1/sessions/default/stream",
+        ) as ws:
+            ws.send_json({"type": "generate", "input": "hi"})
+            assert ws.receive_json()["type"] == "started"
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    done = msg
+                    break
+
+        agg_blob = done["result"].get("manifold_readings")
+        assert agg_blob is not None
+        assert agg_blob["circumplex"]["fraction_mean"] == pytest.approx(0.42)
+        assert agg_blob["circumplex"]["coords"] == [
+            pytest.approx(0.61), pytest.approx(0.42),
+        ]
+
+    def test_token_frame_omits_field_when_no_manifold_probes(
+        self, session_and_client,
+    ):
+        """No manifold probes attached → ``manifold_readings`` omitted
+        from every token frame.  Legacy clients see the unchanged shape.
+        """
+        session, client = session_and_client
+        # Probe list stays empty; capture wiring left default so the
+        # inline branch never triggers.
+        session._manifold_monitor.probe_names = []
+        self._attach_generate(session, ["Hi"])
+
+        with client.websocket_connect(
+            "/saklas/v1/sessions/default/stream",
+        ) as ws:
+            ws.send_json({"type": "generate", "input": "hi"})
+            assert ws.receive_json()["type"] == "started"
+            saw_token = False
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "token":
+                    saw_token = True
+                    assert "manifold_readings" not in msg
+                elif msg["type"] == "done":
+                    break
+        assert saw_token
