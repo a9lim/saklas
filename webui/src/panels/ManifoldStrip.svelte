@@ -30,6 +30,11 @@
 
   const info = $derived(manifoldByName(name));
 
+  /** Display name — bare manifold name with the namespace prefix stripped
+   *  (``default/personas`` → ``personas``).  Full name stays in the
+   *  tooltip for disambiguation. */
+  const displayName = $derived(name.split("/").pop() ?? name);
+
   // ---------- trigger cycle (mirror VectorStrip) ----------
 
   const TRIGGER_ORDER: Trigger[] = [
@@ -115,12 +120,34 @@
       title={entry.enabled ? "Enabled (click to disable)" : "Disabled (click to enable)"}
       aria-label="Toggle manifold {name}"
     >
-      {entry.enabled ? "●" : "○"}
+      {entry.enabled ? "◆" : "◇"}
     </button>
 
-    <span class="name" title="manifold {name}">
-      <span class="name-text">{name}</span>
-    </span>
+    <!-- Axis mirrors VectorStrip.axis: the name takes the neg-pole slot
+         (right-aligned against the slider), the blend slider the middle,
+         and the position readout the pos-pole slot — so a manifold row
+         and a vector row share the same column lanes in the rack. -->
+    <div class="axis">
+      <span class="name" title="manifold {name}">{displayName}</span>
+      <Slider
+        value={entry.blend}
+        min={0}
+        max={1}
+        step={0.05}
+        oninput={onBlendInput}
+        ariaLabel="blend fraction for {name}"
+        title="blend fraction — how strongly to pull onto the manifold"
+      />
+      <span class="coords" title="authoring position: {coordsLabel}">
+        {#if entry.label}
+          <span class="node-pill" title="snapped to node '{entry.label}' (label-form)">%{entry.label}</span>
+        {:else}
+          {coordsLabel}
+        {/if}
+      </span>
+    </div>
+
+    <span class="blend-val" title="blend fraction">{entry.blend.toFixed(2)}</span>
 
     {#if !fitted}
       <span class="warn" title="no fitted tensor for the loaded model — fit it from the manifolds drawer">
@@ -131,14 +158,6 @@
         stale
       </span>
     {/if}
-
-    <span class="coords" title="authoring position: {coordsLabel}">
-      {#if entry.label}
-        <span class="node-pill" title="snapped to node '{entry.label}' (label-form)">%{entry.label}</span>
-      {:else}
-        {coordsLabel}
-      {/if}
-    </span>
 
     <button
       type="button"
@@ -158,21 +177,6 @@
     >
       ✕
     </button>
-  </div>
-
-  <div class="blend-row">
-    <span class="blend-label" title="blend fraction — how strongly to pull onto the manifold">
-      blend
-    </span>
-    <Slider
-      value={entry.blend}
-      min={0}
-      max={1}
-      step={0.05}
-      oninput={onBlendInput}
-      ariaLabel="blend fraction for {name}"
-    />
-    <span class="blend-val">{entry.blend.toFixed(2)}</span>
   </div>
 
   <div class="picker">
@@ -211,11 +215,12 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    /* Phase C.3: a left purple stripe + matching name color
-     * differentiates manifold rows from vector rows at a glance.
-     * Same accent the TUI's manifold rows use (ansi_magenta). */
+    /* A thin left purple stripe + matching name color differentiates
+     * manifold rows from vector rows at a glance.  Matches the manifold
+     * probe strip's 2px bar + ◆ glyph so the manifold family reads the
+     * same across the steering and probe racks. */
     border: 1px solid var(--border);
-    border-left: 3px solid var(--accent-purple);
+    border-left: 2px solid var(--accent-purple);
     border-radius: var(--radius);
     background: var(--bg-alt);
     font-size: var(--text-sm);
@@ -229,6 +234,9 @@
     display: flex;
     align-items: center;
     gap: var(--space-3);
+    /* Match VectorStrip's row height so a manifold header and a vector
+     * row sit at the same height in the shared rack. */
+    min-height: 32px;
     min-width: 0;
   }
   .enable {
@@ -244,23 +252,30 @@
   .strip.disabled .enable {
     color: var(--fg-muted);
   }
-  .name {
-    display: inline-flex;
+  /* Axis grid mirrors VectorStrip.axis exactly so a manifold row and a
+   * vector row in the same rack share the column lanes: name in the
+   * neg-pole slot, blend slider in the middle, position readout in the
+   * pos-pole slot. */
+  .axis {
+    display: grid;
+    grid-template-columns: minmax(2.5em, 1fr) minmax(60px, 2.6fr) minmax(2.5em, 1fr);
     align-items: center;
     gap: var(--space-2);
-    /* Manifold rows use purple as the name color to set them apart
-     * from vector rows (which use fg-strong on the analogous label). */
-    color: var(--accent-purple);
-    font: inherit;
-    font-family: var(--font-mono);
-    min-width: 0;
     flex: 1 1 auto;
-    text-align: left;
+    min-width: 0;
   }
-  .name-text {
+  .name {
+    /* Manifold rows use purple as the name color to set them apart
+     * from vector rows (which use fg-strong on the analogous label).
+     * Right-aligned against the slider, mirroring the neg-pole. */
+    color: var(--accent-purple);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    text-align: right;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
   }
   .warn {
     flex: 0 0 auto;
@@ -271,14 +286,14 @@
     padding: 0 var(--space-2);
   }
   .coords {
-    flex: 0 0 auto;
     color: var(--fg-dim);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
-    max-width: 9em;
+    text-align: left;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
   }
   .trigger-pill {
     background: transparent;
@@ -312,22 +327,15 @@
   .remove:hover {
     color: var(--accent-red);
   }
-  .blend-row {
-    display: grid;
-    grid-template-columns: auto 1fr 3em;
-    align-items: center;
-    gap: var(--space-3);
-  }
-  .blend-label {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    text-transform: lowercase;
-  }
+  /* Blend readout — the alpha-display analogue, same column geometry as
+   * VectorStrip's α value so the two strips' numeric readouts line up
+   * across the rack. */
   .blend-val {
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
+    min-width: 3.5em;
     text-align: right;
+    color: var(--fg-muted);
+    font-variant-numeric: tabular-nums;
   }
   .picker {
     border-top: 1px solid var(--border);

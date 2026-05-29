@@ -47,6 +47,11 @@
   const aggregate = $derived(entry?.aggregate ?? null);
   const trajectory = $derived(entry?.trajectory ?? []);
 
+  /** Display name — the bare manifold name, namespace prefix stripped
+   *  (``default/circumplex`` → ``circumplex``).  The full registered
+   *  name stays in the title for hover disambiguation. */
+  const displayName = $derived(name.split("/").pop() ?? name);
+
   /** Mini-map gating — only 2D box-domain probes with attached node
    *  coords render the visual.  Mirrors ``_isMiniMapCandidate`` in
    *  stores. */
@@ -143,10 +148,7 @@
          carries its +pole label. -->
     <div class="axis">
       <div class="name-cell">
-        <span class="name">{name}</span>
-        {#if entry?.info && entry.info.manifold !== name}
-          <span class="alias">{entry.info.manifold}</span>
-        {/if}
+        <span class="name" title={name}>{displayName}</span>
       </div>
       <div class="bar-cell" aria-hidden="true">
         <!-- Monopolar fill (left-anchored) — fraction is ∈ [0, 1], so
@@ -289,14 +291,6 @@
   .name {
     color: var(--accent-purple);
     font-size: var(--text-sm);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 100%;
-  }
-  .alias {
-    color: var(--fg-muted);
-    font-size: var(--text-2xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

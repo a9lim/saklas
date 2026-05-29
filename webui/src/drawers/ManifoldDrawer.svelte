@@ -20,7 +20,6 @@
     addManifoldToRack,
     attachManifoldProbe,
     closeDrawer,
-    detachManifoldProbe,
     manifoldProbeRack,
     manifoldRack,
     openDrawer,
@@ -83,9 +82,9 @@
 
   onMount(() => {
     void refreshManifoldList();
-    // Pull the attached-probe list too — the +probe / detach-button
-    // affordance is keyed on whether a fitted manifold is already
-    // attached, so the drawer needs this fresh on mount.
+    // Pull the attached-probe list too — the +probe button disables
+    // itself when a fitted manifold is already attached, so the drawer
+    // needs this fresh on mount.
     void refreshManifoldProbeList();
     queueMicrotask(() => searchInputRef?.focus({ preventScroll: true }));
     return () => {
@@ -245,28 +244,6 @@
       });
     } finally {
       customAttaching = false;
-    }
-  }
-
-  async function onProbeRemove(m: ManifoldInfo): Promise<void> {
-    const key = rowKey(m);
-    busyKeys.add(key);
-    try {
-      // Probe may have been registered under either qualified or bare
-      // name depending on the original selector — detach both forms
-      // defensively.  The store helper deletes the entry locally; the
-      // server route only knows the registered name, so try the
-      // qualified key first and fall back to the bare name.
-      const target = manifoldProbeRack.entries.has(key) ? key : m.name;
-      await detachManifoldProbe(target);
-      pushToast(`detached manifold probe ${target}`, { kind: "info" });
-    } catch (e) {
-      pushToast(`detach failed — ${describeError(e)}`, {
-        kind: "error",
-        ttlMs: null,
-      });
-    } finally {
-      busyKeys.delete(key);
     }
   }
 
@@ -565,23 +542,15 @@
                       : `rack ${key} for steering`}
                   >+steer</button>
                   {#if !manifoldProbeRack.unavailable}
-                    {#if isProbed(m)}
-                      <button
-                        type="button"
-                        class="act probe attached"
-                        disabled={busy}
-                        onclick={() => void onProbeRemove(m)}
-                        title={`detach manifold probe ${key}`}
-                      >−probe</button>
-                    {:else}
-                      <button
-                        type="button"
-                        class="act probe"
-                        disabled={busy}
-                        onclick={() => void onProbe(m)}
-                        title={`attach ${key} as a read-side manifold probe`}
-                      >+probe</button>
-                    {/if}
+                    <button
+                      type="button"
+                      class="act probe"
+                      disabled={busy || isProbed(m)}
+                      onclick={() => void onProbe(m)}
+                      title={isProbed(m)
+                        ? `${key} is already attached as a probe`
+                        : `attach ${key} as a read-side manifold probe`}
+                    >+probe</button>
                   {/if}
                   <button
                     type="button"
@@ -906,23 +875,15 @@
     border-color: var(--accent-purple);
   }
   /* Probe action mirrors steer's purple family so manifold surfaces
-   * (steering vs probing) keep one accent.  Attached state inverts so
-   * the row reads "active probe — click to detach". */
+   * (steering vs probing) keep one accent.  Like +steer, it disables
+   * once the manifold is already attached — detach happens from the
+   * probe strip's ✕, not here. */
   .act.probe {
     color: var(--accent-purple);
   }
   .act.probe:hover:not(:disabled) {
     background: rgba(167, 139, 250, 0.12);
     border-color: var(--accent-purple);
-  }
-  .act.probe.attached {
-    background: rgba(167, 139, 250, 0.18);
-    border-color: var(--accent-purple);
-  }
-  .act.probe.attached:hover:not(:disabled) {
-    color: var(--accent-red);
-    border-color: var(--accent-red);
-    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
   }
 
   /* Probe-mode hint banner — sits at the top of the drawer when the
