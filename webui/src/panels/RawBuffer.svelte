@@ -22,6 +22,7 @@
     sendGenerate,
     sendStop,
     highlightState,
+    openDrawer,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import { scoreToRgb, surpriseScore, SURPRISE_TARGET } from "../lib/tokens";
@@ -187,19 +188,54 @@
   // (transparent-text) textarea.  Editing drops back to the plain
   // textarea — tinting is a read affordance.
 
-  const allTokens = $derived.by<TokenScore[]>(() => {
-    const out: TokenScore[] = [];
-    for (const t of chatLog.turns) {
-      if (t.thinkingTokens) out.push(...t.thinkingTokens);
-      if (t.tokens) out.push(...t.tokens);
-      else if (!t.tokens && t.role !== "assistant") {
-        // User / system turns have no token rows — represent them as a
-        // single untinted span so the mirror text matches the buffer.
-        out.push({ text: t.text ?? "", thinking: false });
+  // A coordinate-preserving view of the buffer's tokens.  The flat
+  // ``allTokens`` list below (used by the edit-mode tint mirror) throws
+  // away which turn/index each token came from, but inspect mode needs
+  // those coordinates to open the same token-drilldown drawer chat mode
+  // uses — so the alternatives table and logit-fork work identically.
+  interface RawToken {
+    text: string;
+    /** Loom coordinates for ``openDrawer("token_drilldown", …)``.
+     *  ``null`` for prompt text (user / system turns), which renders as
+     *  an inert span. */
+    turnIdx: number | null;
+    tokenIdx: number;
+    isThinking: boolean;
+    /** Backing score row — drives tint + alt availability.  ``null`` for
+     *  inert prompt spans. */
+    tok: TokenScore | null;
+  }
+
+  const tokenViews = $derived.by<RawToken[]>(() => {
+    const out: RawToken[] = [];
+    chatLog.turns.forEach((t, turnIdx) => {
+      if (t.thinkingTokens) {
+        t.thinkingTokens.forEach((tok, tokenIdx) =>
+          out.push({ text: tok.text, turnIdx, tokenIdx, isThinking: true, tok }),
+        );
       }
-    }
+      if (t.tokens) {
+        t.tokens.forEach((tok, tokenIdx) =>
+          out.push({ text: tok.text, turnIdx, tokenIdx, isThinking: false, tok }),
+        );
+      } else if (t.role !== "assistant") {
+        // User / system turns have no token rows — one inert span so the
+        // rendered text matches the buffer exactly.
+        out.push({
+          text: t.text ?? "",
+          turnIdx: null,
+          tokenIdx: 0,
+          isThinking: false,
+          tok: null,
+        });
+      }
+    });
     return out;
   });
+
+  const allTokens = $derived<TokenScore[]>(
+    tokenViews.map((v) => v.tok ?? { text: v.text, thinking: false }),
+  );
 
   /** True when a tinted read-only mirror should render — a highlight
    *  probe is selected and the buffer isn't being actively edited. */
@@ -227,6 +263,58 @@
     return bg === "transparent" ? "" : `background-color: ${bg}`;
   }
 
+  // ---------- edit / inspect mode ----------
+  //
+  // Edit mode is the free-text textarea (plus the optional tint mirror).
+  // Inspect mode swaps in a read-only clickable token view: each
+  // generated token opens the drilldown drawer where alternatives can be
+  // picked and forked, exactly as in chat mode.  Inspect is read-only —
+  // editing always happens in edit mode — so an uncommitted draft can
+  // never desync from the committed tree the inspect view reads.
+  type Mode = "edit" | "inspect";
+  let mode: Mode = $state<Mode>("edit");
+
+  /** Whether any clickable (generated) token exists to inspect. */
+  const hasClickableTokens = $derived(
+    tokenViews.some((v) => v.turnIdx !== null),
+  );
+
+  /** Inspect is offered only on a settled buffer — a pending edit or an
+   *  in-flight commit would make the read-only view lag the textarea. */
+  const canInspect = $derived(hasClickableTokens && !dirty && !committing);
+
+  /** Fall back to edit when nothing remains to inspect (buffer cleared,
+   *  conversation reset) so the surface never strands on an empty view. */
+  $effect(() => {
+    if (mode === "inspect" && !hasClickableTokens) mode = "edit";
+  });
+
+  function inspectTooltip(v: RawToken): string {
+    const tok = v.tok;
+    if (!tok) return "";
+    const parts: string[] = [];
+    const sc = tokenScore(tok);
+    if (sc !== undefined && highlightState.target) {
+      const label =
+        highlightState.target === SURPRISE_TARGET
+          ? "surprise"
+          : highlightState.target;
+      parts.push(`${label} ${sc >= 0 ? "+" : ""}${sc.toFixed(3)}`);
+    }
+    const n = tok.topAlts?.length ?? 0;
+    parts.push(n > 0 ? `click — ${n} alternatives` : "click — token details");
+    return parts.join(" · ");
+  }
+
+  function openToken(v: RawToken): void {
+    if (v.turnIdx === null) return;
+    openDrawer("token_drilldown", {
+      turnIdx: v.turnIdx,
+      tokenIdx: v.tokenIdx,
+      isThinking: v.isThinking,
+    });
+  }
+
   let logRef: HTMLDivElement | null = $state(null);
   let scrolledUp = $state(false);
   function onScroll(ev: Event): void {
@@ -248,25 +336,79 @@
 </script>
 
 <div class="raw-buffer" aria-label="Completion buffer">
+  <div class="raw-head">
+    <span class="head-label">completion buffer</span>
+    <div class="mode-toggle" role="tablist" aria-label="Buffer mode">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={mode === "edit"}
+        class:active={mode === "edit"}
+        onclick={() => (mode = "edit")}
+        title="edit the raw completion text"
+      >edit</button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={mode === "inspect"}
+        class:active={mode === "inspect"}
+        disabled={mode !== "inspect" && !canInspect}
+        onclick={() => (mode = "inspect")}
+        title={canInspect || mode === "inspect"
+          ? "inspect tokens — click any token for alternatives + fork"
+          : dirty || committing
+            ? "commit or revert the edit to inspect tokens"
+            : "generate tokens first"}
+      >inspect</button>
+    </div>
+  </div>
+
   <div class="surface" bind:this={logRef} onscroll={onScroll}>
-    {#if showTint}
-      <div class="tint-mirror" aria-hidden="true">
-        {#each allTokens as tok, i (i)}
-          <span class="tok" style={tintStyle(tok)}>{tok.text}</span>
+    {#if mode === "inspect"}
+      <div class="inspect" aria-label="Completion tokens">
+        {#each tokenViews as v, i (i)}
+          {#if v.turnIdx === null}
+            <span class="seg plain">{v.text}</span>
+          {:else}
+            <span
+              class="seg tok clickable"
+              class:tinted={highlightState.target !== null}
+              class:has-alts={(v.tok?.topAlts?.length ?? 0) > 0}
+              style={v.tok ? tintStyle(v.tok) : ""}
+              title={inspectTooltip(v)}
+              role="button"
+              tabindex="-1"
+              onclick={() => openToken(v)}
+              onkeydown={(ev) => {
+                if (ev.key === "Enter" || ev.key === " ") {
+                  ev.preventDefault();
+                  openToken(v);
+                }
+              }}
+            >{v.text}</span>
+          {/if}
         {/each}
       </div>
+    {:else}
+      {#if showTint}
+        <div class="tint-mirror" aria-hidden="true">
+          {#each allTokens as tok, i (i)}
+            <span class="tok" style={tintStyle(tok)}>{tok.text}</span>
+          {/each}
+        </div>
+      {/if}
+      <textarea
+        class="buffer-text"
+        class:has-tint={showTint}
+        bind:this={textareaRef}
+        value={draft}
+        oninput={onInput}
+        onkeydown={onKeydown}
+        spellcheck="false"
+        placeholder="(empty completion buffer — type a prompt and continue)"
+        aria-label="Editable completion buffer"
+      ></textarea>
     {/if}
-    <textarea
-      class="buffer-text"
-      class:has-tint={showTint}
-      bind:this={textareaRef}
-      value={draft}
-      oninput={onInput}
-      onkeydown={onKeydown}
-      spellcheck="false"
-      placeholder="(empty completion buffer — type a prompt and continue)"
-      aria-label="Editable completion buffer"
-    ></textarea>
   </div>
 
   <StatusFooter />
@@ -330,7 +472,8 @@
    * geometry so the transparent-text textarea's caret/selection line up
    * with the mirror's glyphs. */
   .tint-mirror,
-  .buffer-text {
+  .buffer-text,
+  .inspect {
     margin: 0;
     padding: var(--space-4);
     font-family: var(--font-mono);
@@ -349,6 +492,95 @@
   }
   .tint-mirror .tok {
     border-radius: var(--radius);
+  }
+
+  /* Inspect mode — read-only clickable token view.  Same geometry as the
+   * textarea / mirror (shared rule above) so wrapping matches; each
+   * generated token is a button that opens the drilldown drawer. */
+  .inspect {
+    min-height: 100%;
+    color: var(--fg-strong);
+  }
+  .inspect .plain {
+    /* Prompt text (user / system turns) — present but not interactive. */
+    color: var(--fg);
+  }
+  .inspect .tok {
+    border-radius: var(--radius);
+  }
+  .inspect .clickable {
+    cursor: pointer;
+  }
+  .inspect .clickable:hover,
+  .inspect .clickable:focus-visible {
+    outline: 1px solid var(--fg-muted);
+    outline-offset: -1px;
+    border-radius: var(--radius);
+  }
+  /* Tokens that captured top-K alternatives get a faint underline so the
+   * forkable ones are discoverable at a glance. */
+  .inspect .has-alts {
+    text-decoration: underline dotted var(--fg-dim);
+    text-underline-offset: 2px;
+  }
+
+  /* Header: label + edit/inspect toggle. */
+  .raw-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+  .head-label {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0;
+  }
+  /* Segmented control — mirrors the house ``.sk-mode-tabs`` (ModeTabs)
+   * and render-mode shape: borderless segments inside one bordered
+   * ``--bg-elev`` track, --text-sm, accent-subtle active fill, fast
+   * transitions.  Kept local (not the shared component) so the inspect
+   * segment can carry a conditional ``disabled`` + dynamic tooltip. */
+  .mode-toggle {
+    display: flex;
+    gap: var(--space-1);
+    padding: var(--space-1);
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .mode-toggle button {
+    background: transparent;
+    color: var(--fg-dim);
+    border: 0;
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    cursor: pointer;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    text-transform: lowercase;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
+  }
+  .mode-toggle button:hover:not(:disabled):not(.active) {
+    color: var(--fg);
+    background: var(--bg-hover);
+  }
+  .mode-toggle button.active {
+    color: var(--accent);
+    background: var(--accent-subtle);
+  }
+  .mode-toggle button:focus-visible {
+    outline: 2px solid var(--accent-glow);
+    outline-offset: 1px;
+  }
+  .mode-toggle button:disabled {
+    color: var(--fg-muted);
+    cursor: not-allowed;
+    opacity: 0.6;
   }
   .buffer-text {
     position: relative;
