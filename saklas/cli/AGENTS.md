@@ -28,6 +28,8 @@ Six-verb root parser (`tui`/`serve`/`pack`/`vector`/`experiment`/`config`) split
 
 `_make_session(args)` builds the `SaklasSession` via `from_pretrained`, resolving probe categories, injection mode, projection metric, DLS, compile, and CUDA-graph settings off `args`. It enforces the `--legacy` conflict checks (mutually exclusive with `--steer-mode`, `--projection-metric`, `--no-dls`). `_warmup_session` runs a 32-token stateless `session.generate("Please respond briefly.", ...)` so dynamo's automatic-shape promotion fires on a realistic prefill length before the user's first request; called from both `tui` and `serve` after `_setup_steering_vectors`. The model loader's `_compile_with_probe` already specializes a minimal 2-token shape during `from_pretrained` to catch compile crashes; the warmup is the layer above that, sized so the user's first interactive prompt skips the per-prefill-shape recompile.
 
+`_attach_default_manifold_probes(session)` runs in `_run_serve` after `create_app`, gated on the dashboard being mounted (`web_enabled`). It attaches the bundled manifolds (`default/personas`, `default/circumplex`) as read-side probes so the dashboard's probe rack opens with them watching — the manifold analogue of `bootstrap_probes` pre-loading default vector probes. Fitted-for-model only (it checks `ManifoldFolder.tensor_models()`); an unfitted bundled manifold is skipped with a one-line hint rather than triggering an expensive startup fit.
+
 ## Flags
 
 `tui` and `serve` share model-loading args (`model`, `-q/--quantize`, `-d/--device`, `-p/--probes`), the injection block (`_add_injection_args`), the logit block (`_add_logit_args`), and config args (`_add_config_args`: `-c/--config` repeatable, `-s/--strict`).

@@ -310,6 +310,50 @@ def _warmup_session(session: SaklasSession) -> None:
         print(f"  warm-up skipped: {e}")
 
 
+def _attach_default_manifold_probes(session: SaklasSession) -> None:
+    """Auto-attach the bundled manifold probes on dashboard startup.
+
+    The two bundled manifolds (``personas``, ``circumplex``) ship as the
+    default read-side counterparts to the bundled vector probes, so the
+    dashboard's probe rack opens with them already watching — the
+    manifold analogue of how ``bootstrap_probes`` pre-loads the default
+    vector probes at session construction.
+
+    Only manifolds already *fitted* for the loaded model are attached:
+    fitting runs a forward pass per node and would block ``serve``
+    startup for minutes on a fresh model, so an unfitted bundled
+    manifold is skipped with a one-line hint (fit it from the dashboard
+    and it auto-loads next launch).  Selector is the fully-qualified
+    ``default/<name>`` so the registered probe name matches a manual
+    attach from the manifolds drawer — no duplicate rows.
+    """
+    from saklas.io.manifolds import (
+        ManifoldFolder,
+        ManifoldFormatError,
+        bundled_manifold_names,
+    )
+    from saklas.io.paths import manifold_dir, safe_model_id
+
+    stem = safe_model_id(session.model_id)
+    for name in bundled_manifold_names():
+        selector = f"default/{name}"
+        try:
+            mf = ManifoldFolder.load(manifold_dir("default", name))
+        except (ManifoldFormatError, FileNotFoundError):
+            continue
+        if stem not in mf.tensor_models():
+            print(
+                f"  manifold probe {selector}: not fitted for this model "
+                "— skipping (fit it from the dashboard to auto-load)"
+            )
+            continue
+        try:
+            session.add_manifold_probe(selector)
+            print(f"  manifold probe {selector}: attached")
+        except SaklasError as exc:
+            print(f"  manifold probe {selector}: skipped — {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Top-level runners
 # ---------------------------------------------------------------------------
@@ -379,6 +423,13 @@ def _run_serve(args: argparse.Namespace) -> None:
                      cors_origins=args.cors or None,
                      api_key=getattr(args, "api_key", None),
                      web=web_enabled)
+
+    # The dashboard's probe rack opens with the bundled manifold probes
+    # already watching (the read-side default, mirroring the bundled
+    # vector probes).  Gated on the dashboard being mounted — with
+    # ``--no-web`` there's no rack to populate.
+    if web_enabled:
+        _attach_default_manifold_probes(session)
 
     _warmup_session(session)
 

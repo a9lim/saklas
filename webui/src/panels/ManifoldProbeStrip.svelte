@@ -194,7 +194,7 @@
   <div class="layers" aria-label="Per-layer fraction for {name}">
     {#if layerKeys.length === 0}
       <div class="layers-status">
-        no per-layer data yet, generate a token first
+        no data yet, generate a token first
       </div>
     {:else}
       <span class="endcap" aria-hidden="true">L{Number(layerKeys[0])}</span>

@@ -1,16 +1,14 @@
 <script lang="ts">
-  // Probe rack — fused vector + manifold probes in one section, mirroring
-  // SteeringRack's vector + manifold steering layout.  Section header
-  // with a combined count, vector strips sorted alphabetically followed
-  // by manifold strips sorted alphabetically, then a footer with two
-  // entry-point buttons (+ add probe / + add manifold probe).
+  // Probe rack — fused manifold + vector probes in one section.  Section
+  // header with a combined count, manifold strips sorted alphabetically
+  // first (the bundled ``personas`` / ``circumplex`` probes auto-load
+  // here, so they head the rack), then vector strips, then a footer with
+  // two entry-point buttons (+ add probe / + add manifold probe).
   //
   // Sort cycle order matches the TUI (Ctrl+S): name → value → change →
   // name.  Sort only orders vector probes — manifold probes always sort
-  // alphabetically below (they aren't comparable to vector probes on
-  // ``value`` or ``change`` — different units, different domains —
-  // mirroring how SteeringRack keeps vectors above manifolds in stable
-  // alphabetical groups).
+  // alphabetically at the top (they aren't comparable to vector probes
+  // on ``value`` or ``change`` — different units, different domains).
   //
   // Manifold strips keep their purple accent so the probe family stays
   // visually distinct even inside the shared rack.  The catalog
@@ -45,8 +43,8 @@
 
   // Manifold probes are always sorted alphabetically — the vector
   // sortMode ordering (value/change) doesn't apply across the two
-  // families.  Matches SteeringRack's "sort vectors, then list
-  // manifolds alphabetically" cadence.
+  // families.  They render at the top of the rack (above vector probes)
+  // since the bundled defaults auto-load here.
   const sortedManifoldProbes = $derived.by(() => {
     return [...manifoldProbeRack.entries.keys()].sort((a, b) =>
       a.localeCompare(b),
@@ -129,14 +127,14 @@
         </div>
       </div>
     {:else}
-      {#each sortedProbes as probe (probe)}
-        <div role="listitem">
-          <ProbeStrip name={probe} />
-        </div>
-      {/each}
       {#each sortedManifoldProbes as probe (probe)}
         <div role="listitem">
           <ManifoldProbeStrip name={probe} />
+        </div>
+      {/each}
+      {#each sortedProbes as probe (probe)}
+        <div role="listitem">
+          <ProbeStrip name={probe} />
         </div>
       {/each}
     {/if}
