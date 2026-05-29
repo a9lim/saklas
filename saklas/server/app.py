@@ -58,6 +58,35 @@ class UnsupportedContentError(ValueError, SaklasError):
         return (400, str(self) or self.__class__.__name__)
 
 
+def _flatten_content(content: Any) -> str:
+    """Concatenate the text parts of an OpenAI multimodal content array.
+
+    Accepts a string (passed through), a list of content parts (each a
+    ``{"type": "text", "text": ...}`` dict or a bare string — non-text
+    parts raise :class:`UnsupportedContentError`), ``None`` (→ ``""``,
+    the Ollama convention), or any other scalar (stringified).  Shared
+    by ``ChatMessage._flatten_content`` (OpenAI routes) and the Ollama
+    shim's message/prompt extraction.
+    """
+    if isinstance(content, list):
+        pieces: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                pieces.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                pieces.append(part)
+            else:
+                raise UnsupportedContentError(
+                    "non-text content parts are not supported by this model"
+                )
+        return "".join(pieces)
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return str(content)
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request/response models
 # ---------------------------------------------------------------------------
@@ -71,20 +100,7 @@ class ChatMessage(BaseModel):
     def _flatten_content(self):
         # Accept OpenAI multimodal content-part arrays for text-only use:
         # concatenate text parts, reject anything else with a clear error.
-        if isinstance(self.content, list):
-            pieces: list[str] = []
-            for part in self.content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    pieces.append(str(part.get("text", "")))
-                elif isinstance(part, str):
-                    pieces.append(part)
-                else:
-                    raise UnsupportedContentError(
-                        "non-text content parts are not supported by this model"
-                    )
-            self.content = "".join(pieces)
-        elif not isinstance(self.content, str):
-            self.content = str(self.content)
+        self.content = _flatten_content(self.content)
         return self
 
 
@@ -166,27 +182,13 @@ class _SamplingBase(BaseModel):
         inside ``session.steering()`` — the server does not resolve poles
         here.
         """
-        from saklas.core.steering_expr import parse_expr
-
-        req_steering: "Steering | None" = None
-        explicit_clear = self.steering is not None and not self.steering.strip()
-        if self.steering is not None and self.steering.strip():
-            req_steering = parse_expr(self.steering)
-
+        req_steering, explicit_clear = _parse_req_steering(self.steering)
         thinking: bool | None = self.thinking
         if req_steering is not None and req_steering.thinking is not None:
             thinking = req_steering.thinking
-
-        merged_alphas: dict[str, Any] = {}
-        if default_steering is not None and not explicit_clear:
-            merged_alphas.update(default_steering.alphas)
-        if req_steering is not None:
-            for k, v in req_steering.alphas.items():
-                merged_alphas[k] = v
-
-        if not merged_alphas and thinking is None:
-            return None
-        return Steering(alphas=merged_alphas, thinking=thinking)
+        return _merge_steering(
+            req_steering, default_steering, explicit_clear, thinking,
+        )
 
 
 class ChatCompletionRequest(_SamplingBase):
@@ -333,6 +335,88 @@ def _manifold_token_readings(event: Any) -> dict[str, Any] | None:
     return out or None
 
 
+def _parse_req_steering(
+    expr: str | None,
+) -> tuple["Steering | None", bool]:
+    """Parse a per-request steering expression string.
+
+    Returns ``(req_steering, explicit_clear)``: ``None`` expression
+    inherits the server default (``explicit_clear=False``); an explicit
+    empty / whitespace string is a clear request (``explicit_clear=True``,
+    ``req_steering=None``); a non-empty string parses through the shared
+    grammar.  Shared by the OpenAI and Ollama route families.
+    """
+    from saklas.core.steering_expr import parse_expr
+
+    if expr is None:
+        return None, False
+    if not expr.strip():
+        return None, True
+    return parse_expr(expr), False
+
+
+def _merge_steering(
+    req_steering: "Steering | None",
+    default_steering: "Steering | None",
+    explicit_clear: bool,
+    thinking: bool | None,
+) -> "Steering | None":
+    """Compose a parsed request steering over the server default.
+
+    Per-request keys override the default at the key level; default-only
+    keys pass through; ``explicit_clear`` drops the default entirely.
+    Returns ``None`` when the composed alphas are empty and no ``thinking``
+    override is in play.  Pole aliasing happens inside ``session.steering()``
+    — the server does not resolve poles here.  Each protocol resolves its
+    own ``thinking`` precedence (OpenAI's native field, Ollama's top-level
+    ``think``) before calling in, since the sources differ.
+    """
+    merged_alphas: dict[str, Any] = {}
+    if default_steering is not None and not explicit_clear:
+        merged_alphas.update(default_steering.alphas)
+    if req_steering is not None:
+        for k, v in req_steering.alphas.items():
+            merged_alphas[k] = v
+    if not merged_alphas and thinking is None:
+        return None
+    return Steering(alphas=merged_alphas, thinking=thinking)
+
+
+def _build_sampling_config(
+    *,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None = None,
+    max_tokens: int | None,
+    seed: int | None,
+    stop: tuple[str, ...] | None,
+    logit_bias: dict[int, float] | None = None,
+    presence_penalty: float,
+    frequency_penalty: float,
+    logprobs: int | None = None,
+) -> SamplingConfig:
+    """Build a :class:`SamplingConfig` from already-normalized fields.
+
+    Shared by the OpenAI and Ollama route families.  Each protocol does
+    its own field normalization upstream (OpenAI: logprobs bool/int
+    coercion, no ``top_k``; Ollama: ``num_predict`` → ``max_tokens``,
+    ``repeat_penalty`` → ``presence_penalty`` via ``ln``, ``top_k``) and
+    hands the result here so the construction lives in one place.
+    """
+    return SamplingConfig(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=max_tokens,
+        seed=seed,
+        stop=stop,
+        logit_bias=logit_bias,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        logprobs=logprobs,
+    )
+
+
 def _sampling_kwargs(
     req: _SamplingBase, default_steering: "Steering | None",
 ) -> dict[str, Any]:
@@ -366,7 +450,7 @@ def _sampling_kwargs(
     else:
         lp = None
 
-    sc = SamplingConfig(
+    sc = _build_sampling_config(
         temperature=req.temperature,
         top_p=req.top_p,
         max_tokens=req.max_tokens,
@@ -484,95 +568,81 @@ async def _stream_generation(
             yield f"data: {json.dumps(err)}\n\n"
             return
 
-        if True:
-            if role_delta:
+        if role_delta:
+            chunk = {
+                "id": rid, "object": object_type, "created": created_ts,
+                "model": model_id,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+        try:
+            for event in stream_iter:
+                choice: dict[str, Any] = {
+                    "index": 0, **format_delta(event), "finish_reason": None,
+                }
+                # Per-token manifold readings ride under a vendor-
+                # prefixed extension on the choice so OpenAI clients
+                # that don't read the field stay unaffected.  Populated
+                # only when at least one manifold probe is attached
+                # and ``live_scores`` is True on the stream.
+                mf_token = _manifold_token_readings(event)
+                if mf_token is not None:
+                    choice["x-saklas-manifold-readings"] = mf_token
                 chunk = {
-                    "id": rid, "object": object_type, "created": created_ts,
+                    "id": rid,
+                    "object": object_type,
+                    "created": created_ts,
                     "model": model_id,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "choices": [choice],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
-            try:
-                for event in stream_iter:
-                    choice: dict[str, Any] = {
-                        "index": 0, **format_delta(event), "finish_reason": None,
-                    }
-                    # Per-token manifold readings ride under a vendor-
-                    # prefixed extension on the choice so OpenAI clients
-                    # that don't read the field stay unaffected.  Populated
-                    # only when at least one manifold probe is attached
-                    # and ``live_scores`` is True on the stream.
-                    mf_token = _manifold_token_readings(event)
-                    if mf_token is not None:
-                        choice["x-saklas-manifold-readings"] = mf_token
-                    chunk = {
-                        "id": rid,
-                        "object": object_type,
-                        "created": created_ts,
-                        "model": model_id,
-                        "choices": [choice],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-            except ConcurrentGenerationError:
-                err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
-                yield f"data: {json.dumps(err)}\n\n"
-                return
-            except SaklasError as e:
-                status, msg = e.user_message()
-                err_type = (
-                    "conflict" if status == 409
-                    else "invalid_request_error" if 400 <= status < 500
-                    else "server_error"
-                )
-                err = {
-                    "error": {
-                        "message": msg,
-                        "type": err_type,
-                        "code": status,
-                    }
+        except ConcurrentGenerationError:
+            err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
+            yield f"data: {json.dumps(err)}\n\n"
+            return
+        except SaklasError as e:
+            status, msg = e.user_message()
+            err_type = (
+                "conflict" if status == 409
+                else "invalid_request_error" if 400 <= status < 500
+                else "server_error"
+            )
+            err = {
+                "error": {
+                    "message": msg,
+                    "type": err_type,
+                    "code": status,
                 }
-                yield f"data: {json.dumps(err)}\n\n"
-                return
-
-            finish_reason = session._gen_state.finish_reason
-            final_choice: dict[str, Any] = {
-                "index": 0, **empty_delta, "finish_reason": finish_reason,
             }
-            mf_agg = _manifold_reading_aggregate(session)
-            if mf_agg:
-                final_choice["x-saklas-manifold-readings"] = mf_agg
-            final = {
-                "id": rid,
-                "object": object_type,
-                "created": created_ts,
-                "model": model_id,
-                "choices": [final_choice],
-                "probe_readings": _probe_reading_dict(session),
+            yield f"data: {json.dumps(err)}\n\n"
+            return
+
+        finish_reason = session._gen_state.finish_reason
+        final_choice: dict[str, Any] = {
+            "index": 0, **empty_delta, "finish_reason": finish_reason,
+        }
+        mf_agg = _manifold_reading_aggregate(session)
+        if mf_agg:
+            final_choice["x-saklas-manifold-readings"] = mf_agg
+        final = {
+            "id": rid,
+            "object": object_type,
+            "created": created_ts,
+            "model": model_id,
+            "choices": [final_choice],
+            "probe_readings": _probe_reading_dict(session),
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+
+        if include_usage and session._last_result is not None:
+            usage_chunk = {
+                "id": rid, "object": object_type, "created": created_ts,
+                "model": model_id, "choices": [],
+                "usage": _usage_dict(session._last_result),
             }
-            yield f"data: {json.dumps(final)}\n\n"
+            yield f"data: {json.dumps(usage_chunk)}\n\n"
 
-            if include_usage and session._last_result is not None:
-                usage_chunk = {
-                    "id": rid, "object": object_type, "created": created_ts,
-                    "model": model_id, "choices": [],
-                    "usage": _usage_dict(session._last_result),
-                }
-                yield f"data: {json.dumps(usage_chunk)}\n\n"
-
-            yield "data: [DONE]\n\n"
-
-
-def _profile_top_layers(profile: dict[int, Any], n: int = 5) -> list[tuple[int, float]]:
-    """Return top-n profile layers sorted by baked magnitude descending.
-
-    Since shares are baked into tensor magnitudes, ||vec|| is the same
-    "how much does this layer steer per unit alpha" quantity that
-    per-layer scores used to encode.
-    """
-    return sorted(
-        ((idx, float(vec.norm().item())) for idx, vec in profile.items()),
-        key=lambda x: x[1], reverse=True,
-    )[:n]
+        yield "data: [DONE]\n\n"
 
 
 # ---------------------------------------------------------------------------

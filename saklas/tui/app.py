@@ -707,47 +707,56 @@ class SaklasApp(App[None]):
         chat.add_system_message("System prompt set.")
         self._refresh_gen_config()
 
-    def _handle_temp(self, arg: str) -> None:
+    def _set_config_value(
+        self,
+        attr: str,
+        raw: str,
+        *,
+        cast: "Callable[[str], Any]",
+        label: str,
+    ) -> None:
+        """Shared body for the scalar ``SamplingConfig`` handlers.
+
+        Empty ``raw`` prints the current value; otherwise ``cast`` parses
+        and validates it (a ``ValueError`` from ``cast`` is the
+        "invalid" path), the session config is replaced, a confirmation
+        is printed, and the generation-config panel refreshes.  ``label``
+        is the human-readable name reused across all three messages —
+        ``"<label>: <cur>"``, ``"Invalid <label-lower> value"``, and
+        ``"<label> set to <val>"``.
+        """
         chat = self._chat_panel
-        if not arg:
-            chat.add_system_message(f"Temperature: {self._session.config.temperature}")
+        if not raw:
+            chat.add_system_message(
+                f"{label}: {getattr(self._session.config, attr)}"
+            )
             return
         try:
-            val = max(0.0, float(arg))
+            val = cast(raw)
         except ValueError:
-            chat.add_system_message("Invalid temperature value")
+            chat.add_system_message(f"Invalid {label.lower()} value")
             return
-        self._session.config = replace(self._session.config, temperature=val)
-        chat.add_system_message(f"Temperature set to {val}")
+        self._session.config = replace(self._session.config, **{attr: val})
+        chat.add_system_message(f"{label} set to {val}")
         self._refresh_gen_config()
+
+    def _handle_temp(self, arg: str) -> None:
+        self._set_config_value(
+            "temperature", arg,
+            cast=lambda s: max(0.0, float(s)), label="Temperature",
+        )
 
     def _handle_top_p(self, arg: str) -> None:
-        chat = self._chat_panel
-        if not arg:
-            chat.add_system_message(f"Top-p: {self._session.config.top_p}")
-            return
-        try:
-            val = max(0.0, min(1.0, float(arg)))
-        except ValueError:
-            chat.add_system_message("Invalid top-p value")
-            return
-        self._session.config = replace(self._session.config, top_p=val)
-        chat.add_system_message(f"Top-p set to {val}")
-        self._refresh_gen_config()
+        self._set_config_value(
+            "top_p", arg,
+            cast=lambda s: max(0.0, min(1.0, float(s))), label="Top-p",
+        )
 
     def _handle_max(self, arg: str) -> None:
-        chat = self._chat_panel
-        if not arg:
-            chat.add_system_message(f"Max tokens: {self._session.config.max_new_tokens}")
-            return
-        try:
-            val = max(1, int(arg))
-        except ValueError:
-            chat.add_system_message("Invalid max tokens value")
-            return
-        self._session.config = replace(self._session.config, max_new_tokens=val)
-        chat.add_system_message(f"Max tokens set to {val}")
-        self._refresh_gen_config()
+        self._set_config_value(
+            "max_new_tokens", arg,
+            cast=lambda s: max(1, int(s)), label="Max tokens",
+        )
 
     def _handle_help(self, _arg: str) -> None:
         self._chat_panel.add_system_message(
@@ -997,70 +1006,56 @@ class SaklasApp(App[None]):
             f"Extracting '{display}'{suffix}{variant_note}{role_note}..."
         )
 
-        def _worker():
+        def _work() -> None:
             def _progress(msg: str) -> None:
                 self.call_from_thread(self._steer_status, msg)
-            try:
-                # Bare ``--sae`` (variant == "sae") routes the load through
-                # session autoload rather than a fresh PCA extract — it
-                # means "use the unique SAE variant that's already on disk".
-                # Ambiguous / missing cases surface via the session errors.
-                if variant == "sae" and sae_release is None:
-                    autoload_key = (
-                        concept if namespace is None
-                        else f"{namespace}/{concept}"
+            # Bare ``--sae`` (variant == "sae") routes the load through
+            # session autoload rather than a fresh PCA extract — it
+            # means "use the unique SAE variant that's already on disk".
+            # Ambiguous / missing cases surface via the session errors.
+            if variant == "sae" and sae_release is None:
+                autoload_key = (
+                    concept if namespace is None
+                    else f"{namespace}/{concept}"
+                )
+                self._session._try_autoload_vector(autoload_key, variant="sae")
+                key = f"{autoload_key}:sae"
+                profile_dict = self._session._profiles.get(key)
+                if profile_dict is None:
+                    raise ValueError(
+                        f"no SAE variant loaded for '{autoload_key}' — "
+                        f"run `saklas vector extract {autoload_key} --sae <RELEASE>` "
+                        f"first, or pick a release with "
+                        f"`:sae-<release>` in the concept name."
                     )
-                    self._session._try_autoload_vector(autoload_key, variant="sae")
-                    key = f"{autoload_key}:sae"
-                    profile_dict = self._session._profiles.get(key)
-                    if profile_dict is None:
-                        raise ValueError(
-                            f"no SAE variant loaded for '{autoload_key}' — "
-                            f"run `saklas vector extract {autoload_key} --sae <RELEASE>` "
-                            f"first, or pick a release with "
-                            f"`:sae-<release>` in the concept name."
-                        )
-                    on_success(key, profile_dict, alpha)
-                    return
+                on_success(key, profile_dict, alpha)
+                return
 
-                extract_kwargs = {"baseline": baseline, "on_progress": _progress}
-                if sae_release is not None:
-                    extract_kwargs["sae"] = sae_release
-                if namespace is not None:
-                    extract_kwargs["namespace"] = namespace
-                if role is not None:
-                    extract_kwargs["role"] = role
-                # ``session.extract`` already returns the fully-qualified
-                # canonical name — including the ``:sae-<release>`` suffix
-                # when ``sae=`` was passed. Rebuilding it here would
-                # double-suffix the key and break every downstream
-                # ``/alpha`` / ``/unsteer`` / pole lookup.
-                canonical, profile = self._session.extract(concept, **extract_kwargs)
-                if namespace is not None:
-                    # Re-attach the namespace so the registered key matches
-                    # what the parser produced (so ``/alpha`` / ``/unsteer``
-                    # against the namespace-qualified form keep working).
-                    if ":" in canonical:
-                        bare, suffix = canonical.rsplit(":", 1)
-                        canonical = f"{namespace}/{bare}:{suffix}"
-                    else:
-                        canonical = f"{namespace}/{canonical}"
-                on_success(canonical, profile, alpha)
-            except SaklasError as e:
-                self.call_from_thread(self._steer_status, e.user_message()[1])
-            except ValueError as e:
-                self.call_from_thread(self._steer_status, str(e))
-            except Exception as e:
-                # AmbiguousVariantError / UnknownVariantError are KeyError/ValueError
-                # subclasses — either branch lands here. Surface cleanly.
-                self.call_from_thread(self._steer_status, f"{type(e).__name__}: {e}")
-            finally:
-                # Advance the queue drain so a queued ``/extract`` doesn't
-                # stall subsequent items — extract runs on a worker, not
-                # through the gen loop, so no natural ``done`` arrives.
-                self._ui_token_queue.put(("done", False))
+            extract_kwargs = {"baseline": baseline, "on_progress": _progress}
+            if sae_release is not None:
+                extract_kwargs["sae"] = sae_release
+            if namespace is not None:
+                extract_kwargs["namespace"] = namespace
+            if role is not None:
+                extract_kwargs["role"] = role
+            # ``session.extract`` already returns the fully-qualified
+            # canonical name — including the ``:sae-<release>`` suffix
+            # when ``sae=`` was passed. Rebuilding it here would
+            # double-suffix the key and break every downstream
+            # ``/alpha`` / ``/unsteer`` / pole lookup.
+            canonical, profile = self._session.extract(concept, **extract_kwargs)
+            if namespace is not None:
+                # Re-attach the namespace so the registered key matches
+                # what the parser produced (so ``/alpha`` / ``/unsteer``
+                # against the namespace-qualified form keep working).
+                if ":" in canonical:
+                    bare, suffix = canonical.rsplit(":", 1)
+                    canonical = f"{namespace}/{bare}:{suffix}"
+                else:
+                    canonical = f"{namespace}/{canonical}"
+            on_success(canonical, profile, alpha)
 
-        self.run_worker(_worker, thread=True)
+        self._run_worker_with_queue(_work)
 
     def _handle_steer(self, text: str) -> None:
         """Apply a steering expression — the shared grammar from
@@ -1362,34 +1357,24 @@ class SaklasApp(App[None]):
             return
         chat.add_system_message(f"Fitting manifold from {folder}...")
 
-        def _worker() -> None:
+        def _work() -> None:
             def _progress(msg: str) -> None:
                 self.call_from_thread(self._steer_status, msg)
-            try:
-                manifold = self._session.extract_manifold(
-                    folder, on_progress=_progress,
-                )
-                self.call_from_thread(
-                    self._steer_status,
-                    f"fitted manifold '{manifold.name}' "
-                    f"({len(manifold.layers)}L, "
-                    f"{len(manifold.node_labels)} nodes) — "
-                    f"steer it with `/steer <coeff> {manifold.name}%<coords>`",
-                )
-            except SaklasError as e:
-                self.call_from_thread(self._steer_status, e.user_message()[1])
-            except ValueError as e:
-                # ``fit_rbf_interpolant`` raises a bare ``ValueError`` on
-                # poisedness failure — not a ``SaklasError``.
-                self.call_from_thread(self._steer_status, str(e))
-            except Exception as e:
-                self.call_from_thread(
-                    self._steer_status, f"{type(e).__name__}: {e}",
-                )
-            finally:
-                self._ui_token_queue.put(("done", False))
+            # ``fit_rbf_interpolant`` raises a bare ``ValueError`` on
+            # poisedness failure — not a ``SaklasError``; the shared
+            # worker wrapper surfaces it as a plain string.
+            manifold = self._session.extract_manifold(
+                folder, on_progress=_progress,
+            )
+            self.call_from_thread(
+                self._steer_status,
+                f"fitted manifold '{manifold.name}' "
+                f"({len(manifold.layers)}L, "
+                f"{len(manifold.node_labels)} nodes) — "
+                f"steer it with `/steer <coeff> {manifold.name}%<coords>`",
+            )
 
-        self.run_worker(_worker, thread=True)
+        self._run_worker_with_queue(_work)
 
     def _handle_manifold_probe(self, text: str) -> None:
         """``/manifold-probe <selector>`` — attach a manifold probe.
@@ -1589,6 +1574,49 @@ class SaklasApp(App[None]):
                 self.call_from_thread(
                     self._steer_status, f"{type(e).__name__}: {e}",
                 )
+            finally:
+                self._ui_token_queue.put(("done", False))
+
+        self.run_worker(_worker, thread=True)
+
+    def _run_worker_with_queue(
+        self,
+        work: "Callable[[], Any]",
+        *,
+        on_error: "Callable[[BaseException], None] | None" = None,
+    ) -> None:
+        """Run ``work`` on a worker thread with the canonical
+        try/except/finally boilerplate the off-gen-loop handlers share.
+
+        Errors surface through ``_steer_status`` — ``SaklasError`` via its
+        ``user_message()``, ``ValueError`` as a bare string, anything else
+        as ``"<Type>: <msg>"`` — and the ``finally`` block enqueues a
+        ``("done", False)`` sentinel so the pending-queue drain keeps
+        advancing (these handlers run off the gen loop, so no natural
+        ``done`` arrives).  Pass ``on_error`` to override the default
+        error surfacing entirely.
+        """
+
+        def _worker() -> None:
+            try:
+                work()
+            except SaklasError as e:
+                if on_error is not None:
+                    on_error(e)
+                else:
+                    self.call_from_thread(self._steer_status, e.user_message()[1])
+            except ValueError as e:
+                if on_error is not None:
+                    on_error(e)
+                else:
+                    self.call_from_thread(self._steer_status, str(e))
+            except Exception as e:
+                if on_error is not None:
+                    on_error(e)
+                else:
+                    self.call_from_thread(
+                        self._steer_status, f"{type(e).__name__}: {e}"
+                    )
             finally:
                 self._ui_token_queue.put(("done", False))
 

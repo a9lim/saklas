@@ -766,13 +766,6 @@ def _fmt_position(position: tuple[float, ...] | str) -> str:
     return ",".join(f"{c:g}" for c in position)
 
 
-# Backwards-compat alias for the rename above — narrower callers still
-# pass strict coord tuples (e.g. the naturalness CLI's chord baseline)
-# and shouldn't care about the wider position type.
-def _fmt_coords(position: tuple[float, ...]) -> str:
-    return _fmt_position(position)
-
-
 def _merge_manifold(
     alphas: "dict[str, AlphaEntry]",
     manifold: str,
