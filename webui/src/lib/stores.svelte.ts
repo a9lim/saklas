@@ -96,6 +96,13 @@ export async function refreshSession(): Promise<void> {
   }
 }
 
+/** One-shot guard: the role boxes are client-sticky (they ride each send),
+ *  unlike the numeric sampling defaults which mirror server config on every
+ *  patch.  We seed them from the family's standard role labels exactly once,
+ *  on the first session-info load — re-seeding on later patches would clobber
+ *  a value the user typed. */
+let _roleDefaultsSeeded = false;
+
 /** Mirror the server's session.config defaults into the local
  * ``samplingState``.  The local store was previously pre-seeded with its
  * own constants (``max_tokens: 256`` etc.) which drifted away from the
@@ -104,7 +111,20 @@ export async function refreshSession(): Promise<void> {
  * was running against a 1024-token cap.  Sync once on every refresh so
  * the displayed cap matches what generation actually used. */
 function _hydrateSamplingFromInfo(): void {
-  const cfg = sessionState.info?.config;
+  const info = sessionState.info;
+  // Seed the sticky role boxes once, so they show e.g. ``user`` / ``model``
+  // instead of an empty ``—`` placeholder.  Only fills an empty box, so a
+  // value already in hand (typed before info landed) is never overwritten.
+  if (!_roleDefaultsSeeded && info) {
+    _roleDefaultsSeeded = true;
+    if (samplingState.user_role === "" && info.default_user_role) {
+      samplingState.user_role = info.default_user_role;
+    }
+    if (samplingState.assistant_role === "" && info.default_assistant_role) {
+      samplingState.assistant_role = info.default_assistant_role;
+    }
+  }
+  const cfg = info?.config;
   if (!cfg) return;
   if (typeof cfg.max_tokens === "number" && Number.isFinite(cfg.max_tokens)) {
     samplingState.max_tokens = cfg.max_tokens;
@@ -1712,14 +1732,30 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
       ? { return_top_k: samplingState.return_top_k }
       : {}),
     // Per-message role labels (roleplay scaffold) ride every send like
-    // ``seed`` — trimmed, empty = standard role (omitted).
-    ...(samplingState.user_role.trim()
-      ? { user_role: samplingState.user_role.trim() }
-      : {}),
-    ...(samplingState.assistant_role.trim()
-      ? { assistant_role: samplingState.assistant_role.trim() }
-      : {}),
+    // ``seed`` — trimmed.  Empty = standard role, omitted.  A value equal to
+    // the family's standard label (the box's seeded default) is *also* a
+    // no-op, so we omit it too: the node isn't stamped with a redundant label
+    // and the bubble keeps its structural heading.  Only a genuine override
+    // (a label the user changed away from the default) is sent.
+    ...roleOverride(samplingState.user_role, sessionState.info?.default_user_role, "user_role"),
+    ...roleOverride(
+      samplingState.assistant_role,
+      sessionState.info?.default_assistant_role,
+      "assistant_role",
+    ),
   };
+}
+
+/** ``{key: value}`` when ``raw`` is a non-empty label that differs from the
+ *  family default, else ``{}`` (treated as "use the standard role"). */
+function roleOverride(
+  raw: string,
+  fallback: string | null | undefined,
+  key: "user_role" | "assistant_role",
+): Partial<WSSampling> {
+  const value = raw.trim();
+  if (!value || value === fallback) return {};
+  return { [key]: value };
 }
 
 function buildSamplingPayload(): WSSampling | null {
@@ -2075,13 +2111,21 @@ function handleWsMessage(msg: WSServerMessage): void {
     }
     case "node_created": {
       // Pre-allocate the node so n-way regen render slots exist before
-      // token events tagged with this node_id arrive.  The full node
-      // body lands via a subsequent ``tree_mutated`` (added) event.
+      // token events tagged with this node_id arrive.  The full node body
+      // lands via a ``tree_mutated`` (added) event — which the server's
+      // forwarder actually enqueues *before* this ``node_created``.  So
+      // merge over any node already in hand rather than replacing it: a
+      // bare ``node_created`` payload omits ``role_label`` (among other
+      // fields), and ``upsertLoomNode`` is a full replace — a blind
+      // overwrite would wipe a custom role glyph back to the structural
+      // letter (U/A) until the next full-tree refetch (e.g. on click).
+      const existing = loomTree.nodes.get(msg.node_id);
       upsertLoomNode({
+        ...existing,
         id: msg.node_id,
         parent_id: msg.parent_id,
         role: msg.role,
-        text: loomTree.nodes.get(msg.node_id)?.text ?? "",
+        text: existing?.text ?? "",
       });
       if (msg.role === "assistant" && genStatus.active && !abState.processingAb) {
         adoptStreamingNode(msg.node_id);

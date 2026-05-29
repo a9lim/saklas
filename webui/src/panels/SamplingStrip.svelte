@@ -376,7 +376,7 @@
       ? "user-turn role label — sent with each message, stamped on that turn"
       : "user-role substitution unavailable for this model / mode"}
   >
-    <span class="label">user as</span>
+    <span class="label">user role</span>
     <input
       type="text"
       class="role-input"
@@ -395,7 +395,7 @@
       ? "assistant-turn role label — the persona the model generates the reply under"
       : "assistant-role substitution unavailable for this model / mode"}
   >
-    <span class="label">reply as</span>
+    <span class="label">assistant role</span>
     <input
       type="text"
       class="role-input"

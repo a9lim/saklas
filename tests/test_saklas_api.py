@@ -187,6 +187,10 @@ class TestSessions:
         body = resp.json()
         assert body["role_substitution_supported"] is True
         assert body["user_role_supported"] is True
+        # Gemma's standard assistant label is ``model`` (not ``assistant``);
+        # the webui seeds the role boxes with these so they show live defaults.
+        assert body["default_assistant_role"] == "model"
+        assert body["default_user_role"] == "user"
 
     def test_clear(self, session_and_client):
         session, client = session_and_client

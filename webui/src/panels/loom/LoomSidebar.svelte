@@ -652,10 +652,34 @@
     void loomNavigate(node.id);
   }
 
+  /** True when a keydown originated in a text-entry element (an ``<input>``,
+   *  ``<textarea>``, ``<select>``, or a ``contenteditable`` host) — used to
+   *  keep the sidebar's bare-key nav shortcuts from stealing keystrokes meant
+   *  for a nested field. */
+  function _isEditableTarget(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null;
+    if (!el) return false;
+    const tag = el.tagName;
+    return (
+      tag === "INPUT" ||
+      tag === "TEXTAREA" ||
+      tag === "SELECT" ||
+      el.isContentEditable
+    );
+  }
+
   function onSidebarKey(ev: KeyboardEvent): void {
     // Only fire when the sidebar (or one of its children) is focused.
     if (modal.kind !== null || menu.open) return;
     const k = ev.key;
+    // The bare-key nav shortcuts (j/k/h/l/s/n//) bubble up from every child
+    // of the sidebar — including its own filter box and the SamplingStrip's
+    // role inputs, which live at the bottom of this column.  Letters like
+    // ``s`` / ``n`` / ``h`` / ``l`` and ``/`` are valid text there, so a
+    // keystroke originating in an editable element must fall through to the
+    // field instead of being hijacked (and ``preventDefault``-swallowed) as
+    // a tree command.  Escape still passes so it can defocus the field.
+    if (k !== "Escape" && _isEditableTarget(ev.target)) return;
     if (k === "j") { ev.preventDefault(); navSibling(+1); return; }
     if (k === "k") { ev.preventDefault(); navSibling(-1); return; }
     if (k === "h") { ev.preventDefault(); navUpDown(-1); return; }

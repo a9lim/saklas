@@ -411,6 +411,25 @@ def _role_support(session: SaklasSession) -> tuple[bool, bool]:
     )
 
 
+def _default_role_labels(session: SaklasSession) -> tuple[str | None, str | None]:
+    """``(assistant_label, user_label)`` — the family's *standard* role
+    strings (e.g. Gemma ``model`` / ``user``, ChatML ``assistant`` / ``user``),
+    or ``None`` when the family can't substitute that side.  The webui seeds
+    the role boxes with these so they show the live defaults rather than an
+    empty placeholder."""
+    from saklas.core.role_templates import ROLE_HEADERS, USER_ROLE_HEADERS
+
+    mt = _session_model_type(session)
+    if mt is None:
+        return (None, None)
+    asst = ROLE_HEADERS.get(mt)
+    usr = USER_ROLE_HEADERS.get(mt)
+    return (
+        asst.label if asst is not None else None,
+        usr.label if usr is not None else None,
+    )
+
+
 def _device_dtype(session: SaklasSession) -> tuple[str, str]:
     info = session.model_info or {}
     device = str(info.get("device", getattr(session, "_device", "")))
@@ -436,8 +455,10 @@ def _session_info(
     default_expr = str(default_steering) if default_steering is not None else None
     try:
         assistant_role_ok, user_role_ok = _role_support(session)
+        default_assistant_role, default_user_role = _default_role_labels(session)
     except Exception:
         assistant_role_ok = user_role_ok = False
+        default_assistant_role = default_user_role = None
     return {
         "id": _SINGLE_SESSION_ID,
         "model_id": session.model_id,
@@ -454,6 +475,8 @@ def _session_info(
         "default_steering": default_expr,
         "role_substitution_supported": assistant_role_ok,
         "user_role_supported": user_role_ok,
+        "default_assistant_role": default_assistant_role,
+        "default_user_role": default_user_role,
     }
 
 

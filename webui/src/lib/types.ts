@@ -78,6 +78,15 @@ export interface SessionInfo {
   /** True iff the family supports *user*-role substitution. Same family
    *  set as the assistant side today. Treat ``undefined`` as ``false``. */
   user_role_supported?: boolean;
+  /** The family's *standard* assistant-role label (e.g. Gemma ``model``,
+   *  ChatML ``assistant``), or ``null``/``undefined`` when the family can't
+   *  substitute the assistant side.  Seeds the assistant-role box so it
+   *  shows the live default; a box value equal to this is treated as "no
+   *  override" on send. */
+  default_assistant_role?: string | null;
+  /** The family's *standard* user-role label (``user`` everywhere today),
+   *  or ``null``/``undefined`` when unsupported.  Seeds the user-role box. */
+  default_user_role?: string | null;
 }
 
 // ----------------------------------------------------- manifolds --
