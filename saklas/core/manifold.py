@@ -77,6 +77,17 @@ DEFAULT_N_COMPONENTS = 64
 # never by the steering hot path -- the hook steers to a fixed position.
 DEFAULT_INVERSION_RESOLUTION = 512
 
+# Hard ceiling on the grid-scan candidate count (res**n) inside
+# ``invert_parameterization``.  Without it, a high-dimensional manifold
+# explodes: the bundled 8-D ``personas`` at the old per-axis res of 8
+# meant 8**8 = 16.7M candidates and a ~50 GB broadcast inside
+# ``eval_rbf`` -- and ``ManifoldMonitor.score_aggregate`` calls the
+# inverter once per layer on *every* generation, spiking unified memory
+# to ~2x the model.  Capping the candidate budget keeps each call bounded
+# (a few hundred MB) regardless of intrinsic dimension; the scan is
+# already approximate for n >= 3 so this only coarsens an coarse landing.
+_INVERSION_GRID_BUDGET = 100_000
+
 
 # ================================================================ domains ===
 #
@@ -1631,13 +1642,16 @@ def invert_parameterization(
     n = domain.intrinsic_dim
     if n <= 2:
         res = resolution
-    elif n == 3:
-        res = 24
     else:
-        res = 8
+        # Cap total candidates (res**n) at the grid budget so the scan
+        # never allocates a giant candidate set / RBF kernel. floor of the
+        # n-th root keeps res**n <= budget; min() keeps the per-axis grid
+        # no finer than requested.
+        res = max(2, min(resolution, int(_INVERSION_GRID_BUDGET ** (1.0 / n))))
         log.info(
-            "invert_parameterization: n=%d domain, grid coarsened to %d "
-            "per axis — naturalness metric is approximate", n, res,
+            "invert_parameterization: n=%d domain, grid capped to %d per "
+            "axis (%d candidates) — landing is approximate",
+            n, res, res ** n,
         )
 
     cand = domain.sample_positions(res).to(
