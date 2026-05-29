@@ -155,6 +155,85 @@ _warned: set[str] = set()
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2,
                torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
 
+# safetensors dtype tag -> torch dtype, for the manual (mmap-free) reader.
+_ST_DTYPES: dict[str, torch.dtype] = {
+    "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+    "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+    "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8,
+    "BOOL": torch.bool, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+}
+
+
+def _read_safetensors_header(path: str) -> tuple[dict[str, Any], int]:
+    """Parse a safetensors header: ``(tensor_metadata, data_section_offset)``.
+
+    The format is an 8-byte little-endian header length, that many bytes
+    of JSON (name → ``{dtype, shape, data_offsets}``), then the packed
+    tensor data.  The ``__metadata__`` entry is dropped.
+    """
+    import json
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+    header.pop("__metadata__", None)
+    return header, 8 + n
+
+
+def _open_uncached(path: str) -> int:
+    """Open ``path`` read-only, asking the OS not to cache its pages.
+
+    On Apple Silicon the page cache shares the same physical RAM as MPS,
+    so mmap-reading a 62 GB checkpoint fills the cache *on top of* the
+    61 GB on-device model — ~2× the model size, which forces the unified
+    pool into compression/swap.  ``F_NOCACHE`` (macOS) reads straight
+    through without populating the unified buffer cache, holding the
+    host-side transient to a single tensor.  Elsewhere the page cache is
+    reclaimable and doesn't compete with discrete VRAM, so a plain fd is
+    fine.
+    """
+    import os
+    import sys
+    fd = os.open(path, os.O_RDONLY)
+    if sys.platform == "darwin":
+        import fcntl
+        try:
+            fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+        except OSError:
+            pass
+    return fd
+
+
+def _read_st_tensor(fd: int, header: dict[str, Any], data_start: int, name: str) -> torch.Tensor:
+    """Read one tensor by name from an already-open safetensors fd.
+
+    ``pread`` at the tensor's recorded offset, wrap the bytes as a CPU
+    tensor (zero-copy view of the freshly-read buffer), reshape.  No mmap,
+    so with an :func:`_open_uncached` fd the bytes never enter the page
+    cache.
+    """
+    import os
+    import warnings
+    meta = header[name]
+    start, end = meta["data_offsets"]
+    nbytes = end - start
+    offset = data_start + start
+    # A single pread can't exceed INT_MAX bytes on macOS (EINVAL), and a
+    # bf16 embedding is ~2.8 GB, so read in capped chunks.
+    _CHUNK = 1 << 28  # 256 MiB
+    chunks: list[bytes] = []
+    got = 0
+    while got < nbytes:
+        block = os.pread(fd, min(_CHUNK, nbytes - got), offset + got)
+        if not block:
+            break
+        chunks.append(block)
+        got += len(block)
+    buf = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # frombuffer warns on read-only bytes
+        flat = torch.frombuffer(buf, dtype=_ST_DTYPES[meta["dtype"]])
+    return flat.reshape(meta["shape"])
+
 
 class _NoTextWeightsExtracted(RuntimeError):
     """No text-model weights matched the ``language_model.`` layout.
@@ -194,16 +273,19 @@ def _load_text_from_multimodal(
       ``from_pretrained(device_map={"": "mps"})`` path stages the entire
       state dict in CPU RAM *and* copies it to MPS before freeing the CPU
       side — ~2× the model size at peak (>128 GB for gemma-4-31B).
-    * **Tensor-by-tensor streaming** via ``safe_open`` (lazy mmap) keeps
-      the host-side transient to a single tensor rather than a whole
-      shard — a 31 GB gemma-4 shard never fully materializes in RAM.
+    * **Cache-bypassing reads** — each shard is read with ``pread`` on an
+      :func:`_open_uncached` fd (``F_NOCACHE`` on macOS) rather than
+      mmap'd via ``safe_open``.  mmap would fault the whole 62 GB
+      checkpoint into the page cache, which on unified memory collides
+      with the on-device model; reading straight through holds the
+      host-side transient to a single tensor.
 
     Raises :class:`_NoTextWeightsExtracted` if nothing matched, so the
     caller can fall back to a full multimodal load.
     """
     import gc
     import json
-    from safetensors import safe_open
+    import os
     from transformers.utils import (
         cached_file,
         SAFE_WEIGHTS_INDEX_NAME,
@@ -244,30 +326,37 @@ def _load_text_from_multimodal(
             # skip it. In practice the single-shard path raises before here.
             if sf is None:
                 continue
-            with safe_open(sf, framework="pt", device="cpu") as f:
-                keyset = set(f.keys())
-                for k in keyset:
-                    if "language_model." not in k:
+            header, data_start = _read_safetensors_header(sf)
+            # Read in on-disk offset order so an uncached fd still streams
+            # sequentially (no per-tensor seek thrash).
+            names = sorted(header, key=lambda nm: header[nm]["data_offsets"][0])
+            fd = _open_uncached(sf)
+            try:
+                for name in names:
+                    if "language_model." not in name:
                         continue  # vision tower / projector — skip
                     # Drop the language_model. segment to recover the text
                     # model's own parameter name. Works for both layouts:
                     #   language_model.model.layers… -> model.layers…
                     #   model.language_model.layers… -> model.layers…
-                    key = k.replace("language_model.", "", 1)
+                    key = name.replace("language_model.", "", 1)
                     if key.endswith(".weight_scale_inv") or key.endswith(".activation_scale"):
                         continue
                     target = targets.get(key)
                     if target is None:
                         continue
-                    v = f.get_tensor(k)
+                    v = _read_st_tensor(fd, header, data_start, name)
                     # Dequantize FP8: real_weight = weight.to(dtype) * scale
                     if v.dtype in _FP8_DTYPES:
-                        sk = k + "_scale_inv"
-                        scale = f.get_tensor(sk) if sk in keyset else None
+                        sk = name + "_scale_inv"
+                        scale = (_read_st_tensor(fd, header, data_start, sk)
+                                 if sk in header else None)
                         v = v.to(dtype) * scale.to(dtype) if scale is not None else v.to(dtype)
                     target.copy_(v)  # CPU→device cast + copy into preallocated param
                     matched += 1
                     del v
+            finally:
+                os.close(fd)
             if device == "mps":
                 torch.mps.empty_cache()
             gc.collect()
