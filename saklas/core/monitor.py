@@ -241,6 +241,57 @@ class TraitMonitor:
         """
         return self._score_probes(hidden_per_layer, accumulate=False)
 
+    def score_single_token_tensor(
+        self, hidden_per_layer: dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        """On-device ``[P]`` aggregate row for one token — no host sync.
+
+        Exactly the math :meth:`_score_probes` does up to ``num/den``
+        (per-layer ``V @ h_unit`` weighted accumulate, ``den.clamp_(min=
+        1e-8)``), but returns the result as an on-device tensor in
+        ``self._cache_probe_keys`` order instead of ``.cpu().tolist()``.
+        Read-only: no history/stats accumulation, zero ``.item()``/
+        ``.cpu()`` calls.
+
+        Powers the session's incremental per-token capture path
+        (``_finalize_generation`` stacks one row per generated token and
+        does a single ``.cpu().tolist()`` at the end, reproducing
+        :meth:`score_per_token` bit-for-bit while keeping only the latest
+        hidden per layer in device memory).
+
+        The empty-hidden / no-probes case returns a zeros ``[P]`` tensor
+        on a sensible device (the cache device if a cache has been built,
+        else CPU).
+        """
+        probe_keys = (
+            self._cache_probe_keys
+            if self._cache_device is not None
+            else tuple(self._raw_profiles.keys())
+        )
+        n_probes = len(probe_keys)
+        if not hidden_per_layer or n_probes == 0:
+            device = self._cache_device or torch.device("cpu")
+            return torch.zeros((n_probes,), device=device, dtype=torch.float32)
+
+        device = next(iter(hidden_per_layer.values())).device
+        self._ensure_cache(device)
+        probe_keys = self._cache_probe_keys
+        n_probes = len(probe_keys)
+
+        num = torch.zeros((n_probes,), device=device, dtype=torch.float32)
+        den = torch.zeros((n_probes,), device=device, dtype=torch.float32)
+        for layer_idx, h in hidden_per_layer.items():
+            entry = self._layer_cache.get(layer_idx)
+            if entry is None:
+                continue
+            V, W = entry  # V: (P, D), W: (P,)
+            h_unit = self._normalize_hidden(layer_idx, h.float())  # (D,)
+            sims = V @ h_unit  # (P,)
+            num.add_(W * sims)
+            den.add_(W)
+        den.clamp_(min=1e-8)
+        return num / den
+
     def score_single_token_per_layer(
         self,
         hidden_per_layer: dict[int, torch.Tensor],
@@ -818,12 +869,15 @@ class ManifoldMonitor:
             else:
                 w_shared = {idx: ev.get(idx, 0.0) / total_w for idx in shared}
 
-            # Per-node EV-weighted distance accumulator (CPU scalars —
-            # K is on the order of tens, the sync cost is one
-            # ``.tolist()`` per layer per probe).
+            # Per-node EV-weighted distance accumulated ON-DEVICE as a
+            # ``[K]`` tensor (K on the order of tens) and the EV-weighted
+            # fraction as an on-device scalar.  Mirrors ``TraitMonitor``'s
+            # single-sync discipline: zero ``.item()``/``.tolist()`` inside
+            # the per-layer loop, one ``.cpu().tolist()`` + one ``.item()``
+            # per probe after the loop.
             K = probe.node_values_reduced[shared[0]].shape[0]
-            dist_acc = [0.0] * K
-            frac_sum = 0.0
+            dist_acc: torch.Tensor | None = None
+            frac_acc: torch.Tensor | None = None
             for layer_idx in shared:
                 sub = manifold.layers[layer_idx]
                 h = hidden_per_layer[layer_idx].to(torch.float32)
@@ -834,13 +888,18 @@ class ManifoldMonitor:
                 mean = sub.mean.to(device=h.device, dtype=torch.float32)
                 basis = sub.basis.to(device=h.device, dtype=torch.float32)
                 h_par_c, h_perp = decompose(h, mean, basis)
-                # Subspace fraction.
+                w = w_shared[layer_idx]
+                # Subspace fraction — accumulate on-device, no per-layer sync.
                 num = torch.linalg.vector_norm(h_par_c)
                 denom = torch.linalg.vector_norm(h - mean).clamp(
                     min=_FRACTION_EPSILON,
                 )
-                frac = float((num / denom).clamp(min=0.0, max=1.0).item())
-                frac_sum += w_shared[layer_idx] * frac
+                frac = (num / denom).clamp(min=0.0, max=1.0)
+                frac_contrib = w * frac
+                frac_acc = (
+                    frac_contrib if frac_acc is None
+                    else frac_acc + frac_contrib
+                )
                 # Per-node distance in reduced-subspace coords.  ``h_par_c``
                 # in world-space coords; project to reduced via the same
                 # ``basis`` so the cdist runs in R-dim, K is small.
@@ -849,15 +908,20 @@ class ManifoldMonitor:
                     device=h.device, dtype=torch.float32,
                 )  # (K, R)
                 dists = torch.cdist(h_reduced, v_reduced).reshape(-1)  # (K,)
-                dist_list = dists.cpu().tolist()
-                w = w_shared[layer_idx]
-                for k in range(K):
-                    dist_acc[k] += w * dist_list[k]
+                contrib = w * dists
+                dist_acc = (
+                    contrib if dist_acc is None else dist_acc + contrib
+                )
+            # Single sync per probe: pull the accumulated distances + the
+            # fraction off-device together, then sort host-side.
+            assert dist_acc is not None and frac_acc is not None  # shared ≠ []
+            dist_list = dist_acc.cpu().tolist()
+            frac_sum = float(frac_acc.item())
             # Top-N by ascending EV-weighted distance.
-            order = sorted(range(K), key=lambda k: dist_acc[k])
+            order = sorted(range(K), key=lambda k: dist_list[k])
             top = order[: probe.top_n]
             nearest = [
-                (manifold.node_labels[k], dist_acc[k]) for k in top
+                (manifold.node_labels[k], dist_list[k]) for k in top
             ]
             out[name] = ManifoldTokenReading(
                 fraction=frac_sum,

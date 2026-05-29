@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any, Literal
 
 import torch
@@ -107,27 +108,82 @@ class HiddenCapture:
     Hot-path discipline: hooks copy a (dim,) slice via ``detach().clone()``
     (device-local, no sync) and append to a per-layer Python list. Stacking and
     fp32 casting happen after detach, not in the hot path.
+
+    Incremental mode (``set_incremental``): for the common monitored case
+    the full ``[T, D]`` stack is never needed — the session scores each
+    token as it is produced and keeps only the per-token score rows. In
+    this mode each per-layer hook OVERWRITES its bucket (length-1) instead
+    of appending, so device memory stays O(layers·D) for the whole
+    generation, and a ``step_sink`` callback fires once per forward (after
+    the highest hooked layer stores its slice) with the latest per-layer
+    slice. ``latest_per_layer()`` and the ``bucket[-1]`` reads the
+    streaming tap relies on keep working — a length-1 bucket's ``[-1]`` is
+    still the latest. Non-incremental mode is byte-identical to the append
+    path: ``stacked()`` returns the full ``[T, D]``.
     """
 
     def __init__(self) -> None:
         self._per_layer: dict[int, list[torch.Tensor]] = {}
         self._handles: list[Any] = []
+        # Incremental-mode state. ``_incremental`` flips the per-layer
+        # hook from append to overwrite; ``_step_sink`` is invoked once
+        # per forward after the highest hooked layer (``_max_layer``)
+        # stores this step's slice. All three reset on attach/clear.
+        self._incremental: bool = False
+        self._step_sink: Callable[[dict[int, torch.Tensor]], None] | None = None
+        self._max_layer: int | None = None
 
     def attach(
         self, layers: "torch.nn.ModuleList", layer_indices: list[int]
     ) -> None:
         self._per_layer = {idx: [] for idx in layer_indices}
         self._handles = []
+        # Attach resets incremental state — a fresh capture starts in the
+        # append (full-retention) mode. ``set_incremental`` must be called
+        # after attach to opt into incremental scoring for this gen.
+        self._incremental = False
+        self._step_sink = None
+        self._max_layer = None
         for idx in layer_indices:
             bucket = self._per_layer[idx]
 
-            def _make(bucket_ref: list[torch.Tensor]) -> Any:
+            def _make(bucket_ref: list[torch.Tensor], layer_idx: int) -> Any:
                 def _hook(module: Any, input: Any, output: Any) -> None:
                     h = output if isinstance(output, torch.Tensor) else output[0]
-                    bucket_ref.append(h[0, -1, :].detach().clone())
+                    slice_ = h[0, -1, :].detach().clone()
+                    if self._incremental:
+                        # Overwrite — keep the bucket length-1 so device
+                        # memory stays O(layers·D). ``[-1]`` reads (tap,
+                        # latest_per_layer) still return the latest slice.
+                        bucket_ref[:] = (slice_,)
+                        # The highest hooked layer fires last in the
+                        # forward (forward hooks run in layer-execution
+                        # order), so by the time it stores its slice every
+                        # hooked layer holds this step's value. Score now.
+                        if layer_idx == self._max_layer and self._step_sink is not None:
+                            self._step_sink(self.latest_per_layer())
+                    else:
+                        bucket_ref.append(slice_)
                 return _hook
 
-            self._handles.append(layers[idx].register_forward_hook(_make(bucket)))
+            self._handles.append(
+                layers[idx].register_forward_hook(_make(bucket, idx)),
+            )
+
+    def set_incremental(
+        self, step_sink: Callable[[dict[int, torch.Tensor]], None],
+    ) -> None:
+        """Enable incremental mode: overwrite buckets + per-step scoring.
+
+        Must be called after :meth:`attach`. Flips the per-layer hook from
+        append to length-1 overwrite and records the highest hooked layer
+        as the per-forward sink trigger. ``step_sink`` receives
+        :meth:`latest_per_layer` once per forward, after every hooked
+        layer has stored this step's slice.
+        """
+        self._incremental = True
+        self._step_sink = step_sink
+        self._max_layer = max(self._per_layer) if self._per_layer else None
 
     def detach(self) -> None:
         for h in self._handles:
@@ -137,6 +193,9 @@ class HiddenCapture:
     def clear(self) -> None:
         self._per_layer = {}
         self._handles = []
+        self._incremental = False
+        self._step_sink = None
+        self._max_layer = None
 
     def stacked(self) -> dict[int, torch.Tensor]:
         """Return per-layer ``(n_captures, dim)`` tensors in the capture dtype.
@@ -815,11 +874,16 @@ class SteeringManager:
         alpha: float,
         trigger: Trigger = Trigger.BOTH,
     ) -> None:
+        # Shares are computed lazily in ``apply_to_model`` — only the
+        # angular path reads them, and ``_profile_layer_shares`` does a
+        # host ``.item()`` sync per layer.  Additive reads ``||baked_L||``
+        # back out of the tensor magnitude and never touches shares, so
+        # eager computation here would burn the sync on every add for
+        # nothing under the default-after-mode-flip additive case.
         self.vectors[name] = {
             "profile": profile,
             "alpha": alpha,
             "trigger": trigger,
-            "shares": _profile_layer_shares(profile),
         }
 
     def add_ablation(
@@ -951,7 +1015,10 @@ class SteeringManager:
                 # to ``|α|·θ_max``, matching the additive-path intuition
                 # that high-signal layers carry most of the steering and
                 # the user-facing α is bounded in the same band.
-                shares: dict[int, float] = v.get("shares", {})
+                # Compute shares here (not at add_vector) — this is the
+                # only path that reads them, and the computation host-syncs
+                # per layer.
+                shares: dict[int, float] = _profile_layer_shares(profile)
                 if not shares:
                     # Profile is degenerate (all-zero); skip silently.
                     continue

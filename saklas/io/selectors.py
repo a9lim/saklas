@@ -23,7 +23,7 @@ from typing import Optional
 
 from saklas.core.errors import SaklasError
 from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata
-from saklas.io.paths import vectors_dir
+from saklas.io.paths import manifolds_dir, vectors_dir
 
 _VARIANT_REGEX = _re.compile(r"^(raw|pca|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?)$")
 
@@ -103,10 +103,19 @@ def parse(raw: str) -> Selector:
 # on cache_ops to call `invalidate()` after any mutation.
 _concepts_cache: dict[Path, list[ResolvedConcept]] = {}
 
+# Module-level cache keyed by manifolds root path, mirroring _concepts_cache.
+# resolve_manifold_label() walks every installed manifold from disk on every
+# call; the steering grammar invokes it on plain bare slugs, so a compound
+# expression resolves it repeatedly. We cache the full all-namespace walk once
+# (the namespace=None form) and filter in-memory, exactly as resolve() does for
+# concepts. Cleared in invalidate() so manifold install/refresh/remove drops it.
+_manifold_labels_cache: dict[Path, list["ResolvedManifoldLabel"]] = {}
+
 
 def invalidate() -> None:
-    """Drop the cached concept walk. Call after install/delete/refresh."""
+    """Drop cached concept + manifold-label walks. Call after install/delete/refresh."""
     _concepts_cache.clear()
+    _manifold_labels_cache.clear()
 
 
 def _all_concepts() -> list[ResolvedConcept]:
@@ -284,14 +293,49 @@ class ResolvedManifoldLabel:
         return f"{self.namespace}/{self.manifold_name}"
 
 
+def _all_manifold_labels() -> list[ResolvedManifoldLabel]:
+    """Flattened (namespace, manifold, label) index over every installed manifold.
+
+    Memoized on ``manifolds_dir()`` like :func:`_all_concepts`; callers filter
+    in-memory by namespace + label. We cache the all-namespace walk (rather than
+    keying the cache by namespace too) so a single entry serves every lookup,
+    matching how ``resolve()`` filters the cached concept walk — bare-name
+    resolution dominates and a namespace-scoped query just narrows the same list.
+    """
+    root = manifolds_dir()
+    cached = _manifold_labels_cache.get(root)
+    if cached is not None:
+        return cached
+    # Lazy import — selectors.py lives under io/ and shouldn't import
+    # at module-load time from a peer that may import it back.
+    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
+
+    out: list[ResolvedManifoldLabel] = []
+    try:
+        manifolds = list(iter_manifold_folders())
+    except ManifoldFormatError:
+        # A single malformed folder shouldn't poison the whole resolve;
+        # ``iter_manifold_folders`` already skips them, but defensive.
+        _manifold_labels_cache[root] = out
+        return out
+    for ns, mf in manifolds:
+        for label in mf.node_labels:
+            out.append(ResolvedManifoldLabel(
+                namespace=ns, manifold_name=mf.name, label=label,
+            ))
+    _manifold_labels_cache[root] = out
+    return out
+
+
 def resolve_manifold_label(
     label: str, *, namespace: Optional[str] = None,
 ) -> Optional[ResolvedManifoldLabel]:
     """Resolve a bare label to (namespace, manifold, label) — or ``None``.
 
-    Walks every installed manifold (or every manifold inside
-    ``namespace`` when set) for one whose ``node_labels`` contains
-    ``label``.  Returns a :class:`ResolvedManifoldLabel` on a single
+    Scans the memoized manifold-label index (every installed manifold, or
+    every manifold inside ``namespace`` when set) for one whose
+    ``node_labels`` contains ``label``.  Returns a
+    :class:`ResolvedManifoldLabel` on a single
     match, ``None`` when nothing matches (the caller falls through to
     other resolution tiers — e.g. a fresh concept), and raises
     :class:`AmbiguousSelectorError` when multiple manifolds carry a
@@ -305,26 +349,12 @@ def resolve_manifold_label(
     fitted for the loaded model.  A persona manifold authored on
     disk but never fitted still surfaces here.
     """
-    # Lazy import — selectors.py lives under io/ and shouldn't import
-    # at module-load time from a peer that may import it back.
-    from saklas.io.manifolds import (
-        ManifoldFormatError, iter_manifold_folders,
-    )
-
-    matches: list[ResolvedManifoldLabel] = []
-    try:
-        manifolds = list(iter_manifold_folders(namespace))
-    except ManifoldFormatError:
-        # A single malformed folder shouldn't poison the whole resolve;
-        # ``iter_manifold_folders`` already skips them, but defensive.
-        return None
-    for ns, mf in manifolds:
-        if label in mf.node_labels:
-            matches.append(ResolvedManifoldLabel(
-                namespace=ns,
-                manifold_name=mf.name,
-                label=label,
-            ))
+    index = _all_manifold_labels()
+    matches = [
+        m for m in index
+        if m.label == label
+        and (namespace is None or m.namespace == namespace)
+    ]
     if not matches:
         return None
     if len(matches) > 1:

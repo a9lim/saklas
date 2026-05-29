@@ -651,6 +651,7 @@ def generate_steered(
     score_callback: Callable[[], dict[str, float]] | None = None,
     use_static_cache: bool = False,
     forced_prefix: list[int] | None = None,
+    steering_active: bool = True,
 ) -> list[int]:
     """
     Runs in a worker thread (not the async event loop).
@@ -1021,9 +1022,12 @@ def generate_steered(
                 logits = outputs.logits[:, -1, :]
                 # Steering can push hidden states past fp16 range, cascading
                 # to inf/NaN logits.  nan_to_num clears NaN/inf first;
-                # clamp then bounds any remaining finite outliers.
-                logits.nan_to_num_(nan=0.0, posinf=100.0, neginf=-100.0)
-                logits.clamp_(-100.0, 100.0)
+                # clamp then bounds any remaining finite outliers.  These are
+                # two vocab-width kernels per token, only needed when steering
+                # is actually applied — the unsteered path skips them.
+                if steering_active:
+                    logits.nan_to_num_(nan=0.0, posinf=100.0, neginf=-100.0)
+                    logits.clamp_(-100.0, 100.0)
 
                 # Presence + frequency penalty (applied to raw logits,
                 # before temperature, per OpenAI semantics).

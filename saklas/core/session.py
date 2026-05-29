@@ -736,6 +736,16 @@ class SaklasSession:
         # generate_steered when probes are active so scoring happens
         # without a second forward pass.
         self._capture = HiddenCapture()
+        # Incremental-capture state. In the common monitored case
+        # (vector probes, no manifold probes, no return_hidden) the
+        # capture scores each token on-device as it is produced and keeps
+        # only the per-token score rows here — O(layers·D) device memory
+        # instead of the full O(T·layers·D) stack. ``_capture_incremental``
+        # tells ``_finalize_generation`` to build (agg, per_token) from
+        # these rows instead of ``score_captured``. Reset at each
+        # ``_begin_capture`` and on teardown.
+        self._incremental_rows: list[torch.Tensor] = []
+        self._capture_incremental: bool = False
 
         # Reentrant — ``_generate_core`` acquires it for the whole gen,
         # then enters an internal ``self.steering(...)`` scope which
@@ -2772,10 +2782,32 @@ class SaklasSession:
             manifold_layers = self._manifold_monitor.attached_layers()
             union = vector_layers | manifold_layers
             if not union:
+                self._capture_incremental = False
+                self._incremental_rows = []
                 return False
             layer_idxs = sorted(union)
         self._capture.clear()
         self._capture.attach(self._layers, layer_idxs)
+        # Incremental scoring applies in the common monitored case: vector
+        # probes attached, no manifold probes (those need the pooled mean
+        # stack for the end-of-gen aggregate → keep full retention), and
+        # not widen (return_hidden lands the full per-layer stack on the
+        # result → keep full retention). When eligible, each token is
+        # scored on-device as it is produced; only the latest hidden per
+        # layer survives, plus the tiny per-token score rows.
+        incremental = (
+            (not widen)
+            and bool(self._monitor.probe_names)
+            and not self._manifold_monitor.probe_names
+        )
+        self._capture_incremental = incremental
+        self._incremental_rows = []
+        if incremental:
+            def _step_sink(latest: dict[int, torch.Tensor]) -> None:
+                self._incremental_rows.append(
+                    self._monitor.score_single_token_tensor(latest),
+                )
+            self._capture.set_incremental(_step_sink)
         return True
 
     def _end_capture(self) -> None:
@@ -2798,6 +2830,77 @@ class SaklasSession:
         return self._monitor.score_per_token(
             captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
+
+    def _score_incremental(
+        self, generated_ids: list[int], *, accumulate: bool = True,
+    ) -> tuple[dict[str, float], dict[str, list[float]]]:
+        """Build ``(agg_vals, per_token)`` from the incremental score rows.
+
+        Bit-identical to :meth:`TraitMonitor.score_per_token` for the
+        same captures: each ``self._incremental_rows[k]`` is the on-device
+        ``[P]`` aggregate row :meth:`TraitMonitor.score_single_token_tensor`
+        produced for generated token ``k`` (probe order =
+        ``monitor._cache_probe_keys``), already exactly the ``num/den``
+        math ``score_per_token`` runs per token. We only need to stack,
+        trim the EOS off-by-one, sync once, reshape into the per-token
+        dict, pool the aggregate row, and mirror the accumulate semantics.
+
+        Falls back to :meth:`score_captured` defensively if the row count
+        underran ``generated_ids`` (shouldn't happen — one sink fire per
+        forward, one forward per generated token).
+        """
+        monitor = self._monitor
+        n = len(generated_ids)
+        rows = self._incremental_rows
+        if not rows or n == 0:
+            return self.score_captured(generated_ids, accumulate=accumulate)
+        # Under-capture: misaligned. Fall back to the full-stack path
+        # (which itself guards the ragged-by-one case per layer).
+        if len(rows) < n:
+            return self.score_captured(generated_ids, accumulate=accumulate)
+
+        probe_keys = monitor._cache_probe_keys
+        n_probes = len(probe_keys)
+        stacked = torch.stack(rows)  # [F, P] on device
+        # EOS off-by-one: capture can overshoot generated_ids by one when
+        # generation terminates on EOS (the forward fires, the loop breaks
+        # without appending the EOS id). Trim trailing extras so row[i] ↔
+        # generated_ids[i] — the same trim score_per_token applies.
+        if stacked.shape[0] > n:
+            stacked = stacked[:n]
+        result = stacked.cpu().tolist()  # single sync: list[F'] of list[P]
+
+        per_token: dict[str, list[float]] = {
+            name: [] for name in monitor._raw_profiles
+        }
+        for i, name in enumerate(probe_keys):
+            per_token[name] = [row[i] for row in result]
+        for name in monitor._raw_profiles:
+            if not per_token[name]:
+                per_token[name] = [0.0] * n
+
+        # Aggregate pool: last non-special generated token — copy the
+        # exact walkback score_per_token does.
+        special_ids = set(getattr(self._tokenizer, "all_special_ids", []) or [])
+        agg_idx = n - 1
+        while agg_idx > 0 and int(generated_ids[agg_idx]) in special_ids:
+            agg_idx -= 1
+        if n_probes and 0 <= agg_idx < len(result):
+            agg_row = result[agg_idx]
+            agg_vals = {name: agg_row[i] for i, name in enumerate(probe_keys)}
+        else:
+            agg_vals = {}
+        for name in monitor._raw_profiles:
+            agg_vals.setdefault(name, 0.0)
+
+        # Mirror score_per_token's accumulate semantics: the aggregate
+        # feeds history/stats + flips _pending_aggregate (via
+        # _apply_accumulate), and _pending_per_token flips, only when
+        # accumulating. Stateless callers must not leak into either.
+        if accumulate:
+            monitor._apply_accumulate(agg_vals)
+            monitor._pending_per_token = True
+        return agg_vals, per_token
 
     @overload
     def score_hidden(
@@ -3777,9 +3880,14 @@ class SaklasSession:
             text = _decoded if isinstance(_decoded, str) else _decoded[0]
 
         if self._monitor.probe_names and generated_ids:
-            agg_vals, per_token = self.score_captured(
-                generated_ids, accumulate=not stateless,
-            )
+            if self._capture_incremental:
+                agg_vals, per_token = self._score_incremental(
+                    generated_ids, accumulate=not stateless,
+                )
+            else:
+                agg_vals, per_token = self.score_captured(
+                    generated_ids, accumulate=not stateless,
+                )
             self._last_per_token_scores = per_token or None
             if stateless:
                 readings = {
@@ -4203,6 +4311,7 @@ class SaklasSession:
             score_callback=gating_callback,
             use_static_cache=use_static_cache,
             forced_prefix=forced_prefix,
+            steering_active=bool(self._steering.hooks),
         )
         elapsed = time.monotonic() - start
 
@@ -4573,6 +4682,11 @@ class SaklasSession:
             # streaming target is no longer live.
             self._active_gen_reservation = None
             self._last_token_probe_payload = None
+            # Reset incremental-capture state so the next gen starts clean
+            # (finalize has already consumed the rows by now). Belt-and-
+            # suspenders: ``_begin_capture`` resets these at gen start too.
+            self._capture_incremental = False
+            self._incremental_rows = []
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 

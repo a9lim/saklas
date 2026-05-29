@@ -151,7 +151,10 @@ def install_folder(src: Path, namespace: str, as_: Optional[str], *, force: bool
     dst.mkdir(parents=True, exist_ok=True)
     for entry in src.iterdir():
         if entry.is_file() and entry.name != "pack.json":
-            write_bytes_atomic(dst / entry.name, entry.read_bytes())
+            # OS-level copy (no full-file RAM buffer) — tensor files can be
+            # large. pack.json is the only file written atomically below; the
+            # sha256 manifest verify that follows catches a torn copy.
+            shutil.copy2(entry, dst / entry.name)
 
     src_meta.write(dst)
 

@@ -94,8 +94,9 @@ neither imports up into `cli`). `Selector(kind, value, namespace)` with kinds
 `namespace/default`. `parse(raw)` handles `ns/name`, `tag:`/`namespace:`/`model:`
 prefixes, and a trailing `:variant` (`raw` | `pca` | `sae[-<release>]`, via
 `_VARIANT_REGEX`). `resolve(selector)` walks `vectors_dir()` into
-`ResolvedConcept`s through a module-level cache — mutating code must call
-`invalidate()`.
+`ResolvedConcept`s through a module-level cache; `resolve_manifold_label`
+memoizes its own walk of `manifolds_dir()` in a peer cache. `invalidate()`
+clears both — mutating code must call it.
 
 `resolve_pole(raw, namespace=None) -> (canonical, sign, match, variant)` is the
 pole-alias pipeline: a bare pole on either side of an installed bipolar concept
@@ -104,7 +105,9 @@ alpha). Cross-namespace or cross-canonical collisions raise
 `AmbiguousSelectorError`.
 
 `resolve_manifold_label(label, namespace=None) -> ResolvedManifoldLabel | None`
-walks every installed manifold for one whose `node_labels` contains `label`.
+scans a memoized index (the all-namespace `manifolds_dir()` walk, keyed on the
+root like `resolve`'s concept cache; filtered in-memory by namespace + label)
+for a manifold whose `node_labels` contains `label`.
 Returns a `ResolvedManifoldLabel(namespace, manifold_name, label)` on a unique
 hit, `None` on miss, raises `AmbiguousSelectorError` on cross-manifold
 collision. `resolve_bare_name(raw, namespace=None) -> (pole_hit, manifold_hit)`
