@@ -10,6 +10,9 @@ input is not accepted anywhere in the stack.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, Generator
+
 import pytest
 
 from saklas.io import selectors as _sel
@@ -20,7 +23,7 @@ from saklas.core.triggers import Trigger
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Generator[None, None, None]:
     """Keep parser pole-resolution from scanning the user's real vectors dir."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _sel.invalidate()
@@ -31,7 +34,7 @@ def _isolated_home(monkeypatch, tmp_path):
 class _Stub(SaklasSession):
     """Construct a session without touching any model/tokenizer machinery."""
 
-    def __init__(self, profiles: dict) -> None:  # type: ignore[override]
+    def __init__(self, profiles: dict) -> None:  # pyright: ignore[reportMissingTypeArgument]  # bare dict; stub doesn't constrain key/value types
         import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
@@ -70,19 +73,24 @@ class _Stub(SaklasSession):
         self._active_role: str | None = None
         self.events = EventBus()
         self._rebuild_calls: list[dict[str, float]] = []
-        self._rebuild_entries: list[dict[str, tuple[float, Trigger]]] = []
+        # SteeringStackEntry is tuple[float, Trigger] | AblationTerm | ManifoldTerm;
+        # use Any so the append below accepts the full union without type errors.
+        self._rebuild_entries: list[dict[str, Any]] = []
 
-    def _rebuild_steering_hooks(self) -> None:  # type: ignore[override]
+    def _rebuild_steering_hooks(self) -> None:
         flat = self._flatten_steering_stack()
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
         self._rebuild_entries.append(dict(flat))
+        # The stub only registers plain (alpha, Trigger) entries; cast away the
+        # union so pyright does not flag AblationTerm / ManifoldTerm as non-iterable.
+        flat_any: dict[str, Any] = flat
         self._rebuild_calls.append(
-            {name: alpha for name, (alpha, _trig) in flat.items()},
+            {name: alpha for name, (alpha, _trig) in flat_any.items()},
         )
 
-    def _resolve_pole_aliases(self, entries):  # type: ignore[override]
+    def _resolve_pole_aliases(self, entries):  # pyright: ignore[reportMissingParameterType]  # intentionally untyped stub override
         return {k: (float(v[0]), v[1]) for k, v in entries.items()}
 
     # Override the lazy whitener property so tests stay model-free —
@@ -92,7 +100,7 @@ class _Stub(SaklasSession):
     # transparently (same path real sessions hit when neutral
     # activations aren't cached yet).
     @property
-    def whitener(self) -> None:  # type: ignore[override]
+    def whitener(self) -> None:
         return None
 
 
@@ -217,7 +225,7 @@ def test_steering_applied_event_carries_entries():
         assert applied.entries["b"] == (0.5, Trigger.AFTER_THINKING)
 
 
-def test_pole_alias_sign_flip_preserves_trigger(tmp_path, monkeypatch):
+def test_pole_alias_sign_flip_preserves_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Bare-pole alias ``wolf`` resolves to ``deer.wolf`` with sign -1;
     the trigger survives the sign flip through the grammar path."""
     from saklas.io import packs
@@ -238,7 +246,7 @@ def test_pole_alias_sign_flip_preserves_trigger(tmp_path, monkeypatch):
         assert entries["deer.wolf"] == (-0.4, Trigger.AFTER_THINKING)
 
 
-def test_autoload_cache_hit_registers_bundled_vector(monkeypatch, tmp_path):
+def test_autoload_cache_hit_registers_bundled_vector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """`_try_autoload_vector` is the cache-hit fast path used by the server
     route to let HTTP clients steer bundled concepts without a prior
     `POST /vectors`. Exercises the concept-scan + safetensors-load path
@@ -265,7 +273,7 @@ def test_autoload_cache_hit_registers_bundled_vector(monkeypatch, tmp_path):
     )
 
     class _AutoloadStub(SaklasSession):
-        def __init__(self):  # type: ignore[override]
+        def __init__(self):
             self._profiles = {}
             self._model_info = {"model_id": "fake/model"}
             self._device = torch.device("cpu")

@@ -1,11 +1,26 @@
 
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
+
 import pytest
 
 from saklas.io import cache_ops, packs
 from saklas.io import selectors as sel
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
-def _mk(home, ns, name, models=(), tags=(), source="local"):
+
+def _mk(
+    home: Path,
+    ns: str,
+    name: str,
+    models: Iterable[str] = (),
+    tags: Iterable[str] = (),
+    source: str = "local",
+) -> Path:
     d = home / "vectors" / ns / name
     d.mkdir(parents=True)
     (d / "statements.json").write_text("[]")
@@ -25,7 +40,7 @@ def _mk(home, ns, name, models=(), tags=(), source="local"):
     return d
 
 
-def test_delete_single_concept_tensors(monkeypatch, tmp_path):
+def test_delete_single_concept_tensors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", models=["gemma", "qwen"])
     n = cache_ops.delete_tensors(sel.parse("happy"), model_scope=None)
@@ -35,7 +50,7 @@ def test_delete_single_concept_tensors(monkeypatch, tmp_path):
     assert not list(d.glob("*.safetensors"))
 
 
-def test_delete_with_model_scope(monkeypatch, tmp_path):
+def test_delete_with_model_scope(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", models=["gemma", "qwen"])
     n = cache_ops.delete_tensors(sel.parse("happy"), model_scope="gemma")
@@ -45,7 +60,7 @@ def test_delete_with_model_scope(monkeypatch, tmp_path):
     assert (d / "qwen.safetensors").exists()
 
 
-def test_delete_tag_scoped(monkeypatch, tmp_path):
+def test_delete_tag_scoped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", models=["gemma"], tags=["emotion"])
     _mk(tmp_path, "default", "calm", models=["gemma"], tags=["emotion"])
@@ -56,7 +71,7 @@ def test_delete_tag_scoped(monkeypatch, tmp_path):
     assert (tmp_path / "vectors" / "default" / "honest" / "gemma.safetensors").exists()
 
 
-def test_delete_all(monkeypatch, tmp_path):
+def test_delete_all(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", models=["gemma"])
     _mk(tmp_path, "a9lim", "archaic", models=["gemma"])
@@ -65,7 +80,7 @@ def test_delete_all(monkeypatch, tmp_path):
     assert (tmp_path / "vectors" / "default" / "happy" / "statements.json").exists()
 
 
-def test_install_local_folder(monkeypatch, tmp_path):
+def test_install_local_folder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     src = tmp_path / "src" / "archaic"
     src.mkdir(parents=True)
@@ -81,7 +96,7 @@ def test_install_local_folder(monkeypatch, tmp_path):
     assert (target / "statements.json").is_file()
 
 
-def test_install_conflict_without_force(monkeypatch, tmp_path):
+def test_install_conflict_without_force(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     src = tmp_path / "src" / "archaic"
     src.mkdir(parents=True)
@@ -96,7 +111,7 @@ def test_install_conflict_without_force(monkeypatch, tmp_path):
         cache_ops.install_folder(src, namespace="local", as_=None)
 
 
-def test_install_force_overwrites(monkeypatch, tmp_path):
+def test_install_force_overwrites(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     src = tmp_path / "src" / "archaic"
     src.mkdir(parents=True)
@@ -117,7 +132,7 @@ def test_install_force_overwrites(monkeypatch, tmp_path):
     assert m.description == "second"
 
 
-def test_install_as_relocates(monkeypatch, tmp_path):
+def test_install_as_relocates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     src = tmp_path / "src" / "archaic"
     src.mkdir(parents=True)
@@ -133,7 +148,7 @@ def test_install_as_relocates(monkeypatch, tmp_path):
     assert m.name == "ancient"
 
 
-def test_refresh_bundled_restores_statements(monkeypatch, tmp_path):
+def test_refresh_bundled_restores_statements(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     packs.materialize_bundled()
     d = tmp_path / "vectors" / "default" / "angry.calm"
@@ -146,7 +161,7 @@ def test_refresh_bundled_restores_statements(monkeypatch, tmp_path):
     assert (d / "statements.json").read_text() == original
 
 
-def test_refresh_local_skipped(monkeypatch, tmp_path):
+def test_refresh_local_skipped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Locals have no upstream to re-pull from, so refresh skips them
     silently — this keeps `-r all` working when the user has their own
     vectors in the cache."""
@@ -155,11 +170,11 @@ def test_refresh_local_skipped(monkeypatch, tmp_path):
     assert cache_ops.refresh(sel.parse("local/bard")) == 0
 
 
-def test_install_hf_routes_to_pull_pack(monkeypatch, tmp_path):
+def test_install_hf_routes_to_pull_pack(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     called = {}
 
-    def fake_pull(coord, target_folder, *, force, revision=None):
+    def fake_pull(coord: str, target_folder: Path, *, force: bool, revision: Optional[str] = None) -> Path:
         called["coord"] = coord
         called["target"] = target_folder
         called["force"] = force
@@ -182,11 +197,11 @@ def test_install_hf_routes_to_pull_pack(monkeypatch, tmp_path):
     assert called["target"] == tmp_path / "home" / "vectors" / "user" / "happy"
 
 
-def test_install_hf_with_revision_pins_source(monkeypatch, tmp_path):
+def test_install_hf_with_revision_pins_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     called = {}
 
-    def fake_pull(coord, target_folder, *, force, revision=None):
+    def fake_pull(coord: str, target_folder: Path, *, force: bool, revision: Optional[str] = None) -> Path:
         called["coord"] = coord
         called["revision"] = revision
         target_folder.mkdir(parents=True, exist_ok=True)
@@ -208,12 +223,12 @@ def test_install_hf_with_revision_pins_source(monkeypatch, tmp_path):
     assert m.source == "hf://user/happy@v1.2.0"
 
 
-def test_refresh_pinned_hf_source_passes_revision(monkeypatch, tmp_path):
+def test_refresh_pinned_hf_source_passes_revision(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "user", "happy", source="hf://user/happy@v1.2.0")
     called = {}
 
-    def fake_pull(coord, target_folder, *, force, revision=None):
+    def fake_pull(coord: str, target_folder: Path, *, force: bool, revision: Optional[str] = None) -> Path:
         called["coord"] = coord
         called["revision"] = revision
         called["force"] = force
@@ -226,7 +241,7 @@ def test_refresh_pinned_hf_source_passes_revision(monkeypatch, tmp_path):
     assert called["force"] is True
 
 
-def test_list_local_all(monkeypatch, tmp_path):
+def test_list_local_all(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"])
     _mk(tmp_path, "a9lim", "archaic", tags=["style"])
@@ -239,7 +254,7 @@ def test_list_local_all(monkeypatch, tmp_path):
     assert result.error is None
 
 
-def test_list_local_info_mode(monkeypatch, tmp_path):
+def test_list_local_info_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"], models=["gemma"])
     info = cache_ops.pack_info("default", "happy", hf=False)
@@ -250,7 +265,7 @@ def test_list_local_info_mode(monkeypatch, tmp_path):
     assert info.status == "installed"
 
 
-def test_list_concepts_includes_hf_rows(monkeypatch, tmp_path):
+def test_list_concepts_includes_hf_rows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"])
     monkeypatch.setattr(
@@ -275,7 +290,7 @@ def test_list_concepts_includes_hf_rows(monkeypatch, tmp_path):
 # delete_tensors --variant filter
 # ---------------------------------------------------------------------------
 
-def test_delete_tensors_variant_raw_only(tmp_path, monkeypatch):
+def test_delete_tensors_variant_raw_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """variant='raw' leaves SAE variants alone."""
     import json
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -305,7 +320,7 @@ def test_delete_tensors_variant_raw_only(tmp_path, monkeypatch):
     assert (ns_folder / "m_sae-mock.json").exists()
 
 
-def test_delete_tensors_variant_sae_only(tmp_path, monkeypatch):
+def test_delete_tensors_variant_sae_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import json
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -335,7 +350,7 @@ def test_delete_tensors_variant_sae_only(tmp_path, monkeypatch):
     assert not (ns_folder / "m_sae-b.safetensors").exists()
 
 
-def test_delete_tensors_variant_all_default(tmp_path, monkeypatch):
+def test_delete_tensors_variant_all_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """variant='all' deletes every variant."""
     import json
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))

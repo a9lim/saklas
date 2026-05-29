@@ -286,7 +286,7 @@ def _row_token_ids(rows: list[dict[str, Any]] | None) -> tuple[list[int], list[s
     texts: list[str] = []
     for row in rows or []:
         try:
-            tid = int(row.get("token_id"))
+            tid = int(row.get("token_id"))  # pyright: ignore[reportArgumentType]  # None raises TypeError, caught below
         except (TypeError, ValueError):
             continue
         if tid < 0:
@@ -563,6 +563,8 @@ def _replay_branch_logprobs(
                             frequency_penalty=frequency_penalty,
                         )
                     if bias_idx is not None:
+                        # bias_val is always set when bias_idx is set (both come from logit_bias)
+                        assert bias_val is not None
                         logits[0, bias_idx] += bias_val.to(logits.dtype)
 
                     vocab_size = int(logits.shape[-1])

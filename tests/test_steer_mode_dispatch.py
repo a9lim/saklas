@@ -18,6 +18,8 @@ The session-internals tests reuse the ``_Stub`` pattern from
 from __future__ import annotations
 
 import math
+from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -32,7 +34,7 @@ from saklas.io import selectors as _sel
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     """Keep parser pole-resolution from scanning the user's real vectors dir."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _sel.invalidate()
@@ -47,12 +49,12 @@ class _Stub(SaklasSession):
 
     def __init__(
         self,
-        profiles: dict,
+        profiles: dict[str, Any],
         *,
         injection_mode: str = "angular",
         theta_max: float | None = None,
         projection_metric: str = "mahalanobis",
-    ) -> None:  # type: ignore[override]
+    ) -> None:
         import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
@@ -73,12 +75,12 @@ class _Stub(SaklasSession):
         self._whitener = None
         self._layer_means = {}
         self._steering = SteeringManager(
-            injection_mode=injection_mode,  # type: ignore[arg-type]
+            injection_mode=injection_mode,  # pyright: ignore[reportArgumentType]  # injection_mode is a validated str narrowed to InjectionMode at runtime; SteeringManager param is Literal
             theta_max=self._theta_max,
         )
 
     @property
-    def whitener(self) -> None:  # type: ignore[override]
+    def whitener(self) -> None:
         return None
         # apply_to_model walks model_layers / device / dtype but only the
         # observable mode/theta on the manager is what we assert against.
@@ -86,14 +88,14 @@ class _Stub(SaklasSession):
         self._device = torch.device("cpu")
         self._dtype = torch.float32
 
-    def _rebuild_steering_hooks(self) -> None:  # type: ignore[override]
+    def _rebuild_steering_hooks(self) -> None:
         # Bypass real hook installation but still resolve the override
         # so ``_resolve_steering_override`` is exercised.
         eff_mode, eff_theta = self._resolve_steering_override()
-        self._steering.injection_mode = eff_mode  # type: ignore[assignment]
+        self._steering.injection_mode = eff_mode  # pyright: ignore[reportAttributeAccessIssue]  # eff_mode is str, SteeringManager.injection_mode typed as InjectionMode Literal
         self._steering.theta_max = eff_theta
 
-    def _resolve_pole_aliases(self, entries):  # type: ignore[override]
+    def _resolve_pole_aliases(self, entries):  # pyright: ignore[reportMissingParameterType]  # stub override in test; entries deliberately untyped
         return {k: (float(v[0]), v[1]) for k, v in entries.items()}
 
 
@@ -115,7 +117,7 @@ class TestSessionDefaults:
 
     def test_invalid_mode_rejected_at_construction(self) -> None:
         with pytest.raises(ValueError):
-            SaklasSession.__init__.__wrapped__(  # type: ignore[attr-defined]
+            SaklasSession.__init__.__wrapped__(
                 _Stub({}), object(), object(), injection_mode="rotational",
             ) if False else _validate_mode("rotational")
 
@@ -227,31 +229,31 @@ class TestCliFlags:
 
 
 class TestYamlRoundTrip:
-    def test_load_injection_mode(self, tmp_path) -> None:
+    def test_load_injection_mode(self, tmp_path: Path) -> None:
         yaml_path = tmp_path / "cfg.yaml"
         yaml_path.write_text("injection_mode: additive\n")
         cfg = ConfigFile.load(yaml_path)
         assert cfg.injection_mode == "additive"
 
-    def test_load_theta_max(self, tmp_path) -> None:
+    def test_load_theta_max(self, tmp_path: Path) -> None:
         yaml_path = tmp_path / "cfg.yaml"
         yaml_path.write_text("theta_max: 1.5\n")
         cfg = ConfigFile.load(yaml_path)
         assert cfg.theta_max == 1.5
 
-    def test_invalid_injection_mode_rejected(self, tmp_path) -> None:
+    def test_invalid_injection_mode_rejected(self, tmp_path: Path) -> None:
         yaml_path = tmp_path / "cfg.yaml"
         yaml_path.write_text("injection_mode: spinning\n")
         with pytest.raises(ConfigFileError):
             ConfigFile.load(yaml_path)
 
-    def test_invalid_theta_max_type_rejected(self, tmp_path) -> None:
+    def test_invalid_theta_max_type_rejected(self, tmp_path: Path) -> None:
         yaml_path = tmp_path / "cfg.yaml"
         yaml_path.write_text('theta_max: "lots"\n')
         with pytest.raises(ConfigFileError):
             ConfigFile.load(yaml_path)
 
-    def test_negative_theta_max_rejected(self, tmp_path) -> None:
+    def test_negative_theta_max_rejected(self, tmp_path: Path) -> None:
         yaml_path = tmp_path / "cfg.yaml"
         yaml_path.write_text("theta_max: -1.0\n")
         with pytest.raises(ConfigFileError):
@@ -264,7 +266,7 @@ class TestYamlRoundTrip:
 
 
 class TestExtractionMethodDispatch:
-    def test_extract_method_default_uses_dim(self, monkeypatch) -> None:
+    def test_extract_method_default_uses_dim(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``ExtractionPipeline.extract`` defaults to method='dim' so the
         DiM extractor fires unless overridden.
         """
@@ -298,5 +300,5 @@ class TestExtractionMethodDispatch:
             layers = frozenset({0})
 
         sae = _Sae()
-        assert _method_label("dim", sae) == "dim_sae"
-        assert _method_label("pca", sae) == "pca_center_sae"
+        assert _method_label("dim", sae) == "dim_sae"  # pyright: ignore[reportArgumentType]  # _Sae is a minimal stub; _method_label only checks `is not None`
+        assert _method_label("pca", sae) == "pca_center_sae"  # pyright: ignore[reportArgumentType]  # same stub gap

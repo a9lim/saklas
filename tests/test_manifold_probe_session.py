@@ -10,12 +10,13 @@ populates ``GenerationResult.manifold_readings``, stream populates
 from __future__ import annotations
 
 import types
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-from saklas.core.manifold import BoxAxis, BoxDomain, Manifold
+from saklas.core.manifold import BoxAxis, BoxDomain, LayerSubspace, Manifold
 from saklas.core.manifold import (
     fit_layer_subspace as _fit_layer_subspace_with_ev,
 )
@@ -29,7 +30,7 @@ from saklas.core.results import (
 from saklas.core.session import SaklasSession
 
 
-def fit_layer_subspace(*args, **kwargs):
+def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     sub, _ev = _fit_layer_subspace_with_ev(*args, **kwargs)
     return sub
 
@@ -40,7 +41,7 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 2) -> Manifold:
     torch.manual_seed(0)
     domain = BoxDomain([BoxAxis("u", periodic=False, lo=-1.0, hi=1.0)])
     coords = torch.tensor([[-1.0], [0.0], [1.0]])
-    layers: dict[int, object] = {}
+    layers: dict[int, LayerSubspace] = {}
     ev: dict[int, float] = {}
     e1 = torch.zeros(dim)
     e1[0] = 1.0
@@ -91,10 +92,11 @@ def _stub_session() -> SaklasSession:
     session._invalidate_prefix_cache = _invalidate
 
     # Bind the real methods we want to exercise.
+    _add_probe_fn: Any = SaklasSession.add_manifold_probe
     session.add_manifold_probe = types.MethodType(
-        SaklasSession.add_manifold_probe.__wrapped__
-        if hasattr(SaklasSession.add_manifold_probe, "__wrapped__")
-        else SaklasSession.add_manifold_probe,
+        _add_probe_fn.__wrapped__
+        if hasattr(_add_probe_fn, "__wrapped__")
+        else _add_probe_fn,
         session,
     )
     session.remove_manifold_probe = types.MethodType(
@@ -153,7 +155,7 @@ def test_add_probe_invalidates_prefix_cache():
     session._ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
-    session._prefix_cache = ("dummy",)
+    session._prefix_cache = ("dummy",)  # pyright: ignore[reportAttributeAccessIssue]  # test stub: wrong-shaped sentinel to verify invalidation
     session.add_manifold_probe("toy")
     assert session._prefix_cache is None
 
@@ -173,13 +175,13 @@ def test_begin_capture_widens_to_manifold_layers():
     # Track what layers _capture.attach was called with.
     attached_layers: list[int] = []
 
-    def _attach(layers, layer_idxs):
-        attached_layers.extend(layer_idxs)
+    def _attach(layers: Any, layer_indices: list[int]) -> None:
+        attached_layers.extend(layer_indices)
     session._capture.attach = _attach
     session._capture.clear = lambda: None
     # Real layer list of length 4 (just need len() — the stub doesn't
     # forward through to anything that touches the layers).
-    session._layers = [None] * 4
+    session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
 
     # Bind the real _begin_capture and run it.
     ok = SaklasSession._begin_capture(session, widen=False)
@@ -192,7 +194,7 @@ def test_begin_capture_no_probes_returns_false():
     """No vector probes, no manifold probes → ``_begin_capture`` returns
     False (the v1 behavior)."""
     session = _stub_session()
-    session._layers = [None] * 4
+    session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
     session._capture.attach = lambda *args, **kw: None
     session._capture.clear = lambda: None
     ok = SaklasSession._begin_capture(session, widen=False)

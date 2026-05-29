@@ -52,6 +52,7 @@ def test_overlay_steering_replaces_when_set():
 def test_invert_simple_term():
     r = Recipe(steering="0.3 honest.deceptive")
     inv = r.invert_steering()
+    assert inv.steering is not None  # invert_steering always returns a str
     assert "-0.3" in inv.steering
 
 
@@ -61,6 +62,7 @@ def test_invert_compound_expression():
     # Both signs flipped — first term renders ``-0.3`` directly; the
     # second renders as a ``- 0.5`` separator-and-magnitude pair through
     # ``format_expr``.  Either way both coefficients are negated.
+    assert inv.steering is not None  # invert_steering always returns a str
     assert "-0.3" in inv.steering
     assert "- 0.5" in inv.steering or "-0.5" in inv.steering
     # Trigger preserved.
@@ -87,6 +89,7 @@ def test_compose_unsteered():
 def test_compose_inverted_flips_signs():
     r = Recipe(steering="0.4 warm.clinical")
     mod = r.compose_modifier("inverted")
+    assert mod.steering is not None  # compose_modifier("inverted") always returns a str
     assert "-0.4" in mod.steering
 
 
@@ -100,12 +103,14 @@ def test_compose_reseed_gives_fresh_seed():
 def test_compose_cool():
     r = Recipe()
     mod = r.compose_modifier("cool")
+    assert mod.sampling is not None  # compose_modifier("cool") always sets sampling
     assert mod.sampling.temperature == pytest.approx(0.3)
 
 
 def test_compose_hot():
     r = Recipe()
     mod = r.compose_modifier("hot")
+    assert mod.sampling is not None  # compose_modifier("hot") always sets sampling
     assert mod.sampling.temperature == pytest.approx(1.2)
 
 
@@ -132,6 +137,7 @@ def test_compose_custom_via_overlay():
     partial = Recipe(sampling=SamplingConfig(temperature=0.5), seed=99)
     out = base.overlay(partial)
     assert out.steering == "0.3 honest"
+    assert out.sampling is not None  # overlay with explicit sampling always sets it
     assert out.sampling.temperature == pytest.approx(0.5)
     assert out.seed == 99
 

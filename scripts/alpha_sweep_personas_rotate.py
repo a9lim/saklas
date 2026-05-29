@@ -105,7 +105,7 @@ def run_sweep(
     # Baseline: no steering.
     print("\n== baseline (no steering) ==")
     t0 = time.time()
-    base = session.generate(prompt, **common_kwargs).first  # type: ignore[arg-type]
+    base = session.generate(prompt, **common_kwargs).first  # pyright: ignore[reportArgumentType]  # dict[str, object] spreads as object-typed kwargs
     print(f"  [{time.time() - t0:.1f}s]  {base.text!r}")
     runs.append({
         "mode": "baseline",
@@ -121,7 +121,7 @@ def run_sweep(
         print(f"\n== {label}  {expr} ==")
         t0 = time.time()
         out = session.generate(
-            prompt, steering=expr, **common_kwargs,  # type: ignore[arg-type]
+            prompt, steering=expr, **common_kwargs,  # pyright: ignore[reportArgumentType]  # dict[str, object] spreads as object-typed kwargs
         ).first
         print(f"  [{time.time() - t0:.1f}s]  {out.text!r}")
         runs.append({

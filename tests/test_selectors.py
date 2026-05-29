@@ -1,5 +1,8 @@
 
+from __future__ import annotations
+
 import pytest
+from pathlib import Path
 
 from saklas.io import selectors as sel
 from saklas.io import packs
@@ -59,7 +62,7 @@ def test_parse_invalid_prefix_raises():
         sel.parse("unknown:foo")
 
 
-def _mk(tmp_path, ns, name, tags=None):
+def _mk(tmp_path: Path, ns: str, name: str, tags: list[str] | None = None) -> Path:
     d = tmp_path / "vectors" / ns / name
     d.mkdir(parents=True)
     (d / "statements.json").write_text("[]")
@@ -72,7 +75,7 @@ def _mk(tmp_path, ns, name, tags=None):
     return d
 
 
-def test_resolve_bare_unique(monkeypatch, tmp_path):
+def test_resolve_bare_unique(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy")
     results = sel.resolve(sel.parse("happy"))
@@ -80,7 +83,7 @@ def test_resolve_bare_unique(monkeypatch, tmp_path):
     assert results[0].name == "happy"
 
 
-def test_resolve_bare_ambiguous_raises(monkeypatch, tmp_path):
+def test_resolve_bare_ambiguous_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy")
     _mk(tmp_path, "a9lim", "happy")
@@ -90,7 +93,7 @@ def test_resolve_bare_ambiguous_raises(monkeypatch, tmp_path):
     assert "a9lim/happy" in str(ei.value)
 
 
-def test_resolve_namespaced(monkeypatch, tmp_path):
+def test_resolve_namespaced(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy")
     _mk(tmp_path, "a9lim", "happy")
@@ -99,7 +102,7 @@ def test_resolve_namespaced(monkeypatch, tmp_path):
     assert "a9lim" in str(results[0].folder)
 
 
-def test_resolve_tag(monkeypatch, tmp_path):
+def test_resolve_tag(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy", tags=["emotion"])
     _mk(tmp_path, "default", "calm", tags=["emotion"])
@@ -109,7 +112,7 @@ def test_resolve_tag(monkeypatch, tmp_path):
     assert names == ["calm", "happy"]
 
 
-def test_resolve_namespace(monkeypatch, tmp_path):
+def test_resolve_namespace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy")
     _mk(tmp_path, "a9lim", "archaic")
@@ -117,7 +120,7 @@ def test_resolve_namespace(monkeypatch, tmp_path):
     assert [r.name for r in results] == ["archaic"]
 
 
-def test_resolve_all(monkeypatch, tmp_path):
+def test_resolve_all(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _mk(tmp_path, "default", "happy")
     _mk(tmp_path, "a9lim", "archaic")
@@ -125,7 +128,7 @@ def test_resolve_all(monkeypatch, tmp_path):
     assert len(results) == 2
 
 
-def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch, tmp_path):
+def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``model:X`` matches any concept with a tensor for X — raw or SAE.
 
     Regression for the pre-fix bug where the filter only globbed
@@ -156,7 +159,7 @@ def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch, tmp_path):
     assert names == ["a_raw_only", "b_sae_only"]
 
 
-def test_parse_args_concept_plus_model(monkeypatch, tmp_path):
+def test_parse_args_concept_plus_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     args, model_scope = sel.parse_args(["tag:emotion", "model:google/gemma-2-2b-it"])
     assert args.kind == "tag"
@@ -183,7 +186,7 @@ def test_parse_args_two_models_raises():
 # --- resolve_pole alias resolution -----------------------------------------
 
 class TestResolvePole:
-    def test_monopolar_exact_match(self, monkeypatch, tmp_path):
+    def test_monopolar_exact_match(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "agentic")
         sel.invalidate()
@@ -192,7 +195,7 @@ class TestResolvePole:
         assert sign == 1
         assert m is not None
 
-    def test_positive_pole_alias(self, monkeypatch, tmp_path):
+    def test_positive_pole_alias(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "angry.calm")
         sel.invalidate()
@@ -200,7 +203,7 @@ class TestResolvePole:
         assert name == "angry.calm"
         assert sign == 1
 
-    def test_negative_pole_alias(self, monkeypatch, tmp_path):
+    def test_negative_pole_alias(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "angry.calm")
         sel.invalidate()
@@ -208,7 +211,7 @@ class TestResolvePole:
         assert name == "angry.calm"
         assert sign == -1
 
-    def test_composite_literal(self, monkeypatch, tmp_path):
+    def test_composite_literal(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "angry.calm")
         sel.invalidate()
@@ -216,7 +219,7 @@ class TestResolvePole:
         assert name == "angry.calm"
         assert sign == 1
 
-    def test_slug_normalization(self, monkeypatch, tmp_path):
+    def test_slug_normalization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "high_context.low_context")
         sel.invalidate()
@@ -224,7 +227,7 @@ class TestResolvePole:
         assert name == "high_context.low_context"
         assert sign == 1
 
-    def test_unknown_falls_through(self, monkeypatch, tmp_path):
+    def test_unknown_falls_through(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         sel.invalidate()
         name, sign, m, _v = sel.resolve_pole("xyzzy")
@@ -232,7 +235,7 @@ class TestResolvePole:
         assert sign == 1
         assert m is None
 
-    def test_collision_monopolar_vs_bipolar(self, monkeypatch, tmp_path):
+    def test_collision_monopolar_vs_bipolar(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "alice", "angry")
         _mk(tmp_path, "default", "angry.calm")
@@ -240,7 +243,7 @@ class TestResolvePole:
         with pytest.raises(sel.AmbiguousSelectorError):
             sel.resolve_pole("angry")
 
-    def test_collision_two_bipolars(self, monkeypatch, tmp_path):
+    def test_collision_two_bipolars(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "default", "angry.calm")
         _mk(tmp_path, "default", "angry.fearful")
@@ -248,7 +251,7 @@ class TestResolvePole:
         with pytest.raises(sel.AmbiguousSelectorError):
             sel.resolve_pole("angry")
 
-    def test_namespaced_scoped_resolve(self, monkeypatch, tmp_path):
+    def test_namespaced_scoped_resolve(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _mk(tmp_path, "bob", "deer.wolf")
         _mk(tmp_path, "alice", "wolf")
@@ -257,15 +260,17 @@ class TestResolvePole:
         name, sign, m, _variant = sel.resolve_pole("wolf", namespace="bob")
         assert name == "deer.wolf"
         assert sign == -1
+        assert m is not None  # scoped resolve with installed concept always matches
         assert m.namespace == "bob"
         # Scoped to alice/: wolf is a monopolar exact match
         name, sign, m, _variant = sel.resolve_pole("wolf", namespace="alice")
         assert name == "wolf"
         assert sign == 1
+        assert m is not None  # scoped resolve with installed concept always matches
         assert m.namespace == "alice"
 
 
-def _install_minimal_pack(saklas_home, name):
+def _install_minimal_pack(saklas_home: Path, name: str) -> None:
     """Lay down a minimal pack.json tree so _all_concepts finds the name."""
     import json
     folder = saklas_home / "vectors" / "default" / name
@@ -283,7 +288,7 @@ def _install_minimal_pack(saklas_home, name):
     }))
 
 
-def test_resolve_pole_strips_raw_variant(tmp_path, monkeypatch):
+def test_resolve_pole_strips_raw_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -297,7 +302,7 @@ def test_resolve_pole_strips_raw_variant(tmp_path, monkeypatch):
     assert variant == "raw"
 
 
-def test_resolve_pole_sae_variant(tmp_path, monkeypatch):
+def test_resolve_pole_sae_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -309,7 +314,7 @@ def test_resolve_pole_sae_variant(tmp_path, monkeypatch):
     assert variant == "sae"
 
 
-def test_resolve_pole_sae_with_release(tmp_path, monkeypatch):
+def test_resolve_pole_sae_with_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -320,7 +325,7 @@ def test_resolve_pole_sae_with_release(tmp_path, monkeypatch):
     assert variant == "sae-gemma-scope-2b-pt-res-canonical"
 
 
-def test_resolve_pole_no_variant_defaults_to_raw(tmp_path, monkeypatch):
+def test_resolve_pole_no_variant_defaults_to_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -331,7 +336,7 @@ def test_resolve_pole_no_variant_defaults_to_raw(tmp_path, monkeypatch):
     assert variant == "raw"
 
 
-def test_resolve_pole_variant_preserves_pole_sign(tmp_path, monkeypatch):
+def test_resolve_pole_variant_preserves_pole_sign(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "deer.wolf")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -344,7 +349,7 @@ def test_resolve_pole_variant_preserves_pole_sign(tmp_path, monkeypatch):
     assert variant == "sae"
 
 
-def test_resolve_pole_rejects_invalid_variant(tmp_path, monkeypatch):
+def test_resolve_pole_rejects_invalid_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "honest.deceptive")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -379,7 +384,7 @@ def test_parse_role_variant():
     assert s.namespace is None
 
 
-def test_resolve_pole_role_variant(tmp_path, monkeypatch):
+def test_resolve_pole_role_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "angry.calm")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -393,7 +398,7 @@ def test_resolve_pole_role_variant(tmp_path, monkeypatch):
     assert variant == "role-pirate"
 
 
-def test_resolve_pole_role_with_dotted_id(tmp_path, monkeypatch):
+def test_resolve_pole_role_with_dotted_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_minimal_pack(tmp_path, "happy.sad")
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
@@ -423,7 +428,7 @@ def test_parse_role_with_namespace():
     assert s.namespace == "default"
 
 
-def test_materialize_then_invalidate_makes_bundled_visible(monkeypatch, tmp_path):
+def test_materialize_then_invalidate_makes_bundled_visible(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The contract `SaklasSession.__init__` relies on for bundled visibility.
 
     Regression: when bundled concepts are added (e.g. via

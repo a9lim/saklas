@@ -16,7 +16,7 @@ at rest.
 from __future__ import annotations
 
 import pathlib
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 
 import torch
 
@@ -286,6 +286,17 @@ class Profile:
                 proj = (torch.dot(a_f, b_f) / b_dot) * b_f
                 out[layer] = (a_f - proj).to(dtype=a_t.dtype)
         return type(self)(out, metadata=self._metadata)
+
+    @overload
+    def cosine_similarity(
+        self, other: "Profile", *, per_layer: Literal[False] = ...,
+        whitener: "Any | None" = ...,
+    ) -> float: ...
+    @overload
+    def cosine_similarity(
+        self, other: "Profile", *, per_layer: Literal[True],
+        whitener: "Any | None" = ...,
+    ) -> dict[int, float]: ...
 
     def cosine_similarity(
         self,

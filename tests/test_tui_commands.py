@@ -7,7 +7,9 @@ just the state the dispatchers touch. TUI rendering is out of scope.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,8 +24,8 @@ def _make_app():
     The slash-command dispatch + _generate worker only need the attribute
     bag — not a live Textual tree — so we build one by hand.
     """
-    app = object.__new__(SaklasApp)
-    session = MagicMock()
+    app: Any = object.__new__(SaklasApp)
+    session: Any = MagicMock()
     # v2.3 loom: conversation lives in ``session.tree`` (LoomTree).
     # We install a real LoomTree so the regen/rewind path's
     # navigate/edit calls work; ``session.history`` is the derived
@@ -127,7 +129,7 @@ def _make_app():
     return app
 
 
-def _msgs(app):
+def _msgs(app: Any) -> str:
     return "\n".join(app._chat_panel.messages)
 
 
@@ -264,7 +266,7 @@ def test_unprobe_removes():
     app._trait_panel.set_active_probes = MagicMock()
     app._apply_highlight_to_all = MagicMock()
 
-    def _unprobe(name):
+    def _unprobe(name: Any) -> None:
         app._session._monitor.probe_names = []
     app._session.unprobe.side_effect = _unprobe
 
@@ -285,7 +287,7 @@ def test_model_info():
     assert "Active vectors" in msg
 
 
-def test_save_load_roundtrip(tmp_path, monkeypatch):
+def test_save_load_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """/save serializes the full loom tree; /load swaps it back in."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     app = _make_app()
@@ -336,7 +338,7 @@ def test_help_mentions_new_bindings():
 # ---- Task A: _generate worker uses new API ----
 
 
-def test_generate_worker_uses_generate_stream(monkeypatch):
+def test_generate_worker_uses_generate_stream(monkeypatch: pytest.MonkeyPatch):
     app = _make_app()
     app._session._device = SimpleNamespace(type="cpu")
     # Stub generate_stream to capture kwargs and yield one event.
@@ -356,7 +358,7 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
         scores = None
         perplexity = None
 
-    def _fake_stream(input, **kwargs):
+    def _fake_stream(input: Any, **kwargs: Any) -> Any:
         captured["input"] = input
         captured["kwargs"] = kwargs
         yield _Event()
@@ -367,7 +369,7 @@ def test_generate_worker_uses_generate_stream(monkeypatch):
     app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), widget))
 
     # Track worker dispatch — run inline.
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
@@ -392,7 +394,7 @@ def test_generate_worker_enables_live_scores_for_probe_highlight():
     app._highlight_probe = "happy.sad"
     captured = {}
 
-    def _fake_stream(input, **kwargs):
+    def _fake_stream(input: Any, **kwargs: Any) -> Any:
         captured["kwargs"] = kwargs
         return iter([])
 
@@ -423,7 +425,7 @@ def test_start_generation_inherits_highlight_state():
     app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), widget))
     app._session.generate_stream = MagicMock(return_value=iter([]))
 
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
@@ -440,7 +442,7 @@ def test_start_generation_skips_highlight_when_off():
     app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), widget))
     app._session.generate_stream = MagicMock(return_value=iter([]))
 
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
@@ -454,13 +456,13 @@ def test_generate_worker_passes_steering_when_alphas_active():
     app._enabled["foo"] = True
     captured = {}
 
-    def _fake_stream(input, **kwargs):
+    def _fake_stream(input: Any, **kwargs: Any) -> Any:
         captured["kwargs"] = kwargs
         return iter([])
     app._session.generate_stream = _fake_stream
     app._chat_panel.start_assistant_message = MagicMock(return_value=(MagicMock(), MagicMock()))
 
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
@@ -625,7 +627,7 @@ def test_parse_alpha_clamped_to_max():
 # ---- /steer routes through the shared expression grammar ----
 
 
-def test_steer_expression_parses_sae_variant(monkeypatch, tmp_path):
+def test_steer_expression_parses_sae_variant(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """``/steer 0.3 myvec:sae`` parses through the shared grammar; the
     variant is preserved on the alphas key."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -636,7 +638,7 @@ def test_steer_expression_parses_sae_variant(monkeypatch, tmp_path):
     assert s.alphas == {"myvec:sae": pytest.approx(0.3)}
 
 
-def test_steer_expression_hyphenated_concept(monkeypatch, tmp_path):
+def test_steer_expression_hyphenated_concept(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Dash-joined identifiers parse as a single concept name; the
     resolver's slug step collapses ``-`` to ``_`` so the final key uses
     underscores."""
@@ -648,7 +650,7 @@ def test_steer_expression_hyphenated_concept(monkeypatch, tmp_path):
     assert list(s.alphas.keys()) == ["high_context"]
 
 
-def test_steer_expression_release_suffix(monkeypatch, tmp_path):
+def test_steer_expression_release_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Explicit release rides on the ``:sae-<release>`` suffix."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import selectors as _sel
@@ -658,7 +660,7 @@ def test_steer_expression_release_suffix(monkeypatch, tmp_path):
     assert "myvec:sae-gemma-scope-2b-pt-res-canonical" in s.alphas
 
 
-def test_handle_extract_trusts_canonical_from_session(monkeypatch, tmp_path):
+def test_handle_extract_trusts_canonical_from_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Regression: ``session.extract(sae=RELEASE)`` already returns a
     canonical with the ``:sae-<release>`` suffix. The TUI worker must NOT
     re-append ``:{variant}`` — doing so produces ``foo:sae-R:sae-R`` and
@@ -678,20 +680,20 @@ def test_handle_extract_trusts_canonical_from_session(monkeypatch, tmp_path):
     app = _make_app()
 
     # Mock session.extract to return the session-side canonical (suffixed).
-    def _fake_extract(concept, **kwargs):
+    def _fake_extract(concept: Any, **kwargs: Any) -> Any:
         assert kwargs.get("sae") == "gemma-scope-2b-pt-res-canonical"
         canonical = f"{concept}:sae-gemma-scope-2b-pt-res-canonical"
         return canonical, Profile({0: torch.zeros(4)})
     app._session.extract = _fake_extract
 
     # Run worker inline so we can capture the final registered name.
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _on_success(name, profile, alpha):
+    def _on_success(name: Any, profile: Any, alpha: Any) -> None:
         captured["name"] = name
 
     app._handle_extract(
@@ -706,7 +708,7 @@ def test_handle_extract_trusts_canonical_from_session(monkeypatch, tmp_path):
     assert captured["name"].count(":sae-") == 1
 
 
-def test_handle_extract_raw_variant_passes_canonical_through(monkeypatch, tmp_path):
+def test_handle_extract_raw_variant_passes_canonical_through(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Raw (no SAE) path: ``session.extract`` returns the bare canonical."""
     import torch
     from saklas.core.profile import Profile
@@ -716,18 +718,18 @@ def test_handle_extract_raw_variant_passes_canonical_through(monkeypatch, tmp_pa
 
     app = _make_app()
 
-    def _fake_extract(concept, **kwargs):
+    def _fake_extract(concept: Any, **kwargs: Any) -> Any:
         assert "sae" not in kwargs
         return concept, Profile({0: torch.zeros(4)})
     app._session.extract = _fake_extract
 
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _on_success(name, profile, alpha):
+    def _on_success(name: Any, profile: Any, alpha: Any) -> None:
         captured["name"] = name
 
     app._handle_extract(
@@ -736,7 +738,7 @@ def test_handle_extract_raw_variant_passes_canonical_through(monkeypatch, tmp_pa
     assert captured["name"] == "honest"
 
 
-def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch, tmp_path):
+def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Option C: typing ``concept:sae-<release>`` routes the release to
     ``session.extract(sae=release)`` even without the ``--sae`` preamble.
     """
@@ -748,7 +750,7 @@ def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch, tmp_path):
 
     app = _make_app()
 
-    def _fake_extract(concept, **kwargs):
+    def _fake_extract(concept: Any, **kwargs: Any) -> Any:
         # The ``:sae-<release>`` suffix must get peeled before the
         # concept reaches session.extract — release rides on ``sae=``.
         assert concept == "honest"
@@ -756,13 +758,13 @@ def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch, tmp_path):
         return f"{concept}:sae-my-release", Profile({0: torch.zeros(4)})
     app._session.extract = _fake_extract
 
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _on_success(name, profile, alpha):
+    def _on_success(name: Any, profile: Any, alpha: Any) -> None:
         captured["name"] = name
 
     # variant defaults to "raw" — the suffix inside the concept flips it.
@@ -773,7 +775,7 @@ def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch, tmp_path):
     assert captured["name"] == "honest:sae-my-release"
 
 
-def test_handle_extract_bare_sae_uses_autoload(monkeypatch, tmp_path):
+def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Option C ``--sae <concept>``: no fresh extract — session autoload
     picks the unique SAE tensor already on disk.
     """
@@ -785,24 +787,24 @@ def test_handle_extract_bare_sae_uses_autoload(monkeypatch, tmp_path):
     app = _make_app()
 
     # session.extract must NOT be called for bare --sae.
-    def _fail_extract(*a, **kw):
+    def _fail_extract(*a: Any, **kw: Any) -> Any:
         raise AssertionError("session.extract must not run for bare --sae")
     app._session.extract = _fail_extract
 
     # _try_autoload_vector populates _profiles[<concept>:sae].
-    def _autoload(canonical, *, variant):
+    def _autoload(canonical: Any, *, variant: Any) -> None:
         assert canonical == "honest"
         assert variant == "sae"
         app._session._profiles["honest:sae"] = {0: torch.zeros(4)}
     app._session._try_autoload_vector = _autoload
 
-    def _run_worker(fn, thread=True):
+    def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
     app.run_worker = _run_worker
 
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _on_success(name, profile, alpha):
+    def _on_success(name: Any, profile: Any, alpha: Any) -> None:
         captured["name"] = name
 
     app._handle_extract(
@@ -815,7 +817,7 @@ def test_handle_extract_bare_sae_uses_autoload(monkeypatch, tmp_path):
 # ---- /steer error-path regression tests ----
 
 
-def test_handle_steer_ambiguous_pole_does_not_crash(monkeypatch):
+def test_handle_steer_ambiguous_pole_does_not_crash(monkeypatch: pytest.MonkeyPatch):
     """Regression: ``/steer 0.5 <bare colliding name>`` used to escape
     ``except SteeringExprError`` because ``AmbiguousSelectorError`` is
     a ``SelectorError(ValueError, SaklasError)`` rather than a
@@ -831,7 +833,7 @@ def test_handle_steer_ambiguous_pole_does_not_crash(monkeypatch):
 
     app = _make_app()
 
-    def _ambiguous(*_args, **_kwargs):
+    def _ambiguous(*_args: Any, **_kwargs: Any) -> Any:
         raise AmbiguousSelectorError(
             "ambiguous pole 'wolf': matches alice/wolf, default/deer.wolf"
         )
@@ -852,7 +854,7 @@ def test_handle_steer_ambiguous_pole_does_not_crash(monkeypatch):
     app._session.steer.assert_not_called()
 
 
-def test_handle_steer_expression_error_still_caught(monkeypatch):
+def test_handle_steer_expression_error_still_caught(monkeypatch: pytest.MonkeyPatch):
     """Negative control: keep the original ``SteeringExprError`` arm
     working — bad grammar still emits the ``Steering expression error``
     prefix, not the generic ``Error`` one introduced by the new arm."""
@@ -890,7 +892,7 @@ def test_detect_namespace_selector_rejects_non_bulk_forms():
     assert _detect_namespace_selector("9live/") is None
 
 
-def _stub_concepts(monkeypatch, concepts):
+def _stub_concepts(monkeypatch: pytest.MonkeyPatch, concepts: Any) -> None:
     """Patch ``_all_concepts`` to return a synthetic list of namespaced
     folders. Each entry is a SimpleNamespace with ``namespace`` and
     ``name`` attributes — the only fields the bulk handlers read.
@@ -901,7 +903,7 @@ def _stub_concepts(monkeypatch, concepts):
     monkeypatch.setattr(_sel, "_all_concepts", lambda: fakes)
 
 
-def _drain_workers(app):
+def _drain_workers(app: Any) -> None:
     """Synchronously execute the most recent ``run_worker`` call.
 
     The TUI worker normally runs on a Textual thread; in tests we just
@@ -917,7 +919,7 @@ def _drain_workers(app):
     app.run_worker.reset_mock()
 
 
-def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch):
+def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch: pytest.MonkeyPatch):
     app = _make_app()
     # Two cached, one missing on disk for this model.
     _stub_concepts(monkeypatch, [
@@ -928,10 +930,14 @@ def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch)
 
     cached_keys = {"alice/honest.deceptive", "alice/warm.clinical"}
 
-    def _autoload(canonical, *, variant="raw"):
+    import torch
+
+    def _autoload(canonical: Any, *, variant: Any = "raw") -> None:
         # Simulate cache hit for the two pre-baked tensors; miss for the third.
+        # A real tensor (not object()) so the bulk handler's Profile(...) wrap
+        # — which re-validates the cached dict before re-registering — passes.
         if canonical in cached_keys:
-            app._session._profiles[canonical] = {0: object()}
+            app._session._profiles[canonical] = {0: torch.zeros(2)}
     app._session._try_autoload_vector = _autoload
     app.run_worker = MagicMock()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
@@ -960,7 +966,7 @@ def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch)
     assert app._session.steer.call_count == 2
 
 
-def test_handle_steer_namespace_empty_namespace_short_circuits(monkeypatch):
+def test_handle_steer_namespace_empty_namespace_short_circuits(monkeypatch: pytest.MonkeyPatch):
     app = _make_app()
     _stub_concepts(monkeypatch, [("default", "foo")])  # different ns
     app.run_worker = MagicMock()
@@ -972,7 +978,7 @@ def test_handle_steer_namespace_empty_namespace_short_circuits(monkeypatch):
     assert app._alphas == {}
 
 
-def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch):
+def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch: pytest.MonkeyPatch):
     app = _make_app()
     _stub_concepts(monkeypatch, [
         ("alice", "calm.angry"),
@@ -1040,7 +1046,7 @@ def test_handle_unprobe_namespace_clears_highlight_when_seed_is_in_namespace():
 
     # Mutate probe_names as ``unprobe`` would so ``set_active_probes``
     # afterward observes the trimmed set.
-    def _unprobe(name):
+    def _unprobe(name: Any) -> None:
         app._session._monitor.probe_names = [
             p for p in app._session._monitor.probe_names if p != name
         ]
@@ -1064,7 +1070,7 @@ def test_handle_unprobe_namespace_keeps_highlight_when_seed_outside_namespace():
     app._apply_highlight_to_all = MagicMock()
     app._refresh_trait_why = MagicMock()
 
-    def _unprobe(name):
+    def _unprobe(name: Any) -> None:
         app._session._monitor.probe_names = [
             p for p in app._session._monitor.probe_names if p != name
         ]
@@ -1116,6 +1122,9 @@ class _FakeInput:
         last_row = self._document.line_count - 1
         last_col = len(self._document.get_line(last_row))
         self.cursor_location: tuple[int, int] = (last_row, last_col)
+        # Mirror the ChatInput flag that the pending-queue pull/restore path
+        # reads and sets to allow empty-string submits for pulled slots.
+        self.allow_empty_submit: bool = False
 
     @property
     def text(self) -> str:
@@ -1129,7 +1138,7 @@ class _FakeInput:
         self._document._set(text)
 
 
-def _wire_fake_input(app, value: str = "") -> _FakeInput:
+def _wire_fake_input(app: Any, value: str = "") -> _FakeInput:
     fake = _FakeInput(value)
     app.query_one = MagicMock(return_value=fake)
     return fake
@@ -1448,9 +1457,9 @@ def test_pending_strip_markup_round_trips_through_rich():
     # builder via Static.update with a captured update target.
     strip = object.__new__(PendingStrip)
     captured: list[str] = []
-    strip.update = lambda s: captured.append(s)  # type: ignore[method-assign]
-    strip.add_class = lambda _c: None  # type: ignore[method-assign]
-    strip.remove_class = lambda _c: None  # type: ignore[method-assign]
+    strip.update = lambda s: captured.append(s)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]  # Textual Static.update stub; lambda captures VisualType → str
+    strip.add_class = lambda _c: None  # pyright: ignore[reportAttributeAccessIssue]  # Textual Widget.add_class stub
+    strip.remove_class = lambda _c: None  # pyright: ignore[reportAttributeAccessIssue]  # Textual Widget.remove_class stub
     strip._queue = []
 
     items = [
@@ -1576,7 +1585,7 @@ def test_left_panel_highlight_line_renders():
     truncated to the 15-char preview budget."""
     from saklas.tui.vector_panel import LeftPanel
 
-    panel = LeftPanel(model_info={})
+    panel: Any = LeftPanel(model_info={})
     captured: list[str] = []
     panel._gen_config_widget = SimpleNamespace(update=captured.append)
 
@@ -1809,7 +1818,7 @@ def test_manifold_command_rejects_unknown_subverb():
     assert "Usage: /manifold fit" in _msgs(app)
 
 
-def test_manifold_fit_missing_folder_reports(tmp_path):
+def test_manifold_fit_missing_folder_reports(tmp_path: Path) -> None:
     """`/manifold fit` on a folder with no manifold.json reports cleanly
     without firing a worker."""
     app = _make_app()
@@ -1819,7 +1828,7 @@ def test_manifold_fit_missing_folder_reports(tmp_path):
     app.run_worker.assert_not_called()
 
 
-def test_manifold_fit_runs_session_extract_manifold(tmp_path):
+def test_manifold_fit_runs_session_extract_manifold(tmp_path: Path) -> None:
     """`/manifold fit <folder>` with a manifold.json present routes
     through ``session.extract_manifold`` on a worker."""
     (tmp_path / "manifold.json").write_text("{}")
@@ -1828,9 +1837,9 @@ def test_manifold_fit_runs_session_extract_manifold(tmp_path):
     fitted = SimpleNamespace(
         name="circumplex", layers=[0, 1, 2], node_labels=["a", "b", "c"],
     )
-    captured = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_extract_manifold(folder, **kwargs):
+    def _fake_extract_manifold(folder: Any, **kwargs: Any) -> Any:
         captured["folder"] = folder
         return fitted
     app._session.extract_manifold = _fake_extract_manifold
@@ -1862,7 +1871,7 @@ def test_manifold_fit_mid_gen_enqueues_pending():
 # ---------------------------------------------------------------------------
 
 
-def test_steer_manifold_term_validates_and_registers(monkeypatch, tmp_path):
+def test_steer_manifold_term_validates_and_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """A ``%`` manifold term in ``/steer`` routes through eager artifact
     validation and lands on ``_manifold_terms`` — not the scalar
     ``_alphas`` dict."""
@@ -1877,7 +1886,7 @@ def test_steer_manifold_term_validates_and_registers(monkeypatch, tmp_path):
     domain = SimpleNamespace(intrinsic_dim=2)
     manifold = SimpleNamespace(domain=domain)
 
-    def _ensure(key):
+    def _ensure(key: Any) -> None:
         app._session._manifolds[key] = manifold
     app._session._ensure_manifold_loaded = _ensure
     app._session._manifolds = {}
@@ -1893,7 +1902,7 @@ def test_steer_manifold_term_validates_and_registers(monkeypatch, tmp_path):
     assert app._enabled.get("circumplex%0.3,0.8") is True
 
 
-def test_steer_manifold_term_arity_mismatch_reports(monkeypatch, tmp_path):
+def test_steer_manifold_term_arity_mismatch_reports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """A position with the wrong coordinate count is rejected against the
     loaded manifold's domain."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -1905,7 +1914,7 @@ def test_steer_manifold_term_arity_mismatch_reports(monkeypatch, tmp_path):
     domain = SimpleNamespace(intrinsic_dim=2)
     manifold = SimpleNamespace(domain=domain)
 
-    def _ensure(key):
+    def _ensure(key: Any) -> None:
         app._session._manifolds[key] = manifold
     app._session._ensure_manifold_loaded = _ensure
     app._session._manifolds = {}
@@ -1918,7 +1927,7 @@ def test_steer_manifold_term_arity_mismatch_reports(monkeypatch, tmp_path):
     assert app._manifold_terms == {}
 
 
-def test_steer_manifold_unregistered_reports(monkeypatch, tmp_path):
+def test_steer_manifold_unregistered_reports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """An unfitted manifold surfaces ``ManifoldNotRegisteredError`` as a
     system message rather than crashing the worker."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -1929,7 +1938,7 @@ def test_steer_manifold_unregistered_reports(monkeypatch, tmp_path):
     app = _make_app()
     app._session._manifolds = {}
 
-    def _ensure(key):
+    def _ensure(key: Any) -> None:
         raise ManifoldNotRegisteredError(
             f"manifold '{key}' has no fitted tensor"
         )
@@ -1943,7 +1952,7 @@ def test_steer_manifold_unregistered_reports(monkeypatch, tmp_path):
     assert app._manifold_terms == {}
 
 
-def test_steer_mixed_expression_applies_vector_siblings(monkeypatch, tmp_path):
+def test_steer_mixed_expression_applies_vector_siblings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """A mixed expression (vector + manifold) still applies its scalar
     vector term — the manifold term uses ``continue``, not ``return``."""
     import torch
@@ -1955,14 +1964,14 @@ def test_steer_mixed_expression_applies_vector_siblings(monkeypatch, tmp_path):
     app = _make_app()
     app._refresh_left_panel = MagicMock()
 
-    def _fake_extract(concept, **kwargs):
+    def _fake_extract(concept: Any, **kwargs: Any) -> Any:
         return concept, Profile({0: torch.zeros(4)})
     app._session.extract = _fake_extract
 
     domain = SimpleNamespace(intrinsic_dim=1)
     manifold = SimpleNamespace(domain=domain)
 
-    def _ensure(key):
+    def _ensure(key: Any) -> None:
         app._session._manifolds[key] = manifold
     app._session._ensure_manifold_loaded = _ensure
     app._session._manifolds = {}
@@ -1977,7 +1986,7 @@ def test_steer_mixed_expression_applies_vector_siblings(monkeypatch, tmp_path):
     assert "circumplex%0.4" in app._manifold_terms
 
 
-def test_active_alphas_merges_manifold_terms(monkeypatch, tmp_path):
+def test_active_alphas_merges_manifold_terms(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """``_active_alphas`` merges scalar vectors and manifold terms,
     honoring the shared ``_enabled`` flag."""
     from saklas.core.steering_expr import ManifoldTerm
@@ -2080,14 +2089,14 @@ def test_manifold_probe_remove_requires_name():
     assert "Usage: /manifold-probe-remove" in _msgs(app)
 
 
-def test_manifold_probe_attach_routes_through_session(monkeypatch):
+def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.MonkeyPatch):
     """``/manifold-probe <selector>`` calls ``session.add_manifold_probe``
     on a worker; on success the trait panel is refreshed with the
     attached probe's manifold artifact."""
     app = _make_app()
     captured = {}
 
-    def _fake_add(selector, **kwargs):
+    def _fake_add(selector: Any, **kwargs: Any) -> Any:
         captured["selector"] = selector
         # Pretend the session registered the probe under the selector
         # name and populated the monitor.
@@ -2119,7 +2128,7 @@ def test_manifold_probe_remove_routes_through_session():
     app._session._manifold_monitor.probe_names = ["circumplex"]
     app._session._manifold_monitor.attached_probes = MagicMock(return_value={})
 
-    def _fake_remove(name):
+    def _fake_remove(name: Any) -> None:
         app._session._manifold_monitor.probe_names = []
     app._session.remove_manifold_probe = _fake_remove
     app._trait_panel.set_active_manifold_probes = MagicMock()
@@ -2196,7 +2205,7 @@ def test_trait_panel_renders_manifold_section_empty_state():
     the nearest-list as empty without crashing."""
     from saklas.tui.trait_panel import TraitPanel
 
-    panel = object.__new__(TraitPanel)
+    panel: Any = object.__new__(TraitPanel)
     panel._categories = {}
     panel._current_values = {}
     panel._previous_values = {}
@@ -2239,9 +2248,9 @@ def test_trait_panel_renders_manifold_minimap_for_2d_box():
     from the aggregate lands on a row that contains the ``●`` marker."""
     import torch
     from saklas.core.results import ManifoldAggregate
-    from saklas.tui.trait_panel import TraitPanel, MINIMAP_H, MINIMAP_W
+    from saklas.tui.trait_panel import TraitPanel
 
-    panel = object.__new__(TraitPanel)
+    panel: Any = object.__new__(TraitPanel)
     panel._categories = {}
     panel._current_values = {}
     panel._previous_values = {}
@@ -2297,7 +2306,7 @@ def test_trait_panel_skips_minimap_for_higher_dim():
     from saklas.core.results import ManifoldTokenReading
     from saklas.tui.trait_panel import TraitPanel
 
-    panel = object.__new__(TraitPanel)
+    panel: Any = object.__new__(TraitPanel)
     panel._categories = {}
     panel._current_values = {}
     panel._previous_values = {}
@@ -2349,9 +2358,9 @@ def test_pairs_extract_routes_through_session_extract():
 
     app = _make_app()
     app._refresh_left_panel = MagicMock()
-    captured = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_extract(source, **kwargs):
+    def _fake_extract(source: Any, **kwargs: Any) -> Any:
         captured["source"] = source
         captured["kwargs"] = kwargs
         return "mood", Profile({0: torch.zeros(4)})

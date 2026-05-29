@@ -59,7 +59,7 @@ def load_defaults() -> dict[str, list[str]]:
 
 
 def bootstrap_layer_means(
-    model: Any, tokenizer: Any, layers: list[Any], model_info: dict[str, Any],
+    model: Any, tokenizer: Any, layers: torch.nn.ModuleList, model_info: dict[str, Any],
 ) -> dict[int, torch.Tensor]:
     """Load or compute per-layer mean activations for probe centering.
 
@@ -99,7 +99,7 @@ def bootstrap_layer_means(
 def bootstrap_probes(
     model: Any,
     tokenizer: Any,
-    layers: list[Any],
+    layers: torch.nn.ModuleList,
     model_info: dict[str, Any],
     categories: list[str],
     *,

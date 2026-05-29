@@ -26,6 +26,7 @@ import re
 import shutil
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -321,7 +322,7 @@ def persona_pca_coords_per_layer(manifold: Manifold) -> dict[int, torch.Tensor]:
 
 def run_experiment(
     session: SaklasSession, manifold: Manifold, label: str,
-) -> dict:
+) -> dict[str, Any]:
     """Where does default-mode land on the manifold?"""
     runset = session.generate(
         PROMPT,
@@ -340,7 +341,7 @@ def run_experiment(
     assert hidden is not None
 
     personas = persona_pca_coords_per_layer(manifold)
-    per_layer: dict[int, dict] = {}
+    per_layer: dict[int, dict[str, Any]] = {}
     for layer_idx, sub in manifold.layers.items():
         if layer_idx not in hidden:
             continue
@@ -416,9 +417,17 @@ def main() -> None:
     source_manifold = source_manifold.to(
         device=session._device, dtype=torch.float32,
     )
+    _ref_layer_raw = (
+        source_manifold.metadata.get("reference_layer", 30)
+        if isinstance(source_manifold.metadata, dict)
+        else 30
+    )
+    # metadata values are typed as `object`; cast to int (the stored value is
+    # always an int or falls back to the literal 30 above).
+    _ref_layer: int = int(_ref_layer_raw)  # pyright: ignore[reportArgumentType]  # metadata values typed as object
     anchored = augment_manifold(
         source_manifold, default_centroids,
-        reference_layer=source_manifold.metadata.get("reference_layer", 30) if isinstance(source_manifold.metadata, dict) else 30,
+        reference_layer=_ref_layer,
     )
 
     # ----- phase 4: save the anchored manifold --------------------------

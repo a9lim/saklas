@@ -221,5 +221,7 @@ def test_manager_alpha_scaled_by_steer_gain():
     mgr.apply_to_model(layers, device=torch.device("cpu"), dtype=torch.float32)
     # Fast-path: composed == 0.5 * _STEER_GAIN * vec.
     expected = (0.5 * _STEER_GAIN) * vec
+    # Fast path with BOTH-only trigger guarantees composed is non-None.
+    assert mgr.hooks[0].composed is not None
     assert torch.allclose(mgr.hooks[0].composed, expected, atol=1e-6)
     mgr.clear_all()

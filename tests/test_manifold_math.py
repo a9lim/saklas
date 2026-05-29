@@ -6,6 +6,8 @@ temp directory.
 from __future__ import annotations
 
 import math
+from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -31,7 +33,7 @@ from saklas.core.manifold import (
 
 # ------------------------------------------------------------------ domains ---
 
-def fit_layer_subspace(*args, **kwargs):
+def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     """Test alias dropping the EV ratio.  ``core.manifold.fit_layer_subspace``
     returns ``(LayerSubspace, ev_ratio)``; most tests don't care about the
     second half, so unpack here once."""
@@ -231,7 +233,7 @@ def _circle(k: int, dim: int) -> tuple[torch.Tensor, BoxDomain, torch.Tensor]:
     return centroids, domain, node_params
 
 
-def _grid2d(steps=(0.0, 0.5, 1.0)) -> tuple[BoxDomain, torch.Tensor]:
+def _grid2d(steps: tuple[float, ...] = (0.0, 0.5, 1.0)) -> tuple[BoxDomain, torch.Tensor]:
     domain = BoxDomain([
         BoxAxis("u", periodic=False, lo=0.0, hi=1.0),
         BoxAxis("v", periodic=False, lo=0.0, hi=1.0),
@@ -514,7 +516,7 @@ def test_subspace_rotate_degenerate_h_par_is_identity():
 
 # ----------------------------------------------------------------- save/load ---
 
-def test_save_load_manifold_round_trip(tmp_path, monkeypatch):
+def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     ca, domain, node_params = _circle(7, dim=20)
     cb = ca * 1.3

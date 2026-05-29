@@ -5,6 +5,8 @@ Bipolar separator is `.` (see saklas.session.BIPOLAR_SEP).
 """
 from __future__ import annotations
 
+from typing import Any
+
 from saklas.core.session import (
     SaklasSession,
     _humanize_concept,
@@ -66,10 +68,10 @@ class TestHumanize:
         captured = {}
 
         class _FakeSession(SaklasSession):
-            def __init__(self):  # bypass real construction
+            def __init__(self) -> None:  # bypass real construction
                 pass
 
-            def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
+            def _run_generator(self, system_msg: str, prompt: str, max_new_tokens: int, **_kwargs: Any) -> str:
                 captured["prompt"] = prompt
                 return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
 
@@ -84,10 +86,10 @@ class TestHumanize:
         captured = {}
 
         class _FakeSession(SaklasSession):
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
-            def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
+            def _run_generator(self, system_msg: str, prompt: str, max_new_tokens: int, **_kwargs: Any) -> str:
                 captured["prompt"] = prompt
                 return "\n".join(f"{i}. domain {i}" for i in range(1, 10))
 
@@ -124,10 +126,10 @@ class TestHumanize:
         captured = {}
 
         class _FakeSession(SaklasSession):
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
-            def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
+            def _run_generator(self, system_msg: str, prompt: str, max_new_tokens: int, **_kwargs: Any) -> str:
                 captured.setdefault("prompts", []).append(prompt)
                 return (
                     "1a. Statement one is more than ten characters long.\n"

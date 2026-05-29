@@ -8,7 +8,7 @@ import shlex
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable, Literal, TYPE_CHECKING, overload
+from typing import Any, Callable, Iterable, Literal, TYPE_CHECKING, overload
 
 import torch
 from textual.app import App, ComposeResult
@@ -900,7 +900,8 @@ class SaklasApp(App[None]):
         rest = (head + (" " + tail if tail else "")).strip()
         return rest, m.group(1)
 
-    def _handle_extract(self, text: str, include_alpha: bool, on_success,
+    def _handle_extract(self, text: str, include_alpha: bool,
+                        on_success: "Callable[..., Any]",
                         pending_type: str | None = None,
                         variant: str = "raw",
                         namespace: str | None = None) -> None:
@@ -997,7 +998,7 @@ class SaklasApp(App[None]):
         )
 
         def _worker():
-            def _progress(msg):
+            def _progress(msg: str) -> None:
                 self.call_from_thread(self._steer_status, msg)
             try:
                 # Bare ``--sae`` (variant == "sae") routes the load through
@@ -1175,7 +1176,7 @@ class SaklasApp(App[None]):
         downstream ``session.extract`` call so ``alice/foo`` and
         ``bob/foo`` stay distinct end-to-end.
         """
-        def _on_success(name, profile, a):
+        def _on_success(name: str, profile: Any, a: float) -> None:
             self._session.steer(name, profile)
             self._alphas[name] = a
             self._enabled[name] = True
@@ -1289,13 +1290,13 @@ class SaklasApp(App[None]):
             self._handle_probe_namespace(ns)
             return
 
-        def _on_success(name, profile, _alpha):
+        def _on_success(name: str, profile: Any, _alpha: Any) -> None:
             self._session.probe(name, profile)
             self.call_from_thread(self._on_probe_added, name)
         self._handle_extract(text, include_alpha=False, on_success=_on_success)
 
     def _handle_extract_only(self, text: str) -> None:
-        def _on_success(name, _profile, _alpha):
+        def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
             # Pure cache-warm: no steering, no probe, no panel state.
             self.call_from_thread(
                 self._steer_status, f"extracted '{name}'"
@@ -1571,7 +1572,7 @@ class SaklasApp(App[None]):
                 from saklas.io.datasource import DataSource
 
                 source = DataSource(pairs=pairs, name=name)
-                extract_kwargs: dict = {
+                extract_kwargs: dict[str, Any] = {
                     "on_progress": _progress, "namespace": "local",
                 }
                 if role is not None:
@@ -2138,7 +2139,7 @@ class SaklasApp(App[None]):
             logprobs=0,
         )
 
-        def _on_token(text, is_thinking, tid, lp, top_alts, perplexity):
+        def _on_token(text: str, is_thinking: bool, tid: Any, lp: Any, top_alts: Any, perplexity: Any) -> None:
             # Mirrors the ``("tok", …)`` tuple ``_start_generation`` builds
             # from a ``TokenEvent``.  ``prefill_assistant``'s on_token
             # carries no probe scores (no streaming monitor hook on this
@@ -3035,11 +3036,13 @@ class SaklasApp(App[None]):
             loaded, skipped = self._bulk_autoload_namespace(ns)
 
             def _finish() -> None:
+                from saklas.core.profile import Profile as _Profile
                 for key in loaded:
                     profile = self._session._profiles.get(key)
                     if profile is None:
                         continue
-                    self._session.steer(key, profile)
+                    # _profiles stores dict[int, Tensor]; steer() expects Profile.
+                    self._session.steer(key, _Profile(profile))
                     self._alphas[key] = DEFAULT_ALPHA
                     self._enabled[key] = False
                 self._refresh_left_panel()
@@ -3443,8 +3446,8 @@ class SaklasApp(App[None]):
             collector.add(last)
         path = Path(path_str).expanduser()
         try:
-            collector.to_jsonl(path)
-            chat.add_system_message(f"Exported {len(collector)} result(s) to {path}")
+            collector.to_jsonl(str(path))
+            chat.add_system_message(f"Exported {len(collector.results)} result(s) to {path}")
         except Exception as e:
             chat.add_system_message(f"Export error: {e}")
 
@@ -4055,6 +4058,9 @@ class SaklasApp(App[None]):
             cands = ", ".join(c[:12] for c in match.candidates[:8])
             chat.add_system_message(f"ambiguous '{prefix}': {cands}")
             return
+        # node_id is non-None here: match.missing and match.ambiguous are both False,
+        # which by PrefixMatch's invariant means node_id was assigned a str hit.
+        assert match.node_id is not None  # noqa: S101
         try:
             self._session.tree.navigate(match.node_id)
         except Exception as e:
@@ -4791,6 +4797,9 @@ class SaklasApp(App[None]):
                 )
                 return
 
+        # node_id is non-None here: the loop above verified neither match is missing/ambiguous,
+        # which by PrefixMatch's invariant means both node_ids were assigned str hits.
+        assert m1.node_id is not None and m2.node_id is not None  # noqa: S101
         try:
             diff = self._session.diff_nodes(m1.node_id, m2.node_id)
         except Exception as e:
@@ -4799,7 +4808,7 @@ class SaklasApp(App[None]):
 
         chat.add_system_message(self._render_node_diff(diff, full=full))
 
-    def _render_node_diff(self, diff, *, full: bool) -> str:
+    def _render_node_diff(self, diff: Any, *, full: bool) -> str:
         """Format a :class:`NodeDiff` for the chat panel.
 
         Unified-diff prose (cheap on terminal width) plus top-5 readings

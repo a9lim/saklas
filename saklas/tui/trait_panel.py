@@ -28,7 +28,7 @@ MINIMAP_H = 7
 
 class TraitPanel(Widget):
 
-    def __init__(self, categories: dict[str, list[str]] | None = None, **kwargs) -> None:
+    def __init__(self, categories: dict[str, list[str]] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._categories: dict[str, list[str]] = dict(categories) if categories else {}
         self._current_values: dict[str, float] = {}

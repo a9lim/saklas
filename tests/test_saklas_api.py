@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,12 +62,12 @@ def _mock_session():
     session._trait_lock = threading.Lock()
     session._trait_subscribers = property(lambda self: len(self._trait_queues))
 
-    def _register_trait_queue(loop, q):
+    def _register_trait_queue(loop: Any, q: Any) -> None:
         with session._trait_lock:
             session._trait_queues.append((loop, q))
     session.register_trait_queue = _register_trait_queue
 
-    def _unregister_trait_queue(loop, q):
+    def _unregister_trait_queue(loop: Any, q: Any) -> None:
         with session._trait_lock:
             try:
                 session._trait_queues.remove((loop, q))
@@ -77,16 +78,16 @@ def _mock_session():
     # EventBus mock with subscribe/unsubscribe support.
     _event_subscribers = []
 
-    def _subscribe(cb):
+    def _subscribe(cb: Any) -> Any:
         _event_subscribers.append(cb)
-        def _unsub():
+        def _unsub() -> None:
             try:
                 _event_subscribers.remove(cb)
             except ValueError:
                 pass
         return _unsub
 
-    def _emit(event):
+    def _emit(event: Any) -> None:
         for cb in list(_event_subscribers):
             try:
                 cb(event)
@@ -114,7 +115,7 @@ def session_and_client():
 
 
 class TestSessions:
-    def test_list(self, session_and_client):
+    def test_list(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions")
@@ -127,37 +128,37 @@ class TestSessions:
         assert "config" in s
         assert s["config"]["temperature"] == 1.0
 
-    def test_create_idempotent(self, session_and_client):
+    def test_create_idempotent(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
             resp = client.post("/saklas/v1/sessions", json={})
         assert resp.status_code == 200
         assert resp.json()["id"] == "default"
 
-    def test_create_model_mismatch_logs_warning(self, session_and_client, caplog):
+    def test_create_model_mismatch_logs_warning(self, session_and_client: Any, caplog: Any) -> None:
         _, client = session_and_client
         with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
             resp = client.post("/saklas/v1/sessions", json={"model": "other/model"})
         assert resp.status_code == 200
         assert resp.json()["model_id"] == "test/model"
 
-    def test_get_by_default(self, session_and_client):
+    def test_get_by_default(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
 
-    def test_get_not_found(self, session_and_client):
+    def test_get_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.get("/saklas/v1/sessions/other")
         assert resp.status_code == 404
 
-    def test_delete_is_noop(self, session_and_client):
+    def test_delete_is_noop(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.delete("/saklas/v1/sessions/default")
         assert resp.status_code == 204
 
-    def test_patch_updates_config(self, session_and_client):
+    def test_patch_updates_config(self, session_and_client: Any) -> None:
         session, client = session_and_client
         with patch("saklas.server.saklas_api.supports_thinking", return_value=False):
             resp = client.patch(
@@ -169,7 +170,7 @@ class TestSessions:
         assert session.config.system_prompt == "Be brief."
 
     @staticmethod
-    def _set_family(session, model_type: str) -> None:
+    def _set_family(session: Any, model_type: str) -> None:
         """Pin the mock session's resolved model_type so the role-header
         registries (and thus role-support gating) see a real family."""
         session._model = MagicMock()
@@ -177,7 +178,7 @@ class TestSessions:
         session._model.config.text_config = None
         session._model.config.model_type = model_type
 
-    def test_session_info_exposes_role_support(self, session_and_client):
+    def test_session_info_exposes_role_support(self, session_and_client: Any) -> None:
         """Per-message role boxes gate on these flags — keep them on the wire."""
         session, client = session_and_client
         self._set_family(session, "gemma2")
@@ -192,13 +193,13 @@ class TestSessions:
         assert body["default_assistant_role"] == "model"
         assert body["default_user_role"] == "user"
 
-    def test_clear(self, session_and_client):
+    def test_clear(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/saklas/v1/sessions/default/clear")
         assert resp.status_code == 204
         session.clear_history.assert_called_once()
 
-    def test_rewind_empty(self, session_and_client):
+    def test_rewind_empty(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.history = []
         resp = client.post("/saklas/v1/sessions/default/rewind")
@@ -209,18 +210,18 @@ class TestSessions:
 
 
 class TestVectors:
-    def test_list_empty(self, session_and_client):
+    def test_list_empty(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default/vectors")
         assert resp.status_code == 200
         assert resp.json()["vectors"] == []
 
-    def test_get_not_found(self, session_and_client):
+    def test_get_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default/vectors/missing")
         assert resp.status_code == 404
 
-    def test_delete_not_found(self, session_and_client):
+    def test_delete_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.delete("/saklas/v1/sessions/default/vectors/missing")
         assert resp.status_code == 404
@@ -230,13 +231,13 @@ class TestVectors:
 
 
 class TestProbes:
-    def test_list_empty(self, session_and_client):
+    def test_list_empty(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default/probes")
         assert resp.status_code == 200
         assert resp.json()["probes"] == []
 
-    def test_defaults(self, session_and_client):
+    def test_defaults(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with patch(
             "saklas.server.saklas_api.load_defaults",
@@ -246,18 +247,18 @@ class TestProbes:
         assert resp.status_code == 200
         assert "emotion" in resp.json()["defaults"]
 
-    def test_activate(self, session_and_client):
+    def test_activate(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/saklas/v1/sessions/default/probes/happy")
         assert resp.status_code == 204
         session.probe.assert_called_once_with("happy")
 
-    def test_deactivate_not_found(self, session_and_client):
+    def test_deactivate_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.delete("/saklas/v1/sessions/default/probes/missing")
         assert resp.status_code == 404
 
-    def test_score_probe_oneshot(self, session_and_client):
+    def test_score_probe_oneshot(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session._monitor.probe_names = ["happy"]
         session._monitor.measure.return_value = {"happy": 0.42}
@@ -273,7 +274,7 @@ class TestProbes:
 
 
 class TestExtract:
-    def test_extract_json(self, session_and_client):
+    def test_extract_json(self, session_and_client: Any) -> None:
         import torch
         from saklas.core.profile import Profile
         session, client = session_and_client
@@ -289,7 +290,7 @@ class TestExtract:
         assert data["profile"]["layers"] == [0, 1]
         assert "on_progress" in session.extract.call_args.kwargs
 
-    def test_extract_sse_streams_progress_live(self, session_and_client):
+    def test_extract_sse_streams_progress_live(self, session_and_client: Any) -> None:
         """SSE branch must yield each ``on_progress`` message as its own
         event rather than buffering them all until extraction returns.
 
@@ -305,7 +306,7 @@ class TestExtract:
         session, client = session_and_client
         profile = Profile({0: torch.ones(4)})
 
-        def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
+        def _extract(source: Any, baseline: Any = None, *, on_progress: Any = None, **_kwargs: Any) -> Any:
             assert on_progress is not None
             on_progress("Generating 9 scenarios for 'angry.calm'...")
             on_progress("Generating contrastive pairs across 9 domains...")
@@ -339,13 +340,13 @@ class TestExtract:
         assert "Generating 9 scenarios" in frames[0]
         assert "Extracting difference-of-means" in frames[2]
 
-    def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client):
+    def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client: Any) -> None:
         import torch
         from saklas.core.profile import Profile
         session, client = session_and_client
         profile = Profile({0: torch.ones(4)})
 
-        def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
+        def _extract(source: Any, baseline: Any = None, *, on_progress: Any = None, **_kwargs: Any) -> Any:
             # A {pairs:[...]} payload coerces to a DataSource carrying the
             # request's name — not a bare list, which the pipeline would
             # name "custom" and collide on disk.
@@ -379,7 +380,7 @@ class TestExtract:
         assert data["canonical"] == "custom"
         assert data["progress"] == ["progress"]
 
-    def test_extract_json_coerces_single_pair_dict(self, session_and_client):
+    def test_extract_json_coerces_single_pair_dict(self, session_and_client: Any) -> None:
         # A bare {positive, negative} object — not wrapped in {"pairs": ...}
         # — coerces to a one-pair DataSource carrying the request name.
         import torch
@@ -387,7 +388,7 @@ class TestExtract:
         session, client = session_and_client
         profile = Profile({0: torch.ones(4)})
 
-        def _extract(source, baseline=None, *, on_progress=None, **_kwargs):
+        def _extract(source: Any, baseline: Any = None, *, on_progress: Any = None, **_kwargs: Any) -> Any:
             from saklas.io.datasource import DataSource
             assert isinstance(source, DataSource)
             assert source.pairs == [("pos one", "neg one")]
@@ -411,13 +412,13 @@ class TestExtract:
 
 
 class TestWebSocket:
-    def _attach_generate(self, session, tokens):
+    def _attach_generate(self, session: Any, tokens: Any) -> None:
         """Install a fake ``session.generate`` that drives ``on_token``."""
-        def _gen(input, *, steering=None, sampling=None, stateless=False,
-                 raw=False, thinking=None, on_token=None,
-                 parent_node_id=None, n=1):
+        def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
+                 stateless: Any = False, raw: Any = False, thinking: Any = None,
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
             for i, tok in enumerate(tokens):
-                on_token(tok, False, 1000 + i, None, None)
+                on_token(tok, False, 1000 + i, None, None)  # pyright: ignore[reportOptionalCall]
                 time.sleep(0.001)
             result = GenerationResult(
                 text="".join(tokens), tokens=list(range(1000, 1000 + len(tokens))),
@@ -435,7 +436,7 @@ class TestWebSocket:
 
         session.generate.side_effect = _gen
 
-    def test_generate_happy_path(self, session_and_client):
+    def test_generate_happy_path(self, session_and_client: Any) -> None:
         session, client = session_and_client
         self._attach_generate(session, ["Hello", " ", "world"])
 
@@ -457,7 +458,7 @@ class TestWebSocket:
             assert len(ptp) == 3
             assert ptp[0]["probes"]["happy"] == pytest.approx(0.1)
 
-    def test_unknown_message_type(self, session_and_client):
+    def test_unknown_message_type(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({"type": "frobnicate"})
@@ -465,7 +466,7 @@ class TestWebSocket:
             assert msg["type"] == "error"
             assert "unknown message type" in msg["message"]
 
-    def test_multi_turn_no_recv_race(self, session_and_client):
+    def test_multi_turn_no_recv_race(self, session_and_client: Any) -> None:
         """Three back-to-back generate turns on the same WS.
 
         Regression for the "cannot call recv while another coroutine is
@@ -490,17 +491,17 @@ class TestWebSocket:
                         break
                     assert msg["type"] == "token"
 
-    def test_mid_generation_generate_frame_runs_after_current_turn(self, session_and_client):
+    def test_mid_generation_generate_frame_runs_after_current_turn(self, session_and_client: Any) -> None:
         """A premature second generate frame is deferred, not re-read in a spin loop."""
         session, client = session_and_client
         calls: list[str] = []
 
-        def _gen(input, *, steering=None, sampling=None, stateless=False,
-                 raw=False, thinking=None, on_token=None,
-                 parent_node_id=None, n=1):
+        def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
+                 stateless: Any = False, raw: Any = False, thinking: Any = None,
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
             calls.append(str(input))
             time.sleep(0.02 if input == "one" else 0.001)
-            on_token(str(input), False, 1000 + len(calls), None, None)
+            on_token(str(input), False, 1000 + len(calls), None, None)  # pyright: ignore[reportOptionalCall]
             result = GenerationResult(
                 text=str(input), tokens=[1000 + len(calls)],
                 token_count=1, tok_per_sec=50.0, elapsed=0.02,
@@ -526,7 +527,7 @@ class TestWebSocket:
         assert done == ["one", "two"]
         assert calls == ["one", "two"]
 
-    def test_idle_stop_is_noop(self, session_and_client):
+    def test_idle_stop_is_noop(self, session_and_client: Any) -> None:
         """A ``{type: "stop"}`` outside any generation closes cleanly."""
         _, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
@@ -536,7 +537,7 @@ class TestWebSocket:
             msg = ws.receive_json()
             assert msg["type"] == "error"
 
-    def test_session_mismatch_closes(self, session_and_client):
+    def test_session_mismatch_closes(self, session_and_client: Any) -> None:
         _, client = session_and_client
         with pytest.raises(Exception):
             with client.websocket_connect("/saklas/v1/sessions/other/stream") as ws:
@@ -575,7 +576,7 @@ class TestWebSocket:
             msg = ws.receive_json()
             assert msg["type"] == "error"
 
-    def test_bad_steering_does_not_kill_connection(self, session_and_client, monkeypatch):
+    def test_bad_steering_does_not_kill_connection(self, session_and_client: Any, monkeypatch: Any) -> None:
         """Regression: a bad steering expression on a generate frame used
         to escape ``_build_steering`` and bubble out to the outer reader
         loop's ``except Exception``, which closed the WS with code 1011.
@@ -593,7 +594,7 @@ class TestWebSocket:
 
         real_parse = _sx.parse_expr
 
-        def _fake_parse(text, *, namespace=None):
+        def _fake_parse(text: Any, *, namespace: Any = None) -> Any:
             if text.strip() == "0.5 wolf":
                 raise AmbiguousSelectorError(
                     "ambiguous pole 'wolf': matches alice/wolf, default/deer.wolf"
@@ -630,7 +631,7 @@ class TestWebSocket:
 
 
 class TestTraitsStream:
-    def test_session_not_found_404(self, session_and_client):
+    def test_session_not_found_404(self, session_and_client: Any) -> None:
         _, client = session_and_client
         resp = client.get("/saklas/v1/sessions/nonexistent/traits/stream")
         assert resp.status_code == 404
@@ -644,7 +645,7 @@ class TestTraitsStream:
         resp = client.get("/saklas/v1/sessions/default/traits/stream")
         assert resp.status_code == 401
 
-    def test_register_unregister_trait_queue(self, session_and_client):
+    def test_register_unregister_trait_queue(self, session_and_client: Any) -> None:
         """Trait queue registration/unregistration works correctly."""
         session, _ = session_and_client
         loop = asyncio.new_event_loop()
@@ -679,7 +680,7 @@ class TestTraitsStream:
         loop.close()
 
 
-    def test_route_registered(self, session_and_client):
+    def test_route_registered(self, session_and_client: Any) -> None:
         """SSE route is registered (valid path resolves, bad session 404s)."""
         _, client = session_and_client
         # Can't GET a valid session without hanging (infinite SSE generator),
@@ -825,7 +826,7 @@ class TestScoreSingleToken:
         assert single["p1"] == pytest.approx(no_acc["p1"])
 
 
-def test_autoload_picks_sae_variant(tmp_path, monkeypatch):
+def test_autoload_picks_sae_variant(tmp_path: Any, monkeypatch: Any) -> None:
     """When variant='sae', autoload picks the _sae-* tensor, not the raw one."""
     import json
     import torch
@@ -859,22 +860,22 @@ def test_autoload_picks_sae_variant(tmp_path, monkeypatch):
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
-        def _promote_profile(self, p):
+        _profiles: dict[str, Any] = {}
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
-    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive")
+    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive")  # pyright: ignore[reportArgumentType]
     assert "honest.deceptive" in sess._profiles
     assert torch.allclose(sess._profiles["honest.deceptive"][0], torch.full((4,), 1.0))
 
     sess._profiles.clear()
-    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")
+    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")  # pyright: ignore[reportArgumentType]
     assert "honest.deceptive:sae" in sess._profiles
     assert torch.allclose(sess._profiles["honest.deceptive:sae"][0], torch.full((4,), 2.0))
 
 
-def test_autoload_picks_sae_with_explicit_release(tmp_path, monkeypatch):
+def test_autoload_picks_sae_with_explicit_release(tmp_path: Any, monkeypatch: Any) -> None:
     """variant='sae-<release>' loads that specific release's tensor."""
     import json
     import torch
@@ -905,19 +906,19 @@ def test_autoload_picks_sae_with_explicit_release(tmp_path, monkeypatch):
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
-        def _promote_profile(self, p):
+        _profiles: dict[str, Any] = {}
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
-    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae-release-b")
+    S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae-release-b")  # pyright: ignore[reportArgumentType]
     assert "honest.deceptive:sae-release-b" in sess._profiles
     assert torch.allclose(
         sess._profiles["honest.deceptive:sae-release-b"][0], torch.full((4,), 4.0)
     )
 
 
-def test_autoload_raises_ambiguous_when_multiple_sae_variants(tmp_path, monkeypatch):
+def test_autoload_raises_ambiguous_when_multiple_sae_variants(tmp_path: Any, monkeypatch: Any) -> None:
     import json
     import torch
     from safetensors.torch import save_file
@@ -944,16 +945,16 @@ def test_autoload_raises_ambiguous_when_multiple_sae_variants(tmp_path, monkeypa
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
-        def _promote_profile(self, p):
+        _profiles: dict[str, Any] = {}
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
     with pytest.raises(AmbiguousVariantError):
-        S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")
+        S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")  # pyright: ignore[reportArgumentType]
 
 
-def test_autoload_raises_unknown_when_variant_missing(tmp_path, monkeypatch):
+def test_autoload_raises_unknown_when_variant_missing(tmp_path: Any, monkeypatch: Any) -> None:
     import json
     import torch
     from safetensors.torch import save_file
@@ -980,16 +981,16 @@ def test_autoload_raises_unknown_when_variant_missing(tmp_path, monkeypatch):
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
-        def _promote_profile(self, p):
+        _profiles: dict[str, Any] = {}
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
     with pytest.raises(UnknownVariantError):
-        S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")
+        S.SaklasSession._try_autoload_vector(sess, "honest.deceptive", variant="sae")  # pyright: ignore[reportArgumentType]
 
 
-def test_autoload_raw_default_is_silent_on_miss(tmp_path, monkeypatch):
+def test_autoload_raw_default_is_silent_on_miss(tmp_path: Any, monkeypatch: Any) -> None:
     """variant='raw' stays silent when no tensor exists — matches pre-Task-7 behavior."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.core import session as S
@@ -998,17 +999,17 @@ def test_autoload_raw_default_is_silent_on_miss(tmp_path, monkeypatch):
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
-        def _promote_profile(self, p):
+        _profiles: dict[str, Any] = {}
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
     # No concept installed at all; no error, no population.
-    S.SaklasSession._try_autoload_vector(sess, "nonexistent")
+    S.SaklasSession._try_autoload_vector(sess, "nonexistent")  # pyright: ignore[reportArgumentType]
     assert sess._profiles == {}
 
 
-def test_steering_resolves_sae_variant_key(tmp_path, monkeypatch):
+def test_steering_resolves_sae_variant_key(tmp_path: Any, monkeypatch: Any) -> None:
     """`session.steering("0.3 honest:sae")` registers under canonical:sae."""
     import json
     import torch
@@ -1036,14 +1037,14 @@ def test_steering_resolves_sae_variant_key(tmp_path, monkeypatch):
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
+        _profiles: dict[str, Any] = {}
         _try_autoload_vector = S.SaklasSession._try_autoload_vector
-        def _promote_profile(self, p):
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
     entries = {"honest:sae": (0.3, Trigger.BOTH)}
-    out = S.SaklasSession._resolve_pole_aliases(sess, entries)
+    out = S.SaklasSession._resolve_pole_aliases(sess, entries)  # pyright: ignore[reportArgumentType]
 
     # Registered (and returned) under canonical:sae
     assert "honest.deceptive:sae" in out
@@ -1051,7 +1052,7 @@ def test_steering_resolves_sae_variant_key(tmp_path, monkeypatch):
     assert out["honest.deceptive:sae"][1] == Trigger.BOTH
 
 
-def test_steering_variant_with_pole_sign_flip(tmp_path, monkeypatch):
+def test_steering_variant_with_pole_sign_flip(tmp_path: Any, monkeypatch: Any) -> None:
     """A pole-aliased name with :sae variant still gets its sign flipped."""
     import json
     import torch
@@ -1078,22 +1079,22 @@ def test_steering_variant_with_pole_sign_flip(tmp_path, monkeypatch):
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
+        _profiles: dict[str, Any] = {}
         _try_autoload_vector = S.SaklasSession._try_autoload_vector
-        def _promote_profile(self, p):
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
     # "wolf" resolves to "deer.wolf" with sign=-1; variant :sae is preserved.
     entries = {"wolf:sae": (0.5, Trigger.BOTH)}
-    out = S.SaklasSession._resolve_pole_aliases(sess, entries)
+    out = S.SaklasSession._resolve_pole_aliases(sess, entries)  # pyright: ignore[reportArgumentType]
 
     assert "deer.wolf:sae" in out
     # sign is flipped — user asked for wolf +0.5 so effective is -0.5 on deer.wolf
     assert out["deer.wolf:sae"][0] == pytest.approx(-0.5)
 
 
-def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
+def test_steering_variant_and_raw_coexist(tmp_path: Any, monkeypatch: Any) -> None:
     """Same canonical, two variants in one steering dict → two distinct keys."""
     import json
     import torch
@@ -1124,9 +1125,9 @@ def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
 
     class StubSession:
         model_id = "m"
-        _profiles: dict = {}
+        _profiles: dict[str, Any] = {}
         _try_autoload_vector = S.SaklasSession._try_autoload_vector
-        def _promote_profile(self, p):
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
     sess = StubSession()
@@ -1134,7 +1135,7 @@ def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
         "honest.deceptive": (0.3, Trigger.BOTH),
         "honest.deceptive:sae": (0.2, Trigger.BOTH),
     }
-    out = S.SaklasSession._resolve_pole_aliases(sess, entries)
+    out = S.SaklasSession._resolve_pole_aliases(sess, entries)  # pyright: ignore[reportArgumentType]
 
     assert "honest.deceptive" in out
     assert "honest.deceptive:sae" in out
@@ -1142,7 +1143,7 @@ def test_steering_variant_and_raw_coexist(tmp_path, monkeypatch):
     assert out["honest.deceptive:sae"][0] == pytest.approx(0.2)
 
 
-def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
+def test_session_extract_sae_saves_suffixed_file(tmp_path: Any, monkeypatch: Any) -> None:
     """session.extract(..., sae=release) writes to <model>_sae-<release>.safetensors
     and returns a canonical:sae-<release> name."""
     import torch
@@ -1155,9 +1156,10 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     from saklas.core import vectors as V
     from saklas.core import extraction as E
 
-    captured: dict = {}
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *,
-                     sae=None, concept_label=None, **_kwargs):
+    captured: dict[str, Any] = {}
+    def fake_extract(model: Any, tokenizer: Any, pairs: Any, layers: Any,
+                     device: Any = None, *, sae: Any = None,
+                     concept_label: Any = None, **_kwargs: Any) -> Any:
         captured["sae"] = sae
         return ({0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}, {})
     # Stub both extractors — pipeline dispatches to DiM by default in v2.1+,
@@ -1168,7 +1170,7 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
 
     # Stub SAE backend loader.
-    def fake_loader(release, **kw):
+    def fake_loader(release: Any, **kw: Any) -> Any:
         return MockSaeBackend(
             layers=frozenset({0, 2}), d_model=4, release=release,
         )
@@ -1201,29 +1203,29 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
         tokenizer = None
         layers = [object()] * 4
 
-        def _run_generator(self, system_msg, prompt, max_new_tokens):  # pragma: no cover
+        def _run_generator(self, system_msg: Any, prompt: Any, max_new_tokens: Any) -> Any:  # pragma: no cover
             raise AssertionError("scenario gen path should not be reached")
 
-        def generate_scenarios(self, *a, **kw):  # pragma: no cover
+        def generate_scenarios(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
             raise AssertionError("scenario gen path should not be reached")
 
-        def generate_statements(self, *a, **kw):  # pragma: no cover
+        def generate_statements(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
             raise AssertionError("statement gen path should not be reached")
 
-        def _local_concept_folder(self, canonical):
+        def _local_concept_folder(self, canonical: Any) -> Any:
             import pathlib
             folder = pathlib.Path(tmp_path) / "vectors" / "local" / canonical
             folder.mkdir(parents=True, exist_ok=True)
             return folder
 
-        def _promote_profile(self, p):
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
-        def _update_local_pack_files(self, folder):
+        def _update_local_pack_files(self, folder: Any) -> None:
             pass
 
     handle = StubHandle()
-    pipeline = E.ExtractionPipeline(handle, handle, EventBus())
+    pipeline = E.ExtractionPipeline(handle, handle, EventBus())  # pyright: ignore[reportArgumentType]
     name, profile = pipeline.extract("honest.deceptive", sae="mock-release")
 
     # Return key carries the :sae-<release> suffix
@@ -1245,7 +1247,7 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path, monkeypatch):
     assert captured["sae"] is not None
 
 
-def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
+def test_session_extract_raw_path_unchanged(tmp_path: Any, monkeypatch: Any) -> None:
     """Without sae=..., extract returns the bare canonical name and writes the raw tensor."""
     import torch
 
@@ -1254,8 +1256,9 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
     from saklas.core import vectors as V
     from saklas.core import extraction as E
 
-    def fake_extract(model, tokenizer, pairs, layers, device=None, *,
-                     sae=None, concept_label=None, **_kwargs):
+    def fake_extract(model: Any, tokenizer: Any, pairs: Any, layers: Any,
+                     device: Any = None, *, sae: Any = None,
+                     concept_label: Any = None, **_kwargs: Any) -> Any:
         return ({0: torch.ones(4), 2: torch.ones(4)}, {})
     monkeypatch.setattr(V, "extract_contrastive", fake_extract)
     monkeypatch.setattr(E, "extract_contrastive", fake_extract)
@@ -1286,29 +1289,29 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
         tokenizer = None
         layers = [object()] * 4
 
-        def _run_generator(self, *a, **kw):  # pragma: no cover
+        def _run_generator(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
             raise AssertionError("not used in raw-statements path")
 
-        def generate_scenarios(self, *a, **kw):  # pragma: no cover
+        def generate_scenarios(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
             raise AssertionError("not used in raw-statements path")
 
-        def generate_pairs(self, *a, **kw):  # pragma: no cover
+        def generate_pairs(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
             raise AssertionError("not used in raw-statements path")
 
-        def _local_concept_folder(self, canonical):
+        def _local_concept_folder(self, canonical: Any) -> Any:
             import pathlib
             folder = pathlib.Path(tmp_path) / "vectors" / "local" / canonical
             folder.mkdir(parents=True, exist_ok=True)
             return folder
 
-        def _promote_profile(self, p):
+        def _promote_profile(self, p: Any) -> Any:
             return p
 
-        def _update_local_pack_files(self, folder):
+        def _update_local_pack_files(self, folder: Any) -> None:
             pass
 
     handle = StubHandle()
-    pipeline = E.ExtractionPipeline(handle, handle, EventBus())
+    pipeline = E.ExtractionPipeline(handle, handle, EventBus())  # pyright: ignore[reportArgumentType]
     name, profile = pipeline.extract("honest.deceptive")
 
     # No :sae suffix
@@ -1323,13 +1326,13 @@ def test_session_extract_raw_path_unchanged(tmp_path, monkeypatch):
 
 
 class TestExtractPreview:
-    def test_preview_returns_pairs(self, session_and_client):
+    def test_preview_returns_pairs(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generate_scenarios.return_value = ["a quiet morning", "a storm"]
 
-        def _statements(concepts, *args, scenarios=None,
-                        statements_per_cell=None, share_moment=False,
-                        on_progress=None, **_kw):
+        def _statements(concepts: Any, *args: Any, scenarios: Any = None,
+                        statements_per_cell: Any = None, share_moment: Any = False,
+                        on_progress: Any = None, **_kw: Any) -> Any:
             # The route wraps generate_statements with share_moment=True
             # and two concepts ([positive, negative_slot]).
             assert share_moment is True
@@ -1355,7 +1358,7 @@ class TestExtractPreview:
             "positive": "I feel calm.", "negative": "I feel anxious.",
         }
 
-    def test_preview_rejects_empty_concept(self, session_and_client):
+    def test_preview_rejects_empty_concept(self, session_and_client: Any) -> None:
         _session, client = session_and_client
         resp = client.post(
             "/saklas/v1/sessions/default/extract/preview",
@@ -1364,7 +1367,7 @@ class TestExtractPreview:
         assert resp.status_code == 400
 
 
-def _box1d_payload(name="mood"):
+def _box1d_payload(name: str = "mood") -> dict[str, Any]:
     return {
         "namespace": "local",
         "name": name,
@@ -1385,7 +1388,7 @@ def _box1d_payload(name="mood"):
 
 
 class TestManifoldRoutes:
-    def test_create_list_get(self, session_and_client, tmp_path, monkeypatch):
+    def test_create_list_get(self, session_and_client: Any, tmp_path: Any, monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
 
@@ -1406,7 +1409,7 @@ class TestManifoldRoutes:
         assert labels == ["calm", "mid", "afraid"]
         assert detail["nodes"][0]["statements"] == ["I am calm.", "Steady."]
 
-    def test_create_conflict(self, session_and_client, tmp_path, monkeypatch):
+    def test_create_conflict(self, session_and_client: Any, tmp_path: Any, monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
         assert client.post("/saklas/v1/manifolds",
@@ -1414,8 +1417,8 @@ class TestManifoldRoutes:
         assert client.post("/saklas/v1/manifolds",
                            json=_box1d_payload()).status_code == 409
 
-    def test_create_too_few_nodes(self, session_and_client, tmp_path,
-                                  monkeypatch):
+    def test_create_too_few_nodes(self, session_and_client: Any, tmp_path: Any,
+                                  monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
         payload = _box1d_payload()
@@ -1423,8 +1426,8 @@ class TestManifoldRoutes:
         assert client.post("/saklas/v1/manifolds",
                            json=payload).status_code == 400
 
-    def test_patch_description(self, session_and_client, tmp_path,
-                               monkeypatch):
+    def test_patch_description(self, session_and_client: Any, tmp_path: Any,
+                               monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
         client.post("/saklas/v1/manifolds", json=_box1d_payload())
@@ -1433,7 +1436,7 @@ class TestManifoldRoutes:
         assert resp.status_code == 200
         assert resp.json()["description"] == "edited"
 
-    def test_delete(self, session_and_client, tmp_path, monkeypatch):
+    def test_delete(self, session_and_client: Any, tmp_path: Any, monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
         client.post("/saklas/v1/manifolds", json=_box1d_payload())
@@ -1442,14 +1445,14 @@ class TestManifoldRoutes:
         assert client.get(
             "/saklas/v1/manifolds/local/mood").status_code == 404
 
-    def test_get_missing(self, session_and_client, tmp_path, monkeypatch):
+    def test_get_missing(self, session_and_client: Any, tmp_path: Any, monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
         assert client.get(
             "/saklas/v1/manifolds/local/ghost").status_code == 404
 
-    def test_delete_refuses_when_busy(self, session_and_client, tmp_path,
-                                      monkeypatch):
+    def test_delete_refuses_when_busy(self, session_and_client: Any, tmp_path: Any,
+                                      monkeypatch: Any) -> None:
         # A fit thread holding the engine gen-lock must block a delete —
         # removing nodes/ mid-fit would corrupt the read.
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -1459,7 +1462,7 @@ class TestManifoldRoutes:
         assert client.delete(
             "/saklas/v1/manifolds/local/mood").status_code == 409
 
-    def test_fit_json(self, session_and_client, tmp_path, monkeypatch):
+    def test_fit_json(self, session_and_client: Any, tmp_path: Any, monkeypatch: Any) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         session, client = session_and_client
         client.post("/saklas/v1/manifolds", json=_box1d_payload())

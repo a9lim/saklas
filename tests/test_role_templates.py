@@ -16,6 +16,7 @@ behaviour.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import jinja2
 import pytest
@@ -115,9 +116,9 @@ MISTRAL_TEMPLATE = (
 
 @dataclass
 class _FakeBatch:
-    input_ids: list[int]
+    input_ids: Any  # list[int] or Tensor depending on return_tensors
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> Any:
         if key == "input_ids":
             return self.input_ids
         raise KeyError(key)
@@ -136,13 +137,13 @@ class FakeTokenizer:
 
     def apply_chat_template(
         self,
-        messages,
+        messages: list[dict[str, Any]],
         *,
         add_generation_prompt: bool = True,
         tokenize: bool = True,
-        return_tensors=None,
-        **kwargs,
-    ):
+        return_tensors: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
         rendered = self._template.render(
             messages=messages,
             add_generation_prompt=add_generation_prompt,
@@ -154,15 +155,15 @@ class FakeTokenizer:
 
     def __call__(
         self,
-        text,
+        text: str,
         *,
-        return_tensors=None,
+        return_tensors: str | None = None,
         add_special_tokens: bool = True,
-    ):
+    ) -> _FakeBatch:
         return _FakeBatch(input_ids=self._tokenize(text, return_tensors=return_tensors))
 
     @staticmethod
-    def _tokenize(text: str, *, return_tensors=None):
+    def _tokenize(text: str, *, return_tensors: str | None = None) -> Any:
         # Stable deterministic mapping: token id is the hash of each
         # whitespace-split chunk mod a small constant.  Real values
         # don't matter for these tests.
@@ -660,7 +661,7 @@ def test_role_header_is_frozen():
     """RoleHeader is a frozen dataclass — registry entries can't be mutated post-import."""
     header = RoleHeader(before="x", after="y", label="z")
     with pytest.raises((AttributeError, Exception)):
-        header.before = "mutated"  # type: ignore[misc]
+        header.before = "mutated"  # pyright: ignore[reportAttributeAccessIssue]  # frozen dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -674,8 +675,8 @@ def test_build_chat_input_with_gen_role():
     """
     from saklas.core.generation import build_chat_input
 
-    tok = _qwen_tok()
-    tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
+    tok: Any = _qwen_tok()
+    tok.chat_template = QWEN_TEMPLATE
 
     messages = [{"role": "user", "content": "hello"}]
     input_ids = build_chat_input(
@@ -698,8 +699,8 @@ def test_build_chat_input_with_per_turn_labels():
     """Per-message ``label`` keys drive a faithful per-turn render."""
     from saklas.core.generation import build_chat_input
 
-    tok = _qwen_tok()
-    tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
+    tok: Any = _qwen_tok()
+    tok.chat_template = QWEN_TEMPLATE
 
     messages = [
         {"role": "user", "content": "hi", "label": "captain"},
@@ -723,8 +724,8 @@ def test_build_chat_input_no_labels_unchanged():
     """No labels + ``gen_role=None`` is byte-identical to the plain path."""
     from saklas.core.generation import build_chat_input
 
-    tok = _qwen_tok()
-    tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
+    tok: Any = _qwen_tok()
+    tok.chat_template = QWEN_TEMPLATE
 
     messages = [{"role": "user", "content": "hello"}]
     direct = build_chat_input(tok, messages, system_prompt="be brief.")
@@ -741,8 +742,8 @@ def test_build_chat_input_gen_role_requires_model_type():
     """
     from saklas.core.generation import build_chat_input
 
-    tok = _qwen_tok()
-    tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
+    tok: Any = _qwen_tok()
+    tok.chat_template = QWEN_TEMPLATE
 
     with pytest.raises(ValueError, match="model_type"):
         build_chat_input(
@@ -791,7 +792,7 @@ GPT_OSS_HARMONY_TEMPLATE = (
         ),
     ],
 )
-def test_apply_with_user_role_per_family(tok_factory, model_type, expected):
+def test_apply_with_user_role_per_family(tok_factory: Any, model_type: str, expected: str) -> None:
     """user_role relabels the user turn for every supported family."""
     tok = tok_factory()
     out = apply_with_role(
@@ -917,8 +918,8 @@ def test_build_chat_input_user_label_distinct_from_plain():
 
     from saklas.core.generation import build_chat_input
 
-    tok = _qwen_tok()
-    tok.chat_template = QWEN_TEMPLATE  # type: ignore[attr-defined]
+    tok: Any = _qwen_tok()
+    tok.chat_template = QWEN_TEMPLATE
 
     plain = build_chat_input(tok, [{"role": "user", "content": "hello"}])
     with_user = build_chat_input(

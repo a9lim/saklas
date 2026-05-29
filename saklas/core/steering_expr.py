@@ -520,7 +520,7 @@ class _Parser:
         # Allow a leading ``-`` on the threshold so ``@when:x>-0.5``
         # parses as ``threshold = -0.5``.
         threshold = self._signed_num()
-        return Trigger.when(probe, op_str, threshold)  # type: ignore[arg-type]
+        return Trigger.when(probe, op_str, threshold)  # pyright: ignore[reportArgumentType]  # dict[str,str] widens the literal op value; runtime is always a valid ProbeGateOp
 
     def _signed_num(self) -> float:
         """Parse an optionally signed numeric literal: ``[+|-] NUM``."""

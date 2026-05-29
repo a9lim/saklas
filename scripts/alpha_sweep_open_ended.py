@@ -61,7 +61,7 @@ def run_concept(
     session: SaklasSession,
     name: str,
     pos: str,
-    neg: str,
+    neg: str | None,
     prompt: str,
     use_neg_alphas: bool,
 ) -> None:

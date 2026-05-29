@@ -10,7 +10,7 @@ from __future__ import annotations
 from saklas.core.triggers import Trigger, TriggerContext
 
 
-def _ctx(*, prefill=False, thinking=False, gen_step=0) -> TriggerContext:
+def _ctx(*, prefill: bool = False, thinking: bool = False, gen_step: int = 0) -> TriggerContext:
     return TriggerContext(is_prefill=prefill, thinking=thinking, gen_step=gen_step)
 
 
@@ -87,7 +87,7 @@ def test_trigger_is_hashable_and_frozen():
     # Verify frozenness.
     import pytest
     with pytest.raises(Exception):
-        a.prompt = False  # type: ignore[misc]
+        a.prompt = False  # pyright: ignore[reportAttributeAccessIssue]  # frozen dataclass; assignment is intentional to test frozenness
 
 
 def test_presets_are_trigger_instances():

@@ -1,31 +1,35 @@
+from pathlib import Path
+
+import pytest
+
 from saklas.io import paths
 
 
-def test_default_home(monkeypatch, tmp_path):
+def test_default_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("SAKLAS_HOME", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     assert paths.saklas_home() == tmp_path / ".saklas"
 
 
-def test_env_override(monkeypatch, tmp_path):
+def test_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     custom = tmp_path / "custom_root"
     monkeypatch.setenv("SAKLAS_HOME", str(custom))
     assert paths.saklas_home() == custom
 
 
-def test_subdirs(monkeypatch, tmp_path):
+def test_subdirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     assert paths.vectors_dir() == tmp_path / "vectors"
     assert paths.models_dir() == tmp_path / "models"
     assert paths.neutral_statements_path() == tmp_path / "neutral_statements.json"
 
 
-def test_concept_dir(monkeypatch, tmp_path):
+def test_concept_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     assert paths.concept_dir("default", "happy") == tmp_path / "vectors" / "default" / "happy"
 
 
-def test_model_dir_flattens_slashes(monkeypatch, tmp_path):
+def test_model_dir_flattens_slashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     assert paths.model_dir("google/gemma-2-2b-it") == tmp_path / "models" / "google__gemma-2-2b-it"
 
@@ -66,7 +70,7 @@ def test_tensor_filename_roundtrip_sae():
     assert parsed == ("google__gemma-2-2b-it", "sae-gemma-scope-2b-pt-res-canonical")
 
 
-def test_tensor_filename_roundtrip_from_transferred(monkeypatch):
+def test_tensor_filename_roundtrip_from_transferred(monkeypatch: pytest.MonkeyPatch) -> None:
     # Transferred profiles ride the same variant-suffix machinery as SAE.
     name = paths.tensor_filename(
         "Qwen/Qwen2.5-7B-Instruct",

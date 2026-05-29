@@ -10,6 +10,7 @@ activation tensors.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -213,7 +214,7 @@ class TestAlignmentQuality:
 
 
 class TestAlignmentCache:
-    def test_cache_path_layout(self, tmp_path, monkeypatch) -> None:
+    def test_cache_path_layout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         ts, sc = alignment_cache_path("google/gemma-3-4b-it", "Qwen/Qwen2.5-7B-Instruct")
         # Layout: under the *target* model's dir.
@@ -223,7 +224,7 @@ class TestAlignmentCache:
         assert ts.suffix == ".safetensors"
         assert sc.suffix == ".json"
 
-    def test_save_load_round_trip(self, tmp_path, monkeypatch) -> None:
+    def test_save_load_round_trip(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         D = 4
         M = {0: torch.eye(D), 5: torch.eye(D)}
@@ -245,7 +246,7 @@ class TestAlignmentCache:
         assert "0" in sidecar["quality_per_layer"]
         assert sidecar["quality_per_layer"]["0"] == pytest.approx(0.85)
 
-    def test_load_missing_returns_none(self, tmp_path, monkeypatch) -> None:
+    def test_load_missing_returns_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         assert load_alignment_map("nope/src", "nope/tgt") is None
 
@@ -256,7 +257,7 @@ class TestAlignmentCache:
 
 
 class TestSidecarTransferFields:
-    def test_round_trip(self, tmp_path) -> None:
+    def test_round_trip(self, tmp_path: Path) -> None:
         from saklas.io.packs import Sidecar
 
         sc = Sidecar(

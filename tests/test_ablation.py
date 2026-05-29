@@ -16,7 +16,7 @@ from saklas.core.triggers import Trigger, TriggerContext
 
 
 class _DummyLayer(torch.nn.Module):
-    def forward(self, x):  # type: ignore[override]
+    def forward(self, x):  # pyright: ignore[reportMissingParameterType]  # torch.nn.Module.forward accepts *input: Any
         return (x,)
 
 
@@ -297,7 +297,7 @@ def test_multi_direction_correlated_over_ablates():
 
 
 class _NoopModule(torch.nn.Module):
-    def forward(self, x):  # type: ignore[override]
+    def forward(self, x):  # pyright: ignore[reportMissingParameterType]  # torch.nn.Module.forward accepts *input: Any
         return (x,)
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -12,7 +13,7 @@ from saklas.core.profile import Profile, ProfileError
 from saklas.core.vectors import save_profile, load_profile
 
 
-def test_save_profile_writes_format_version_in_sidecar(tmp_path):
+def test_save_profile_writes_format_version_in_sidecar(tmp_path: Path):
     profile = {0: torch.zeros(4), 1: torch.ones(4)}
     path = tmp_path / "x.safetensors"
     save_profile(profile, str(path), {"method": "contrastive_pca"})
@@ -21,7 +22,7 @@ def test_save_profile_writes_format_version_in_sidecar(tmp_path):
     assert sidecar["method"] == "contrastive_pca"
 
 
-def test_load_profile_rejects_missing_format_version(tmp_path):
+def test_load_profile_rejects_missing_format_version(tmp_path: Path):
     profile = {0: torch.zeros(4)}
     path = tmp_path / "x.safetensors"
     save_profile(profile, str(path), {"method": "contrastive_pca"})
@@ -36,7 +37,7 @@ def test_load_profile_rejects_missing_format_version(tmp_path):
         load_profile(str(path))
 
 
-def test_load_profile_rejects_format_version_one(tmp_path):
+def test_load_profile_rejects_format_version_one(tmp_path: Path):
     profile = {0: torch.zeros(4)}
     path = tmp_path / "x.safetensors"
     save_profile(profile, str(path), {"method": "contrastive_pca"})
@@ -50,7 +51,7 @@ def test_load_profile_rejects_format_version_one(tmp_path):
         load_profile(str(path))
 
 
-def test_profile_save_roundtrip_uses_format_version(tmp_path):
+def test_profile_save_roundtrip_uses_format_version(tmp_path: Path):
     p = Profile({0: torch.randn(4), 1: torch.randn(4)})
     path = tmp_path / "y.safetensors"
     p.save(path)
@@ -61,7 +62,7 @@ def test_profile_save_roundtrip_uses_format_version(tmp_path):
     assert back.layers == [0, 1]
 
 
-def test_pack_metadata_rejects_format_version_one(tmp_path):
+def test_pack_metadata_rejects_format_version_one(tmp_path: Path):
     d = tmp_path / "p"
     d.mkdir()
     (d / "pack.json").write_text(json.dumps({
@@ -79,7 +80,7 @@ def test_pack_metadata_rejects_format_version_one(tmp_path):
         packs.PackMetadata.load(d)
 
 
-def test_pack_metadata_rejects_missing_format_version(tmp_path):
+def test_pack_metadata_rejects_missing_format_version(tmp_path: Path):
     d = tmp_path / "p"
     d.mkdir()
     (d / "pack.json").write_text(json.dumps({
@@ -96,7 +97,7 @@ def test_pack_metadata_rejects_missing_format_version(tmp_path):
         packs.PackMetadata.load(d)
 
 
-def test_pack_metadata_write_includes_format_version(tmp_path):
+def test_pack_metadata_write_includes_format_version(tmp_path: Path):
     d = tmp_path / "p"
     d.mkdir()
     meta = packs.PackMetadata(

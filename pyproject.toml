@@ -103,30 +103,25 @@ ignore = ["E501", "E741", "E402", "E731"]
 # Examples are runnable demos that print results.
 "examples/*" = ["T20"]
 
-# Pyright — scoped to the public API surface.  Engine/CLI/server/TUI
-# layers lean hard on torch/transformers/fastapi/textual internals whose
-# stubs are uneven; running the checker over them is all noise.  The
-# surface users import from ``saklas`` is the real contract, so it's what
-# we hold to a type checker.
+# Pyright — whole-project type checking.  Historically scoped to the
+# public-API surface because the engine/CLI/server/TUI layers lean on
+# torch/transformers/fastapi/textual internals whose stubs are uneven;
+# the tree is now fully annotated, so the checker runs across everything
+# and the strict rules below hold project-wide.
 #
 # ``standard`` mode (rather than ``strict``) is deliberate: ``strict``
 # turns on ``reportUnknown*`` and those fire constantly on legitimate
 # ``Tensor.norm()`` / ``Tensor.item()`` calls because torch's type stubs
-# are partial.  We escalate the rules that actually catch bugs on a
-# public API (missing parameter types, missing type arguments, attribute
-# access, argument / call issues) to error.
+# are partial.  We escalate the rules that actually catch bugs (missing
+# parameter types, missing type arguments, attribute access, argument /
+# call / return / assignment issues) to error; the irreducible torch
+# stub-gap noise (private re-exports) stays at warning.
 [tool.pyright]
 include = [
-    "saklas/__init__.py",
-    "saklas/core/errors.py",
-    "saklas/core/events.py",
-    "saklas/core/profile.py",
-    "saklas/core/sampling.py",
-    "saklas/core/steering.py",
-    "saklas/core/steering_expr.py",
-    "saklas/core/triggers.py",
-    "saklas/core/results.py",
-    "saklas/io/datasource.py",
+    "saklas",
+    "tests",
+    "scripts",
+    "examples",
 ]
 exclude = ["**/__pycache__", "**/node_modules"]
 pythonVersion = "3.11"

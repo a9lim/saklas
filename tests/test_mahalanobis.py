@@ -8,6 +8,8 @@ loading a real model.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -283,7 +285,7 @@ class TestProfileCosineWithWhitener:
                      1: torch.tensor([0.0, 1.0, 0.0])})
         b = Profile({0: torch.tensor([1.0, 0.0, 0.0]),
                      1: torch.tensor([1.0, 0.0, 0.0])})
-        out = a.cosine_similarity(b, per_layer=True, whitener=None)
+        out: Any = a.cosine_similarity(b, per_layer=True, whitener=None)
         assert out[0] == pytest.approx(1.0)
         assert out[1] == pytest.approx(0.0)
 
@@ -292,7 +294,7 @@ class TestProfileCosineWithWhitener:
         w = _build_whitener(layers=(0, 1), n=100, d=d, seed=51)
         a = Profile({0: torch.randn(d), 1: torch.randn(d)})
         b = Profile({0: torch.randn(d), 1: torch.randn(d)})
-        per_layer = a.cosine_similarity(b, per_layer=True, whitener=w)
+        per_layer: Any = a.cosine_similarity(b, per_layer=True, whitener=w)
         # Each layer's value should equal the standalone call.
         for L in (0, 1):
             assert per_layer[L] == pytest.approx(
@@ -307,7 +309,7 @@ class TestProfileCosineWithWhitener:
         torch.manual_seed(0)
         a = Profile({L: torch.randn(d) for L in (0, 1, 2)})
         b = Profile({L: torch.randn(d) for L in (0, 1, 2)})
-        agg = a.cosine_similarity(b, whitener=w)
+        agg: Any = a.cosine_similarity(b, whitener=w)
         assert -1.0 <= agg <= 1.0
 
     def test_whitener_falls_back_for_uncovered_layers(self):
@@ -316,7 +318,7 @@ class TestProfileCosineWithWhitener:
         w = _build_whitener(layers=(0,), n=80, d=d, seed=71)
         a = Profile({0: torch.randn(d), 5: torch.tensor([1.0] * d)})
         b = Profile({0: torch.randn(d), 5: torch.tensor([1.0] * d)})
-        per_layer = a.cosine_similarity(b, per_layer=True, whitener=w)
+        per_layer: Any = a.cosine_similarity(b, per_layer=True, whitener=w)
         # Layer 5 is uncovered; identical vectors should still cosine-1.
         assert per_layer[5] == pytest.approx(1.0)
 
@@ -392,7 +394,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
         """
         import hashlib
 
-        def _stub(model, tokenizer, text, layers, device, **_kwargs):
+        def _stub(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any) -> dict[int, torch.Tensor]:
             # Deterministic per-text seed — md5 of (seed, text) gives a
             # 64-bit int with no Python hash-randomization sensitivity.
             digest = hashlib.md5(f"{seed}_{text}".encode()).hexdigest()[:16]
@@ -408,7 +410,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
             return out
         return _stub
 
-    def test_isotropic_whitener_close_to_euclidean(self, monkeypatch):
+    def test_isotropic_whitener_close_to_euclidean(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Isotropic Σ → Mahalanobis ≈ Euclidean (within finite-sample bias)."""
         from saklas.core import vectors as V
 
@@ -427,11 +429,11 @@ class TestExtractDifferenceOfMeansWithWhitener:
 
         torch.manual_seed(0)
         eu_profile, _ = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, **common,
+            _FakeModel(), _FakeTok(), pairs, **common,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
         )
         torch.manual_seed(0)
         m_profile, _ = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, whitener=w, **common,
+            _FakeModel(), _FakeTok(), pairs, whitener=w, **common,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
         )
 
         # Each layer's direction (Euclidean unit) should be close.
@@ -451,7 +453,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
                 f"Euclidean mag {eu_profile[L].norm()} (ratio={ratio:.3f})"
             )
 
-    def test_hook_share_invariant_under_anisotropic_sigma(self, monkeypatch):
+    def test_hook_share_invariant_under_anisotropic_sigma(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Hook share = ||m_L||_M / Σ ||m_L'||_M (the algebraic invariant)."""
         from saklas.core import vectors as V
 
@@ -480,7 +482,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
 
         torch.manual_seed(0)
         m_profile, _ = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, whitener=w, **common,
+            _FakeModel(), _FakeTok(), pairs, whitener=w, **common,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
         )
 
         # Rebuild the mean_diffs the extractor saw, so we can check the
@@ -512,7 +514,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
                 f"share {mahalanobis_share:.4f} (invariant violated)"
             )
 
-    def test_single_pair_branch_accepts_whitener(self, monkeypatch):
+    def test_single_pair_branch_accepts_whitener(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``n_pairs == 1`` path runs without error when whitener provided."""
         from saklas.core import vectors as V
 
@@ -526,7 +528,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
         w = LayerWhitener.from_neutral_activations(acts, means)
 
         profile, _ = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
+            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
             device=torch.device("cpu"), dls=False, whitener=w,
         )
         # All layers retained, magnitudes positive.
@@ -534,7 +536,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
         for L in profile:
             assert profile[L].norm().item() > 0.0
 
-    def test_uncovered_layer_falls_back_to_euclidean(self, monkeypatch):
+    def test_uncovered_layer_falls_back_to_euclidean(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Layer not covered by the whitener uses Euclidean score for that layer."""
         from saklas.core import vectors as V
 
@@ -548,7 +550,7 @@ class TestExtractDifferenceOfMeansWithWhitener:
         w = LayerWhitener.from_neutral_activations(acts, means)
 
         profile, _ = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
+            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
             device=torch.device("cpu"), dls=False, whitener=w,
         )
         # All 4 layers in profile; layers 2,3 used Euclidean fallback.

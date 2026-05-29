@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -28,7 +29,7 @@ from saklas.io import hf, packs
 def _stub_session_with_lock() -> SaklasSession:
     """Build a __new__-bypass stub session with the minimum state the
     extract gate touches."""
-    s = SaklasSession.__new__(SaklasSession)
+    s: Any = SaklasSession.__new__(SaklasSession)
     s._gen_phase = GenState.IDLE
     s._gen_lock = threading.Lock()
     return s
@@ -58,7 +59,7 @@ def test_extract_releases_lock_on_path_through_phase_gate():
     lock it acquired must be released so subsequent extract attempts
     can proceed once the phase clears."""
     from types import SimpleNamespace
-    s = SaklasSession.__new__(SaklasSession)
+    s: Any = SaklasSession.__new__(SaklasSession)
     s._gen_phase = GenState.RUNNING
     s._gen_lock = threading.Lock()
     s._extraction = SimpleNamespace(extract=lambda *a, **kw: ("x", None))

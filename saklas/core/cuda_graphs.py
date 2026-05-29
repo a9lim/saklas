@@ -59,7 +59,7 @@ def _support_cache_key(
     base = getattr(model, "_orig_mod", model)
     dtype: torch.dtype | None = None
     try:
-        dtype = next(base.parameters()).dtype  # type: ignore[union-attr]
+        dtype = next(base.parameters()).dtype
     except Exception:  # noqa: BLE001 - probe path must stay best-effort
         dtype = None
     return id(base), str(device), dtype
@@ -109,14 +109,14 @@ def is_cuda_graphs_supported(
     # AttributeError on missing config fields, ValueError on shape
     # mismatches, NotImplementedError on unsupported attention layouts.
     try:
-        cfg = model.config  # type: ignore[union-attr]
+        cfg = model.config
         dtype = cache_key[2] or (
             next(model.parameters()).dtype
             if hasattr(model, "parameters")
             else torch.bfloat16
         )
         probe = StaticCache(
-            cfg,  # type: ignore[arg-type]
+            cfg,  # pyright: ignore[reportArgumentType]  # transformers stub types model.config as PreTrainedConfig|Tensor|Module
             max_cache_len=1,
             device=device,
             dtype=dtype,
@@ -160,7 +160,7 @@ def make_static_cache(
     """
     from transformers import StaticCache
     return StaticCache(
-        model.config,  # type: ignore[arg-type,union-attr]
+        model.config,  # pyright: ignore[reportArgumentType]  # transformers stub types model.config as PreTrainedConfig|Tensor|Module
         max_cache_len=max_cache_len,
         device=device,
         dtype=dtype,

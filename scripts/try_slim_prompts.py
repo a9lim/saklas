@@ -109,7 +109,7 @@ def main() -> int:
         original = session._run_generator
         prompt_count = {"i": 0}
 
-        def _wrapped(system_msg, prompt, max_new_tokens, **kwargs):
+        def _wrapped(system_msg: str, prompt: str, max_new_tokens: int, **kwargs: str | None) -> str:
             prompt_count["i"] += 1
             print(
                 f"\n  [prompt #{prompt_count['i']}, "
@@ -120,7 +120,7 @@ def main() -> int:
             print("  [/prompt]\n")
             return original(system_msg, prompt, max_new_tokens, **kwargs)
 
-        session._run_generator = _wrapped  # type: ignore[method-assign]
+        session._run_generator = _wrapped
 
     for pos, neg, label in axes:
         print()

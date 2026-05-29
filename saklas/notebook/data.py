@@ -15,10 +15,10 @@ if TYPE_CHECKING:
     from saklas.core.results import GenerationResult, ResultCollector, RunSet
 
 
-DataFrameSource: TypeAlias = (
-    "Union[RunSet, ResultCollector, list[GenerationResult], "
-    "list[dict[str, Any]], pd.DataFrame]"
-)
+DataFrameSource: TypeAlias = Union[
+    "RunSet", "ResultCollector", "list[GenerationResult]",
+    "list[dict[str, Any]]", "pd.DataFrame"
+]
 
 
 def _require_pandas() -> Any:
@@ -57,7 +57,7 @@ def to_dataframe(
     # Already a DataFrame: pass through.  Duck-typed so we don't force a
     # pandas import at module load when the source is something else.
     if hasattr(source, "to_records") and hasattr(source, "columns"):
-        return source  # type: ignore[return-value]
+        return source  # pyright: ignore[reportReturnType]  # duck-typed DataFrame pass-through; runtime guard above confirms the shape
 
     # ResultCollector: delegate to its own to_dataframe so column naming
     # stays in one place.  Imported here (not at module top) so users

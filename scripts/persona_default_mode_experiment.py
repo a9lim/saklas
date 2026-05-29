@@ -28,8 +28,10 @@ from pathlib import Path
 
 import torch
 
+from typing import Any
+
 from saklas import SamplingConfig, SaklasSession
-from saklas.core.manifold import eval_rbf, load_manifold
+from saklas.core.manifold import LayerSubspace, Manifold, eval_rbf, load_manifold
 
 
 MODEL_ID = "google/gemma-4-31b-it"
@@ -43,12 +45,12 @@ SEED = 42
 OUT_PATH = Path("/tmp/persona_default_mode.json")
 
 
-def project_to_coords(centroid: torch.Tensor, sub) -> torch.Tensor:
+def project_to_coords(centroid: torch.Tensor, sub: LayerSubspace) -> torch.Tensor:
     """Activation -> PCA-subspace coordinates (R,)."""
     return (centroid - sub.mean) @ sub.basis.T
 
 
-def persona_pca_coords(manifold, sub) -> torch.Tensor:
+def persona_pca_coords(manifold: Manifold, sub: LayerSubspace) -> torch.Tensor:
     """Each persona node's centroid mapped to (K, R) via the RBF.
 
     The RBF was fit to interpolate the per-layer PCA-coords of the
@@ -110,7 +112,7 @@ def main() -> None:
 
     # --- analysis ---------------------------------------------------------
 
-    per_layer: dict[int, dict] = {}
+    per_layer: dict[int, dict[str, Any]] = {}
     for layer_idx, sub in manifold.layers.items():
         if layer_idx not in hidden:
             continue

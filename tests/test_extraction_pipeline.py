@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import pathlib
+from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 import torch
@@ -22,6 +24,7 @@ from saklas.core.extraction import (
     ModelHandle,
     PackWriter,
 )
+
 
 
 # ----------------------------------------------------------------------
@@ -49,12 +52,12 @@ class _StubHandle:
         self.model_id = "stub-model"
         self.device = torch.device("cpu")
         self.dtype = torch.float32
-        self.model = object()
-        self.tokenizer = object()
-        self.layers = [object(), object(), object(), object()]
+        self.model: torch.nn.Module = object()  # pyright: ignore[reportAttributeAccessIssue]  # stub object satisfies duck-typed usage only; real Module not needed for CPU tests
+        self.tokenizer: Any = object()
+        self.layers: Any = [object(), object(), object(), object()]
 
         self._tmp = pathlib.Path(tmp_path)
-        self._profiles: dict = {}
+        self._profiles: dict[str, Any] = {}
 
         # Tracking — every test that cares asserts on these counters.
         self.run_generator_calls = 0
@@ -62,7 +65,7 @@ class _StubHandle:
         self.pairs_calls = 0
         self.promote_calls = 0
         self.update_pack_calls = 0
-        self.added: dict = {}
+        self.added: dict[str, Any] = {}
 
         self._scenarios_response = scenarios_response or [f"domain {i}" for i in range(9)]
         self._pairs_response = pairs_response or [
@@ -71,24 +74,36 @@ class _StubHandle:
 
     # ModelHandle surface ------------------------------------------------
 
-    def _run_generator(self, system_msg, prompt, max_new_tokens):  # pragma: no cover
+    def _run_generator(self, system_msg: str, prompt: str, max_new_tokens: int) -> str:  # pragma: no cover
         self.run_generator_calls += 1
         # Tests should not actually take this path; if they do the
         # response is bogus on purpose.
         return ""
 
     def generate_scenarios(
-        self, concept, baseline=None, n=9, *, on_progress=None, role=None,
-    ):
+        self,
+        concept: str,
+        baseline: str | None = None,
+        n: int = 9,
+        *,
+        on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
+    ) -> list[str]:
         self.scenarios_calls += 1
         self.last_scenarios_role = role
         return list(self._scenarios_response)
 
     def generate_statements(
-        self, concepts, *,
-        scenarios=None, n_scenarios=9, statements_per_cell=5,
-        share_moment=False, on_progress=None, role=None,
-    ):
+        self,
+        concepts: list[str],
+        *,
+        scenarios: list[str] | None = None,
+        n_scenarios: int = 9,
+        statements_per_cell: int = 5,
+        share_moment: bool = False,
+        on_progress: Callable[[str], None] | None = None,
+        role: str | None = None,
+    ) -> dict[str, list[str]]:
         self.pairs_calls += 1
         self.last_pairs_role = role
         # Reshape the canned ``(positive, negative)`` pairs into the
@@ -106,7 +121,7 @@ class _StubHandle:
 
     # PackWriter surface -------------------------------------------------
 
-    def _local_concept_folder(self, canonical, *, namespace="local"):
+    def _local_concept_folder(self, canonical: str, *, namespace: str = "local") -> pathlib.Path:
         from saklas.io.packs import PackMetadata
         folder = self._tmp / "vectors" / namespace / canonical
         folder.mkdir(parents=True, exist_ok=True)
@@ -118,15 +133,15 @@ class _StubHandle:
             ).write(folder)
         return folder
 
-    def _promote_profile(self, p):
+    def _promote_profile(self, profile: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
         self.promote_calls += 1
-        return p
+        return profile
 
-    def _update_local_pack_files(self, folder):
+    def _update_local_pack_files(self, folder: pathlib.Path) -> None:
         self.update_pack_calls += 1
 
 
-def _fake_extract(monkeypatch, *, response=None):
+def _fake_extract(monkeypatch: Any, *, response: Any = None) -> dict[str, Any]:
     """Replace both ``extract_contrastive`` and ``extract_difference_of_means``
     inside the extraction module.
 
@@ -138,11 +153,11 @@ def _fake_extract(monkeypatch, *, response=None):
     """
     from saklas.core import extraction as E
 
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _make(label):
-        def _fake(model, tokenizer, pairs, layers, device=None, *,
-                  sae=None, concept_label=None, **_kwargs):
+    def _make(label: str) -> Callable[..., Any]:
+        def _fake(model: Any, tokenizer: Any, pairs: Any, layers: Any, device: Any = None, *,
+                  sae: Any = None, concept_label: Any = None, **_kwargs: Any) -> Any:
             # ``**_kwargs`` swallows ``dls`` / ``layer_means`` /
             # ``whitener`` (added in v2.1) — the fake doesn't model
             # any of them, just records what the pipeline asked for.
@@ -168,16 +183,16 @@ def _fake_extract(monkeypatch, *, response=None):
 class TestProtocolShape:
     """Runtime-checkable Protocols accept the implicit session implementation."""
 
-    def test_session_satisfies_modelhandle(self, tmp_path, monkeypatch):
+    def test_session_satisfies_modelhandle(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # SaklasSession's natural shape passes isinstance against both
         # protocols.  Validates the `runtime_checkable` decoration on each.
         handle = _StubHandle(tmp_path)
         assert isinstance(handle, ModelHandle)
         assert isinstance(handle, PackWriter)
 
-    def test_pipeline_constructs_against_stub(self, tmp_path):
+    def test_pipeline_constructs_against_stub(self, tmp_path: Path) -> None:
         handle = _StubHandle(tmp_path)
-        pipeline = ExtractionPipeline(handle, handle, EventBus())
+        pipeline = ExtractionPipeline(handle, handle, EventBus())  # pyright: ignore[reportArgumentType]
         # Hold the references the plan promised.
         assert pipeline._handle is handle
         assert pipeline._packs is handle
@@ -186,7 +201,7 @@ class TestProtocolShape:
 class TestTensorCacheShortCircuit:
     """Cache-hit semantics: pre-populated tensor → no model forward fires."""
 
-    def test_tensor_cache_hit_skips_extract_contrastive(self, tmp_path, monkeypatch):
+    def test_tensor_cache_hit_skips_extract_contrastive(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
         captured = _fake_extract(monkeypatch)
@@ -226,7 +241,7 @@ class TestTensorCacheShortCircuit:
 class TestForceStatementsRegenerates:
     """force_statements=True: cache exists, statements regenerated."""
 
-    def test_force_statements_bypasses_cache_and_calls_generators(self, tmp_path, monkeypatch):
+    def test_force_statements_bypasses_cache_and_calls_generators(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
         captured = _fake_extract(monkeypatch)
@@ -274,7 +289,7 @@ class TestForceStatementsRegenerates:
 class TestExplicitScenariosBypass:
     """scenarios=[...]: pair gen runs, but scenario gen does NOT."""
 
-    def test_explicit_scenarios_skips_scenario_generation(self, tmp_path, monkeypatch):
+    def test_explicit_scenarios_skips_scenario_generation(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
         captured = _fake_extract(monkeypatch)
@@ -312,7 +327,7 @@ class TestExplicitScenariosBypass:
 class TestVectorExtractedEvent:
     """The pipeline still emits VectorExtracted on the supplied EventBus."""
 
-    def test_vector_extracted_event_fires_on_cache_hit(self, tmp_path, monkeypatch):
+    def test_vector_extracted_event_fires_on_cache_hit(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
         _fake_extract(monkeypatch)
@@ -356,7 +371,7 @@ class TestVectorExtractedEvent:
 class TestSessionGate:
     """SaklasSession.extract gates on GenState.IDLE before delegating."""
 
-    def test_session_extract_raises_when_generation_active(self):
+    def test_session_extract_raises_when_generation_active(self) -> None:
         # Bypass SaklasSession.__init__ — we only need _gen_phase + _extraction.
         from types import SimpleNamespace
         from saklas.core.session import (
@@ -366,14 +381,14 @@ class TestSessionGate:
         import threading
         session = SaklasSession.__new__(SaklasSession)
         session._gen_phase = GenState.RUNNING
-        session._gen_lock = threading.Lock()
+        session._gen_lock = threading.RLock()  # gate uses acquire(blocking=False), needs RLock
         # _extraction won't be reached — gate fires first.
-        session._extraction = SimpleNamespace(extract=lambda *a, **kw: ("x", None))
+        session._extraction = SimpleNamespace(extract=lambda *a, **kw: ("x", None))  # pyright: ignore[reportAttributeAccessIssue]  # stub bypasses ExtractionPipeline; gate fires before _extraction is reached
 
         with pytest.raises(ConcurrentExtractionError):
             session.extract("honest.deceptive")
 
-    def test_concurrent_extraction_error_subclasses_saklas_error(self):
+    def test_concurrent_extraction_error_subclasses_saklas_error(self) -> None:
         from saklas.core.errors import SaklasError
         from saklas.core.session import ConcurrentExtractionError
         assert issubclass(ConcurrentExtractionError, SaklasError)
@@ -395,8 +410,8 @@ class TestRoleVariant:
     """
 
     def test_extract_with_role_writes_role_variant_file(
-        self, tmp_path, monkeypatch,
-    ):
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
         captured = _fake_extract(monkeypatch)
@@ -426,7 +441,7 @@ class TestRoleVariant:
         assert handle.last_scenarios_role == "pirate"
         assert handle.last_pairs_role == "pirate"
 
-    def test_extract_role_rejects_with_sae(self, tmp_path, monkeypatch):
+    def test_extract_role_rejects_with_sae(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
         from saklas.io.selectors import invalidate
@@ -449,8 +464,8 @@ class TestRoleVariant:
             )
 
     def test_extract_role_cache_hit_returns_role_qualified_name(
-        self, tmp_path, monkeypatch,
-    ):
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """A pre-baked role tensor short-circuits the pipeline and the
         cached output name still carries the role suffix."""
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))

@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -23,7 +24,6 @@ from saklas.core.model import load_model, get_layers
 from saklas.core.vectors import extract_contrastive
 from saklas.io.paths import saklas_home, safe_model_id
 
-
 TRANSLATE_SYSTEM = (
     "You are a precise English-to-French translator. Translate the user's "
     "sentence into natural, fluent French. Output only the translation, with "
@@ -31,7 +31,7 @@ TRANSLATE_SYSTEM = (
 )
 
 
-def _apply_template(tokenizer, msgs):
+def _apply_template(tokenizer: Any, msgs: list[dict[str, Any]]) -> Any:
     out = tokenizer.apply_chat_template(
         msgs, return_tensors="pt", add_generation_prompt=True,
     )
@@ -41,7 +41,7 @@ def _apply_template(tokenizer, msgs):
     return out["input_ids"] if "input_ids" in out else out.input_ids
 
 
-def translate_one(model, tokenizer, text: str, device) -> str:
+def translate_one(model: Any, tokenizer: Any, text: str, device: torch.device) -> str:
     msgs = [
         {"role": "system", "content": TRANSLATE_SYSTEM},
         {"role": "user", "content": text},
@@ -71,12 +71,12 @@ def translate_one(model, tokenizer, text: str, device) -> str:
     return reply
 
 
-def load_statements(path: Path) -> list[dict]:
+def load_statements(path: Path) -> list[dict[str, Any]]:
     with open(path) as f:
         return json.load(f)
 
 
-def layer_ratios(baked_path: Path, layer_means_path: Path, indices=(0, 1, 2)):
+def layer_ratios(baked_path: Path, layer_means_path: Path, indices: tuple[int, ...] = (0, 1, 2)) -> dict[str | int, float]:
     baked = load_file(str(baked_path))
     lm = load_file(str(layer_means_path))
     out = {}

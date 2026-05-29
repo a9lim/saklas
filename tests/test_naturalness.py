@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 
@@ -109,7 +110,7 @@ def test_off_manifold_trajectory_scores_higher():
 class _MockTok:
     bos_token_id = 0
 
-    def __call__(self, text, return_tensors=None, add_special_tokens=None):
+    def __call__(self, text: str, return_tensors: str | None = None, add_special_tokens: bool | None = None) -> dict[str, Any]:
         ids = [(ord(c) % 13) + 1 for c in text] or [1]
         return {"input_ids": torch.tensor([ids])}
 
@@ -118,7 +119,8 @@ class _MockModel:
     def __init__(self, vocab: int):
         self.vocab = vocab
 
-    def __call__(self, input_ids=None, use_cache=None):
+    def __call__(self, input_ids: torch.Tensor | None = None, use_cache: bool | None = None) -> SimpleNamespace:
+        assert input_ids is not None  # callers always pass a tensor
         seq = input_ids.shape[1]
         torch.manual_seed(int(input_ids.sum()))
         return SimpleNamespace(logits=torch.randn(1, seq, self.vocab))

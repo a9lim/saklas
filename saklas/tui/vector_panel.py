@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
@@ -15,10 +17,10 @@ MAX_ALPHA = 1.0
 class LeftPanel(Widget):
     """Entire left column: model, vectors, gen config, keys."""
 
-    def __init__(self, model_info: dict, **kwargs) -> None:
+    def __init__(self, model_info: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._model_info = model_info
-        self._vectors: list[dict] = []
+        self._vectors: list[dict[str, Any]] = []
         self._selected_idx: int = 0
         self._thinking: bool | None = None  # None = model doesn't support it
         # True when the model thinks unconditionally (gpt-oss / Mistral-3
@@ -82,7 +84,7 @@ class LeftPanel(Widget):
             id="key-ref",
         )
 
-    def update_vectors(self, vectors: list[dict]) -> None:
+    def update_vectors(self, vectors: list[dict[str, Any]]) -> None:
         self._vectors = vectors
         if self._vectors:
             self._selected_idx = min(self._selected_idx, len(self._vectors) - 1)
@@ -121,7 +123,7 @@ class LeftPanel(Widget):
             self._selected_idx = (self._selected_idx - 1) % len(self._vectors)
             self._render_vectors()
 
-    def get_selected(self) -> dict | None:
+    def get_selected(self) -> dict[str, Any] | None:
         if self._vectors and 0 <= self._selected_idx < len(self._vectors):
             return self._vectors[self._selected_idx]
         return None
@@ -182,7 +184,7 @@ class LeftPanel(Widget):
         content.update("\n".join(lines))
 
     def _render_manifold_row(
-        self, v: dict, is_selected: bool, enabled: bool,
+        self, v: dict[str, Any], is_selected: bool, enabled: bool,
     ) -> str:
         """Render one manifold row.
 

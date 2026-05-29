@@ -28,7 +28,7 @@ MAX_TOKENS = 180
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n", 1)[0])
     p.add_argument("--model", default=DEFAULT_MODEL_ID)
     p.add_argument(
         "--alphas", nargs="+", type=float, default=None,

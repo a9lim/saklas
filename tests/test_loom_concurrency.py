@@ -34,7 +34,7 @@ def _mk_tree_with_reservation():
 
     Reservation = u1 (the user-parent of the streaming assistant).
     """
-    state = {"reservation": None}
+    state: dict[str, str | None] = {"reservation": None}
 
     def conflict_check(node_id: str, op: str) -> None:
         reservation = state["reservation"]

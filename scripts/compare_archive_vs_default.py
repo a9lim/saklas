@@ -97,7 +97,9 @@ def main() -> int:
             print(f"  [warn] {name}: no shared layers between old and new", file=sys.stderr)
             continue
         cos = old.cosine_similarity(new, whitener=whitener)
-        results.append((name, float(cos), len(shared)))
+        # per_layer=False (default) guarantees a scalar float return
+        assert isinstance(cos, float), "expected scalar cosine_similarity without per_layer"
+        results.append((name, cos, len(shared)))
 
     if not results:
         print("no concepts to compare. did you re-extract yet?", file=sys.stderr)

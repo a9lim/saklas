@@ -9,6 +9,7 @@ callback consumes.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 import torch
@@ -16,8 +17,8 @@ import torch
 from saklas.core.manifold import (
     BoxAxis,
     BoxDomain,
+    LayerSubspace,
     Manifold,
-    eval_rbf,
     fit_layer_subspace as _fit_layer_subspace_with_ev,
 )
 from saklas.core.monitor import (
@@ -28,7 +29,7 @@ from saklas.core.monitor import (
 from saklas.core.results import ManifoldAggregate, ManifoldTokenReading
 
 
-def fit_layer_subspace(*args, **kwargs):
+def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     """Test helper: drop the EV ratio for callers that don't care."""
     sub, _ev = _fit_layer_subspace_with_ev(*args, **kwargs)
     return sub
@@ -54,7 +55,7 @@ def _toy_manifold(
     domain = BoxDomain([BoxAxis("u", periodic=False, lo=-1.0, hi=1.0)])
     coords = torch.tensor([[-1.0], [0.0], [1.0]])
 
-    layers: dict[int, object] = {}
+    layers: dict[int, LayerSubspace] = {}
     ev: dict[int, float] = {}
     # Same orthonormal frame across layers so each layer's geometry is
     # easy to reason about (the fraction = 1.0 case lands on a single

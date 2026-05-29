@@ -7,9 +7,10 @@ import logging
 import threading
 import warnings
 from enum import IntEnum
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import torch
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas.core.results import TokenAlt
 from saklas.core.triggers import TriggerContext
@@ -41,14 +42,14 @@ class ThinkingState(enum.Enum):
 
 log = logging.getLogger(__name__)
 
-def _tok_key(tokenizer) -> tuple[str, int]:
+def _tok_key(tokenizer: PreTrainedTokenizerBase) -> tuple[str, int]:
     return (getattr(tokenizer, 'name_or_path', ''), tokenizer.vocab_size)
 
 
 _eos_cache: dict[tuple[str, int], set[int]] = {}
 
 
-def _get_eos_ids(model, tokenizer) -> set[int]:
+def _get_eos_ids(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase) -> set[int]:
     """Return cached set of all EOS token IDs for model+tokenizer."""
     tok_key = _tok_key(tokenizer)
     cached = _eos_cache.get(tok_key)
@@ -62,7 +63,7 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
         else:
             eos_ids.update(eid)
     if tokenizer.eos_token_id is not None:
-        eos_ids.add(tokenizer.eos_token_id)
+        eos_ids.add(int(tokenizer.eos_token_id))  # pyright: ignore[reportArgumentType]  # transformers stub over-widens eos_token_id
     # Pick up end-of-turn tokens that some models (Gemma 4, etc.) add as
     # special tokens but don't list in generation_config.eos_token_id.
     _EOT_NAMES = {"<end_of_turn>", "<|endoftext|>", "<|end|>", "<|eot_id|>",
@@ -78,7 +79,7 @@ def _get_eos_ids(model, tokenizer) -> set[int]:
 _token_table_cache: dict[tuple[str, int], list[str | None]] = {}
 
 
-def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
+def _get_token_table(tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> list[str | None]:
     """Return cached token-id-to-string lookup table.
 
     Replaces per-token ``convert_ids_to_tokens`` calls with a single
@@ -101,7 +102,7 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
         end = min(start + _CHUNK, vocab_size)
         ids = [[i] for i in range(start, end)]
         try:
-            decoded = tokenizer.batch_decode(ids)
+            decoded: list[str] | None = cast(list[str], tokenizer.batch_decode(ids))  # transformers stub widens batch_decode return
         except Exception:
             decoded = None
         if decoded is not None and len(decoded) == (end - start):
@@ -110,7 +111,7 @@ def _get_token_table(tokenizer, vocab_size: int) -> list[str | None]:
         else:
             for i in range(start, end):
                 try:
-                    s = tokenizer.decode([i])
+                    s = cast(str, tokenizer.decode([i]))  # transformers stub widens decode return to str|list[str]
                     table[i] = s if '\ufffd' not in s else None
                 except Exception:
                     table[i] = ''
@@ -123,7 +124,7 @@ _none_result: tuple[int | None, int | None, int | None, bool] = (None, None, Non
 
 
 def _detect_bracket_delimiters(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[int | None, int | None, int | None, bool] | None:
     """Detect bracket-pair thinking delimiters (Mistral-3 Reasoning style).
 
@@ -146,7 +147,7 @@ def _detect_bracket_delimiters(
 
 
 def _detect_channel_delimiters(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[int | None, int | None, int | None, bool] | None:
     """Detect channel-based thinking for models that always use channels.
 
@@ -164,10 +165,10 @@ def _detect_channel_delimiters(
     # Check whether the generation prompt already opens a channel
     # (model starts in thinking) or the model must emit it explicitly.
     try:
-        gen_prompt = tokenizer.apply_chat_template(
+        gen_prompt = cast(str, tokenizer.apply_chat_template(  # transformers stub doesn't narrow tokenize=False return
             [{"role": "user", "content": "hi"}],
             add_generation_prompt=True, tokenize=False,
-        )
+        ))
     except Exception:
         gen_prompt = ""
     starts_in = "<|channel|>" in gen_prompt
@@ -185,7 +186,7 @@ def _detect_channel_delimiters(
 
 
 def _detect_think_delimiters(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[int | None, int | None, int | None, bool]:
     """Detect thinking start/end delimiter tokens from the chat template.
 
@@ -253,10 +254,10 @@ def _detect_think_delimiters(
 
     for asst_msg in attempts:
         try:
-            rendered = tokenizer.apply_chat_template(
+            rendered = cast(str, tokenizer.apply_chat_template(  # transformers stub doesn't narrow tokenize=False return
                 [{"role": "user", "content": "hi"}, asst_msg],
                 tokenize=False, enable_thinking=True,
-            )
+            ))
         except Exception:
             continue
 
@@ -293,11 +294,11 @@ def _detect_think_delimiters(
         starts_in_thinking = False
         if start_id is not None and start_tok is not None:
             try:
-                gen_prompt = tokenizer.apply_chat_template(
+                gen_prompt = cast(str, tokenizer.apply_chat_template(  # transformers stub doesn't narrow tokenize=False return
                     [{"role": "user", "content": "hi"}],
                     add_generation_prompt=True, tokenize=False,
                     enable_thinking=True,
-                )
+                ))
                 if start_tok in gen_prompt:
                     starts_in_thinking = True
                     start_id = None  # nothing to detect at runtime
@@ -319,12 +320,12 @@ def _detect_think_delimiters(
     return _none_result
 
 
-def supports_thinking(tokenizer) -> bool:
+def supports_thinking(tokenizer: PreTrainedTokenizerBase) -> bool:
     """Check if the tokenizer's chat template supports thinking mode."""
     return _detect_think_delimiters(tokenizer) != _none_result
 
 
-def thinking_is_optional(tokenizer) -> bool:
+def thinking_is_optional(tokenizer: PreTrainedTokenizerBase) -> bool:
     """Return True iff the user can actually turn thinking off.
 
     Templates carry an ``enable_thinking`` Jinja variable for the
@@ -347,7 +348,7 @@ def thinking_is_optional(tokenizer) -> bool:
     return "enable_thinking" in template
 
 
-def detect_base_model(tokenizer) -> bool:
+def detect_base_model(tokenizer: PreTrainedTokenizerBase) -> bool:
     """True when the tokenizer carries no chat template — a base model.
 
     A base (completion) model has no ``chat_template``, so there are no
@@ -434,7 +435,7 @@ class GenerationState:
 
     def __init__(self):
         self.stop_requested = threading.Event()
-        self.token_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self.token_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.thinking_end_idx: int = 0
         self.finish_reason: str = "stop"
         self.thinking_state: ThinkingState = ThinkingState.IDLE
@@ -520,7 +521,7 @@ _chat_input_cache: dict[
 
 
 def _chat_input_cache_key(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     chat: list[dict[str, Any]],
     system_prompt: str | None,
     thinking: bool,
@@ -540,7 +541,7 @@ def _chat_input_cache_key(
 
 
 def build_chat_input(
-    tokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     messages: list[dict[str, Any]],
     system_prompt: str | None = None,
     thinking: bool = False,
@@ -580,7 +581,7 @@ def build_chat_input(
             # Return a clone — callers (notably ``_prepare_input``) ``.to``
             # device-move the tensor and would otherwise alias the cache.
             return cached.clone()
-        kwargs: dict = {}
+        kwargs: dict[str, Any] = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = thinking
         if not has_labels:
@@ -610,7 +611,7 @@ def build_chat_input(
         if isinstance(result, torch.Tensor):
             tensor = result
         else:
-            tensor = result["input_ids"]
+            tensor = cast(torch.Tensor, result["input_ids"])  # pyright: ignore[reportArgumentType, reportCallIssue]  # transformers BatchEncoding stub lacks str-key subscript
         # Insert into cache — evict FIFO at the size cap. dict insertion
         # order is the eviction order; popping the first key removes the
         # oldest entry. Not strictly LRU (no touch-on-hit reorder), but
@@ -627,12 +628,12 @@ def build_chat_input(
     # ignore the kwarg here rather than raising — the engine routes
     # base-model traffic to the raw path before this branch fires.
     text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in chat) + "\nAssistant:"
-    return tokenizer(text, return_tensors="pt")["input_ids"]
+    return cast(torch.Tensor, tokenizer(text, return_tensors="pt")["input_ids"])  # transformers BatchEncoding str-key subscript
 
 
 def generate_steered(
-    model,
-    tokenizer,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
@@ -645,7 +646,7 @@ def generate_steered(
     frequency_penalty: float = 0.0,
     logprobs: int | None = None,
     trigger_ctx: TriggerContext | None = None,
-    past_key_values=None,
+    past_key_values: Any = None,
     cache_position_offset: int = 0,
     score_callback: Callable[[], dict[str, float]] | None = None,
     use_static_cache: bool = False,
@@ -897,7 +898,8 @@ def generate_steered(
             no_cache_len = int(current_input.shape[1])
 
     def _emit_token(text: str, is_thinking: bool, token_id: int,
-                    logprob, top_alts, perplexity) -> None:
+                    logprob: float | None, top_alts: list[TokenAlt] | None,
+                    perplexity: float | None) -> None:
         if not is_thinking and state.response_text is not None:
             state.response_text += text
         if on_token is not None:
@@ -913,7 +915,7 @@ def generate_steered(
             cached = token_table[tid]
             if cached is not None:
                 return cached
-        return tokenizer.decode([tid])
+        return cast(str, tokenizer.decode([tid]))  # transformers stub widens decode return to str|list[str]
 
     try:
         with torch.inference_mode():
@@ -1033,6 +1035,7 @@ def generate_steered(
                     )
 
                 if bias_idx is not None:
+                    assert bias_val is not None  # set together with bias_idx when logit_bias is non-empty
                     logits[0, bias_idx] += bias_val.to(logits.dtype)
 
                 chosen_logprob: float | None = None
@@ -1087,7 +1090,7 @@ def generate_steered(
                 if logprobs is not None:
                     assert cand_logp is not None
                     if forced_in_pool:
-                        chosen_logprob = float(cand_logp[chosen_pos.item()].item())
+                        chosen_logprob = float(cand_logp[int(chosen_pos.item())].item())
                     else:
                         chosen_logprob = float(torch.log_softmax(
                             logits.float(), dim=-1,
@@ -1113,7 +1116,7 @@ def generate_steered(
                     _advance_current_input(next_token)
                     if tstate == _ThinkState.THINKING:
                         if on_token and pending_ids:
-                            _emit_token(tokenizer.decode(pending_ids),
+                            _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                         pending_thinking, -1, None, None,
                                         current_perplexity)
                             pending_ids.clear()
@@ -1121,7 +1124,7 @@ def generate_steered(
                         state.thinking_state = ThinkingState.RESPONSE_PREAMBLE
                     elif tstate == _ThinkState.PREAMBLE:
                         if on_token and pending_ids:
-                            _emit_token(tokenizer.decode(pending_ids),
+                            _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                         pending_thinking, -1, None, None,
                                         current_perplexity)
                             pending_ids.clear()
@@ -1167,7 +1170,7 @@ def generate_steered(
                     # ``[THINK]`` into content).
                     tstate = _ThinkState.THINKING
                     state.thinking_state = ThinkingState.THINKING
-                    tok_text = tokenizer.decode([token_id])
+                    tok_text = cast(str, tokenizer.decode([token_id]))  # transformers stub widens decode return
                     if tok_text == "" or tok_text.isspace():
                         continue  # swallow leading whitespace
                     # fall through to normal token handling below
@@ -1175,7 +1178,7 @@ def generate_steered(
                 # Handle end-of-thinking delimiter
                 if tstate == _ThinkState.THINKING and token_id == think_end_id:
                     if on_token and pending_ids:
-                        _emit_token(tokenizer.decode(pending_ids),
+                        _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                     pending_thinking, -1, None, None,
                                     current_perplexity)
                         pending_ids.clear()
@@ -1202,6 +1205,7 @@ def generate_steered(
                     penalty_state.add(token_id)
 
                 if on_token:
+                    assert token_table is not None  # token_table is non-None when on_token is set
                     tok_str = token_table[token_id] if token_id < _vocab else ''
                     emit_text: str | None = None
                     emit_id = token_id
@@ -1213,7 +1217,7 @@ def generate_steered(
                         pending_ids.append(token_id)
                     elif pending_ids:
                         pending_ids.append(token_id)
-                        emit_text = tokenizer.decode(pending_ids)
+                        emit_text = cast(str, tokenizer.decode(pending_ids))  # transformers stub widens decode return
                         emit_id = -1
                         emit_thinking = pending_thinking
                         pending_ids.clear()
@@ -1253,7 +1257,7 @@ def generate_steered(
         if on_token and pending_ids:
             state.emit_map.append((len(generated_ids) - 1, pending_thinking))
             _emit_token(
-                tokenizer.decode(pending_ids), pending_thinking, -1, None, None,
+                cast(str, tokenizer.decode(pending_ids)), pending_thinking, -1, None, None,
                 current_perplexity,
             )
 

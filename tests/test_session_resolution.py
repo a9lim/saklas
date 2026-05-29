@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -11,7 +13,7 @@ from saklas.core.events import EventBus
 from saklas.core.session import SaklasSession
 
 
-def _write_tensor_pack(tmp_path, namespace: str, name: str, model_id: str, value: float):
+def _write_tensor_pack(tmp_path: Path, namespace: str, name: str, model_id: str, value: float):
     from saklas.core.vectors import save_profile
     from saklas.io.packs import PackMetadata, hash_folder_files
     from saklas.io.paths import tensor_filename
@@ -42,30 +44,31 @@ def _stub_session(model_id: str) -> SaklasSession:
     from saklas.core.session import GenState
 
     session = SaklasSession.__new__(SaklasSession)
-    session._model_info = {"model_id": model_id}
-    session._device = torch.device("cpu")
-    session._dtype = torch.float32
-    session.events = EventBus()
-    session._model = SimpleNamespace()
-    session._tokenizer = SimpleNamespace()
-    session._layers = []
-    session._profiles = {}
-    session._gen_phase = GenState.IDLE
+    s: Any = session  # cast to Any for stub attribute assignments bypassing typed slots
+    s._model_info = {"model_id": model_id}
+    s._device = torch.device("cpu")
+    s._dtype = torch.float32
+    s.events = EventBus()
+    s._model = SimpleNamespace()
+    s._tokenizer = SimpleNamespace()
+    s._layers = []
+    s._profiles = {}
+    s._gen_phase = GenState.IDLE
     import threading
-    session._gen_lock = threading.Lock()
+    s._gen_lock = threading.Lock()
     # v2.1+: ``session.extract`` consults ``_extraction_method`` /
     # ``_dls`` / ``_layer_means`` for defaults; without them on the
     # stub it crashes with AttributeError before delegating to the
     # pipeline.
-    session._extraction_method = "dim"
-    session._dls = True
-    session._layer_means = {}
+    s._extraction_method = "dim"
+    s._dls = True
+    s._layer_means = {}
     # Pipeline normally constructed in __init__; stub skips that, wire one in.
-    session._extraction = ExtractionPipeline(session, session, session.events)
+    s._extraction = ExtractionPipeline(session, session, session.events)
     return session
 
 
-def test_extract_honors_namespace_when_pack_names_collide(monkeypatch, tmp_path):
+def test_extract_honors_namespace_when_pack_names_collide(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from saklas.io.selectors import invalidate
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -80,7 +83,7 @@ def test_extract_honors_namespace_when_pack_names_collide(monkeypatch, tmp_path)
     assert torch.allclose(profile[0], torch.full((4,), 2.0))
 
 
-def test_extract_bare_duplicate_pack_name_raises(monkeypatch, tmp_path):
+def test_extract_bare_duplicate_pack_name_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from saklas.io.selectors import AmbiguousSelectorError, invalidate
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))

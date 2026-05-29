@@ -7,6 +7,8 @@ model-loading machinery and pre-registers profiles directly.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -118,7 +120,7 @@ class TestProjectProfile:
 
 class _Stub(SaklasSession):
     """SaklasSession without real model/tokenizer, mirrors test_steering_context."""
-    def __init__(self, profiles: dict) -> None:  # type: ignore[override]
+    def __init__(self, profiles: dict[str, Any]) -> None:
         import threading
         self._profiles = dict(profiles)
         self._steering_stack = []
@@ -138,28 +140,29 @@ class _Stub(SaklasSession):
         self._whitener = None
         self._layer_means = {}
         self.events = EventBus()
-        self._rebuild_calls: list[dict[str, float]] = []
-        self._rebuild_entries: list[dict[str, tuple[float, Trigger]]] = []
+        self._rebuild_calls: list[dict[str, Any]] = []
+        self._rebuild_entries: list[dict[str, Any]] = []
 
     @property
-    def whitener(self) -> None:  # type: ignore[override]
+    def whitener(self) -> None:
         # No model in stub mode — return None so
         # ``_materialize_projections`` falls back to Euclidean
         # per-layer (the path real sessions hit when neutrals aren't
         # cached yet).
         return None
 
-    def _rebuild_steering_hooks(self) -> None:  # type: ignore[override]
+    def _rebuild_steering_hooks(self) -> None:
         flat = self._flatten_steering_stack()
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
         self._rebuild_entries.append(dict(flat))
+        flat_any: dict[str, Any] = flat
         self._rebuild_calls.append(
-            {name: alpha for name, (alpha, _trig) in flat.items()},
+            {name: alpha for name, (alpha, _trig) in flat_any.items()},
         )
 
-    def _resolve_pole_aliases(self, entries):  # type: ignore[override]
+    def _resolve_pole_aliases(self, entries):  # pyright: ignore[reportMissingParameterType]  # stub override with untyped entries param
         return {k: (float(v[0]), v[1]) for k, v in entries.items()}
 
 
@@ -257,7 +260,7 @@ class _MetricStub(_Stub):
 
     def __init__(
         self,
-        profiles: dict,
+        profiles: dict[str, Any],
         *,
         projection_metric: str = "mahalanobis",
         whitener_value: object = "WHITENER",
@@ -268,7 +271,7 @@ class _MetricStub(_Stub):
         self._whitener_sentinel = whitener_value
 
     @property
-    def whitener(self) -> object:  # type: ignore[override]
+    def whitener(self) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # intentionally widens _Stub.whitener: None → object for test sentinel
         return self._whitener_sentinel
 
 
@@ -280,20 +283,20 @@ class TestProjectionMetricDefault:
     under ``"euclidean"`` (the ``--legacy`` path).
     """
 
-    def _patch_project(self, monkeypatch, calls: list) -> None:
+    def _patch_project(self, monkeypatch: pytest.MonkeyPatch, calls: list[Any]) -> None:
         # ``_materialize_projections`` imports ``project_profile``
         # lazily inside the method (``from saklas.core.vectors import
         # project_profile``), so we patch it on the source module.
         from saklas.core import vectors as vectors_mod
 
-        def _spy(base, onto, operator, *, whitener=None):
+        def _spy(base: Any, onto: Any, operator: Any, *, whitener: Any = None) -> Any:
             calls.append((operator, whitener is None))
             return {0: torch.tensor([0.0, 1.0])}
 
         monkeypatch.setattr(vectors_mod, "project_profile", _spy)
 
-    def test_default_passes_whitener(self, monkeypatch):
-        calls: list = []
+    def test_default_passes_whitener(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[Any] = []
         s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
         self._patch_project(monkeypatch, calls)
         with s.steering(parse_expr("0.5 a|b")):
@@ -302,8 +305,8 @@ class TestProjectionMetricDefault:
             "default session should hand session.whitener to project_profile"
         )
 
-    def test_legacy_metric_passes_none(self, monkeypatch):
-        calls: list = []
+    def test_legacy_metric_passes_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[Any] = []
         s = _MetricStub(
             {"a": _profile_a(), "b": _profile_b()},
             projection_metric="euclidean",
@@ -315,10 +318,10 @@ class TestProjectionMetricDefault:
             "euclidean session should pass whitener=None"
         )
 
-    def test_per_call_override_flips_metric(self, monkeypatch):
+    def test_per_call_override_flips_metric(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from saklas.core.steering import Steering
 
-        calls: list = []
+        calls: list[Any] = []
         s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
         self._patch_project(monkeypatch, calls)
         # First scope inherits the session default ("mahalanobis").
@@ -337,10 +340,10 @@ class TestProjectionMetricDefault:
             pass
         assert calls == [("|", False), ("|", True)]
 
-    def test_per_call_override_inherits_to_inner_scope(self, monkeypatch):
+    def test_per_call_override_inherits_to_inner_scope(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from saklas.core.steering import Steering
 
-        calls: list = []
+        calls: list[Any] = []
         s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
         self._patch_project(monkeypatch, calls)
         # Outer scope sets "euclidean"; inner scope ``None`` inherits it.
@@ -357,10 +360,10 @@ class TestProjectionMetricDefault:
             "euclidean choice via _resolve_projection_metric"
         )
 
-    def test_invalid_metric_rejected(self, monkeypatch):
+    def test_invalid_metric_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from saklas.core.steering import Steering
 
-        calls: list = []
+        calls: list[Any] = []
         s = _MetricStub({"a": _profile_a(), "b": _profile_b()})
         self._patch_project(monkeypatch, calls)
         bad = Steering(
@@ -383,16 +386,16 @@ class TestLayerMeansLazy:
     the conservative-keep branch, and DLS silently disabled itself.
     """
 
-    def test_property_returns_existing_means_without_rebuild(self, monkeypatch):
+    def test_property_returns_existing_means_without_rebuild(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Non-empty ``self._layer_means`` short-circuits the property
         — no bootstrap call.  Sanity check that the lazy path is
         only triggered on miss."""
         s = _Stub({"a": _profile_a()})
         s._layer_means = {0: torch.tensor([1.0, 2.0])}
 
-        called: list = []
+        called: list[Any] = []
 
-        def _fail_bootstrap(*args, **kwargs):
+        def _fail_bootstrap(*args: Any, **kwargs: Any) -> Any:
             called.append(args)
             return {99: torch.tensor([0.0])}
 
@@ -403,7 +406,7 @@ class TestLayerMeansLazy:
         assert torch.equal(result[0], torch.tensor([1.0, 2.0]))
         assert called == [], "bootstrap_layer_means should not run on hit"
 
-    def test_property_lazy_builds_when_empty(self, monkeypatch):
+    def test_property_lazy_builds_when_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Empty ``self._layer_means`` triggers ``bootstrap_layer_means``
         on first access; result is cached on subsequent calls."""
         s = _Stub({"a": _profile_a()})
@@ -417,9 +420,9 @@ class TestLayerMeansLazy:
         # real property, which is what we want to exercise.
         # Replace bootstrap_layer_means with a tracker.
         built = {3: torch.tensor([5.0, 6.0]), 4: torch.tensor([7.0, 8.0])}
-        calls: list = []
+        calls: list[Any] = []
 
-        def _spy(*args, **kwargs):
+        def _spy(*args: Any, **kwargs: Any) -> Any:
             calls.append(args)
             return built
 
@@ -432,18 +435,18 @@ class TestLayerMeansLazy:
 
         # Give the stub the minimal handle attributes the bootstrap call
         # looks at, so the try-block actually runs.
-        s._model = object()  # type: ignore[attr-defined]
-        s._tokenizer = object()  # type: ignore[attr-defined]
-        s._layers = []  # type: ignore[attr-defined]
-        s._model_info = {}  # type: ignore[attr-defined]
+        s._model = object()  # pyright: ignore[reportAttributeAccessIssue]  # injecting minimal stub handle; real type is PreTrainedModel
+        s._tokenizer = object()  # pyright: ignore[reportAttributeAccessIssue]  # injecting minimal stub handle; real type is PreTrainedTokenizerBase
+        s._layers = []  # pyright: ignore[reportAttributeAccessIssue]  # injecting minimal stub handle; real type is ModuleList
+        s._model_info = {}
         monkeypatch.setattr(session_mod, "bootstrap_layer_means", _spy)
 
         # First access — triggers build.
-        out = SaklasSession.layer_means.fget(s)  # type: ignore[union-attr]
+        out = SaklasSession.layer_means.fget(s)  # pyright: ignore[reportOptionalCall]  # fget is None per stub's whitener→None return; correct at runtime
         assert out is built
         assert len(calls) == 1
         # Second access — caches; no second call.
-        out2 = SaklasSession.layer_means.fget(s)  # type: ignore[union-attr]
+        out2 = SaklasSession.layer_means.fget(s)  # pyright: ignore[reportOptionalCall]  # same as above
         assert out2 is built
         assert len(calls) == 1
 
@@ -584,7 +587,7 @@ class TestNestedProjectionScopeLeak:
         # overwrites it, exit, and assert the sentinel is restored.
         s = _Stub({"a": _profile_a(), "b": _profile_b()})
         sentinel = {0: torch.tensor([99.0, 99.0])}
-        s._profiles["a|b"] = sentinel  # type: ignore[assignment]
+        s._profiles["a|b"] = sentinel
         with s.steering(parse_expr("0.5 a|b")):
             assert s._profiles["a|b"] is not sentinel
         assert s._profiles["a|b"] is sentinel, (

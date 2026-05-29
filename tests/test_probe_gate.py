@@ -14,6 +14,9 @@ heavy to stub usefully.  These tests cover the moving parts.
 
 from __future__ import annotations
 
+import pathlib
+from typing import cast
+
 import pytest
 
 from saklas.core.events import EventBus
@@ -160,7 +163,7 @@ class TestTriggerContextProbeScores:
 
 class TestGrammar:
     @pytest.fixture(autouse=True)
-    def _isolated_home(self, monkeypatch, tmp_path):
+    def _isolated_home(self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
         from saklas.io import selectors as _sel
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _sel.invalidate()
@@ -170,7 +173,7 @@ class TestGrammar:
     def test_parse_basic_gate(self):
         s = parse_expr("0.3 angry.calm@when:angry.calm>0.4")
         assert "angry.calm" in s.alphas
-        coeff, trig = s.alphas["angry.calm"]
+        coeff, trig = cast(tuple[float, Trigger], s.alphas["angry.calm"])
         assert coeff == 0.3
         assert trig.gate == ProbeGate(
             probe="angry.calm", op=">", threshold=0.4,
@@ -180,20 +183,20 @@ class TestGrammar:
     def test_parse_all_four_ops(self):
         for op in (">", ">=", "<", "<="):
             s = parse_expr(f"0.5 angry.calm@when:angry.calm{op}0.3")
-            _coeff, trig = s.alphas["angry.calm"]
+            _coeff, trig = cast(tuple[float, Trigger], s.alphas["angry.calm"])
             assert trig.gate is not None
             assert trig.gate.op == op
 
     def test_parse_negative_threshold(self):
         s = parse_expr("0.5 angry.calm@when:angry.calm<-0.5")
-        _coeff, trig = s.alphas["angry.calm"]
+        _coeff, trig = cast(tuple[float, Trigger], s.alphas["angry.calm"])
         assert trig.gate is not None
         assert trig.gate.threshold == -0.5
 
     def test_parse_unipolar_probe_name(self):
         # Probes don't have to be bipolar — ``manipulative`` is monopolar.
         s = parse_expr("0.5 angry.calm@when:manipulative>0.3")
-        _coeff, trig = s.alphas["angry.calm"]
+        _coeff, trig = cast(tuple[float, Trigger], s.alphas["angry.calm"])
         assert trig.gate is not None
         assert trig.gate.probe == "manipulative"
 
@@ -236,7 +239,7 @@ class TestGrammar:
             "0.3 angry.calm@when:angry.calm>0.4 + 0.2 happy.sad"
         )
         # Both terms land in alphas with their respective triggers.
-        _c, t1 = s.alphas["angry.calm"]
+        _c, t1 = cast(tuple[float, Trigger], s.alphas["angry.calm"])
         assert t1.gate is not None
         e2 = s.alphas["happy.sad"]
         # Bare-float entry — inherits Steering.trigger (= BOTH default).
@@ -251,7 +254,7 @@ class _StubSession(SaklasSession):
     Bypasses model load; only the steering stack helpers are exercised.
     """
 
-    def __init__(self) -> None:  # type: ignore[override]
+    def __init__(self) -> None:
         from saklas.core.hooks import DEFAULT_THETA_MAX
         self._profiles = {}
         self._steering_stack = []

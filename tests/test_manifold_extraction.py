@@ -7,6 +7,8 @@ real model is needed.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -22,7 +24,10 @@ _DIM = 8
 _N_LAYERS = 4
 
 
-def _stub_encoder(model, tokenizer, text, layers, device, **_kwargs):
+def _stub_encoder(
+    model: Any, tokenizer: Any, text: str, layers: Any,
+    device: Any, **_kwargs: Any,
+) -> dict[int, torch.Tensor]:
     """Synthetic per-layer activations, deterministic per node label."""
     label = text.split()[0]
     seed = abs(hash(label)) % 100_000
@@ -37,18 +42,54 @@ def _stub_encoder(model, tokenizer, text, layers, device, **_kwargs):
 
 
 class _Handle:
-    """Minimal ModelHandle stub."""
+    """Minimal ModelHandle stub.
 
-    def __init__(self):
+    Satisfies the ``ModelHandle`` protocol used by
+    ``ManifoldExtractionPipeline``.  The generator methods are never
+    called in CPU-only manifold-extraction tests; they exist only to
+    complete the structural protocol.
+    """
+
+    def __init__(self) -> None:
         self.model_id = "stub-model"
-        self.model = object()
-        self.tokenizer = object()
+        # Use a real nn.Module so the protocol's ``model: nn.Module`` is met.
+        self.model: torch.nn.Module = torch.nn.Linear(1, 1)
+        self.tokenizer: Any = object()
         self.device = torch.device("cpu")
         self.dtype = torch.float32
-        self.layers = [object()] * _N_LAYERS
+        self.layers: Any = [object()] * _N_LAYERS
+
+    def _run_generator(
+        self, system_msg: str, prompt: str, max_new_tokens: int,
+    ) -> str:
+        raise NotImplementedError("stub: not called in CPU manifold tests")
+
+    def generate_scenarios(
+        self,
+        concept: str,
+        baseline: str | None = None,
+        n: int = 9,
+        *,
+        on_progress: Any = None,
+        role: str | None = None,
+    ) -> list[str]:
+        raise NotImplementedError("stub: not called in CPU manifold tests")
+
+    def generate_statements(
+        self,
+        concepts: list[str],
+        *,
+        scenarios: list[str] | None = None,
+        n_scenarios: int = 9,
+        statements_per_cell: int = 5,
+        share_moment: bool = False,
+        on_progress: Any = None,
+        role: str | None = None,
+    ) -> dict[str, list[str]]:
+        raise NotImplementedError("stub: not called in CPU manifold tests")
 
 
-def _box1d_domain(periodic: bool, k: int) -> dict:
+def _box1d_domain(periodic: bool, k: int) -> dict[str, Any]:
     axis = (
         {"name": "t", "periodic": True, "period": 1.0}
         if periodic
@@ -57,8 +98,14 @@ def _box1d_domain(periodic: bool, k: int) -> dict:
     return {"type": "box", "axes": [axis]}
 
 
-def _author_manifold(root, *, periodic=True, labels=None,
-                     domain=None, coords=None):
+def _author_manifold(
+    root: Path,
+    *,
+    periodic: bool = True,
+    labels: list[str] | None = None,
+    domain: dict[str, Any] | None = None,
+    coords: list[list[float]] | None = None,
+) -> Path:
     labels = labels or _LABELS
     folder = root / "mood"
     (folder / "nodes").mkdir(parents=True)
@@ -89,12 +136,12 @@ def _author_manifold(root, *, periodic=True, labels=None,
 
 
 @pytest.fixture(autouse=True)
-def _stub(monkeypatch):
+def _stub(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(0)
     monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encoder)
 
 
-def test_fit_produces_manifold(tmp_path):
+def test_fit_produces_manifold(tmp_path: Path) -> None:
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
     manifold = pipe.fit(folder)
@@ -106,7 +153,7 @@ def test_fit_produces_manifold(tmp_path):
     assert manifold.feature_space == "raw"
 
 
-def test_fit_writes_tensor_and_manifest(tmp_path):
+def test_fit_writes_tensor_and_manifest(tmp_path: Path) -> None:
     folder = _author_manifold(tmp_path)
     ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
     assert (folder / "stub-model.safetensors").exists()
@@ -116,7 +163,7 @@ def test_fit_writes_tensor_and_manifest(tmp_path):
     assert "stub-model.json" in mf.files
 
 
-def test_fit_emits_event(tmp_path):
+def test_fit_emits_event(tmp_path: Path) -> None:
     folder = _author_manifold(tmp_path)
     events = EventBus()
     seen = []
@@ -127,7 +174,7 @@ def test_fit_emits_event(tmp_path):
     assert seen[0].name == "mood"
 
 
-def test_fit_cache_hit_skips_forward_passes(tmp_path, monkeypatch):
+def test_fit_cache_hit_skips_forward_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
     pipe.fit(folder)
@@ -135,7 +182,7 @@ def test_fit_cache_hit_skips_forward_passes(tmp_path, monkeypatch):
     calls = {"n": 0}
     real = _stub_encoder
 
-    def _counting(*args, **kwargs):
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
         calls["n"] += 1
         return real(*args, **kwargs)
 
@@ -145,7 +192,7 @@ def test_fit_cache_hit_skips_forward_passes(tmp_path, monkeypatch):
     assert manifold.name == "mood"
 
 
-def test_fit_cache_miss_on_corpus_change(tmp_path, monkeypatch):
+def test_fit_cache_miss_on_corpus_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
     pipe.fit(folder)
@@ -157,7 +204,7 @@ def test_fit_cache_miss_on_corpus_change(tmp_path, monkeypatch):
     calls = {"n": 0}
     real = _stub_encoder
 
-    def _counting(*args, **kwargs):
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
         calls["n"] += 1
         return real(*args, **kwargs)
 
@@ -166,7 +213,7 @@ def test_fit_cache_miss_on_corpus_change(tmp_path, monkeypatch):
     assert calls["n"] > 0  # corpus changed -> forward passes re-run
 
 
-def test_fit_cache_miss_on_domain_change(tmp_path, monkeypatch):
+def test_fit_cache_miss_on_domain_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     folder = _author_manifold(tmp_path, periodic=True)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
     pipe.fit(folder)
@@ -180,7 +227,7 @@ def test_fit_cache_miss_on_domain_change(tmp_path, monkeypatch):
     calls = {"n": 0}
     real = _stub_encoder
 
-    def _counting(*args, **kwargs):
+    def _counting(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
         calls["n"] += 1
         return real(*args, **kwargs)
 
@@ -189,7 +236,7 @@ def test_fit_cache_miss_on_domain_change(tmp_path, monkeypatch):
     assert calls["n"] > 0  # geometry changed -> re-fit
 
 
-def test_fit_sae_variant(tmp_path):
+def test_fit_sae_variant(tmp_path: Path) -> None:
     folder = _author_manifold(tmp_path)
     sae = MockSaeBackend(
         layers=frozenset(range(_N_LAYERS)), d_model=_DIM,
@@ -203,16 +250,20 @@ def test_fit_sae_variant(tmp_path):
     assert (folder / "stub-model_sae-mock-rel.safetensors").exists()
 
 
-def test_fit_natural_manifold(tmp_path):
+def test_fit_natural_manifold(tmp_path: Path) -> None:
+    from saklas.core.manifold import BoxDomain
     folder = _author_manifold(tmp_path, periodic=False)
     manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
     assert manifold.domain.intrinsic_dim == 1
+    # The domain must be a BoxDomain (authored with box spec); narrowing
+    # the type lets pyright resolve the .axes attribute.
+    assert isinstance(manifold.domain, BoxDomain)
     assert manifold.domain.axes[0].periodic is False
     for sub in manifold.layers.values():
         assert sub.node_params.shape[0] == len(_LABELS)
 
 
-def test_fit_n2_box_manifold(tmp_path):
+def test_fit_n2_box_manifold(tmp_path: Path) -> None:
     labels = [f"n{i}" for i in range(9)]
     domain = {
         "type": "box",
@@ -231,7 +282,7 @@ def test_fit_n2_box_manifold(tmp_path):
     assert pt.shape == (_DIM,)
 
 
-def test_fit_rejects_poisedness_failure(tmp_path):
+def test_fit_rejects_poisedness_failure(tmp_path: Path) -> None:
     # Five nodes on a 2-D domain, all collinear -> the affine term is
     # underdetermined and the RBF fit raises.
     labels = [f"n{i}" for i in range(5)]
@@ -263,13 +314,13 @@ def test_fit_rejects_poisedness_failure(tmp_path):
 
 
 def _discover_folder(
-    root,
+    root: Path,
     *,
     name: str = "personas",
     fit_mode: str = "pca",
     labels: list[str] | None = None,
-    hyperparams: dict | None = None,
-):
+    hyperparams: dict[str, Any] | None = None,
+) -> Path:
     """Hand-author a discover-mode manifold folder without going through
     create_discover_manifold_folder (which writes to ~/.saklas/)."""
     if labels is None:
@@ -292,7 +343,7 @@ def _discover_folder(
     return folder
 
 
-def test_discover_pca_produces_custom_domain(tmp_path):
+def test_discover_pca_produces_custom_domain(tmp_path: Path) -> None:
     """PCA discover fit produces a CustomDomain of the picked intrinsic dim."""
     folder = _discover_folder(
         tmp_path, fit_mode="pca",
@@ -314,7 +365,7 @@ def test_discover_pca_produces_custom_domain(tmp_path):
     assert sorted(manifold.layers) == list(range(_N_LAYERS))
 
 
-def test_discover_records_fit_mode_and_diagnostics(tmp_path):
+def test_discover_records_fit_mode_and_diagnostics(tmp_path: Path) -> None:
     """The sidecar carries fit_mode + diagnostics so the inspector can render."""
     folder = _discover_folder(
         tmp_path, fit_mode="pca",
@@ -334,13 +385,15 @@ def test_discover_records_fit_mode_and_diagnostics(tmp_path):
     assert sidecar["hyperparams"]["var_threshold"] == 0.70
 
 
-def test_discover_cache_hit_skips_forward_passes(tmp_path, monkeypatch):
+def test_discover_cache_hit_skips_forward_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A second fit with unchanged inputs short-circuits to the cached tensor."""
     folder = _discover_folder(tmp_path, fit_mode="pca")
     ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
 
     # Patch the centroid pooler to crash if called — cache hit must skip it.
-    def _explode(*_a, **_k):
+    def _explode(*_a: Any, **_k: Any) -> None:
         raise AssertionError("compute_node_centroid called on cache hit")
     from saklas.core import manifold as M
     monkeypatch.setattr(M, "compute_node_centroid", _explode)
@@ -349,7 +402,7 @@ def test_discover_cache_hit_skips_forward_passes(tmp_path, monkeypatch):
     assert manifold.name == "personas"
 
 
-def test_discover_cache_invalidates_on_hyperparam_change(tmp_path):
+def test_discover_cache_invalidates_on_hyperparam_change(tmp_path: Path) -> None:
     """Changing max_dim refits rather than serving the cached tensor."""
     folder = _discover_folder(
         tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
@@ -368,7 +421,7 @@ def test_discover_cache_invalidates_on_hyperparam_change(tmp_path):
     assert m2.domain.intrinsic_dim <= 2
 
 
-def test_discover_cache_invalidates_on_fit_mode_change(tmp_path):
+def test_discover_cache_invalidates_on_fit_mode_change(tmp_path: Path) -> None:
     """Switching pca ↔ spectral forces a refit.
 
     Uses 9 labels so both fit modes pick a ``k`` satisfying
@@ -393,7 +446,7 @@ def test_discover_cache_invalidates_on_fit_mode_change(tmp_path):
     assert sidecar_spec["fit_mode"] == "spectral"
 
 
-def test_discover_round_trip_through_load_manifold(tmp_path):
+def test_discover_round_trip_through_load_manifold(tmp_path: Path) -> None:
     """A fitted discover manifold loads back with the same domain + coords."""
     from saklas.core.manifold import CustomDomain, load_manifold
     folder = _discover_folder(
@@ -413,7 +466,7 @@ def test_discover_round_trip_through_load_manifold(tmp_path):
         assert m2.layers[L].basis.shape == m1.layers[L].basis.shape
 
 
-def test_discover_subspace_replace_moves_toward_target(tmp_path):
+def test_discover_subspace_replace_moves_toward_target(tmp_path: Path) -> None:
     """End-to-end behavior check: subspace_replace at α=1 moves the in-subspace
     component substantially toward the manifold target.
 
@@ -464,7 +517,7 @@ def test_discover_subspace_replace_moves_toward_target(tmp_path):
         )
 
 
-def test_discover_enforces_min_nodes_after_picking_k(tmp_path):
+def test_discover_enforces_min_nodes_after_picking_k(tmp_path: Path) -> None:
     """If the picker picks a k for which the heap is too small, fit raises.
 
     With only 4 nodes and ``max_dim=4`` (forcing picked_k=4 in the

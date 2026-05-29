@@ -210,7 +210,7 @@ class ExtractionPipeline:
 
     def extract(
         self,
-        source,
+        source: str | DataSource | list[Any],
         baseline: str | None = None,
         *,
         scenarios: list[str] | None = None,
@@ -273,7 +273,7 @@ class ExtractionPipeline:
 
     def _extract_impl(
         self,
-        source,
+        source: str | DataSource | list[Any],
         baseline: str | None = None,
         *,
         scenarios: list[str] | None = None,
@@ -343,7 +343,7 @@ class ExtractionPipeline:
             sae_backend = sae
             sae_release = sae.release
 
-        sae_metadata: dict = {}
+        sae_metadata: dict[str, Any] = {}
         if sae_backend is not None:
             sae_metadata = {
                 "sae_release": sae_backend.release,
@@ -366,7 +366,7 @@ class ExtractionPipeline:
         # rendering.  Falls back to the text_config when present
         # (multimodal-with-text-submodel loads).  ``None`` is safe when
         # role is also None (the chat-template path stays plain).
-        role_metadata: dict = {}
+        role_metadata: dict[str, Any] = {}
         model_type_for_role: str | None = None
         if role is not None:
             model_cfg = getattr(self._handle.model, "config", None)
@@ -403,7 +403,7 @@ class ExtractionPipeline:
         # to avoid.  Pre-v2.1 this dict was eager and
         # ``probes=[]`` sessions paid the neutral build on every
         # cache-hit ``session.extract`` call.
-        eager_kwargs: dict = {
+        eager_kwargs: dict[str, Any] = {
             "sae": sae_backend,
             "concept_label": canonical,
             "dls": dls,
@@ -411,7 +411,7 @@ class ExtractionPipeline:
             "model_type": model_type_for_role,
         }
 
-        def _resolve_extract_kwargs() -> dict:
+        def _resolve_extract_kwargs() -> dict[str, Any]:
             """Materialize the full extractor kwargs dict on demand.
 
             Resolves ``layer_means`` and ``whitener`` from the handle
@@ -432,10 +432,10 @@ class ExtractionPipeline:
             return out
 
         def _build_return(
-            profile_dict: dict,
+            profile_dict: dict[int, Any],
             diagnostics: dict[int, dict[str, float]] | None = None,
         ) -> tuple[str, Profile]:
-            meta: dict = {"method": method_label, "bake": bake_label}
+            meta: dict[str, Any] = {"method": method_label, "bake": bake_label}
             meta.update(sae_metadata)
             meta.update(role_metadata)
             if diagnostics:
@@ -449,11 +449,11 @@ class ExtractionPipeline:
             return out_name, Profile(profile_dict, metadata=meta)
 
         def _save_meta(
-            extra: dict | None = None,
+            extra: dict[str, Any] | None = None,
             *,
             diagnostics: dict[int, dict[str, float]] | None = None,
-        ) -> dict:
-            meta: dict = {"method": method_label, "bake": bake_label}
+        ) -> dict[str, Any]:
+            meta: dict[str, Any] = {"method": method_label, "bake": bake_label}
             if extra:
                 meta.update(extra)
             meta.update(sae_metadata)
@@ -779,7 +779,7 @@ class ManifoldExtractionPipeline:
 
     def fit(
         self,
-        folder,
+        folder: str | pathlib.Path,
         *,
         sae: str | SaeBackend | None = None,
         sae_revision: str | None = None,
@@ -1059,9 +1059,9 @@ class ManifoldExtractionPipeline:
             if max_subspace_dim_override is not None:
                 resolved_hyperparams["max_subspace_dim"] = max_subspace_dim_override
             if hasattr(diagnostics, "k_nn"):  # SpectralDiagnostics
-                resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)
+                resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)  # pyright: ignore[reportAttributeAccessIssue]  # SpectralDiagnostics only; guarded by hasattr
                 resolved_hyperparams["bandwidth"] = float(
-                    diagnostics.bandwidth,
+                    diagnostics.bandwidth,  # pyright: ignore[reportAttributeAccessIssue]  # SpectralDiagnostics only; guarded by hasattr
                 )
             if anchor_label is not None:
                 resolved_hyperparams["anchor_origin"] = anchor_label

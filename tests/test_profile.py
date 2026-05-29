@@ -1,6 +1,9 @@
 """Unit tests for the Profile wrapper class."""
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
 import torch
 
@@ -8,7 +11,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile, ProfileError
 
 
-def _mk(layers=(0, 5, 10), dim=8, dtype=torch.float32):
+def _mk(layers: Any = (0, 5, 10), dim: int = 8, dtype: Any = torch.float32) -> dict[int, torch.Tensor]:
     return {i: torch.randn(dim, dtype=dtype) for i in layers}
 
 
@@ -39,12 +42,12 @@ def test_empty_profile_rejected():
 
 def test_bad_key_type_rejected():
     with pytest.raises(ProfileError, match="layer key must be int"):
-        Profile({"0": torch.zeros(4)})
+        Profile({"0": torch.zeros(4)})  # pyright: ignore[reportArgumentType]  # str key, intentionally wrong type for the test
 
 
 def test_bad_value_type_rejected():
     with pytest.raises(ProfileError, match="must be torch.Tensor"):
-        Profile({0: [1.0, 2.0]})  # type: ignore[arg-type]
+        Profile({0: [1.0, 2.0]})  # pyright: ignore[reportArgumentType]  # list value, intentionally wrong type for the test
 
 
 def test_weight_at_missing_raises_profile_error():
@@ -63,7 +66,7 @@ def test_metadata_is_copy():
     assert p.metadata["method"] == "contrastive_pca"
 
 
-def test_save_load_roundtrip(tmp_path):
+def test_save_load_roundtrip(tmp_path: Path):
     p = Profile(_mk(layers=(0, 3)))
     path = tmp_path / "cv.safetensors"
     p.save(path, metadata={"method": "contrastive_pca"})
@@ -207,7 +210,7 @@ def test_cosine_similarity_per_layer_partial_overlap():
     """per_layer=True only includes shared layers."""
     a = Profile({0: torch.randn(8), 1: torch.randn(8)})
     b = Profile({1: torch.randn(8), 2: torch.randn(8)})
-    result = a.cosine_similarity(b, per_layer=True)
+    result: dict[int, float] = a.cosine_similarity(b, per_layer=True)
     assert set(result.keys()) == {1}
 
 
@@ -298,7 +301,7 @@ def test_repr_long_form_shows_range_and_count():
 # save metadata override
 # ---------------------------------------------------------------------------
 
-def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path):
+def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path: Path):
     """``metadata=`` kwarg to ``save`` overrides matching keys in ``self.metadata``.
 
     The wire sidecar is deliberately slim (see ``saklas.core.vectors.save_profile``)

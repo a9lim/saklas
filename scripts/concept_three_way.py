@@ -54,9 +54,10 @@ import re
 import sys
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas import Profile, SamplingConfig, SaklasSession
 from saklas.core.vectors import _capture_all_hidden_states, compute_dls_mask
@@ -174,7 +175,7 @@ JUDGE_PROMPT = (
 # ---------------------------------------------------------------------------
 
 
-def load_concept_pack() -> tuple[list[str], list[dict]]:
+def load_concept_pack() -> tuple[list[str], list[dict[str, Any]]]:
     """Return (scenarios, statements).  ``statements[i]`` belongs to
     scenario ``i // 5`` — the bundled pack ships 5 pairs per scenario
     in scenario order."""
@@ -215,7 +216,7 @@ def generate_scenario_prompts(
 # ---------------------------------------------------------------------------
 
 
-def _last_content_idx(ids: torch.Tensor, tokenizer) -> int:
+def _last_content_idx(ids: torch.Tensor, tokenizer: PreTrainedTokenizerBase) -> int:
     """Mirror ``_encode_and_capture_all``'s pooling site: walk back past
     chat-template trailing markers (``all_special_ids`` ∪
     ``added_tokens_encoder``) until we land on a content token."""
@@ -231,10 +232,10 @@ def _last_content_idx(ids: torch.Tensor, tokenizer) -> int:
 
 
 def capture_prefill_with_context(
-    model,
-    tokenizer,
-    layers,
-    device,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
     statement: str,
     user_prompt: str,
 ) -> dict[int, torch.Tensor]:
@@ -248,11 +249,11 @@ def capture_prefill_with_context(
         {"role": "user", "content": user_prompt},
         {"role": "assistant", "content": statement},
     ]
-    text = tokenizer.apply_chat_template(
+    text = cast(str, tokenizer.apply_chat_template(  # transformers stub doesn't narrow tokenize=False return
         messages, tokenize=False, add_generation_prompt=False,
-    )
+    ))
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
-    ids = enc["input_ids"]
+    ids: torch.Tensor = enc["input_ids"]  # pyright: ignore[reportAssignmentType]  # BatchEncoding subscript returns Tensor at runtime
     if ids.numel() == 0:
         bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id or 0
         ids = torch.tensor([[bos_id]])
@@ -268,7 +269,7 @@ def capture_prefill_with_context(
 def build_ctx_profile(
     session: SaklasSession,
     scenarios: list[str],
-    statements: list[dict],
+    statements: list[dict[str, Any]],
     scenario_prompts: dict[str, str],
 ) -> Profile:
     model = session._model

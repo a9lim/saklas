@@ -12,7 +12,9 @@ not run in the CPU-only matrix.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -44,7 +46,8 @@ class _FakeModel:
 def test_cpu_device_returns_unsupported():
     """CPU is the safest signal: don't try to build StaticCache, don't
     even import — just say no with a reason mentioning the device."""
-    supported, reason = cg.is_cuda_graphs_supported(_FakeModel(), "cpu")
+    m: Any = _FakeModel()
+    supported, reason = cg.is_cuda_graphs_supported(m, "cpu")
     assert supported is False
     assert reason is not None and "CUDA-only" in reason
 
@@ -54,7 +57,8 @@ def test_mps_device_returns_unsupported():
     MPS but graph capture is a CUDA-only torch feature, so the static-
     shape benefit doesn't pay off — simpler to gate at device.
     """
-    supported, reason = cg.is_cuda_graphs_supported(_FakeModel(), "mps")
+    m: Any = _FakeModel()
+    supported, reason = cg.is_cuda_graphs_supported(m, "mps")
     assert supported is False
     assert reason is not None and "CUDA-only" in reason
 
@@ -64,7 +68,8 @@ def test_torch_device_object_accepted():
     stores ``self._device`` as a ``torch.device`` after the parameter-
     iteration probe, so we must handle either shape."""
     dev = torch.device("cpu")
-    supported, reason = cg.is_cuda_graphs_supported(_FakeModel(), dev)
+    m: Any = _FakeModel()
+    supported, reason = cg.is_cuda_graphs_supported(m, dev)
     assert supported is False
     assert reason is not None
 
@@ -92,8 +97,9 @@ def test_static_cache_construction_failure_returns_unsupported():
             cache_utils, "StaticCache",
             side_effect=RuntimeError("synthetic: layer_types missing"),
         ):
+            m: Any = _FakeModel()
             supported, reason = cg.is_cuda_graphs_supported(
-                _FakeModel(), "cuda",
+                m, "cuda",
             )
     assert supported is False
     assert reason is not None
@@ -107,15 +113,15 @@ def test_static_cache_construction_failure_returns_unsupported():
 # ---------------------------------------------------------------------------
 
 
-def test_warn_once_dedupes_per_model(caplog):
+def test_warn_once_dedupes_per_model(caplog: pytest.LogCaptureFixture):
     """The session calls ``warn_once`` at construction; subsequent calls
     on the same model object should be silent."""
     import logging
     caplog.set_level(logging.INFO, logger=cg.log.name)
     cg._warned_models.clear()  # reset between tests
 
-    m1 = _FakeModel()
-    m2 = _FakeModel()
+    m1: Any = _FakeModel()
+    m2: Any = _FakeModel()
 
     cg.warn_once(m1, "test reason A")
     cg.warn_once(m1, "test reason A")  # dedupe
@@ -131,7 +137,7 @@ def test_warn_once_dedupes_per_model(caplog):
     )
 
 
-def test_support_probe_cache_survives_compile_wrapper(monkeypatch):
+def test_support_probe_cache_survives_compile_wrapper(monkeypatch: pytest.MonkeyPatch):
     """from_pretrained probes before torch.compile; __init__ sees wrapper.
 
     The second support check should hit the cached result through
@@ -143,15 +149,15 @@ def test_support_probe_cache_survives_compile_wrapper(monkeypatch):
     calls: list[object] = []
 
     class _FakeStaticCache:
-        def __init__(self, config, *, max_cache_len, device, dtype):
+        def __init__(self, config: Any, *, max_cache_len: int, device: Any, dtype: Any) -> None:
             calls.append((config, max_cache_len, device, dtype))
             self.layers = [object()]
 
     monkeypatch.setattr(transformers, "StaticCache", _FakeStaticCache, raising=False)
-    model = _FakeModel()
+    model: Any = _FakeModel()
 
     assert cg.is_cuda_graphs_supported(model, "cuda") == (True, None)
-    wrapper = SimpleNamespace(_orig_mod=model)
+    wrapper: Any = SimpleNamespace(_orig_mod=model)
     assert cg.is_cuda_graphs_supported(wrapper, "cuda") == (True, None)
     assert len(calls) == 1
 
@@ -169,7 +175,7 @@ def test_cuda_graphs_flag_parses():
     assert args.cuda_graphs is True
 
 
-def test_yaml_cuda_graphs_true_folds_onto_args(monkeypatch, tmp_path):
+def test_yaml_cuda_graphs_true_folds_onto_args(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from saklas import cli
     from saklas.cli import runners as cli_runners
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -181,7 +187,7 @@ def test_yaml_cuda_graphs_true_folds_onto_args(monkeypatch, tmp_path):
     assert args.cuda_graphs is True
 
 
-def test_yaml_cuda_graphs_invalid_type_errors(tmp_path):
+def test_yaml_cuda_graphs_invalid_type_errors(tmp_path: Path):
     """``cuda_graphs: "true"`` (a YAML string) must reject rather than
     coerce — coercion would silently turn the static-cache path on."""
     from saklas.cli.config_file import ConfigFile, ConfigFileError
@@ -191,7 +197,7 @@ def test_yaml_cuda_graphs_invalid_type_errors(tmp_path):
         ConfigFile.load(p)
 
 
-def test_yaml_compile_and_cuda_graphs_compose(monkeypatch, tmp_path):
+def test_yaml_compile_and_cuda_graphs_compose(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Both opt-ins in one YAML — the runner sees both args set."""
     from saklas import cli
     from saklas.cli import runners as cli_runners

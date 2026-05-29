@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,7 +22,7 @@ from saklas.io.manifolds import (
 )
 
 
-def _box1d(periodic: bool, labels: list[str]) -> dict:
+def _box1d(periodic: bool, labels: list[str]) -> dict[str, Any]:
     """A 1-D box domain spec with evenly-spaced node coords."""
     k = len(labels)
     axis = (
@@ -48,9 +49,9 @@ def _author_manifold(
     name: str = "mood",
     periodic: bool = True,
     labels: list[str] | None = None,
-    files: dict | None = None,
-    domain: dict | None = None,
-    nodes: list[dict] | None = None,
+    files: dict[str, Any] | None = None,
+    domain: dict[str, Any] | None = None,
+    nodes: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Hand-author a v3 manifold folder; return its path."""
     if labels is None:
@@ -85,7 +86,7 @@ def test_min_nodes_per_dimension():
     assert min_nodes(3) == 7
 
 
-def test_load_minimal_manifold(tmp_path):
+def test_load_minimal_manifold(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     mf = ManifoldFolder.load(folder)
     assert mf.name == "mood"
@@ -95,7 +96,7 @@ def test_load_minimal_manifold(tmp_path):
     assert mf.description == "a mood manifold"
 
 
-def test_node_groups(tmp_path):
+def test_node_groups(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     mf = ManifoldFolder.load(folder)
     groups = mf.node_groups()
@@ -106,13 +107,13 @@ def test_node_groups(tmp_path):
                           "calm statement 2"]
 
 
-def test_missing_manifold_json_raises(tmp_path):
+def test_missing_manifold_json_raises(tmp_path: Path):
     (tmp_path / "empty").mkdir()
     with pytest.raises(ManifoldFormatError):
         ManifoldFolder.load(tmp_path / "empty")
 
 
-def test_stale_format_version_raises(tmp_path):
+def test_stale_format_version_raises(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     meta = json.loads((folder / "manifold.json").read_text())
     meta["format_version"] = 2
@@ -121,7 +122,7 @@ def test_stale_format_version_raises(tmp_path):
         ManifoldFolder.load(folder)
 
 
-def test_domain_required(tmp_path):
+def test_domain_required(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     meta = json.loads((folder / "manifold.json").read_text())
     del meta["domain"]
@@ -130,14 +131,14 @@ def test_domain_required(tmp_path):
         ManifoldFolder.load(folder)
 
 
-def test_too_few_nodes_raises(tmp_path):
+def test_too_few_nodes_raises(tmp_path: Path):
     with pytest.raises(ManifoldFormatError):
         ManifoldFolder.load(
             _author_manifold(tmp_path, labels=["calm", "afraid"])
         )
 
 
-def test_too_few_nodes_for_2d(tmp_path):
+def test_too_few_nodes_for_2d(tmp_path: Path):
     # A 2-D domain needs min_nodes(2) == 5; four nodes is too few.
     domain = {
         "type": "box",
@@ -156,7 +157,7 @@ def test_too_few_nodes_for_2d(tmp_path):
         )
 
 
-def test_node_coords_dim_mismatch_raises(tmp_path):
+def test_node_coords_dim_mismatch_raises(tmp_path: Path):
     # 1-D domain but a node carrying two coordinates.
     nodes = [
         {"label": "a", "coords": [0.0, 0.0]},
@@ -167,7 +168,7 @@ def test_node_coords_dim_mismatch_raises(tmp_path):
         ManifoldFolder.load(_author_manifold(tmp_path, nodes=nodes))
 
 
-def test_bad_node_label_raises(tmp_path):
+def test_bad_node_label_raises(tmp_path: Path):
     nodes = [
         {"label": "calm", "coords": [0.0]},
         {"label": "Uneasy", "coords": [0.5]},   # uppercase invalid
@@ -177,7 +178,7 @@ def test_bad_node_label_raises(tmp_path):
         ManifoldFolder.load(_author_manifold(tmp_path, nodes=nodes))
 
 
-def test_duplicate_labels_raises(tmp_path):
+def test_duplicate_labels_raises(tmp_path: Path):
     nodes = [
         {"label": "calm", "coords": [0.0]},
         {"label": "calm", "coords": [0.5]},
@@ -187,7 +188,7 @@ def test_duplicate_labels_raises(tmp_path):
         ManifoldFolder.load(_author_manifold(tmp_path, nodes=nodes))
 
 
-def test_poisedness_soft_warning(tmp_path):
+def test_poisedness_soft_warning(tmp_path: Path):
     # Five nodes on a 2-D domain but all collinear — a soft warning, not
     # a hard error (the hard error is raised later at fit time).
     domain = {
@@ -207,7 +208,7 @@ def test_poisedness_soft_warning(tmp_path):
         )
 
 
-def test_missing_node_file_raises(tmp_path):
+def test_missing_node_file_raises(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     (folder / "nodes" / "00_calm.json").unlink()
     with pytest.raises(ManifoldFormatError):
@@ -225,7 +226,7 @@ def _add_dummy_tensor(folder: Path) -> None:
     }))
 
 
-def test_integrity_check_catches_tampering(tmp_path):
+def test_integrity_check_catches_tampering(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     _add_dummy_tensor(folder)
     files = hash_manifold_files(folder)
@@ -238,7 +239,7 @@ def test_integrity_check_catches_tampering(tmp_path):
         ManifoldFolder.load(folder)
 
 
-def test_node_corpus_edits_do_not_trip_integrity(tmp_path):
+def test_node_corpus_edits_do_not_trip_integrity(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     _add_dummy_tensor(folder)
     files = hash_manifold_files(folder)
@@ -249,7 +250,7 @@ def test_node_corpus_edits_do_not_trip_integrity(tmp_path):
     ManifoldFolder.load(folder)
 
 
-def test_nodes_sha256_stable_and_sensitive(tmp_path):
+def test_nodes_sha256_stable_and_sensitive(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     mf = ManifoldFolder.load(folder)
     h1 = mf.nodes_sha256()
@@ -259,7 +260,7 @@ def test_nodes_sha256_stable_and_sensitive(tmp_path):
     assert h1 != h2
 
 
-def test_nodes_sha256_sensitive_to_coords(tmp_path):
+def test_nodes_sha256_sensitive_to_coords(tmp_path: Path):
     # Moving a node's authoring coordinate must invalidate the hash even
     # when the corpus is untouched — the fit depends on the geometry.
     folder = _author_manifold(tmp_path)
@@ -271,7 +272,7 @@ def test_nodes_sha256_sensitive_to_coords(tmp_path):
     assert h1 != h2
 
 
-def test_write_metadata_populates_files(tmp_path):
+def test_write_metadata_populates_files(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     _add_dummy_tensor(folder)
     mf = ManifoldFolder.load(folder)
@@ -284,7 +285,7 @@ def test_write_metadata_populates_files(tmp_path):
     assert reloaded.files == mf.files
 
 
-def test_manifold_sidecar_load(tmp_path):
+def test_manifold_sidecar_load(tmp_path: Path):
     path = tmp_path / "m.json"
     path.write_text(json.dumps({
         "method": "manifold_sae",
@@ -307,7 +308,7 @@ def test_manifold_sidecar_load(tmp_path):
 
 # --------------------------------------------------- authoring (create/update) ---
 
-def _author_nodes(labels):
+def _author_nodes(labels: list[str]) -> list[dict[str, Any]]:
     """A well-spread node list for a 1-D box, statements inline."""
     out = []
     for i, label in enumerate(labels):
@@ -319,7 +320,7 @@ def _author_nodes(labels):
     return out
 
 
-def test_create_manifold_folder_round_trip(tmp_path, monkeypatch):
+def test_create_manifold_folder_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -337,7 +338,7 @@ def test_create_manifold_folder_round_trip(tmp_path, monkeypatch):
     assert advisories == []
 
 
-def test_create_manifold_folder_conflict(tmp_path, monkeypatch):
+def test_create_manifold_folder_conflict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -347,7 +348,7 @@ def test_create_manifold_folder_conflict(tmp_path, monkeypatch):
         create_manifold_folder("local", "dup", "", domain, nodes)
 
 
-def test_create_manifold_folder_too_few_nodes(tmp_path, monkeypatch):
+def test_create_manifold_folder_too_few_nodes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -357,7 +358,7 @@ def test_create_manifold_folder_too_few_nodes(tmp_path, monkeypatch):
         )
 
 
-def test_create_manifold_folder_bad_coords_arity(tmp_path, monkeypatch):
+def test_create_manifold_folder_bad_coords_arity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -370,7 +371,7 @@ def test_create_manifold_folder_bad_coords_arity(tmp_path, monkeypatch):
         create_manifold_folder("local", "bad", "", domain, nodes)
 
 
-def test_create_manifold_folder_empty_statements(tmp_path, monkeypatch):
+def test_create_manifold_folder_empty_statements(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -380,7 +381,7 @@ def test_create_manifold_folder_empty_statements(tmp_path, monkeypatch):
         create_manifold_folder("local", "nostmt", "", domain, nodes)
 
 
-def test_create_manifold_folder_bad_namespace(tmp_path, monkeypatch):
+def test_create_manifold_folder_bad_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -390,7 +391,7 @@ def test_create_manifold_folder_bad_namespace(tmp_path, monkeypatch):
         )
 
 
-def test_update_manifold_folder_statements(tmp_path, monkeypatch):
+def test_update_manifold_folder_statements(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -407,7 +408,7 @@ def test_update_manifold_folder_statements(tmp_path, monkeypatch):
     assert mf.nodes_sha256() != sha_before
 
 
-def test_update_manifold_folder_relabels_cleanly(tmp_path, monkeypatch):
+def test_update_manifold_folder_relabels_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -424,7 +425,7 @@ def test_update_manifold_folder_relabels_cleanly(tmp_path, monkeypatch):
     ]
 
 
-def test_malformed_json_raises_format_error(tmp_path):
+def test_malformed_json_raises_format_error(tmp_path: Path):
     # A corrupt manifest must surface as ManifoldFormatError, not a bare
     # JSONDecodeError — the HTTP routes and iter_manifold_folders only
     # guard against the former.
@@ -434,7 +435,7 @@ def test_malformed_json_raises_format_error(tmp_path):
         ManifoldFolder.load(folder)
 
 
-def test_iter_manifold_folders_skips_malformed(tmp_path, monkeypatch):
+def test_iter_manifold_folders_skips_malformed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -448,7 +449,7 @@ def test_iter_manifold_folders_skips_malformed(tmp_path, monkeypatch):
     assert found == {"good"}
 
 
-def test_iter_manifold_folders(tmp_path, monkeypatch):
+def test_iter_manifold_folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
         {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
@@ -470,7 +471,7 @@ def _discover_corpora(labels: list[str]) -> dict[str, list[str]]:
     }
 
 
-def test_create_discover_manifold_folder_round_trip(tmp_path, monkeypatch):
+def test_create_discover_manifold_folder_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A freshly authored discover folder loads with the expected shape."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -496,7 +497,7 @@ def test_create_discover_manifold_folder_round_trip(tmp_path, monkeypatch):
     assert all(len(stmts) == 3 for _, stmts in groups)
 
 
-def test_create_discover_manifold_rejects_unknown_fit_mode(tmp_path, monkeypatch):
+def test_create_discover_manifold_rejects_unknown_fit_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     with pytest.raises(ManifoldFormatError, match="fit_mode"):
         create_discover_manifold_folder(
@@ -506,7 +507,7 @@ def test_create_discover_manifold_rejects_unknown_fit_mode(tmp_path, monkeypatch
         )
 
 
-def test_create_discover_manifold_rejects_authored_fit_mode(tmp_path, monkeypatch):
+def test_create_discover_manifold_rejects_authored_fit_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """``authored`` is not a valid discover-mode fit_mode."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     with pytest.raises(ManifoldFormatError, match="fit_mode"):
@@ -517,7 +518,7 @@ def test_create_discover_manifold_rejects_authored_fit_mode(tmp_path, monkeypatc
         )
 
 
-def test_discover_manifold_rejects_coords_on_nodes(tmp_path):
+def test_discover_manifold_rejects_coords_on_nodes(tmp_path: Path):
     """A discover folder must not carry per-node ``coords`` — those are derived."""
     folder = tmp_path / "leaky"
     (folder / "nodes").mkdir(parents=True)
@@ -534,7 +535,7 @@ def test_discover_manifold_rejects_coords_on_nodes(tmp_path):
         ManifoldFolder.load(folder)
 
 
-def test_discover_manifold_rejects_domain_field(tmp_path):
+def test_discover_manifold_rejects_domain_field(tmp_path: Path):
     """A discover folder must not carry a ``domain`` — coords are derived."""
     folder = tmp_path / "leaky2"
     (folder / "nodes").mkdir(parents=True)
@@ -554,7 +555,7 @@ def test_discover_manifold_rejects_domain_field(tmp_path):
         ManifoldFolder.load(folder)
 
 
-def test_discover_nodes_sha256_sensitive_to_hyperparams(tmp_path, monkeypatch):
+def test_discover_nodes_sha256_sensitive_to_hyperparams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A hyperparam edit invalidates the fit cache — the staleness key changes."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -571,7 +572,7 @@ def test_discover_nodes_sha256_sensitive_to_hyperparams(tmp_path, monkeypatch):
     assert h1 != h2, "hyperparam change must invalidate the fit cache"
 
 
-def test_discover_nodes_sha256_sensitive_to_fit_mode(tmp_path, monkeypatch):
+def test_discover_nodes_sha256_sensitive_to_fit_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Switching ``pca`` ↔ ``spectral`` invalidates the fit cache."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -588,7 +589,7 @@ def test_discover_nodes_sha256_sensitive_to_fit_mode(tmp_path, monkeypatch):
     assert h_pca != h_spec, "fit_mode change must invalidate the fit cache"
 
 
-def test_discover_nodes_sha256_sensitive_to_corpus(tmp_path, monkeypatch):
+def test_discover_nodes_sha256_sensitive_to_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """The standing invariant: a corpus edit invalidates the fit cache."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -604,7 +605,7 @@ def test_discover_nodes_sha256_sensitive_to_corpus(tmp_path, monkeypatch):
     assert h1 != h2
 
 
-def test_discover_write_metadata_round_trip(tmp_path, monkeypatch):
+def test_discover_write_metadata_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A re-written discover folder loads identically."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -623,7 +624,7 @@ def test_discover_write_metadata_round_trip(tmp_path, monkeypatch):
     assert again.node_coords == []
 
 
-def test_discover_create_drops_cross_method_hyperparams(tmp_path, monkeypatch):
+def test_discover_create_drops_cross_method_hyperparams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A spectral key on a pca create gets dropped — would crash the dispatcher."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -642,7 +643,7 @@ def test_discover_create_drops_cross_method_hyperparams(tmp_path, monkeypatch):
     assert mf.hyperparams == {"max_dim": 8, "var_threshold": 0.70}
 
 
-def test_discover_create_drops_cross_method_hyperparams_spectral(tmp_path, monkeypatch):
+def test_discover_create_drops_cross_method_hyperparams_spectral(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Mirror — a pca key on a spectral create gets dropped."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
@@ -660,7 +661,7 @@ def test_discover_create_drops_cross_method_hyperparams_spectral(tmp_path, monke
     assert mf.hyperparams == {"max_dim": 8, "k_nn": 5, "bandwidth": 0.1}
 
 
-def test_authored_fit_mode_defaults_when_field_absent(tmp_path, monkeypatch):
+def test_authored_fit_mode_defaults_when_field_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A legacy v3 manifold.json without a ``fit_mode`` field loads as authored."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = _author_manifold(tmp_path)
@@ -677,7 +678,7 @@ def test_authored_fit_mode_defaults_when_field_absent(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_merge_discover_unions_nodes(tmp_path, monkeypatch):
+def test_merge_discover_unions_nodes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Two discover sources merge into a fresh discover folder whose
     node corpus is the union (in source order) of both inputs.
     """
@@ -713,7 +714,7 @@ def test_merge_discover_unions_nodes(tmp_path, monkeypatch):
         assert len(groups[label]) == 3
 
 
-def test_merge_discover_refuses_authored_source(tmp_path, monkeypatch):
+def test_merge_discover_refuses_authored_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Authored manifolds carry user-declared geometry; merge refuses
     them because there's no shared coordinate system to reconcile.
     """
@@ -731,7 +732,7 @@ def test_merge_discover_refuses_authored_source(tmp_path, monkeypatch):
         )
 
 
-def test_merge_discover_refuses_label_collision(tmp_path, monkeypatch):
+def test_merge_discover_refuses_label_collision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Same label in two sources isn't auto-renamed — refuse so the
     user resolves the collision deliberately (renaming hides
     provenance otherwise).
@@ -755,7 +756,7 @@ def test_merge_discover_refuses_label_collision(tmp_path, monkeypatch):
 
 
 def test_merge_discover_refuses_mixed_fit_modes_without_override(
-    tmp_path, monkeypatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     """Sources with different fit_modes require an explicit override —
     the merged folder has one ``fit_mode``, so picking implicitly
@@ -788,7 +789,7 @@ def test_merge_discover_refuses_mixed_fit_modes_without_override(
     assert mf.fit_mode == "pca"
 
 
-def test_merge_discover_refuses_missing_source(tmp_path, monkeypatch):
+def test_merge_discover_refuses_missing_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A non-existent source raises FileNotFoundError before any folder
     is written — atomic-on-failure discipline."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -804,7 +805,7 @@ def test_merge_discover_refuses_missing_source(tmp_path, monkeypatch):
         )
 
 
-def test_merge_discover_force_overwrites(tmp_path, monkeypatch):
+def test_merge_discover_force_overwrites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """An existing destination raises FileExistsError without
     ``force=True``; with ``force=True`` it's rebuilt clean.
     """
@@ -827,7 +828,7 @@ def test_merge_discover_force_overwrites(tmp_path, monkeypatch):
     assert mf.description == "v2"
 
 
-def test_merge_discover_refuses_under_two_sources(tmp_path, monkeypatch):
+def test_merge_discover_refuses_under_two_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Single-source 'merge' is meaningless — refuse with a clear error."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     create_discover_manifold_folder(

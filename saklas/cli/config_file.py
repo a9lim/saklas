@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from saklas.core.errors import SaklasError
 
@@ -88,8 +88,8 @@ class ConfigFile:
             chain.append(cls.load(Path(p)))
         return compose(chain) if chain else cls()
 
-    def to_dict(self) -> dict:
-        out: dict = {}
+    def to_dict(self) -> dict[str, object]:
+        out: dict[str, object] = {}
         for f in ("model", "thinking", "temperature", "top_p", "max_tokens", "system_prompt"):
             v = getattr(self, f)
             if v is not None:
@@ -268,7 +268,7 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
     return out
 
 
-def apply_flag_overrides(cfg_in: ConfigFile, **flags) -> ConfigFile:
+def apply_flag_overrides(cfg_in: ConfigFile, **flags: Any) -> ConfigFile:
     """Return a new ConfigFile with non-None flag values overriding cfg_in."""
     supplied = {k: v for k, v in flags.items() if v is not None}
     return replace(cfg_in, **supplied)

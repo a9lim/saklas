@@ -29,7 +29,6 @@ from saklas.io.atomic import write_json_atomic
 from saklas.io.hf_manifolds import (
     HFError as ManifoldHFError,
     ManifoldInstallConflict,
-    fetch_manifold_info,
     install_manifold,
     search_manifolds,
 )

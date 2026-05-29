@@ -6,8 +6,10 @@ AutoModelForCausalLM calls and inspect the load_kwargs `load_model` passes.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from saklas.core import model as model_mod
@@ -34,10 +36,10 @@ class _FakeModel(SimpleNamespace):
         super().__init__()
         self.config = SimpleNamespace(_attn_implementation=attn_impl)
 
-    def requires_grad_(self, _flag):  # noqa: D401
+    def requires_grad_(self, _flag: bool) -> _FakeModel:  # noqa: D401
         return self
 
-    def train(self, _flag):
+    def train(self, _flag: bool) -> _FakeModel:
         return self
 
     def parameters(self):
@@ -48,9 +50,9 @@ def _captured_load_kwargs(device: str, model_type: str = "deepseek_v2"):
     """Run load_model with a mocked transformers stack; return the kwargs
     actually handed to AutoModelForCausalLM.from_pretrained."""
     cfg = _FakeConfig(model_type)
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_from_pretrained(model_id, **kwargs):
+    def _fake_from_pretrained(model_id: str, **kwargs: Any) -> _FakeModel:
         captured.update(kwargs)
         return _FakeModel(kwargs.get("attn_implementation", "sdpa"))
 
@@ -94,9 +96,9 @@ def test_mla_in_text_config_also_triggers():
     """A multimodal wrapper whose text_config is deepseek_v2 must also
     fall through to eager on MPS."""
     cfg = _FakeConfig(model_type="some_vlm", text_model_type="deepseek_v2")
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_from_pretrained(model_id, **kwargs):
+    def _fake_from_pretrained(model_id: str, **kwargs: Any) -> _FakeModel:
         captured.update(kwargs)
         return _FakeModel(kwargs.get("attn_implementation", "sdpa"))
 
@@ -131,9 +133,9 @@ def _captured_tokenizer_kwargs(model_id: str, model_type: str = "qwen3"):
     """Run load_model with a mocked transformers stack; return the kwargs
     actually handed to AutoTokenizer.from_pretrained."""
     cfg = _FakeConfig(model_type)
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
-    def _fake_tok_from_pretrained(mid, **kwargs):
+    def _fake_tok_from_pretrained(mid: str, **kwargs: Any) -> SimpleNamespace:
         captured.update(kwargs)
         return SimpleNamespace()
 
@@ -204,7 +206,7 @@ def _run_load_with_compile(
     Returns ``(compile_called, compile_kwargs, returned_model)``.
     """
     cfg = _FakeConfig(model_type)
-    compile_invocations: list[dict] = []
+    compile_invocations: list[dict[str, Any]] = []
     base_model = _FakeModel("sdpa")
 
     class _FakeCompiled:
@@ -213,14 +215,14 @@ def _run_load_with_compile(
         shape and return an object with ``.logits``."""
         _compiled_marker = True
 
-        def __init__(self, model):
+        def __init__(self, model: Any) -> None:
             self._orig_mod = model
 
-        def __call__(self, **fwd):
+        def __call__(self, **fwd: Any) -> SimpleNamespace:
             n = fwd["input_ids"].shape[1]
             return SimpleNamespace(logits=torch.zeros(1, n, 1))
 
-    def _fake_compile(model, **kwargs):
+    def _fake_compile(model: Any, **kwargs: Any) -> _FakeCompiled:
         compile_invocations.append({"model": model, **kwargs})
         return _FakeCompiled(model)
 
@@ -320,10 +322,10 @@ def test_compile_probe_failure_falls_back_to_eager():
     class _BrokenCompiled:
         _compiled_marker = True
 
-        def __init__(self, model):
+        def __init__(self, model: Any) -> None:
             self._orig_mod = model
 
-        def __call__(self, **fwd):
+        def __call__(self, **fwd: Any) -> None:
             raise RuntimeError("inductor codegen produced an invalid kernel")
 
     with (
@@ -359,7 +361,7 @@ def test_compile_mode_propagates():
     assert invocations[0]["mode"] == "reduce-overhead"
 
 
-def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch):
+def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch: pytest.MonkeyPatch):
     """``device='mps'`` on a host without an MPS backend (e.g. Linux CI)
     must not crash.  The CUDA branch already gates on
     ``torch.cuda.is_available()``; the MPS branch must mirror that — the

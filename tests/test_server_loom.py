@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,7 +26,6 @@ from fastapi.testclient import TestClient
 from saklas.core.events import EventBus
 from saklas.core.loom import LoomTree
 from saklas.core.results import GenerationResult
-
 
 # ---------------------------------------------------------------------------
 # Test session factory
@@ -72,8 +72,8 @@ class _StubSession:
         cfg.system_prompt = "You are a stub."
         self.config = cfg
 
-        self.vectors: dict = {}
-        self.probes: dict = {}
+        self.vectors: dict[str, Any] = {}
+        self.probes: dict[str, Any] = {}
 
         monitor = MagicMock()
         monitor.probe_names = []
@@ -119,11 +119,11 @@ class _StubSession:
     def build_readings(self):  # pragma: no cover - unused by these tests
         return {}
 
-    def register_trait_queue(self, loop, q):
+    def register_trait_queue(self, loop: Any, q: Any) -> None:
         with self._trait_lock:
             self._trait_queues.append((loop, q))
 
-    def unregister_trait_queue(self, loop, q):
+    def unregister_trait_queue(self, loop: Any, q: Any) -> None:
         with self._trait_lock:
             try:
                 self._trait_queues.remove((loop, q))
@@ -159,9 +159,9 @@ class _StubSession:
             )
 
     # ----- generation entry point --------------------------------------
-    def generate(self, input, *, steering=None, sampling=None,
-                 stateless=False, raw=False, thinking=None,
-                 on_token=None, parent_node_id=None, n=1):
+    def generate(self, input: Any, *, steering: Any = None, sampling: Any = None,
+                 stateless: bool = False, raw: bool = False, thinking: Any = None,
+                 on_token: Any = None, parent_node_id: Any = None, n: int = 1):
         """Stub generate.
 
         Routes through the tree the same way SaklasSession does for
@@ -212,8 +212,8 @@ class _StubSession:
         return results[0] if n == 1 else results
 
     # ----- answer-prefill entry point ----------------------------------
-    def prefill_assistant(self, node_id, text, *, steering=None,
-                          sampling=None, on_token=None):
+    def prefill_assistant(self, node_id: Any, text: Any, *, steering: Any = None,
+                          sampling: Any = None, on_token: Any = None):
         """Stub answer-prefill.
 
         Mirrors ``SaklasSession.prefill_assistant``'s tree shape: anchor
@@ -258,7 +258,7 @@ class _StubSession:
 
     # ----- commit entry points (Ctrl+Enter on either surface) ----------
     def append_user_turn(
-        self, parent_node_id, text, *, allow_any_parent=False, role_label=None
+        self, parent_node_id: Any, text: Any, *, allow_any_parent: bool = False, role_label: Any = None
     ):
         """Stub commit-user.
 
@@ -292,7 +292,7 @@ class _StubSession:
         return self.tree.add_user_turn(
             text, parent_id=parent_node_id, role_label=role_label)
 
-    def append_assistant_turn(self, user_node_id, text, *, role_label=None):
+    def append_assistant_turn(self, user_node_id: Any, text: Any, *, role_label: Any = None):
         """Stub commit-assistant.
 
         Mirrors ``SaklasSession.append_assistant_turn``: refuses non-user
@@ -336,9 +336,11 @@ class _StubSession:
 
 @pytest.fixture
 def session_and_client():
+    from typing import cast
+    from saklas.core.session import SaklasSession
     from saklas.server import create_app
     session = _StubSession()
-    app = create_app(session, default_steering=None)
+    app = create_app(cast(SaklasSession, session), default_steering=None)
     return session, TestClient(app)
 
 
@@ -348,7 +350,7 @@ def session_and_client():
 
 
 class TestTreeGet:
-    def test_root_only(self, session_and_client):
+    def test_root_only(self, session_and_client: Any):
         session, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default/tree")
         assert resp.status_code == 200
@@ -363,7 +365,7 @@ class TestTreeGet:
         assert root_node["text"] == ""
         assert root_node["id"] == session.tree.root_id
 
-    def test_matches_to_dict(self, session_and_client):
+    def test_matches_to_dict(self, session_and_client: Any):
         session, client = session_and_client
         # Add a user turn so structure has more than just root.
         uid = session.tree.add_user_turn("hello")
@@ -379,7 +381,7 @@ class TestTreeGet:
         assert uid in ids
         assert data["children_of"][session.tree.root_id] == [uid]
 
-    def test_ships_per_token_rows(self, session_and_client):
+    def test_ships_per_token_rows(self, session_and_client: Any):
         """Tree GET serializes ``tokens`` / ``thinking_tokens`` so the
         webui can rehydrate inline highlight tints + token-drilldown
         click targets after a force-refresh.  Regression guard against
@@ -423,7 +425,7 @@ class TestTreeGet:
             "5": {"calm": 0.38}, "10": {"calm": 0.45},
         }
 
-    def test_active_path_shape(self, session_and_client):
+    def test_active_path_shape(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("greet")
         a1 = session.tree.begin_assistant(u1)
@@ -446,7 +448,7 @@ class TestTreeGet:
 
 
 class TestTreeNavigate:
-    def test_navigate_updates_active(self, session_and_client):
+    def test_navigate_updates_active(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("hi")
         u2 = session.tree.add_user_turn("hi-again", parent_id=session.tree.root_id)
@@ -461,7 +463,7 @@ class TestTreeNavigate:
         assert data["active_node_id"] == u1
         assert session.tree.active_node_id == u1
 
-    def test_navigate_unknown_node_404(self, session_and_client):
+    def test_navigate_unknown_node_404(self, session_and_client: Any):
         _, client = session_and_client
         resp = client.post(
             "/saklas/v1/sessions/default/tree/navigate",
@@ -471,7 +473,7 @@ class TestTreeNavigate:
 
 
 class TestTreeEdit:
-    def test_edit_in_place(self, session_and_client):
+    def test_edit_in_place(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("typo")
         resp = client.post(
@@ -486,7 +488,7 @@ class TestTreeEdit:
         # Underlying tree was mutated
         assert session.tree.get(u1).text == "fixed"
 
-    def test_edit_409_during_reservation(self, session_and_client):
+    def test_edit_409_during_reservation(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("hi")
         # Simulate an in-flight gen reserving u1's subtree.
@@ -499,7 +501,7 @@ class TestTreeEdit:
         # Tree text unchanged
         assert session.tree.get(u1).text == "hi"
 
-    def test_edit_root_400(self, session_and_client):
+    def test_edit_root_400(self, session_and_client: Any):
         session, client = session_and_client
         resp = client.post(
             "/saklas/v1/sessions/default/tree/edit",
@@ -507,7 +509,7 @@ class TestTreeEdit:
         )
         assert resp.status_code == 400
 
-    def test_edit_unknown_node_404(self, session_and_client):
+    def test_edit_unknown_node_404(self, session_and_client: Any):
         _, client = session_and_client
         resp = client.post(
             "/saklas/v1/sessions/default/tree/edit",
@@ -517,7 +519,7 @@ class TestTreeEdit:
 
 
 class TestTreeBranch:
-    def test_branch_succeeds(self, session_and_client):
+    def test_branch_succeeds(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("hello")
         resp = client.post(
@@ -533,7 +535,7 @@ class TestTreeBranch:
         siblings = session.tree.children_of[session.tree.root_id]
         assert u1 in siblings and new_id in siblings
 
-    def test_branch_allowed_during_reservation(self, session_and_client):
+    def test_branch_allowed_during_reservation(self, session_and_client: Any):
         """Branches don't touch the streaming target — must succeed even
         while a gen reservation is held."""
         session, client = session_and_client
@@ -545,7 +547,7 @@ class TestTreeBranch:
         )
         assert resp.status_code == 200
 
-    def test_branch_root_400(self, session_and_client):
+    def test_branch_root_400(self, session_and_client: Any):
         session, client = session_and_client
         resp = client.post(
             "/saklas/v1/sessions/default/tree/branch",
@@ -555,7 +557,7 @@ class TestTreeBranch:
 
 
 class TestTreeDelete:
-    def test_delete_disjoint_subtree(self, session_and_client):
+    def test_delete_disjoint_subtree(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("a")
         u2 = session.tree.add_user_turn("b", parent_id=session.tree.root_id)
@@ -567,7 +569,7 @@ class TestTreeDelete:
         # Active node untouched
         assert session.tree.active_node_id == u2
 
-    def test_delete_containing_active_repoints_active(self, session_and_client):
+    def test_delete_containing_active_repoints_active(self, session_and_client: Any):
         # Deleting a subtree that contains the active node used to 400.
         # The engine now repoints the active pointer to the surviving
         # parent (root → fresh start) and the route returns 200.
@@ -580,7 +582,7 @@ class TestTreeDelete:
         assert not session.tree.has(u1)
         assert session.tree.active_node_id == session.tree.root_id
 
-    def test_delete_409_during_reservation(self, session_and_client):
+    def test_delete_409_during_reservation(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("a")
         u2 = session.tree.add_user_turn("b", parent_id=session.tree.root_id)
@@ -591,7 +593,7 @@ class TestTreeDelete:
 
 
 class TestTreeStarNote:
-    def test_star_round_trip(self, session_and_client):
+    def test_star_round_trip(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("hi")
         resp = client.post(
@@ -605,7 +607,7 @@ class TestTreeStarNote:
         match = [n for n in tree_resp.json()["nodes"] if n["id"] == u1]
         assert match and match[0]["starred"] is True
 
-    def test_note_round_trip(self, session_and_client):
+    def test_note_round_trip(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("hi")
         resp = client.post(
@@ -621,7 +623,7 @@ class TestTreeStarNote:
 
 
 class TestTreeReset:
-    def test_reset_drops_branches(self, session_and_client):
+    def test_reset_drops_branches(self, session_and_client: Any):
         session, client = session_and_client
         old_root = session.tree.root_id
         session.tree.add_user_turn("a")
@@ -633,7 +635,7 @@ class TestTreeReset:
         assert session.tree.active_node_id == session.tree.root_id
         assert session.tree.children_of[session.tree.root_id] == []
 
-    def test_reset_409_during_reservation(self, session_and_client):
+    def test_reset_409_during_reservation(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("x")
         session._active_gen_reservation = u1
@@ -642,7 +644,7 @@ class TestTreeReset:
 
 
 class TestTranscript:
-    def test_transcript_yaml_shape(self, session_and_client):
+    def test_transcript_yaml_shape(self, session_and_client: Any):
         session, client = session_and_client
         u1 = session.tree.add_user_turn("hello")
         a1 = session.tree.begin_assistant(u1)
@@ -678,7 +680,7 @@ class TestTranscript:
         assert parsed["turns"][0]["role"] == "user"
         assert parsed["turns"][1]["role"] == "assistant"
 
-    def test_transcript_unknown_node_404(self, session_and_client):
+    def test_transcript_unknown_node_404(self, session_and_client: Any):
         _, client = session_and_client
         resp = client.post(
             "/saklas/v1/sessions/default/tree/transcript",
@@ -693,7 +695,7 @@ class TestTranscript:
 
 
 class TestWebSocketLoom:
-    def test_generate_with_parent_node_id(self, session_and_client):
+    def test_generate_with_parent_node_id(self, session_and_client: Any):
         """Result attaches under the supplied parent_node_id."""
         session, client = session_and_client
         # Build a tree with two user-turn options.
@@ -750,7 +752,7 @@ class TestWebSocketLoom:
         # No assistant landed under u1 (the request bypassed the active node).
         assert session.tree.children_of[u1] == []
 
-    def test_generate_n2_creates_two_siblings(self, session_and_client):
+    def test_generate_n2_creates_two_siblings(self, session_and_client: Any):
         """n=2 produces two assistant siblings under the same user-parent.
 
         Pinned to ``parent_node_id=root`` so the engine's add_user_turn
@@ -811,7 +813,7 @@ class TestWebSocketLoom:
 
 
 class TestPrefill:
-    def test_missing_text_400(self, session_and_client):
+    def test_missing_text_400(self, session_and_client: Any):
         """prefill_node_id without prefill_text is rejected before dispatch."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("seed me")
@@ -822,7 +824,7 @@ class TestPrefill:
         assert msg["status"] == 400
         assert "prefill" in msg["message"].lower()
 
-    def test_empty_text_400(self, session_and_client):
+    def test_empty_text_400(self, session_and_client: Any):
         """An empty prefill_text is treated as 'no text' — same 400."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("seed me")
@@ -836,7 +838,7 @@ class TestPrefill:
         assert msg["type"] == "error"
         assert msg["status"] == 400
 
-    def test_conflicts_with_fork_400(self, session_and_client):
+    def test_conflicts_with_fork_400(self, session_and_client: Any):
         """A message can't be both a fork and a prefill."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("seed me")
@@ -853,7 +855,7 @@ class TestPrefill:
         assert msg["type"] == "error"
         assert msg["status"] == 400
 
-    def test_creates_seeded_sibling(self, session_and_client):
+    def test_creates_seeded_sibling(self, session_and_client: Any):
         """A valid prefill lands an assistant child opening with the text."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("what's the weather?")
@@ -895,7 +897,7 @@ class TestPrefill:
 
 
 class TestCommit:
-    def test_missing_text_400(self, session_and_client):
+    def test_missing_text_400(self, session_and_client: Any):
         """commit_role without commit_text is rejected before dispatch."""
         _session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
@@ -905,7 +907,7 @@ class TestCommit:
         assert msg["status"] == 400
         assert "commit" in msg["message"].lower()
 
-    def test_invalid_role_400(self, session_and_client):
+    def test_invalid_role_400(self, session_and_client: Any):
         _session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
@@ -919,7 +921,7 @@ class TestCommit:
         # both surface 400.
         assert msg["type"] == "error"
 
-    def test_assistant_commit_requires_parent_400(self, session_and_client):
+    def test_assistant_commit_requires_parent_400(self, session_and_client: Any):
         """``commit_role='assistant'`` without parent_node_id is rejected —
         the authored turn has to hang off a known user node."""
         _session, client = session_and_client
@@ -934,7 +936,7 @@ class TestCommit:
         assert msg["status"] == 400
         assert "parent_node_id" in msg["message"]
 
-    def test_conflicts_with_prefill_400(self, session_and_client):
+    def test_conflicts_with_prefill_400(self, session_and_client: Any):
         """A message can't be both a commit and a prefill."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("seed me")
@@ -950,7 +952,7 @@ class TestCommit:
         assert msg["type"] == "error"
         assert msg["status"] == 400
 
-    def test_commit_user_lands_user_child(self, session_and_client):
+    def test_commit_user_lands_user_child(self, session_and_client: Any):
         """Ctrl+Enter on a non-user active node — server creates a user
         child under the active node and acks with the new node id."""
         session, client = session_and_client
@@ -990,7 +992,7 @@ class TestCommit:
         assert session.tree.nodes[new_id].parent_id == root
         assert session.tree.rev > rev_before
 
-    def test_commit_user_refused_under_user_node(self, session_and_client):
+    def test_commit_user_refused_under_user_node(self, session_and_client: Any):
         """Server rejects commit_role=user when the resolved parent is
         itself a user node — D15 keeps user-under-user out of the tree."""
         session, client = session_and_client
@@ -1010,7 +1012,7 @@ class TestCommit:
         assert msg["type"] == "error"
         assert msg["code"] == "InvalidNodeOperationError"
 
-    def test_commit_user_raw_allows_user_parent(self, session_and_client):
+    def test_commit_user_raw_allows_user_parent(self, session_and_client: Any):
         """A flat (base-model) commit carries ``raw: true`` — the
         user-under-user guard is lifted, so an authored span lands
         under a node of any role."""
@@ -1035,7 +1037,7 @@ class TestCommit:
         new_id = done["result"]["node_id"]
         assert session.tree.nodes[new_id].parent_id == uid
 
-    def test_commit_assistant_lands_authored_sibling(self, session_and_client):
+    def test_commit_assistant_lands_authored_sibling(self, session_and_client: Any):
         """Ctrl+Enter on a user active node lands a sibling assistant
         whose text *is* the typed text — no decode, no continuation."""
         session, client = session_and_client

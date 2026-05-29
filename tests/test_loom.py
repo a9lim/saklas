@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -73,8 +74,9 @@ def test_begin_and_finalize_assistant():
     uid = t.add_user_turn("hello")
     aid = t.begin_assistant(uid, recipe=Recipe(steering="0.3 honest"))
     assert t.nodes[aid].role == "assistant"
-    assert t.nodes[aid].recipe is not None
-    assert t.nodes[aid].recipe.steering == "0.3 honest"
+    recipe = t.nodes[aid].recipe
+    assert recipe is not None  # guaranteed by begin_assistant with explicit Recipe arg
+    assert recipe.steering == "0.3 honest"
     assert t.active_node_id == aid
     t.finalize_assistant(
         aid, text="hi back",
@@ -224,7 +226,7 @@ def test_edit_root_refused():
 def test_edit_emits_event():
     t = _seed_tree()
     bus = EventBus()
-    seen: list = []
+    seen: list[Any] = []
     bus.subscribe(seen.append)
     t.attach_events(bus)
     t.edit(t.active_node_id, "edited")
@@ -241,6 +243,7 @@ def test_branch_creates_sibling_and_preserves_original():
     t = _seed_tree()
     a1 = t.active_node_id
     parent = t.nodes[a1].parent_id
+    assert parent is not None  # a1 is a child of a user node in the seed tree
     a2 = t.branch(a1, "alternate reply")
     assert a2 != a1
     assert t.nodes[a2].parent_id == parent
@@ -574,7 +577,7 @@ def test_d15_engine_check_passes_for_explicit_grandparent():
 # stub lets us unit-test the contract without loading a model.
 
 
-def _bind_commit_methods(tree: LoomTree, tokenizer):
+def _bind_commit_methods(tree: LoomTree, tokenizer: Any):
     from saklas.core.session import SaklasSession
     stub = type(
         "S", (),

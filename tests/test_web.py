@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -129,7 +131,7 @@ def _index_asset_paths(html: bytes) -> list[str]:
 
 
 class TestWebMount:
-    def test_root_serves_spa_shell(self, web_client) -> None:
+    def test_root_serves_spa_shell(self, web_client: Any) -> None:
         _session, client = web_client
         r = client.get("/")
         assert r.status_code == 200
@@ -140,7 +142,7 @@ class TestWebMount:
         assets = _index_asset_paths(r.content)
         assert len(assets) >= 1, "index.html should reference at least one /assets/* file"
 
-    def test_assets_referenced_by_index_are_servable(self, web_client) -> None:
+    def test_assets_referenced_by_index_are_servable(self, web_client: Any) -> None:
         _session, client = web_client
         index = client.get("/").content
         for path in _index_asset_paths(index):
@@ -150,7 +152,7 @@ class TestWebMount:
             # Vite chunk weighs in at hundreds of bytes.
             assert len(r.content) > 0
 
-    def test_unknown_route_falls_back_to_index(self, web_client) -> None:
+    def test_unknown_route_falls_back_to_index(self, web_client: Any) -> None:
         _session, client = web_client
         # SPA fallback: /lab is a client-side route the SPA owns; the
         # server returns index.html so the SPA can take over routing.
@@ -158,7 +160,7 @@ class TestWebMount:
         assert r.status_code == 200
         assert b'id="app"' in r.content
 
-    def test_no_web_does_not_mount_root(self, api_only_client) -> None:
+    def test_no_web_does_not_mount_root(self, api_only_client: Any) -> None:
         _session, client = api_only_client
         # ``--no-web`` (CLI) / ``web=False`` (library): GET / shouldn't
         # return the dashboard.  Detect by absence of the SPA's mount
@@ -166,7 +168,7 @@ class TestWebMount:
         r = client.get("/")
         assert b'id="app"' not in r.content
 
-    def test_path_traversal_falls_back_to_index(self, web_client) -> None:
+    def test_path_traversal_falls_back_to_index(self, web_client: Any) -> None:
         # The SPA fallback ``/{full_path:path}`` accepts attacker-
         # controlled input.  ``..`` segments and absolute-style paths
         # must not escape the dist directory; the resolver clamps to
@@ -191,7 +193,7 @@ class TestWebMount:
 
 
 class TestCorrelationEndpoint:
-    def test_default_returns_all_loaded_vectors(self, web_client) -> None:
+    def test_default_returns_all_loaded_vectors(self, web_client: Any) -> None:
         _session, client = web_client
         r = client.get("/saklas/v1/sessions/default/correlation")
         assert r.status_code == 200
@@ -201,7 +203,7 @@ class TestCorrelationEndpoint:
         # Symmetric off-diagonal.
         assert data["matrix"]["honest"]["warm"] == pytest.approx(data["matrix"]["warm"]["honest"])
 
-    def test_names_filter_restricts_matrix(self, web_client) -> None:
+    def test_names_filter_restricts_matrix(self, web_client: Any) -> None:
         _session, client = web_client
         r = client.get("/saklas/v1/sessions/default/correlation?names=honest")
         assert r.status_code == 200
@@ -209,12 +211,12 @@ class TestCorrelationEndpoint:
         assert data["names"] == ["honest"]
         assert list(data["matrix"]["honest"].keys()) == ["honest"]
 
-    def test_unknown_name_returns_404(self, web_client) -> None:
+    def test_unknown_name_returns_404(self, web_client: Any) -> None:
         _session, client = web_client
         r = client.get("/saklas/v1/sessions/default/correlation?names=missing,honest")
         assert r.status_code == 404
 
-    def test_layers_shared_records_pair_overlap(self, web_client) -> None:
+    def test_layers_shared_records_pair_overlap(self, web_client: Any) -> None:
         _session, client = web_client
         r = client.get("/saklas/v1/sessions/default/correlation")
         data = r.json()
@@ -225,7 +227,7 @@ class TestCorrelationEndpoint:
 
 
 class TestVectorPerLayerNorms:
-    def test_get_vector_returns_per_layer_norms(self, web_client) -> None:
+    def test_get_vector_returns_per_layer_norms(self, web_client: Any) -> None:
         _session, client = web_client
         r = client.get("/saklas/v1/sessions/default/vectors/honest")
         assert r.status_code == 200
@@ -303,7 +305,7 @@ class TestRegisterWebRoutes:
         assert (d / "index.html").is_file()
         assert (d / "assets").is_dir()
 
-    def test_register_against_empty_dist_raises_clear_error(self, tmp_path, monkeypatch) -> None:
+    def test_register_against_empty_dist_raises_clear_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi import FastAPI
 
         from saklas.web import routes as web_routes

@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
 import pytest
 
 from saklas import cli
@@ -8,7 +13,7 @@ from saklas.cli import runners as cli_runners
 # parse_args — top-level subcommand dispatch
 # ---------------------------------------------------------------------------
 
-def test_parse_zero_args_prints_help_and_exits_zero(capsys):
+def test_parse_zero_args_prints_help_and_exits_zero(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit) as ex:
         cli.parse_args([])
     assert ex.value.code == 0
@@ -40,7 +45,7 @@ def test_parse_tui_with_config_only():
 # pack subtree
 # ---------------------------------------------------------------------------
 
-def test_parse_pack_no_verb_exits_zero(capsys):
+def test_parse_pack_no_verb_exits_zero(capsys: pytest.CaptureFixture[str]):
     # pack with no verb prints help and exits 0.
     with pytest.raises(SystemExit) as ex:
         cli.main(["pack"])
@@ -118,7 +123,7 @@ def test_parse_pack_merge_is_gone():
 # vector subtree
 # ---------------------------------------------------------------------------
 
-def test_parse_vector_no_verb_exits_zero(capsys):
+def test_parse_vector_no_verb_exits_zero(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit) as ex:
         cli.main(["vector"])
     assert ex.value.code == 0
@@ -195,14 +200,14 @@ def test_parse_config_validate():
     assert args.file == "/tmp/setup.yaml"
 
 
-def test_config_show_runs(monkeypatch, tmp_path, capsys):
+def test_config_show_runs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     cli.main(["config", "show", "--no-default"])
     out = capsys.readouterr().out
     assert "saklas" in out  # header
 
 
-def test_config_show_with_extra(monkeypatch, tmp_path, capsys):
+def test_config_show_with_extra(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "x.yaml"
     p.write_text("model: google/gemma-2-2b-it\ntemperature: 0.7\n")
@@ -212,7 +217,7 @@ def test_config_show_with_extra(monkeypatch, tmp_path, capsys):
     assert "temperature" in out
 
 
-def test_config_validate_ok(monkeypatch, tmp_path, capsys):
+def test_config_validate_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "x.yaml"
     p.write_text("model: google/gemma-2-2b-it\n")
@@ -221,13 +226,13 @@ def test_config_validate_ok(monkeypatch, tmp_path, capsys):
     assert "ok" in out
 
 
-def test_config_validate_missing_file(tmp_path):
+def test_config_validate_missing_file(tmp_path: Path):
     with pytest.raises(SystemExit) as ex:
         cli.main(["config", "validate", str(tmp_path / "nope.yaml")])
     assert ex.value.code == 2
 
 
-def test_config_validate_local_vector_missing(monkeypatch, tmp_path):
+def test_config_validate_local_vector_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "x.yaml"
     p.write_text("vectors:\n  local/nope: 0.5\n")
@@ -257,7 +262,7 @@ def test_serve_compile_flag_parses():
     assert args.compile is True
 
 
-def test_yaml_compile_true_folds_onto_args(monkeypatch, tmp_path):
+def test_yaml_compile_true_folds_onto_args(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """YAML ``compile: true`` should set ``args.compile=True`` when the
     CLI didn't already pass ``--compile``."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -271,7 +276,7 @@ def test_yaml_compile_true_folds_onto_args(monkeypatch, tmp_path):
     assert args.compile is True
 
 
-def test_yaml_compile_false_is_noop(monkeypatch, tmp_path):
+def test_yaml_compile_false_is_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """``compile: false`` matches the default — accepting it in YAML
     keeps round-trip symmetry but doesn't flip ``args.compile``."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -282,7 +287,7 @@ def test_yaml_compile_false_is_noop(monkeypatch, tmp_path):
     assert getattr(args, "compile", False) is False
 
 
-def test_cli_compile_overrides_yaml_compile_false(monkeypatch, tmp_path):
+def test_cli_compile_overrides_yaml_compile_false(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """CLI flag wins over YAML — passing ``--compile`` even with
     ``compile: false`` in YAML must keep the opt-in."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -293,7 +298,7 @@ def test_cli_compile_overrides_yaml_compile_false(monkeypatch, tmp_path):
     assert args.compile is True
 
 
-def test_yaml_compile_invalid_type_errors(monkeypatch, tmp_path):
+def test_yaml_compile_invalid_type_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Reject non-boolean ``compile:`` values rather than coercing —
     ``compile: "true"`` (a string) would otherwise pass through as
     truthy and silently turn compile on."""
@@ -308,7 +313,7 @@ def test_yaml_compile_invalid_type_errors(monkeypatch, tmp_path):
 # Runners
 # ---------------------------------------------------------------------------
 
-def test_run_refresh_bundled(monkeypatch, tmp_path):
+def test_run_refresh_bundled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
     packs.materialize_bundled()
@@ -320,7 +325,7 @@ def test_run_refresh_bundled(monkeypatch, tmp_path):
     assert target.read_text() != "[]"
 
 
-def test_run_refresh_neutrals(monkeypatch, tmp_path):
+def test_run_refresh_neutrals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     (tmp_path / "neutral_statements.json").write_text("[]")
     cli.main(["pack", "refresh", "neutrals"])
@@ -328,7 +333,7 @@ def test_run_refresh_neutrals(monkeypatch, tmp_path):
     assert content != "[]"
 
 
-def test_run_install_folder(monkeypatch, tmp_path):
+def test_run_install_folder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     from saklas.io import packs
     src = tmp_path / "src" / "happy"
@@ -343,10 +348,10 @@ def test_run_install_folder(monkeypatch, tmp_path):
     assert (tmp_path / "home" / "vectors" / "local" / "happy" / "pack.json").is_file()
 
 
-def test_run_ls_empty(monkeypatch, tmp_path, capsys):
+def test_run_ls_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    def boom(_sel):
+    def boom(_sel: Any) -> Any:
         raise AssertionError("HF query must not run with pack ls")
 
     monkeypatch.setattr("saklas.io.hf.search_packs", boom)
@@ -355,11 +360,11 @@ def test_run_ls_empty(monkeypatch, tmp_path, capsys):
     assert "NAME" in out
 
 
-def test_run_search_calls_hf(monkeypatch, tmp_path, capsys):
+def test_run_search_calls_hf(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     calls = []
 
-    def fake(sel):
+    def fake(sel: Any) -> list[dict[str, Any]]:
         calls.append(sel)
         return [{"name": "happy", "namespace": "alice", "tags": [], "recommended_alpha": 0.5}]
 
@@ -370,7 +375,7 @@ def test_run_search_calls_hf(monkeypatch, tmp_path, capsys):
     assert "happy" in out
 
 
-def test_run_rm_refuses_broad(monkeypatch, tmp_path):
+def test_run_rm_refuses_broad(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
     packs.materialize_bundled()
@@ -378,7 +383,7 @@ def test_run_rm_refuses_broad(monkeypatch, tmp_path):
         cli.main(["pack", "rm", "all"])
 
 
-def test_run_rm_specific(monkeypatch, tmp_path):
+def test_run_rm_specific(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
     packs.materialize_bundled()
@@ -386,7 +391,7 @@ def test_run_rm_specific(monkeypatch, tmp_path):
     assert not (tmp_path / "vectors" / "default" / "happy.sad").exists()
 
 
-def test_run_extract_cache_hit_prints_already_extracted(monkeypatch, tmp_path, capsys):
+def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
     packs.materialize_bundled()
@@ -398,16 +403,16 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch, tmp_path, c
     tensor.write_bytes(b"")
 
     class FakeSession:
-        def __init__(self, **kw):
+        def __init__(self, **kw: Any) -> None:
             self.model_id = model_id
             self.model_info = {"model_type": "fake", "num_layers": 1,
                                "hidden_dim": 8, "vram_used_gb": 0.0}
             self.probes = {}
 
-        def _local_concept_folder(self, canonical, *, namespace="local"):
+        def _local_concept_folder(self, canonical: str, *, namespace: str = "local") -> Path:
             return vectors_dir() / namespace / canonical
 
-        def extract(self, *a, **kw):
+        def extract(self, *a: Any, **kw: Any) -> Any:
             raise AssertionError("extract() must not be called on cache hit")
 
     monkeypatch.setattr(cli_runners, "_make_session", lambda args: FakeSession())
@@ -422,7 +427,7 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch, tmp_path, c
     assert str(tensor) in out
 
 
-def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
+def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
     packs.materialize_bundled()
@@ -434,21 +439,21 @@ def test_run_tui_registers_config_vectors(monkeypatch, tmp_path):
     extract_calls = []
 
     class FakeSession:
-        def __init__(self, **kw):
+        def __init__(self, **kw: Any) -> None:
             self.kw = kw
             self.model_info = {"model_type": "fake", "num_layers": 1,
                                "hidden_dim": 8, "vram_used_gb": 0.0}
             self.probes = {}
 
-        def extract(self, name, **kw):
+        def extract(self, name: str, **kw: Any) -> Any:
             extract_calls.append((name, kw))
             return name, "PROFILE"
 
-        def steer(self, name, profile, alpha=None):
+        def steer(self, name: str, profile: Any, alpha: Any = None) -> None:
             registered[name] = (profile, alpha)
 
     class FakeApp:
-        def __init__(self, session):
+        def __init__(self, session: Any) -> None:
             self.session = session
 
         def run(self):
@@ -499,7 +504,7 @@ def test_parse_vector_compare_missing_model_errors():
         cli.parse_args(["vector", "compare", "angry.calm"])
 
 
-def test_vector_appears_in_help(capsys):
+def test_vector_appears_in_help(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit):
         cli.parse_args([])
     out = capsys.readouterr().out
@@ -510,7 +515,7 @@ def test_vector_appears_in_help(capsys):
 # _run_compare — verbose modes (1-arg ranked, N×N matrix)
 # ---------------------------------------------------------------------------
 
-def _setup_compare_env(monkeypatch, tmp_path):
+def _setup_compare_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Set SAKLAS_HOME, materialize bundled, and return the vectors_dir path."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
@@ -520,10 +525,10 @@ def _setup_compare_env(monkeypatch, tmp_path):
     return tmp_path / "vectors"
 
 
-def _mock_profile(agg_fn, pl_fn):
+def _mock_profile(agg_fn: Any, pl_fn: Any) -> Any:
     """Return a simple duck-typed mock (not a Profile subclass) with cosine_similarity."""
     class MockProfile:
-        def cosine_similarity(self, other, *, per_layer=False, whitener=None):
+        def cosine_similarity(self, other: Any, *, per_layer: bool = False, whitener: Any = None) -> Any:
             # ``whitener`` is accepted (forwarded by ``_run_compare`` after
             # the v2.1 ``--metric mahalanobis`` wiring) but ignored here —
             # the mocks return a fixed scalar that doesn't depend on the
@@ -533,7 +538,7 @@ def _mock_profile(agg_fn, pl_fn):
     return MockProfile()
 
 
-def test_run_compare_one_arg_verbose_text(monkeypatch, tmp_path, capsys):
+def test_run_compare_one_arg_verbose_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """1-arg + -v text mode: prints per-layer breakdown for top 3."""
     vdir = _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -555,14 +560,14 @@ def test_run_compare_one_arg_verbose_text(monkeypatch, tmp_path, capsys):
     happy_profile = _mock_profile(lambda o: None, lambda o: None)
     warm_profile = _mock_profile(lambda o: None, lambda o: None)
 
-    def target_agg(other):
+    def target_agg(other: Any) -> float:
         if other is happy_profile:
             return 0.3421
         if other is warm_profile:
             return 0.1893
         return 0.0
 
-    def target_pl(other):
+    def target_pl(other: Any) -> dict[int, float]:
         if other is happy_profile:
             return {14: 0.5122, 15: 0.4891}
         if other is warm_profile:
@@ -595,7 +600,7 @@ def test_run_compare_one_arg_verbose_text(monkeypatch, tmp_path, capsys):
     assert "0.5122" in out
 
 
-def test_run_compare_one_arg_verbose_json(monkeypatch, tmp_path, capsys):
+def test_run_compare_one_arg_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """1-arg + -v -j JSON mode: output includes per_layer_top3 key."""
     import json as _json
     vdir = _setup_compare_env(monkeypatch, tmp_path)
@@ -640,7 +645,7 @@ def test_run_compare_one_arg_verbose_json(monkeypatch, tmp_path, capsys):
     assert abs(pl["14"] - 0.5122) < 1e-5
 
 
-def test_run_compare_matrix_verbose_json(monkeypatch, tmp_path, capsys):
+def test_run_compare_matrix_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """3-arg N×N + -v -j JSON mode: output includes per_layer dict keyed by 'a|b'."""
     import json as _json
     vdir = _setup_compare_env(monkeypatch, tmp_path)
@@ -659,7 +664,7 @@ def test_run_compare_matrix_verbose_json(monkeypatch, tmp_path, capsys):
     from saklas.core.profile import Profile
 
     per_layer_vals = {14: 0.3456, 15: 0.2345}
-    profiles_by_path: dict = {}
+    profiles_by_path: dict[str, Any] = {}
     for c in concepts:
         fp = _mock_profile(lambda o: 0.25, lambda o: per_layer_vals)
         profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
@@ -682,7 +687,7 @@ def test_run_compare_matrix_verbose_json(monkeypatch, tmp_path, capsys):
     assert abs(pl["14"] - 0.3456) < 1e-5
 
 
-def test_run_compare_matrix_verbose_text_unchanged(monkeypatch, tmp_path, capsys):
+def test_run_compare_matrix_verbose_text_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """3-arg N×N + -v text mode: no per-layer section (text matrix is dense enough)."""
     vdir = _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -698,7 +703,7 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch, tmp_path, capsys
         dirs[c] = d
 
     from saklas.core.profile import Profile
-    profiles_by_path: dict = {}
+    profiles_by_path: dict[str, Any] = {}
     for c in concepts:
         fp = _mock_profile(lambda o: 0.25, lambda o: {14: 0.1})
         profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
@@ -719,7 +724,7 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch, tmp_path, capsys
 # _run_why — layer introspection
 # ---------------------------------------------------------------------------
 
-def _setup_why_env(monkeypatch, tmp_path):
+def _setup_why_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Set SAKLAS_HOME, materialize bundled, return vectors_dir."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs
@@ -729,7 +734,7 @@ def _setup_why_env(monkeypatch, tmp_path):
     return tmp_path / "vectors"
 
 
-def _mock_why_profile(layer_mags: dict, diagnostics: dict | None = None):
+def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] | None = None) -> Any:
     """Return a duck-typed mock profile for _run_why.
 
     Carries the four surfaces ``_run_why`` reads: ``items()`` (per-layer
@@ -786,7 +791,7 @@ def test_parse_vector_why_missing_model_errors():
         cli.parse_args(["vector", "why", "angry.calm"])
 
 
-def test_run_why_text_output(monkeypatch, tmp_path, capsys):
+def test_run_why_text_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """Text output renders a per-bucket histogram covering every layer."""
     vdir = _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -818,7 +823,7 @@ def test_run_why_text_output(monkeypatch, tmp_path, capsys):
     assert "█" in out
 
 
-def test_run_why_text_buckets_large_profile(monkeypatch, tmp_path, capsys):
+def test_run_why_text_buckets_large_profile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """With >24 layers, buckets collapse into layer ranges."""
     vdir = _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -848,7 +853,7 @@ def test_run_why_text_buckets_large_profile(monkeypatch, tmp_path, capsys):
     assert len(bar_lines) == HIST_BUCKETS
 
 
-def test_run_why_json_output(monkeypatch, tmp_path, capsys):
+def test_run_why_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """JSON output is full-fidelity, in layer order."""
     import json as _json
     vdir = _setup_why_env(monkeypatch, tmp_path)
@@ -878,7 +883,7 @@ def test_run_why_json_output(monkeypatch, tmp_path, capsys):
     assert abs(data["layers"][1]["magnitude"] - 0.847) < 1e-4
 
 
-def test_run_why_concept_not_found(monkeypatch, tmp_path, capsys):
+def test_run_why_concept_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """Missing concept exits with code 1."""
     _setup_why_env(monkeypatch, tmp_path)
     with pytest.raises(SystemExit) as exc:
@@ -908,7 +913,7 @@ def test_split_variant_suffix_parses_sae_variants():
     )
 
 
-def test_run_why_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
+def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """``vector why foo:sae`` must load the SAE tensor, not the raw one."""
     vdir = _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -943,7 +948,7 @@ def test_run_why_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
     assert "L0" not in out
 
 
-def test_run_why_sae_ambiguous_errors(monkeypatch, tmp_path, capsys):
+def test_run_why_sae_ambiguous_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """``:sae`` with multiple installed SAE variants must error out."""
     vdir = _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -964,7 +969,7 @@ def test_run_why_sae_ambiguous_errors(monkeypatch, tmp_path, capsys):
     assert "multiple SAE variants" in err
 
 
-def test_run_compare_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
+def test_run_compare_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """Each concept in ``vector compare`` parses its own :variant suffix."""
     vdir = _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
@@ -1009,7 +1014,7 @@ def test_run_compare_accepts_sae_suffix(monkeypatch, tmp_path, capsys):
     assert "happy.sad" in out
 
 
-def test_config_bare_pole_resolves_canonical(monkeypatch, tmp_path):
+def test_config_bare_pole_resolves_canonical(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Config YAML with bare pole 'wolf' should resolve to 'deer.wolf' with -1 sign."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io import packs

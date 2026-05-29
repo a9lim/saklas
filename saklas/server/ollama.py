@@ -260,7 +260,7 @@ def _flatten_content(content: Any) -> str:
     return str(content)
 
 
-def _extract_messages(body: dict) -> list[dict[str, str]]:
+def _extract_messages(body: dict[str, Any]) -> list[dict[str, str]]:
     raw = body.get("messages") or []
     out: list[dict[str, str]] = []
     for m in raw:
@@ -281,7 +281,7 @@ _PROCESSED_OPTIONS: frozenset[str] = frozenset({
 
 
 def _resolve_options(
-    body: dict, default_steering: "Steering | None",
+    body: dict[str, Any], default_steering: "Steering | None",
 ) -> tuple[dict[str, Any], str | None]:
     """Translate Ollama `options` + top-level fields into session.generate kwargs.
 
@@ -364,7 +364,7 @@ def _resolve_options(
     if think_flag is not None:
         thinking = bool(think_flag)
 
-    merged_alphas: dict = {}
+    merged_alphas: dict[str, Any] = {}
     if default_steering is not None and not explicit_clear:
         merged_alphas.update(default_steering.alphas)
     if req_steering is not None:
@@ -400,7 +400,7 @@ def _resolve_options(
 # Response assembly
 # ---------------------------------------------------------------------------
 
-def _duration_stats(result, elapsed_ns: int) -> dict[str, int]:
+def _duration_stats(result: Any, elapsed_ns: int) -> dict[str, int]:
     """Build Ollama's *_duration and *_count fields from a GenerationResult.
 
     All durations are in nanoseconds.  Saklas tracks tokens/sec so we split the
@@ -569,7 +569,7 @@ def register_ollama_routes(app: FastAPI) -> None:
     # Generation endpoints
     # -----------------------------------------------------------------------
 
-    def _check_model_or_404(body: dict) -> None:
+    def _check_model_or_404(body: dict[str, Any]) -> None:
         """In strict mode, reject requests whose `model` doesn't match the loaded session."""
         if not _strict_mode():
             return
@@ -585,11 +585,11 @@ def register_ollama_routes(app: FastAPI) -> None:
             )
 
     async def _run_and_build_chat_response(
-        body: dict,
+        body: dict[str, Any],
         is_chat: bool,
-        gen_kwargs: dict,
+        gen_kwargs: dict[str, Any],
         system: str | None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Shared non-streaming path for /api/chat and /api/generate.
 
         Option resolution is hoisted to the route handler so any
@@ -666,9 +666,9 @@ def register_ollama_routes(app: FastAPI) -> None:
         return payload
 
     async def _stream_chat_or_generate(
-        body: dict,
+        body: dict[str, Any],
         is_chat: bool,
-        gen_kwargs: dict,
+        gen_kwargs: dict[str, Any],
         system: str | None,
     ):
         """Streaming NDJSON body for /api/chat and /api/generate.

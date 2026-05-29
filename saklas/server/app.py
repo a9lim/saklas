@@ -8,14 +8,18 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+if TYPE_CHECKING:
+    from saklas.core.results import GenerationResult
+
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, model_validator
+from starlette.datastructures import Headers
 
 from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
@@ -113,11 +117,11 @@ class _SamplingBase(BaseModel):
     # Native thinking override.  None = auto (honours supports_thinking).
     thinking: bool | None = None
     # LangChain compat: accept no-op shapes, reject anything real.
-    tools: list | None = None
+    tools: list[Any] | None = None
     tool_choice: Any = None
     # Fields accepted and ignored:
     n: int | None = None
-    response_format: dict | None = None
+    response_format: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _unify_max_tokens(self):
@@ -173,7 +177,7 @@ class _SamplingBase(BaseModel):
         if req_steering is not None and req_steering.thinking is not None:
             thinking = req_steering.thinking
 
-        merged_alphas: dict = {}
+        merged_alphas: dict[str, Any] = {}
         if default_steering is not None and not explicit_clear:
             merged_alphas.update(default_steering.alphas)
         if req_steering is not None:
@@ -213,7 +217,7 @@ def _error(status: int, message: str, error_type: str = "error",
 _bearer = HTTPBearer(auto_error=False)
 
 
-def _check_bearer(headers, expected: str) -> bool:
+def _check_bearer(headers: Headers, expected: str) -> bool:
     """Return True iff a correct ``Authorization: Bearer <expected>`` header is present."""
     auth = headers.get("authorization") or headers.get("Authorization")
     if not auth:
@@ -222,8 +226,8 @@ def _check_bearer(headers, expected: str) -> bool:
     return scheme.lower() == "bearer" and token == expected
 
 
-def _require_auth(request: Request = None,  # type: ignore[assignment]
-                  websocket=None):
+def _require_auth(request: Request = None,  # pyright: ignore[reportArgumentType]  # FastAPI injects Request/WebSocket by type; None default is a sentinel, not a real argument
+                  websocket=None):  # pyright: ignore[reportMissingParameterType]  # FastAPI special-cases bare WebSocket/Request injection; an explicit `WebSocket | None` annotation makes it build a request field and raises at app-construction time
     """Bearer-token auth gate for HTTP routes.
 
     Accepts either a ``Request`` or a ``WebSocket`` — FastAPI resolves the
@@ -250,7 +254,7 @@ def _require_auth(request: Request = None,  # type: ignore[assignment]
     return None
 
 
-def ws_auth_ok(websocket) -> bool:
+def ws_auth_ok(websocket: WebSocket) -> bool:
     """Return True iff the WebSocket handshake carries valid bearer auth.
 
     Call this BEFORE ``websocket.accept()``. If it returns False, close the
@@ -388,7 +392,7 @@ def _sampling_kwargs(
     }
 
 
-def _usage_dict(result) -> dict[str, int]:
+def _usage_dict(result: GenerationResult) -> dict[str, int]:
     pt = result.prompt_tokens
     ct = result.token_count
     return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
@@ -401,7 +405,7 @@ def _token_bytes(text: str) -> list[int]:
         return []
 
 
-def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
+def _render_logprobs_chat(result: GenerationResult, session: SaklasSession) -> dict[str, Any] | None:
     if result.logprobs is None:
         return None
     tok = session._tokenizer
@@ -414,7 +418,7 @@ def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
     # engine emits its id via ``result.tokens`` without the streaming
     # text representation alongside.
     for tid, lp, top in result.logprobs:
-        tok_str = tok.decode([tid])
+        tok_str: str = tok.decode([tid])  # pyright: ignore[reportAssignmentType]  # transformers stub returns str | list[str] but single-list input always yields str
         content.append({
             "token": tok_str,
             "logprob": lp,
@@ -428,7 +432,7 @@ def _render_logprobs_chat(result, session: SaklasSession) -> dict | None:
     return {"content": content}
 
 
-def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
+def _render_logprobs_completions(result: GenerationResult, session: SaklasSession) -> dict[str, Any] | None:
     """OpenAI /v1/completions logprobs shape (flat, token-parallel arrays).
 
     https://platform.openai.com/docs/api-reference/completions/object#completions/object-logprobs
@@ -446,7 +450,7 @@ def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
     text_offset: list[int] = []
     offset = 0
     for tid, lp, top in result.logprobs:
-        tok_str = tok.decode([tid])
+        tok_str: str = tok.decode([tid])  # pyright: ignore[reportAssignmentType]  # transformers stub returns str | list[str] but single-list input always yields str
         tokens.append(tok_str)
         token_logprobs.append(lp)
         top_logprobs.append({alt.text: alt.logprob for alt in top})
@@ -461,8 +465,9 @@ def _render_logprobs_completions(result, session: SaklasSession) -> dict | None:
 
 
 async def _stream_generation(
-    app, session: SaklasSession,
-    stream_iter, rid, model_id, object_type, format_delta, empty_delta,
+    app: FastAPI, session: SaklasSession,
+    stream_iter: Iterator[Any], rid: str, model_id: str, object_type: str,
+    format_delta: Callable[[Any], dict[str, Any]], empty_delta: dict[str, Any],
     include_usage: bool = False, role_delta: bool = False,
 ):
     """Shared SSE generator for chat and completion streaming.
@@ -557,7 +562,7 @@ async def _stream_generation(
             yield "data: [DONE]\n\n"
 
 
-def _profile_top_layers(profile: dict, n: int = 5) -> list[tuple[int, float]]:
+def _profile_top_layers(profile: dict[int, Any], n: int = 5) -> list[tuple[int, float]]:
     """Return top-n profile layers sorted by baked magnitude descending.
 
     Since shares are baked into tensor magnitudes, ||vec|| is the same
@@ -714,7 +719,7 @@ def _register_routes(app: FastAPI) -> None:
     # Chat completions
     # -----------------------------------------------------------------------
 
-    async def _run_blocking(req, prompt_or_messages, *, raw: bool):
+    async def _run_blocking(req: _SamplingBase, prompt_or_messages: Any, *, raw: bool) -> Any:
         gen_kwargs = _sampling_kwargs(req, app.state.default_steering)
         async with session.lock:
             return session.generate(prompt_or_messages, raw=raw, **gen_kwargs)
@@ -728,7 +733,7 @@ def _register_routes(app: FastAPI) -> None:
         gen_kwargs = _sampling_kwargs(req, app.state.default_steering)
 
         if req.stream:
-            def _chat_delta(event):
+            def _chat_delta(event: Any) -> dict[str, Any]:
                 d: dict[str, str] = {}
                 if event.thinking:
                     d["reasoning_content"] = event.text

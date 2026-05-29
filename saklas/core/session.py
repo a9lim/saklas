@@ -421,7 +421,7 @@ class _SteeringContext:
                 if prev is _PROFILE_ABSENT:
                     profiles.pop(key, None)
                 else:
-                    profiles[key] = prev  # type: ignore[assignment]
+                    profiles[key] = prev  # pyright: ignore[reportArgumentType]  # sentinel restore: prev is dict[int, Tensor] at runtime
             self._synthetic_snapshots = {}
 
 
@@ -581,7 +581,8 @@ class SaklasSession:
         # lookup rather than another StaticCache(max_cache_len=1)
         # allocation.
         return cls(
-            model, tokenizer,
+            model,  # pyright: ignore[reportArgumentType]  # may be torch.compile OptimizedModule wrapping PreTrainedModel
+            tokenizer,
             probes=probes,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
@@ -671,7 +672,7 @@ class SaklasSession:
             return_top_k = 256
         self._default_return_top_k: int = int(return_top_k)
         self._steering = SteeringManager(
-            injection_mode=self._injection_mode,  # type: ignore[arg-type]
+            injection_mode=self._injection_mode,
             theta_max=self._theta_max,
         )
         # CUDA-graphs / StaticCache routing (Phase B, v2.2).  Probe
@@ -815,7 +816,7 @@ class SaklasSession:
         # Live trait SSE subscribers.  Each entry is (event_loop, asyncio.Queue).
         # The generation thread pushes tagged tuples via loop.call_soon_threadsafe;
         # SSE handlers drain the queue asynchronously.
-        self._trait_queues: list[tuple] = []
+        self._trait_queues: list[tuple[Any, ...]] = []
         self._trait_lock = threading.Lock()
 
         # Ensure bundled concepts are materialized in the user cache and
@@ -871,7 +872,7 @@ class SaklasSession:
         # it without re-passing.  ``--legacy`` sets this to False.
         self._dls: bool = bool(dls)
 
-        probe_profiles: dict[str, dict] = {}
+        probe_profiles: dict[str, dict[int, torch.Tensor]] = {}
         if probe_categories:
             probe_profiles = bootstrap_probes(
                 self._model, self._tokenizer, self._layers, self._model_info,
@@ -947,7 +948,7 @@ class SaklasSession:
     # -- State queries --
 
     @property
-    def model_info(self) -> dict:
+    def model_info(self) -> dict[str, Any]:
         return dict(self._model_info)
 
     @property
@@ -963,7 +964,7 @@ class SaklasSession:
         return {name: Profile(tensors) for name, tensors in self._profiles.items()}
 
     @property
-    def probes(self) -> dict[str, dict]:
+    def probes(self) -> dict[str, dict[str, Any]]:
         profiles = self._monitor.profiles
         return {name: {"profile": profiles[name]}
                 for name in self._monitor.probe_names}
@@ -1007,12 +1008,12 @@ class SaklasSession:
     def _trait_subscribers(self) -> int:
         return len(self._trait_queues)
 
-    def register_trait_queue(self, loop, q) -> None:
+    def register_trait_queue(self, loop: Any, q: Any) -> None:
         """Register an ``(event_loop, asyncio.Queue)`` pair for live trait events."""
         with self._trait_lock:
             self._trait_queues.append((loop, q))
 
-    def unregister_trait_queue(self, loop, q) -> None:
+    def unregister_trait_queue(self, loop: Any, q: Any) -> None:
         """Remove a previously registered trait queue."""
         with self._trait_lock:
             try:
@@ -1220,7 +1221,7 @@ class SaklasSession:
         ).to(self._device)
         attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
-            out = self._model.generate(
+            out = self._model.generate(  # pyright: ignore[reportCallIssue]  # transformers stubs don't expose generate on PreTrainedModel directly
                 input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
@@ -1228,7 +1229,8 @@ class SaklasSession:
                 pad_token_id=pad_id,
             )
         new_ids = out[0][input_ids.shape[-1]:]
-        return self._tokenizer.decode(new_ids, skip_special_tokens=True)
+        decoded = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+        return decoded if isinstance(decoded, str) else decoded[0]
 
     def generate_scenarios(
         self,
@@ -1705,7 +1707,7 @@ class SaklasSession:
 
     def extract(
         self,
-        source,
+        source: Any,
         baseline: str | None = None,
         *,
         scenarios: list[str] | None = None,
@@ -1790,7 +1792,7 @@ class SaklasSession:
                 sae=sae,
                 sae_revision=sae_revision,
                 namespace=namespace,
-                method=effective_method,  # type: ignore[arg-type]
+                method=effective_method,  # pyright: ignore[reportArgumentType]  # str is narrowed to Literal['dim','pca'] by earlier validation
                 dls=effective_dls,
                 role=role,
             )
@@ -1799,7 +1801,7 @@ class SaklasSession:
 
     def extract_manifold(
         self,
-        folder,
+        folder: Any,
         *,
         sae: str | None = None,
         sae_revision: str | None = None,
@@ -1835,7 +1837,7 @@ class SaklasSession:
 
     def clone_from_corpus(
         self,
-        path,
+        path: Any,
         name: str,
         *,
         n_pairs: int = 90,
@@ -1864,7 +1866,7 @@ class SaklasSession:
         self,
         profile: Profile,
         path: str,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         profile.save(path, metadata=metadata)
 
@@ -2720,7 +2722,7 @@ class SaklasSession:
         eff_mode, eff_theta = self._resolve_steering_override()
         self._steering.apply_to_model(
             self._layers, self._device, self._dtype,
-            injection_mode=eff_mode,  # type: ignore[arg-type]
+            injection_mode=eff_mode,  # pyright: ignore[reportArgumentType]  # str narrowed to InjectionMode by session-level validation
             theta_max=eff_theta,
         )
 
@@ -2912,7 +2914,7 @@ class SaklasSession:
 
     # -- Monitoring --
 
-    def probe(self, name: str, profile: dict | None = None) -> None:
+    def probe(self, name: str, profile: Any = None) -> None:
         if profile is None:
             _, profile = self.extract(name)
         if not self._layer_means:
@@ -3654,7 +3656,7 @@ class SaklasSession:
     # -- Generation helpers --
 
     def _prepare_input(
-        self, input, raw: bool = False, thinking: bool = False,
+        self, input: Any, raw: bool = False, thinking: bool = False,
         stateless: bool = False,
         parent_node_id: str | None = None,
         user_role: str | None = None,
@@ -3667,9 +3669,10 @@ class SaklasSession:
             # call's own ``input``.  ``stateless`` skips the tree walk so
             # the buffer is purely ``input``.
             prefix = "" if stateless else self.tree.flat_text(parent_node_id)
-            return self._tokenizer.encode(
+            encoded = self._tokenizer.encode(
                 prefix + input, return_tensors="pt",
-            ).to(self._device)
+            )
+            return encoded.to(self._device)  # pyright: ignore[reportAttributeAccessIssue]  # return_tensors="pt" gives BatchEncoding/Tensor, not list
         if isinstance(input, str):
             if stateless:
                 prior: list[dict[str, Any]] = []
@@ -3748,7 +3751,7 @@ class SaklasSession:
         return readings
 
     def _finalize_generation(
-        self, input, generated_ids: list[int], elapsed: float,
+        self, input: Any, generated_ids: list[int], elapsed: float,
         vector_snapshot: dict[str, float], prompt_tokens: int = 0,
         stateless: bool = False,
         logprobs_list: list[tuple[int, float, list[Any]]] | None = None,
@@ -3767,9 +3770,10 @@ class SaklasSession:
             self._gen_state.finish_reason == "stop_sequence"
             and self._gen_state.response_text is not None
         ):
-            text = self._gen_state.response_text
+            text: str = self._gen_state.response_text
         else:
-            text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+            _decoded = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+            text = _decoded if isinstance(_decoded, str) else _decoded[0]
 
         if self._monitor.probe_names and generated_ids:
             agg_vals, per_token = self.score_captured(
@@ -3901,7 +3905,7 @@ class SaklasSession:
                 resp_rows[r_i]["raw_index"] = raw_index
                 r_i += 1
 
-    def _generation_preamble(self, input, raw, thinking, stateless=False,
+    def _generation_preamble(self, input: Any, raw: bool, thinking: bool, stateless: bool = False,
                              parent_node_id: str | None = None,
                              user_role: str | None = None,
                              assistant_role: str | None = None):
@@ -3938,7 +3942,7 @@ class SaklasSession:
 
         if sampling is None:
             return self.config
-        overrides: dict = {}
+        overrides: dict[str, Any] = {}
         if sampling.temperature is not None:
             overrides["temperature"] = sampling.temperature
         if sampling.top_p is not None:
@@ -4029,7 +4033,7 @@ class SaklasSession:
         dict[int, float] | None,
         float,
         float,
-        list | None,
+        list[Any] | None,
     ]:
         """Normalize per-call generation controls before model work."""
         steering_obj = Steering.from_value(steering)
@@ -4061,7 +4065,7 @@ class SaklasSession:
         frequency_penalty = (
             sampling.frequency_penalty if sampling is not None else 0.0
         )
-        logprobs_list: list | None = [] if raw_lp is not None else None
+        logprobs_list: list[Any] | None = [] if raw_lp is not None else None
         return (
             steering_obj,
             use_thinking_req,
@@ -4087,7 +4091,7 @@ class SaklasSession:
 
     def _start_loom_assistant(
         self,
-        input,
+        input: Any,
         *,
         stateless: bool,
         raw: bool,
@@ -4203,14 +4207,14 @@ class SaklasSession:
 
         if cached_pkv is not None and self._prefix_cache is not None:
             try:
-                cached_pkv.crop(cache_position_offset)
+                cached_pkv.crop(cache_position_offset)  # pyright: ignore[reportAttributeAccessIssue]  # HF cache object; crop() is present at runtime
             except (AttributeError, TypeError):
                 self._invalidate_prefix_cache()
         return generated_ids, elapsed
 
     def _generate_core(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -4271,11 +4275,11 @@ class SaklasSession:
         mean_logprob_count: int = 0
         trait_token_counter = [0]
 
-        def _token_tap(text, is_thinking, tid, lp, top_alts, perplexity):
+        def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
             nonlocal mean_logprob_sum, mean_logprob_count
-            if logprobs_list is not None and tid >= 0 and not is_thinking:
+            if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
                 logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
-            if lp is not None and tid >= 0 and not is_thinking:
+            if lp is not None and tid is not None and tid >= 0 and not is_thinking:
                 mean_logprob_sum += lp
                 mean_logprob_count += 1
             if assistant_node_id is not None and tid is not None:
@@ -4545,7 +4549,7 @@ class SaklasSession:
 
     def _generate_runset(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -4610,7 +4614,7 @@ class SaklasSession:
 
     def generate(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -4674,7 +4678,7 @@ class SaklasSession:
 
     def generate_stream(
         self,
-        input,
+        input: Any,
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -4703,13 +4707,13 @@ class SaklasSession:
         stream. Final aggregate/per-token readings are still computed during
         generation finalization from the captured hidden states.
         """
-        q: queue.SimpleQueue = queue.SimpleQueue()
+        q: queue.SimpleQueue[Any] = queue.SimpleQueue()
         done = object()
         result_holder: list[GenerationResult] = []
         exc_holder: list[BaseException] = []
         idx_counter = [0]
 
-        def _push(text, is_thinking, tid, lp, top_alts, perplexity):
+        def _push(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
             scores: dict[str, float] | None = None
             manifold_readings = None
             if live_scores and (
@@ -4732,7 +4736,7 @@ class SaklasSession:
                             )
                         )
             event = TokenEvent(
-                text=text, token_id=tid, index=idx_counter[0],
+                text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
                 scores=scores, perplexity=perplexity,
                 manifold_readings=manifold_readings,
@@ -4778,7 +4782,7 @@ class SaklasSession:
 
     def generate_batch(
         self,
-        prompts: list,
+        prompts: list[Any],
         *,
         steering: "str | Steering | None" = None,
         sampling: SamplingConfig | None = None,
@@ -4835,7 +4839,7 @@ class SaklasSession:
 
     def generate_sweep(
         self,
-        prompt,
+        prompt: Any,
         sweep: dict[str, list[float]],
         *,
         base_steering: "str | Steering | None" = None,
@@ -4975,8 +4979,8 @@ class SaklasSession:
         self._profiles.clear()
         self._manifolds.clear()
 
-    def __enter__(self):
+    def __enter__(self) -> "SaklasSession":
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.close()

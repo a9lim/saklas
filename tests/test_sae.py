@@ -1,6 +1,8 @@
 """Tests for the SAE extraction pipeline."""
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 
@@ -116,13 +118,13 @@ def test_mock_sae_backend_passes_layer_idx_to_overrides():
     assert seen == [2, -5]
 
 
-def test_extract_contrastive_sae_subset_layers(monkeypatch):
+def test_extract_contrastive_sae_subset_layers(monkeypatch: pytest.MonkeyPatch):
     """With sae=MockSaeBackend(layers={1,3}), profile covers only those layers."""
     import torch
     from saklas.core import vectors as V
     from saklas.core.sae import MockSaeBackend
 
-    def fake_encode_and_capture(model, tokenizer, text, layers, device, **_kwargs):
+    def fake_encode_and_capture(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
         torch.manual_seed(hash(text) & 0xFFFF)
         out = {}
         for idx in range(len(layers)):
@@ -145,7 +147,7 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch):
     sae = MockSaeBackend(layers=frozenset({1, 3}), d_model=8)
 
     profile, _ = V.extract_contrastive(
-        FakeModel(), FakeTok(), pairs, layers=layers_list,
+        FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         sae=sae,
         dls=False,
@@ -155,7 +157,7 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch):
     assert all(m > 0 for m in mags)
 
 
-def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
+def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch: pytest.MonkeyPatch):
     """pos > neg on the resulting direction, majority-vote orientation."""
     import torch
     from saklas.core import vectors as V
@@ -163,7 +165,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
 
     torch.manual_seed(0)
 
-    def fake_encode_and_capture(model, tokenizer, text, layers, device, **_kwargs):
+    def fake_encode_and_capture(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
         out = {}
         for idx in range(len(layers)):
             base = torch.zeros(4)
@@ -184,7 +186,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
     sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
 
     profile, _ = V.extract_contrastive(
-        FakeModel(), FakeTok(), pairs, layers=layers_list,
+        FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         sae=sae,
         dls=False,
@@ -193,7 +195,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch):
         assert vec[0].item() > 0
 
 
-def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch):
+def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch: pytest.MonkeyPatch):
     """An SAE covering no model layers raises SaeCoverageError."""
     import torch
     from saklas.core import vectors as V
@@ -217,14 +219,14 @@ def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch):
 
     with pytest.raises(SaeCoverageError):
         V.extract_contrastive(
-            FakeModel(), FakeTok(), pairs, layers=layers_list,
+            FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
             device=torch.device("cpu"),
             sae=sae,
             dls=False,
         )
 
 
-def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
+def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch: pytest.MonkeyPatch):
     """Per-layer baked magnitudes should scale with the layer's share (evr/sum)."""
     import torch
     from saklas.core import vectors as V
@@ -233,7 +235,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
     # Seed so the noise doesn't flip signs or perturb magnitudes.
     torch.manual_seed(0)
 
-    def fake_encode_and_capture(model, tokenizer, text, layers, device, **_kwargs):
+    def fake_encode_and_capture(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
         # Layer 0: high-SNR separation (evr near 1.0)
         # Layer 1: low-SNR separation (evr lower — noise dominates)
         out = {}
@@ -255,7 +257,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
     sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
 
     profile, _ = V.extract_contrastive(
-        FakeModel(), FakeTok(), pairs, layers=layers_list,
+        FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         sae=sae,
         dls=False,
@@ -270,7 +272,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch):
     assert mag_0 > mag_1
 
 
-def test_sae_lens_backend_encodes_and_decodes(monkeypatch):
+def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
     """SaeLensBackend wraps per-layer SAE modules and dispatches by layer index."""
     import torch
     import sys
@@ -279,7 +281,7 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch):
     fake_sae_lens = types.ModuleType("sae_lens")
 
     class FakeSAE:
-        def __init__(self, d_in, d_sae, hook_layer):
+        def __init__(self, d_in: Any, d_sae: Any, hook_layer: Any) -> None:
             self.cfg = types.SimpleNamespace(
                 d_in=d_in, d_sae=d_sae, model_name="test-model", hook_layer=hook_layer,
             )
@@ -287,14 +289,14 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch):
             self.W_dec = self.W_enc.T
             self.b_enc = torch.zeros(d_sae)
 
-        def encode(self, x):
+        def encode(self, x: Any) -> Any:
             return x @ self.W_enc + self.b_enc
 
-        def decode(self, f):
+        def decode(self, f: Any) -> Any:
             return f @ self.W_dec
 
         @classmethod
-        def from_pretrained(cls, release, sae_id, device=None):
+        def from_pretrained(cls, release: Any, sae_id: Any, device: Any = None) -> Any:
             hook_layer = int(sae_id.split("_")[1])
             return (
                 cls(d_in=4, d_sae=4, hook_layer=hook_layer),
@@ -302,8 +304,8 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch):
                 None,
             )
 
-    fake_sae_lens.SAE = FakeSAE
-    fake_sae_lens.get_pretrained_saes_directory = lambda: {
+    fake_sae_lens.SAE = FakeSAE  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
+    fake_sae_lens.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
         "mock-canonical": {
             "saes_map": {f"layer_{i}": i for i in (2, 5, 8)},
             "model": "test-model",
@@ -323,7 +325,7 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch):
     assert v.shape == (4,)
 
 
-def test_sae_lens_backend_missing_dep_raises(monkeypatch):
+def test_sae_lens_backend_missing_dep_raises(monkeypatch: pytest.MonkeyPatch):
     """When sae_lens isn't installed, load_sae_backend raises SaeBackendImportError."""
     import sys
     monkeypatch.setitem(sys.modules, "sae_lens", None)
@@ -333,16 +335,16 @@ def test_sae_lens_backend_missing_dep_raises(monkeypatch):
         load_sae_backend("any", model_id="m", device="cpu")
 
 
-def test_sae_lens_backend_release_not_found(monkeypatch):
+def test_sae_lens_backend_release_not_found(monkeypatch: pytest.MonkeyPatch):
     import sys
     import types
 
     fake = types.ModuleType("sae_lens")
-    fake.get_pretrained_saes_directory = lambda: {
+    fake.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
         "mock-a": {"saes_map": {}, "model": "m"},
         "mock-b": {"saes_map": {}, "model": "m"},
     }
-    fake.SAE = object
+    fake.SAE = object  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
     monkeypatch.setitem(sys.modules, "sae_lens", fake)
 
     from saklas.core.sae import load_sae_backend
@@ -354,22 +356,22 @@ def test_sae_lens_backend_release_not_found(monkeypatch):
     assert "mock-a" in msg or "mock-b" in msg
 
 
-def test_sae_lens_backend_model_mismatch(monkeypatch):
+def test_sae_lens_backend_model_mismatch(monkeypatch: pytest.MonkeyPatch):
     import sys
     import types
 
     fake = types.ModuleType("sae_lens")
 
     class FakeSAE:
-        def __init__(self):
+        def __init__(self) -> None:
             self.cfg = types.SimpleNamespace(model_name="other-model", hook_layer=0)
 
         @classmethod
-        def from_pretrained(cls, release, sae_id, device=None):
+        def from_pretrained(cls, release: Any, sae_id: Any, device: Any = None) -> Any:
             return cls(), {"hook_layer": 0}, None
 
-    fake.SAE = FakeSAE
-    fake.get_pretrained_saes_directory = lambda: {
+    fake.SAE = FakeSAE  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
+    fake.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
         "mock": {"saes_map": {"layer_0": 0}, "model": "other-model"},
     }
     monkeypatch.setitem(sys.modules, "sae_lens", fake)
@@ -380,7 +382,7 @@ def test_sae_lens_backend_model_mismatch(monkeypatch):
         load_sae_backend("mock", model_id="my-model", device="cpu")
 
 
-def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, recwarn):
+def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch: pytest.MonkeyPatch, recwarn: Any):
     """When a release has multiple SAEs per layer, pick narrowest + warn."""
     import sys
     import types
@@ -388,11 +390,11 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, rec
     fake = types.ModuleType("sae_lens")
 
     class FakeSAE:
-        def __init__(self):
+        def __init__(self) -> None:
             self.cfg = types.SimpleNamespace(model_name="test-model", hook_layer=0)
 
         @classmethod
-        def from_pretrained(cls, release, sae_id, device=None):
+        def from_pretrained(cls, release: Any, sae_id: Any, device: Any = None) -> Any:
             # Parse `layer_N` prefix out of canonical sae_id strings like
             # `layer_0/width_16k/l0_100`.
             import re
@@ -402,8 +404,8 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, rec
             sae.cfg.hook_layer = layer
             return sae, {"hook_layer": layer}, None
 
-    fake.SAE = FakeSAE
-    fake.get_pretrained_saes_directory = lambda: {
+    fake.SAE = FakeSAE  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
+    fake.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]  # types.ModuleType stub has no dynamic attrs
         "mock": {
             "saes_map": {
                 "layer_0/width_16k/l0_100": 0,
@@ -430,7 +432,7 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch, rec
 # v2.1, layer selection is now data-driven via :func:`compute_dls_mask`.
 
 
-def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypatch):
+def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypatch: pytest.MonkeyPatch):
     """Without ``layer_means``, DLS centering is undefined and the helper
     falls back to "keep all layers" silently — every layer in the
     profile when ``layer_means=None``."""
@@ -440,7 +442,7 @@ def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypat
     torch.manual_seed(0)
     N = 10
 
-    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
+    def fake_encode(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
         sign = 1.0 if "pos" in text else -1.0
         return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
                 for i in range(N)}
@@ -455,14 +457,14 @@ def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypat
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
     profile, _ = V.extract_contrastive(
-        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+        FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
     )
     # No layer_means → no DLS — every synthesized layer is retained.
     assert set(profile.keys()) == set(range(N))
 
 
-def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch):
+def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch: pytest.MonkeyPatch):
     """``dls=False`` skips the discriminative check entirely."""
     import torch
     from saklas.core import vectors as V
@@ -470,7 +472,7 @@ def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch):
     torch.manual_seed(0)
     N = 6
 
-    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
+    def fake_encode(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
         sign = 1.0 if "pos" in text else -1.0
         return {i: torch.tensor([sign, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
                 for i in range(N)}
@@ -485,14 +487,14 @@ def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch):
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
     profile, _ = V.extract_contrastive(
-        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+        FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         dls=False,
     )
     assert set(profile.keys()) == set(range(N))
 
 
-def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch):
+def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch: pytest.MonkeyPatch):
     """With ``layer_means`` and centered separation, layers where pos
     and neg both project the same side of the baseline are dropped."""
     import torch
@@ -504,7 +506,7 @@ def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch):
     # Layers 0..3: clean opposite-sign separation (pos = +e0, neg = -e0).
     # Layers 4..7: both poles project +e0 from baseline (= 0) — both
     # land on the *same side* of the neutral.  DLS should drop these.
-    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
+    def fake_encode(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
         is_pos = "pos" in text
         out = {}
         for i in range(N):
@@ -528,7 +530,7 @@ def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch):
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(10)]
     layer_means = {i: torch.zeros(4) for i in range(N)}
     profile, _ = V.extract_contrastive(
-        FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+        FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         layer_means=layer_means,
     )
@@ -536,7 +538,7 @@ def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch):
     assert set(profile.keys()) == set(range(4))
 
 
-def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch):
+def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch: pytest.MonkeyPatch):
     """When every layer fails the discriminative check, the helper
     warns and falls back to keep-all rather than emptying the profile."""
     import warnings as _warnings
@@ -547,7 +549,7 @@ def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch):
     N = 4
 
     # Both poles always lean positive — nothing is discriminative.
-    def fake_encode(model, tokenizer, text, layers, device, **_kwargs):
+    def fake_encode(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
         is_pos = "pos" in text
         return {i: torch.tensor(
             [0.7 if is_pos else 0.3, 0.0, 0.0, 0.0],
@@ -567,7 +569,7 @@ def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch):
     with _warnings.catch_warnings(record=True) as caught:
         _warnings.simplefilter("always")
         profile, _ = V.extract_contrastive(
-            FakeModel(), FakeTok(), pairs, layers=[object()] * N,
+            FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
             device=torch.device("cpu"),
             layer_means=layer_means,
         )

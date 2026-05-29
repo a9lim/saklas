@@ -1420,9 +1420,9 @@ def discover_coords(
 # ------------------------------------------------------ centroid capture ---
 
 def compute_node_centroid(
-    model: object,
+    model: torch.nn.Module,
     tokenizer: object,
-    layers: "torch.nn.ModuleList",
+    layers: torch.nn.ModuleList,
     device: torch.device,
     statements: list[str],
     *,
@@ -1785,12 +1785,12 @@ def compute_trajectory_distributions(
     manifold.  Kept off the generation hot path: the steered text is
     produced first, then re-run once here.
     """
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # type: ignore[operator]
+    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # pyright: ignore[reportCallIssue]  # tokenizer typed as object
     ids = enc["input_ids"].to(device)
     if ids.shape[1] == 0:
         raise ValueError("trajectory text tokenized to zero tokens")
     with torch.inference_mode():
-        logits = model(input_ids=ids, use_cache=False).logits  # type: ignore[operator]
+        logits = model(input_ids=ids, use_cache=False).logits  # pyright: ignore[reportCallIssue]  # model typed as object
     return torch.softmax(logits[0].float(), dim=-1).detach().to("cpu")
 
 
@@ -1798,14 +1798,14 @@ def _next_token_distribution(
     model: object, tokenizer: object, text: str, device: torch.device,
 ) -> torch.Tensor:
     """Softmax over the final-position logits for ``text`` -- ``(V,)`` fp32 CPU."""
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # type: ignore[operator]
+    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)  # pyright: ignore[reportCallIssue]  # tokenizer typed as object
     ids = enc["input_ids"]
     if ids.numel() == 0:
         bos = getattr(tokenizer, "bos_token_id", None) or 0
         ids = torch.tensor([[bos]])
     ids = ids.to(device)
     with torch.inference_mode():
-        logits = model(input_ids=ids, use_cache=False).logits  # type: ignore[operator]
+        logits = model(input_ids=ids, use_cache=False).logits  # pyright: ignore[reportCallIssue]  # model typed as object
     return torch.softmax(logits[0, -1].float(), dim=-1).detach().to("cpu")
 
 

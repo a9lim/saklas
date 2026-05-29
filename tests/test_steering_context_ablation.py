@@ -7,6 +7,8 @@ steering-stack manipulation and hook-manager wiring is exercised.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -20,7 +22,7 @@ from saklas.core.triggers import Trigger
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Keep parser pole-resolution from scanning the user's real vectors dir."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     _sel.invalidate()
@@ -29,44 +31,44 @@ def _isolated_home(monkeypatch, tmp_path):
 
 
 class _NoopModule(torch.nn.Module):
-    def forward(self, x):  # type: ignore[override]
+    def forward(self, x):  # pyright: ignore[reportMissingParameterType]  # noop stub, intentionally untyped
         return (x,)
 
 
 def _skeleton_session() -> SaklasSession:
     import threading
     session = SaklasSession.__new__(SaklasSession)
-    session._model = None  # type: ignore[attr-defined]
-    session._tokenizer = None  # type: ignore[attr-defined]
+    session._model = None  # pyright: ignore[reportAttributeAccessIssue]  # skeleton: bypasses __init__, _model accepts None here
+    session._tokenizer = None  # pyright: ignore[reportAttributeAccessIssue]  # skeleton: _tokenizer accepts None here
     session._layers = torch.nn.ModuleList(
         [_NoopModule(), _NoopModule(), _NoopModule()]
     )
     session._device = torch.device("cpu")
     session._dtype = torch.float32
-    session._profiles = {}  # type: ignore[attr-defined]
-    session._layer_means = {}  # type: ignore[attr-defined]
+    session._profiles = {}
+    session._layer_means = {}
     session._steering = SteeringManager()
     session._steering_stack = []
-    session._steering_override_stack = []  # type: ignore[attr-defined]
+    session._steering_override_stack = []
     # v2.2: _push_steering / _pop_steering acquire _gen_lock; skeleton
     # mode never runs gen so the lock is uncontended, but the ``with
     # self._gen_lock:`` block needs the attribute to exist.
-    session._gen_lock = threading.RLock()  # type: ignore[attr-defined]
+    session._gen_lock = threading.RLock()
     # Phase guard the push/pop methods read to reject callback
     # reentry — skeleton sessions are always idle.
     from saklas.core.session import GenState
-    session._gen_phase = GenState.IDLE  # type: ignore[attr-defined]
-    session._internal_steering_pop = False  # type: ignore[attr-defined]
-    session._injection_mode = "additive"  # type: ignore[attr-defined]
-    session._theta_max = 1.5707963267948966  # type: ignore[attr-defined]
-    session._projection_metric = "mahalanobis"  # type: ignore[attr-defined]
-    session._whitener = None  # type: ignore[attr-defined]
+    session._gen_phase = GenState.IDLE
+    session._internal_steering_pop = False
+    session._injection_mode = "additive"
+    session._theta_max = 1.5707963267948966
+    session._projection_metric = "mahalanobis"
+    session._whitener = None
     # Skeleton session has no real model — stub the lazy whitener
     # property to ``None`` so ``_materialize_projections`` falls back
     # to Euclidean per-layer transparently.
-    type(session).whitener = property(lambda _self: None)  # type: ignore[attr-defined]
+    type(session).whitener = property(lambda _self: None)  # pyright: ignore[reportAttributeAccessIssue]  # monkey-patching read-only property on type for skeleton stub
     session.events = EventBus()
-    session._history = []
+    session._history = []  # pyright: ignore[reportAttributeAccessIssue]  # skeleton: _history is dynamically set
     return session
 
 

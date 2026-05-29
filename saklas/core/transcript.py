@@ -127,7 +127,7 @@ class Turn:
             except (TypeError, ValueError):
                 continue
         return cls(
-            role=str(data.get("role", "user")),  # type: ignore[arg-type]
+            role=str(data.get("role", "user")),  # pyright: ignore[reportArgumentType]  # str narrowed to Literal at runtime
             text=str(data.get("text", "")),
             recipe=recipe,
             readings=readings,
@@ -180,7 +180,7 @@ class Transcript:
             turns.append(turn)
 
         probes: list[ProbeRef] = []
-        for name in getattr(session._monitor, "probe_names", ()):  # type: ignore[attr-defined]
+        for name in getattr(session._monitor, "probe_names", ()):
             digest = session._probe_hash(name)
             if digest is not None:
                 probes.append(ProbeRef(name=name, sha256=digest))
@@ -337,7 +337,7 @@ class Transcript:
 
         session_hashes = {
             name: session._probe_hash(name)
-            for name in getattr(session._monitor, "probe_names", ())  # type: ignore[attr-defined]
+            for name in getattr(session._monitor, "probe_names", ())
         }
         drift: list[str] = []
         missing: list[str] = []

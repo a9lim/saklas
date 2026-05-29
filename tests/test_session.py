@@ -3,10 +3,15 @@ Requires a GPU (CUDA or Apple Silicon MPS) and downloads
 google/gemma-3-4b-it (~8GB) on first run.
 """
 from __future__ import annotations
+from pathlib import Path
+from typing import TYPE_CHECKING
 import pytest
 import torch
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, RunSet, TokenEvent
+
+if TYPE_CHECKING:
+    from saklas.core.session import SaklasSession
 
 _HAS_GPU = torch.cuda.is_available() or torch.backends.mps.is_available()
 pytestmark = [
@@ -28,7 +33,7 @@ def session():
     s.close()
 
 class TestConstruction:
-    def test_model_info(self, session):
+    def test_model_info(self, session: SaklasSession) -> None:
         info = session.model_info
         # gemma-3-4b-it loads as the text-only submodule of a multimodal checkpoint,
         # so model_type is "gemma3_text" (see model.py:_load_text_from_multimodal).
@@ -36,25 +41,25 @@ class TestConstruction:
         assert info["hidden_dim"] > 0
         assert info["num_layers"] > 0
 
-    def test_config_defaults(self, session):
+    def test_config_defaults(self, session: SaklasSession) -> None:
         assert session.config.temperature == 1.0
         assert session.config.top_p == 0.9
         assert session.config.max_new_tokens == 1024
 
-    def test_probes_loaded(self, session):
+    def test_probes_loaded(self, session: SaklasSession) -> None:
         assert len(session.probes) > 0
 
-    def test_history_starts_empty(self, session):
+    def test_history_starts_empty(self, session: SaklasSession) -> None:
         assert session.history == []
 
-    def test_vectors_starts_empty(self, session):
+    def test_vectors_starts_empty(self, session: SaklasSession) -> None:
         assert session.vectors == {}
 
-    def test_last_result_starts_none(self, session):
+    def test_last_result_starts_none(self, session: SaklasSession) -> None:
         assert session.last_result is None
 
 class TestSteering:
-    def test_extract_and_steer(self, session):
+    def test_extract_and_steer(self, session: SaklasSession) -> None:
         name, profile = session.extract([("I am happy", "I am sad")])
         assert isinstance(profile, Profile)
         assert all(isinstance(k, int) for k in profile)
@@ -63,26 +68,26 @@ class TestSteering:
         # vectors registry speaks Profile, not bare dicts (saklas 1.x → 3.x).
         assert isinstance(session.vectors["happy"], Profile)
 
-    def test_unsteer(self, session):
+    def test_unsteer(self, session: SaklasSession) -> None:
         session.unsteer("happy")
         assert "happy" not in session.vectors
 
-    def test_extract_curated(self, session):
+    def test_extract_curated(self, session: SaklasSession) -> None:
         name, profile = session.extract("happy", baseline="sad")
         assert name == "happy.sad"
         assert isinstance(profile, Profile)
         assert len(profile) > 0
 
-    def test_extract_datasource(self, session):
+    def test_extract_datasource(self, session: SaklasSession) -> None:
         from saklas.io.datasource import DataSource
         ds = DataSource(pairs=[("formal", "casual")])
         name, profile = session.extract(ds)
         assert isinstance(profile, Profile)
 
 class TestMonitoring:
-    def test_monitor_and_unmonitor(self, session):
+    def test_monitor_and_unmonitor(self, session: SaklasSession) -> None:
         _, profile = session.extract([("I am honest", "I am deceptive")])
-        session.probe("test_probe", profile)
+        session.probe("test_probe", profile)  # pyright: ignore[reportArgumentType]  # session.probe annotation says dict, Profile is not a dict subclass
         assert "test_probe" in session.probes
         session.unprobe("test_probe")
         assert "test_probe" not in session.probes
@@ -94,7 +99,7 @@ class TestLifecycle:
             assert s.model_info["model_type"].startswith("gemma3")
 
 class TestGeneration:
-    def test_generate_unsteered(self, session):
+    def test_generate_unsteered(self, session: SaklasSession) -> None:
         result = session.generate("Say hello in one word.")
         assert isinstance(result, RunSet)
         assert isinstance(result.first, GenerationResult)
@@ -104,7 +109,7 @@ class TestGeneration:
         assert result.elapsed > 0
         assert result.vectors == {}  # no alphas = no steering snapshot
 
-    def test_generate_blocking_messages(self, session):
+    def test_generate_blocking_messages(self, session: SaklasSession) -> None:
         result = session.generate([
             {"role": "user", "content": "Say hello in one word."},
         ])
@@ -112,32 +117,32 @@ class TestGeneration:
         assert isinstance(result.first, GenerationResult)
         assert len(result.text) > 0
 
-    def test_generate_appends_to_history(self, session):
+    def test_generate_appends_to_history(self, session: SaklasSession) -> None:
         session.clear_history()
         session.generate("Say hi.")
         assert len(session.history) == 2
         assert session.history[0]["role"] == "user"
         assert session.history[1]["role"] == "assistant"
 
-    def test_generate_with_alphas(self, session):
+    def test_generate_with_alphas(self, session: SaklasSession) -> None:
         name, profile = session.extract([("formal", "casual")])
         session.steer(name, profile)
         result = session.generate("Hello.", steering=f"0.1 {name}")
         assert result.vectors == {name: 0.1}
         session.unsteer(name)
 
-    def test_generate_with_probes(self, session):
+    def test_generate_with_probes(self, session: SaklasSession) -> None:
         session.clear_history()
         result = session.generate("Tell me something exciting!")
         if session.probes:
             assert isinstance(result.readings, dict)
 
-    def test_last_result(self, session):
+    def test_last_result(self, session: SaklasSession) -> None:
         session.clear_history()
         result = session.generate("Hello.")
         assert session.last_result is result.first
 
-    def test_ab_comparison(self, session):
+    def test_ab_comparison(self, session: SaklasSession) -> None:
         """A/B test: same prompt, with and without steering."""
         name, profile = session.extract([("I am happy", "I am sad")])
         session.steer(name, profile)
@@ -152,12 +157,12 @@ class TestGeneration:
         assert len(unsteered.text) > 0
         session.unsteer(name)
 
-    def test_unknown_vector_raises(self, session):
+    def test_unknown_vector_raises(self, session: SaklasSession) -> None:
         with pytest.raises(KeyError, match="nonexistent"):
             session.generate("Hello.", steering="0.1 nonexistent")
 
 class TestCloning:
-    def test_clone_from_corpus_end_to_end(self, session, tmp_path):
+    def test_clone_from_corpus_end_to_end(self, session: SaklasSession, tmp_path: Path) -> None:
         from saklas.io.paths import concept_dir, safe_model_id
 
         pirate_lines = [
@@ -217,7 +222,7 @@ class TestCloning:
             assert (folder / f"{sid}.safetensors").exists()
 
             # Probe path: add as probe, generate, score. Asserts scoring runs clean.
-            session.probe("pirate_test", profile)
+            session.probe("pirate_test", profile)  # pyright: ignore[reportArgumentType]  # session.probe annotation says dict, Profile is not a dict subclass
             try:
                 session.clear_history()
                 result = session.generate(
@@ -258,7 +263,7 @@ class TestCloning:
                 import shutil
                 shutil.rmtree(folder, ignore_errors=True)
 
-    def test_extract_cli_roundtrip(self, tmp_path):
+    def test_extract_cli_roundtrip(self, tmp_path: Path) -> None:
         import subprocess
         import sys
         from saklas.io.paths import concept_dir, safe_model_id
@@ -289,7 +294,7 @@ class TestCloning:
 
 
 class TestStreamingGeneration:
-    def test_generate_stream(self, session):
+    def test_generate_stream(self, session: SaklasSession) -> None:
         session.clear_history()
         tokens = []
         for event in session.generate_stream("Say hello."):
@@ -300,18 +305,19 @@ class TestStreamingGeneration:
         assert session.last_result is not None
         assert session.last_result.token_count == len(tokens)
 
-    def test_stream_with_alphas(self, session):
+    def test_stream_with_alphas(self, session: SaklasSession) -> None:
         name, profile = session.extract([("I am happy", "I am sad")])
         session.steer(name, profile)
         session.clear_history()
         tokens = list(session.generate_stream("Hello.", steering=f"0.15 {name}"))
         assert len(tokens) > 0
+        assert session.last_result is not None  # generate_stream guarantees last_result is set
         assert session.last_result.vectors == {name: 0.15}
         session.unsteer(name)
 
 
 class TestAblation:
-    def test_ablation_suppresses_self_probe_score(self, session):
+    def test_ablation_suppresses_self_probe_score(self, session: SaklasSession) -> None:
         """Ablating a concept drives its own monitor score toward zero.
 
         Sharp correctness check: if the hook properly replaces the component
@@ -346,7 +352,7 @@ class TestAblation:
         )
 
 
-def test_return_hidden_round_trip(session):
+def test_return_hidden_round_trip(session: SaklasSession) -> None:
     """return_hidden=True populates hidden_states; score_hidden round-trips."""
     from saklas import SamplingConfig
 
@@ -394,7 +400,7 @@ def test_return_hidden_round_trip(session):
             assert abs(a - b) < tol, f"probe {name}: {a} vs {b}"
 
 
-def test_return_hidden_false_leaves_hidden_states_none(session):
+def test_return_hidden_false_leaves_hidden_states_none(session: SaklasSession) -> None:
     from saklas import SamplingConfig
 
     result = session.generate(
@@ -409,7 +415,7 @@ class TestPrefixCache:
     shared chat prefix.  See ``SaklasSession.cache_prefix``.
     """
 
-    def _shared_prefix_messages(self, session, prompt_body: str):
+    def _shared_prefix_messages(self, session: SaklasSession, prompt_body: str):
         """Build a (prefix_messages, full_messages) pair where the
         full chat-template encoding of full_messages begins with the
         prefix_messages encoding.
@@ -459,7 +465,7 @@ class TestPrefixCache:
         prefix_ids_trim = prefix_ids[:, :L]
         return prefix_ids_trim, full_msg
 
-    def test_cache_hit_matches_no_cache_output(self, session):
+    def test_cache_hit_matches_no_cache_output(self, session: SaklasSession) -> None:
         from saklas import SamplingConfig
 
         session.clear_history()
@@ -493,7 +499,7 @@ class TestPrefixCache:
         # Cleanup so other tests aren't affected.
         session.cache_prefix(None)
 
-    def test_steering_invalidates_cache(self, session):
+    def test_steering_invalidates_cache(self, session: SaklasSession) -> None:
         # Warm the cache.
         prefix_ids, _ = self._shared_prefix_messages(session, "Hello.")
         session.cache_prefix(prefix_ids)

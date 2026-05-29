@@ -193,7 +193,7 @@ def _parse_one_clause(raw: str) -> _Clause:
         head, _, tail = raw.partition(":")
         head_stripped = head.strip()
         if head_stripped in _AGG_OPS:
-            agg = head_stripped  # type: ignore[assignment]
+            agg = head_stripped
             rest = tail
         else:
             # Colon inside a probe name (e.g. ``deer.wolf:sae`` — not a
@@ -242,7 +242,7 @@ def _parse_one_clause(raw: str) -> _Clause:
             f"clause {raw!r}: threshold {threshold_str!r} is not a number"
         ) from None
 
-    op: CompareOp = op_str  # type: ignore[assignment]
+    op: CompareOp = op_str  # pyright: ignore[reportAssignmentType]  # regex group() is str, not Literal
     return _Clause(agg=agg, probe=probe, op=op, threshold=threshold)
 
 

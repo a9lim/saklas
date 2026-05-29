@@ -21,10 +21,7 @@ CPU-only; no model load.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
-
 import pytest
 import torch
 
@@ -71,7 +68,7 @@ def _author_role_folder(root: Path, *, with_roles: bool = True) -> Path:
     return folder
 
 
-def test_per_node_role_round_trip(tmp_path):
+def test_per_node_role_round_trip(tmp_path: Path):
     from saklas.io.manifolds import ManifoldFolder
 
     folder = _author_role_folder(tmp_path)
@@ -83,7 +80,7 @@ def test_per_node_role_round_trip(tmp_path):
     assert mf2.node_roles == ["pirate", "cowboy", "professor"]
 
 
-def test_legacy_folder_without_roles_loads_all_none(tmp_path):
+def test_legacy_folder_without_roles_loads_all_none(tmp_path: Path):
     """Loading a manifold whose nodes carry no ``role`` field yields an
     all-``None`` ``node_roles`` list of the right length.  This is
     semantically "no roles" — :meth:`ManifoldFolder.nodes_sha256` and
@@ -98,7 +95,7 @@ def test_legacy_folder_without_roles_loads_all_none(tmp_path):
     assert not any(r is not None for r in mf.node_roles)
 
 
-def test_role_field_invalidates_nodes_sha256(tmp_path):
+def test_role_field_invalidates_nodes_sha256(tmp_path: Path):
     from saklas.io.manifolds import ManifoldFolder
 
     folder_legacy = _author_role_folder(tmp_path / "a", with_roles=False)
@@ -109,7 +106,7 @@ def test_role_field_invalidates_nodes_sha256(tmp_path):
     assert legacy.nodes_sha256() != role.nodes_sha256()
 
 
-def test_invalid_role_slug_rejected(tmp_path):
+def test_invalid_role_slug_rejected(tmp_path: Path):
     from saklas.io.manifolds import ManifoldFolder, ManifoldFormatError
 
     folder = tmp_path / "persona"
@@ -139,7 +136,7 @@ def test_invalid_role_slug_rejected(tmp_path):
         ManifoldFolder.load(folder)
 
 
-def test_create_discover_folder_with_roles(tmp_path, monkeypatch):
+def test_create_discover_folder_with_roles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io.manifolds import (
         ManifoldFolder, create_discover_manifold_folder,
     )
@@ -264,7 +261,7 @@ def test_grammar_label_form_rejects_projection():
 
 # -- selector resolution + cross-tier ambiguity ----------------------------
 
-def test_resolve_manifold_label_unique_match(tmp_path, monkeypatch):
+def test_resolve_manifold_label_unique_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io.manifolds import create_discover_manifold_folder
     from saklas.io.selectors import resolve_manifold_label
 
@@ -286,14 +283,14 @@ def test_resolve_manifold_label_unique_match(tmp_path, monkeypatch):
     assert hit.manifold_key == "local/persona"
 
 
-def test_resolve_manifold_label_miss_returns_none(tmp_path, monkeypatch):
+def test_resolve_manifold_label_miss_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io.selectors import resolve_manifold_label
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     assert resolve_manifold_label("pirate") is None
 
 
-def test_resolve_manifold_label_ambiguous_raises(tmp_path, monkeypatch):
+def test_resolve_manifold_label_ambiguous_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io.manifolds import create_discover_manifold_folder
     from saklas.io.selectors import (
         AmbiguousSelectorError,
@@ -323,7 +320,7 @@ def test_resolve_manifold_label_ambiguous_raises(tmp_path, monkeypatch):
         resolve_manifold_label("pirate")
 
 
-def test_bare_name_resolves_to_manifold_term(tmp_path, monkeypatch):
+def test_bare_name_resolves_to_manifold_term(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io.manifolds import create_discover_manifold_folder
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -343,7 +340,7 @@ def test_bare_name_resolves_to_manifold_term(tmp_path, monkeypatch):
     assert term.position == "pirate"
 
 
-def test_namespace_qualified_bare_name_still_resolves(tmp_path, monkeypatch):
+def test_namespace_qualified_bare_name_still_resolves(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io.manifolds import create_discover_manifold_folder
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))

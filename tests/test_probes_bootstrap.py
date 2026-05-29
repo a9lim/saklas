@@ -78,7 +78,7 @@ def test_bootstrap_raises_on_stale_statements(
     model_info: dict[str, Any] = {"model_id": "google/gemma-2-2b-it"}
     with pytest.raises(StaleSidecarError) as excinfo:
         probes_bootstrap.bootstrap_probes(
-            None, None, [], model_info, ["custom-tag"],
+            None, None, torch.nn.ModuleList(), model_info, ["custom-tag"],
         )
     msg = str(excinfo.value)
     assert "default/zz-custom" in msg
@@ -112,7 +112,7 @@ def test_bootstrap_allow_stale_env_var(
 
     model_info: dict[str, Any] = {"model_id": "google/gemma-2-2b-it"}
     probes = probes_bootstrap.bootstrap_probes(
-        None, None, [], model_info, ["custom-tag"],
+        None, None, torch.nn.ModuleList(), model_info, ["custom-tag"],
     )
     assert "zz-custom" in probes
 
@@ -132,6 +132,6 @@ def test_bootstrap_matching_hash_loads_cleanly(
 
     model_info: dict[str, Any] = {"model_id": "google/gemma-2-2b-it"}
     probes = probes_bootstrap.bootstrap_probes(
-        None, None, [], model_info, ["custom-tag"],
+        None, None, torch.nn.ModuleList(), model_info, ["custom-tag"],
     )
     assert "zz-custom" in probes

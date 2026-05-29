@@ -36,7 +36,7 @@ _MAX_TEMPLATE_OVERHEAD = 100
 _template_overhead_cache: dict[int, int] = {}
 
 
-def _chat_template_overhead(tokenizer, template_kwargs: dict) -> int:
+def _chat_template_overhead(tokenizer: Any, template_kwargs: dict[str, Any]) -> int:
     """Return the number of extra tokens the chat template adds beyond content."""
     cache_key = id(tokenizer)
     cached = _template_overhead_cache.get(cache_key)
@@ -76,7 +76,7 @@ def _normalize(v: torch.Tensor, ref_norm: float | None = None) -> torch.Tensor:
     return unit
 
 
-def _capture_all_hidden_states(model, layers, input_ids):
+def _capture_all_hidden_states(model: torch.nn.Module, layers: torch.nn.ModuleList, input_ids: torch.Tensor):
     """Run a single-sequence forward pass capturing hidden states at ALL layers.
 
     Uses ``use_cache=False`` to avoid polluting any persistent KV cache.
@@ -86,8 +86,8 @@ def _capture_all_hidden_states(model, layers, input_ids):
     """
     captured_hidden: dict[int, torch.Tensor] = {}
 
-    def _make_hook(idx):
-        def _hook(module, input, output):
+    def _make_hook(idx: int):
+        def _hook(module: torch.nn.Module, input: Any, output: Any):
             h = output if isinstance(output, torch.Tensor) else output[0]
             # No .clone() — with use_cache=False and inference_mode() the
             # residual-stream tensors are fresh allocations at each layer
@@ -113,7 +113,11 @@ def _capture_all_hidden_states(model, layers, input_ids):
 
 
 def _encode_and_capture_all(
-    model, tokenizer, text, layers, device,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    text: str,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
     *,
     role: str | None = None,
     model_type: str | None = None,
@@ -142,7 +146,7 @@ def _encode_and_capture_all(
     if getattr(tokenizer, "chat_template", None) is not None:
         # Disable thinking/reasoning mode for models that support it
         # (Qwen 3.5, QwQ, etc.) — thinking tokens would contaminate pooling.
-        kwargs: dict = {}
+        kwargs: dict[str, Any] = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = False
 
@@ -239,10 +243,10 @@ def _load_neutral_prompts() -> list[str]:
 
 
 def compute_layer_means(
-    model,
-    tokenizer,
-    layers,
-    device=None,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    layers: torch.nn.ModuleList,
+    device: torch.device | None = None,
 ) -> dict[int, torch.Tensor]:
     """Compute mean hidden state per layer over neutral prompts.
 
@@ -252,6 +256,7 @@ def compute_layer_means(
     """
     if device is None:
         device = next(model.parameters()).device
+    assert device is not None  # device is always set by this point
 
     n_layers = len(layers)
     sums: dict[int, torch.Tensor] = {}
@@ -276,10 +281,10 @@ def compute_layer_means(
 
 
 def compute_neutral_activations(
-    model,
-    tokenizer,
-    layers,
-    device=None,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    layers: torch.nn.ModuleList,
+    device: torch.device | None = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer ``[N, D]`` stack across the 90 neutral prompts.
 
@@ -296,6 +301,7 @@ def compute_neutral_activations(
     """
     if device is None:
         device = next(model.parameters()).device
+    assert device is not None  # device is always set by this point
 
     n_layers = len(layers)
     rows: list[dict[int, torch.Tensor]] = []
@@ -575,11 +581,11 @@ def compute_dls_mask(
 
 
 def _capture_diffs_for_pairs(
-    model,
-    tokenizer,
-    pairs: list[dict],
-    layers,
-    device,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    pairs: list[dict[str, str]],
+    layers: torch.nn.ModuleList,
+    device: torch.device,
     *,
     sae: "SaeBackend | None" = None,
     role: str | None = None,
@@ -780,11 +786,11 @@ def _share_bake_and_warn(
 
 
 def extract_contrastive(
-    model,
-    tokenizer,
-    pairs: list[dict],
-    layers,
-    device=None,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    pairs: list[dict[str, str]],
+    layers: torch.nn.ModuleList,
+    device: torch.device | None = None,
     *,
     sae: "SaeBackend | None" = None,
     concept_label: str | None = None,
@@ -861,6 +867,7 @@ def extract_contrastive(
     """
     if device is None:
         device = next(model.parameters()).device
+    assert device is not None  # device is always set by this point
 
     (n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
      norm_sums_cpu, sae_layer_set,
@@ -1046,11 +1053,11 @@ def extract_contrastive(
 
 
 def extract_difference_of_means(
-    model,
-    tokenizer,
-    pairs: list[dict],
-    layers,
-    device=None,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    pairs: list[dict[str, str]],
+    layers: torch.nn.ModuleList,
+    device: torch.device | None = None,
     *,
     sae: "SaeBackend | None" = None,
     concept_label: str | None = None,
@@ -1122,6 +1129,7 @@ def extract_difference_of_means(
     """
     if device is None:
         device = next(model.parameters()).device
+    assert device is not None  # device is always set by this point
 
     (n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
      norm_sums_cpu, sae_layer_set,
@@ -1326,8 +1334,8 @@ def extract_difference_of_means(
 
 def save_profile(
     profile: dict[int, torch.Tensor],
-    path: str,
-    metadata: dict,
+    path: str | Path,
+    metadata: dict[str, Any],
 ) -> None:
     """Save a baked vector profile as .safetensors with a slim .json sidecar.
 
@@ -1354,7 +1362,7 @@ def save_profile(
 
     from saklas import __version__ as _saklas_version
     from saklas.io.packs import PACK_FORMAT_VERSION
-    sidecar: dict = {
+    sidecar: dict[str, Any] = {
         "format_version": PACK_FORMAT_VERSION,
         "method": metadata.get("method", "contrastive_pca"),
         "saklas_version": _saklas_version,
@@ -1402,7 +1410,7 @@ def save_profile(
     log.info("Saved profile (%d layers) to %s", len(profile), path)
 
 
-def load_profile(path: str) -> tuple[dict[int, torch.Tensor], dict]:
+def load_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Load a baked vector profile and its metadata.
 
     Dispatches on file extension: ``.safetensors`` reads the companion
@@ -1540,7 +1548,7 @@ def project_profile(
     return out
 
 
-def load_contrastive_pairs(dataset_path: str) -> dict:
+def load_contrastive_pairs(dataset_path: str) -> dict[str, Any]:
     """Load a contrastive-pairs JSON file.
 
     Expects a bare list: ``[{"positive": ..., "negative": ...}, ...]``

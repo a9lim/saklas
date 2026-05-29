@@ -1267,9 +1267,9 @@ def register_saklas_routes(app: FastAPI) -> None:
         """
         _resolve_session_id(session, session_id)
         # Cast role through the Literal-narrowing layer the tree owns.
-        role_arg = req.role  # type: ignore[assignment]
+        role_arg = req.role
         new_id = session.tree.branch(
-            req.node_id, req.text, role=role_arg,
+            req.node_id, req.text, role=role_arg,  # pyright: ignore[reportArgumentType]  # req.role is str|None; branch() expects Role|None (Literal narrowing)
         )
         return {
             "node_id": new_id,
@@ -1382,18 +1382,18 @@ def register_saklas_routes(app: FastAPI) -> None:
         captured: list[str] = []
 
         def _on_warning(
-            message,
-            category,
-            filename,
-            lineno,
-            file=None,
-            line=None,
-        ):
+            message: Warning | str,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            file: Any = None,
+            line: str | None = None,
+        ) -> None:
             captured.append(str(message))
 
         async with session.lock:
             with warnings.catch_warnings():
-                warnings.showwarning = _on_warning  # type: ignore[assignment]
+                warnings.showwarning = _on_warning
                 try:
                     leaf_id = await asyncio.to_thread(
                         transcript.import_into,
@@ -1595,7 +1595,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         cache_obj: Any = getattr(session, "_joint_logprob_cache", None)
         if cache_obj is None:
             cache_obj = {}
-            session._joint_logprob_cache = cache_obj  # type: ignore[attr-defined]
+            session._joint_logprob_cache = cache_obj
         cache: dict[tuple[str, str], Any] = cache_obj
 
         key = _cache_key(req.a_id, req.b_id)
@@ -2975,7 +2975,7 @@ async def _ws_handle_generate(
     if n == 1:
         seeds = [base_seed]
     else:
-        seeds = list(derive_seed_schedule(base_seed, n))  # type: ignore[arg-type]
+        seeds = list(derive_seed_schedule(base_seed, n))
 
     # Acquire the session lock for the full N-way batch lifetime so
     # concurrent WS clients serialize FIFO instead of overlapping.
@@ -3153,14 +3153,14 @@ async def _ws_handle_generate(
             recipe_override = msg.recipe_override
 
             def _worker(
-                _sampling=per_sibling_sampling,
-                _on_token=_on_token,
-                _result_holder=result_holder,
-                _error_holder=error_holder,
-                _token_queue=token_queue,
-                _sentinel=_SENTINEL,
-                _recipe_override=recipe_override,
-            ):
+                _sampling: SamplingConfig | None = per_sibling_sampling,
+                _on_token: Callable[..., Any] = _on_token,
+                _result_holder: list[GenerationResult | RunSet] = result_holder,
+                _error_holder: list[BaseException] = error_holder,
+                _token_queue: asyncio.Queue[Any] = token_queue,
+                _sentinel: object = _SENTINEL,
+                _recipe_override: Any = recipe_override,
+            ) -> None:
                 try:
                     if msg.fork_node_id is not None:
                         # Fork: recipe / sampling / parent all come from
@@ -3168,8 +3168,8 @@ async def _ws_handle_generate(
                         # WS-level steering/sampling/n fields are ignored.
                         result = session.fork_from_token(
                             msg.fork_node_id,
-                            int(msg.fork_raw_index),  # type: ignore[arg-type]
-                            int(msg.fork_alt_token_id),  # type: ignore[arg-type]
+                            int(msg.fork_raw_index),  # pyright: ignore[reportArgumentType]  # guarded non-None by is_fork check above; int() accepts int|None only at runtime with None already excluded
+                            int(msg.fork_alt_token_id),  # pyright: ignore[reportArgumentType]  # guarded non-None by is_fork check above; int() accepts int|None only at runtime with None already excluded
                             on_token=_on_token,
                         )
                     elif msg.prefill_node_id is not None:

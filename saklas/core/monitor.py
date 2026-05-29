@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -45,7 +45,7 @@ class TraitMonitor:
     """
 
     @staticmethod
-    def _empty_stats() -> dict:
+    def _empty_stats() -> dict[str, Any]:
         return dict(_EMPTY_STATS)
 
     def __init__(self, probe_profiles: dict[str, dict[int, torch.Tensor]],
@@ -74,7 +74,7 @@ class TraitMonitor:
         self._mean_cache: dict[int, torch.Tensor] = {}
 
         self.history: dict[str, deque[float]] = {n: deque(maxlen=_MAX_HISTORY) for n in self._raw_profiles}
-        self._stats: dict[str, dict] = {n: self._empty_stats() for n in self._raw_profiles}
+        self._stats: dict[str, dict[str, Any]] = {n: self._empty_stats() for n in self._raw_profiles}
 
         # Aggregate path sets _pending_aggregate; per-token path sets _pending_per_token.
         # has_pending_data() returns aggregate readiness — the TUI uses it to refresh
@@ -291,7 +291,7 @@ class TraitMonitor:
                 out[layer_idx].setdefault(name, 0.0)
         return out
 
-    def measure(self, model, tokenizer, layers, text: str, device=None, accumulate: bool = True) -> dict[str, float]:
+    def measure(self, model: torch.nn.Module, tokenizer: Any, layers: torch.nn.ModuleList, text: str, device: torch.device | None = None, accumulate: bool = True) -> dict[str, float]:
         """Run one forward pass over *text* and compute probe similarities.
 
         Pools the last content token's hidden state per layer (same as
@@ -319,7 +319,7 @@ class TraitMonitor:
         self,
         captured: dict[int, torch.Tensor],
         generated_ids: list[int],
-        tokenizer,
+        tokenizer: Any,
         *,
         accumulate: bool = True,
     ) -> tuple[dict[str, float], dict[str, list[float]]]:
@@ -541,7 +541,7 @@ class TraitMonitor:
                 previous[name] = 0.0
         return current, previous
 
-    def get_stats(self, name: str) -> dict:
+    def get_stats(self, name: str) -> dict[str, Any]:
         return self._stats.get(name, self._empty_stats())
 
     def get_sparkline(self, name: str) -> str:

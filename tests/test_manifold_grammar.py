@@ -5,6 +5,8 @@ these run in an isolated SAKLAS_HOME with no packs installed.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from saklas.io import selectors as sel
@@ -21,14 +23,14 @@ from saklas.core.triggers import Trigger
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     sel.invalidate()
     yield
     sel.invalidate()
 
 
-def _only_term(expr: str):
+def _only_term(expr: str) -> Any:
     steering = parse_expr(expr)
     assert len(steering.alphas) == 1
     return next(iter(steering.alphas.values()))
@@ -189,7 +191,7 @@ def test_manifold_composes_with_projection():
     "local/emotions%0.3",
     "emotions%0.5 + 0.3 angry",
 ])
-def test_format_round_trip(expr):
+def test_format_round_trip(expr: str) -> None:
     steering = parse_expr(expr)
     reparsed = parse_expr(format_expr(steering))
     a = sorted(

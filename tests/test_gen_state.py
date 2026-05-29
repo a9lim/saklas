@@ -6,6 +6,8 @@ loaded on a real device.  See Phase 6 of the audit-followups plan.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -33,18 +35,18 @@ def session():
 
 
 class TestGenStateTransitions:
-    def test_idle_at_construction(self, session):
+    def test_idle_at_construction(self, session: Any) -> None:
         assert session.gen_state is GenState.IDLE
         assert session.is_generating is False
 
-    def test_running_during_generate(self, session):
+    def test_running_during_generate(self, session: Any) -> None:
         """Inside an ``on_token`` callback, the session must report
         ``RUNNING`` — that callback fires from the generation worker
         thread between the inner-try entry and exit."""
         session.clear_history()
         observed: list[GenState] = []
 
-        def _tap(*args, **kwargs):
+        def _tap(*args: Any, **kwargs: Any) -> None:
             observed.append(session.gen_state)
 
         from saklas.core.sampling import SamplingConfig
@@ -58,7 +60,7 @@ class TestGenStateTransitions:
             f"expected all RUNNING, got {observed}"
         )
 
-    def test_returns_to_idle_after_success(self, session):
+    def test_returns_to_idle_after_success(self, session: Any) -> None:
         session.clear_history()
         from saklas.core.sampling import SamplingConfig
         session.generate(
@@ -68,7 +70,7 @@ class TestGenStateTransitions:
         assert session.gen_state is GenState.IDLE
         assert session.is_generating is False
 
-    def test_returns_to_idle_after_exception(self, session):
+    def test_returns_to_idle_after_exception(self, session: Any) -> None:
         """Worker-side failures must still drain the state machine.
 
         We trigger this by referencing an unregistered vector — the
@@ -96,7 +98,7 @@ class TestGenStateTransitions:
 
 
 class TestConcurrentGuard:
-    def test_concurrent_generate_rejected(self, session):
+    def test_concurrent_generate_rejected(self, session: Any) -> None:
         """Re-entering generation from inside ``on_token`` must raise
         ``ConcurrentGenerationError`` — the typed state guard sits on
         top of the threading lock.
@@ -106,7 +108,7 @@ class TestConcurrentGuard:
 
         captured: list[BaseException] = []
 
-        def _reentry(*args, **kwargs):
+        def _reentry(*args: Any, **kwargs: Any) -> None:
             try:
                 session.generate(
                     "nope",

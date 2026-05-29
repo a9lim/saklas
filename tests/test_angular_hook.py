@@ -265,6 +265,7 @@ class TestManagerAngularDefault:
         )
         # Fast path stamped composed = α × baked (no gain multiplier).
         expected = 0.4 * baked
+        assert mgr.hooks[0].composed is not None  # invariant: non-zero alpha produces composed
         assert torch.allclose(mgr.hooks[0].composed, expected, atol=1e-6)
         # Manager and hook agree on theta_max default.
         assert mgr.theta_max == DEFAULT_THETA_MAX
@@ -286,5 +287,6 @@ class TestManagerAngularDefault:
             layers, device=torch.device("cpu"), dtype=torch.float32,
         )
         expected = (0.5 * _STEER_GAIN) * baked
+        assert mgr.hooks[0].composed is not None  # invariant: non-zero alpha produces composed
         assert torch.allclose(mgr.hooks[0].composed, expected, atol=1e-6)
         mgr.clear_all()

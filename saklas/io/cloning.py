@@ -206,6 +206,9 @@ def _neutralize_batch(
         cfg, state, thinking=False, seed=seed,
     )
     text = session._tokenizer.decode(generated_ids, skip_special_tokens=True)
+    # generate_steered returns list[int] (single sequence), so decode always
+    # returns str — the transformers stub types it as str | list[str].
+    assert isinstance(text, str)  # invariant: 1-D token list → str
     return _parse_numbered(text, len(batch))
 
 

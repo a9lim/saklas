@@ -13,6 +13,7 @@ from saklas.cli.parsers import _EXPERIMENT_VERBS, _PACK_VERBS, _VECTOR_VERBS
 from saklas.core.errors import SaklasError
 
 if TYPE_CHECKING:
+    from saklas.core.session import SaklasSession
     from saklas.core.steering import Steering
 
 
@@ -137,7 +138,7 @@ def _make_session(args: argparse.Namespace):
     )
 
 
-def _print_model_info(session) -> None:
+def _print_model_info(session: SaklasSession) -> None:
     info = session.model_info
     print(f"Architecture: {info['model_type']}")
     print(f"Layers: {info['num_layers']}, Hidden dim: {info['hidden_dim']}")
@@ -226,7 +227,7 @@ def _print_startup(args: argparse.Namespace) -> None:
 
 
 def _setup_steering_vectors(
-    session,
+    session: SaklasSession,
     expression: "str | None",
     *,
     verbose: bool = False,
@@ -283,7 +284,7 @@ def _setup_steering_vectors(
     return parse_expr(expression)
 
 
-def _warmup_session(session) -> None:
+def _warmup_session(session: SaklasSession) -> None:
     """Run a stateless generation so the first real request is fast.
 
     The model loader's compile probe (``_compile_with_probe``) already
@@ -681,7 +682,7 @@ def _run_extract(args: argparse.Namespace) -> None:
             if p.exists():
                 p.unlink()
 
-    extract_kwargs: dict = {"method": method}
+    extract_kwargs: dict[str, Any] = {"method": method}
     if getattr(args, "sae", None):
         extract_kwargs["sae"] = args.sae
     if getattr(args, "sae_revision", None):
@@ -853,7 +854,7 @@ def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
 
 
 def _resolve_variant_tensor(
-    folder,
+    folder: Path,
     model_id: str,
     variant: str | None,
 ) -> "Path | None":
@@ -1037,11 +1038,14 @@ def _run_compare(args: argparse.Namespace) -> None:
             print(f"compare: no other profiles found for model {args.model}", file=sys.stderr)
             sys.exit(1)
 
-        scores = {name: target.cosine_similarity(p, whitener=whitener) for name, p in others.items()}
+        scores: dict[str, float] = {
+            name: target.cosine_similarity(p, whitener=whitener)
+            for name, p in others.items()
+        }
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         if args.json_output:
-            result: dict = {"target": target_name, "model": args.model,
+            result: dict[str, Any] = {"target": target_name, "model": args.model,
                             "similarities": [{"name": n, "similarity": round(s, 6)}
                                               for n, s in ranked]}
             if args.verbose:
@@ -1061,10 +1065,10 @@ def _run_compare(args: argparse.Namespace) -> None:
                 print()
                 print("  per-layer (top 3):")
                 for name, _ in ranked[:3]:
-                    per_layer = target.cosine_similarity(others[name], per_layer=True, whitener=whitener)
+                    per_layer_top3: dict[int, float] = target.cosine_similarity(others[name], per_layer=True, whitener=whitener)
                     print(f"    {name}:")
-                    for layer in sorted(per_layer):
-                        print(f"      layer {layer:>3}: {per_layer[layer]:+.4f}")
+                    for layer in sorted(per_layer_top3):
+                        print(f"      layer {layer:>3}: {per_layer_top3[layer]:+.4f}")
         return
 
     if len(ordered) < 2:
@@ -1075,7 +1079,7 @@ def _run_compare(args: argparse.Namespace) -> None:
     if len(ordered) == 2:
         a_name, b_name = ordered
         a, b = profiles[a_name], profiles[b_name]
-        sim = a.cosine_similarity(b, whitener=whitener)
+        sim: float = a.cosine_similarity(b, whitener=whitener)
 
         if args.json_output:
             result = {"a": a_name, "b": b_name, "model": args.model,
@@ -1087,9 +1091,9 @@ def _run_compare(args: argparse.Namespace) -> None:
         else:
             print(f"{a_name} ~ {b_name}: {sim:+.4f}")
             if args.verbose:
-                per_layer = a.cosine_similarity(b, per_layer=True, whitener=whitener)
-                for layer in sorted(per_layer):
-                    print(f"  layer {layer:>3}: {per_layer[layer]:+.4f}")
+                per_layer_2: dict[int, float] = a.cosine_similarity(b, per_layer=True, whitener=whitener)
+                for layer in sorted(per_layer_2):
+                    print(f"  layer {layer:>3}: {per_layer_2[layer]:+.4f}")
         return
 
     # 3+ mode: N×N matrix.
@@ -1479,7 +1483,7 @@ def _run_transfer(args: argparse.Namespace) -> None:
     )
 
 
-def _domain_label(spec: dict) -> str:
+def _domain_label(spec: dict[str, Any]) -> str:
     """Short ``type(Nd)`` label for a manifold domain spec dict."""
     kind = spec.get("type", "?")
     if kind == "box":
@@ -1602,7 +1606,7 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
     fitted = []
     for stem in mf.tensor_models():
         sc = mf.sidecar(stem)
-        entry: dict = {
+        entry: dict[str, Any] = {
             "stem": stem,
             "method": sc.method,
             "feature_space": sc.feature_space,
@@ -1659,7 +1663,7 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
                     mf.node_labels, mf.node_coords, node_roles_padded,
                 )
             ]
-        body: dict = {
+        body: dict[str, Any] = {
             "namespace": ns,
             "name": mf.name,
             "description": mf.description,
@@ -2122,7 +2126,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
 
     sampling = SamplingConfig(max_tokens=args.max_tokens, seed=0)
 
-    def _score(steer) -> tuple[str, float, float]:
+    def _score(steer: str | None) -> tuple[str, float, float]:
         result = session.generate(
             args.prompt, steering=steer, sampling=sampling,
         )
@@ -2133,7 +2137,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         per_step = trajectory_naturalness(traj, behavior, domain)
         return text, float(per_step.mean()), float(per_step.max())
 
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     _text, mean_d, max_d = _score(args.steer)
     rows.append({
         "label": "manifold", "steering": args.steer,

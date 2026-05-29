@@ -150,6 +150,8 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
     if selector.kind == "model":
         # ``model:X`` matches any concept with an installed tensor for X,
         # regardless of variant — raw or SAE.
+        # parse() guarantees selector.value is non-None for kind="model".
+        assert selector.value is not None
         from saklas.io.packs import enumerate_variants
         return [
             c for c in concepts
@@ -372,6 +374,8 @@ def resolve_bare_name(
 
     if pole_hit is not None and manifold_hit is not None:
         canonical, sign, match, variant = pole_hit
+        # pole_hit is only set when resolve_pole returned a non-None match.
+        assert match is not None
         pole_label = (
             f"{match.namespace}/{canonical}"
             + (" (negated)" if sign < 0 else "")

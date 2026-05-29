@@ -1,6 +1,8 @@
 """Roundtrip and edge-case tests for saklas.gguf_io."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -9,7 +11,7 @@ gguf = pytest.importorskip("gguf")
 from saklas.io.gguf_io import read_gguf_profile, write_gguf_profile
 
 
-def test_roundtrip_preserves_tensors(tmp_path):
+def test_roundtrip_preserves_tensors(tmp_path: Path):
     profile = {
         0: torch.randn(16),
         3: torch.randn(16),
@@ -28,7 +30,7 @@ def test_roundtrip_preserves_tensors(tmp_path):
     assert "saklas_version" in meta
 
 
-def test_roundtrip_preserves_layer_indices_out_of_order(tmp_path):
+def test_roundtrip_preserves_layer_indices_out_of_order(tmp_path: Path):
     profile = {14: torch.randn(8), 3: torch.randn(8), 0: torch.randn(8)}
     path = tmp_path / "x.gguf"
     write_gguf_profile(profile, path, model_hint="gemma3")
@@ -36,7 +38,7 @@ def test_roundtrip_preserves_layer_indices_out_of_order(tmp_path):
     assert set(loaded.keys()) == {0, 3, 14}
 
 
-def test_write_casts_to_float32(tmp_path):
+def test_write_casts_to_float32(tmp_path: Path):
     # fp16 input — must be readable back as fp32 without loss of indexing.
     profile = {0: torch.randn(8, dtype=torch.float16)}
     path = tmp_path / "fp16.gguf"
@@ -45,7 +47,7 @@ def test_write_casts_to_float32(tmp_path):
     assert loaded[0].dtype == torch.float32
 
 
-def test_read_rejects_wrong_architecture(tmp_path):
+def test_read_rejects_wrong_architecture(tmp_path: Path):
     # Write a GGUF with a non-controlvector architecture and verify read rejects it.
     path = tmp_path / "not_cv.gguf"
     writer = gguf.GGUFWriter(str(path), "llama")  # wrong arch
@@ -59,7 +61,7 @@ def test_read_rejects_wrong_architecture(tmp_path):
         read_gguf_profile(path)
 
 
-def test_read_requires_model_hint(tmp_path):
+def test_read_requires_model_hint(tmp_path: Path):
     path = tmp_path / "no_hint.gguf"
     writer = gguf.GGUFWriter(str(path), "controlvector")
     writer.add_tensor("direction.0", torch.randn(4).numpy())
@@ -71,7 +73,7 @@ def test_read_requires_model_hint(tmp_path):
         read_gguf_profile(path)
 
 
-def test_read_rejects_empty(tmp_path):
+def test_read_rejects_empty(tmp_path: Path):
     path = tmp_path / "empty.gguf"
     writer = gguf.GGUFWriter(str(path), "controlvector")
     writer.add_string("controlvector.model_hint", "llama")
@@ -83,7 +85,7 @@ def test_read_rejects_empty(tmp_path):
         read_gguf_profile(path)
 
 
-def test_load_profile_dispatches_on_extension(tmp_path):
+def test_load_profile_dispatches_on_extension(tmp_path: Path):
     """saklas.core.vectors.load_profile should route .gguf to the GGUF loader."""
     from saklas.core.vectors import load_profile
     profile = {0: torch.randn(8), 5: torch.randn(8)}

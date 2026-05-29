@@ -11,6 +11,7 @@ override ``_run_generator`` to return canned strings.  CPU-only, no IO.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import pytest
 
@@ -76,8 +77,8 @@ def _fake_session_class(*, share_moment: bool = False):
             self._scenario_call_count = 0
 
         def _run_generator(
-            self, system_msg, prompt, max_new_tokens, **_kwargs,
-        ):
+            self, system_msg: Any, prompt: Any, max_new_tokens: Any, **_kwargs: Any,
+        ) -> Any:
             self._calls.append((prompt, system_msg, max_new_tokens))
             if "situational domains" in prompt:
                 self._scenario_call_count += 1
@@ -406,7 +407,7 @@ def test_raises_when_scenario_generation_fails():
         def __init__(self):
             pass
 
-        def _run_generator(self, *a, **kw):
+        def _run_generator(self, *a: Any, **kw: Any) -> Any:
             return "no list here"
 
     with pytest.raises(ValueError, match="could not generate scenarios"):
@@ -425,7 +426,7 @@ def test_short_cell_pads_to_K_preserving_shape_independent_mode():
         def __init__(self):
             self.calls = 0
 
-        def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
+        def _run_generator(self, system_msg: Any, prompt: Any, max_new_tokens: Any, **_kwargs: Any) -> Any:
             self.calls += 1
             if "situational domains" in prompt:
                 return _scenarios_text(_N_SCENARIOS)
@@ -451,7 +452,7 @@ def test_short_cell_pads_to_K_preserving_shape_share_moment_mode():
         def __init__(self):
             self.calls = 0
 
-        def _run_generator(self, system_msg, prompt, max_new_tokens, **_kwargs):
+        def _run_generator(self, system_msg: Any, prompt: Any, max_new_tokens: Any, **_kwargs: Any) -> Any:
             self.calls += 1
             if "situational domains" in prompt:
                 return _scenarios_text(_N_SCENARIOS)
@@ -516,8 +517,8 @@ def _neutrals_fake_session_class():
             self._calls: list[tuple[str, str, int]] = []
 
         def _run_generator(
-            self, system_msg, prompt, max_new_tokens, **_kwargs,
-        ):
+            self, system_msg: Any, prompt: Any, max_new_tokens: Any, **_kwargs: Any,
+        ) -> Any:
             self._calls.append((prompt, system_msg, max_new_tokens))
             if "everyday" in prompt and "domains" in prompt:
                 return _scenarios_text(_N_SCENARIOS)

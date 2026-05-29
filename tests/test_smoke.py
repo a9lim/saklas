@@ -10,6 +10,7 @@ import math
 import time
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -39,18 +40,18 @@ def model_and_tokenizer():
 
 
 @pytest.fixture(scope="module")
-def layers(model_and_tokenizer):
+def layers(model_and_tokenizer: Any) -> Any:
     from saklas.core.model import get_layers
     model, _ = model_and_tokenizer
     return get_layers(model)
 
 
 @pytest.fixture(scope="module")
-def num_layers(layers):
+def num_layers(layers: Any) -> int:
     return len(layers)
 
 
-def _extract_profile(model, tokenizer, concept, layers):
+def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> Any:
     """Extract a profile for a single concept with one pair."""
     from saklas.core.vectors import extract_contrastive
     profile, _ = extract_contrastive(
@@ -60,20 +61,20 @@ def _extract_profile(model, tokenizer, concept, layers):
 
 
 @pytest.fixture(scope="module")
-def layer_means(model_and_tokenizer, layers):
+def layer_means(model_and_tokenizer: Any, layers: Any) -> Any:
     from saklas.core.vectors import compute_layer_means
     model, tokenizer = model_and_tokenizer
     return compute_layer_means(model, tokenizer, layers)
 
 
 @pytest.fixture(scope="module")
-def happy_profile(model_and_tokenizer, layers):
+def happy_profile(model_and_tokenizer: Any, layers: Any) -> Any:
     model, tokenizer = model_and_tokenizer
     return _extract_profile(model, tokenizer, "happy", layers)
 
 
 class TestVectorExtraction:
-    def test_returns_valid_profile(self, happy_profile, model_and_tokenizer):
+    def test_returns_valid_profile(self, happy_profile: Any, model_and_tokenizer: Any) -> None:
         model, _ = model_and_tokenizer
         cfg = getattr(model.config, "text_config", None) or model.config
         hidden_dim = cfg.hidden_size
@@ -85,7 +86,7 @@ class TestVectorExtraction:
             norm = vec.norm().item()
             assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
 
-    def test_extraction_fast_enough(self, model_and_tokenizer, layers):
+    def test_extraction_fast_enough(self, model_and_tokenizer: Any, layers: Any) -> None:
         """Single contrastive extraction should complete within the backend's budget."""
         model, tokenizer = model_and_tokenizer
         start = time.perf_counter()
@@ -97,7 +98,7 @@ class TestVectorExtraction:
 
 
 class TestSteering:
-    def test_steered_output_differs(self, model_and_tokenizer, layers, happy_profile):
+    def test_steered_output_differs(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
 
@@ -129,7 +130,7 @@ class TestSteering:
 
         assert ids0 != ids1, "Steered output should differ from unsteered"
 
-    def test_hook_cleanup(self, model_and_tokenizer, layers, happy_profile):
+    def test_hook_cleanup(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
 
@@ -164,7 +165,7 @@ class TestSteering:
 
 
 class TestSaveLoad:
-    def test_roundtrip(self, happy_profile):
+    def test_roundtrip(self, happy_profile: Any) -> None:
         from saklas.core.vectors import save_profile, load_profile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -182,7 +183,7 @@ class TestSaveLoad:
 
 
 class TestTraitMonitor:
-    def test_monitor_records_history(self, model_and_tokenizer, layers, happy_profile, layer_means):
+    def test_monitor_records_history(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.monitor import TraitMonitor
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
@@ -235,7 +236,7 @@ class TestTraitMonitor:
         sparkline = monitor.get_sparkline("happy")
         assert len(sparkline) > 0
 
-    def test_throughput_regression(self, model_and_tokenizer, layers, happy_profile, layer_means):
+    def test_throughput_regression(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         """Steered generation should be at least 85% of vanilla throughput."""
         from saklas.core.hooks import SteeringManager
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
@@ -283,7 +284,7 @@ class TestTraitMonitor:
 
 
 class TestExtractContrastive:
-    def test_returns_valid_profile(self, model_and_tokenizer, layers, num_layers):
+    def test_returns_valid_profile(self, model_and_tokenizer: Any, layers: Any, num_layers: int) -> None:
         from saklas.core.vectors import extract_contrastive
         model, tokenizer = model_and_tokenizer
         cfg = getattr(model.config, "text_config", None) or model.config
@@ -316,7 +317,7 @@ class TestExtractContrastive:
 
 
 class TestBuildChatInput:
-    def test_chat_template_path(self, model_and_tokenizer):
+    def test_chat_template_path(self, model_and_tokenizer: Any) -> None:
         from saklas.core.generation import build_chat_input
         _, tokenizer = model_and_tokenizer
         messages = [{"role": "user", "content": "Hello"}]
@@ -325,7 +326,7 @@ class TestBuildChatInput:
         assert ids.shape[0] == 1
         assert ids.shape[1] > 0
 
-    def test_with_system_prompt(self, model_and_tokenizer):
+    def test_with_system_prompt(self, model_and_tokenizer: Any) -> None:
         from saklas.core.generation import build_chat_input
         _, tokenizer = model_and_tokenizer
         messages = [{"role": "user", "content": "Hello"}]
@@ -336,7 +337,7 @@ class TestBuildChatInput:
 
 
 class TestProbesBootstrap:
-    def test_bootstrap_loads_from_cache(self, monkeypatch, model_and_tokenizer, layers, happy_profile):
+    def test_bootstrap_loads_from_cache(self, monkeypatch: pytest.MonkeyPatch, model_and_tokenizer: Any, layers: Any, happy_profile: Any) -> None:
         """Bootstrap should return cached profiles without re-extracting."""
         from saklas.io.probes_bootstrap import bootstrap_probes
         from saklas.core.vectors import save_profile
@@ -377,7 +378,7 @@ class TestAblationPerformance:
     does one extra matmul per active ablation layer per step. Intentional.
     """
 
-    def test_throughput_with_ablation(self, model_and_tokenizer, layers, layer_means):
+    def test_throughput_with_ablation(self, model_and_tokenizer: Any, layers: Any, layer_means: Any) -> None:
         from saklas.core.session import SaklasSession
 
         model, tokenizer = model_and_tokenizer
@@ -443,7 +444,7 @@ class TestDiscoverManifoldEndToEnd:
     _GENERATE_BUDGET_S = _EXTRACTION_BUDGET_S * 6
     _FIT_BUDGET_S = _EXTRACTION_BUDGET_S * 2
 
-    def test_discover_pipeline(self, model_and_tokenizer, tmp_path, monkeypatch):
+    def test_discover_pipeline(self, model_and_tokenizer: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from saklas.core.manifold import CustomDomain
         from saklas.core.session import SaklasSession
         from saklas.io.manifolds import create_discover_manifold_folder

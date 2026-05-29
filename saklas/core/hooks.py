@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -111,7 +111,7 @@ class HiddenCapture:
 
     def __init__(self) -> None:
         self._per_layer: dict[int, list[torch.Tensor]] = {}
-        self._handles: list = []
+        self._handles: list[Any] = []
 
     def attach(
         self, layers: "torch.nn.ModuleList", layer_indices: list[int]
@@ -121,8 +121,8 @@ class HiddenCapture:
         for idx in layer_indices:
             bucket = self._per_layer[idx]
 
-            def _make(bucket_ref):
-                def _hook(module, input, output):
+            def _make(bucket_ref: list[torch.Tensor]) -> Any:
+                def _hook(module: Any, input: Any, output: Any) -> None:
                     h = output if isinstance(output, torch.Tensor) else output[0]
                     bucket_ref.append(h[0, -1, :].detach().clone())
                 return _hook
@@ -473,7 +473,7 @@ class SteeringHook:
         cos_buf.fill_(cos_v)
         sin_buf.fill_(sin_v)
 
-    def hook_fn(self, module, input, output):
+    def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
         # Fast path: single composed additive tensor, no ablation, no
         # trigger check.
         if self.composed is not None:
@@ -750,9 +750,9 @@ class SteeringManager:
         theta_max: float = DEFAULT_THETA_MAX,
     ) -> None:
         self.hooks: dict[int, SteeringHook] = {}
-        self.vectors: dict[str, dict] = {}
-        self.ablations: dict[str, dict] = {}
-        self.manifolds: dict[str, dict] = {}
+        self.vectors: dict[str, dict[str, Any]] = {}
+        self.ablations: dict[str, dict[str, Any]] = {}
+        self.manifolds: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
         self.injection_mode: InjectionMode = injection_mode
         self.theta_max: float = theta_max

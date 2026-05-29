@@ -41,7 +41,7 @@ def _author_legacy(root: Path, *, cyclic: bool, labels: list[str],
     return folder
 
 
-def test_upgrade_cyclic_to_box_domain(tmp_path):
+def test_upgrade_cyclic_to_box_domain(tmp_path: Path):
     mod = _load_script()
     folder = _author_legacy(
         tmp_path, cyclic=True, labels=["a", "b", "c", "d"],
@@ -61,7 +61,7 @@ def test_upgrade_cyclic_to_box_domain(tmp_path):
     ManifoldFolder.load(folder)
 
 
-def test_upgrade_sequential_to_open_axis(tmp_path):
+def test_upgrade_sequential_to_open_axis(tmp_path: Path):
     mod = _load_script()
     folder = _author_legacy(
         tmp_path, cyclic=False, labels=["a", "b", "c", "d", "e"],
@@ -73,7 +73,7 @@ def test_upgrade_sequential_to_open_axis(tmp_path):
     assert coords[0] == 0.0 and coords[-1] == 1.0
 
 
-def test_upgrade_removes_stale_tensors(tmp_path):
+def test_upgrade_removes_stale_tensors(tmp_path: Path):
     mod = _load_script()
     folder = _author_legacy(
         tmp_path, cyclic=True, labels=["a", "b", "c"], with_tensor=True,
@@ -85,7 +85,7 @@ def test_upgrade_removes_stale_tensors(tmp_path):
     assert not (folder / "old-model.json").exists()
 
 
-def test_upgrade_is_idempotent(tmp_path):
+def test_upgrade_is_idempotent(tmp_path: Path):
     mod = _load_script()
     folder = _author_legacy(
         tmp_path, cyclic=True, labels=["a", "b", "c", "d"],

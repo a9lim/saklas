@@ -16,15 +16,21 @@ lock that contract.
 """
 from __future__ import annotations
 
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
 import pytest
 
 from saklas.core.steering_expr import parse_expr
-from saklas.core.triggers import ProbeGate, Trigger, TriggerContext
+from saklas.core.triggers import ProbeGate, TriggerContext
 from saklas.io import selectors as sel
+
+if TYPE_CHECKING:
+    from saklas.core.steering import Steering
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     """Run each test against an empty SAKLAS_HOME.
 
     Bundled bipolar concepts (``angry.calm``) would otherwise resolve
@@ -39,7 +45,7 @@ def _isolated_home(monkeypatch, tmp_path):
     sel.invalidate()
 
 
-def _trigger_of(steering, key):
+def _trigger_of(steering: Steering, key: str) -> Any:
     """Pull the :class:`Trigger` attached to ``key`` in ``steering.alphas``."""
     val = steering.alphas[key]
     if isinstance(val, tuple):

@@ -9,6 +9,9 @@ behaves the same as the raw branch on an identity-decoder mock backend.
 """
 from __future__ import annotations
 
+from typing import Any
+
+import pytest
 import torch
 
 from saklas.core import vectors as V
@@ -22,7 +25,9 @@ from saklas.core.sae import MockSaeBackend
 # ---------------------------------------------------------------------------
 
 
-def _stub_encode_separable(model, tokenizer, text, layers, device, **_kwargs):
+def _stub_encode_separable(
+    model: Any, tokenizer: Any, text: str, layers: Any, device: Any, **_kwargs: Any
+) -> dict[int, torch.Tensor]:
     """Stable pos/neg activations along axis 0 with tiny gaussian noise."""
     n = len(layers)
     sign = 1.0 if "pos" in text else -1.0
@@ -34,7 +39,9 @@ def _stub_encode_separable(model, tokenizer, text, layers, device, **_kwargs):
     return out
 
 
-def _stub_encode_noisy(model, tokenizer, text, layers, device, **_kwargs):
+def _stub_encode_noisy(
+    model: Any, tokenizer: Any, text: str, layers: Any, device: Any, **_kwargs: Any
+) -> dict[int, torch.Tensor]:
     """Noisier pos/neg pairs — class-mean axis still axis 0 but per-pair
     diff has substantial off-axis variance.  This is the regime where Im
     & Li 2025 predicts PCA can pick a near-orthogonal direction; DiM
@@ -50,8 +57,8 @@ def _stub_encode_noisy(model, tokenizer, text, layers, device, **_kwargs):
     return out
 
 
-class _FakeModel:
-    def parameters(self):
+class _FakeModel(torch.nn.Module):
+    def parameters(self, recurse: bool = True):  # pyright: ignore[reportIncompatibleMethodOverride]  # stub yields Tensor not Parameter
         yield torch.zeros(1)
 
 
@@ -71,7 +78,7 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 class TestDimReturnShape:
     """``extract_difference_of_means`` matches ``extract_contrastive`` shape."""
 
-    def test_returns_profile_and_diagnostics(self, monkeypatch) -> None:
+    def test_returns_profile_and_diagnostics(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode_separable)
 
@@ -79,7 +86,8 @@ class TestDimReturnShape:
             {"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(8)
         ]
         profile, diagnostics = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 6,
+            _FakeModel(), _FakeTok(), pairs,
+            layers=[object()] * 6,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
             device=torch.device("cpu"),
             dls=False,
         )
@@ -89,7 +97,7 @@ class TestDimReturnShape:
             assert v.dtype == torch.float32
 
     def test_dls_keep_set_aligns_diagnostics_with_profile(
-        self, monkeypatch,
+        self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # v2.1: edge-drop replaced by data-driven DLS.  Without
         # ``layer_means`` the helper falls back to "keep all layers"
@@ -101,7 +109,8 @@ class TestDimReturnShape:
             {"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)
         ]
         profile, diagnostics = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 8,
+            _FakeModel(), _FakeTok(), pairs,
+            layers=[object()] * 8,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
             device=torch.device("cpu"),
             dls=False,
         )
@@ -116,29 +125,34 @@ class TestDimReturnShape:
 class TestDimAgreesWithPca:
     """On well-separated synthetic data DiM and PCA pick the same axis."""
 
-    def test_clean_signal_high_cosine(self, monkeypatch) -> None:
+    def test_clean_signal_high_cosine(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode_separable)
         pairs = [
             {"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(20)
         ]
-        common = dict(
-            layers=[object()] * 6,
-            device=torch.device("cpu"),
-            dls=False,
-        )
+        _layers = [object()] * 6
+        _device = torch.device("cpu")
 
         torch.manual_seed(0)
-        pca, _ = V.extract_contrastive(_FakeModel(), _FakeTok(), pairs, **common)
+        pca, _ = V.extract_contrastive(
+            _FakeModel(), _FakeTok(), pairs,
+            layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
+            device=_device, dls=False,
+        )
         torch.manual_seed(0)
-        dim, _ = V.extract_difference_of_means(_FakeModel(), _FakeTok(), pairs, **common)
+        dim, _ = V.extract_difference_of_means(
+            _FakeModel(), _FakeTok(), pairs,
+            layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
+            device=_device, dls=False,
+        )
 
         for layer in pca:
             assert _cos(pca[layer], dim[layer]) > 0.95, (
                 f"DiM and PCA disagreed on layer {layer} for clean signal"
             )
 
-    def test_share_bake_magnitudes_in_band(self, monkeypatch) -> None:
+    def test_share_bake_magnitudes_in_band(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Per-layer baked magnitudes from DiM live in the same band as
         PCA's — share-baking math is method-agnostic, so the total
         ``Σ_L ||baked_L||`` budget should match within an order of
@@ -151,15 +165,20 @@ class TestDimAgreesWithPca:
             {"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(12)
         ]
 
-        common = dict(
-            layers=[object()] * 6,
-            device=torch.device("cpu"),
-            dls=False,
+        _layers = [object()] * 6
+        _device = torch.device("cpu")
+        torch.manual_seed(0)
+        pca, _ = V.extract_contrastive(
+            _FakeModel(), _FakeTok(), pairs,
+            layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
+            device=_device, dls=False,
         )
         torch.manual_seed(0)
-        pca, _ = V.extract_contrastive(_FakeModel(), _FakeTok(), pairs, **common)
-        torch.manual_seed(0)
-        dim, _ = V.extract_difference_of_means(_FakeModel(), _FakeTok(), pairs, **common)
+        dim, _ = V.extract_difference_of_means(
+            _FakeModel(), _FakeTok(), pairs,
+            layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
+            device=_device, dls=False,
+        )
 
         pca_total = sum(t.norm().item() for t in pca.values())
         dim_total = sum(t.norm().item() for t in dim.values())
@@ -174,7 +193,7 @@ class TestDimAgreesWithPca:
 class TestDimOnNoisyPairs:
     """DiM should be at least as well-behaved as PCA on noisy signals."""
 
-    def test_unit_normed_per_layer(self, monkeypatch) -> None:
+    def test_unit_normed_per_layer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode_noisy)
         pairs = [
@@ -182,7 +201,8 @@ class TestDimOnNoisyPairs:
         ]
 
         profile, _ = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 5,
+            _FakeModel(), _FakeTok(), pairs,
+            layers=[object()] * 5,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
             device=torch.device("cpu"), dls=False,
         )
         # Baked tensors carry share × ref_norm; we don't assert unit
@@ -200,7 +220,7 @@ class TestDimOnNoisyPairs:
 class TestDimSaeBranch:
     """SAE+DiM uses ``mean(F_pos − F_neg)`` then decodes back to model space."""
 
-    def test_identity_sae_matches_raw_direction(self, monkeypatch) -> None:
+    def test_identity_sae_matches_raw_direction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Identity SAE encode/decode is a no-op, so SAE-DiM should agree
         with raw-DiM on the same pairs."""
         torch.manual_seed(0)
@@ -218,12 +238,14 @@ class TestDimSaeBranch:
         torch.manual_seed(0)
         raw, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs,
-            layers=layers, device=torch.device("cpu"), dls=False,
+            layers=layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
+            device=torch.device("cpu"), dls=False,
         )
         torch.manual_seed(0)
         sae_profile, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs,
-            layers=layers, device=torch.device("cpu"), dls=False,
+            layers=layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
+            device=torch.device("cpu"), dls=False,
             sae=sae,
         )
 

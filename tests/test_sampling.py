@@ -23,13 +23,13 @@ def test_defaults():
 def test_frozen():
     sc = SamplingConfig(temperature=0.5)
     with pytest.raises((AttributeError, Exception)):
-        sc.temperature = 1.0  # type: ignore[misc]
+        sc.temperature = 1.0  # pyright: ignore[reportAttributeAccessIssue]  # SamplingConfig is frozen dataclass
 
 
 def test_stop_coerced_to_tuple():
     # __post_init__ coerces list→tuple at runtime; type annotation narrows
     # the public contract to tuple, so the list input here needs a pragma.
-    sc = SamplingConfig(stop=["a", "b"])  # type: ignore[arg-type]
+    sc = SamplingConfig(stop=["a", "b"])  # pyright: ignore[reportArgumentType]  # __post_init__ coerces list→tuple
     assert sc.stop == ("a", "b")
     assert isinstance(sc.stop, tuple)
 

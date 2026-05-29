@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
+from typing import Any
 
 import pytest
 import torch
@@ -19,14 +21,14 @@ from saklas.core.manifold import (
     Manifold,
     fit_layer_subspace,
 )
+from saklas.core.steering_expr import SteeringExprError
+from saklas.core.triggers import Trigger, TriggerContext
 
 
-def fit_layer_subspace_only(*args, **kwargs):
+def fit_layer_subspace_only(*args: Any, **kwargs: Any) -> Any:
     """Drop the EV ratio for tests that don't care about it."""
     sub, _ev = fit_layer_subspace(*args, **kwargs)
     return sub
-from saklas.core.steering_expr import SteeringExprError
-from saklas.core.triggers import Trigger, TriggerContext
 
 _DIM = 8
 
@@ -55,7 +57,7 @@ def _circle(k: int, dim: int, scale: float = 1.0) -> torch.Tensor:
     return out
 
 
-def _manifold(layers=(0, 1)) -> Manifold:
+def _manifold(layers: Sequence[int] = (0, 1)) -> Manifold:
     """A 1-D periodic (loop) manifold over 6 nodes."""
     domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
@@ -73,7 +75,7 @@ def _manifold(layers=(0, 1)) -> Manifold:
     )
 
 
-def _manifold2d(layers=(0,)) -> Manifold:
+def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
     """A 2-D box (disk-like) manifold over a 3x3 grid of 9 nodes."""
     domain = BoxDomain([
         BoxAxis("u", periodic=False, lo=0.0, hi=1.0),
@@ -101,8 +103,8 @@ def _manifold2d(layers=(0,)) -> Manifold:
 
 def _recompose_manifold(
     hook: SteeringHook, manifold: Manifold, layer: int, alpha: float,
-    position=(0.5,),
-):
+    position: Sequence[float] = (0.5,),
+) -> None:
     ctx = TriggerContext()
     sub = manifold.layers[layer]
     target = manifold.manifold_point(layer, position)

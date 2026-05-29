@@ -6,6 +6,9 @@ isolated SAKLAS_HOME with no packs installed.
 """
 from __future__ import annotations
 
+from collections.abc import Generator
+from pathlib import Path
+
 import pytest
 
 from saklas.io import selectors as sel
@@ -22,14 +25,14 @@ from saklas.core.triggers import Trigger
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Generator[None, None, None]:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     sel.invalidate()
     yield
     sel.invalidate()
 
 
-def _mk(tmp_path, ns, name, tags=None):
+def _mk(tmp_path: Path, ns: str, name: str, tags: list[str] | None = None) -> Path:
     d = tmp_path / "vectors" / ns / name
     d.mkdir(parents=True)
     (d / "statements.json").write_text("[]")
@@ -135,7 +138,7 @@ def test_namespace_with_bipolar():
     assert s.alphas == {"bob/deer.wolf": 0.3}
 
 
-def test_namespace_disambiguates_collision(tmp_path):
+def test_namespace_disambiguates_collision(tmp_path: Path) -> None:
     # Two packs sharing a concept name across namespaces — the parser
     # must keep the user's explicit ``alice/`` / ``bob/`` prefix in the
     # alphas key so each pack ends up at a distinct registry slot.
@@ -258,6 +261,7 @@ def test_projection_onto():
     key = "honest~sycophantic"
     assert key in s.alphas
     v = s.alphas[key]
+    assert isinstance(v, ProjectedTerm)
     assert v.operator == "~"
 
 
@@ -392,7 +396,7 @@ def test_dot_without_second_pole():
 
 # ------------------------------------------------------ pole aliasing ---
 
-def test_pole_alias_flips_sign(tmp_path):
+def test_pole_alias_flips_sign(tmp_path: Path) -> None:
     # Install ``default/deer.wolf``; bare ``wolf`` should resolve to
     # ``deer.wolf`` with sign -1, so ``0.5 wolf`` -> ``deer.wolf: -0.5``.
     _mk(tmp_path, "default", "deer.wolf")
@@ -401,14 +405,14 @@ def test_pole_alias_flips_sign(tmp_path):
     assert s.alphas == {"deer.wolf": -0.5}
 
 
-def test_pole_positive_pole_keeps_sign(tmp_path):
+def test_pole_positive_pole_keeps_sign(tmp_path: Path) -> None:
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 deer")
     assert s.alphas == {"deer.wolf": 0.5}
 
 
-def test_pole_composite_literal_bypasses_resolution(tmp_path):
+def test_pole_composite_literal_bypasses_resolution(tmp_path: Path) -> None:
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 deer.wolf")
@@ -522,7 +526,7 @@ class TestRoundTripGolden:
         (".25 honest", "0.25 honest"),
         ("2 honest", "2 honest"),
     ])
-    def test_canonical_form(self, text, canonical):
+    def test_canonical_form(self, text: str, canonical: str) -> None:
         s = parse_expr(text)
         assert format_expr(s) == canonical
 
@@ -539,7 +543,7 @@ class TestRoundTripGolden:
         "0.5 honest:sae-gemma-scope",
         "0.5 honest:sae|sycophantic",
     ])
-    def test_format_parse_format_is_stable(self, text):
+    def test_format_parse_format_is_stable(self, text: str) -> None:
         """Render -> re-parse -> render produces the same string."""
         s1 = parse_expr(text)
         r1 = format_expr(s1)
@@ -589,13 +593,13 @@ def test_from_value_steering_passthrough():
 
 def test_from_value_rejects_dict():
     with pytest.raises(TypeError) as ei:
-        Steering.from_value({"honest": 0.5})
+        Steering.from_value({"honest": 0.5})  # pyright: ignore[reportArgumentType]  # intentional bad-type test
     assert "str | Steering | None" in str(ei.value)
 
 
 def test_from_value_rejects_list():
     with pytest.raises(TypeError):
-        Steering.from_value([("honest", 0.5)])
+        Steering.from_value([("honest", 0.5)])  # pyright: ignore[reportArgumentType]  # intentional bad-type test
 
 
 # -------------------------------------------------------------- referenced_selectors ---
@@ -659,7 +663,7 @@ def test_ablation_term_is_frozen():
     from saklas.core.steering_expr import AblationTerm
     t = AblationTerm(coeff=1.0, trigger=Trigger.BOTH, target="x")
     with pytest.raises(FrozenInstanceError):
-        t.coeff = 0.5  # type: ignore[misc]
+        t.coeff = 0.5  # pyright: ignore[reportAttributeAccessIssue]  # frozen dataclass — assignment expected to raise FrozenInstanceError
 
 
 def test_ablation_explicit_coefficient():
@@ -694,7 +698,7 @@ def test_ablation_signed_explicit():
     assert term.coeff == -0.3
 
 
-def test_ablation_with_namespace(tmp_path):
+def test_ablation_with_namespace(tmp_path: Path) -> None:
     from saklas.core.steering_expr import AblationTerm
     _mk(tmp_path, "bob", "custom", tags=[])
     s = parse_expr("!bob/custom")
@@ -805,7 +809,7 @@ def test_format_ablation_variant_preserved():
     "0.3 honest - !sycophantic",
     "!refusal + !sycophantic",
 ])
-def test_ablation_format_parse_format_is_stable(text):
+def test_ablation_format_parse_format_is_stable(text: str) -> None:
     """Ablation expressions round-trip through parse -> format stably."""
     s1 = parse_expr(text)
     r1 = format_expr(s1)
@@ -922,7 +926,7 @@ def test_direct_ablation_construction_round_trips():
 # gate changes, only parsing and format round-trip.
 
 
-def _gate_of(steering, key):
+def _gate_of(steering: Steering, key: str):
     """Extract the (probe, op, threshold) gate triple for ``key``."""
     val = steering.alphas[key]
     if isinstance(val, tuple):
@@ -950,7 +954,7 @@ def test_manifold_label_gate_parses():
 
 
 @pytest.mark.parametrize("op", [">", ">=", "<", "<="])
-def test_manifold_fraction_gate_all_ops(op):
+def test_manifold_fraction_gate_all_ops(op: str) -> None:
     s = parse_expr(f"0.3 happy.sad @when:circumplex:fraction {op} 0.3")
     gate = _gate_of(s, "happy.sad")
     assert gate.probe == "circumplex:fraction"
@@ -959,7 +963,7 @@ def test_manifold_fraction_gate_all_ops(op):
 
 
 @pytest.mark.parametrize("op", [">", ">=", "<", "<="])
-def test_manifold_label_gate_all_ops(op):
+def test_manifold_label_gate_all_ops(op: str) -> None:
     s = parse_expr(f"0.3 happy.sad @when:circumplex@elated {op} -0.1")
     gate = _gate_of(s, "happy.sad")
     assert gate.probe == "circumplex@elated"
@@ -996,7 +1000,7 @@ def test_manifold_label_gate_round_trips():
 
 
 @pytest.mark.parametrize("op", [">", ">=", "<", "<="])
-def test_manifold_fraction_gate_round_trips_all_ops(op):
+def test_manifold_fraction_gate_round_trips_all_ops(op: str) -> None:
     canonical = f"0.3 happy.sad@when:circumplex:fraction{op}0.25"
     s = parse_expr(canonical)
     assert format_expr(s) == canonical

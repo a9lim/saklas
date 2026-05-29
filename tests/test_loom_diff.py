@@ -161,7 +161,7 @@ def test_session_diff_nodes_via_synthetic_session():
     tree, u, a1, a2 = _seed_tree_with_siblings()
 
     class _Stub:
-        def __init__(self, tree):
+        def __init__(self, tree: LoomTree) -> None:
             self.tree = tree
 
     stub = _Stub(tree)

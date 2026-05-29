@@ -2,7 +2,7 @@
 
 import logging
 import warnings
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -15,14 +15,14 @@ _ORIG_HISTC = None
 _ORIG_LDEXP = None
 
 
-def _histc_mps_safe(input, bins=100, min=0, max=0, *, out=None):
+def _histc_mps_safe(input: torch.Tensor, bins: int = 100, min: float = 0, max: float = 0, *, out: torch.Tensor | None = None) -> torch.Tensor:
     assert _ORIG_HISTC is not None
     if input.device.type == "mps" and not input.is_floating_point():
         input = input.float()
     return _ORIG_HISTC(input, bins=bins, min=min, max=max, out=out)
 
 
-def _ldexp_mps_safe(input, other, *, out=None):
+def _ldexp_mps_safe(input: Any, other: Any, *, out: torch.Tensor | None = None) -> Any:
     assert _ORIG_LDEXP is not None
     if hasattr(input, "device") and input.device.type == "mps":
         in_cpu = input.cpu()
@@ -47,19 +47,19 @@ def patch_torch_for_mps() -> bool:
     installed = False
     if getattr(torch.histc, "_saklas_mps_safe", False) is False:
         _ORIG_HISTC = torch.histc
-        _histc_mps_safe._saklas_mps_safe = True  # type: ignore[attr-defined]
+        _histc_mps_safe._saklas_mps_safe = True  # pyright: ignore[reportFunctionMemberAccess]  # FunctionType stub forbids dynamic attrs
         torch.histc = _histc_mps_safe
         installed = True
     if getattr(torch.ldexp, "_saklas_mps_safe", False) is False:
         _ORIG_LDEXP = torch.ldexp
-        _ldexp_mps_safe._saklas_mps_safe = True  # type: ignore[attr-defined]
+        _ldexp_mps_safe._saklas_mps_safe = True  # pyright: ignore[reportFunctionMemberAccess]  # FunctionType stub forbids dynamic attrs
         torch.ldexp = _ldexp_mps_safe
         installed = True
     return installed
 
-def _MODEL_LAYERS(m): return m.model.layers
-def _TRANSFORMER_H(m): return m.transformer.h
-def _VLM_LANGUAGE_LAYERS(m): return m.model.language_model.layers
+def _MODEL_LAYERS(m: Any) -> Any: return m.model.layers
+def _TRANSFORMER_H(m: Any) -> Any: return m.transformer.h
+def _VLM_LANGUAGE_LAYERS(m: Any) -> Any: return m.model.language_model.layers
 
 _LAYER_ACCESSORS = {
     # Llama family
@@ -158,7 +158,7 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2,
 
 def _load_text_from_multimodal(
     model_id: str,
-    text_config,
+    text_config: Any,
     dtype: torch.dtype,
     device: str,
 ):
@@ -206,6 +206,10 @@ def _load_text_from_multimodal(
     prefix = "language_model."
 
     for sf in shard_paths:
+        # cached_file returns str | None; None means a missing shard — skip it.
+        # In practice, the single-shard path above would raise before we get here.
+        if sf is None:
+            continue
         shard = load_file(sf, device="cpu")
         mapped: dict[str, torch.Tensor] = {}
 
@@ -237,7 +241,7 @@ def _load_text_from_multimodal(
     return model
 
 
-def _run_compile_probes(compiled, model, device, bos_token_id: int, *, mode: str):
+def _run_compile_probes(compiled: Any, model: PreTrainedModel, device: str | torch.device, bos_token_id: int, *, mode: str) -> None:
     """Trigger compilation of the call shapes saklas actually uses.
 
     For ``mode="reduce-overhead"`` saklas's session generates through
@@ -323,7 +327,7 @@ def _run_compile_probes(compiled, model, device, bos_token_id: int, *, mode: str
 
 
 def _compile_with_probe(
-    model,
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     device: str | torch.device,
     *,
@@ -406,7 +410,7 @@ def _pick_dtype(device: str) -> torch.dtype:
     return torch.float32
 
 
-def _resolve_dtype(dtype, device: str) -> torch.dtype:
+def _resolve_dtype(dtype: torch.dtype | str | None, device: str) -> torch.dtype:
     if dtype is None:
         return _pick_dtype(device)
     if isinstance(dtype, str):
@@ -471,7 +475,7 @@ def load_model(
     # so it fires for any mistralai/* repo (Mistral-Small, Ministral, etc.) and
     # third-party finetunes whose name carries the family.
     # https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84
-    tokenizer_kwargs: dict = {"trust_remote_code": True}
+    tokenizer_kwargs: dict[str, Any] = {"trust_remote_code": True}
     if "mistral" in model_id.lower():
         tokenizer_kwargs["fix_mistral_regex"] = True
     tokenizer = AutoTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
@@ -545,7 +549,7 @@ def load_model(
     # model_type isn't registered with AutoModelForCausalLM (e.g.
     # Ministral tagged as Mistral3).  If the config has a text_config
     # that IS a known causal-LM type, use that instead.
-    load_kwargs: dict = dict(
+    load_kwargs: dict[str, Any] = dict(
         attn_implementation=attn_impl,
         trust_remote_code=trust,
         device_map=device_map,
@@ -574,6 +578,7 @@ def load_model(
         # with a "language_model." prefix that doesn't match the
         # text-only model's parameter names.  Load manually.
         # Propagate _name_or_path so cache paths resolve correctly.
+        assert text_cfg is not None  # guaranteed by extract_text_model condition above
         if not getattr(text_cfg, "_name_or_path", ""):
             text_cfg._name_or_path = model_id
         log.info("extracting text model (%s) from multimodal checkpoint (%s)",
@@ -611,7 +616,7 @@ def load_model(
             if "dtype" not in load_kwargs:
                 load_kwargs["dtype"] = torch.float32
             model = _try_load_with_fallbacks()
-            model = model.to(device)
+            model = model.to(device)  # pyright: ignore[reportArgumentType]  # transformers stub: .to(str) overload missing
 
     model.requires_grad_(False)
     model.train(False)
@@ -664,7 +669,7 @@ def _get_memory_gb(device: str) -> float:
     return 0.0
 
 
-def get_layers(model) -> nn.ModuleList:
+def get_layers(model: PreTrainedModel) -> nn.ModuleList:
     """Return the sequential transformer blocks for a supported architecture."""
     model_type = model.config.model_type
     accessor = _LAYER_ACCESSORS.get(model_type)
@@ -684,13 +689,13 @@ def get_layers(model) -> nn.ModuleList:
     return accessor(model)
 
 
-def _text_config(model):
+def _text_config(model: PreTrainedModel) -> Any:
     """Return the text-specific config, handling multimodal wrappers."""
     cfg = model.config
     return getattr(cfg, "text_config", cfg)
 
 
-def get_model_info(model, tokenizer) -> dict:
+def get_model_info(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase) -> dict[str, Any]:
     """Summary dict: model_type, num_layers, hidden_dim, device, dtype, vram_used_gb, param_count."""
     layers = get_layers(model)
     first_param = next(model.parameters())

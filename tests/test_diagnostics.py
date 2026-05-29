@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import warnings
+from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -83,7 +85,7 @@ class TestComputeLayerDiagnostics:
 # ---------------------------------------------------------------------------
 
 
-def _stub_encode(model, tokenizer, text, layers, device, **_kwargs):
+def _stub_encode(model: Any, tokenizer: Any, text: str, layers: Any, device: Any, **_kwargs: Any) -> dict[int, torch.Tensor]:
     """Per-layer activation that has clear pos/neg separation along axis 0.
 
     Reused by every full-extraction test below; matches the shape
@@ -111,13 +113,13 @@ class _FakeTok:
 class TestExtractContrastiveReturnsTuple:
     """``extract_contrastive`` returns ``(profile, diagnostics)``."""
 
-    def test_multi_pair_diagnostics_shape(self, monkeypatch) -> None:
+    def test_multi_pair_diagnostics_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode)
 
         pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(8)]
         profile, diagnostics = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 6,
+            _FakeModel(), _FakeTok(), pairs, layers=[object()] * 6,  # pyright: ignore[reportArgumentType]
             device=torch.device("cpu"),
             dls=False,
         )
@@ -137,7 +139,7 @@ class TestExtractContrastiveReturnsTuple:
             } <= set(metrics.keys())
 
     def test_dls_keep_set_aligns_diagnostics_with_profile(
-        self, monkeypatch,
+        self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # v2.1: edge-drop is gone.  When DLS runs (centered against
         # provided layer_means) the diagnostics dict and profile dict
@@ -155,7 +157,7 @@ class TestExtractContrastiveReturnsTuple:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
             profile, diagnostics = V.extract_contrastive(
-                _FakeModel(), _FakeTok(), pairs, layers=[object()] * 8,
+                _FakeModel(), _FakeTok(), pairs, layers=[object()] * 8,  # pyright: ignore[reportArgumentType]
                 device=torch.device("cpu"),
                 dls=False,
             )
@@ -165,10 +167,10 @@ class TestExtractContrastiveReturnsTuple:
 class TestSoftWarning:
     """``UserWarning`` fires on degenerate metrics, never raises."""
 
-    def test_one_sided_pairs_warn(self, monkeypatch) -> None:
+    def test_one_sided_pairs_warn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Identical pos/neg activations except a tiny axis-0 separation —
         # high EVR, near-zero intra variance, no inter-pair disagreement.
-        def _identical(model, tokenizer, text, layers, device, **_kwargs):
+        def _identical(model: Any, tokenizer: Any, text: str, layers: Any, device: Any, **_kwargs: Any) -> dict[int, torch.Tensor]:
             sign = 1.0 if "pos" in text else -1.0
             return {idx: torch.tensor([sign * 0.001, 0.0, 0.0, 0.0])
                     for idx in range(len(layers))}
@@ -179,7 +181,7 @@ class TestSoftWarning:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             V.extract_contrastive(
-                _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
+                _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,  # pyright: ignore[reportArgumentType]
                 device=torch.device("cpu"),
                 dls=False,
                 concept_label="probe-test",
@@ -189,7 +191,7 @@ class TestSoftWarning:
         assert any("one-sided" in m for m in msgs)
         assert any("probe-test" in m for m in msgs)
 
-    def test_aligned_pairs_no_warning(self, monkeypatch) -> None:
+    def test_aligned_pairs_no_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(42)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode)
         pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(20)]
@@ -197,7 +199,7 @@ class TestSoftWarning:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             V.extract_contrastive(
-                _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,
+                _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,  # pyright: ignore[reportArgumentType]
                 device=torch.device("cpu"),
                 dls=False,
                 concept_label="clean-probe",
@@ -217,7 +219,7 @@ class TestSoftWarning:
 
 
 class TestSidecarRoundTrip:
-    def test_save_load_preserves_diagnostics(self, tmp_path) -> None:
+    def test_save_load_preserves_diagnostics(self, tmp_path: Path) -> None:
         profile_dict = {0: torch.ones(4), 2: torch.ones(4) * 0.5}
         diagnostics = {
             0: {
@@ -254,7 +256,7 @@ class TestSidecarRoundTrip:
         assert meta["diagnostics"][0]["evr"] == pytest.approx(0.62)
         assert meta["diagnostics"][2]["inter_pair_alignment"] == pytest.approx(0.55)
 
-    def test_old_sidecar_without_diagnostics_loads_clean(self, tmp_path) -> None:
+    def test_old_sidecar_without_diagnostics_loads_clean(self, tmp_path: Path) -> None:
         # Simulate a v1.5-era sidecar: no diagnostics_by_layer key at all.
         profile_dict = {0: torch.ones(4)}
         path = tmp_path / "old.safetensors"
@@ -267,7 +269,7 @@ class TestSidecarRoundTrip:
         _, meta = V.load_profile(str(path))
         assert "diagnostics" not in meta
 
-    def test_sidecar_dataclass_roundtrip(self, tmp_path) -> None:
+    def test_sidecar_dataclass_roundtrip(self, tmp_path: Path) -> None:
         # Mirror the same shape through io.packs.Sidecar so packs.py
         # readers see the same field consistently.
         sc = Sidecar(

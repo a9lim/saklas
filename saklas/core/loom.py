@@ -225,7 +225,7 @@ class Recipe:
         parent (``Recipe.overlay``) and see the no-op.
         """
         from saklas.core.steering_expr import (
-            AblationTerm, ProjectedTerm, parse_expr, format_expr,
+            AblationTerm, ManifoldTerm, ProjectedTerm, parse_expr, format_expr,
         )
         from saklas.core.steering import Steering
 
@@ -248,6 +248,14 @@ class Recipe:
                     coeff=-val.coeff,
                     trigger=val.trigger,
                     target=val.target,
+                )
+                continue
+            if isinstance(val, ManifoldTerm):
+                flipped[name] = ManifoldTerm(
+                    coeff=-val.coeff,
+                    trigger=val.trigger,
+                    manifold=val.manifold,
+                    position=val.position,
                 )
                 continue
             if isinstance(val, tuple):
@@ -684,7 +692,7 @@ class LoomTree:
                 continue
             msg: dict[str, str] = {"role": node.role, "content": node.text}
             if with_labels:
-                msg["label"] = node.role_label  # type: ignore[assignment]
+                msg["label"] = node.role_label  # pyright: ignore[reportArgumentType]  # role_label is str | None; with_labels callers expect nullable label
             out.append(msg)
         return out
 
@@ -1022,7 +1030,7 @@ class LoomTree:
             active_moved_to: str | None = None
             if self.active_node_id in removed_set:
                 # parent_id is non-None because node_id != root_id.
-                self.active_node_id = parent_id  # type: ignore[assignment]
+                self.active_node_id = parent_id  # pyright: ignore[reportAttributeAccessIssue]  # non-None: node_id != root_id guard above ensures it
                 active_moved_to = parent_id
 
             if parent_id is not None:

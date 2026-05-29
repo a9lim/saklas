@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -30,10 +31,10 @@ class _StopTokenizer:
         3: "",
     }
 
-    def batch_decode(self, ids):
+    def batch_decode(self, ids: Any) -> list[str]:
         return [self._pieces[row[0]] for row in ids]
 
-    def decode(self, ids, skip_special_tokens=False):
+    def decode(self, ids: Any, skip_special_tokens: bool = False) -> str:
         pieces = []
         for tid in ids:
             if skip_special_tokens and tid in self.all_special_ids:
@@ -47,7 +48,7 @@ class _EchoTokenizer:
 
     name_or_path = "echo-tokenizer"
 
-    def encode(self, text, return_tensors=None):
+    def encode(self, text: str, return_tensors: str | None = None) -> Any:
         ids = [ord(c) for c in text]
         if return_tensors == "pt":
             return torch.tensor([ids], dtype=torch.long)
@@ -68,7 +69,7 @@ def test_prepare_input_raw_feeds_flat_active_path():
     a1 = tree.begin_assistant(u1)
     tree.finalize_assistant(a1, text="time")
 
-    session = SaklasSession.__new__(SaklasSession)
+    session: Any = SaklasSession.__new__(SaklasSession)
     session._tokenizer = _EchoTokenizer()
     session._device = torch.device("cpu")
     session.tree = tree
@@ -100,7 +101,7 @@ class _StopModel:
         self._tokens = [0, 1, 2]
         self._idx = 0
 
-    def __call__(self, **_kwargs):
+    def __call__(self, **_kwargs: Any) -> Any:
         tid = self._tokens[min(self._idx, len(self._tokens) - 1)]
         self._idx += 1
         logits = torch.full((1, 1, self.config.vocab_size), -100.0)
@@ -113,15 +114,15 @@ class _NoCacheModel(_StopModel):
         super().__init__()
         self._tokens = [0, 1, 3]
 
-    def __call__(self, **_kwargs):
+    def __call__(self, **_kwargs: Any) -> Any:
         out = super().__call__(**_kwargs)
         out.past_key_values = None
         return out
 
 
 def test_stop_sequence_trimmed_text_is_final_result_text():
-    model = _StopModel()
-    tokenizer = _StopTokenizer()
+    model: Any = _StopModel()
+    tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     emitted: list[str] = []
 
@@ -140,7 +141,7 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     assert state.finish_reason == "stop_sequence"
     assert state.response_text == "Hello"
 
-    session = SaklasSession.__new__(SaklasSession)
+    session: Any = SaklasSession.__new__(SaklasSession)
     session._gen_state = state
     session._tokenizer = tokenizer
     session._monitor = SimpleNamespace(probe_names=[])
@@ -175,12 +176,12 @@ def test_penalty_state_applies_sparse_counts_on_device():
     assert logits[0, 1].item() == 0.0
 
 
-def test_no_cache_fallback_does_not_cat_each_step(monkeypatch):
-    model = _NoCacheModel()
-    tokenizer = _StopTokenizer()
+def test_no_cache_fallback_does_not_cat_each_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    model: Any = _NoCacheModel()
+    tokenizer: Any = _StopTokenizer()
     state = GenerationState()
 
-    def _forbid_cat(*_args, **_kwargs):
+    def _forbid_cat(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("no-cache fallback should use the preallocated buffer")
 
     monkeypatch.setattr(torch, "cat", _forbid_cat)

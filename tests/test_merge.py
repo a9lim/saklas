@@ -1,4 +1,9 @@
 """vector merge — expression grammar + pack writer + projection math."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
 import pytest
 import torch
 
@@ -8,7 +13,7 @@ from saklas.core.vectors import save_profile
 
 # --------------------------------------------------------- expr parsing ---
 
-def test_parse_expr_two_components(monkeypatch, tmp_path):
+def test_parse_expr_two_components(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Parser rejects bare (non-namespaced) components; the happy path
     below uses a namespace-qualified expression, which shared_models
     round-trips through the parser."""
@@ -91,7 +96,12 @@ def test_linear_sum_single_component():
 
 # ---------------------------------------------- pack-writing end-to-end ---
 
-def _make_concept_with_tensors(tmp_path, ns, name, model_tensors):
+def _make_concept_with_tensors(
+    tmp_path: Path,
+    ns: str,
+    name: str,
+    model_tensors: dict[str, Any],
+) -> Path:
     d = tmp_path / "vectors" / ns / name
     d.mkdir(parents=True)
     (d / "statements.json").write_text("[]")
@@ -109,7 +119,7 @@ def _make_concept_with_tensors(tmp_path, ns, name, model_tensors):
     return d
 
 
-def test_shared_models_intersection(monkeypatch, tmp_path):
+def test_shared_models_intersection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     profile = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy",
@@ -120,7 +130,7 @@ def test_shared_models_intersection(monkeypatch, tmp_path):
     assert shared == ["gemma"]
 
 
-def test_shared_models_empty_raises(monkeypatch, tmp_path):
+def test_shared_models_empty_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     profile = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": profile})
@@ -129,7 +139,7 @@ def test_shared_models_empty_raises(monkeypatch, tmp_path):
         merge.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
 
 
-def test_merge_into_pack_single_model(monkeypatch, tmp_path):
+def test_merge_into_pack_single_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p1 = {0: torch.tensor([1.0, 0.0])}
     p2 = {0: torch.tensor([0.0, 2.0])}
@@ -149,11 +159,13 @@ def test_merge_into_pack_single_model(monkeypatch, tmp_path):
     assert (dst / "gemma.safetensors").is_file()
     sc = packs.Sidecar.load(dst / "gemma.json")
     assert sc.method == "merge"
+    # merge_into_pack always writes components; assert guards the Optional
+    assert sc.components is not None
     assert set(sc.components.keys()) == {"default/happy", "a9lim/archaic"}
     assert sc.components["default/happy"]["alpha"] == 0.5
 
 
-def test_merge_into_pack_conflict(monkeypatch, tmp_path):
+def test_merge_into_pack_conflict(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": p})
@@ -169,7 +181,7 @@ def test_merge_into_pack_conflict(monkeypatch, tmp_path):
         )
 
 
-def test_merge_into_pack_explicit_model(monkeypatch, tmp_path):
+def test_merge_into_pack_explicit_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy",
@@ -186,7 +198,7 @@ def test_merge_into_pack_explicit_model(monkeypatch, tmp_path):
     assert not (dst / "qwen.safetensors").is_file()
 
 
-def test_merge_into_pack_with_projection(monkeypatch, tmp_path):
+def test_merge_into_pack_with_projection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """merge_into_pack applies project-away when ``|`` operator is used.
 
     v2.1 fix-up: pre-v2.1 merge accepted ``~`` for project-away,
