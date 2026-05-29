@@ -156,6 +156,15 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2,
                torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
 
 
+class _NoTextWeightsExtracted(RuntimeError):
+    """No text-model weights matched the ``language_model.`` layout.
+
+    Raised by :func:`_load_text_from_multimodal` so the caller can fall
+    back to a standard full-model load rather than return a model full of
+    random initialization.
+    """
+
+
 def _load_text_from_multimodal(
     model_id: str,
     text_config: Any,
@@ -164,19 +173,37 @@ def _load_text_from_multimodal(
 ):
     """Load just the text model from a multimodal checkpoint.
 
-    Multimodal checkpoints store text-model weights under a
-    ``language_model.`` prefix.  This function creates a text-only
-    model directly on the target device, then loads each safetensors
-    shard, strips the prefix, dequantizes FP8 weights, and copies
-    them in shard-by-shard.  Vision-tower weights are skipped.
+    Multimodal checkpoints store the text-model weights under a
+    ``language_model.`` path *segment* — either as a leading prefix
+    (Mistral-3 / Ministral: ``language_model.model.layers…``) or nested
+    inside the composite model (Gemma-3 / Gemma-4:
+    ``model.language_model.layers…``).  This function builds a text-only
+    model directly on the target device, then streams each safetensors
+    shard tensor-by-tensor, drops the ``language_model.`` segment to
+    recover the text model's own parameter names, dequantizes FP8
+    weights, and copies each into the preallocated parameter.  Vision
+    tower / projector weights (no ``language_model.`` segment) are
+    skipped.
 
-    Creating on-device and loading per-shard keeps peak CPU RSS low
-    (~6 GB vs ~30 GB), which matters on Apple Silicon where CPU and
-    MPS share unified memory.
+    Two memory disciplines matter on Apple Silicon, where CPU and MPS
+    share one unified-memory pool:
+
+    * **On-device construction** — ``from_config`` under
+      ``torch.device(device)`` allocates the model once, on the target
+      device, so there is never a second full-model copy.  The standard
+      ``from_pretrained(device_map={"": "mps"})`` path stages the entire
+      state dict in CPU RAM *and* copies it to MPS before freeing the CPU
+      side — ~2× the model size at peak (>128 GB for gemma-4-31B).
+    * **Tensor-by-tensor streaming** via ``safe_open`` (lazy mmap) keeps
+      the host-side transient to a single tensor rather than a whole
+      shard — a 31 GB gemma-4 shard never fully materializes in RAM.
+
+    Raises :class:`_NoTextWeightsExtracted` if nothing matched, so the
+    caller can fall back to a full multimodal load.
     """
     import gc
     import json
-    from safetensors.torch import load_file
+    from safetensors import safe_open
     from transformers.utils import (
         cached_file,
         SAFE_WEIGHTS_INDEX_NAME,
@@ -187,6 +214,13 @@ def _load_text_from_multimodal(
     # spike RSS and eat into MPS's unified memory budget.
     with torch.device(device):
         model = AutoModelForCausalLM.from_config(text_config, dtype=dtype)
+
+    # The text model's own parameter / buffer names → their (already
+    # device-resident) tensors, so each shard tensor can be copy_'d in
+    # place.  named_parameters() de-dupes tied weights, so a tied lm_head
+    # is absent here and rides along on the shared embed_tokens storage.
+    targets: dict[str, torch.Tensor] = dict(model.named_parameters())
+    targets.update(model.named_buffers())
 
     # Prefer the sharded index; fall back to a single `model.safetensors`
     # for repos that ship consolidated weights (e.g. Ministral-3-3B).
@@ -203,37 +237,45 @@ def _load_text_from_multimodal(
         single_path = cached_file(model_id, SAFE_WEIGHTS_NAME)
         shard_paths = [single_path]
 
-    prefix = "language_model."
-
-    for sf in shard_paths:
-        # cached_file returns str | None; None means a missing shard — skip it.
-        # In practice, the single-shard path above would raise before we get here.
-        if sf is None:
-            continue
-        shard = load_file(sf, device="cpu")
-        mapped: dict[str, torch.Tensor] = {}
-
-        for k, v in shard.items():
-            if not k.startswith(prefix):
+    matched = 0
+    with torch.no_grad():
+        for sf in shard_paths:
+            # cached_file returns str | None; None means a missing shard —
+            # skip it. In practice the single-shard path raises before here.
+            if sf is None:
                 continue
-            key = k[len(prefix):]
-            if key.endswith(".weight_scale_inv") or key.endswith(".activation_scale"):
-                continue
+            with safe_open(sf, framework="pt", device="cpu") as f:
+                keyset = set(f.keys())
+                for k in keyset:
+                    if "language_model." not in k:
+                        continue  # vision tower / projector — skip
+                    # Drop the language_model. segment to recover the text
+                    # model's own parameter name. Works for both layouts:
+                    #   language_model.model.layers… -> model.layers…
+                    #   model.language_model.layers… -> model.layers…
+                    key = k.replace("language_model.", "", 1)
+                    if key.endswith(".weight_scale_inv") or key.endswith(".activation_scale"):
+                        continue
+                    target = targets.get(key)
+                    if target is None:
+                        continue
+                    v = f.get_tensor(k)
+                    # Dequantize FP8: real_weight = weight.to(dtype) * scale
+                    if v.dtype in _FP8_DTYPES:
+                        sk = k + "_scale_inv"
+                        scale = f.get_tensor(sk) if sk in keyset else None
+                        v = v.to(dtype) * scale.to(dtype) if scale is not None else v.to(dtype)
+                    target.copy_(v)  # CPU→device cast + copy into preallocated param
+                    matched += 1
+                    del v
+            if device == "mps":
+                torch.mps.empty_cache()
+            gc.collect()
 
-            # Dequantize FP8: real_weight = weight.to(dtype) * scale
-            if v.dtype in _FP8_DTYPES:
-                scale = shard.get(k + "_scale_inv")
-                if scale is not None:
-                    v = v.to(dtype) * scale.to(dtype)
-                else:
-                    v = v.to(dtype)
-            mapped[key] = v.to(device=device, dtype=dtype)
-
-        if mapped:
-            model.load_state_dict(mapped, strict=False)
-
-        del shard, mapped
-        gc.collect()
+    if matched == 0:
+        raise _NoTextWeightsExtracted(
+            f"no text-model weights matched the language_model. layout in {model_id!r}"
+        )
 
     if device == "mps":
         torch.mps.empty_cache()
@@ -566,28 +608,42 @@ def load_model(
         load_kwargs["dtype"] = resolved_dtype
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust)
     text_cfg = getattr(config, "text_config", None)
+    # A non-None text_config means a multimodal wrapper. When it wraps a
+    # text model saklas supports, load *only* the text submodel: it skips
+    # the unused vision tower and — crucially — loads on-device shard-by-
+    # shard so peak memory stays ~1× the model size instead of the ~2× the
+    # standard CPU-stage-then-device-copy path costs on unified memory (the
+    # >128 GB gemma-4-31B blowup). This fires even when the outer composite
+    # model_type is itself in _LAYER_ACCESSORS (gemma3/gemma4): the full
+    # multimodal model is still usable when handed to SaklasSession
+    # directly, but the from_pretrained path prefers text-only.
     extract_text_model = (
         text_cfg is not None
         and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
-        and getattr(config, "model_type", None) not in _LAYER_ACCESSORS
     )
 
+    model = None
     if extract_text_model:
-        # Multimodal checkpoint wrapping a supported text-only model
-        # (e.g. Ministral tagged as Mistral3).  Weights are stored
-        # with a "language_model." prefix that doesn't match the
-        # text-only model's parameter names.  Load manually.
+        # Weights live under a "language_model." path segment that doesn't
+        # match the text-only model's parameter names.  Load manually.
         # Propagate _name_or_path so cache paths resolve correctly.
         assert text_cfg is not None  # guaranteed by extract_text_model condition above
         if not getattr(text_cfg, "_name_or_path", ""):
             text_cfg._name_or_path = model_id
         log.info("extracting text model (%s) from multimodal checkpoint (%s)",
                  text_cfg.model_type, config.model_type)
-        model = _load_text_from_multimodal(
-            model_id, text_cfg, load_kwargs.get("dtype", resolved_dtype),
-            device,
-        )
-    else:
+        try:
+            model = _load_text_from_multimodal(
+                model_id, text_cfg, load_kwargs.get("dtype", resolved_dtype),
+                device,
+            )
+        except _NoTextWeightsExtracted as e:
+            # Unexpected weight layout — don't ship random init; fall through
+            # to the standard full-model load below.
+            log.warning("%s; falling back to full multimodal load", e)
+            model = None
+
+    if model is None:
         # --- standard load (with attention, dtype, and device fallbacks) ---
         def _try_load_with_fallbacks():
             try:
