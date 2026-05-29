@@ -229,14 +229,6 @@ async function request<T>(
   return (await r.text()) as unknown as T;
 }
 
-/** Legacy export — preserved for the v1.6 stores.ts file.  Throws ``Error``
- * (not ``ApiError``) for backwards-compat. */
-export async function getJson<T>(path: string): Promise<T> {
-  const r = await fetch(path, { headers: authHeaders() });
-  if (!r.ok) throw new Error(`${path}: ${r.status}`);
-  return (await r.json()) as T;
-}
-
 function jsonBody(body: unknown): RequestInit {
   return {
     method: "POST",

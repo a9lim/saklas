@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import _EXPERIMENT_VERBS, _PACK_VERBS, _VECTOR_VERBS
 from saklas.core.errors import SaklasError
+from saklas.core.stats import median_or_zero
 
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
@@ -1255,16 +1256,6 @@ def _summarize_diagnostics(
     extraction-time warning uses.  Mirrored in the JSON output so callers
     don't have to recompute it client-side.
     """
-    def _median(values: list[float]) -> float:
-        s = sorted(values)
-        n = len(s)
-        if n == 0:
-            return 0.0
-        mid = n // 2
-        if n % 2 == 1:
-            return s[mid]
-        return 0.5 * (s[mid - 1] + s[mid])
-
     evrs = [m["evr"] for m in diagnostics.values() if "evr" in m]
     intras = [
         m["intra_pair_variance_mean"]
@@ -1282,10 +1273,10 @@ def _summarize_diagnostics(
         if "diff_principal_projection" in m
     ]
 
-    med_evr = _median(evrs) if evrs else 0.0
-    med_intra = _median(intras) if intras else 0.0
-    med_align = _median(aligns) if aligns else 0.0
-    med_proj = _median(projs) if projs else 0.0
+    med_evr = median_or_zero(evrs)
+    med_intra = median_or_zero(intras)
+    med_align = median_or_zero(aligns)
+    med_proj = median_or_zero(projs)
 
     if med_evr > 0.95 and med_intra < 0.01:
         quality = "poor"
@@ -1534,21 +1525,9 @@ def _run_transfer(args: argparse.Namespace) -> None:
     )
 
 
-def _domain_label(spec: dict[str, Any]) -> str:
-    """Short ``type(Nd)`` label for a manifold domain spec dict."""
-    kind = spec.get("type", "?")
-    if kind == "box":
-        n = len(spec.get("axes", []))
-    elif kind == "sphere":
-        n = int(spec.get("dim", 0))
-    elif kind == "custom":
-        n = int(spec.get("embed_dim", 0))
-    else:
-        n = 0
-    return f"{kind}({n}d)"
-
-
 def _run_manifold_fit(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import domain_label
+
     _require_model(args)
     folder = Path(args.folder)
     if not (folder / "manifold.json").exists():
@@ -1572,7 +1551,7 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
     print(
         f"fitted manifold '{manifold.name}' "
         f"({len(manifold.layers)} layers, {len(manifold.node_labels)} nodes, "
-        f"{_domain_label(manifold.domain.to_spec())}, "
+        f"{domain_label(manifold.domain.to_spec())}, "
         f"{manifold.feature_space})"
     )
 
@@ -1605,6 +1584,7 @@ def _iter_manifold_folders(namespace: str | None):
 
 def _run_manifold_ls(args: argparse.Namespace) -> None:
     import json as _json
+    from saklas.io.manifolds import domain_label
 
     rows = list(_iter_manifold_folders(getattr(args, "namespace", None)))
     if getattr(args, "json_output", False):
@@ -1623,7 +1603,7 @@ def _run_manifold_ls(args: argparse.Namespace) -> None:
         print("no manifolds installed under ~/.saklas/manifolds/")
         return
     for ns, mf in rows:
-        kind = _domain_label(mf.domain)
+        kind = domain_label(mf.domain)
         models = ", ".join(mf.tensor_models()) or "(unfitted)"
         print(
             f"  {ns}/{mf.name}  [{kind}, {len(mf.node_labels)} nodes]  {models}"
@@ -1632,6 +1612,7 @@ def _run_manifold_ls(args: argparse.Namespace) -> None:
 
 def _run_manifold_show(args: argparse.Namespace) -> None:
     import json as _json
+    from saklas.io.manifolds import domain_label
 
     name = args.name
     target_ns = None
@@ -1748,7 +1729,7 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
             else:
                 print(f"    {label}  (coords pending fit){role_tail}")
     else:
-        print(f"  domain: {_domain_label(mf.domain)}")
+        print(f"  domain: {domain_label(mf.domain)}")
         print("  nodes:")
         for label, coords, role in zip(
             mf.node_labels, mf.node_coords, node_roles_padded,
@@ -1831,6 +1812,8 @@ def _resolve_manifold_folder(name: str) -> Path:
 
 
 def _run_manifold_discover(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import domain_label
+
     """``saklas vector manifold discover`` — fit a discover-mode manifold.
 
     The folder must already exist (usually created by ``generate``) and
@@ -1925,7 +1908,7 @@ def _run_manifold_discover(args: argparse.Namespace) -> None:
         f"discovered manifold '{manifold.name}' "
         f"({len(manifold.layers)} layers, "
         f"{len(manifold.node_labels)} nodes, "
-        f"{_domain_label(manifold.domain.to_spec())}, "
+        f"{domain_label(manifold.domain.to_spec())}, "
         f"{manifold.feature_space}, "
         f"fit_mode={new_fit_mode})"
     )

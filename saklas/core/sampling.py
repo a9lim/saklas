@@ -62,6 +62,11 @@ class SamplingConfig:
     # prompt so steer baseline matches extract baseline.
     user_role: str | None = None
     assistant_role: str | None = None
+    # Persist per-layer probe heatmaps on loom token rows.  Aggregate probe
+    # scores are cheap enough to keep by default for reloadable highlights;
+    # this heavier layer×probe payload is opt-in for surfaces such as the
+    # native dashboard token drilldown.
+    persist_per_layer_scores: bool = False
 
     def __post_init__(self) -> None:
         # Accept list[str] from callers; store as tuple so the frozen
@@ -98,6 +103,7 @@ class SamplingConfig:
         "return_top_k": 0,
         "user_role": None,
         "assistant_role": None,
+        "persist_per_layer_scores": False,
     }
 
     def merged_with(self, other: "SamplingConfig | None") -> "SamplingConfig":

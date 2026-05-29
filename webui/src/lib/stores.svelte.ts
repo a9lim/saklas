@@ -1765,6 +1765,7 @@ function buildSamplingPayload(): WSSampling | null {
   // advanced extras (penalties, stop, logit-bias, return_top_k) aren't
   // PATCH-able either — both always ride per-call.
   const payload: WSSampling = {
+    persist_per_layer_scores: true,
     ...nonDefaultSamplingOverrides(),
     ...(samplingState.seed !== null ? { seed: samplingState.seed } : {}),
   };

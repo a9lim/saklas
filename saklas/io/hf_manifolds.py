@@ -22,7 +22,13 @@ from typing import Any, Optional
 
 from saklas.core.errors import SaklasError
 from saklas.io.atomic import write_bytes_atomic
-from saklas.io.hf import HFError, _hf_api, _hf_hub_download, _hf_snapshot_download
+from saklas.io.hf import (
+    HFError,
+    _hf_api,
+    _hf_hub_download,
+    _hf_snapshot_download,
+    split_revision,
+)
 from saklas.io.manifolds import (
     MANIFOLD_FORMAT_VERSION,
     ManifoldFolder,
@@ -347,21 +353,6 @@ class ManifoldInstallConflict(RuntimeError, SaklasError):
 
     def user_message(self) -> tuple[int, str]:
         return (409, str(self) or self.__class__.__name__)
-
-
-def split_revision(target: str) -> tuple[str, Optional[str]]:
-    """Split ``owner/name@revision`` into ``(coord, revision)``.
-
-    Mirrors :func:`saklas.io.hf.split_revision` for symmetry — manifold
-    names use the same ``NAME_REGEX`` as pack names, so ``@`` is
-    unambiguous as a revision separator.
-    """
-    if "@" not in target:
-        return target, None
-    coord, _, rev = target.partition("@")
-    if not rev:
-        raise HFError(f"empty revision after '@' in {target!r}")
-    return coord, rev
 
 
 def install_manifold(

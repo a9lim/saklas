@@ -38,6 +38,7 @@ from saklas.io.manifolds import (
     _sanitize_hyperparams,
     create_discover_manifold_folder,
     create_manifold_folder,
+    domain_label,
     iter_manifold_folders,
     merge_discover_manifolds,
     min_nodes,
@@ -206,22 +207,6 @@ class MergeManifoldRequest(BaseModel):
     force: bool = False
 
 
-# ------------------------------------------------------------------ helpers ---
-
-def _domain_label(spec: dict[str, Any]) -> str:
-    """Short ``type(Nd)`` label for a manifold domain spec dict."""
-    kind = spec.get("type", "?")
-    if kind == "box":
-        n = len(spec.get("axes", []))
-    elif kind == "sphere":
-        n = int(spec.get("dim", 0))
-    elif kind == "custom":
-        n = int(spec.get("embed_dim", 0))
-    else:
-        n = 0
-    return f"{kind}({n}d)"
-
-
 def _intrinsic_dim(spec: dict[str, Any]) -> int:
     try:
         return domain_from_spec(spec).intrinsic_dim
@@ -325,7 +310,7 @@ def _manifold_json(
         # surface the materialized ``CustomDomain(picked_k)`` spec so
         # the rack strip can build N sliders.
         "domain": effective_domain,
-        "domain_label": _domain_label(effective_domain) if effective_domain else _domain_label(mf.domain),
+        "domain_label": domain_label(effective_domain) if effective_domain else domain_label(mf.domain),
         "intrinsic_dim": n,
         "min_nodes": min_nodes(n) if n > 0 else None,
         "node_count": len(mf.node_labels),

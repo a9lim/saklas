@@ -155,9 +155,27 @@ def _finite_float(value: torch.Tensor | float) -> float | None:
     return out if math.isfinite(out) else None
 
 
+_LogprobRows = torch.Tensor | dict[int, torch.Tensor]
+
+
+def _logprob_row(rows: _LogprobRows, row_idx: int) -> torch.Tensor | None:
+    if isinstance(rows, dict):
+        return rows.get(row_idx)
+    if 0 <= row_idx < rows.shape[0]:
+        return rows[row_idx]
+    return None
+
+
+def _logprob_value(rows: _LogprobRows, row_idx: int, token_id: int) -> float | None:
+    row = _logprob_row(rows, row_idx)
+    if row is None or token_id < 0 or token_id >= row.shape[-1]:
+        return None
+    return _finite_float(row[token_id])
+
+
 def _compute_rows(
-    logp_a: torch.Tensor,        # [T_a, V] sampler-renormalized logprobs
-    logp_b: torch.Tensor,        # [T_b, V]
+    logp_a: _LogprobRows,        # sampler-renormalized logprobs by predictor row
+    logp_b: _LogprobRows,
     token_ids_a: list[int],      # full sequence (prefix + assistant) for A
     token_ids_b: list[int],
     token_strs_a: list[str],     # decoded text per id (display) for A's full seq
@@ -201,9 +219,9 @@ def _compute_rows(
         lp_a_in_a: float | None = None
         lp_b_in_b: float | None = None
         if 0 <= a_idx < len(assistant_ids_a):
-            lp_a_in_a = _finite_float(logp_a[pa_pos, assistant_ids_a[a_idx]])
+            lp_a_in_a = _logprob_value(logp_a, pa_pos, assistant_ids_a[a_idx])
         if 0 <= b_idx < len(assistant_ids_b):
-            lp_b_in_b = _finite_float(logp_b[pb_pos, assistant_ids_b[b_idx]])
+            lp_b_in_b = _logprob_value(logp_b, pb_pos, assistant_ids_b[b_idx])
 
         # Cross-evaluation: only meaningful when the positions actually
         # align (byte-equal context up to here).  On divergent rows the
@@ -214,16 +232,23 @@ def _compute_rows(
         rank_changed = False
         approx_kl: float | None = None
         if sp.aligned and 0 <= a_idx < len(assistant_ids_a) and 0 <= b_idx < len(assistant_ids_b):
-            lp_a_in_b = _finite_float(logp_b[pb_pos, assistant_ids_a[a_idx]])
-            lp_b_in_a = _finite_float(logp_a[pa_pos, assistant_ids_b[b_idx]])
-            # Rank-1 change: does the argmax differ at this aligned
-            # position?  Cheap signal — one ``argmax`` per side.
-            argmax_a = int(logp_a[pa_pos].argmax().item())
-            argmax_b = int(logp_b[pb_pos].argmax().item())
-            rank_changed = argmax_a != argmax_b
-            approx_kl = _finite_float(_approx_kl_topk(
-                logp_a[pa_pos], logp_b[pb_pos], kl_top_k,
-            ))
+            row_a = _logprob_row(logp_a, pa_pos)
+            row_b = _logprob_row(logp_b, pb_pos)
+            if row_a is not None and row_b is not None:
+                lp_a_in_b = _logprob_value(
+                    logp_b, pb_pos, assistant_ids_a[a_idx],
+                )
+                lp_b_in_a = _logprob_value(
+                    logp_a, pa_pos, assistant_ids_b[b_idx],
+                )
+                # Rank-1 change: does the argmax differ at this aligned
+                # position?  Cheap signal — one ``argmax`` per side.
+                argmax_a = int(row_a.argmax().item())
+                argmax_b = int(row_b.argmax().item())
+                rank_changed = argmax_a != argmax_b
+                approx_kl = _finite_float(_approx_kl_topk(
+                    row_a, row_b, kl_top_k,
+                ))
 
         rows.append(JointLogprobRow(
             a_index=a_idx,
@@ -432,18 +457,23 @@ def _call_model(model: Any, **kwargs: Any) -> Any:
 def _replay_branch_logprobs(
     session: "SaklasSession",
     branch: _ReplayBranch,
-) -> torch.Tensor:
-    """Force-replay one branch and return visible response-row logprobs."""
+) -> dict[int, torch.Tensor]:
+    """Force-replay one branch and return visible response-row logprobs.
+
+    The result is keyed by predictor row in the full branch sequence.  Only
+    response-token rows are retained; prompt rows and thinking-only rows are
+    intentionally absent so long branches do not allocate dense
+    ``[n_rows, vocab]`` tensors filled mostly with ``-inf``.
+    """
     model = session._model
     try:
         device = next(model.parameters()).device
     except StopIteration:  # pragma: no cover - defensive for odd test doubles
         device = torch.device("cpu")
 
-    n_rows = len(branch.token_ids)
     forced_ids = branch.thinking_ids + branch.response_ids
     if not forced_ids:
-        return torch.empty((n_rows, 0), dtype=torch.float32)
+        return {}
     if not branch.prompt_ids:
         raise ValueError("joint-logprob replay requires a non-empty prompt")
 
@@ -590,17 +620,7 @@ def _replay_branch_logprobs(
             if monitor is not None and hasattr(monitor, "end_live"):
                 monitor.end_live()
 
-    if vocab_size is None:
-        return torch.empty((n_rows, 0), dtype=torch.float32)
-    out = torch.full(
-        (n_rows, vocab_size),
-        float("-inf"),
-        dtype=torch.float32,
-    )
-    for row_idx, logp in row_logps.items():
-        if 0 <= row_idx < n_rows:
-            out[row_idx] = logp
-    return out
+    return row_logps if vocab_size is not None else {}
 
 
 def compute_joint_logprobs(

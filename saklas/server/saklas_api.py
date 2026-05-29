@@ -30,7 +30,6 @@ import json
 import time
 import uuid
 from collections import deque
-from dataclasses import replace as _replace
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -39,13 +38,14 @@ from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
-from saklas.io.probes_bootstrap import load_defaults
+from saklas.io.probes_bootstrap import load_defaults  # noqa: F401
 from saklas.core.loom import LoomMutated
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.ws_events import build_token_event
 
 
 _SINGLE_SESSION_ID = "default"
@@ -149,6 +149,10 @@ class WSSamplingParams(BaseModel):
     # SamplingConfig layer to ``[0, 256]``; pydantic accepts the int
     # and forwards as-is.
     return_top_k: int = 0
+    # Native-dashboard opt-in for the heavier layer×probe heatmap payload.
+    # Regular API clients can leave this false and still get aggregate
+    # per-token probe scores.
+    persist_per_layer_scores: bool = False
     # Per-message role-substitution labels (roleplay scaffold).  Ride each
     # generate like ``seed``; stamped onto the produced loom nodes (user
     # turn ← ``user_role``, generated assistant turn ← ``assistant_role``)
@@ -278,24 +282,6 @@ class JointLogprobsRequest(BaseModel):
     b_id: str
 
 
-class InstallPackRequest(BaseModel):
-    """Body for ``POST /saklas/v1/packs``.
-
-    ``target`` is an HF coordinate (``ns/name[@rev]``) or a local folder
-    path — the same surface ``saklas pack install`` consumes.  ``as_``
-    relocates the install to ``<dst_ns>/<dst_name>``; ``force``
-    overwrites an existing folder; ``statements_only`` strips tensors
-    after install.  Field name ``as_`` (Pydantic alias ``as``) avoids
-    shadowing the Python keyword on the wire.
-    """
-    target: str
-    as_: str | None = Field(default=None, alias="as")
-    force: bool = False
-    statements_only: bool = False
-
-    model_config = {"populate_by_name": True}
-
-
 class MergeVectorRequest(BaseModel):
     """Body for ``POST /saklas/v1/sessions/{id}/vectors/merge``.
 
@@ -321,24 +307,6 @@ class CloneVectorRequest(BaseModel):
     n_pairs: int = 90
     seed: int | None = None
     baseline: str | None = None
-
-
-class ManifoldProbeRequest(BaseModel):
-    """Body for ``POST /saklas/v1/manifold-probes``.
-
-    ``selector`` rides the same ``[ns/]name[:variant]`` shape the
-    steering grammar's ``%`` operator consumes — the artifact loads
-    through :meth:`SaklasSession._ensure_manifold_loaded`, so a probe
-    registered here shares the cache with any matching ``%`` steering
-    term.  ``name`` overrides the registered probe name (defaults to
-    ``selector``); ``top_n`` controls the per-token nearest-node list
-    length (defaults to :data:`saklas.core.monitor.DEFAULT_NEAREST_TOP_N`,
-    currently 3).
-    """
-
-    selector: str
-    name: str | None = None
-    top_n: int | None = None
 
 
 class ExperimentFanRequest(BaseModel):
@@ -530,6 +498,7 @@ def _build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
         return_top_k=body.return_top_k,
         user_role=(body.user_role or None),
         assistant_role=(body.assistant_role or None),
+        persist_per_layer_scores=bool(body.persist_per_layer_scores),
     )
 
 
@@ -791,39 +760,6 @@ def _yaml_inline(value: Any) -> str:
     return json.dumps(value)
 
 
-def _manifold_probe_info(name: str, probe: Any) -> dict[str, Any]:
-    """Serialize one :class:`AttachedManifoldProbe` to JSON for the wire.
-
-    Carries enough metadata for a client to render the manifold's
-    intrinsic structure — domain spec + intrinsic dimension, node
-    labels, the layer set the probe covers, and the configured
-    ``top_n`` nearest-node depth.  Mirrors the shape
-    ``GET /saklas/v1/manifolds`` ships for an artifact, restricted to
-    the fields a read-side probe needs (no per-node statements, no fit
-    diagnostics — the probe is the *runtime* view).
-    """
-    manifold = probe.manifold
-    try:
-        domain_spec = manifold.domain.to_spec()
-    except Exception:
-        domain_spec = {}
-    try:
-        intrinsic_dim = int(manifold.domain.intrinsic_dim)
-    except Exception:
-        intrinsic_dim = 0
-    return {
-        "name": name,
-        "manifold": manifold.name,
-        "top_n": int(probe.top_n),
-        "layers": sorted(manifold.layers.keys()),
-        "node_labels": list(manifold.node_labels),
-        "node_count": len(manifold.node_labels),
-        "domain": domain_spec,
-        "intrinsic_dim": intrinsic_dim,
-        "feature_space": manifold.feature_space,
-    }
-
-
 def _manifold_aggregate_dict(session: SaklasSession) -> dict[str, Any]:
     """Build ``{probe_name: ManifoldAggregate.to_dict()}`` from ``_last_result``.
 
@@ -884,328 +820,18 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     # ----- manifold probes (read-side counterpart to manifold steering) --
 
-    @app.get("/saklas/v1/manifold-probes")
-    def list_manifold_probes():
-        """List every manifold probe currently attached to the session.
-
-        Probes are top-level rather than session-scoped on the wire
-        (mirroring the manifold-artifact routes) because the single
-        session is implicit.  Each row carries the manifold's domain
-        spec, intrinsic dimension, layer coverage, and node labels —
-        enough for a client to render the manifold's geometry without
-        a follow-up fetch of the source artifact.
-        """
-        try:
-            attached = session.manifold_monitor.attached_probes()
-        except Exception:
-            attached = {}
-        return {
-            "probes": [
-                _manifold_probe_info(name, probe)
-                for name, probe in attached.items()
-            ],
-        }
-
-    @app.post("/saklas/v1/manifold-probes", status_code=201)
-    def add_manifold_probe(req: ManifoldProbeRequest):
-        """Attach a manifold probe by selector.
-
-        Wraps :meth:`SaklasSession.add_manifold_probe`; the selector
-        rides the same ``[ns/]name[:variant]`` shape the ``%`` steering
-        operator consumes, so a probe attached here participates in
-        the same lazy-load cache as a manifold steered with
-        ``<selector>%<position>``.  Returns the registered probe info
-        in the same shape ``GET /saklas/v1/manifold-probes`` rows use.
-        """
-        if not req.selector or not req.selector.strip():
-            raise HTTPException(400, "selector must not be empty")
-        top_n = req.top_n if req.top_n and req.top_n > 0 else 3
-        try:
-            registered_name = session.add_manifold_probe(
-                req.selector, as_name=req.name, top_n=top_n,
-            )
-        except FileNotFoundError as e:
-            raise HTTPException(404, str(e))
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        attached = session.manifold_monitor.attached_probes()
-        probe = attached.get(registered_name)
-        if probe is None:
-            raise HTTPException(
-                500,
-                f"manifold probe '{registered_name}' attach did not register",
-            )
-        return _manifold_probe_info(registered_name, probe)
-
-    @app.delete(
-        "/saklas/v1/manifold-probes/{name:path}",
-        status_code=204,
-    )
-    def remove_manifold_probe(name: str):
-        """Detach a previously-attached manifold probe.
-
-        404 when ``name`` is not currently registered.  Mirrors the
-        ``DELETE /probes/{name}`` shape for vector probes.
-
-        ``{name:path}`` (not the default single-segment ``{name}``) is
-        load-bearing — manifold probes are commonly registered under
-        their qualified selector (``default/personas``), and the ``/``
-        survives URL decoding before route matching.  A plain ``{name}``
-        won't match those probes and detach silently 404s.
-        """
-        try:
-            attached_names = session.manifold_monitor.probe_names
-        except Exception:
-            attached_names = []
-        if name not in attached_names:
-            raise HTTPException(404, f"manifold probe '{name}' not attached")
-        session.remove_manifold_probe(name)
-        return JSONResponse(status_code=204, content=None)
+    from saklas.server.manifold_probe_routes import register_manifold_probe_routes
+    register_manifold_probe_routes(app)
 
     # ----- packs (top-level, not under a session) ------------------------
 
-    @app.get("/saklas/v1/packs")
-    def list_packs():
-        """Return locally installed packs as JSON.
-
-        Mirrors ``saklas pack ls`` (local-only branch). HF hub query is
-        the separate ``GET /saklas/v1/packs/search`` route — keeps the
-        common case (UI rack refresh) off the network.
-
-        Each row carries a session-relative ``has_tensor`` flag: ``True``
-        when the pack folder contains a baked tensor for the loaded
-        model (``<safe_model_id>.safetensors``).  The unified webui
-        vectors drawer splits the list on that flag — extracted rows
-        get steer/probe/delete actions, statements-only rows get
-        extract/delete — so the client doesn't have to re-derive the
-        safe-model-id slug.
-        """
-        from saklas.io.cache_ops import list_concepts as _list_concepts
-        from saklas.io.paths import safe_model_id as _safe_id
-        result = _list_concepts(None, hf=False)
-        sid = _safe_id(session.model_id)
-        return {
-            "packs": [
-                {
-                    "name": r.name,
-                    "namespace": r.namespace,
-                    "status": r.status,
-                    "recommended_alpha": r.recommended_alpha,
-                    "tags": list(r.tags),
-                    "description": r.description,
-                    "source": r.source,
-                    "tensor_models": list(r.tensor_models),
-                    "has_tensor": sid in r.tensor_models,
-                    **({"error": r.error} if r.error else {}),
-                }
-                for r in result.installed
-            ],
-        }
-
-    @app.get("/saklas/v1/packs/search")
-    def search_packs(q: str = "", limit: int = 50):
-        """HF-hub search proxy returning JSON.
-
-        Wraps :func:`saklas.io.cache_ops.search_remote_packs` so the UI
-        gets structured rows (not the CLI's text rendering). ``q`` is a
-        free-form query against repo ids; ``limit`` clamps the response
-        size client-side. HF transport errors land as 502; missing
-        ``huggingface_hub`` lands as 503.
-        """
-        from saklas.io.cache_ops import search_remote_packs as _search
-        try:
-            rows = _search(q)
-        except ImportError as e:
-            raise HTTPException(503, f"hf search unavailable: {e}")
-        except Exception as e:
-            raise HTTPException(502, f"hf search failed: {type(e).__name__}: {e}")
-        if limit and limit > 0:
-            rows = rows[:limit]
-        return {
-            "query": q,
-            "results": [
-                {
-                    "name": r.name,
-                    "namespace": r.namespace,
-                    "recommended_alpha": r.recommended_alpha,
-                    "tags": list(r.tags),
-                    "description": r.description,
-                    "tensor_models": list(r.tensor_models),
-                }
-                for r in rows
-            ],
-        }
-
-    @app.post("/saklas/v1/packs")
-    async def install_pack(req: InstallPackRequest):
-        """Install a pack from HF or a local folder.
-
-        Wraps :func:`saklas.io.cache_ops.install`; runs in a worker
-        thread because the HF download path is blocking. ``InstallConflict``
-        (409) and ``ValueError`` (400) propagate via the existing
-        ``SaklasError`` handler / generic mapping.
-        """
-        from saklas.io.cache_ops import install as _install, InstallConflict
-        try:
-            dst = await asyncio.to_thread(
-                _install,
-                req.target,
-                req.as_,
-                force=req.force,
-                statements_only=req.statements_only,
-            )
-        except FileNotFoundError as e:
-            raise HTTPException(404, f"pack not found: {e}")
-        except InstallConflict as e:
-            raise HTTPException(409, str(e))
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        return {
-            "target": req.target,
-            "installed_at": str(dst),
-            "statements_only": req.statements_only,
-        }
-
-    @app.delete("/saklas/v1/packs/{namespace}/{name}")
-    async def delete_pack(namespace: str, name: str):
-        """Remove a locally installed pack folder.
-
-        Wraps :func:`saklas.io.cache_ops.uninstall` on the parsed
-        ``<namespace>/<name>`` selector.  Always passes ``yes=True`` —
-        the selector is fully qualified so there's no broad-selector
-        risk, and the webui surfaces its own two-step confirm before
-        calling this.
-
-        If the concept is currently registered on the session
-        (steering rack or active probe), unsteers / deactivates it
-        first so the engine doesn't keep a stale pointer.  Bundled
-        concepts re-materialize on next session init — the response
-        carries ``rematerializes_on_restart: True`` for the source so
-        the client can surface a friendlier toast.
-
-        Returns ``{namespace, name, source, removed, rematerializes_on_restart}``.
-        404 if nothing matched the selector.
-        """
-        from saklas.io.cache_ops import uninstall as _uninstall
-        from saklas.io.selectors import parse as _parse_selector
-        try:
-            selector = _parse_selector(f"{namespace}/{name}")
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-
-        # Capture source before deletion so the response can carry the
-        # rematerializes-on-restart hint.  ``ConceptRow.source`` is the
-        # canonical "bundled" / "local" / "hf://..." string.
-        from saklas.io.cache_ops import list_concepts as _list_concepts
-        rows = _list_concepts(None, hf=False).installed
-        match = next(
-            (r for r in rows if r.namespace == namespace and r.name == name),
-            None,
-        )
-        if match is None:
-            raise HTTPException(404, f"pack '{namespace}/{name}' not installed")
-        source = match.source
-
-        # Detach from the session under the lock — refuses mid-extraction
-        # via the engine's gen-lock guard (mutations during generation
-        # raise; the lock here serializes against streaming requests).
-        async with session.lock:
-            await asyncio.to_thread(
-                lambda: (
-                    session.unsteer(name) if name in session.vectors else None,
-                ),
-            )
-            # ``session.vectors`` is keyed by canonical name; the namespace
-            # form is also worth trying for ns-qualified registrations.
-            qualified = f"{namespace}/{name}"
-            if qualified in session.vectors:
-                await asyncio.to_thread(session.unsteer, qualified)
-            try:
-                count = await asyncio.to_thread(
-                    _uninstall, selector, yes=True,
-                )
-            except RuntimeError as e:
-                raise HTTPException(400, str(e))
-
-        if count == 0:
-            raise HTTPException(404, f"pack '{namespace}/{name}' not installed")
-        return {
-            "namespace": namespace,
-            "name": name,
-            "source": source,
-            "removed": count,
-            "rematerializes_on_restart": source == "bundled",
-        }
+    from saklas.server.pack_routes import register_pack_routes
+    register_pack_routes(app)
 
     # ----- sessions collection -------------------------------------------
 
-    @app.get("/saklas/v1/sessions")
-    def list_sessions():
-        return {"sessions": [_session_info(session, app.state.default_steering)]}
-
-    @app.post("/saklas/v1/sessions")
-    def create_session(req: CreateSessionRequest):
-        if req.model and req.model != session.model_id:
-            # Idempotent: log and return existing, per plan.
-            import logging
-            logging.getLogger("saklas.api").warning(
-                "POST /saklas/v1/sessions requested model=%r but session is %r; "
-                "single-session mode, returning existing",
-                req.model, session.model_id,
-            )
-        return _session_info(session, app.state.default_steering)
-
-    @app.get("/saklas/v1/sessions/{session_id}")
-    def get_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        return _session_info(session, app.state.default_steering)
-
-    @app.delete("/saklas/v1/sessions/{session_id}", status_code=204)
-    def delete_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        import logging
-        logging.getLogger("saklas.api").warning(
-            "DELETE /saklas/v1/sessions/%s: single-session mode, no-op",
-            session_id,
-        )
-        return JSONResponse(status_code=204, content=None)
-
-    @app.patch("/saklas/v1/sessions/{session_id}")
-    def patch_session(session_id: str, req: PatchSessionRequest):
-        _resolve_session_id(session, session_id)
-        overrides: dict[str, Any] = {}
-        if req.temperature is not None:
-            overrides["temperature"] = req.temperature
-        if req.top_p is not None:
-            overrides["top_p"] = req.top_p
-        if req.top_k is not None:
-            overrides["top_k"] = req.top_k
-        if req.max_tokens is not None:
-            overrides["max_new_tokens"] = req.max_tokens
-        if req.system_prompt is not None:
-            overrides["system_prompt"] = req.system_prompt
-        if overrides:
-            from dataclasses import is_dataclass
-            if is_dataclass(session.config):
-                session.config = _replace(session.config, **overrides)
-            else:
-                for k, v in overrides.items():
-                    setattr(session.config, k, v)
-        return _session_info(session, app.state.default_steering)
-
-    @app.post("/saklas/v1/sessions/{session_id}/clear", status_code=204)
-    def clear_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        session.clear_history()
-        return JSONResponse(status_code=204, content=None)
-
-    @app.post("/saklas/v1/sessions/{session_id}/rewind", status_code=204)
-    def rewind_session(session_id: str):
-        _resolve_session_id(session, session_id)
-        if not session.history:
-            raise HTTPException(400, "History is empty")
-        session.rewind()
-        return JSONResponse(status_code=204, content=None)
+    from saklas.server.session_routes import register_session_routes
+    register_session_routes(app)
 
     # ----- loom tree (v2.3 phase 2) --------------------------------------
 
@@ -2312,205 +1938,16 @@ def register_saklas_routes(app: FastAPI) -> None:
             payload["diagnostics_summary"] = _summarize_diagnostics(diagnostics)
         return payload
 
-    # ----- probes --------------------------------------------------------
+    # ----- probes / experiments / live traits ----------------------------
 
-    @app.get("/saklas/v1/sessions/{session_id}/probes")
-    def list_probes(session_id: str):
-        _resolve_session_id(session, session_id)
-        names = sorted(session.probes.keys())
-        return {"probes": [_probe_info(session, n) for n in names]}
+    from saklas.server.probe_routes import register_probe_routes
+    register_probe_routes(app)
 
-    @app.get("/saklas/v1/sessions/{session_id}/probes/defaults")
-    def list_default_probes(session_id: str):
-        _resolve_session_id(session, session_id)
-        return {"defaults": load_defaults()}
+    from saklas.server.experiment_routes import register_experiment_routes
+    register_experiment_routes(app)
 
-    @app.post("/saklas/v1/sessions/{session_id}/probes/{name}", status_code=204)
-    def activate_probe(session_id: str, name: str):
-        _resolve_session_id(session, session_id)
-        try:
-            session.probe(name)
-        except (KeyError, ValueError, FileNotFoundError) as e:
-            raise HTTPException(400, f"probe '{name}' not available: {e}")
-        return JSONResponse(status_code=204, content=None)
-
-    @app.delete("/saklas/v1/sessions/{session_id}/probes/{name}", status_code=204)
-    def deactivate_probe(session_id: str, name: str):
-        _resolve_session_id(session, session_id)
-        if name not in session.probes:
-            raise HTTPException(404, f"probe '{name}' not active")
-        session.unprobe(name)
-        return JSONResponse(status_code=204, content=None)
-
-    @app.post("/saklas/v1/sessions/{session_id}/probe")
-    async def score_probe_oneshot(session_id: str, req: ScoreProbeRequest):
-        _resolve_session_id(session, session_id)
-        requested = req.probes
-        monitor = session._monitor
-        if requested:
-            missing = [n for n in requested if n not in monitor.probe_names]
-            if missing:
-                raise HTTPException(400, f"probes not active: {missing}")
-
-        async with session.lock:
-            readings = await asyncio.to_thread(
-                monitor.measure, session._model, session._tokenizer,
-                session._layers, req.text,
-            )
-        if requested:
-            readings = {k: v for k, v in readings.items() if k in requested}
-        return {"readings": {k: float(v) for k, v in readings.items()}}
-
-    # ----- Experiments ------------------------------------------------------
-
-    @app.post("/saklas/v1/sessions/{session_id}/experiments/fan")
-    async def run_experiment_fan(session_id: str, req: ExperimentFanRequest):
-        """Run an alpha grid as loom siblings and return a RunSet summary."""
-        _resolve_session_id(session, session_id)
-
-        if not req.grid:
-            raise HTTPException(400, "grid must be non-empty")
-        for name, alphas in req.grid.items():
-            if not alphas:
-                raise HTTPException(400, f"grid['{name}'] must be non-empty")
-        sampling_cfg = _build_sampling(req.sampling)
-
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            runset = await asyncio.to_thread(
-                session.generate_sweep,
-                req.prompt,
-                req.grid,
-                base_steering=req.base_steering,
-                sampling=sampling_cfg,
-                thinking=req.thinking,
-                stateless=False,
-                raw=req.raw,
-            )
-        rows = []
-        for idx, result in enumerate(runset):
-            readings_summary: dict[str, float] = {}
-            for probe_name, r in (getattr(result, "readings", {}) or {}).items():
-                pg = getattr(r, "per_generation", None)
-                val = pg[-1] if pg else getattr(r, "mean", 0.0)
-                readings_summary[probe_name] = round(float(val), 6)
-            rows.append({
-                "idx": idx,
-                "alpha_values": runset.grid[idx] if idx < len(runset.grid) else {},
-                "node_id": runset.node_ids[idx] if idx < len(runset.node_ids) else None,
-                "result": {
-                    "text": result.text,
-                    "token_count": result.token_count,
-                    "tok_per_sec": result.tok_per_sec,
-                    "elapsed": result.elapsed,
-                    "finish_reason": result.finish_reason,
-                    "applied_steering": result.applied_steering,
-                    "readings": readings_summary,
-                },
-            })
-        return {
-            "kind": runset.kind,
-            "total": len(runset),
-            "node_ids": runset.node_ids,
-            "rows": rows,
-        }
-
-    # ----- Live traits SSE stream ------------------------------------------
-
-    @app.get("/saklas/v1/sessions/{session_id}/traits/stream")
-    async def traits_stream(session_id: str, request: Request):
-        """SSE endpoint streaming per-token probe scores during generation.
-
-        Events:
-          - ``data: {"type": "start", ...}`` when generation begins
-          - ``data: {"type": "token", "idx": N, "text": "...", "thinking": bool, "probes": {...}}``
-          - ``data: {"type": "done", "finish_reason": "...", "aggregate": {...}}``
-          - ``: heartbeat`` every 15 s when idle
-
-        The stream stays open across generations; a client can subscribe
-        once and observe every generation the session runs.
-        """
-        _resolve_session_id(session, session_id)
-
-        from saklas.core.events import GenerationStarted, GenerationFinished
-
-        loop = asyncio.get_running_loop()
-        trait_queue: asyncio.Queue[Any] = asyncio.Queue()
-
-        # EventBus callback: push start/done into the same queue as tokens.
-        def _on_event(event: object) -> None:
-            if isinstance(event, GenerationStarted):
-                try:
-                    loop.call_soon_threadsafe(
-                        trait_queue.put_nowait,
-                        ("start", getattr(event, "input", None), getattr(event, "stateless", False)),
-                    )
-                except Exception:
-                    pass
-            elif isinstance(event, GenerationFinished):
-                try:
-                    loop.call_soon_threadsafe(
-                        trait_queue.put_nowait,
-                        ("done", getattr(event, "result", None)),
-                    )
-                except Exception:
-                    pass
-
-        unsub = session.events.subscribe(_on_event)
-        session.register_trait_queue(loop, trait_queue)
-
-        async def event_generator():
-            try:
-                generation_id: str | None = None
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    try:
-                        item = await asyncio.wait_for(trait_queue.get(), timeout=15.0)
-                    except asyncio.TimeoutError:
-                        yield ": heartbeat\n\n"
-                        continue
-
-                    tag = item[0]
-                    if tag == "start":
-                        generation_id = uuid.uuid4().hex[:8]
-                        yield (
-                            f"data: {json.dumps({'type': 'start', 'generation_id': generation_id})}"
-                            "\n\n"
-                        )
-                    elif tag == "token":
-                        _, idx, text, thinking, scores = item
-                        yield (
-                            f"data: {json.dumps({'type': 'token', 'idx': idx, 'text': text, 'thinking': thinking, 'probes': {k: round(v, 6) for k, v in scores.items()}})}"
-                            "\n\n"
-                        )
-                    elif tag == "done":
-                        result = item[1]
-                        agg: dict[str, float] = {}
-                        if result is not None:
-                            readings = getattr(result, "readings", None)
-                            if readings:
-                                for name, r in readings.items():
-                                    # Use this generation's aggregate, not the
-                                    # rolling history mean.
-                                    pg = getattr(r, "per_generation", None)
-                                    val = pg[-1] if pg else getattr(r, "mean", 0.0)
-                                    agg[name] = round(val, 6)
-                        yield (
-                            f"data: {json.dumps({'type': 'done', 'generation_id': generation_id, 'finish_reason': getattr(result, 'finish_reason', 'stop') if result else 'stop', 'aggregate': agg})}"
-                            "\n\n"
-                        )
-                        generation_id = None
-            finally:
-                session.unregister_trait_queue(loop, trait_queue)
-                unsub()
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
+    from saklas.server.traits_routes import register_traits_routes
+    register_traits_routes(app)
 
     # ----- WebSocket token+probe co-stream -------------------------------
 
@@ -3012,134 +2449,18 @@ async def _ws_handle_generate(
                 perplexity: float | None = None,
                 _node_holder: list[str | None] = current_node_holder,
             ) -> None:
-                # Resolve the streaming assistant node id once per token;
-                # cheap (one attribute read) and avoids racing the tree
-                # mutation that adds the assistant node before the first
-                # token fires.
-                node_id = _node_holder[0]
-                if node_id is None:
-                    try:
-                        candidate = session.tree.active_node_id
-                        # Defensive coerce: tests may pass a Mock-shaped
-                        # ``session`` whose ``tree.active_node_id`` is
-                        # not a string.  Treat anything non-string as
-                        # "no node" so the JSON encoder doesn't choke.
-                        if isinstance(candidate, str):
-                            node_id = candidate
-                            _node_holder[0] = candidate
-                    except Exception:
-                        node_id = None
-                event: dict[str, Any] = {
-                    "type": "token",
-                    "text": text,
-                    "thinking": bool(is_thinking),
-                    "token_id": int(tid) if tid is not None else None,
-                    "node_id": node_id,
-                }
-                # Phase 1 logit pass: surface chosen-token logprob + top-K
-                # alternatives on the wire so webui drilldown / inline
-                # surprise / NodeCompare can render distributional info
-                # without a second fetch. Both fields are None when the
-                # engine didn't capture them (no on_token consumer + no
-                # logprobs / return_top_k request); subscribers ``?? null``-
-                # guard so legacy / unconfigured streams pass through
-                # cleanly. ``top_alts`` items are TokenAlt dataclasses;
-                # serialize each to ``{id, text, logprob}`` for JSON.
-                if lp is not None:
-                    event["logprob"] = float(lp)
-                if top_alts:
-                    event["top_alts"] = [
-                        {"id": int(a.id), "text": a.text, "logprob": float(a.logprob)}
-                        for a in top_alts
-                    ]
-                # Raw decode-step index of this emitted token — the join
-                # key a logit fork slices ``raw_token_ids`` on.  Read off
-                # ``emit_map`` (appended immediately before this callback
-                # fires).  Best-effort: a mocked session has no gen state.
-                try:
-                    emap = session._gen_state.emit_map
-                    if emap:
-                        event["raw_index"] = int(emap[-1][0])
-                except Exception:
-                    pass
-                # Inline probe scores for the live inspector + chat
-                # highlight.  ``scores`` is the magnitude-weighted aggregate
-                # per probe — the webui tints tokens with this so live
-                # highlighting matches the post-generation pass.
-                # ``per_layer_scores`` is the per-layer heatmap the token
-                # drilldown drawer needs.
-                #
-                # Both are computed and persisted onto the loom row by
-                # ``session._token_tap`` (engine-side) before this WS
-                # callback fires; we read them back off the row rather
-                # than recomputing.  Single source of truth: the persisted
-                # row is what a webui refresh rehydrates from, so the live
-                # stream and the rehydrated tree match by construction.
-                try:
-                    node = (
-                        session.tree.nodes.get(node_id) if node_id else None
-                    )
-                    rows = (
-                        node.thinking_tokens if is_thinking else node.tokens
-                    ) if node is not None else None
-                    last = rows[-1] if rows else None
-                    if last is not None:
-                        probes_blob = last.get("probes")
-                        if probes_blob:
-                            event["scores"] = probes_blob
-                        per_layer_blob = last.get("per_layer_scores")
-                        if per_layer_blob:
-                            event["per_layer_scores"] = per_layer_blob
-                except Exception:
-                    # Inspector data is best-effort — never let a failure
-                    # here break the streaming token path.
-                    pass
-                # Inline manifold-probe readings for the live inspector.
-                # The vector-probe path above reads off the persisted loom
-                # row (the engine's ``_token_tap`` already scored against
-                # ``session._capture._per_layer``); manifold readings have
-                # no such persistence yet, so we score directly off the
-                # same capture buffer here.  Mirrors what
-                # ``generate_stream._push`` does for the OpenAI / Ollama
-                # streaming paths, lifted into the native WS frame so the
-                # webui's per-token mini-map cursor + fraction meter tick
-                # live instead of stalling at ``awaiting first token...``
-                # until the ``done`` event.  Shape matches the existing
-                # ``ManifoldTokenReading.to_dict()`` the OpenAI/Ollama
-                # paths emit per chunk and the webui's
-                # ``updateManifoldProbesFromToken`` already consumes.
-                try:
-                    mf_monitor = getattr(session, "_manifold_monitor", None)
-                    if (
-                        mf_monitor is not None
-                        and mf_monitor.probe_names
-                    ):
-                        capture = getattr(session, "_capture", None)
-                        per_layer = (
-                            getattr(capture, "_per_layer", None)
-                            if capture is not None
-                            else None
-                        )
-                        if per_layer:
-                            latest_hidden = {
-                                layer_idx: bucket[-1]
-                                for layer_idx, bucket in per_layer.items()
-                                if bucket
-                            }
-                            if latest_hidden:
-                                readings = mf_monitor.score_single_token(
-                                    latest_hidden,
-                                )
-                                if readings:
-                                    event["manifold_readings"] = {
-                                        name: r.to_dict()
-                                        for name, r in readings.items()
-                                    }
-                except Exception:
-                    # Inspector data is best-effort — never let a failure
-                    # here break the streaming token path.
-                    pass
+                event = build_token_event(
+                    session,
+                    _node_holder,
+                    text=text,
+                    is_thinking=is_thinking,
+                    tid=tid,
+                    lp=lp,
+                    top_alts=top_alts,
+                )
                 loop.call_soon_threadsafe(token_queue.put_nowait, event)
+            setattr(_on_token, "_saklas_wants_live_scores", True)
+            setattr(_on_token, "_saklas_wants_per_layer_scores", True)
 
             result_holder: list[GenerationResult | RunSet] = []
             error_holder: list[BaseException] = []

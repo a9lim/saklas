@@ -733,6 +733,35 @@ _MANIFOLD_GAIN_ANGULAR = 8.0
 _MANIFOLD_GAIN_ADDITIVE = _MANIFOLD_GAIN_ANGULAR * _STEER_GAIN  # = 16.0
 
 
+def _profile_layer_shares(profile: dict[int, torch.Tensor]) -> dict[int, float]:
+    norms: dict[int, float] = {}
+    total = 0.0
+    for layer_idx, vec in profile.items():
+        n = float(torch.linalg.vector_norm(vec.to(torch.float32)).item())
+        norms[layer_idx] = n
+        total += n
+    if total <= 1e-12:
+        return {}
+    return {layer_idx: n / total for layer_idx, n in norms.items()}
+
+
+def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
+    layer_scores: dict[int, float] = {}
+    for layer_idx, sub in manifold.layers.items():
+        node_coords = eval_rbf(
+            sub.node_params, sub.rbf_weights, sub.poly_coeffs,
+            sub.node_params,
+        )  # (K, R) — exact centered coords at the fit nodes
+        layer_scores[layer_idx] = float(
+            torch.linalg.vector_norm(node_coords).item()
+        )
+    total_score = sum(layer_scores.values())
+    if total_score <= 1e-12:
+        n_layers = max(1, len(manifold.layers))
+        return {L: 1.0 / n_layers for L in manifold.layers}
+    return {L: s / total_score for L, s in layer_scores.items()}
+
+
 class SteeringManager:
     """Manages multiple SteeringHooks across model layers.
 
@@ -790,6 +819,7 @@ class SteeringManager:
             "profile": profile,
             "alpha": alpha,
             "trigger": trigger,
+            "shares": _profile_layer_shares(profile),
         }
 
     def add_ablation(
@@ -871,6 +901,7 @@ class SteeringManager:
             "position": tuple(float(c) for c in resolved),
             "alpha": alpha,
             "trigger": trigger,
+            "shares": _manifold_layer_shares(manifold),
         }
 
     def apply_to_model(
@@ -920,21 +951,12 @@ class SteeringManager:
                 # to ``|α|·θ_max``, matching the additive-path intuition
                 # that high-signal layers carry most of the steering and
                 # the user-facing α is bounded in the same band.
-                norms_total = 0.0
-                norms: dict[int, float] = {}
-                for layer_idx, vec in profile.items():
-                    n = float(
-                        torch.linalg.vector_norm(
-                            vec.to(torch.float32),
-                        ).item()
-                    )
-                    norms[layer_idx] = n
-                    norms_total += n
-                if norms_total <= 1e-12:
+                shares: dict[int, float] = v.get("shares", {})
+                if not shares:
                     # Profile is degenerate (all-zero); skip silently.
                     continue
                 for layer_idx, vec in profile.items():
-                    share_L = norms[layer_idx] / norms_total
+                    share_L = shares.get(layer_idx, 0.0)
                     additive_by_layer.setdefault(layer_idx, []).append(
                         (vec, user_alpha * share_L, trigger),
                     )
@@ -975,12 +997,10 @@ class SteeringManager:
         # of the centered node centroids in subspace coords — i.e. how
         # widely the per-node centroids spread inside this layer's
         # affine PCA subspace, which is the manifold analogue of "how
-        # discriminative is this layer for the steered concept."  We
-        # recover that by evaluating the RBF interpolant at the node
-        # parameters themselves: the RBF is exact at fit points, so
-        # ``eval_rbf(node_params, ..., node_params) == centered
-        # centroid coords`` by construction, with no need to store the
-        # singular values separately.  Layers with weak persona
+        # discriminative is this layer for the steered concept."  Those
+        # shares are cached when the manifold is registered (by evaluating
+        # the RBF at its fit nodes once), so alpha changes do not repeat
+        # host syncs or small RBF evaluations.  Layers with weak persona
         # separation get a small slice of α; the cumulative budget
         # ``Σ_L α · share_L = α`` regardless of how many layers the
         # manifold covers, so the user-facing α-regime is
@@ -998,26 +1018,7 @@ class SteeringManager:
             trigger = m["trigger"]
             alpha = max(0.0, min(1.0, float(m["alpha"])))
 
-            layer_scores: dict[int, float] = {}
-            for layer_idx, sub in manifold.layers.items():
-                node_coords = eval_rbf(
-                    sub.node_params, sub.rbf_weights, sub.poly_coeffs,
-                    sub.node_params,
-                )  # (K, R) — exact centered coords at the fit nodes
-                layer_scores[layer_idx] = float(
-                    torch.linalg.vector_norm(node_coords).item()
-                )
-            total_score = sum(layer_scores.values())
-            if total_score <= 1e-12:
-                # Degenerate manifold (all centroids collapse to mean);
-                # fall back to flat per-layer share so we still ship a
-                # layer-count-invariant budget rather than NaNs.
-                n_layers = max(1, len(manifold.layers))
-                shares = {L: 1.0 / n_layers for L in manifold.layers}
-            else:
-                shares = {
-                    L: s / total_score for L, s in layer_scores.items()
-                }
+            shares: dict[int, float] = m.get("shares", {})
 
             # Dispatch the per-mode gain.  Angular and additive
             # manifold injections have different per-α behavioral

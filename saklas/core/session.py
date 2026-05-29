@@ -805,6 +805,7 @@ class SaklasSession:
         self._active_gen_reservation: str | None = None
         self._last_result: GenerationResult | None = None
         self._last_per_token_scores: dict[str, list[float]] | None = None
+        self._last_token_probe_payload: dict[str, Any] | None = None
 
         # Probe content-hash cache for transcript export / replay (v2.3
         # phase 5).  Keyed by probe name → sha256 hex of the baked tensor
@@ -4274,14 +4275,72 @@ class SaklasSession:
         mean_logprob_sum: float = 0.0
         mean_logprob_count: int = 0
         trait_token_counter = [0]
+        _wants_live_token_scores = bool(
+            on_token is not None
+            and getattr(on_token, "_saklas_wants_live_scores", False)
+        )
+        _persists_layer_scores = bool(
+            (sampling is not None and sampling.persist_per_layer_scores)
+            or (
+                on_token is not None
+                and getattr(on_token, "_saklas_wants_per_layer_scores", False)
+            )
+        )
 
         def _token_tap(text: str, is_thinking: bool, tid: int | None, lp: float | None, top_alts: Any, perplexity: float | None) -> None:
             nonlocal mean_logprob_sum, mean_logprob_count
+            self._last_token_probe_payload = None
             if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
                 logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
             if lp is not None and tid is not None and tid >= 0 and not is_thinking:
                 mean_logprob_sum += lp
                 mean_logprob_count += 1
+            latest_hidden_for_token: dict[int, torch.Tensor] | None = None
+            scores: dict[str, float] | None = None
+            per_layer_payload: dict[str, dict[str, float]] | None = None
+            manifold_readings = None
+            needs_vector_scores = bool(
+                self._monitor.probe_names
+                and (
+                    assistant_node_id is not None
+                    or _has_trait_consumer
+                    or _wants_live_token_scores
+                )
+            )
+            needs_manifold_scores = bool(
+                self._manifold_monitor.probe_names
+                and _wants_live_token_scores
+            )
+            if needs_vector_scores or needs_manifold_scores:
+                latest_hidden_for_token = {
+                    layer_idx: bucket[-1]
+                    for layer_idx, bucket in self._capture._per_layer.items()
+                    if bucket
+                }
+            if needs_vector_scores and latest_hidden_for_token:
+                agg = self._monitor.score_single_token(latest_hidden_for_token)
+                if agg:
+                    scores = {p: float(v) for p, v in agg.items()}
+                if assistant_node_id is not None and _persists_layer_scores:
+                    per_layer = self._monitor.score_single_token_per_layer(
+                        latest_hidden_for_token,
+                    )
+                    if per_layer:
+                        per_layer_payload = {
+                            str(layer): {
+                                p: round(float(v), 6) for p, v in metrics.items()
+                            }
+                            for layer, metrics in per_layer.items()
+                        }
+            if needs_manifold_scores and latest_hidden_for_token:
+                manifold_readings = self._manifold_monitor.score_single_token(
+                    latest_hidden_for_token,
+                )
+            self._last_token_probe_payload = {
+                "scores": scores,
+                "per_layer_scores": per_layer_payload,
+                "manifold_readings": manifold_readings,
+            }
             if assistant_node_id is not None and tid is not None:
                 token_row: dict[str, Any] = {
                     "token_id": int(tid),
@@ -4300,37 +4359,12 @@ class SaklasSession:
                         }
                         for a in top_alts
                     ]
-                # Per-token probe scoring lives here so the persisted node
-                # row carries the same ``probes`` + ``per_layer_scores`` the
-                # live WS ``token`` event ships.  Without this, the webui
-                # rehydrates a tree across a page refresh with tokens but
-                # no scores — highlight tint and the token-drilldown heatmap
-                # silently go blank for historical turns.  The WS handler
-                # reads these back off the row rather than recomputing.
-                if self._monitor.probe_names:
-                    latest_hidden_for_persist = {
-                        layer_idx: bucket[-1]
-                        for layer_idx, bucket in self._capture._per_layer.items()
-                        if bucket
+                if scores:
+                    token_row["probes"] = {
+                        p: round(float(v), 6) for p, v in scores.items()
                     }
-                    if latest_hidden_for_persist:
-                        agg = self._monitor.score_single_token(
-                            latest_hidden_for_persist,
-                        )
-                        if agg:
-                            token_row["probes"] = {
-                                p: round(float(v), 6) for p, v in agg.items()
-                            }
-                        per_layer = self._monitor.score_single_token_per_layer(
-                            latest_hidden_for_persist,
-                        )
-                        if per_layer:
-                            token_row["per_layer_scores"] = {
-                                str(layer): {
-                                    p: round(float(v), 6) for p, v in metrics.items()
-                                }
-                                for layer, metrics in per_layer.items()
-                            }
+                if per_layer_payload:
+                    token_row["per_layer_scores"] = per_layer_payload
                 self.tree.append_token(
                     assistant_node_id,
                     token_row,
@@ -4340,13 +4374,7 @@ class SaklasSession:
                 on_token(text, is_thinking, tid, lp, top_alts, perplexity)
             # Inline per-token scoring for live SSE trait subscribers.
             if self._trait_queues and self._monitor.probe_names:
-                latest_hidden = {
-                    layer_idx: bucket[-1]
-                    for layer_idx, bucket in self._capture._per_layer.items()
-                    if bucket
-                }
-                if latest_hidden:
-                    scores = self._monitor.score_single_token(latest_hidden)
+                if scores:
                     event = ("token", trait_token_counter[0], text, is_thinking, scores)
                     trait_token_counter[0] += 1
                     with self._trait_lock:
@@ -4544,6 +4572,7 @@ class SaklasSession:
             # delete on this subtree) need to be free again now that the
             # streaming target is no longer live.
             self._active_gen_reservation = None
+            self._last_token_probe_payload = None
             self._gen_phase = GenState.IDLE
             self._gen_lock.release()
 
@@ -4720,21 +4749,14 @@ class SaklasSession:
                 self._monitor.probe_names
                 or self._manifold_monitor.probe_names
             ):
-                latest_hidden = {
-                    layer_idx: bucket[-1]
-                    for layer_idx, bucket in self._capture._per_layer.items()
-                    if bucket
-                }
-                if latest_hidden:
-                    if self._monitor.probe_names:
-                        scores = self._monitor.score_single_token(latest_hidden)
-                        self._monitor.update_live(scores)
-                    if self._manifold_monitor.probe_names:
-                        manifold_readings = (
-                            self._manifold_monitor.score_single_token(
-                                latest_hidden,
-                            )
-                        )
+                payload = self._last_token_probe_payload or {}
+                raw_scores = payload.get("scores")
+                if isinstance(raw_scores, dict) and raw_scores:
+                    scores = {
+                        str(k): float(v) for k, v in raw_scores.items()
+                    }
+                    self._monitor.update_live(scores)
+                manifold_readings = payload.get("manifold_readings")
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
@@ -4743,6 +4765,7 @@ class SaklasSession:
             )
             idx_counter[0] += 1
             q.put(event)
+        setattr(_push, "_saklas_wants_live_scores", bool(live_scores))
 
         def _worker():
             try:

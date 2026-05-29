@@ -693,6 +693,9 @@ export interface WSSampling {
    *  when any on_token consumer is live, just no top alternatives.
    *  Default 0 keeps the wire shape unchanged for opt-out users. */
   return_top_k?: number | null;
+  /** Native dashboard requests this so streamed token rows can rehydrate
+   *  the token-drilldown layer heatmap after a refresh. */
+  persist_per_layer_scores?: boolean | null;
   /** Per-message role-substitution labels (roleplay scaffold).  Ride each
    *  generate / commit like ``seed``; stamped onto the produced loom nodes
    *  and rendered per-turn.  null/empty = standard role label. */

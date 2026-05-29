@@ -92,6 +92,20 @@ _HYPERPARAMS_BY_MODE: dict[str, frozenset[str]] = {
 }
 
 
+def domain_label(spec: dict[str, Any]) -> str:
+    """Short ``type(Nd)`` label for a manifold domain spec dict."""
+    kind = spec.get("type", "?")
+    if kind == "box":
+        n = len(spec.get("axes", []))
+    elif kind == "sphere":
+        n = int(spec.get("dim", 0))
+    elif kind == "custom":
+        n = int(spec.get("embed_dim", 0))
+    else:
+        n = 0
+    return f"{kind}({n}d)"
+
+
 def _sanitize_hyperparams(
     fit_mode: str, hyperparams: dict[str, Any] | None,
 ) -> dict[str, Any]:

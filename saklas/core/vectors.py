@@ -13,6 +13,8 @@ from typing import Any, TYPE_CHECKING
 import torch
 from safetensors.torch import load_file, save_file
 
+from saklas.core.stats import median_or_zero
+
 if TYPE_CHECKING:
     from saklas.core.sae import SaeBackend
 
@@ -24,6 +26,7 @@ log = logging.getLogger(__name__)
 # concept whose median is degenerate is the failure mode users care about.
 _DIAG_DEGENERATE_EVR = 0.95         # ~all variance in one direction
 _DIAG_DEGENERATE_INTRA_VAR = 0.01   # almost-identical pos/neg pairs
+_DIM_DIAGNOSTIC_SAMPLE_MAX = 32
 
 # Skip the chat template for extraction when it adds more than this many
 # tokens of overhead (e.g. Ministral injects a ~500-token system prompt).
@@ -423,16 +426,6 @@ def _emit_diagnostics_warning(
     if not diagnostics:
         return
 
-    def _median(values: list[float]) -> float:
-        s = sorted(values)
-        n = len(s)
-        if n == 0:
-            return 0.0
-        mid = n // 2
-        if n % 2 == 1:
-            return s[mid]
-        return 0.5 * (s[mid - 1] + s[mid])
-
     evrs = [d["evr"] for d in diagnostics.values() if "evr" in d]
     intras = [
         d["intra_pair_variance_mean"]
@@ -442,8 +435,8 @@ def _emit_diagnostics_warning(
     if not evrs:
         return
 
-    med_evr = _median(evrs)
-    med_intra = _median(intras) if intras else float("inf")
+    med_evr = median_or_zero(evrs)
+    med_intra = median_or_zero(intras) if intras else float("inf")
 
     label = concept_label or "probe"
     if med_evr > _DIAG_DEGENERATE_EVR and med_intra < _DIAG_DEGENERATE_INTRA_VAR:
@@ -735,6 +728,104 @@ def _capture_diffs_for_pairs(
         sae_layer_set,
         mean_pos_per_layer,
         mean_neg_per_layer,
+    )
+
+
+def _capture_dim_stats_for_pairs(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    pairs: list[dict[str, str]],
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+) -> tuple[
+    int,
+    dict[int, torch.Tensor],
+    list[float],
+    dict[int, torch.Tensor],
+    dict[int, torch.Tensor],
+    dict[int, list[torch.Tensor]],
+]:
+    """Capture running DiM statistics without retaining every pair diff.
+
+    PCA needs the full ``N × D`` diff matrix.  DiM only needs the mean diff
+    per layer, so the default extractor keeps O(layers × dim) running sums
+    on the model device (CPU on MPS) and a bounded CPU sample for diagnostics.
+    """
+    n_layers = len(layers)
+    accum_device = torch.device("cpu") if device.type == "mps" else device
+    sum_diffs: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
+    sum_pos: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
+    sum_neg: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
+    diagnostic_samples: dict[int, list[torch.Tensor]] = {
+        i: [] for i in range(n_layers)
+    }
+    norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
+
+    for pair in pairs:
+        pos_all = _encode_and_capture_all(
+            model, tokenizer, pair["positive"], layers, device,
+            role=role, model_type=model_type,
+        )
+        neg_all = _encode_and_capture_all(
+            model, tokenizer, pair["negative"], layers, device,
+            role=role, model_type=model_type,
+        )
+        for idx in range(n_layers):
+            p, n = pos_all[idx], neg_all[idx]
+            norm_sums[idx] += p.norm() + n.norm()
+            p_acc = p.to(dtype=torch.float32, device=accum_device)
+            n_acc = n.to(dtype=torch.float32, device=accum_device)
+            diff = p_acc - n_acc
+            sd = sum_diffs[idx]
+            if sd is None:
+                sum_diffs[idx] = diff.clone()
+            else:
+                sd += diff
+
+            p_cpu = p_acc.to("cpu")
+            n_cpu = n_acc.to("cpu")
+            sp = sum_pos[idx]
+            if sp is None:
+                sum_pos[idx] = p_cpu.clone()
+                sum_neg[idx] = n_cpu.clone()
+            else:
+                sp += p_cpu
+                sn = sum_neg[idx]
+                assert sn is not None
+                sn += n_cpu
+
+            samples = diagnostic_samples[idx]
+            if len(samples) < _DIM_DIAGNOSTIC_SAMPLE_MAX:
+                samples.append(diff.detach().to("cpu"))
+        del pos_all, neg_all
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
+    n_pairs = len(pairs)
+    mean_diffs: dict[int, torch.Tensor] = {}
+    mean_pos_per_layer: dict[int, torch.Tensor] = {}
+    mean_neg_per_layer: dict[int, torch.Tensor] = {}
+    if n_pairs > 0:
+        for idx in range(n_layers):
+            sd = sum_diffs[idx]
+            if sd is not None:
+                mean_diffs[idx] = sd / float(n_pairs)
+            sp = sum_pos[idx]
+            sn = sum_neg[idx]
+            if sp is not None and sn is not None:
+                mean_pos_per_layer[idx] = sp / float(n_pairs)
+                mean_neg_per_layer[idx] = sn / float(n_pairs)
+
+    return (
+        n_layers,
+        mean_diffs,
+        norm_sums.tolist(),
+        mean_pos_per_layer,
+        mean_neg_per_layer,
+        diagnostic_samples,
     )
 
 
@@ -1131,18 +1222,17 @@ def extract_difference_of_means(
         device = next(model.parameters()).device
     assert device is not None  # device is always set by this point
 
-    (n_layers, diffs_per_layer, pos_per_layer, neg_per_layer,
-     norm_sums_cpu, sae_layer_set,
-     mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
-        model, tokenizer, pairs, layers, device, sae=sae,
-        role=role, model_type=model_type,
-    )
-
     n_pairs = len(pairs)
     n_norm_samples = n_pairs * 2  # pos + neg per pair
 
     # SAE branch: mean of (F_pos - F_neg) in feature space, decode back.
     if sae is not None:
+        (n_layers, _diffs_per_layer, pos_per_layer, neg_per_layer,
+         norm_sums_cpu, sae_layer_set,
+         mean_pos_per_layer, mean_neg_per_layer) = _capture_diffs_for_pairs(
+            model, tokenizer, pairs, layers, device, sae=sae,
+            role=role, model_type=model_type,
+        )
         assert sae_layer_set is not None
         sae_layers = sorted(sae_layer_set)
         directions: dict[int, torch.Tensor] = {}
@@ -1224,6 +1314,18 @@ def extract_difference_of_means(
             concept_label=concept_label,
         )
 
+    (
+        n_layers,
+        mean_diffs,
+        norm_sums_cpu,
+        mean_pos_per_layer,
+        mean_neg_per_layer,
+        diagnostic_samples,
+    ) = _capture_dim_stats_for_pairs(
+        model, tokenizer, pairs, layers, device,
+        role=role, model_type=model_type,
+    )
+
     # Per-layer DiM in residual-stream space.
     raw = {}
     diagnostics_per_layer = {}
@@ -1232,12 +1334,10 @@ def extract_difference_of_means(
         # Single pair degenerates: mean over one element is just the
         # element.  Use the same scoring as single-pair PCA so share-bake
         # math is unaffected.
-        diff_stack = torch.stack(
-            [diffs_per_layer[idx][0] for idx in range(n_layers)]
-        )
+        diff_stack = torch.stack([mean_diffs[idx] for idx in range(n_layers)])
         diff_norms_cpu = diff_stack.norm(dim=-1).tolist()
         for idx in range(n_layers):
-            diff_vec = diffs_per_layer[idx][0]
+            diff_vec = mean_diffs[idx]
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
             activation_norm = norm_sums_cpu[idx]
@@ -1255,19 +1355,13 @@ def extract_difference_of_means(
                 score,
             )
     else:
-        # Multi-pair: stack diffs, take mean across pairs in fp32.
-        # One stacked tensor + one ``mean(dim=1)`` per shape — single
-        # GPU→CPU transfer for the per-layer norms (= scores).
-        diff_matrices = [
-            torch.stack(diffs_per_layer[idx]) for idx in range(n_layers)
-        ]  # each (N, dim) fp32
+        # Multi-pair DiM: running mean diffs are already available, so no
+        # full ``layers × pairs × dim`` diff matrix is materialized.
         ref_norms = [
             norm_sums_cpu[idx] / n_norm_samples for idx in range(n_layers)
         ]
-
-        batched = torch.stack(diff_matrices)        # (n_layers, N, dim)
-        means = batched.mean(dim=1)                 # (n_layers, dim)
-        means_norms = means.norm(dim=-1)            # (n_layers,)
+        means = torch.stack([mean_diffs[idx] for idx in range(n_layers)])
+        means_norms = means.norm(dim=-1)
 
         if whitener is not None:
             # Mahalanobis branch: per-layer matvec via Woodbury through
@@ -1301,8 +1395,10 @@ def extract_difference_of_means(
             # Diagnostics use the unit-direction so EVR-as-score-proxy
             # and the alignment metric stay scale-invariant.
             diagnostics_per_layer[idx] = _compute_layer_diagnostics(
-                diff_matrices[idx],
-                means[idx].detach().to(diff_matrices[idx].device),
+                torch.stack(diagnostic_samples[idx])
+                if diagnostic_samples[idx]
+                else means[idx].detach().to("cpu").unsqueeze(0),
+                means[idx].detach().to("cpu"),
                 scores_cpu[idx],
             )
 
