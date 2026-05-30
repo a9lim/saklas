@@ -70,7 +70,12 @@ import re
 from dataclasses import dataclass
 from typing import Literal, Optional, TYPE_CHECKING, cast
 
-from saklas.core.errors import SaklasError
+from saklas.core.errors import (
+    ManifoldArityError,  # noqa: F401  — re-exported for back-compat
+    OverlappingManifoldError,  # noqa: F401  — re-exported for back-compat
+    SaklasError,  # noqa: F401  — re-exported for back-compat
+    SteeringExprError,
+)
 from saklas.core.triggers import Trigger
 
 if TYPE_CHECKING:
@@ -85,6 +90,15 @@ if TYPE_CHECKING:
 # preserves the "user typed a number" signal so that late resolution can
 # tell a defaulted ``honest`` from an explicit ``0.5 honest``.
 DEFAULT_COEFF = 0.5
+
+# Shared message for the two structurally-parallel "manifold doesn't
+# compose" parse guards (the ``%``-with-projection / second-``%`` guard
+# and the ``!``-with-``%`` guard).  Consolidated so both surfaces report
+# the same constraint in the same words.
+_MANIFOLD_COMPOSE_MSG = (
+    "a manifold term does not compose with projection ('~'/'|') or "
+    "ablation ('!')"
+)
 
 
 # Default coefficient for ablation terms.  Bare ``!x`` means "fully
@@ -187,17 +201,10 @@ class ManifoldTerm:
     position: tuple[float, ...] | str
 
 
-class SteeringExprError(ValueError, SaklasError):
-    """Raised when a steering expression string cannot be parsed."""
-
-    def __init__(self, msg: str, *, col: int | None = None) -> None:
-        self.col = col
-        if col is not None:
-            msg = f"{msg} (col {col})"
-        super().__init__(msg)
-
-    def user_message(self) -> tuple[int, str]:
-        return (400, str(self) or self.__class__.__name__)
+# ``SteeringExprError`` now lives in :mod:`saklas.core.errors` (alongside its
+# new manifold-specific subclasses ``ManifoldArityError`` /
+# ``OverlappingManifoldError``); it is imported above and re-exported here so
+# ``from saklas.core.steering_expr import SteeringExprError`` keeps working.
 
 
 # ---------------------------------------------------------------- lexer ---
@@ -565,8 +572,7 @@ class _Parser:
                 position = tuple(coords)
             if self._peek().kind in ("TILDE", "ORTHO", "PERCENT"):
                 raise SteeringExprError(
-                    "a manifold position does not compose with projection "
-                    "('~'/'|') or a second '%'; use one '%' per term",
+                    _MANIFOLD_COMPOSE_MSG,
                     col=self._peek().col,
                 )
             return _Selector(
@@ -806,10 +812,7 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
         # manifold name must not run through concept pole-resolution.
         if sel.manifold_position is not None:
             if term.ablation:
-                raise SteeringExprError(
-                    "ablation ('!') does not compose with a manifold "
-                    "position ('%')"
-                )
+                raise SteeringExprError(_MANIFOLD_COMPOSE_MSG)
             mfld_key = _resolve_manifold_atom(sel.base)
             mfld_trig = (
                 term.trigger if term.trigger is not None else Trigger.BOTH

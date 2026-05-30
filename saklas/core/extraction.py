@@ -554,12 +554,34 @@ class ExtractionPipeline:
         #    the tensor cache here is the only semantically coherent
         #    behavior for those flags.  No cache hit means the full
         #    pipeline runs end-to-end and overwrites the stale tensor.
+        #
+        #    Staleness re-check (mirrors ``ManifoldExtractionPipeline.fit``,
+        #    which re-checks ``nodes_sha256`` on every fit and re-fits on
+        #    mismatch): a present tensor whose recorded ``statements_sha256``
+        #    disagrees with the sibling ``statements.json`` was baked against
+        #    different pairs than the file now holds.  Treat that as a cache
+        #    MISS and fall through to re-extraction — do NOT raise.  This is
+        #    the ad-hoc ``pipeline.extract`` path; the session-level
+        #    ``bootstrap_probes`` / ``StaleSidecarError`` fail-loud contract
+        #    is a separate code path and stays untouched.
         if not force_statements and scenarios is None:
             try:
                 profile, _meta = _load_profile(cache_path)
-                profile = self._packs._promote_profile(profile)
-                _progress(f"Loaded cached profile for '{canonical}'.")
-                return _out_name_for_cache(), Profile(profile, metadata=_meta)
+                recorded_sha = _meta.get("statements_sha256") if _meta else None
+                stmts_path = pathlib.Path(cache_path).parent / "statements.json"
+                stale = (
+                    recorded_sha is not None
+                    and stmts_path.exists()
+                    and hash_file(stmts_path) != recorded_sha
+                )
+                if not stale:
+                    profile = self._packs._promote_profile(profile)
+                    _progress(f"Loaded cached profile for '{canonical}'.")
+                    return _out_name_for_cache(), Profile(profile, metadata=_meta)
+                _progress(
+                    f"Cached tensor for '{canonical}' is stale "
+                    f"(statements.json changed) — re-extracting."
+                )
             except (FileNotFoundError, KeyError, ValueError):
                 pass
 
@@ -813,6 +835,7 @@ class ManifoldExtractionPipeline:
         from saklas.io.manifolds import (
             ManifoldFolder, ManifoldSidecar, min_nodes,
         )
+        from saklas.core.errors import SaeCoverageError
 
         def _progress(msg: str) -> None:
             if on_progress:
@@ -895,6 +918,26 @@ class ManifoldExtractionPipeline:
                 f"registry entry"
             )
 
+        # SAE coverage — fail-fast (mirrors the vector path in
+        # ``vectors._capture_diffs_for_pairs``, which raises
+        # ``SaeCoverageError`` *before* its forward loop).  Validate the
+        # fit-layer set here, before the expensive per-node centroid
+        # pooling, so an SAE release that covers none of the model's
+        # layers errors immediately instead of after K node passes.
+        if sae_backend is not None:
+            fit_layers = sorted(
+                set(sae_backend.layers) & set(range(n_layers))
+            )
+            if not fit_layers:
+                raise SaeCoverageError(
+                    f"SAE release {sae_backend.release!r} covers no layers "
+                    f"of {self._handle.model_id}"
+                )
+            feature_space = f"sae-{sae_backend.release}"
+        else:
+            fit_layers = list(range(n_layers))
+            feature_space = "raw"
+
         # 1. Per-node centroids (one forward pass per statement) — shared
         #    between authored and discover paths.  Per-node role rides
         #    through ``compute_node_centroid`` so each node's centroid is
@@ -913,20 +956,12 @@ class ManifoldExtractionPipeline:
                 role=role, model_type=model_type,
             ))
 
-        # 2. Choose the layer set — shared.
-        if sae_backend is not None:
-            fit_layers = sorted(
-                set(sae_backend.layers) & set(range(n_layers))
-            )
-            if not fit_layers:
-                raise ValueError(
-                    f"SAE release {sae_backend.release!r} covers no layers "
-                    f"of {self._handle.model_id}"
-                )
-            feature_space = f"sae-{sae_backend.release}"
-        else:
-            fit_layers = list(range(n_layers))
-            feature_space = "raw"
+        # 2. Layer set is already resolved above (fail-fast SAE coverage).
+        # No DLS analogue here on purpose: manifolds have no pos/neg
+        # polarity, so Dang & Ngo's opposite-sign discriminative test is
+        # undefined.  Per-layer signal is instead captured continuously by
+        # the apply-time ``share_L = ||eval_rbf(node_params)||_F`` weighting
+        # (low-spread layers are down-weighted, not hard-dropped).
 
         # 3. Resolve domain + node_params — the only step that differs
         #    between authored and discover paths.

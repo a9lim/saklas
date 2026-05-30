@@ -40,8 +40,10 @@ from saklas.io.manifolds import (
     create_manifold_folder,
     domain_label,
     iter_manifold_folders,
+    manifold_summary,
     merge_discover_manifolds,
     min_nodes,
+    remove_manifold_folder,
     update_manifold_folder,
 )
 from saklas.io.paths import manifold_dir, safe_model_id
@@ -252,11 +254,28 @@ def _manifold_json(
 ) -> dict[str, Any]:
     """Serialize a :class:`ManifoldFolder` for the wire.
 
+    The session-independent fields come straight from
+    :func:`saklas.io.manifolds.manifold_summary` so this route and the
+    CLI ``vector manifold show -j`` emit byte-identical values for every
+    key they share (``namespace`` / ``name`` / ``description`` /
+    ``source`` / ``fit_mode`` / ``is_discover`` / ``node_count`` /
+    ``node_labels`` / ``node_roles`` / ``hyperparams`` / ``fitted_models``
+    / ``tensor_variants``).  The server then layers the *session-aware*
+    extras on top: ``fitted_for_session`` / ``stale``, plus — for a
+    discover folder fitted on the loaded model — the materialized
+    per-model geometry (``domain`` / ``domain_label`` / ``intrinsic_dim``
+    / ``min_nodes`` / ``node_coords``) that ``manifold_summary`` leaves
+    empty by design (it can't read the per-model safetensors without a
+    session).
+
     ``full`` adds per-node statements and per-tensor fit detail — the
     list route omits both to stay light.
     """
+    folder = manifold_dir(namespace, mf.name)
+    out: dict[str, Any] = manifold_summary(folder)
+
     session_stem = safe_model_id(session.model_id)
-    fitted_models = mf.tensor_models()
+    fitted_models = out["fitted_models"]
     fitted_for_session = session_stem in fitted_models
     n, effective_domain = _resolve_intrinsic_dim(mf, session_stem)
 
@@ -267,14 +286,10 @@ def _manifold_json(
         except (KeyError, ManifoldFormatError, OSError):
             stale = False
 
-    # Per-node roles are part of the manifest shape — surface alongside
-    # labels/coords.  Padded to ``node_count`` with ``None`` so a
-    # consumer can ``zip`` against ``node_labels`` without checking the
-    # length first.  All-``None`` (the legacy / non-role default)
-    # serializes identically to today.
-    node_roles_padded = list(mf.node_roles) + [None] * (
-        len(mf.node_labels) - len(mf.node_roles)
-    )
+    # Roles are index-aligned with ``node_labels``; ``manifold_summary``
+    # already padded them via ``_roles_padded`` so a consumer can ``zip``
+    # against ``node_labels`` without a length check.  Reuse below.
+    node_roles_padded = out["node_roles"]
 
     # For fitted discover folders the derived per-model coords live in
     # the safetensors, not on the folder.  Load them once and share
@@ -295,34 +310,26 @@ def _manifold_json(
         except (FileNotFoundError, KeyError, ValueError):
             derived_coords = []
 
+    # Session-aware geometry override.  ``manifold_summary`` reports the
+    # empty/discover form for a discover folder (no session, no per-model
+    # read); the server lifts the materialized ``CustomDomain(picked_k)``
+    # spec + derived coords from the per-model sidecar/tensor when a fit
+    # exists so the rack strip can build N sliders and snap to a node.
+    # Authored folders already have the right values from the summary, so
+    # only touch these on the discover path.
     if mf.is_discover:
-        node_coords_wire = derived_coords
-    else:
-        node_coords_wire = [list(c) for c in mf.node_coords]
+        out["domain"] = effective_domain
+        out["domain_label"] = (
+            domain_label(effective_domain)
+            if effective_domain else domain_label(mf.domain)
+        )
+        out["intrinsic_dim"] = n
+        out["min_nodes"] = min_nodes(n) if n > 0 else None
+        out["node_coords"] = derived_coords
 
-    out: dict[str, Any] = {
-        "namespace": namespace,
-        "name": mf.name,
-        "description": mf.description,
-        # ``domain`` is the effective spec the frontend needs to render
-        # controls — for an unfitted discover folder this stays the
-        # empty ``{}`` from ``manifold.json``; for a fitted one we
-        # surface the materialized ``CustomDomain(picked_k)`` spec so
-        # the rack strip can build N sliders.
-        "domain": effective_domain,
-        "domain_label": domain_label(effective_domain) if effective_domain else domain_label(mf.domain),
-        "intrinsic_dim": n,
-        "min_nodes": min_nodes(n) if n > 0 else None,
-        "node_count": len(mf.node_labels),
-        "node_labels": list(mf.node_labels),
-        "node_coords": node_coords_wire,
-        "node_roles": node_roles_padded,
-        "fit_mode": mf.fit_mode,
-        "hyperparams": dict(mf.hyperparams),
-        "fitted_models": fitted_models,
-        "fitted_for_session": fitted_for_session,
-        "stale": stale,
-    }
+    # Session-only extras layered on top of the shared summary.
+    out["fitted_for_session"] = fitted_for_session
+    out["stale"] = stale
 
     if full:
         groups = dict(mf.node_groups())
@@ -799,6 +806,17 @@ def register_manifold_routes(app: FastAPI) -> None:
     async def delete_manifold(namespace: str, name: str):
         """Remove a manifold folder.
 
+        Delegates the actual removal to
+        :func:`saklas.io.manifolds.remove_manifold_folder` — the single
+        source of truth shared with the CLI ``vector manifold rm`` — so
+        bundled-respawn semantics stay in one place.  The response
+        carries that helper's ``{namespace, name, source, removed,
+        rematerializes_on_restart}`` (a superset of the historical
+        ``{namespace, name, removed}``; ``source == "bundled"`` /
+        ``default``-namespace flip ``rematerializes_on_restart`` so the
+        client can pick a friendlier toast, matching the pack DELETE
+        route).
+
         Held under ``session.lock`` so it serializes against PATCH and
         the JSON fit path; refuses (409) when a fit thread still holds
         the engine gen-lock — deleting ``nodes/`` mid-fit would corrupt
@@ -810,8 +828,14 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with session.lock:
             _refuse_if_busy(session)
             _evict_manifold(session, namespace, name)
-            await asyncio.to_thread(shutil.rmtree, folder)
-        return {"namespace": namespace, "name": name, "removed": True}
+            try:
+                return await asyncio.to_thread(
+                    remove_manifold_folder, namespace, name,
+                )
+            except FileNotFoundError as e:
+                # Lost a race with another delete between the pre-lock
+                # existence check and acquiring the lock.
+                raise HTTPException(404, str(e))
 
     @app.post("/saklas/v1/manifolds/{namespace}/{name}/fit")
     async def fit_manifold(

@@ -21,6 +21,7 @@ from saklas.core.manifold import (
     Manifold,
     fit_layer_subspace,
 )
+from saklas.core.errors import ManifoldArityError, OverlappingManifoldError
 from saklas.core.steering_expr import SteeringExprError
 from saklas.core.triggers import Trigger, TriggerContext
 
@@ -242,9 +243,12 @@ def test_manager_steer_n2_manifold():
 def test_manager_position_length_mismatch_raises():
     manifold = _manifold2d(layers=(0,))
     mgr = SteeringManager(injection_mode="angular")
-    # A 2-D manifold steered with a single coordinate.
-    with pytest.raises(SteeringExprError):
+    # A 2-D manifold steered with a single coordinate.  The dedicated
+    # ``ManifoldArityError`` still subclasses ``SteeringExprError`` so the
+    # parse-time family catch keeps working.
+    with pytest.raises(ManifoldArityError) as exc:
         mgr.add_manifold("disk", manifold, position=(0.5,), alpha=0.5)
+    assert isinstance(exc.value, SteeringExprError)
 
 
 def test_manager_alpha_clamped():
@@ -430,8 +434,10 @@ def test_manager_rejects_overlapping_manifolds():
     mgr.add_manifold("a", m1, position=(0.3,), alpha=0.5)
     mgr.add_manifold("b", m2, position=(0.7,), alpha=0.5)
     layers = _model_layers(4)
-    with pytest.raises(SteeringExprError):
+    # ``OverlappingManifoldError`` still subclasses ``SteeringExprError``.
+    with pytest.raises(OverlappingManifoldError) as exc:
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+    assert isinstance(exc.value, SteeringExprError)
 
 
 def test_manager_clear_all_drops_manifolds():

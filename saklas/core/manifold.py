@@ -953,9 +953,11 @@ def subspace_replace(
     delta = target_f32 - h_par               # (.., D) in-subspace correction
     h_new = h_f32 + alpha * delta
 
-    norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
+    norm_pre = torch.linalg.vector_norm(
+        h_f32, dim=-1, keepdim=True, dtype=torch.float32,
+    )
     norm_post = torch.linalg.vector_norm(
-        h_new, dim=-1, keepdim=True,
+        h_new, dim=-1, keepdim=True, dtype=torch.float32,
     ).clamp(min=1e-6)
     h_new = h_new * (norm_pre / norm_post)
     return h_new.to(h.dtype)
@@ -1019,11 +1021,13 @@ def subspace_rotate(
     h_par_c, h_perp = decompose(h_f32, mean_f32, basis_f32)
 
     target_c = target_f32 - mean_f32                     # (D,) in subspace
-    target_norm = torch.linalg.vector_norm(target_c).clamp(min=_ROTATE_EPSILON)
+    target_norm = torch.linalg.vector_norm(
+        target_c, dtype=torch.float32,
+    ).clamp(min=_ROTATE_EPSILON)
     target_unit = target_c / target_norm                 # (D,)
 
     h_par_norm = torch.linalg.vector_norm(
-        h_par_c, dim=-1, keepdim=True,
+        h_par_c, dim=-1, keepdim=True, dtype=torch.float32,
     )                                                    # (.., 1)
     safe_par_norm = h_par_norm.clamp(min=_ROTATE_EPSILON)
     u = h_par_c / safe_par_norm                          # (.., D) per-position unit
@@ -1031,7 +1035,9 @@ def subspace_rotate(
     # In-plane orthogonal axis pointing from u toward target_unit.
     cos0 = (u * target_unit).sum(dim=-1, keepdim=True)   # (.., 1)
     w = target_unit - cos0 * u                           # (.., D)
-    w_norm = torch.linalg.vector_norm(w, dim=-1, keepdim=True)
+    w_norm = torch.linalg.vector_norm(
+        w, dim=-1, keepdim=True, dtype=torch.float32,
+    )
     safe_w_norm = w_norm.clamp(min=_ROTATE_EPSILON)
     w_unit = w / safe_w_norm                             # (.., D)
 

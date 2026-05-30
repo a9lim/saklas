@@ -31,6 +31,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "TokenAlt": ("saklas.core.results", "TokenAlt"),
     "TokenEvent": ("saklas.core.results", "TokenEvent"),
     "ProbeReadings": ("saklas.core.results", "ProbeReadings"),
+    "Manifold": ("saklas.core.manifold", "Manifold"),
     "ManifoldTokenReading": ("saklas.core.results", "ManifoldTokenReading"),
     "ManifoldAggregate": ("saklas.core.results", "ManifoldAggregate"),
     "ResultCollector": ("saklas.core.results", "ResultCollector"),
@@ -87,6 +88,7 @@ __all__ = [
     "TokenAlt",
     "TokenEvent",
     "ProbeReadings",
+    "Manifold",
     "ManifoldTokenReading",
     "ManifoldAggregate",
     "ResultCollector",
@@ -167,6 +169,7 @@ if TYPE_CHECKING:
         text_diff as text_diff,
     )
     from saklas.core.mahalanobis import LayerWhitener as LayerWhitener, WhitenerError as WhitenerError
+    from saklas.core.manifold import Manifold as Manifold
     from saklas.core.profile import Profile as Profile, ProfileError as ProfileError
     from saklas.core.results import (
         GenerationResult as GenerationResult,

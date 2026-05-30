@@ -852,3 +852,174 @@ class TestWebSocketManifoldReadings:
                 elif msg["type"] == "done":
                     break
         assert saw_token
+
+
+# ---------------------------------------------------------------------------
+# Shared serializer (manifold_summary) + delete-helper reuse
+# ---------------------------------------------------------------------------
+#
+# These exercise the *real* ``_manifold_json`` against an on-disk authored
+# manifold (the route tests above monkeypatch ``_manifold_json``, so they
+# don't cover the refactor).  Pin two contracts:
+#  (a) the keys the GET route shares with ``io.manifolds.manifold_summary``
+#      carry identical names + values — both consume the same serializer,
+#      so CLI ``vector manifold show -j`` and the server stay in lockstep;
+#  (b) the DELETE route routes its removal through the shared
+#      ``remove_manifold_folder`` helper (single source of truth with the
+#      CLI ``vector manifold rm``), and its response carries that helper's
+#      richer shape.
+
+
+def _author_manifold_on_disk(
+    home: Any,
+    *,
+    namespace: str = "local",
+    name: str = "mood",
+    labels: list[str] | None = None,
+) -> Any:
+    """Hand-author a v4 authored 1-D box manifold under ``$SAKLAS_HOME``.
+
+    Mirrors the minimal fixture ``test_manifolds_io`` uses, but writes
+    into the live ``manifolds/<ns>/<name>/`` tree so the server routes
+    (which resolve through ``manifold_dir``) can find it.  Returns the
+    folder path.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
+
+    labels = labels or ["calm", "uneasy", "afraid", "frantic"]
+    k = len(labels)
+    folder = Path(home) / "manifolds" / namespace / name
+    (folder / "nodes").mkdir(parents=True)
+    coords = [[i / (k - 1)] for i in range(k)]
+    nodes = [{"label": lbl, "coords": coords[i]} for i, lbl in enumerate(labels)]
+    for idx, node in enumerate(nodes):
+        statements = [f"{node['label']} statement {i}" for i in range(3)]
+        (folder / "nodes" / f"{idx:02d}_{node['label']}.json").write_text(
+            _json.dumps(statements)
+        )
+    meta = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": "a mood manifold",
+        "domain": {
+            "type": "box",
+            "axes": [{"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}],
+        },
+        "nodes": nodes,
+        "files": {},
+    }
+    (folder / "manifold.json").write_text(_json.dumps(meta))
+    return folder
+
+
+class TestManifoldSharedSerializer:
+    """``GET /manifolds`` shares ``manifold_summary``'s session-independent keys."""
+
+    @pytest.fixture
+    def home_and_client(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch):
+        # Point $SAKLAS_HOME at a tmp tree so manifold_dir resolves into
+        # an isolated, empty manifolds root (the mock session never runs
+        # bundled materialization).
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        from saklas.server import create_app
+
+        session = _mock_session()
+        app = create_app(session, default_steering=None)
+        return tmp_path, session, TestClient(app)
+
+    def test_get_one_shares_summary_keys(self, home_and_client: Any) -> None:
+        """Every key the GET-one route shares with ``manifold_summary``
+        carries an identical value — the refactor's core guarantee."""
+        from saklas.io.manifolds import manifold_summary
+
+        home, _session, client = home_and_client
+        folder = _author_manifold_on_disk(home, namespace="local", name="mood")
+
+        summary = manifold_summary(folder)
+
+        resp = client.get("/saklas/v1/manifolds/local/mood")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # All shared (session-independent) keys must match byte-for-byte.
+        for key, value in summary.items():
+            assert key in body, f"GET route dropped shared key {key!r}"
+            assert body[key] == value, (
+                f"shared key {key!r} diverged: "
+                f"summary={value!r} route={body[key]!r}"
+            )
+
+        # Session-only extras layered on top — present, not in the summary.
+        assert "fitted_for_session" in body
+        assert "stale" in body
+        assert body["fitted_for_session"] is False  # mock model has no tensor
+        assert body["stale"] is False
+        # ``full`` detail blocks the list route omits.
+        assert "nodes" in body
+        assert [n["label"] for n in body["nodes"]] == summary["node_labels"]
+
+    def test_list_shares_summary_keys(self, home_and_client: Any) -> None:
+        """The list route builds the same shared keys from the summary."""
+        from saklas.io.manifolds import manifold_summary
+
+        home, _session, client = home_and_client
+        folder = _author_manifold_on_disk(home, namespace="local", name="mood")
+        summary = manifold_summary(folder)
+
+        resp = client.get("/saklas/v1/manifolds")
+        assert resp.status_code == 200
+        rows = resp.json()["manifolds"]
+        assert len(rows) == 1
+        row = rows[0]
+        for key, value in summary.items():
+            assert row[key] == value, f"list row diverged on {key!r}"
+        # List route is light — no per-node ``nodes`` / per-tensor ``fitted``.
+        assert "nodes" not in row
+        assert "fitted" not in row
+
+    def test_delete_routes_through_shared_helper(
+        self, home_and_client: Any,
+    ) -> None:
+        """DELETE removes the folder via ``remove_manifold_folder`` and
+        returns that helper's richer ``{namespace, name, source, removed,
+        rematerializes_on_restart}`` shape (superset of the historical
+        ``{namespace, name, removed}``)."""
+        home, _session, client = home_and_client
+        folder = _author_manifold_on_disk(home, namespace="local", name="doomed")
+        assert (folder / "manifold.json").exists()
+
+        resp = client.delete("/saklas/v1/manifolds/local/doomed")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["namespace"] == "local"
+        assert body["name"] == "doomed"
+        assert body["removed"] is True
+        # Shared-helper extras — a local manifold does not respawn.
+        assert body["source"] == "local"
+        assert body["rematerializes_on_restart"] is False
+        # Folder is actually gone.
+        assert not folder.exists()
+
+    def test_delete_bundled_flags_respawn(self, home_and_client: Any) -> None:
+        """A ``default/``-namespace folder flips ``rematerializes_on_restart``
+        through the shared helper — same signal the pack DELETE route emits."""
+        home, _session, client = home_and_client
+        folder = _author_manifold_on_disk(
+            home, namespace="default", name="circumplex",
+        )
+
+        resp = client.delete("/saklas/v1/manifolds/default/circumplex")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["removed"] is True
+        assert body["rematerializes_on_restart"] is True
+        assert not folder.exists()
+
+    def test_delete_missing_404(self, home_and_client: Any) -> None:
+        """DELETE on a folder that was never authored → 404 (pre-lock check)."""
+        _home, _session, client = home_and_client
+        resp = client.delete("/saklas/v1/manifolds/local/ghost")
+        assert resp.status_code == 404

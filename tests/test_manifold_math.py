@@ -498,6 +498,41 @@ def test_subspace_rotate_alpha_one_aligns_h_par_with_target():
     )
 
 
+def test_subspace_norms_fp32_accumulate_at_large_dim():
+    """Defense-in-depth fp32 norm parity with the vector hot path.
+
+    Both injection primitives now pass ``dtype=torch.float32`` to every
+    ``vector_norm`` (matching ``hooks.py``).  With fp16 inputs at a large
+    hidden dim the fp16 sum-of-squares would overflow / lose precision;
+    the fp32 accumulation keeps the norm-preservation invariants exact to
+    the fp16 round-trip tolerance.  This pins the regression so a future
+    refactor can't silently drop the explicit dtype back to incidental.
+    """
+    torch.manual_seed(7)
+    dim = 4096                       # >= 2048: fp16 sum-of-squares overflows
+    h = (torch.randn(3, dim) * 4.0).to(torch.float16)
+    mean = (torch.randn(dim) * 4.0).to(torch.float16)
+    basis = _ortho_basis(4, dim).to(torch.float16)
+    target = ((torch.randn(4) @ basis.float()) + mean.float()).to(torch.float16)
+
+    # subspace_replace: ||h|| preserved.
+    norm_pre = h.float().norm(dim=-1)
+    out_r = subspace_replace(h, mean, basis, target, alpha=0.5)
+    assert out_r.dtype == torch.float16
+    assert torch.allclose(out_r.float().norm(dim=-1), norm_pre, rtol=2e-2)
+    assert torch.isfinite(out_r.float()).all()
+
+    # subspace_rotate: ||h - mean|| preserved.
+    centered_pre = (h.float() - mean.float()).norm(dim=-1)
+    out_a = subspace_rotate(
+        h, mean, basis, target, alpha=0.5, theta_max=math.pi / 2,
+    )
+    assert out_a.dtype == torch.float16
+    centered_post = (out_a.float() - mean.float()).norm(dim=-1)
+    assert torch.allclose(centered_post, centered_pre, rtol=2e-2)
+    assert torch.isfinite(out_a.float()).all()
+
+
 def test_subspace_rotate_degenerate_h_par_is_identity():
     """At the manifold origin (h ≈ mean) the rotation plane is
     undefined — fall back to identity rather than emit NaN."""

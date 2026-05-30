@@ -12,12 +12,17 @@ from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
     ManifoldSidecar,
+    clear_manifold_tensors,
     create_discover_manifold_folder,
     create_manifold_folder,
     hash_manifold_files,
     iter_manifold_folders,
+    manifold_summary,
     merge_discover_manifolds,
     min_nodes,
+    refresh_manifold,
+    remove_manifold_folder,
+    transfer_manifold,
     update_manifold_folder,
 )
 
@@ -841,4 +846,567 @@ def test_merge_discover_refuses_under_two_sources(tmp_path: Path, monkeypatch: p
             "local", "combined", "",
             sources=[("local", "only")],
         )
+
+
+# ============================================================ A1: label regex ===
+#
+# Node labels are stricter than the artifact NAME_REGEX — they drop ``.``
+# (reserved as the bipolar-pole separator and unaddressable via ``%label``).
+
+
+def test_dotted_node_label_rejected_authored_load(tmp_path: Path):
+    """A dotted label is invalid even though it matches the old NAME_REGEX.
+
+    ``deer.wolf`` passes ``^[a-z][a-z0-9._-]{0,63}$`` but the dot is the
+    bipolar separator and the steering-expr lexer can't address it via
+    ``%deer.wolf`` — so it must be rejected at load.
+    """
+    nodes = [
+        {"label": "calm", "coords": [0.0]},
+        {"label": "deer.wolf", "coords": [0.5]},   # dot — invalid
+        {"label": "afraid", "coords": [1.0]},
+    ]
+    with pytest.raises(ManifoldFormatError, match="grammar-addressable"):
+        ManifoldFolder.load(_author_manifold(tmp_path, nodes=nodes))
+
+
+def test_dotted_node_label_rejected_create(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """``create_manifold_folder`` rejects a dotted label up front."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    nodes = _author_nodes(["a", "b", "c"])
+    nodes[1]["label"] = "a.b"
+    with pytest.raises(ManifoldFormatError, match="grammar-addressable"):
+        create_manifold_folder("local", "dotted", "", domain, nodes)
+
+
+def test_dotted_node_label_rejected_discover_create(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """``create_discover_manifold_folder`` rejects a dotted label too."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    with pytest.raises(ManifoldFormatError, match="grammar-addressable"):
+        create_discover_manifold_folder(
+            "local", "dotted_disc", "",
+            fit_mode="pca",
+            node_corpora=_discover_corpora(["alpha", "be.ta", "gamma"]),
+        )
+
+
+def test_underscore_and_hyphen_labels_still_valid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The stricter regex still admits ``_`` and ``-`` — only ``.`` is dropped."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    nodes = _author_nodes(["snake_case", "kebab-case", "plain"])
+    folder, _ = create_manifold_folder("local", "ok_labels", "", domain, nodes)
+    mf = ManifoldFolder.load(folder)
+    assert mf.node_labels == ["snake_case", "kebab-case", "plain"]
+
+
+# ============================================================ B3: lifecycle ===
+#
+# remove_manifold_folder / clear_manifold_tensors / refresh_manifold —
+# the manifold analogue of pack rm / clear / refresh in cache_ops.
+
+
+def _fake_fit_tensor(folder: Path, model_id: str, *, release: str | None = None) -> Path:
+    """Drop a placeholder fitted tensor + sidecar for ``model_id``.
+
+    No model needed — the lifecycle functions only glob/parse filenames.
+    """
+    from saklas.io.paths import sidecar_filename, tensor_filename
+    ts = folder / tensor_filename(model_id, release=release)
+    sc = folder / sidecar_filename(model_id, release=release)
+    ts.write_bytes(b"placeholder-tensor")
+    sc.write_text(json.dumps({
+        "method": "manifold_pca", "saklas_version": "0",
+        "domain": {"type": "box", "axes": [
+            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]},
+        "node_count": 3, "node_labels": [],
+    }))
+    # Refresh the integrity manifest so a later load doesn't reject.
+    ManifoldFolder.load(folder).write_metadata()
+    return ts
+
+
+def test_clear_manifold_tensors_removes_tensors_keeps_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    n = clear_manifold_tensors("local", "mood")
+    assert n == 2  # tensor + sidecar
+    assert not list(folder.glob("*.safetensors"))
+    # Corpus + manifest survive.
+    assert (folder / "manifold.json").exists()
+    assert (folder / "nodes").is_dir()
+    mf = ManifoldFolder.load(folder)
+    assert mf.node_labels == ["a", "b", "c"]
+    # The integrity manifest no longer references the removed files.
+    assert not any(k.endswith(".safetensors") for k in mf.files)
+
+
+def test_clear_manifold_tensors_variant_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    _fake_fit_tensor(folder, "google/gemma-3-4b-it", release="gemma-scope")
+    # variant="raw" only drops the canonical tensor, leaves the SAE one.
+    n = clear_manifold_tensors("local", "mood", variant="raw")
+    assert n == 2
+    remaining = sorted(p.name for p in folder.glob("*.safetensors"))
+    assert remaining == ["google__gemma-3-4b-it_sae-gemma-scope.safetensors"]
+
+
+def test_clear_manifold_tensors_model_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A model scope deletes only that model's tensors, keeping others."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    _fake_fit_tensor(folder, "Qwen/Qwen3-4B")
+    # Scope to gemma — only its tensor + sidecar go.
+    n = clear_manifold_tensors("local", "mood", "google/gemma-3-4b-it")
+    assert n == 2
+    remaining = sorted(p.name for p in folder.glob("*.safetensors"))
+    assert remaining == ["Qwen__Qwen3-4B.safetensors"]
+    # The integrity manifest still references the surviving model's tensor.
+    mf = ManifoldFolder.load(folder)
+    assert "Qwen__Qwen3-4B.safetensors" in mf.files
+
+
+def test_clear_manifold_tensors_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        clear_manifold_tensors("local", "nope")
+
+
+def test_remove_manifold_folder_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    result = remove_manifold_folder("local", "mood")
+    assert not folder.exists()
+    assert result["removed"] is True
+    assert result["source"] == "local"
+    assert result["rematerializes_on_restart"] is False
+
+
+def test_remove_manifold_folder_bundled_namespace_rematerializes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A folder under ``default/`` reports the bundled-respawn flag."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "default", "shipped", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    result = remove_manifold_folder("default", "shipped")
+    assert not folder.exists()
+    assert result["rematerializes_on_restart"] is True
+
+
+def test_remove_manifold_folder_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        remove_manifold_folder("local", "nope")
+
+
+def test_refresh_manifold_skips_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A local manifold has no upstream — refresh is a silent skip."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    assert refresh_manifold("local", "mood") == "skipped"
+
+
+def test_refresh_manifold_hf_repulls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """An ``hf://``-sourced manifold re-pulls via pull_manifold."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "alice", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    # Stamp an hf:// source the way pull_manifold would.
+    mf = ManifoldFolder.load(folder)
+    mf.source = "hf://alice/mood@v1"
+    mf.write_metadata()
+
+    captured: dict[str, Any] = {}
+    import saklas.io.hf_manifolds as hfm
+
+    def fake_pull(coord: str, *, target_folder: Path, force: bool, revision: str | None = None) -> Path:
+        captured.update(coord=coord, target=target_folder,
+                        force=force, revision=revision)
+        return target_folder
+
+    monkeypatch.setattr(hfm, "pull_manifold", fake_pull)
+    assert refresh_manifold("alice", "mood") == "hf"
+    assert captured["coord"] == "alice/mood"
+    assert captured["revision"] == "v1"
+    assert captured["target"] == folder
+
+
+def test_refresh_manifold_model_scope_clears_fit_no_repull(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A scoped refresh drops just the model's fit pair, never re-pulling.
+
+    Mirrors ``cache_ops.refresh``'s scoped path: HF pulls are whole-repo,
+    so a single-model refresh is a tensors-only delete (re-fits on next
+    use), even on an ``hf://``-sourced manifold.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "alice", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    # Even on an hf:// source, a scoped refresh must NOT re-pull.
+    mf = ManifoldFolder.load(folder)
+    mf.source = "hf://alice/mood@v1"
+    mf.write_metadata()
+    _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    _fake_fit_tensor(folder, "Qwen/Qwen3-4B")
+
+    import saklas.io.hf_manifolds as hfm
+
+    def boom(*a: object, **k: object) -> None:  # pragma: no cover - asserted not to fire
+        raise AssertionError("scoped refresh must not re-pull from HF")
+
+    monkeypatch.setattr(hfm, "pull_manifold", boom)
+
+    assert refresh_manifold("alice", "mood", model_scope="google/gemma-3-4b-it") == "scoped"
+    # Only gemma's fit pair is gone; Qwen's survives.
+    remaining = sorted(p.name for p in folder.glob("*.safetensors"))
+    assert remaining == ["Qwen__Qwen3-4B.safetensors"]
+
+
+def test_refresh_manifold_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        refresh_manifold("local", "nope")
+
+
+# ============================================================ B6a: transfer ===
+#
+# transfer_manifold applies a GIVEN per-layer Procrustes map to a fitted
+# manifold's subspace, writing a _from-<safe_src> variant tensor.
+
+
+def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int = 0):
+    """Fit a tiny real authored manifold on synthetic centroids and save it.
+
+    Returns the path of the written canonical tensor.
+    """
+    import torch
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace, save_manifold,
+    )
+
+    g = torch.Generator().manual_seed(seed)
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    coords = torch.tensor([[0.0], [0.5], [1.0]])
+    embedded = domain.embed(coords)
+    layers = {}
+    ev = {}
+    for layer in (4, 5, 6):
+        centroids = torch.randn(3, dim, generator=g)
+        sub, ev_ratio = fit_layer_subspace(centroids, embedded)
+        layers[layer] = sub
+        ev[layer] = ev_ratio
+    man = Manifold(
+        name=folder.name,
+        domain=domain,
+        node_labels=["a", "b", "c"],
+        node_coords=coords,
+        layers=layers,
+        explained_variance=ev,
+    )
+    from saklas.io.paths import tensor_filename
+    out = folder / tensor_filename(model_id)
+    save_manifold(man, out, {"method": "manifold_pca", "nodes_sha256": "src"})
+    return out
+
+
+def test_transfer_manifold_identity_alignment_preserves_geometry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """An identity alignment leaves the per-layer subspace unchanged and
+    writes the transferred tensor at the ``_from-<safe_src>`` filename."""
+    import torch
+    from saklas.core.manifold import load_manifold
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    src_model = "google/gemma-3-4b-it"
+    tgt_model = "Qwen/Qwen2.5-7B-Instruct"
+    src_tensor = _fit_real_manifold(folder, src_model, dim=6)
+    src_man = load_manifold(src_tensor)
+
+    # Identity map per fitted layer.
+    align = {L: torch.eye(6) for L in src_man.layers}
+
+    out = transfer_manifold(
+        folder, from_model=src_model, to_model=tgt_model,
+        alignment=align, transfer_quality_estimate=0.9,
+    )
+    # Filename uses the transfer variant suffix.
+    from saklas.io.paths import tensor_filename
+    assert out.name == tensor_filename(tgt_model, transferred_from=src_model)
+    assert out.name == "Qwen__Qwen2.5-7B-Instruct_from-google__gemma-3-4b-it.safetensors"
+
+    tgt_man = load_manifold(out)
+    assert sorted(tgt_man.layers) == sorted(src_man.layers)
+    for L in src_man.layers:
+        assert torch.allclose(tgt_man.layers[L].mean, src_man.layers[L].mean, atol=1e-5)
+        assert torch.allclose(tgt_man.layers[L].basis, src_man.layers[L].basis, atol=1e-5)
+    # Provenance lands in the sidecar.
+    with open(out.with_suffix(".json")) as f:
+        sc = json.load(f)
+    assert sc["method"] == "manifold_procrustes_transfer"
+    assert sc["source_model_id"] == src_model
+    assert sc["transfer_quality_estimate"] == pytest.approx(0.9)
+    # Folder integrity manifest now covers the transferred tensor.
+    mf = ManifoldFolder.load(folder)
+    assert out.name in mf.files
+
+
+def test_transfer_manifold_rotation_maps_subspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A known rotation Q maps mean → Q@mean and basis → basis@Q^T, so the
+    transferred world-space activation at a node equals Q applied to the
+    source activation."""
+    import torch
+    from saklas.core.manifold import load_manifold
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    src_model = "src/model"
+    tgt_model = "tgt/model"
+    src_tensor = _fit_real_manifold(folder, src_model, dim=6, seed=3)
+    src_man = load_manifold(src_tensor)
+
+    # Random orthogonal Q via QR.
+    A = torch.randn(6, 6, generator=torch.Generator().manual_seed(7))
+    Q, _ = torch.linalg.qr(A)
+    align = {L: Q for L in src_man.layers}
+
+    out = transfer_manifold(
+        folder, from_model=src_model, to_model=tgt_model, alignment=align,
+    )
+    tgt_man = load_manifold(out)
+    # World-space activation at node 0 should be Q @ (source activation).
+    for L in src_man.layers:
+        src_pt = src_man.manifold_point(L, [0.0]).to(torch.float32)
+        tgt_pt = tgt_man.manifold_point(L, [0.0]).to(torch.float32)
+        assert torch.allclose(tgt_pt, Q @ src_pt, atol=1e-4)
+
+
+def test_transfer_manifold_drops_uncovered_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Layers the alignment doesn't cover are dropped from the transfer."""
+    import torch
+    from saklas.core.manifold import load_manifold
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    src_model, tgt_model = "src/m", "tgt/m"
+    _fit_real_manifold(folder, src_model, dim=6)  # writes the on-disk source fit
+    # Cover only layer 5 of {4, 5, 6}.
+    align = {5: torch.eye(6)}
+    out = transfer_manifold(
+        folder, from_model=src_model, to_model=tgt_model, alignment=align,
+    )
+    tgt_man = load_manifold(out)
+    assert sorted(tgt_man.layers) == [5]
+
+
+def test_transfer_manifold_missing_source_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import torch
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    with pytest.raises(FileNotFoundError):
+        transfer_manifold(
+            folder, from_model="never/fitted", to_model="tgt/m",
+            alignment={0: torch.eye(4)},
+        )
+
+
+def test_transfer_manifold_empty_alignment_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fit_real_manifold(folder, "src/m", dim=6)
+    with pytest.raises(ManifoldFormatError, match="empty"):
+        transfer_manifold(
+            folder, from_model="src/m", to_model="tgt/m", alignment={},
+        )
+
+
+def test_transfer_manifold_no_overlap_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """An alignment covering no fitted layer raises rather than write empty."""
+    import torch
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fit_real_manifold(folder, "src/m", dim=6)  # layers 4,5,6
+    with pytest.raises(ManifoldFormatError, match="covered none"):
+        transfer_manifold(
+            folder, from_model="src/m", to_model="tgt/m",
+            alignment={0: torch.eye(6), 1: torch.eye(6)},
+        )
+
+
+def test_transfer_manifold_refuses_overwrite_without_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import torch
+    from saklas.core.manifold import load_manifold
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
+    align = {L: torch.eye(6) for L in load_manifold(src_tensor).layers}
+    transfer_manifold(folder, from_model="src/m", to_model="tgt/m", alignment=align)
+    with pytest.raises(FileExistsError):
+        transfer_manifold(folder, from_model="src/m", to_model="tgt/m", alignment=align)
+    # force=True overwrites cleanly.
+    transfer_manifold(
+        folder, from_model="src/m", to_model="tgt/m", alignment=align, force=True,
+    )
+
+
+# ============================================================ B6b: summary ===
+
+
+def test_manifold_summary_authored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "a mood axis", domain, _author_nodes(["a", "b", "c"]),
+    )
+    _fake_fit_tensor(folder, "google/gemma-3-4b-it")
+    summ = manifold_summary(folder)
+    assert summ["namespace"] == "local"
+    assert summ["name"] == "mood"
+    assert summ["description"] == "a mood axis"
+    assert summ["source"] == "local"
+    assert summ["fit_mode"] == "authored"
+    assert summ["is_discover"] is False
+    assert summ["domain"]["type"] == "box"
+    assert summ["domain_label"] == "box(1d)"
+    assert summ["intrinsic_dim"] == 1
+    assert summ["min_nodes"] == 3
+    assert summ["node_count"] == 3
+    assert summ["node_labels"] == ["a", "b", "c"]
+    assert len(summ["node_coords"]) == 3
+    assert summ["node_roles"] == [None, None, None]
+    assert summ["hyperparams"] == {}
+    assert summ["fitted_models"] == ["google__gemma-3-4b-it"]
+    assert summ["tensor_variants"]["google__gemma-3-4b-it"] == ["raw"]
+
+
+def test_manifold_summary_discover_unfitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "personas", "five personas",
+        fit_mode="pca",
+        node_corpora=_discover_corpora(
+            ["pirate", "caveman", "assistant", "scholar", "robot"],
+        ),
+        hyperparams={"max_dim": 8, "var_threshold": 0.70},
+    )
+    summ = manifold_summary(folder)
+    assert summ["fit_mode"] == "pca"
+    assert summ["is_discover"] is True
+    # Discover folder carries no top-level geometry on disk.
+    assert summ["domain"] == {}
+    assert summ["domain_label"] == "discover-pca"
+    assert summ["intrinsic_dim"] == 0
+    assert summ["min_nodes"] is None
+    assert summ["node_coords"] == []
+    assert summ["hyperparams"] == {"max_dim": 8, "var_threshold": 0.70}
+    assert summ["fitted_models"] == []
+
+
+def test_manifold_summary_reports_transfer_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A transferred tensor surfaces under tensor_variants as ``from-...``."""
+    import torch
+    from saklas.core.manifold import load_manifold
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    src_tensor = _fit_real_manifold(folder, "src/m", dim=6)
+    align = {L: torch.eye(6) for L in load_manifold(src_tensor).layers}
+    transfer_manifold(folder, from_model="src/m", to_model="tgt/m", alignment=align)
+    summ = manifold_summary(folder)
+    assert "src__m" in summ["tensor_variants"]
+    assert summ["tensor_variants"]["src__m"] == ["raw"]
+    assert summ["tensor_variants"]["tgt__m"] == ["from-src__m"]
 

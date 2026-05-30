@@ -255,7 +255,7 @@ def test_grammar_mixed_forms_compose():
 def test_grammar_label_form_rejects_projection():
     from saklas.core.steering_expr import SteeringExprError
 
-    with pytest.raises(SteeringExprError, match="manifold position"):
+    with pytest.raises(SteeringExprError, match="does not compose"):
         parse_expr("0.5 persona%pirate~angry.calm")
 
 

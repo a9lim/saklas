@@ -631,6 +631,8 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     ls.add_argument("--namespace", default=None, metavar="NS",
                     help="Restrict to a single namespace")
     ls.add_argument("-j", "--json", dest="json_output", action="store_true")
+    ls.add_argument("-v", "--verbose", action="store_true",
+                    help="Include descriptions in the table output")
 
     show = sub.add_parser(
         "show", help="Show a manifold's nodes and fitted models",
@@ -639,6 +641,195 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     )
     show.add_argument("name", help="Manifold name (or ns/name)")
     show.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+    install = sub.add_parser(
+        "install",
+        help="Install a manifold from HF or a local folder",
+        description=(
+            "Pull a manifold from a HuggingFace saklas-manifold repo "
+            "(`<ns>/<name>[@revision]`) or copy-install a local folder "
+            "path.  The manifold analogue of `saklas pack install`."
+        ),
+    )
+    install.add_argument(
+        "target",
+        help="<ns>/<name>[@revision] or path to a manifold folder",
+    )
+    install.add_argument(
+        "-a", "--as", dest="as_target", default=None, metavar="NS/NAME",
+        help="Relocate the installed manifold under a different "
+             "namespace/name (must be fully qualified)",
+    )
+    install.add_argument(
+        "-f", "--force", action="store_true",
+        help="Overwrite an existing installation",
+    )
+
+    search = sub.add_parser(
+        "search",
+        help="Search the HuggingFace hub for manifolds",
+        description=(
+            "Search HF for `saklas-manifold`-tagged model repos.  The "
+            "manifold analogue of `saklas pack search`."
+        ),
+    )
+    search.add_argument(
+        "query", nargs="?", default="",
+        help="Search text (matched against HF model ids)",
+    )
+    search.add_argument(
+        "-j", "--json", dest="json_output", action="store_true",
+        help="Emit machine-readable JSON instead of a table",
+    )
+    search.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Include descriptions in the table output",
+    )
+
+    merge = sub.add_parser(
+        "merge",
+        help="Union discover-mode manifolds' nodes into a new manifold",
+        description=(
+            "Union the *nodes* of two or more discover-mode source "
+            "manifolds into a fresh, unfitted discover folder, then run "
+            "`saklas vector manifold discover <merged>` to fit it.  The "
+            "manifold analogue of `saklas vector merge` — but on node "
+            "corpora rather than steering directions.  Restricted to "
+            "discover-mode sources (authored manifolds carry user-declared "
+            "geometry that isn't mergeable without a shared coordinate "
+            "system).  Label collisions across sources raise; rename one "
+            "side before merging."
+        ),
+    )
+    merge.add_argument("name", help="New manifold name (or ns/name)")
+    merge.add_argument(
+        "sources", nargs="+", metavar="SOURCE",
+        help="Two or more discover-mode source manifolds (name or ns/name)",
+    )
+    merge.add_argument(
+        "--description", default="", metavar="TEXT",
+        help="Human-readable description for the merged manifold folder",
+    )
+    merge.add_argument(
+        "--method", dest="fit_mode", choices=("pca", "spectral"), default=None,
+        help="Override the merged fit_mode (default: the sources' shared "
+             "mode; required when sources disagree)",
+    )
+    merge.add_argument(
+        "-f", "--force", action="store_true",
+        help="Overwrite an existing manifold folder",
+    )
+
+    push = sub.add_parser(
+        "push",
+        help="Push a manifold to HF as a model repo",
+        description=(
+            "Push a manifold folder (corpus + fitted tensors) to HF as a "
+            "`saklas-manifold`-tagged model repo.  The manifold analogue "
+            "of `saklas pack push`.  The corpus is always uploaded (a "
+            "manifold can't re-fit without it); per-model tensors are "
+            "filtered by `-m`/`--variant`."
+        ),
+    )
+    push.add_argument("selector", help="Single manifold (name or ns/name)")
+    push.add_argument(
+        "-a", "--as", dest="as_target", default=None, metavar="OWNER/NAME",
+        help="Target HF coord (default: <whoami>/<name>)",
+    )
+    push.add_argument(
+        "-m", "--model", default=None, metavar="MODEL_ID",
+        help="Restrict the pushed tensors to one base model",
+    )
+    push.add_argument("-p", "--private", action="store_true")
+    push.add_argument("-d", "--dry-run", action="store_true")
+    push.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="all",
+        help="Which tensor variant(s) to push. Default: all.",
+    )
+
+    rm = sub.add_parser(
+        "rm",
+        help="Fully remove a manifold folder",
+        description=(
+            "Remove a whole manifold folder.  The manifold analogue of "
+            "`saklas pack rm`.  Bundled manifolds (`default/` namespace) "
+            "re-materialize on next session init."
+        ),
+    )
+    rm.add_argument("selector", help="Manifold name (or ns/name)")
+    rm.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Skip the confirmation prompt for a bundled (default/) manifold",
+    )
+
+    clear = sub.add_parser(
+        "clear",
+        help="Delete per-model fitted tensors for a manifold",
+        description=(
+            "Delete a manifold's per-model fitted tensors (they re-fit on "
+            "next use) while keeping `manifold.json` + the node corpus.  "
+            "The manifold analogue of `saklas pack clear`."
+        ),
+    )
+    clear.add_argument("selector", help="Manifold name (or ns/name)")
+    clear.add_argument(
+        "-m", "--model", default=None, metavar="MODEL_ID",
+        help="Scope to one model's tensors only (default: all models)",
+    )
+    clear.add_argument(
+        "--variant", choices=["raw", "sae", "all"], default="all",
+        help="Which tensor variant(s) to delete. Default: all.",
+    )
+
+    refresh = sub.add_parser(
+        "refresh",
+        help="Re-pull / re-materialize a manifold from its source",
+        description=(
+            "Re-pull a manifold from its source: `local` is skipped, "
+            "`bundled`/`default/` re-materializes from package data, "
+            "`hf://` re-pulls.  With `-m/--model`, instead does a scoped "
+            "refresh — drops just that model's fitted tensor pair so it "
+            "re-fits on next use, without re-pulling from the source.  The "
+            "manifold analogue of `saklas pack refresh`."
+        ),
+    )
+    refresh.add_argument("selector", help="Manifold name (or ns/name)")
+    refresh.add_argument(
+        "-m", "--model", default=None, metavar="MODEL_ID",
+        help="Scope to one model: clear its fitted tensor pair so it re-fits "
+             "on next use (does not re-pull from source). Default: all-source "
+             "re-pull.",
+    )
+
+    transfer = sub.add_parser(
+        "transfer",
+        help="Transfer a manifold from one model to another via Procrustes",
+        description=(
+            "Transfer a fitted manifold from a source model to a target "
+            "model by fitting a per-layer Procrustes alignment between "
+            "their cached neutral activations and mapping the fitted "
+            "subspace into target space.  The manifold analogue of "
+            "`saklas vector transfer`.  Writes the transferred tensor at "
+            "the target's `_from-<safe_src>` variant path."
+        ),
+    )
+    transfer.add_argument("name", help="Manifold name (or ns/name)")
+    transfer.add_argument(
+        "--from", dest="src_model", required=True, metavar="SRC_MODEL",
+        help="Source model id (where the manifold was fitted)",
+    )
+    transfer.add_argument(
+        "--to", dest="tgt_model", required=True, metavar="TGT_MODEL",
+        help="Target model id (where the transferred manifold will live)",
+    )
+    transfer.add_argument(
+        "-f", "--force", action="store_true",
+        help="Recompute alignment + transfer even when cached",
+    )
+    transfer.add_argument(
+        "-j", "--json", dest="json_output", action="store_true",
+        help="Emit machine-readable JSON (path + quality summary)",
+    )
 
 
 _VECTOR_BUILDERS = {

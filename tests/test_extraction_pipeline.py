@@ -238,6 +238,100 @@ class TestTensorCacheShortCircuit:
         assert handle.promote_calls == 1  # cache load promoted to device
 
 
+class TestTensorCacheStalenessRecheck:
+    """Cache-hit staleness re-check: a present tensor whose recorded
+    ``statements_sha256`` disagrees with the sibling ``statements.json`` is
+    treated as a cache MISS and re-extracted (mirrors the manifold path's
+    ``nodes_sha256`` re-check) — *not* raised (that's the session-level
+    ``StaleSidecarError`` path, untouched here)."""
+
+    def test_stale_statements_sha_re_extracts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+        captured = _fake_extract(monkeypatch)
+
+        from saklas.core.vectors import save_profile
+        from saklas.io.packs import PackMetadata, hash_folder_files
+        from saklas.io.paths import tensor_filename
+        from saklas.io.selectors import invalidate
+        invalidate()
+
+        folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+        folder.mkdir(parents=True)
+        # statements.json present; the recorded sha intentionally does NOT
+        # match it (simulating a hand-edit after the tensor was baked).
+        (folder / "statements.json").write_text(json.dumps([
+            {"positive": "fresh-p", "negative": "fresh-n"},
+        ]))
+        save_profile(
+            {0: torch.full((4,), 0.5)},
+            str(folder / tensor_filename("stub-model")),
+            {"method": "difference_of_means",
+             "statements_sha256": "deadbeef-not-the-real-hash"},
+        )
+        PackMetadata(
+            name="honest.deceptive", description="x", version="1.0.0",
+            license="MIT", tags=[], recommended_alpha=0.5,
+            source="local", files=hash_folder_files(folder),
+        ).write(folder)
+
+        handle = _StubHandle(tmp_path)
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
+
+        name, _profile = pipeline.extract("honest.deceptive")
+
+        assert name == "honest.deceptive"
+        # Stale tensor must NOT be served — the extractor re-ran.
+        assert captured.get("call_count") == 1
+        # No raise — this is the ad-hoc cache path, not the fail-loud
+        # bootstrap_probes / StaleSidecarError path.
+
+    def test_matching_statements_sha_still_cache_hits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Control: when the recorded sha MATCHES statements.json, the cache
+        still short-circuits (no re-extraction)."""
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+        captured = _fake_extract(monkeypatch)
+
+        from saklas.core.vectors import save_profile
+        from saklas.io.packs import PackMetadata, hash_file, hash_folder_files
+        from saklas.io.paths import tensor_filename
+        from saklas.io.selectors import invalidate
+        invalidate()
+
+        folder = tmp_path / "vectors" / "default" / "honest.deceptive"
+        folder.mkdir(parents=True)
+        stmts = folder / "statements.json"
+        stmts.write_text(json.dumps([
+            {"positive": "p", "negative": "n"},
+        ]))
+        save_profile(
+            {0: torch.full((4,), 0.5)},
+            str(folder / tensor_filename("stub-model")),
+            {"method": "difference_of_means",
+             "statements_sha256": hash_file(stmts)},
+        )
+        PackMetadata(
+            name="honest.deceptive", description="x", version="1.0.0",
+            license="MIT", tags=[], recommended_alpha=0.5,
+            source="local", files=hash_folder_files(folder),
+        ).write(folder)
+
+        handle = _StubHandle(tmp_path)
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
+
+        name, _profile = pipeline.extract("honest.deceptive")
+
+        assert name == "honest.deceptive"
+        assert "call_count" not in captured  # cache hit — extractor never ran
+        assert handle.scenarios_calls == 0
+        assert handle.pairs_calls == 0
+
+
 class TestForceStatementsRegenerates:
     """force_statements=True: cache exists, statements regenerated."""
 

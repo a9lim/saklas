@@ -133,6 +133,20 @@ def test_rejects_ablation_composition():
         parse_expr("!emotions%0.5")
 
 
+def test_manifold_compose_guards_share_one_message():
+    """The ``%``-with-projection guard and the ``!``-with-``%`` guard emit
+    the same consolidated message (parse-time, ``SteeringExprError``)."""
+    from saklas.core.steering_expr import _MANIFOLD_COMPOSE_MSG
+
+    with pytest.raises(SteeringExprError) as proj:
+        parse_expr("emotions%0.5~angry")
+    with pytest.raises(SteeringExprError) as abl:
+        parse_expr("!emotions%0.5")
+
+    assert _MANIFOLD_COMPOSE_MSG in str(proj.value)
+    assert _MANIFOLD_COMPOSE_MSG in str(abl.value)
+
+
 def test_rejects_missing_position():
     with pytest.raises(SteeringExprError):
         parse_expr("emotions%")

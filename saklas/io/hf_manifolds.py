@@ -98,8 +98,10 @@ def pull_manifold(
         raise HFError(
             f"{coord}: HF repo has no manifold.json at root — saklas "
             f"manifolds must be published with the manifest in place "
-            f"(see `saklas vector manifold push`, once that ships)."
+            f"(see `saklas vector manifold push`)."
         )
+
+    source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
     if target_folder.exists() and not force:
         raise HFError(f"{target_folder} exists; pass force=True to overwrite")
@@ -130,9 +132,24 @@ def pull_manifold(
         # populated-but-broken ``files`` manifest before we touch the
         # target.
         try:
-            ManifoldFolder.load(staging)
+            staged = ManifoldFolder.load(staging)
         except ManifoldFormatError as e:
             raise HFError(f"{coord}: staged manifold failed validation ({e})") from e
+        # Record the HF coord as the manifold's source so ``refresh_manifold``
+        # can re-pull from the same place (mirrors how ``pull_pack``
+        # rewrites ``pack.json.source``).  ``write_metadata`` rebuilds the
+        # manifest from the just-loaded folder and re-hashes ``files`` —
+        # so the staged manifest stays self-consistent for the re-validate
+        # below.
+        staged.source = source
+        staged.write_metadata(files=staged.files)
+        try:
+            ManifoldFolder.load(staging)
+        except ManifoldFormatError as e:
+            raise HFError(
+                f"{coord}: staged manifold failed re-validation after "
+                f"source stamp ({e})"
+            ) from e
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -200,6 +217,244 @@ def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
                         target_folder / "nodes" / child.name,
                         child.read_bytes(),
                     )
+
+
+# ---------------------------------------------------------------------- push --
+#
+# HF upload, mirroring :func:`saklas.io.hf.push_pack` in shape: stage a
+# filtered copy of the folder (so we can add README + .gitattributes
+# without mutating the source), then one ``upload_folder``.  The
+# divergences from the pack push are the ``saklas-manifold`` repo tag, the
+# manifold-shaped model card, and that the corpus (``manifold.json`` +
+# ``nodes/*``) is *always* included — a manifold without its node corpus
+# can't be re-fit, so a tensors-only manifold push would be useless.
+
+
+def _manifold_sidecar_stem_to_hf_coord(stem: str) -> Optional[str]:
+    """Convert a fitted-tensor stem back to its base-model HF coord.
+
+    Mirrors :func:`saklas.io.hf._sidecar_stem_to_hf_coord`: strips any
+    variant suffix (``_sae-<release>`` / ``_from-<safe_src>``) so the
+    ``base_model:`` frontmatter lists the clean base model, then flips
+    ``__`` → ``/``.  Returns ``None`` for stems that don't parse.
+    """
+    from saklas.io.paths import parse_tensor_filename
+
+    parsed = parse_tensor_filename(f"{stem}.safetensors")
+    if parsed is None:
+        return None
+    safe_model, _variant = parsed
+    return safe_model.replace("__", "/")
+
+
+def _render_manifold_card(
+    mf: ManifoldFolder, tensor_stems: list[str], coord: str,
+) -> str:
+    """Build a HF model card (YAML frontmatter + markdown body) for a manifold.
+
+    Parallel to :func:`saklas.io.hf._render_model_card`, but manifold-
+    shaped: the table lists the manifold's domain / node count / fit_mode
+    rather than a recommended alpha.  ``base_model:`` is deduped over the
+    fitted tensor stems.
+    """
+    base_models = sorted({
+        c for stem in tensor_stems
+        if (c := _manifold_sidecar_stem_to_hf_coord(stem)) is not None
+    })
+    tags = ["saklas-manifold", "activation-steering", "steering-manifold"]
+
+    fm = ["---", "library_name: saklas", "tags:"]
+    fm += [f"  - {t}" for t in tags]
+    if base_models:
+        fm.append("base_model:")
+        fm += [f"  - {bm}" for bm in base_models]
+        fm.append("base_model_relation: adapter")
+    fm.append("---")
+
+    from saklas.io.manifolds import domain_label
+
+    if mf.fit_mode == "authored" and mf.domain:
+        dom_lbl = domain_label(mf.domain)
+    else:
+        dom_lbl = f"discover-{mf.fit_mode}"
+
+    body: list[str] = [
+        f"# {mf.name}",
+        "",
+        mf.description,
+        "",
+        f"**Domain:** `{dom_lbl}`  |  **fit_mode:** `{mf.fit_mode}`  |  "
+        f"**nodes:** {len(mf.node_labels)}",
+        "",
+        "## Install",
+        "",
+        "```bash",
+        f"saklas pack install {coord}  # (manifolds install via the same coord)",
+        "```",
+        "",
+        "## Nodes",
+        "",
+        ", ".join(f"`{label}`" for label in mf.node_labels),
+        "",
+    ]
+    if tensor_stems:
+        body += [
+            "## Fitted tensors",
+            "",
+            "| base model | variant |",
+            "| --- | --- |",
+        ]
+        from saklas.io.paths import parse_tensor_filename
+        for stem in sorted(tensor_stems):
+            base = _manifold_sidecar_stem_to_hf_coord(stem) or stem.replace("__", "/")
+            parsed = parse_tensor_filename(f"{stem}.safetensors")
+            variant = "raw" if (parsed is None or parsed[1] is None) else parsed[1]
+            body.append(f"| `{base}` | `{variant}` |")
+        body.append("")
+
+    body += ["---", "", "Generated by `saklas vector manifold push`.", ""]
+    return "\n".join(fm) + "\n\n" + "\n".join(body)
+
+
+def _manifold_variant_matches(key: str, variant: str) -> bool:
+    """Variant filter for a manifold tensor, mirroring ``push_pack``'s.
+
+    ``key`` is the parsed variant slug (``"raw"`` / ``"sae-<release>"`` /
+    ``"from-<safe_src>"``); ``variant`` is one of ``"raw"`` / ``"sae"`` /
+    ``"from"`` / ``"all"``.
+    """
+    if variant == "all":
+        return True
+    if variant == "raw":
+        return key == "raw"
+    if variant == "sae":
+        return key.startswith("sae-")
+    if variant == "from":
+        return key.startswith("from-")
+    return False
+
+
+def push_manifold(
+    folder: Path,
+    coord: str,
+    *,
+    private: bool = False,
+    model_scope: Optional[str] = None,
+    variant: str = "all",
+    dry_run: bool = False,
+) -> tuple[str, Optional[str]]:
+    """Push a manifold folder to HF as a model repo.
+
+    Mirrors :func:`saklas.io.hf.push_pack` exactly in shape — stage a
+    filtered copy (adding README.md + .gitattributes without mutating the
+    source), then one atomic ``upload_folder``.  Returns
+    ``(repo_url, commit_sha)``; ``sha`` is ``None`` on dry-run.
+
+    The corpus is *always* uploaded — ``manifold.json`` plus every
+    ``nodes/*.json`` — because a manifold can't be re-fit without it.
+    Per-model fitted ``<safe>.safetensors`` + ``.json`` sidecars are
+    filtered the way ``push_pack`` filters tensors:
+
+    - ``model_scope`` restricts to one base model (``safe_model_id``).
+    - ``variant`` filters tensor flavor: ``"raw"`` only unsuffixed,
+      ``"sae"`` only ``_sae-*``, ``"from"`` only ``_from-*``, ``"all"``
+      (default) every variant.  Sidecars follow their partner tensor.
+
+    A staged manifest with no tensors is still a valid push — the
+    corpus alone re-fits on the consumer side, unlike a pack where a
+    tensors-and-statements-empty push is rejected.
+    """
+    import tempfile
+
+    from saklas.io.atomic import write_bytes_atomic
+    from saklas.io.manifolds import ManifoldFolder, hash_manifold_files
+    from saklas.io.paths import parse_tensor_filename, safe_model_id as _safe_id
+
+    mf = ManifoldFolder.load(folder)  # runs integrity check
+
+    scope_safe: Optional[str] = None
+    if model_scope is not None:
+        scope_safe = _safe_id(model_scope)
+
+    staging = Path(tempfile.mkdtemp(prefix="saklas-manifold-push-"))
+    try:
+        # Always stage the corpus: manifold.json + the full nodes/ tree.
+        write_bytes_atomic(
+            staging / "manifold.json", (folder / "manifold.json").read_bytes(),
+        )
+        nodes_src = folder / "nodes"
+        if nodes_src.is_dir():
+            for child in sorted(nodes_src.iterdir()):
+                if child.is_file() and child.suffix == ".json":
+                    write_bytes_atomic(
+                        staging / "nodes" / child.name, child.read_bytes(),
+                    )
+        # Optional discover-mode provenance file.
+        scen = folder / "scenarios.json"
+        if scen.is_file():
+            write_bytes_atomic(staging / "scenarios.json", scen.read_bytes())
+
+        # Stage the fitted tensors that survive the model/variant filter,
+        # each with its sidecar.
+        kept_stems: list[str] = []
+        for ts in sorted(folder.glob("*.safetensors")):
+            parsed = parse_tensor_filename(ts.name)
+            if parsed is None:
+                continue
+            file_model, var_slug = parsed
+            if scope_safe is not None and file_model != scope_safe:
+                continue
+            vkey = "raw" if var_slug is None else var_slug
+            if not _manifold_variant_matches(vkey, variant):
+                continue
+            write_bytes_atomic(staging / ts.name, ts.read_bytes())
+            kept_stems.append(ts.stem)
+            sc = ts.with_suffix(".json")
+            if sc.exists():
+                write_bytes_atomic(staging / sc.name, sc.read_bytes())
+
+        # Re-hash the staged copy so the uploaded manifest matches the
+        # bytes we upload (a model/variant filter changes the file set).
+        # Patch the staged ``manifold.json``'s ``files`` map directly
+        # rather than re-loading first: the verbatim-copied manifest
+        # still references the *unfiltered* tensor set, so a
+        # ``ManifoldFolder.load`` of the staging dir would fail its
+        # integrity check against files the filter excluded.
+        from saklas.io.atomic import write_json_atomic as _write_json_atomic
+        staged_manifest = staging / "manifold.json"
+        with open(staged_manifest) as f:
+            staged_data = json.load(f)
+        staged_data["files"] = hash_manifold_files(staging)
+        _write_json_atomic(staged_manifest, staged_data)
+
+        write_bytes_atomic(
+            staging / ".gitattributes",
+            b"*.safetensors filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        write_bytes_atomic(
+            staging / "README.md",
+            _render_manifold_card(mf, kept_stems, coord).encode("utf-8"),
+        )
+
+        repo_url = f"https://huggingface.co/{coord}"
+        if dry_run:
+            return (repo_url, None)
+
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(
+            repo_id=coord, repo_type="model", private=private, exist_ok=True,
+        )
+        info = api.upload_folder(
+            repo_id=coord,
+            repo_type="model",
+            folder_path=str(staging),
+            commit_message=f"saklas manifold push: {mf.name}",
+        )
+        sha = getattr(info, "oid", None) or getattr(info, "commit_sha", None)
+        return (repo_url, sha)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # -------------------------------------------------------------------- search --

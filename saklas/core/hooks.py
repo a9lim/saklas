@@ -954,8 +954,8 @@ class SteeringManager:
             resolved = tuple(float(c) for c in position)
         domain = getattr(manifold, "domain", None)
         if domain is not None and len(resolved) != domain.intrinsic_dim:
-            from saklas.core.steering_expr import SteeringExprError
-            raise SteeringExprError(
+            from saklas.core.errors import ManifoldArityError
+            raise ManifoldArityError(
                 f"manifold {name!r} has a {domain.intrinsic_dim}-dimensional "
                 f"domain but the steering position has {len(resolved)} "
                 f"coordinate(s)"
@@ -1129,8 +1129,8 @@ class SteeringManager:
 
             for layer_idx, sub in manifold.layers.items():
                 if layer_idx in manifold_owner:
-                    from saklas.core.steering_expr import SteeringExprError
-                    raise SteeringExprError(
+                    from saklas.core.errors import OverlappingManifoldError
+                    raise OverlappingManifoldError(
                         f"manifolds '{manifold_owner[layer_idx]}' and "
                         f"'{mname}' both cover layer {layer_idx}; manifold "
                         f"steering allows only one manifold per layer"

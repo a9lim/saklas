@@ -1602,12 +1602,15 @@ def _run_manifold_ls(args: argparse.Namespace) -> None:
     if not rows:
         print("no manifolds installed under ~/.saklas/manifolds/")
         return
+    verbose = getattr(args, "verbose", False)
     for ns, mf in rows:
         kind = domain_label(mf.domain)
         models = ", ".join(mf.tensor_models()) or "(unfitted)"
         print(
             f"  {ns}/{mf.name}  [{kind}, {len(mf.node_labels)} nodes]  {models}"
         )
+        if verbose and mf.description:
+            print(f"    {mf.description}")
 
 
 def _run_manifold_show(args: argparse.Namespace) -> None:
@@ -1676,37 +1679,15 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
         len(mf.node_labels) - len(mf.node_roles)
     )
     if getattr(args, "json_output", False):
-        if mf.is_discover:
-            nodes_json = [
-                {
-                    "label": label,
-                    "coords": (
-                        derived_node_coords[i]
-                        if i < len(derived_node_coords) else None
-                    ),
-                    "role": node_roles_padded[i],
-                }
-                for i, label in enumerate(mf.node_labels)
-            ]
-        else:
-            nodes_json = [
-                {"label": label, "coords": coords, "role": role}
-                for label, coords, role in zip(
-                    mf.node_labels, mf.node_coords, node_roles_padded,
-                )
-            ]
-        body: dict[str, Any] = {
-            "namespace": ns,
-            "name": mf.name,
-            "description": mf.description,
-            "fit_mode": mf.fit_mode,
-            "domain": mf.domain,
-            "nodes": nodes_json,
-            "fitted": fitted,
-        }
-        if mf.hyperparams:
-            body["hyperparams"] = mf.hyperparams
-        print(_json.dumps(body, indent=2))
+        # Share the session-independent summary serializer with the
+        # server's ``GET /saklas/v1/manifolds/{ns}/{name}`` route so both
+        # surfaces emit the same keys.  For a discover folder
+        # ``manifold_summary`` reports the on-disk (empty) geometry —
+        # ``node_coords == []`` — since the derived per-model layout lives
+        # in the fitted safetensors; the text path below still surfaces
+        # the derived coords for interactive use.
+        from saklas.io.manifolds import manifold_summary
+        print(_json.dumps(manifold_summary(mf.folder), indent=2))
         return
 
     print(f"{ns}/{mf.name}")
@@ -2028,6 +2009,332 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     )
 
 
+def _split_manifold_ns_name(raw: str) -> tuple[str, str]:
+    """Split a CLI-supplied manifold selector into ``(namespace, name)``.
+
+    Manifolds are addressed by ``(namespace, name)`` directly — not the
+    concept ``Selector``/``resolve`` machinery — so a bare name defaults
+    to the ``local`` namespace (the manifold lifecycle backends accept
+    the pair verbatim).  Mirrors the ``ns/name`` split in
+    ``_run_manifold_generate``.
+    """
+    if "/" in raw:
+        ns, name = raw.split("/", 1)
+        return ns, name
+    return "local", raw
+
+
+def _run_manifold_install(args: argparse.Namespace) -> None:
+    from saklas.io.hf_manifolds import install_manifold
+
+    dst = install_manifold(args.target, args.as_target, force=args.force)
+    print(f"Installed {args.target} -> {dst}")
+
+
+def _run_manifold_search(args: argparse.Namespace) -> None:
+    import json as _json
+    from saklas.io.hf_manifolds import search_manifolds
+
+    try:
+        rows = search_manifolds(args.query or None)
+    except ImportError as e:
+        print(f"saklas vector manifold search unavailable: {e}", file=sys.stderr)
+        return
+    except Exception as e:
+        print(f"hf search failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    if getattr(args, "json_output", False):
+        print(_json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("(no matches)")
+        return
+    for r in rows:
+        line = (
+            f"{r['name']:<24} {r['namespace']:<12} [hf]          "
+            f"{r['domain_label']:<14} {r['node_count']:>3} nodes  "
+            f"{', '.join(r['tensor_models']) or '(unfitted)'}"
+        )
+        if getattr(args, "verbose", False):
+            line = (
+                f"{r['name']:<24} {r['namespace']:<12} [hf]          "
+                f"{r['domain_label']:<14} {r['node_count']:>3} nodes  "
+                f"{r.get('description', '')}"
+            )
+        print(line)
+
+
+def _run_manifold_merge(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import (
+        ManifoldFormatError, merge_discover_manifolds,
+    )
+
+    target_ns, target_name = _split_manifold_ns_name(args.name)
+    sources = [_split_manifold_ns_name(s) for s in args.sources]
+    if len(sources) < 2:
+        print(
+            "manifold merge: need >= 2 sources (union of one manifold is a no-op)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        dst = merge_discover_manifolds(
+            target_ns, target_name, args.description,
+            sources=sources,
+            fit_mode=args.fit_mode,
+            force=args.force,
+        )
+    except (FileNotFoundError, FileExistsError, ManifoldFormatError, ValueError) as e:
+        print(f"manifold merge failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Merged manifold written to {dst}")
+    print(
+        f"  → run `saklas vector manifold discover {target_ns}/{target_name}` to fit"
+    )
+
+
+def _run_manifold_push(args: argparse.Namespace) -> None:
+    from saklas.io.hf import resolve_target_coord
+    from saklas.io.hf_manifolds import push_manifold
+    from saklas.io.paths import manifold_dir
+
+    ns, name = _split_manifold_ns_name(args.selector)
+    folder = manifold_dir(ns, name)
+    if not (folder / "manifold.json").exists():
+        print(
+            f"manifold push: {ns}/{name} not found at {folder}", file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # The coord follows pack push's resolution: ``--as owner/name`` wins,
+    # else ``<whoami>/<name>``.  ``push_manifold`` takes the resolved
+    # coord directly (no internal selector machinery), so the runner owns
+    # the resolution the way ``cache_ops.push`` does for packs.
+    try:
+        coord = resolve_target_coord(name, args.as_target)
+    except Exception as e:
+        print(f"manifold push: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        repo_url, sha = push_manifold(
+            folder, coord,
+            private=args.private,
+            model_scope=args.model,
+            variant=args.variant,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    if sha:
+        print(f"Pushed {coord} -> {repo_url} @ {sha[:12]}")
+    elif args.dry_run:
+        print(f"Dry-run: would push {coord} -> {repo_url}")
+    else:
+        print(f"Pushed {coord} -> {repo_url}")
+
+
+def _run_manifold_rm(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import remove_manifold_folder
+
+    ns, name = _split_manifold_ns_name(args.selector)
+    # Bundled (``default/``) manifolds re-materialize on next session
+    # init — mirror ``pack rm``'s confirmation guard for the broad/
+    # destructive case (here: a bundled folder the user likely didn't
+    # mean to nuke).  ``-y`` skips it.
+    if ns == "default" and not args.yes:
+        print(
+            f"refusing to remove bundled manifold {ns}/{name} "
+            f"(re-materializes on restart); pass --yes to confirm",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        result = remove_manifold_folder(ns, name)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    msg = f"Removed {result['namespace']}/{result['name']}"
+    if result.get("rematerializes_on_restart"):
+        msg += " (re-materializes on next session start)"
+    print(msg)
+
+
+def _run_manifold_clear(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import clear_manifold_tensors
+
+    ns, name = _split_manifold_ns_name(args.selector)
+    # ``args.model`` is the raw model id; ``clear_manifold_tensors`` does
+    # the safe-id conversion at the io boundary, exactly as the pack
+    # ``cache_ops.delete_tensors`` path does (it passes ``args.model``
+    # straight through to ``enumerate_variants``).
+    try:
+        n = clear_manifold_tensors(ns, name, args.model, variant=args.variant)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    print(f"Deleted {n} files")
+
+
+def _run_manifold_refresh(args: argparse.Namespace) -> None:
+    from saklas.io.manifolds import refresh_manifold
+
+    ns, name = _split_manifold_ns_name(args.selector)
+    # ``args.model`` is the raw model id; ``refresh_manifold`` converts to
+    # a safe id at the io boundary (via ``clear_manifold_tensors``), the
+    # same convention ``cache_ops.refresh``'s scoped path uses.
+    try:
+        tier = refresh_manifold(ns, name, model_scope=args.model)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    if tier == "scoped":
+        print(f"Refreshed {ns}/{name} ({args.model} tensors cleared — re-fits on next use)")
+    elif tier == "skipped":
+        print(f"{ns}/{name}: local source, nothing to refresh")
+    elif tier == "bundled":
+        print(f"Refreshed {ns}/{name} (bundled — re-materialized from package data)")
+    else:  # "hf"
+        print(f"Refreshed {ns}/{name} (re-pulled from HF)")
+
+
+def _run_manifold_transfer(args: argparse.Namespace) -> None:
+    """Cross-model manifold transfer via Procrustes.
+
+    Mirrors :func:`_run_transfer` (the vector path): resolve the manifold
+    folder, fit (or load) the per-layer Procrustes alignment between the
+    source and target models' cached neutral activations — the part that
+    needs both models loaded — then hand the prebuilt alignment dict to
+    :func:`saklas.io.manifolds.transfer_manifold`, which is pure-io and
+    only *applies* the map.
+    """
+    import json as _json
+
+    from saklas.io.alignment import (
+        AlignmentError,
+        alignment_quality,
+        fit_alignment,
+        load_alignment_map,
+        load_or_compute_neutral_activations,
+        save_alignment_map,
+    )
+    from saklas.io.manifolds import (
+        ManifoldFormatError, transfer_manifold,
+    )
+    from saklas.io.paths import manifold_dir, safe_model_id
+
+    ns, name = _split_manifold_ns_name(args.name)
+    folder = manifold_dir(ns, name)
+    if not (folder / "manifold.json").exists():
+        print(
+            f"manifold transfer: {ns}/{name} not found at {folder}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    src_tensor = folder / f"{safe_model_id(args.src_model)}.safetensors"
+    if not src_tensor.exists():
+        print(
+            f"manifold transfer: source fit not found at {src_tensor} — fit "
+            f"the manifold on {args.src_model} first",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    from saklas.core.manifold import load_manifold  # noqa: F401  (parity import path)
+    from saklas.io.paths import tensor_filename
+    tgt_tensor = folder / tensor_filename(
+        args.tgt_model, transferred_from=args.src_model,
+    )
+    if tgt_tensor.exists() and not args.force:
+        print(
+            f"manifold transfer: target already exists at {tgt_tensor}; "
+            f"pass -f to recompute",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Fit / load the per-layer Procrustes alignment.  Mirrors
+    # ``_run_transfer`` exactly — serialize the two model loads so we
+    # never hold both in memory at once.
+    from saklas.core.session import SaklasSession
+
+    cached = None if args.force else load_alignment_map(args.src_model, args.tgt_model)
+    if cached is None:
+        print(
+            f"manifold transfer: fitting Procrustes alignment "
+            f"{args.src_model} -> {args.tgt_model} "
+            f"(this may load each model briefly)...",
+            file=sys.stderr,
+        )
+        with SaklasSession.from_pretrained(args.src_model, device="auto", probes=[]) as src_sess:
+            src_acts = load_or_compute_neutral_activations(
+                src_sess._model, src_sess._tokenizer, src_sess._layers,
+                model_id=args.src_model, force=args.force,
+            )
+        with SaklasSession.from_pretrained(args.tgt_model, device="auto", probes=[]) as tgt_sess:
+            tgt_acts = load_or_compute_neutral_activations(
+                tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
+                model_id=args.tgt_model, force=args.force,
+            )
+        try:
+            M = fit_alignment(src_acts, tgt_acts)
+        except AlignmentError as e:
+            print(f"manifold transfer: {e}", file=sys.stderr)
+            sys.exit(1)
+        quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
+        save_alignment_map(
+            M, args.src_model, args.tgt_model,
+            quality_per_layer=quality_per_layer,
+        )
+    else:
+        M, sidecar = cached
+        raw_q = sidecar.get("quality_per_layer") or {}
+        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
+
+    median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
+
+    try:
+        out_path = transfer_manifold(
+            folder,
+            from_model=args.src_model,
+            to_model=args.tgt_model,
+            alignment=M,
+            transfer_quality_estimate=median_quality,
+            force=args.force,
+        )
+    except (FileNotFoundError, FileExistsError, ManifoldFormatError) as e:
+        print(f"manifold transfer failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    payload = {
+        "namespace": ns,
+        "name": name,
+        "source_model": args.src_model,
+        "target_model": args.tgt_model,
+        "tensor": str(out_path),
+        "transferred_layers": sorted(M.keys()),
+        "median_transfer_quality": (
+            round(median_quality, 4) if median_quality is not None else None
+        ),
+    }
+    if args.json_output:
+        print(_json.dumps(payload, indent=2))
+        return
+
+    quality_str = f"{median_quality:.3f}" if median_quality is not None else "n/a"
+    print(
+        f"Transferred manifold {ns}/{name} "
+        f"from {args.src_model} -> {args.tgt_model}\n"
+        f"  layers:           {len(M)} shared\n"
+        f"  median quality:   {quality_str} (R^2 across shared layers)\n"
+        f"  tensor:           {out_path}\n"
+        f"  variant suffix:   :from-{safe_model_id(args.src_model)}"
+    )
+
+
 def _run_vector_manifold(args: argparse.Namespace) -> None:
     """Dispatch ``saklas vector manifold <verb>``."""
     cmd = getattr(args, "manifold_cmd", None)
@@ -2037,6 +2344,14 @@ def _run_vector_manifold(args: argparse.Namespace) -> None:
         print("  fit       Fit an authored manifold (user-supplied coords)")
         print("  discover  Fit a discover-mode manifold (coords derived from activations)")
         print("  generate  Author a discover-mode manifold from a concept list")
+        print("  merge     Union discover-mode manifolds' nodes into a new manifold")
+        print("  install   Install a manifold from HF or a local folder")
+        print("  search    Search the HuggingFace hub for manifolds")
+        print("  push      Push a manifold to HF as a model repo")
+        print("  rm        Fully remove a manifold folder")
+        print("  clear     Delete per-model fitted tensors for a manifold")
+        print("  refresh   Re-pull / re-materialize a manifold from its source")
+        print("  transfer  Transfer a manifold to another model via Procrustes")
         print("  ls        List installed manifolds")
         print("  show      Show a manifold's nodes and fitted models")
         sys.exit(0)
@@ -2048,6 +2363,30 @@ def _run_vector_manifold(args: argparse.Namespace) -> None:
         return
     if cmd == "generate":
         _run_manifold_generate(args)
+        return
+    if cmd == "merge":
+        _run_manifold_merge(args)
+        return
+    if cmd == "install":
+        _run_manifold_install(args)
+        return
+    if cmd == "search":
+        _run_manifold_search(args)
+        return
+    if cmd == "push":
+        _run_manifold_push(args)
+        return
+    if cmd == "rm":
+        _run_manifold_rm(args)
+        return
+    if cmd == "clear":
+        _run_manifold_clear(args)
+        return
+    if cmd == "refresh":
+        _run_manifold_refresh(args)
+        return
+    if cmd == "transfer":
+        _run_manifold_transfer(args)
         return
     if cmd == "ls":
         _run_manifold_ls(args)

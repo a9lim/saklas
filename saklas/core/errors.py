@@ -87,6 +87,46 @@ class RoleBaselineMismatchWarning(UserWarning):
     """
 
 
+class SteeringExprError(ValueError, SaklasError):
+    """Raised when a steering expression string cannot be parsed."""
+
+    def __init__(self, msg: str, *, col: int | None = None) -> None:
+        self.col = col
+        if col is not None:
+            msg = f"{msg} (col {col})"
+        super().__init__(msg)
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
+
+class ManifoldArityError(SteeringExprError):
+    """Raised when a ``%`` manifold position has the wrong number of
+    coordinates for the manifold's domain.
+
+    The grammar collects the position payload but cannot validate arity —
+    it does not know the domain.  ``SteeringManager.add_manifold`` checks
+    the coordinate count against the loaded domain's intrinsic dimension
+    and raises this when they disagree.  The manifold-surface analogue of
+    the vector surface's dedicated selector errors
+    (``AmbiguousSelectorError`` / ``AmbiguousVariantError``); subclasses
+    ``SteeringExprError`` so existing ``except SteeringExprError`` sites
+    still catch it.
+    """
+
+
+class OverlappingManifoldError(SteeringExprError):
+    """Raised when two manifold terms target the same layer.
+
+    Only one manifold may steer a given layer — composing two manifolds at
+    the same layer is the deferred frontier (see
+    ``docs/plans/manifold-composition.md``).  Subclasses
+    ``SteeringExprError`` so existing ``except SteeringExprError`` sites
+    still catch it; the dedicated type lets callers discriminate the
+    overlap failure from a generic parse error.
+    """
+
+
 class StaleSidecarError(ValueError, SaklasError):
     """Raised when an extracted tensor's recorded ``statements_sha256``
     disagrees with the live ``statements.json`` on disk.

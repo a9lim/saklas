@@ -1392,11 +1392,15 @@ class SaklasSession:
         ``scenarios.json`` so statements regenerate against fixed
         domains.
 
-        The anti-allegory clause ("don't force human-social framing
-        onto concepts that aren't about humans; a robot is a machine,
-        not a metaphor") is verbatim in both the scenario prompt and
-        the per-cell statement prompt.  Tests assert the clause's
-        presence.
+        The anti-allegory anchor — the directive that each concept is a
+        *literal* concept (so non-human axes like deer/wolf or
+        brick/feather stay literal rather than collapsing into
+        human-social metaphor) — is present in all three prompt builders:
+        the scenario prompt, the moment-shared (``share_moment=True``)
+        statement prompt, and the per-cell (``share_moment=False``)
+        statement prompt.  The three phrasings differ in wording but all
+        carry the "literal concept" directive; the tests assert that
+        directive's presence, not byte-identical text.
 
         Returns ``{concept: [statement, ...]}`` where each list has
         exactly ``len(scenarios) * statements_per_cell`` entries,

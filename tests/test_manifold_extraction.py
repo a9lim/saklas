@@ -250,6 +250,35 @@ def test_fit_sae_variant(tmp_path: Path) -> None:
     assert (folder / "stub-model_sae-mock-rel.safetensors").exists()
 
 
+def test_fit_sae_no_coverage_raises_before_pooling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SAE covering none of the model's layers raises ``SaeCoverageError``
+    *before* the per-node centroid pooling loop — fail-fast parity with the
+    vector path (``vectors._capture_diffs_for_pairs``)."""
+    from saklas.core.errors import SaeCoverageError
+
+    folder = _author_manifold(tmp_path)
+    # SAE layers disjoint from [0, _N_LAYERS) — zero coverage.
+    sae = MockSaeBackend(
+        layers=frozenset({_N_LAYERS + 1, _N_LAYERS + 2}), d_model=_DIM,
+        release="empty-rel",
+    )
+
+    # Pooling must never run on the no-coverage path.
+    from saklas.core import manifold as M
+
+    def _explode(*_a: Any, **_k: Any) -> None:
+        raise AssertionError(
+            "compute_node_centroid called before SAE-coverage check"
+        )
+
+    monkeypatch.setattr(M, "compute_node_centroid", _explode)
+
+    with pytest.raises(SaeCoverageError, match="covers no layers"):
+        ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder, sae=sae)
+
+
 def test_fit_natural_manifold(tmp_path: Path) -> None:
     from saklas.core.manifold import BoxDomain
     folder = _author_manifold(tmp_path, periodic=False)
@@ -480,6 +509,12 @@ def test_discover_subspace_replace_moves_toward_target(tmp_path: Path) -> None:
     is much closer to ``target_coords`` than the input's was.
     """
     from saklas.core.manifold import subspace_replace
+    # Seed the global RNG before the fit: the stub encoder perturbs each
+    # layer's centroid with a generator-less ``torch.randn``, so without
+    # this the fitted subspace jitters with test order and the borderline
+    # direction-reducing assertion below goes flaky (matches the seeding
+    # the other discover-fit tests in this file already do).
+    torch.manual_seed(0)
     folder = _discover_folder(
         tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
     )
