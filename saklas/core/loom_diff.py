@@ -316,12 +316,17 @@ def _entry_alpha(entry: Any) -> float:
     """Extract the numeric coefficient from a Steering.alphas entry.
 
     Handles bare floats, ``(alpha, trigger)`` tuples, ``ProjectedTerm``,
-    and ``AblationTerm`` uniformly so the delta formatter doesn't have
-    to special-case each shape.
+    ``AblationTerm``, and ``ManifoldTerm`` uniformly so the delta
+    formatter doesn't have to special-case each shape — every non-scalar
+    entry exposes a ``.coeff`` field.
     """
-    from saklas.core.steering_expr import AblationTerm, ProjectedTerm
+    from saklas.core.steering_expr import (
+        AblationTerm,
+        ManifoldTerm,
+        ProjectedTerm,
+    )
 
-    if isinstance(entry, (ProjectedTerm, AblationTerm)):
+    if isinstance(entry, (ProjectedTerm, AblationTerm, ManifoldTerm)):
         return float(entry.coeff)
     if isinstance(entry, tuple):
         return float(entry[0])

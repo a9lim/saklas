@@ -200,3 +200,20 @@ def test_steering_delta_add_term():
 def test_steering_delta_unparseable_returns_empty():
     # Both unparseable expressions → no change → empty.
     assert steering_delta("???", "???") == ""
+
+
+def test_steering_delta_manifold_coord_term():
+    # A `%` manifold term lands in Steering.alphas as a ManifoldTerm, not a
+    # bare float — the edge-label formatter must read its .coeff rather than
+    # blowing up on float(entry). Regression for the tree edge-label 500.
+    label = steering_delta(None, "0.5 circumplex%0.6,0.4")
+    assert label  # non-empty
+    assert "0.5" in label
+
+
+def test_steering_delta_manifold_label_term():
+    # Label-form (`%pirate`) manifold terms route through the same entry.
+    label = steering_delta(
+        "0.3 personas%hacker", "0.6 personas%hacker",
+    )
+    assert "0.3" in label  # 0.6 − 0.3
