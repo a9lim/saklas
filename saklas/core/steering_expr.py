@@ -7,8 +7,10 @@ turns a user-supplied string into the same :class:`Steering` IR.
 Grammar::
 
     expr        := term (("+" | "-") term)*
-    term        := [coeff ["*"]] selector ["@" trigger]
-    selector    := atom (("~" | "|") atom | "%" NUM)?
+    term        := [coeff ["*"]] ["!"] selector ["@" trigger]
+    selector    := atom (("~" | "|") atom | "%" position)?
+    position    := signed_num ("," signed_num)* | label   # coord list | node label
+    label       := NAME                                # a manifold node label
     atom        := [ns "/"] NAME ["." NAME] [":" variant]
     trigger     := preset | gate
     preset      := "before" | "after" | "both" | "thinking" | "response"
@@ -20,6 +22,14 @@ Grammar::
     op          := ">" | ">=" | "<" | "<="
     coeff       := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
     variant     := "raw" | "sae" | "sae-" ID | "role-" ID
+
+``!`` mean-ablates the selector (``h' = h − α(h·d̂ − μ·d̂)d̂``; bare
+``!x`` is α=1.0); it does not compose with ``~`` / ``|`` / ``%``.  The
+``%`` operator places a generation on a fitted manifold — the
+``position`` is either a comma-separated list of authoring coordinates
+(one per intrinsic dimension) or a single node-label string (sugar for
+that node's coords); the parser only collects the payload, arity /
+label-existence is validated at manifold-load time.
 
 Probe gates (v2.1): ``@when:<probe><op><threshold>`` fires the term only
 on decode steps where the named probe's last reading satisfies the

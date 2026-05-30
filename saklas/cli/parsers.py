@@ -88,6 +88,25 @@ _VECTOR_VERBS: list[tuple[str, str]] = [
     ("manifold",  "Fit and inspect spline-based steering manifolds"),
 ]
 
+# Verb table for ``saklas vector manifold <verb>`` — the source of truth for
+# both parser registration order and the bare-verb help block (``_run_vector_
+# manifold``), mirroring how ``_VECTOR_VERBS`` / ``_PACK_VERBS`` drive theirs.
+_MANIFOLD_VERBS: list[tuple[str, str]] = [
+    ("fit",       "Fit an authored manifold (user-supplied coords)"),
+    ("discover",  "Fit a discover-mode manifold (coords derived from activations)"),
+    ("generate",  "Author a discover-mode manifold from a concept list"),
+    ("ls",        "List installed manifolds"),
+    ("show",      "Show a manifold's nodes and fitted models"),
+    ("install",   "Install a manifold from HF or a local folder"),
+    ("search",    "Search the HuggingFace hub for manifolds"),
+    ("merge",     "Union discover-mode manifolds' nodes into a new manifold"),
+    ("push",      "Push a manifold to HF as a model repo"),
+    ("rm",        "Fully remove a manifold folder"),
+    ("clear",     "Delete per-model fitted tensors for a manifold"),
+    ("refresh",   "Re-pull / re-materialize a manifold from its source"),
+    ("transfer",  "Transfer a manifold to another model via Procrustes"),
+]
+
 _EXPERIMENT_VERBS: list[tuple[str, str]] = [
     ("fan",         "Run an alpha grid as one experiment"),
     ("transcript",  "Replay or inspect saved transcript paths"),
@@ -605,6 +624,11 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Human-readable description for the manifold folder",
     )
     generate.add_argument(
+        "--seed", type=int, default=None, metavar="INT",
+        help="Seed the statement generation for reproducible corpora "
+             "(parity with `vector clone --seed`; default: unseeded)",
+    )
+    generate.add_argument(
         "--role-per-node", dest="role_per_node", action="store_true",
         help=(
             "Role-augmented (persona) manifold: use each --concepts slug "
@@ -711,7 +735,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Human-readable description for the merged manifold folder",
     )
     merge.add_argument(
-        "--method", dest="fit_mode", choices=("pca", "spectral"), default=None,
+        "--method", choices=("pca", "spectral"), default=None,
         help="Override the merged fit_mode (default: the sources' shared "
              "mode; required when sources disagree)",
     )
@@ -743,8 +767,9 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     push.add_argument("-p", "--private", action="store_true")
     push.add_argument("-d", "--dry-run", action="store_true")
     push.add_argument(
-        "--variant", choices=["raw", "sae", "all"], default="all",
-        help="Which tensor variant(s) to push. Default: all.",
+        "--variant", choices=["raw", "sae", "all"], default="raw",
+        help="Which tensor variant(s) to push. Default: raw. (SAE variants "
+             "carry stronger provenance, so sharing them is opt-in.)",
     )
 
     rm = sub.add_parser(

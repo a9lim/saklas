@@ -21,7 +21,7 @@ from typing import Any, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from saklas.core.manifold import domain_from_spec
 from saklas.core.session import ConcurrentExtractionError, SaklasSession
@@ -176,8 +176,10 @@ class InstallManifoldRequest(BaseModel):
     """
 
     target: str
-    as_: str | None = None
+    as_: str | None = Field(default=None, alias="as")
     force: bool = False
+
+    model_config = {"populate_by_name": True}
 
 
 class MergeManifoldSource(BaseModel):
@@ -526,7 +528,8 @@ def register_manifold_routes(app: FastAPI) -> None:
         # the cap when ``limit`` is omitted or oversized.
         if limit and limit > 0:
             rows = rows[: int(limit)]
-        return {"results": rows}
+        # Echo ``query`` for parity with ``GET /saklas/v1/packs/search``.
+        return {"query": q, "results": rows}
 
     @app.post("/saklas/v1/manifolds/merge", status_code=201)
     async def merge_manifold(req: MergeManifoldRequest):
@@ -719,11 +722,16 @@ def register_manifold_routes(app: FastAPI) -> None:
                                 {"message": str(e), "code": "ValueError"},
                             ))
                         except Exception as e:  # noqa: BLE001
+                            # Don't surface ``str(e)`` — Python exception
+                            # messages routinely echo filesystem paths or
+                            # vendor error text.  Log the full traceback
+                            # server-side, send a generic shape (matching
+                            # the vector clone/extract SSE workers).
                             log.exception("manifold generate crashed")
                             queue.put_nowait((
                                 "error",
                                 {
-                                    "message": str(e) or "generate failed",
+                                    "message": "generate failed",
                                     "code": type(e).__name__,
                                 },
                             ))
@@ -936,11 +944,16 @@ def register_manifold_routes(app: FastAPI) -> None:
                                 },
                             ))
                         except Exception as e:  # noqa: BLE001
+                            # Don't surface ``str(e)`` — Python exception
+                            # messages routinely echo filesystem paths or
+                            # vendor error text.  Log the full traceback
+                            # server-side, send a generic shape (matching
+                            # the vector clone/extract SSE workers).
                             log.exception("manifold fit crashed")
                             queue.put_nowait((
                                 "error",
                                 {
-                                    "message": str(e) or "fit failed",
+                                    "message": "fit failed",
                                     "code": type(e).__name__,
                                 },
                             ))

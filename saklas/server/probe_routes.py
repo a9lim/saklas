@@ -6,9 +6,22 @@ import asyncio
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from saklas.server import saklas_api as _api
 from saklas.server.saklas_api import ScoreProbeRequest, _probe_info, _resolve_session_id
+
+
+class ScoreManifoldRequest(BaseModel):
+    """Body for ``POST /sessions/{id}/manifold-probe``.
+
+    The manifold-side counterpart to :class:`ScoreProbeRequest`:
+    one-shot text scoring against attached manifold probes.  ``names``
+    restricts the scored subset (defaults to every attached probe).
+    """
+
+    text: str
+    names: list[str] | None = None
 
 
 def register_probe_routes(app: FastAPI) -> None:
@@ -64,3 +77,35 @@ def register_probe_routes(app: FastAPI) -> None:
         if requested:
             readings = {key: value for key, value in readings.items() if key in requested}
         return {"readings": {key: float(value) for key, value in readings.items()}}
+
+    @app.post("/saklas/v1/sessions/{session_id}/manifold-probe")
+    async def score_manifold_oneshot(session_id: str, req: ScoreManifoldRequest):
+        """One-shot manifold scoring over arbitrary text, no generation.
+
+        The read-side manifold counterpart to ``POST .../probe``: runs
+        :meth:`SaklasSession.measure_manifold` (a single forward pass +
+        per-layer aggregate) under the session lock and returns each
+        attached manifold probe's :class:`ManifoldAggregate` as JSON.
+        ``names`` restricts the scored subset; unknown names 400.
+        """
+        _resolve_session_id(session, session_id)
+        requested = req.names
+        if requested:
+            try:
+                attached = session.manifold_monitor.probe_names
+            except Exception:
+                attached = []
+            missing = [name for name in requested if name not in attached]
+            if missing:
+                raise HTTPException(400, f"manifold probes not attached: {missing}")
+
+        async with session.lock:
+            readings = await asyncio.to_thread(
+                session.measure_manifold, req.text, names=requested,
+            )
+        return {
+            "readings": {
+                name: aggregate.to_dict()
+                for name, aggregate in readings.items()
+            },
+        }

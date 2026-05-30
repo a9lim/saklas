@@ -11,7 +11,7 @@ direction from source-space to target-space.
 Public surface:
 
 * :func:`load_or_compute_neutral_activations` — disk-cached per-model
-  neutral-statement activations; ``[N=90, D]`` per layer in fp16.
+  neutral-statement activations; ``[N=90, D]`` per layer, stored bf16.
 * :func:`fit_alignment` — per-layer alignment map ``M_L : ℝ^D_src → ℝ^D_tgt``.
 * :func:`transfer_profile` — apply the alignment map to a profile.
 * :func:`alignment_cache_path` — disk cache for the fitted map keyed by
@@ -69,9 +69,12 @@ def load_or_compute_neutral_activations(
     discipline as ``layer_means``).  Stale cache → recompute, write,
     return.  Fresh cache → load and return.
 
-    Returns ``{layer_idx: [N, D] fp32 CPU tensor}``.  Stored as fp16 on
-    disk to keep the artifact ~30MB instead of ~60MB; promoted back to
-    fp32 in memory for the Procrustes fit.
+    Returns ``{layer_idx: [N, D] fp32 CPU tensor}``.  Stored as bf16 on
+    disk to keep the artifact ~30MB instead of ~60MB (and, unlike fp16,
+    bf16's fp32-range exponent survives extreme-activation channels —
+    gemma-3's late layers exceed the fp16 max of 65504 and would otherwise
+    overflow to ±inf); promoted back to fp32 in memory for the Procrustes
+    fit / whitener.
     """
     from saklas.core.vectors import compute_neutral_activations
 
@@ -91,14 +94,25 @@ def load_or_compute_neutral_activations(
                 sc = json.load(f)
             if current_ns_hash is None or sc.get("statements_sha256") == current_ns_hash:
                 tensors = load_file(str(ts_path))
-                # Tensors stored as ``layer_<idx>``; lift fp16 → fp32 in
-                # memory because Procrustes wants fp32 precision.
+                # Tensors stored as ``layer_<idx>``; lift bf16 (or a legacy
+                # fp16 cache) → fp32 in memory because Procrustes / the
+                # whitener want fp32 precision.
                 out = {
                     int(k.split("_", 1)[1]): v.float()
                     for k, v in tensors.items()
                 }
-                log.debug("Loaded cached neutral activations for %s", model_id)
-                return out
+                # Self-heal a legacy fp16 cache whose values overflowed to
+                # ±inf: gemma-3's extreme late-layer channels exceed the
+                # fp16 max (65504), poisoning the whitener (``λ=inf`` →
+                # ``K=nan``).  A non-finite cache is treated as stale and
+                # recomputed (now stored bf16, fp32 exponent range).
+                if all(bool(torch.isfinite(t).all()) for t in out.values()):
+                    log.debug("Loaded cached neutral activations for %s", model_id)
+                    return out
+                log.warning(
+                    "Cached neutral activations for %s are non-finite "
+                    "(legacy fp16 overflow); recomputing as bf16.", model_id,
+                )
             log.info(
                 "Neutral activations stale (neutral_statements changed); recomputing for %s",
                 model_id,
@@ -109,11 +123,13 @@ def load_or_compute_neutral_activations(
     log.info("Computing neutral activations (one-time per model)...")
     activations = compute_neutral_activations(model, tokenizer, layers)
 
-    # Persist as fp16 — the alignment fit doesn't benefit from fp32
-    # precision in the input observations themselves; the Procrustes
-    # SVD lifts to fp32 internally.
-    fp16 = {f"layer_{idx}": t.contiguous().to(torch.float16).cpu() for idx, t in activations.items()}
-    save_file(fp16, str(ts_path))
+    # Persist as bf16 — half the disk of fp32 (the alignment fit / whitener
+    # lift to fp32 internally and don't need fp32 input precision), but with
+    # fp32's exponent range so extreme-activation channels (gemma-3's late
+    # layers exceed the fp16 max of 65504) don't overflow to ±inf the way
+    # the former fp16 store did.
+    bf16 = {f"layer_{idx}": t.contiguous().to(torch.bfloat16).cpu() for idx, t in activations.items()}
+    save_file(bf16, str(ts_path))
     write_json_atomic(sc_path, {
         "method": "neutral_activations",
         "statements_sha256": current_ns_hash or "",

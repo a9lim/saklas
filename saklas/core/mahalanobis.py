@@ -160,6 +160,19 @@ class LayerWhitener:
                 )
             X_c = X - mu  # (N, D)
             n, d = X_c.shape
+            # Defensive: skip a layer whose centered activations are
+            # non-finite (a corrupt or legacy-fp16-overflowed neutral-
+            # activation cache — gemma-3's late-layer channels exceed the
+            # fp16 max and stored as ±inf).  Skipping leaves the layer
+            # *uncovered*, so the all-or-nothing ``covers_all`` gate routes
+            # every consumer (monitor read, DiM bake, manifold share) to
+            # Euclidean for the whole set rather than mixing a nan-bearing
+            # layer in.  With the bf16 neutral-activation store this never
+            # triggers in practice; it is the single robustness guarantee
+            # that lets callers trust ``covers_all`` without their own
+            # finite-check.
+            if not bool(torch.isfinite(X_c).all()):
+                continue
             # λ_L = mean diagonal of the un-regularized sample covariance
             # Σ̂ = X^T X / N.  trace(Σ̂) = ||X||_F² / N, divided by D → mean
             # eigenvalue of Σ̂ averaged over the standard basis.  Stable
@@ -182,6 +195,12 @@ class LayerWhitener:
             G = X_c @ X_c.transpose(0, 1)  # (N, N) Gram
             G.diagonal().add_(n * lam)
             K = torch.linalg.inv(G)
+            # Never carry non-finite factors into the hot path: if the
+            # regularized inverse came back inf/nan (e.g. ``frob_sq`` itself
+            # overflowed fp32, so ``λ``/``G`` did too), skip the layer —
+            # the same uncovered fallback as a non-finite input.
+            if not bool(torch.isfinite(K).all()):
+                continue
             centered[L] = X_c
             small_inv[L] = K
             ridge[L] = lam
@@ -232,9 +251,13 @@ class LayerWhitener:
         acts_raw = load_file(str(acts_path))
         # Both files key tensors by ``layer_<idx>`` (alignment.py and
         # vectors.save_profile shape).  ``layer_means`` are stored fp32;
-        # ``neutral_activations`` are stored fp16 to halve disk usage and
-        # promoted to fp32 here because the small N×N inverse doesn't
-        # tolerate fp16 condition number.
+        # ``neutral_activations`` are stored bf16 (a legacy cache may be
+        # fp16) to halve disk usage and promoted to fp32 here because the
+        # small N×N inverse doesn't tolerate reduced-precision condition
+        # number.  ``from_neutral_activations`` skips any layer whose values
+        # come back non-finite (a legacy fp16 cache that overflowed on an
+        # extreme-activation channel), so a corrupt cache degrades to
+        # Euclidean rather than poisoning the inverse.
         means = {
             int(k.split("_", 1)[1]): v.to(dtype=torch.float32)
             for k, v in means_raw.items()
@@ -321,6 +344,28 @@ class LayerWhitener:
         KXv = K @ Xv  # (N,)
         out = (v32 - X.transpose(0, 1) @ KXv) / lam
         return out.to(dtype=v_in_dtype)
+
+    def woodbury_factors(
+        self, layer: int, *, device: torch.device, dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Return ``(X, K, λ)`` for a layer, cast to ``device`` / ``dtype``.
+
+        The three quantities that drive the Woodbury apply
+        ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` — the centered neutral
+        observations ``X ∈ ℝ^(N, D)``, the small inverse
+        ``K = (NλI + X Xᵀ)⁻¹ ∈ ℝ^(N, N)``, and the ridge ``λ``.  Exposed so
+        a hot-path consumer (the trait monitor's Mahalanobis read) can
+        precompute device-resident factors **once** at cache-build and run
+        the per-token ``Σ⁻¹ h_c`` apply inline on-device — without routing
+        every token through :meth:`apply_inv`, which force-promotes to
+        fp32 CPU and reshapes to 1-D.  ``apply_inv`` stays the canonical
+        analysis-time entry point; this is its hot-path companion.
+        """
+        if layer not in self._X:
+            raise WhitenerError(f"whitener does not cover layer {layer}")
+        X = self._X[layer].to(device=device, dtype=dtype)
+        K = self._K[layer].to(device=device, dtype=dtype)
+        return X, K, float(self._lambda[layer])
 
     def subspace_gram(self, layer: int, basis: torch.Tensor) -> torch.Tensor:
         """Return the reduced-space inverse-covariance Gram ``B Σ_L^{-1} Bᵀ``.

@@ -188,6 +188,70 @@ def _encode_and_capture_all(
     Returns:
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
+    ids, content_end = _render_and_tokenize_for_capture(
+        tokenizer, text, device, role=role, model_type=model_type,
+    )
+    hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
+    return {
+        idx: h[0, min(content_end, h.shape[1] - 1)].float()
+        for idx, h in hidden_per_layer.items()
+    }
+
+
+def encode_and_capture_stack(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    text: str,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+) -> tuple[dict[int, torch.Tensor], int]:
+    """Capture the full ``[T, D]`` per-layer hidden stack over *text*.
+
+    The stack-returning companion to :func:`_encode_and_capture_all`:
+    same chat-template rendering, tokenization, and last-content-token
+    discipline, but it returns the whole sequence stack per layer plus the
+    ``agg_index`` of the last content token rather than collapsing to a
+    single pooled state.  Used by :meth:`ManifoldMonitor.measure` (one-shot
+    manifold text scoring), where ``score_aggregate`` pools the
+    ``agg_index`` row itself.
+
+    Returns ``({layer_idx: [T, D] fp32}, agg_index)``.
+    """
+    ids, content_end = _render_and_tokenize_for_capture(
+        tokenizer, text, device, role=role, model_type=model_type,
+    )
+    hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
+    stacks = {
+        idx: h[0].float()  # [T, D]
+        for idx, h in hidden_per_layer.items()
+    }
+    # content_end is already the last-content index in this sequence;
+    # clamp defensively against the captured stack length.
+    seq_len = next(iter(stacks.values())).shape[0] if stacks else 0
+    agg_index = min(content_end, seq_len - 1) if seq_len else 0
+    return stacks, agg_index
+
+
+def _render_and_tokenize_for_capture(
+    tokenizer: Any,
+    text: str,
+    device: torch.device,
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Render + tokenize *text* and locate the last content token.
+
+    The shared front half of :func:`_encode_and_capture_all` /
+    :func:`encode_and_capture_stack` — chat-template wrapping (with the
+    optional role substitution and the template-overhead fallback) plus
+    the canonical last-content-token walkback.  Returns ``(ids [1, T] on
+    device, content_end)`` so both pooling shapes share one definition of
+    how text becomes model input and where "content" ends.
+    """
     if getattr(tokenizer, "chat_template", None) is not None:
         # Disable thinking/reasoning mode for models that support it
         # (Qwen 3.5, QwQ, etc.) — thinking tokens would contaminate pooling.
@@ -266,11 +330,7 @@ def _encode_and_capture_all(
         while content_end > 0 and id_list[content_end] in skip_ids:
             content_end -= 1
 
-    hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
-    return {
-        idx: h[0, min(content_end, h.shape[1] - 1)].float()
-        for idx, h in hidden_per_layer.items()
-    }
+    return ids, content_end
 
 
 @functools.cache

@@ -214,6 +214,9 @@ def hash_manifold_files(folder: Path) -> dict[str, str]:
 
 
 def _hash_file(path: Path) -> str:
+    # Twin: :func:`saklas.io.packs.hash_file` is byte-identical and kept
+    # separate by design (the manifold format is decoupled from packs);
+    # mirror any change to one in the other.
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -384,6 +387,16 @@ class ManifoldFolder:
                 f"the old 1-D cyclic-spline format — convert them with "
                 f"scripts/upgrade_manifolds.py."
             )
+        if fmt > MANIFOLD_FORMAT_VERSION:
+            # Symmetric upper bound, mirroring ``PackMetadata.load`` — a
+            # manifold authored by a newer saklas may use fields this
+            # reader can't safely interpret, so refuse rather than load
+            # it silently.
+            raise ManifoldFormatError(
+                f"manifold.json in {folder} was created by a newer saklas "
+                f"(format v{fmt} > local v{MANIFOLD_FORMAT_VERSION}); "
+                f"upgrade saklas."
+            )
 
         name = data.get("name", folder.name)
         if not isinstance(name, str) or not NAME_REGEX.match(name):
@@ -545,8 +558,18 @@ class ManifoldFolder:
 
         for t in sorted(folder.glob("*.safetensors")):
             sc_path = t.with_suffix(".json")
-            if sc_path.exists():
-                inst._sidecars[t.stem] = ManifoldSidecar.load(sc_path)
+            # Every fitted tensor must carry its ``.json`` sidecar, the
+            # same invariant ``ConceptFolder.load`` enforces.  ``fit``
+            # always writes one via ``save_manifold``, so a missing
+            # sidecar means a genuinely-corrupt folder, not a legitimate
+            # shape — refuse rather than silently accept a sidecar-less
+            # tensor.
+            if not sc_path.exists():
+                raise ManifoldFormatError(
+                    f"manifold {name!r} tensor {t.name} has no sidecar "
+                    f"{sc_path.name}"
+                )
+            inst._sidecars[t.stem] = ManifoldSidecar.load(sc_path)
         return inst
 
     # -- node corpus -------------------------------------------------------
@@ -1251,8 +1274,12 @@ def _manifold_tensor_variant_matches(key: str, filter_: str) -> bool:
     ``key`` is the variant slug a manifold tensor filename parses to:
     ``"raw"`` (unsuffixed, canonical), ``"sae-<release>"``, or
     ``"from-<safe_src>"`` (transferred).  ``filter_`` is one of ``"raw"``
-    / ``"sae"`` / ``"all"`` — the same three the pack ``clear`` surface
-    accepts.
+    / ``"sae"`` / ``"from"`` / ``"all"`` — ``"from"`` selects transferred
+    tensors, so a ``clear --variant from`` drops only the cross-model
+    transfer variants while keeping the native fit.  Twin of
+    ``cache_ops._variant_matches_key`` — kept in sync so the pack and
+    manifold clear-filters recognize the same variant slugs (both match
+    the ``_from-<safe_src>`` variant transfers produce).
     """
     if filter_ == "all":
         return True
@@ -1260,6 +1287,8 @@ def _manifold_tensor_variant_matches(key: str, filter_: str) -> bool:
         return key == "raw"
     if filter_ == "sae":
         return key.startswith("sae-")
+    if filter_ == "from":
+        return key.startswith("from-")
     return False
 
 
@@ -1269,8 +1298,8 @@ def _manifold_tensor_files(
     """Per-model fitted tensors + their ``.json`` sidecars under ``folder``.
 
     Globs ``*.safetensors``, filters by ``variant`` (``raw`` / ``sae`` /
-    ``all``), and pairs each kept tensor with its sidecar.  The node
-    corpus and ``manifold.json`` are never touched — this is the
+    ``from`` / ``all``), and pairs each kept tensor with its sidecar.  The
+    node corpus and ``manifold.json`` are never touched — this is the
     fitted-artifact layer only.
 
     ``model_scope`` (a raw model id, e.g. ``"google/gemma-3-4b-it"``)
@@ -1311,7 +1340,8 @@ def clear_manifold_tensors(
     on next use) while leaving ``manifold.json`` and the ``nodes/`` corpus
     in place.  ``variant`` filters by tensor flavor — ``"raw"`` only the
     unsuffixed canonical tensors, ``"sae"`` only ``_sae-*`` variants,
-    ``"all"`` (default) both.  ``model_scope`` (a raw model id) narrows
+    ``"from"`` only ``_from-*`` transfer variants, ``"all"`` (default)
+    every flavor.  ``model_scope`` (a raw model id) narrows
     deletion to that one model's tensors (safe-id-matched, the same
     convention ``delete_tensors`` uses); ``None`` (default) clears every
     model.  Returns the number of files deleted.
@@ -1687,11 +1717,14 @@ def _canonical_json_sha256(data: bytes) -> str:
 
     Hashes the canonical-JSON form (sorted keys, no surrounding
     whitespace) so cosmetic-only differences (key order, indent, trailing
-    newline) compare equal.  Mirrors the helper in
-    :mod:`saklas.io.packs` — kept local to avoid reaching into a private
-    cross-module name.  Falls back to a raw sha256 if the bytes don't
+    newline) compare equal.  Falls back to a raw sha256 if the bytes don't
     parse as JSON, so unparseable on-disk content is treated as "user
     edited" rather than silently overwritten.
+
+    Twin: :func:`saklas.io.packs._canonical_json_sha256` is the
+    byte-equivalent helper for the decoupled pack format — kept separate
+    (rather than importing the private cross-module name) so the two
+    formats can churn independently; mirror any change to one in the other.
     """
     try:
         parsed = json.loads(data)
@@ -1861,8 +1894,23 @@ def materialize_bundled_manifolds() -> None:
             if format_stale
             else "manifest content changed"
         )
-        _log.info(
-            "materialize_bundled_manifolds: refreshed default/%s — %s",
+        # Unlike ``packs.materialize_bundled`` (which preserves a
+        # user-edited ``statements.json``), the bundle-update path here
+        # re-copies every node file unconditionally — a node "edit" is
+        # stale-against-old-bundle once the manifest moves.  That clobber
+        # is intentional, but a user who hand-edited a bundled node corpus
+        # deserves to *see* that their edit was overwritten, so this is a
+        # user-facing warning rather than an INFO log they'd never notice.
+        warnings.warn(
+            f"materialize_bundled_manifolds: refreshed default/{name} — "
+            f"{reason}; any local edits to its node corpus were overwritten "
+            f"(fork under local/ to keep a custom corpus)",
+            UserWarning,
+            stacklevel=2,
+        )
+        _log.warning(
+            "materialize_bundled_manifolds: refreshed default/%s — %s "
+            "(node corpus re-copied, local edits overwritten)",
             name, reason,
         )
 

@@ -65,7 +65,7 @@ def test_parse_manifold_merge():
     assert args.manifold_cmd == "merge"
     assert args.name == "combined"
     assert args.sources == ["a", "local/b", "c"]
-    assert args.fit_mode == "spectral"
+    assert args.method == "spectral"
     assert args.force is True
 
 
@@ -73,6 +73,28 @@ def test_parse_manifold_merge_needs_at_least_one_source():
     # argparse requires >=1 positional source; the runner enforces >=2.
     with pytest.raises(SystemExit):
         cli.parse_args(["vector", "manifold", "merge", "combined"])
+
+
+def test_parse_manifold_generate_seed():
+    # ``--seed`` is parity with ``vector clone --seed`` (default unseeded).
+    args = cli.parse_args([
+        "vector", "manifold", "generate", "mood",
+        "--concepts", "happy", "sad", "--seed", "42",
+    ])
+    assert args.manifold_cmd == "generate"
+    assert args.seed == 42
+    default = cli.parse_args([
+        "vector", "manifold", "generate", "mood", "--concepts", "happy", "sad",
+    ])
+    assert default.seed is None
+
+
+def test_require_model_reports_manifold_leaf_verb(capsys: pytest.CaptureFixture[str]):
+    """The -m error names the manifold leaf verb (``manifold fit``), not just ``manifold``."""
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["vector", "manifold", "fit", "/tmp/some_folder"])
+    assert ex.value.code == 2
+    assert "manifold fit: -m/--model is required" in capsys.readouterr().err
 
 
 def test_parse_manifold_push():
@@ -90,9 +112,10 @@ def test_parse_manifold_push():
     assert args.dry_run is True
 
 
-def test_parse_manifold_push_variant_default_all():
+def test_parse_manifold_push_variant_default_raw():
     args = cli.parse_args(["vector", "manifold", "push", "circumplex"])
-    assert args.variant == "all"
+    # Aligned with `pack push` — SAE variants are opt-in.
+    assert args.variant == "raw"
     assert args.private is False
     assert args.dry_run is False
 
@@ -397,9 +420,12 @@ def test_run_manifold_clear_calls_backend(monkeypatch: pytest.MonkeyPatch, capsy
         return 3
 
     monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
+    # Bare ``circumplex`` resolves cross-namespace to the bundled
+    # ``default/circumplex`` (the only installed match) — the lifecycle
+    # verbs no longer hard-default a bare name to ``local/``.
     cli.main(["vector", "manifold", "clear", "circumplex", "--variant", "raw"])
     assert calls == [
-        {"ns": "local", "name": "circumplex", "model_scope": None, "variant": "raw"},
+        {"ns": "default", "name": "circumplex", "model_scope": None, "variant": "raw"},
     ]
     out = capsys.readouterr().out
     assert "Deleted 3 files" in out
@@ -414,9 +440,10 @@ def test_run_manifold_clear_passes_model_scope(monkeypatch: pytest.MonkeyPatch, 
         return 1
 
     monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
+    # Bare name resolves cross-namespace to bundled ``default/circumplex``.
     cli.main(["vector", "manifold", "clear", "circumplex", "-m", "foo/bar"])
     assert calls == [
-        {"ns": "local", "name": "circumplex", "model_scope": "foo/bar", "variant": "all"},
+        {"ns": "default", "name": "circumplex", "model_scope": "foo/bar", "variant": "all"},
     ]
     captured = capsys.readouterr()
     assert "Deleted 1 files" in captured.out
@@ -445,8 +472,9 @@ def test_run_manifold_refresh_passes_model_scope(monkeypatch: pytest.MonkeyPatch
         return "scoped"
 
     monkeypatch.setattr("saklas.io.manifolds.refresh_manifold", fake_refresh)
+    # Bare name resolves cross-namespace to bundled ``default/circumplex``.
     cli.main(["vector", "manifold", "refresh", "circumplex", "-m", "foo/bar"])
-    assert calls == [{"ns": "local", "name": "circumplex", "model_scope": "foo/bar"}]
+    assert calls == [{"ns": "default", "name": "circumplex", "model_scope": "foo/bar"}]
     captured = capsys.readouterr()
     assert "foo/bar" in captured.out and "re-fits on next use" in captured.out
     assert "no effect" not in captured.err
@@ -552,6 +580,74 @@ def test_run_manifold_transfer_missing_source_fit_errors(monkeypatch: pytest.Mon
             "--from", "src/model", "--to", "tgt/model",
         ])
     assert ex.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-namespace bare-name lifecycle resolution (clear/refresh/rm/transfer)
+# ---------------------------------------------------------------------------
+
+def test_lifecycle_bare_name_not_found_exits(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A bare name with no installed match exits 1, no backend call."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "saklas.io.manifolds.clear_manifold_tensors",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call backend")),
+    )
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["vector", "manifold", "clear", "nope_not_installed"])
+    assert ex.value.code == 1
+
+
+def test_lifecycle_bare_name_resolves_local(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """A bare name uniquely installed under ``local/`` resolves there."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _author_circumplex_lite(tmp_path)  # writes local/moodlite
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_clear(ns: str, name: str, model_scope: Any = None, *, variant: str = "all") -> int:
+        calls.append((ns, name))
+        return 0
+
+    monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
+    cli.main(["vector", "manifold", "clear", "moodlite"])
+    assert calls == [("local", "moodlite")]
+
+
+def test_lifecycle_bare_name_ambiguous_exits(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A bare name installed in two namespaces raises an ambiguity error (exit 2)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import create_manifold_folder
+    domain_spec = {"type": "box", "axes": [{"min": -1.0, "max": 1.0, "periodic": False}]}
+    nodes = [
+        {"label": "low", "coords": [-1.0], "statements": ["s."]},
+        {"label": "mid", "coords": [0.0], "statements": ["s."]},
+        {"label": "high", "coords": [1.0], "statements": ["s."]},
+    ]
+    for ns in ("local", "alice"):
+        create_manifold_folder(ns, "dup", "d", domain_spec, nodes)
+
+    monkeypatch.setattr(
+        "saklas.io.manifolds.clear_manifold_tensors",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call backend")),
+    )
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["vector", "manifold", "clear", "dup"])
+    assert ex.value.code == 2
+
+
+def test_lifecycle_explicit_ns_pins_without_walk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """An explicit ``ns/name`` pins verbatim — no existence pre-check, backend runs."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))  # nothing installed
+    calls: list[tuple[str, str]] = []
+
+    def fake_clear(ns: str, name: str, model_scope: Any = None, *, variant: str = "all") -> int:
+        calls.append((ns, name))
+        return 0
+
+    monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
+    cli.main(["vector", "manifold", "clear", "alice/ghost"])
+    assert calls == [("alice", "ghost")]
 
 
 # ---------------------------------------------------------------------------

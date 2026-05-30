@@ -8,6 +8,7 @@ loading a real model.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pytest
@@ -71,6 +72,27 @@ class TestLayerWhitenerConstruction:
         assert w.layers == {0, 1}
         assert 7 not in w
         assert 0 in w
+
+    def test_nonfinite_layer_is_excluded(self):
+        """A non-finite layer (legacy fp16-overflowed cache surfacing as
+        ±inf) is skipped, leaving it uncovered — so the all-or-nothing
+        ``covers_all`` gate degrades the whole consumer to Euclidean rather
+        than carrying ``nan`` factors into the hot path.
+        """
+        good = _make_acts(0)
+        bad = _make_acts(1).clone()
+        bad[0, 0] = float("inf")  # one overflowed channel poisons the layer
+        acts = {0: good, 1: bad}
+        means = {0: torch.zeros(16), 1: torch.zeros(16)}
+        w = LayerWhitener.from_neutral_activations(acts, means)
+        assert w.layers == {0}            # bad layer dropped
+        assert 1 not in w
+        assert not w.covers_all([0, 1])   # all-or-nothing trips to False
+        assert w.covers_all([0])
+        # The surviving layer's factors are finite.
+        X, K, lam = w.woodbury_factors(0, device=torch.device("cpu"), dtype=torch.float32)
+        assert torch.isfinite(X).all() and torch.isfinite(K).all()
+        assert math.isfinite(lam)
 
     def test_no_shared_layers_raises(self):
         acts = {0: _make_acts(0)}

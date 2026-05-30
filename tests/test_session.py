@@ -318,29 +318,47 @@ class TestStreamingGeneration:
 
 class TestAblation:
     def test_ablation_suppresses_self_probe_score(self, session: SaklasSession) -> None:
-        """Ablating a concept drives its own monitor score toward zero.
+        """Ablating a concept drives its own *Euclidean* monitor score toward zero.
 
-        Sharp correctness check: if the hook properly replaces the component
-        along d̂ with the neutral mean, the probe's magnitude-weighted cosine
-        score — which IS the projection along that same direction — must
-        collapse for post-ablation activations.
+        Sharp correctness check: the ablation hook replaces the Euclidean
+        component along d̂ with the neutral mean, so the *Euclidean*
+        magnitude-weighted cosine — which IS the projection along that same
+        direction — must collapse for post-ablation activations.  The
+        default session monitor now reads the **Mahalanobis** cosine
+        (``⟨V, h_c⟩_M``, which the Euclidean ablation does NOT zero — the
+        whitened alignment survives removal of the Euclidean projection),
+        so this test scores against a dedicated Euclidean ``TraitMonitor``
+        built from the same probe profiles to keep the metric matched to
+        the ablation operator.  The whitened reading shifting is intended
+        (the ablation operator stays Euclidean; the read metric changed).
         """
+        from saklas.core.monitor import TraitMonitor
+        from saklas.core.sampling import SamplingConfig
+
         prompt = "Describe an ordinary afternoon."
         probe = next(iter(session.probes))
+        # Euclidean monitor (whitener=None) over the same probe profiles
+        # + layer means — the metric the Euclidean ablation suppresses.
+        euclid = TraitMonitor(
+            dict(session._monitor.profiles),
+            layer_means=session._monitor.layer_means,
+        )
 
-        # Baseline: generate without ablation, capture probe's aggregate score.
-        _ = session.generate(prompt)
-        scores_baseline = session.last_per_token_scores
-        assert scores_baseline is not None
-        assert probe in scores_baseline
-        baseline = abs(scores_baseline[probe][-1])
+        def _self_score(steering: str | None) -> float:
+            r = session.generate(
+                prompt,
+                steering=steering,
+                sampling=SamplingConfig(return_hidden=True, seed=1),
+            )
+            # hidden_states is {layer: [T, D]}; score_stack pools the last
+            # row for the aggregate (same single-state discipline the
+            # default per-token aggregate uses).
+            hidden = r.first.hidden_states
+            agg, _per_token = euclid.score_stack(hidden, accumulate=False)
+            return abs(agg[probe])
 
-        # With ablation: the same probe's score should drop sharply.
-        with session.steering(f"!{probe}"):
-            _ = session.generate(prompt)
-        scores_ablated = session.last_per_token_scores
-        assert scores_ablated is not None
-        ablated = abs(scores_ablated[probe][-1])
+        baseline = _self_score(None)
+        ablated = _self_score(f"!{probe}")
 
         # Expect the ablated score to be at most 10% of baseline (or 0.05
         # absolute, whichever is larger — guards the degenerate case where

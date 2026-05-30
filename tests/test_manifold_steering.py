@@ -254,27 +254,37 @@ def test_manager_position_length_mismatch_raises():
 
 
 def test_manager_alpha_clamped():
-    # With a single covered layer, share_L == 1.0, so per-layer α
-    # equals the clamped user α times ``_MANIFOLD_GAIN_ANGULAR``.  A multi-
-    # layer test for the share-weighted cumulative budget lives below.
+    # User α is clamped to [0, 1]; with a single covered layer share_L ==
+    # 1.0, so the raw per-layer budget would be ``1.0 · _MANIFOLD_GAIN_
+    # ANGULAR`` (8.0).  Under angular mode that budget is the rotation
+    # angle in θ_max units, and a single layer can't rotate past θ_max —
+    # the water-fill caps it at 1.0 (one full θ_max).  (The excess has
+    # nowhere to go on a one-layer manifold, so it saturates.)
     manifold = _manifold(layers=(0,))
     mgr = SteeringManager(injection_mode="angular")
     mgr.add_manifold("mood", manifold, position=(0.5,), alpha=5.0)
     layers = _model_layers(1)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     _trig, _basis, _mean, _target, alpha = mgr.hooks[0].manifold_groups[0]
-    assert alpha == pytest.approx(1.0 * _MANIFOLD_GAIN_ANGULAR, abs=1e-6)
+    assert alpha == pytest.approx(1.0, abs=1e-6)
 
 
 def test_manager_share_weighting_sums_to_user_alpha():
-    """Per-layer α is share-weighted so ``Σ_L α_L = α`` regardless of
-    how many layers the manifold covers — analogous to vector
-    steering's ``Σ_L share_L · α · θ_max = α · θ_max`` invariant.  This
-    is the layer-count-invariance property that keeps the user-facing
-    α-regime independent of model depth and of how many layers the
-    manifold's fit retained.
+    """Per-layer α is share-weighted so the cumulative budget
+    ``Σ_L α_L = α · gain`` regardless of how many layers the manifold
+    covers — analogous to vector steering's ``Σ_L share_L · α · θ_max =
+    α · θ_max`` invariant.  This is the layer-count-invariance property
+    that keeps the user-facing α-regime independent of model depth.
+
+    Tested in the *unsaturated* regime: ``α · gain ≤ 1`` so the angular
+    water-fill cap (no layer past θ_max) never bites and the cumulative
+    budget is exactly ``α · gain`` for every layer count.  The saturated
+    regime (where the cap does bite) is covered by
+    ``test_manager_angular_budget_caps_per_layer`` below.
     """
-    user_alpha = 0.5
+    # 0.1 · 8.0 = 0.8 ≤ 1.0, so even a single layer holds the whole
+    # budget without saturating.
+    user_alpha = 0.1
     for n_layers in (1, 2, 4):
         manifold = _manifold(layers=tuple(range(n_layers)))
         mgr = SteeringManager(injection_mode="angular")
@@ -294,6 +304,55 @@ def test_manager_share_weighting_sums_to_user_alpha():
             f"share-weighted budget at n={n_layers} layers: "
             f"{total} ≠ {expected}"
         )
+
+
+def test_manager_angular_budget_caps_per_layer():
+    """Angular manifold steering never rotates a layer past θ_max.
+
+    With a high user α, the raw per-layer budget (``α · share_L · gain``)
+    blows past 1.0 (= θ > θ_max) — ``subspace_rotate`` does NOT clamp, so
+    the manager's water-fill must.  Assert no per-layer budget exceeds
+    1.0 and the cumulative budget is the saturated ceiling ``min(α · gain,
+    n_layers)``.  Additive mode keeps the raw share-weighted value (a
+    blend fraction, no θ_max ceiling).
+    """
+    n_layers = 3
+    manifold = _manifold(layers=tuple(range(n_layers)))
+    # α=1.0, gain 8.0 ⇒ raw cumulative 8.0 ≫ n_layers=3 ⇒ every layer
+    # saturates at 1.0.
+    mgr = SteeringManager(injection_mode="angular")
+    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=1.0)
+    mgr.apply_to_model(
+        _model_layers(n_layers), torch.device("cpu"), torch.float32,
+    )
+    budgets = [
+        grp[4]
+        for hook in mgr.hooks.values()
+        for grp in hook.manifold_groups
+    ]
+    assert budgets, "expected manifold groups to be attached"
+    for b in budgets:
+        assert b <= 1.0 + 1e-6, f"layer rotates past θ_max: {b}"
+    assert sum(budgets) == pytest.approx(
+        min(1.0 * _MANIFOLD_GAIN_ANGULAR, n_layers), abs=1e-4,
+    )
+
+    # Additive: same α, no per-layer cap — the raw share-weighted blend
+    # fractions stand (they can exceed 1.0; the operator norm-restores).
+    mgr_add = SteeringManager(injection_mode="additive")
+    mgr_add.add_manifold("mood", manifold, position=(0.5,), alpha=1.0)
+    mgr_add.apply_to_model(
+        _model_layers(n_layers), torch.device("cpu"), torch.float32,
+    )
+    add_budgets = [
+        grp[4]
+        for hook in mgr_add.hooks.values()
+        for grp in hook.manifold_groups
+    ]
+    # Cumulative additive budget is the un-capped α · _MANIFOLD_GAIN_ADDITIVE.
+    assert sum(add_budgets) == pytest.approx(
+        1.0 * _MANIFOLD_GAIN_ADDITIVE, abs=1e-4,
+    )
 
 
 def test_manager_additive_ev_normalization():
@@ -359,9 +418,12 @@ def test_manager_per_mode_gain_dispatch():
     manifold, different mode → different per-layer effective α.
     """
     manifold = _manifold(layers=(0,))
-    user_alpha = 0.3
     # Single-layer manifold so share_L = 1.0 and the per-layer α is
     # ``user_alpha · gain`` exactly — clean comparison across modes.
+    # Kept in the unsaturated angular regime (``α · gain ≤ 1``) so the
+    # per-layer water-fill cap doesn't pin the angular value and mask the
+    # gain comparison: 0.1 · 8.0 = 0.8 ≤ 1.0.
+    user_alpha = 0.1
     mgr_ang = SteeringManager(injection_mode="angular")
     mgr_ang.add_manifold("m", manifold, position=(0.5,), alpha=user_alpha)
     mgr_ang.apply_to_model(
@@ -410,7 +472,10 @@ def test_manager_share_weighting_weights_by_centroid_spread():
         },
         feature_space="raw",
     )
-    user_alpha = 0.4
+    # Kept in the unsaturated regime (each layer's budget ≤ 1.0) so the
+    # angular water-fill cap doesn't flatten the 1:2 ratio: the wider
+    # share is ``(2/3) · α · 8`` ≤ 1.0 for α ≤ 0.1875.
+    user_alpha = 0.15
     mgr = SteeringManager(injection_mode="angular")
     mgr.add_manifold("mood", manifold, position=(0.5,), alpha=user_alpha)
     mgr.apply_to_model(

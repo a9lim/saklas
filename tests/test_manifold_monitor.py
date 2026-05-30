@@ -35,6 +35,21 @@ def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     return sub
 
 
+def _node_world(m: Manifold, layer_idx: int) -> torch.Tensor:
+    """World-space ``(K, D)`` node activations for a layer.
+
+    The monitor used to pre-cache this as ``AttachedManifoldProbe
+    .node_values_world``; that field was dead (only the reduced cache is
+    read in scoring) and was removed.  Tests recompute it on demand from
+    the manifold's RBF — exactly the ``sub.eval_at(domain.embed(coords))``
+    the cache builder used.
+    """
+    sub = m.layers[layer_idx]
+    coords = m.node_coords.to(torch.float32)
+    embedded = m.domain.embed(m.domain.clamp_position(coords))
+    return sub.eval_at(embedded)  # (K, D)
+
+
 def _toy_manifold(
     *,
     n_layers: int = 2,
@@ -108,12 +123,11 @@ def test_add_probe_registers_and_precaches():
     assert "toy" in probes
     p = probes["toy"]
     assert isinstance(p, AttachedManifoldProbe)
-    # Per-layer node-value caches present for every fitted layer, with
-    # shape (K, D) for world and (K, R) for reduced.
+    # Per-layer reduced node-value cache present for every fitted layer,
+    # with shape (K, R).  (The former world-space cache was dead code and
+    # has been removed — only the reduced cache feeds scoring.)
     for layer_idx in m.layers:
-        assert layer_idx in p.node_values_world
         assert layer_idx in p.node_values_reduced
-        assert p.node_values_world[layer_idx].shape[0] == len(m.node_labels)
         assert p.node_values_reduced[layer_idx].shape[0] == len(m.node_labels)
     # EV weights normalized to sum ≈ 1.
     assert sum(p.ev_weights.values()) == pytest.approx(1.0, abs=1e-5)
@@ -238,11 +252,8 @@ def test_nearest_finds_correct_node_at_centroid():
     for k in range(len(m.node_labels)):
         hidden = {}
         for layer_idx, sub in m.layers.items():
-            # World-space activation at node k = mean + (centered node).
-            # The pre-cached node_values_world matches sub.eval_at —
-            # use that directly.
-            probe = mon.attached_probes()["toy"]
-            v_world_k = probe.node_values_world[layer_idx][k]
+            # World-space activation at node k = sub.eval_at(coord_k).
+            v_world_k = _node_world(m, layer_idx)[k]
             hidden[layer_idx] = v_world_k
         readings = mon.score_single_token(hidden)
         nearest = readings["toy"].nearest
@@ -306,14 +317,13 @@ def test_score_aggregate_at_node_recovers_authoring_coord():
     m = _toy_manifold(dim=8)
     mon = ManifoldMonitor()
     mon.add_probe("toy", m)
-    probe = mon.attached_probes()["toy"]
 
     # Pick node 0 (coord = -1.0).  Captured stack has T=3 rows, all the
     # same centroid — the pooled (last-non-special) row stays on it.
     target_k = 0
     captured: dict[int, torch.Tensor] = {}
     for layer_idx, _sub in m.layers.items():
-        v_world_k = probe.node_values_world[layer_idx][target_k]
+        v_world_k = _node_world(m, layer_idx)[target_k]
         captured[layer_idx] = v_world_k.unsqueeze(0).repeat(3, 1)
 
     agg = mon.score_aggregate(captured)
@@ -344,14 +354,14 @@ def test_score_aggregate_pools_last_non_special_row_not_mean():
     m = _toy_manifold(dim=8)
     mon = ManifoldMonitor()
     mon.add_probe("toy", m)
-    probe = mon.attached_probes()["toy"]
 
     # T=2: row 0 = node 2 (coord +1, "c"), row 1 = node 0 (coord -1, "a").
     # row 1 stands in for a trailing special token the session walks past.
     captured: dict[int, torch.Tensor] = {}
     for layer_idx, _sub in m.layers.items():
-        node2 = probe.node_values_world[layer_idx][2]
-        node0 = probe.node_values_world[layer_idx][0]
+        world = _node_world(m, layer_idx)
+        node2 = world[2]
+        node0 = world[0]
         captured[layer_idx] = torch.stack([node2, node0])
 
     # agg_index=0 → the non-special row → node 2 (coord +1, "c").
@@ -400,10 +410,9 @@ def test_score_aggregate_to_dict_round_trip():
     m = _toy_manifold(dim=8)
     mon = ManifoldMonitor()
     mon.add_probe("toy", m)
-    probe = mon.attached_probes()["toy"]
     captured: dict[int, torch.Tensor] = {}
     for layer_idx, _sub in m.layers.items():
-        v_world_k = probe.node_values_world[layer_idx][1]
+        v_world_k = _node_world(m, layer_idx)[1]
         captured[layer_idx] = v_world_k.unsqueeze(0).repeat(2, 1)
 
     agg = mon.score_aggregate(captured)

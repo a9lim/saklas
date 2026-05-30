@@ -289,7 +289,7 @@ def _render_manifold_card(
         "## Install",
         "",
         "```bash",
-        f"saklas pack install {coord}  # (manifolds install via the same coord)",
+        f"saklas vector manifold install {coord}",
         "```",
         "",
         "## Nodes",
@@ -340,7 +340,7 @@ def push_manifold(
     *,
     private: bool = False,
     model_scope: Optional[str] = None,
-    variant: str = "all",
+    variant: str = "raw",
     dry_run: bool = False,
 ) -> tuple[str, Optional[str]]:
     """Push a manifold folder to HF as a model repo.
@@ -356,9 +356,9 @@ def push_manifold(
     filtered the way ``push_pack`` filters tensors:
 
     - ``model_scope`` restricts to one base model (``safe_model_id``).
-    - ``variant`` filters tensor flavor: ``"raw"`` only unsuffixed,
-      ``"sae"`` only ``_sae-*``, ``"from"`` only ``_from-*``, ``"all"``
-      (default) every variant.  Sidecars follow their partner tensor.
+    - ``variant`` filters tensor flavor: ``"raw"`` (default) only
+      unsuffixed, ``"sae"`` only ``_sae-*``, ``"from"`` only ``_from-*``,
+      ``"all"`` every variant.  Sidecars follow their partner tensor.
 
     A staged manifest with no tensors is still a valid push — the
     corpus alone re-fits on the consumer side, unlike a pack where a

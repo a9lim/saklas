@@ -45,7 +45,7 @@ saklas vector why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bu
 saklas vector transfer <concept> --from SRC --to TGT [-f]   # cross-model Procrustes transfer
 saklas vector manifold fit <folder> [-m MODEL] [--sae REL]  # fit an authored RBF manifold
 saklas vector manifold discover <name> [-m MODEL] [--method pca|spectral] [--max-dim N] ...
-saklas vector manifold generate <name> --concepts C... [--n-scenarios N] [--statements-per-concept K]
+saklas vector manifold generate <name> --concepts C... [--n-scenarios N] [--statements-per-concept K] [--seed S]
 saklas vector manifold install <target> [-a NS/N] [-f]      # HF coord or local folder
 saklas vector manifold search <query> [-j|-v]               # search HF hub for saklas-manifold repos
 saklas vector manifold merge <name> <src...> [-f]           # union discover-mode node corpora
@@ -114,7 +114,7 @@ Bake metric: DiM scores via `||mean_diff||_M / ref_norm` when a `LayerWhitener` 
 
 Per session via `SaklasSession.from_pretrained(injection_mode=..., theta_max=...)` or per call via `Steering(injection_mode=..., theta_max=...)`; `None` inherits the session default. CLI `--steer-mode` / `--theta-max`, YAML `injection_mode:` / `theta_max:`.
 
-- **Angular** (default): per-layer Givens rotation toward `d̂`, `θ_L = share_L × ||composed_unit_sum||_L × θ_max`. Cumulative budget `Σ_L θ_L = |α| × θ_max`, so `α=1` ↔ a full π/2 rotation. Norm-preserving by construction.
+- **Angular** (default): per-layer Givens rotation toward `d̂`, `θ_L = share_L × ||composed_unit_sum||_L × θ_max`. Cumulative budget `Σ_L θ_L = |α| × θ_max`, so `α=1` ↔ a full π/2 rotation. Norm-preserving by construction. Each layer's `θ_L` is bounded at `θ_max`: when the share-weighted budget would push a layer past it, `hooks._redistribute_budget` water-fills the trimmed excess onto the still-unsaturated layers (capping each at `θ_max`, iterating to a fixpoint) rather than silently dropping it — so the cumulative budget is conserved up to `min(Σ, n_layers)·θ_max` and no single layer over-rotates. The same helper backs the manifold angular path, so the two surfaces share one cap-and-redistribute rule.
 - **Additive**: `composed_L = α × _STEER_GAIN × baked_L` with an explicit per-position norm rescale. `_STEER_GAIN = 2.0` only multiplies under this mode.
 
 `DEFAULT_THETA_MAX = π/2`.
@@ -251,7 +251,7 @@ These gate `test_smoke.py::test_throughput_regression` (steered ≥ 85% of vanil
 - **Shares baked at extraction**, applied mode-specifically: additive folds share into magnitude, angular reads `share_L = ||baked_L|| / Σ ||baked||` at apply time.
 - **Norm preservation is mode-specific**: additive rescales explicitly, angular's Givens rotation is exact. Near-aligned positions get a `torch.where` no-op fallback.
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
-- **Monitor capture is hook-driven**, inline with generation — one matmul per layer scores all probes, no second forward pass.
+- **Monitor capture is hook-driven**, inline with generation — one matmul per layer scores all probes, no second forward pass. `TraitMonitor` scores in the **whitened (Mahalanobis) metric** — the per-layer probe similarity is the Mahalanobis cosine, matching the default DiM bake metric and `~`/`|` projection; the `Σ⁻¹`-applied probe directions are precomputed at cache-build so the hot path stays one matmul plus a cheap per-token Woodbury apply. The metric is **all-or-nothing** via `LayerWhitener.covers_all` (the same gate extraction / manifold fit / `vector compare` use): Mahalanobis only when the whitener covers *every* probed layer with finite Woodbury factors, else Euclidean cosine for all layers — never a per-layer mix (aggregating cosines from two metrics into one probe score is exactly what the gate forbids). `covers_all` is trustworthy as "finite factors everywhere": `LayerWhitener` excludes any layer whose centered activations or regularized inverse come back non-finite, and neutral activations are cached **bf16** (not fp16) so extreme-activation channels — gemma-3's late layers exceed the fp16 ceiling of 65504 — no longer overflow to ±inf in the first place. The per-layer weight stays `||baked||₂` (the bake already folded the Mahalanobis score into the magnitude).
 - **Steering hooks are transient** — composed before generation, removed after. No persistent hooks.
 - **MPS discipline** — diffs on CPU, `torch.mps.empty_cache()` between extraction passes, end-of-loop sync to dodge Metal command-buffer reuse crashes.
 

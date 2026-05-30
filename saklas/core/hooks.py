@@ -715,14 +715,23 @@ class SteeringHook:
             self._handle = None
 
 
-# Global gain that pins the user-facing alpha scale.  Per-layer shares
-# (score_i / sum(scores)) are baked into the stored direction magnitudes
-# at extraction time, so the hook math collapses to a single flat scalar:
+# Gain that pins the user-facing alpha scale, applied **only under
+# additive mode** (the default is angular, which maps α directly to a
+# rotation angle and takes no gain).  Per-layer shares
+# (score_L / Σ scores) are baked into the stored direction magnitudes at
+# extraction time, so the additive hook math collapses to a single flat
+# scalar:
 #
-#     effective_injection = user_alpha * _STEER_GAIN * baked_direction_i
+#     effective_injection = user_alpha * _STEER_GAIN * baked_direction_L
+#
+# (Angular mode never multiplies by ``_STEER_GAIN``: its per-layer budget
+# is ``user_alpha · share_L``, water-filled to ≤ θ_max per layer, and the
+# share is read straight back off ``||baked_L||`` — see
+# ``SteeringManager.apply_to_model``.)
 #
 # The same two invariances fall out of the baking step (they just moved
-# from apply-time to extract-time):
+# from apply-time to extract-time), and hold for both injection modes
+# because both read the per-layer share off the baked magnitude:
 #
 #   - Layer-count invariance: total injection is independent of n_layers,
 #     so models of different depths hit the same behavioral effect at the
@@ -730,32 +739,30 @@ class SteeringHook:
 #     gemma-4-E4B at 42 layers vs gemma-4-31B at 60 layers would drift
 #     by ~1.5× in coherent α).
 #
-#   - Score-magnitude invariance: absolute PCA scores vary wildly between
-#     architectures (diffuse Llama-3.2-3B ≈0.07, sharp gemma-3-4b ≈0.25
-#     for the same pairs), but only the *relative* per-layer shares
-#     matter here — high-signal layers still get proportionally more
-#     push within a profile.
+#   - Score-magnitude invariance: absolute extraction scores vary wildly
+#     between architectures (diffuse Llama-3.2-3B ≈0.07, sharp gemma-3-4b
+#     ≈0.25 for the same pairs), but only the *relative* per-layer shares
+#     matter here — high-signal layers still get proportionally more push
+#     within a profile.
 #
 # The gain is calibrated so that a user alpha of ~0.5 lands in the
-# coherent steering band on the reference model (gemma-4-31B-it) for
-# the bundled 21-probe pack.  Raising the gain shifts every model's
+# coherent additive-steering band on the reference model (gemma-4-31B-it)
+# across the 26 bundled concepts.  Raising the gain shifts every model's
 # coherent α lower; lowering does the opposite.  Smaller or non-standard-
 # geometry models (MatFormer, MoE, heavily safety-trained) may still need
 # proportionally higher alpha due to residual architectural effects
 # (activation magnitude, attention layout) this normalization doesn't
 # capture.
 #
-# Recalibrated from 3.5 → 2.0 when extract_contrastive gained the
-# drop_edges=(2, 2) default.  Edge-drop removes L0/L1 and L_N-2/L_N-1
-# from the share distribution (early layers carry tokenization/lexical
-# features; late layers are unembedding-aligned — steering either corrupts
-# surface form rather than latent meaning).  Remaining middle layers'
-# shares inflate ~10-15% after redistribution, and the post-drop coherence
-# ratio rises (directions align tighter), so per-α directional rotation
-# increases.  2.0 pushes the cliff above α≈0.9 on the reference model,
-# giving users a wide coherent band (~0.3-0.85) to dial in steering
-# intensity and leaving generous headroom for the long tail of untested
-# architectures.
+# History: recalibrated from 3.5 → 2.0 alongside discriminative layer
+# selection (DLS, Dang & Ngo 2026 — the share-bake gate that replaced the
+# earlier fixed edge-drop heuristic).  DLS keeps only the layers where the
+# pos / neg projections straddle the neutral baseline (polarity, not
+# intensity), which both trims early tokenization / late unembedding
+# layers *and* tightens the retained directions' cross-layer coherence —
+# so per-α directional rotation rises and 2.0 lands the additive cliff
+# above α≈0.9 on the reference model, giving a wide coherent band
+# (~0.3-0.85) with headroom for the untested-architecture tail.
 _STEER_GAIN = 2.0
 
 
@@ -790,6 +797,70 @@ _STEER_GAIN = 2.0
 # vector/manifold steering.
 _MANIFOLD_GAIN_ANGULAR = 8.0
 _MANIFOLD_GAIN_ADDITIVE = _MANIFOLD_GAIN_ANGULAR * _STEER_GAIN  # = 16.0
+
+
+def _redistribute_budget(
+    per_layer_raw: dict[int, float],
+) -> dict[int, float]:
+    """Water-fill a per-layer angular budget so no layer exceeds θ_max.
+
+    Both angular steering paths express a per-layer rotation budget in
+    ``θ_max`` units (1.0 ⇒ a full ``θ_max`` rotation at that layer).  A
+    peaked per-layer share can push a single layer's budget above 1.0;
+    the historical code clamped that layer at 1.0 and silently *dropped*
+    the excess, which loses cumulative steering budget on a saturated
+    layer.  This helper instead conserves the budget: cap each layer at
+    1.0 and redistribute the trimmed excess across the still-uncapped
+    layers proportional to their current value, iterating until no new
+    layer caps (or every layer is capped).
+
+    The cumulative budget is preserved up to the hard ceiling: the
+    returned values sum to ``min(Σ raw, n_layers)`` — when the requested
+    total fits under ``n_layers · θ_max`` every bit of budget lands on
+    some layer; when it overflows (more total than the layers can hold)
+    every layer saturates at 1.0.
+
+    Apply-time only (one host-side pass over the layer set per
+    ``apply_to_model``), never the per-token hot path; pure Python floats
+    so there is no device sync.  Negative raw budgets (an inverted /
+    sign-flipped term) are passed through by magnitude: the cap and the
+    redistribution operate on ``|raw|`` and the original sign is
+    re-attached, so a negative term rotates the other way without
+    breaking the water-fill bookkeeping.
+    """
+    if not per_layer_raw:
+        return {}
+    signs: dict[int, float] = {
+        L: (-1.0 if v < 0.0 else 1.0) for L, v in per_layer_raw.items()
+    }
+    # Work on magnitudes; re-attach sign at the end.
+    capped: dict[int, float] = {L: abs(v) for L, v in per_layer_raw.items()}
+    uncapped: set[int] = set(capped)
+    # Iterate: pull every over-budget layer down to 1.0, pool the trimmed
+    # excess, and spread it over the layers still below 1.0 in proportion
+    # to their current (sub-cap) value.  Each pass can only push more
+    # layers to the cap, so it terminates in ≤ n_layers iterations.
+    while True:
+        excess = 0.0
+        newly_capped: list[int] = []
+        for L in list(uncapped):
+            if capped[L] > 1.0:
+                excess += capped[L] - 1.0
+                capped[L] = 1.0
+                newly_capped.append(L)
+        for L in newly_capped:
+            uncapped.discard(L)
+        if excess <= 1e-12 or not uncapped:
+            break
+        pool = sum(capped[L] for L in uncapped)
+        if pool <= 1e-12:
+            # All remaining layers are at zero budget — nothing to soak
+            # up the excess; it is dropped (cumulative budget already
+            # equals n_capped, the hard ceiling for this configuration).
+            break
+        for L in uncapped:
+            capped[L] += excess * (capped[L] / pool)
+    return {L: signs[L] * capped[L] for L in per_layer_raw}
 
 
 def _profile_layer_shares(profile: dict[int, torch.Tensor]) -> dict[int, float]:
@@ -1037,10 +1108,20 @@ class SteeringManager:
                 if not shares:
                     # Profile is degenerate (all-zero); skip silently.
                     continue
+                # Raw per-layer budget in θ_max units (1.0 ⇒ full θ_max
+                # rotation at that layer).  Water-fill so a peaked-share
+                # layer never rotates past θ_max while the trimmed excess
+                # is redistributed to unsaturated layers — preserving the
+                # cumulative budget Σ_L θ_L = min(|α|, n_layers)·θ_max
+                # instead of silently dropping it on the capped layer.
+                raw_budget: dict[int, float] = {
+                    layer_idx: user_alpha * shares.get(layer_idx, 0.0)
+                    for layer_idx in profile
+                }
+                capped_budget = _redistribute_budget(raw_budget)
                 for layer_idx, vec in profile.items():
-                    share_L = shares.get(layer_idx, 0.0)
                     additive_by_layer.setdefault(layer_idx, []).append(
-                        (vec, user_alpha * share_L, trigger),
+                        (vec, capped_budget.get(layer_idx, 0.0), trigger),
                     )
             else:
                 # Additive (legacy): the v1.x ``α × _STEER_GAIN`` math.
@@ -1142,6 +1223,34 @@ class SteeringManager:
             else:
                 quality_factor = 1.0
 
+            # ``_MANIFOLD_GAIN_*`` pin the user-facing α scale into
+            # vector-comparable territory; share-weighting alone leaves the
+            # cumulative budget at ``α · θ_max`` which is too small to drive
+            # a visible effect through the manifold's ``h_par``-only
+            # injection geometry.  The ``quality_factor`` is 1.0 outside
+            # additive-mode + v4-manifold combinations.
+            raw_alpha: dict[int, float] = {
+                layer_idx: (
+                    alpha * shares[layer_idx] * manifold_gain * quality_factor
+                )
+                for layer_idx in manifold.layers
+            }
+            # Angular mode reads ``effective_alpha`` as a rotation budget
+            # in θ_max units (``subspace_rotate`` computes ``θ =
+            # effective_alpha · θ_max``).  A peaked-share layer can push
+            # that budget past 1.0 — i.e. rotate ``h_par`` more than θ_max,
+            # which ``subspace_rotate`` does *not* clamp.  Water-fill the
+            # per-layer budget so no layer rotates past θ_max and the
+            # trimmed excess is redistributed to unsaturated layers,
+            # preserving the cumulative rotation budget.  Additive mode is
+            # a blend fraction with its own per-position norm restore, so
+            # there is no θ_max ceiling to enforce — leave it as the raw
+            # share-weighted value.
+            if self.injection_mode == "angular":
+                eff_alpha = _redistribute_budget(raw_alpha)
+            else:
+                eff_alpha = raw_alpha
+
             for layer_idx, sub in manifold.layers.items():
                 if layer_idx in manifold_owner:
                     from saklas.core.errors import OverlappingManifoldError
@@ -1152,18 +1261,8 @@ class SteeringManager:
                     )
                 manifold_owner[layer_idx] = mname
                 target = manifold.manifold_point(layer_idx, position)
-                # ``_MANIFOLD_GAIN_*`` pin the user-facing α scale into
-                # vector-comparable territory; share-weighting alone
-                # leaves the cumulative budget at ``α · θ_max`` which
-                # is too small to drive a visible effect through the
-                # manifold's ``h_par``-only injection geometry.  The
-                # ``quality_factor`` is 1.0 outside additive-mode +
-                # v4-manifold combinations.
-                effective_alpha = (
-                    alpha * shares[layer_idx] * manifold_gain * quality_factor
-                )
                 manifold_by_layer.setdefault(layer_idx, []).append(
-                    (sub.basis, sub.mean, target, effective_alpha, trigger),
+                    (sub.basis, sub.mean, target, eff_alpha[layer_idx], trigger),
                 )
 
         active_layers = (

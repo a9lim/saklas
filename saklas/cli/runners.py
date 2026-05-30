@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
-from saklas.cli.parsers import _EXPERIMENT_VERBS, _PACK_VERBS, _VECTOR_VERBS
+from saklas.cli.parsers import (
+    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _VECTOR_VERBS,
+)
 from saklas.core.errors import SaklasError
 from saklas.core.stats import median_or_zero
 
@@ -597,6 +599,13 @@ def _run_push(args: argparse.Namespace) -> None:
 def _require_model(args: argparse.Namespace) -> None:
     if not args.model:
         cmd = getattr(args, "vector_cmd", None) or getattr(args, "pack_cmd", None) or "?"
+        # The manifold leaves (fit / discover / generate / transfer) all carry
+        # ``vector_cmd == "manifold"``, so the leaf verb lives on
+        # ``manifold_cmd`` — surface it so the error reads e.g. "manifold fit"
+        # rather than the bare "manifold".
+        manifold_cmd = getattr(args, "manifold_cmd", None)
+        if manifold_cmd:
+            cmd = f"{cmd} {manifold_cmd}"
         print(f"{cmd}: -m/--model is required", file=sys.stderr)
         sys.exit(2)
 
@@ -1762,20 +1771,32 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
         print(f"  fitted models: (none — run `saklas vector manifold {hint}`)")
 
 
-def _resolve_manifold_folder(name: str) -> Path:
-    """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to a folder path.
+def _resolve_manifold_ns_name(name: str) -> tuple[str, str]:
+    """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to ``(namespace, name)``.
 
     Mirrors :func:`_run_manifold_show`'s ambiguity handling — bare names
-    resolve cross-namespace and raise on collision; an ``ns/name`` form
-    pins to a single namespace.  Exits with a clear error on miss /
-    ambiguity so the discover and show runners share semantics.
+    resolve cross-namespace (reaching e.g. bundled ``default/`` when that's
+    the only match) and raise on collision; an ``ns/name`` form pins to a
+    single namespace.  Exits with a clear error on miss / ambiguity.
+
+    This is the lifecycle analogue of the concept-selector cross-namespace
+    resolution: ``clear`` / ``refresh`` / ``rm`` / ``transfer`` (and the
+    folder-returning ``discover`` / ``show``) all route a bare name through
+    here so it can reach any namespace, not just ``local/``.  (``generate``
+    deliberately does *not* — it authors a fresh folder and defaults bare →
+    ``local/`` via :func:`_split_manifold_ns_name`.)
+
+    An explicit ``ns/name`` pins directly — it's returned verbatim without a
+    filesystem walk, leaving the existence check to the io backend (which
+    raises ``FileNotFoundError``).  Only a *bare* name walks the installed
+    manifolds to discover its namespace, raising on collision / miss.
     """
-    target_ns: str | None = None
     if "/" in name:
-        target_ns, name = name.split("/", 1)
+        ns, leaf = name.split("/", 1)
+        return ns, leaf
     matches = [
         (ns, mf)
-        for ns, mf in _iter_manifold_folders(target_ns)
+        for ns, mf in _iter_manifold_folders(None)
         if mf.name == name
     ]
     if not matches:
@@ -1789,7 +1810,21 @@ def _resolve_manifold_folder(name: str) -> Path:
             file=sys.stderr,
         )
         sys.exit(2)
-    return matches[0][1].folder
+    return matches[0][0], matches[0][1].name
+
+
+def _resolve_manifold_folder(name: str) -> Path:
+    """Resolve a CLI-supplied ``NAME`` (or ``ns/name``) to a folder path.
+
+    Thin wrapper over :func:`_resolve_manifold_ns_name` for the verbs that
+    want the folder directly (``discover`` / ``show``); the lifecycle verbs
+    that hand a ``(namespace, name)`` pair to their io backend call the
+    pair-returning form instead.
+    """
+    from saklas.io.paths import manifold_dir
+
+    ns, resolved = _resolve_manifold_ns_name(name)
+    return manifold_dir(ns, resolved)
 
 
 def _run_manifold_discover(args: argparse.Namespace) -> None:
@@ -2081,7 +2116,7 @@ def _run_manifold_merge(args: argparse.Namespace) -> None:
         dst = merge_discover_manifolds(
             target_ns, target_name, args.description,
             sources=sources,
-            fit_mode=args.fit_mode,
+            fit_mode=args.method,  # parser dest unified to ``method`` (matches discover)
             force=args.force,
         )
     except (FileNotFoundError, FileExistsError, ManifoldFormatError, ValueError) as e:
@@ -2139,7 +2174,7 @@ def _run_manifold_push(args: argparse.Namespace) -> None:
 def _run_manifold_rm(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import remove_manifold_folder
 
-    ns, name = _split_manifold_ns_name(args.selector)
+    ns, name = _resolve_manifold_ns_name(args.selector)
     # Bundled (``default/``) manifolds re-materialize on next session
     # init — mirror ``pack rm``'s confirmation guard for the broad/
     # destructive case (here: a bundled folder the user likely didn't
@@ -2165,7 +2200,7 @@ def _run_manifold_rm(args: argparse.Namespace) -> None:
 def _run_manifold_clear(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import clear_manifold_tensors
 
-    ns, name = _split_manifold_ns_name(args.selector)
+    ns, name = _resolve_manifold_ns_name(args.selector)
     # ``args.model`` is the raw model id; ``clear_manifold_tensors`` does
     # the safe-id conversion at the io boundary, exactly as the pack
     # ``cache_ops.delete_tensors`` path does (it passes ``args.model``
@@ -2181,7 +2216,7 @@ def _run_manifold_clear(args: argparse.Namespace) -> None:
 def _run_manifold_refresh(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import refresh_manifold
 
-    ns, name = _split_manifold_ns_name(args.selector)
+    ns, name = _resolve_manifold_ns_name(args.selector)
     # ``args.model`` is the raw model id; ``refresh_manifold`` converts to
     # a safe id at the io boundary (via ``clear_manifold_tensors``), the
     # same convention ``cache_ops.refresh``'s scoped path uses.
@@ -2223,9 +2258,9 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import (
         ManifoldFormatError, transfer_manifold,
     )
-    from saklas.io.paths import manifold_dir, safe_model_id
+    from saklas.io.paths import manifold_dir, safe_model_id, tensor_filename
 
-    ns, name = _split_manifold_ns_name(args.name)
+    ns, name = _resolve_manifold_ns_name(args.name)
     folder = manifold_dir(ns, name)
     if not (folder / "manifold.json").exists():
         print(
@@ -2234,7 +2269,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    src_tensor = folder / f"{safe_model_id(args.src_model)}.safetensors"
+    src_tensor = folder / tensor_filename(args.src_model)
     if not src_tensor.exists():
         print(
             f"manifold transfer: source fit not found at {src_tensor} — fit "
@@ -2243,8 +2278,6 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    from saklas.core.manifold import load_manifold  # noqa: F401  (parity import path)
-    from saklas.io.paths import tensor_filename
     tgt_tensor = folder / tensor_filename(
         args.tgt_model, transferred_from=args.src_model,
     )
@@ -2341,19 +2374,9 @@ def _run_vector_manifold(args: argparse.Namespace) -> None:
     if cmd is None:
         print("usage: saklas vector manifold <verb> [...]")
         print()
-        print("  fit       Fit an authored manifold (user-supplied coords)")
-        print("  discover  Fit a discover-mode manifold (coords derived from activations)")
-        print("  generate  Author a discover-mode manifold from a concept list")
-        print("  merge     Union discover-mode manifolds' nodes into a new manifold")
-        print("  install   Install a manifold from HF or a local folder")
-        print("  search    Search the HuggingFace hub for manifolds")
-        print("  push      Push a manifold to HF as a model repo")
-        print("  rm        Fully remove a manifold folder")
-        print("  clear     Delete per-model fitted tensors for a manifold")
-        print("  refresh   Re-pull / re-materialize a manifold from its source")
-        print("  transfer  Transfer a manifold to another model via Procrustes")
-        print("  ls        List installed manifolds")
-        print("  show      Show a manifold's nodes and fitted models")
+        width = max(len(v) for v, _ in _MANIFOLD_VERBS)
+        for v, desc in _MANIFOLD_VERBS:
+            print(f"  {v:<{width}}  {desc}")
         sys.exit(0)
     if cmd == "fit":
         _run_manifold_fit(args)

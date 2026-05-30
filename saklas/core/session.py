@@ -40,7 +40,13 @@ from saklas.io.packs import PackFormatError, PackMetadata, hash_folder_files
 from saklas.io.paths import concept_dir
 from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
 from saklas.core.profile import Profile
-from saklas.core.results import GenerationResult, RunSet, TokenEvent, ProbeReadings
+from saklas.core.results import (
+    GenerationResult,
+    ManifoldAggregate,
+    ProbeReadings,
+    RunSet,
+    TokenEvent,
+)
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
@@ -895,7 +901,9 @@ class SaklasSession:
                 dls=self._dls,
             )
 
-        self._monitor = TraitMonitor(probe_profiles, self._layer_means)
+        self._monitor = TraitMonitor(
+            probe_profiles, self._layer_means, whitener=self._whitener,
+        )
         # Read-side counterpart to manifold steering.  Peer to
         # ``self._monitor``: vector probes and manifold probes attach
         # independently; per-token score callbacks merge their flat
@@ -1088,6 +1096,16 @@ class SaklasSession:
         """
         if self._whitener is None:
             self._whitener = self._build_whitener_from_cache_or_compute()
+            # Keep the trait monitor's read metric in lock-step with the
+            # session whitener: when it's built lazily (e.g. a ``probes=[]``
+            # session that later extracts), push it into the monitor so
+            # probe reads switch to the Mahalanobis cosine.  ``set_whitener``
+            # is a no-op when the identity is unchanged.  Guarded with
+            # ``getattr`` because the property can be touched mid-init
+            # before ``_monitor`` is assigned.
+            monitor = getattr(self, "_monitor", None)
+            if monitor is not None and self._whitener is not None:
+                monitor.set_whitener(self._whitener)
         return self._whitener
 
     def _build_whitener_from_cache_or_compute(self) -> "Any":
@@ -3084,6 +3102,38 @@ class SaklasSession:
         """Detach a previously-attached manifold probe."""
         self._manifold_monitor.remove_probe(name)
         self._invalidate_prefix_cache()
+
+    def measure_manifold(
+        self,
+        text: str,
+        *,
+        names: list[str] | None = None,
+    ) -> dict[str, ManifoldAggregate]:
+        """One-shot manifold scoring over *text* — the read-side `%` analogue.
+
+        Runs a single forward pass over *text*, captures the hidden states
+        across the attached manifold-probe layers, and returns
+        :meth:`ManifoldMonitor.score_aggregate` keyed by probe name — the
+        manifold counterpart to how the vector ``POST /probe`` path uses
+        :meth:`TraitMonitor.measure`.  Pools each aggregate from the last
+        content token via the canonical
+        :func:`saklas.core.vectors.last_content_index` walkback (same
+        single-state discipline as extraction and the generation-time
+        aggregate).
+
+        ``names=None`` scores every attached manifold probe; a subset list
+        filters the result to those names (unknown names are dropped).
+        Returns an empty dict when no manifold probe is attached.  Caller
+        is responsible for serialization (the server holds ``session.lock``
+        the same way it does for ``monitor.measure``).
+        """
+        readings = self._manifold_monitor.measure(
+            self._model, self._tokenizer, self._layers, self._device, text,
+        )
+        if names is not None:
+            wanted = set(names)
+            readings = {k: v for k, v in readings.items() if k in wanted}
+        return readings
 
     def _probe_hash(self, name: str) -> str | None:
         """Return sha256 hex of the baked tensor bytes for ``name``.

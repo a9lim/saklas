@@ -216,3 +216,133 @@ def test_score_hidden_accumulate_true_records():
         {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, accumulate=True,
     )
     assert s._monitor._stats["x"]["count"] == 1
+
+
+# ============================================ Mahalanobis read metric ===
+
+
+def _whitener_from_neutrals(
+    X: torch.Tensor, mean: torch.Tensor, layer: int = 0,
+):
+    """Build a single-layer LayerWhitener from synthetic neutrals."""
+    from saklas.core.mahalanobis import LayerWhitener
+
+    return LayerWhitener.from_neutral_activations(
+        {layer: X}, {layer: mean},
+    )
+
+
+def test_identity_covariance_matches_euclidean():
+    """When the neutral covariance is ~isotropic (whitening ≈ identity up
+    to ridge scale), the whitened cosine matches the Euclidean cosine —
+    the natural sanity check that the new metric reduces to the old one
+    on isotropic activations.
+    """
+    torch.manual_seed(0)
+    profile = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
+    # Isotropic neutrals centered at 0: covariance ≈ σ²·I, so Σ⁻¹ ∝ I and
+    # the whitened cosine equals the Euclidean cosine (scale cancels in
+    # the cosine ratio).
+    X = torch.randn(200, 4)
+    mean = X.mean(dim=0)
+    whitener = _whitener_from_neutrals(X, mean)
+
+    euclid = TraitMonitor({"x": dict(profile)}, layer_means={0: mean})
+    maha = TraitMonitor(
+        {"x": dict(profile)}, layer_means={0: mean}, whitener=whitener,
+    )
+    h = {0: torch.tensor([0.7, 0.7, 0.1, 0.0]) + mean}
+    e = euclid.measure_from_hidden(h, accumulate=False)["x"]
+    m = maha.measure_from_hidden(h, accumulate=False)["x"]
+    # Ridge regularization + finite-sample covariance keep Σ from being
+    # exactly I, so the whitened read tracks the Euclidean one closely
+    # without matching bit-for-bit — a loose tolerance is the right
+    # assertion for "reduces to Euclidean on isotropic neutrals."
+    assert m == pytest.approx(e, abs=6e-2)
+
+
+def test_anisotropic_covariance_differs_from_euclidean():
+    """On strongly anisotropic neutrals the whitened cosine departs from
+    the Euclidean cosine — the metric down-weights alignment along the
+    high-variance neutral direction.
+    """
+    torch.manual_seed(1)
+    profile = {0: torch.tensor([1.0, 1.0, 0.0, 0.0]) / (2 ** 0.5)}
+    # Neutrals with a huge variance along axis 0, tiny elsewhere.
+    base = torch.randn(300, 4)
+    base[:, 0] *= 20.0
+    base[:, 1] *= 0.5
+    mean = base.mean(dim=0)
+    whitener = _whitener_from_neutrals(base, mean)
+
+    euclid = TraitMonitor({"x": dict(profile)}, layer_means={0: mean})
+    maha = TraitMonitor(
+        {"x": dict(profile)}, layer_means={0: mean}, whitener=whitener,
+    )
+    # A hidden aligned mostly with the high-variance axis.
+    h = {0: torch.tensor([10.0, 0.5, 0.0, 0.0]) + mean}
+    e = euclid.measure_from_hidden(h, accumulate=False)["x"]
+    m = maha.measure_from_hidden(h, accumulate=False)["x"]
+    # The metrics must disagree (the whole point); the whitened read
+    # discounts the high-variance-axis overlap.
+    assert abs(m - e) > 1e-2
+
+
+def test_set_whitener_invalidates_cache_and_switches_metric():
+    """``set_whitener`` flips the read metric and flushes the cache so the
+    next scoring call rebuilds against the new covariance.
+    """
+    torch.manual_seed(2)
+    profile = {0: torch.tensor([1.0, 1.0, 0.0, 0.0]) / (2 ** 0.5)}
+    base = torch.randn(300, 4)
+    base[:, 0] *= 20.0
+    mean = base.mean(dim=0)
+    whitener = _whitener_from_neutrals(base, mean)
+
+    mon = TraitMonitor({"x": dict(profile)}, layer_means={0: mean})
+    h = {0: torch.tensor([10.0, 0.5, 0.0, 0.0]) + mean}
+    before = mon.measure_from_hidden(h, accumulate=False)["x"]
+    assert mon.whitener is None
+
+    mon.set_whitener(whitener)
+    assert mon.whitener is whitener
+    after = mon.measure_from_hidden(h, accumulate=False)["x"]
+    # Same instance, same probe, different metric ⇒ different reading.
+    assert abs(after - before) > 1e-2
+
+    # Re-setting the identical whitener is a no-op (no exception, metric
+    # unchanged).
+    again = mon.measure_from_hidden(h, accumulate=False)["x"]
+    assert again == pytest.approx(after, abs=1e-6)
+
+
+def test_partial_coverage_falls_back_to_all_euclidean():
+    """All-or-nothing read metric: a whitener covering only some probed
+    layers drops the *whole* monitor to Euclidean — never a per-layer
+    Mahalanobis/Euclidean mix (aggregating cosines from two metrics into
+    one probe score is what ``LayerWhitener.covers_all`` exists to forbid).
+    """
+    torch.manual_seed(3)
+    profile = {
+        0: torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        1: torch.tensor([0.0, 1.0, 0.0, 0.0]),
+    }
+    X0 = torch.randn(120, 4)
+    mean0 = X0.mean(dim=0)
+    # Whitener covers layer 0 only; the monitor probes layers 0 and 1.
+    whitener = _whitener_from_neutrals(X0, mean0, layer=0)
+    mon = TraitMonitor(
+        {"x": dict(profile)},
+        layer_means={0: mean0, 1: torch.zeros(4)},
+        whitener=whitener,
+    )
+    h = {
+        0: torch.tensor([1.0, 0.0, 0.0, 0.0]) + mean0,
+        1: torch.tensor([0.0, 1.0, 0.0, 0.0]),
+    }
+    out = mon.measure_from_hidden(h, accumulate=False)["x"]
+    assert out == out  # finite, not NaN
+    # covers_all([0, 1]) is False → no Mahalanobis cache at all; every
+    # probed layer scores under the Euclidean cosine.
+    mon._ensure_cache(torch.device("cpu"))
+    assert mon._layer_white == {}

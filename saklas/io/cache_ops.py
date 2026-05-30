@@ -33,12 +33,17 @@ class RefreshError(RuntimeError, SaklasError):
 
 
 def _variant_matches_key(key: str, filter_: str) -> bool:
+    # Twin of ``manifolds._manifold_tensor_variant_matches`` — kept in sync so
+    # the pack and manifold clear-filters recognize the same variant slugs.
+    # ``"from"`` selects transferred ``from-<safe_src>`` tensors.
     if filter_ == "all":
         return True
     if filter_ == "raw":
         return key == "raw"
     if filter_ == "sae":
         return key.startswith("sae-")
+    if filter_ == "from":
+        return key.startswith("from-")
     return False
 
 

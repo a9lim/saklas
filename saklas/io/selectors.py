@@ -25,7 +25,9 @@ from saklas.core.errors import SaklasError
 from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata
 from saklas.io.paths import manifolds_dir, vectors_dir
 
-_VARIANT_REGEX = _re.compile(r"^(raw|pca|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?)$")
+_VARIANT_REGEX = _re.compile(
+    r"^(raw|pca|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
+)
 
 
 class SelectorError(ValueError, SaklasError):
@@ -214,7 +216,8 @@ def resolve_pole(
     Raises:
         SelectorError: when the ``:variant`` suffix doesn't match
             ``_VARIANT_REGEX`` (``raw`` | ``pca`` | ``sae`` |
-            ``sae-<release>`` | ``role`` | ``role-<id>``).
+            ``sae-<release>`` | ``role`` | ``role-<id>`` | ``from`` |
+            ``from-<src>``).
         AmbiguousSelectorError: when multiple installed concepts match
             the input under different canonical names (e.g. both
             ``alice/angry`` and ``default/angry.calm`` exist and the

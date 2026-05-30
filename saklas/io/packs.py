@@ -267,7 +267,12 @@ def synthesize_pack_metadata(
 
 
 def hash_file(path: Path) -> str:
-    """Return hex sha256 of a file's contents."""
+    """Return hex sha256 of a file's contents.
+
+    Twin: :func:`saklas.io.manifolds._hash_file` is byte-identical and
+    kept separate by design (the manifold format is decoupled from packs);
+    mirror any change to one in the other.
+    """
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -442,6 +447,10 @@ def _canonical_json_sha256(data: bytes) -> str:
     Falls back to a raw sha256 if the bytes don't parse as JSON — better to
     treat unparseable on-disk content as "different from bundled" than to
     silently replace it.
+
+    Twin: :func:`saklas.io.manifolds._canonical_json_sha256` is the
+    byte-equivalent helper for the decoupled manifold format; mirror any
+    change to one in the other.
     """
     try:
         parsed = json.loads(data)

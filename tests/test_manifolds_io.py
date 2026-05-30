@@ -127,6 +127,17 @@ def test_stale_format_version_raises(tmp_path: Path):
         ManifoldFolder.load(folder)
 
 
+def test_newer_format_version_raises(tmp_path: Path):
+    # Symmetric ceiling, mirroring PackMetadata.load — a manifold authored
+    # by a future saklas (format_version > local) must not load silently.
+    folder = _author_manifold(tmp_path)
+    meta = json.loads((folder / "manifold.json").read_text())
+    meta["format_version"] = MANIFOLD_FORMAT_VERSION + 1
+    (folder / "manifold.json").write_text(json.dumps(meta))
+    with pytest.raises(ManifoldFormatError, match="newer saklas"):
+        ManifoldFolder.load(folder)
+
+
 def test_domain_required(tmp_path: Path):
     folder = _author_manifold(tmp_path)
     meta = json.loads((folder / "manifold.json").read_text())
@@ -241,6 +252,16 @@ def test_integrity_check_catches_tampering(tmp_path: Path):
     ManifoldFolder.load(folder)
     (folder / "stub-model.safetensors").write_bytes(b"tampered")
     with pytest.raises(ManifoldFormatError):
+        ManifoldFolder.load(folder)
+
+
+def test_missing_sidecar_raises(tmp_path: Path):
+    # A fitted .safetensors without its .json sidecar is a corrupt folder —
+    # the same invariant ConceptFolder.load enforces for packs.
+    folder = _author_manifold(tmp_path)
+    _add_dummy_tensor(folder)
+    (folder / "stub-model.json").unlink()
+    with pytest.raises(ManifoldFormatError, match="no sidecar"):
         ManifoldFolder.load(folder)
 
 

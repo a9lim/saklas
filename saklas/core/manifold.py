@@ -1719,7 +1719,20 @@ def invert_parameterization(
             damping * diag.clamp(min=_INVERSION_DIAG_FLOOR)
             + _INVERSION_DIAG_FLOOR
         )
-        step = torch.linalg.solve(jtj + reg, jtr).squeeze(-1)  # (N, S, n)
+        # Collapse the ``(N, S)`` batch into one leading dim and solve on
+        # contiguous inputs.  A size-1 leading batch — the single-query
+        # ``score_aggregate`` path runs at ``N=1`` — otherwise trips
+        # ``torch.linalg.solve``'s internal out-resize deprecation warning
+        # on MPS (it squeezes ``[1, S, n, n] → [S, n, n]`` internally);
+        # doing the squeeze explicitly here avoids it, bit-for-bit
+        # identical result.
+        A = jtj + reg                                    # (N, S, n, n)
+        n_dim = A.shape[-1]
+        bsz = A.shape[:-2]                               # (N, S)
+        step = torch.linalg.solve(
+            A.reshape(-1, n_dim, n_dim).contiguous(),
+            jtr.reshape(-1, n_dim, 1).contiguous(),
+        ).reshape(*bsz, n_dim)                           # (N, S, n)
         p = domain.clamp_position(p - step)
 
     # Best restart per query by final reduced-space residual norm.

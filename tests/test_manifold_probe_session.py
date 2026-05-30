@@ -267,11 +267,13 @@ def test_score_aggregate_called_with_correct_captures():
     mon.add_probe("toy", m)
 
     # Build a captured stack at node 1's centroid (so coords come back
-    # near 0.0).
-    probe = mon.attached_probes()["toy"]
+    # near 0.0).  Recompute the world-space node activation from the RBF
+    # (the former ``node_values_world`` cache was removed — only the
+    # reduced cache feeds scoring).
+    embedded = m.domain.embed(m.domain.clamp_position(m.node_coords.float()))
     captured: dict[int, torch.Tensor] = {}
-    for layer_idx, _sub in m.layers.items():
-        v_world = probe.node_values_world[layer_idx][1]
+    for layer_idx, sub in m.layers.items():
+        v_world = sub.eval_at(embedded)[1]
         captured[layer_idx] = v_world.unsqueeze(0).repeat(5, 1)
 
     agg = mon.score_aggregate(captured)

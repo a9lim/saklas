@@ -37,11 +37,18 @@ class TraitMonitor:
 
     Each probe has a profile (dict mapping layer_idx -> baked direction).
     After generation, a single forward pass over the generated text
-    pools the last content token's hidden state at each layer.
-    Mean-centered cosine similarities against probe vectors, weighted by
-    the baked magnitude ||baked_i|| (which encodes share * ref_norm — the
-    same "how much does this layer steer per unit alpha" quantity),
-    give one value per probe per generation.
+    pools the last content token's hidden state at each layer.  Per-layer
+    probe similarity is the whitened (Mahalanobis) cosine
+    ``⟨V, h_c⟩_M / (||V||_M ||h_c||_M)`` when a :class:`LayerWhitener`
+    is wired and covers the layer — matching the Mahalanobis metric the
+    default DiM extraction bakes and the ``~`` / ``|`` projection
+    defaults to — and falls back to plain Euclidean cosine on layers the
+    whitener doesn't cover (no whitener wired ⇒ all layers Euclidean).
+    Similarities are weighted by the baked magnitude ``||baked_L||₂``
+    (which encodes share * ref_norm — the same "how much does this layer
+    steer per unit alpha" quantity; the bake already folded the
+    Mahalanobis score into that magnitude, so the weight stays Euclidean
+    to avoid double-counting), giving one value per probe per generation.
     """
 
     @staticmethod
@@ -49,13 +56,20 @@ class TraitMonitor:
         return dict(_EMPTY_STATS)
 
     def __init__(self, probe_profiles: dict[str, dict[int, torch.Tensor]],
-                 layer_means: dict[int, torch.Tensor] | None = None):
+                 layer_means: dict[int, torch.Tensor] | None = None,
+                 whitener: Any = None):
         """
         probe_profiles: maps probe name -> profile dict (layer_idx -> baked vector)
         layer_means: maps layer_idx -> mean activation vector for centering
+        whitener: optional :class:`~saklas.core.mahalanobis.LayerWhitener`;
+            when set, per-layer probe similarity switches to the whitened
+            (Mahalanobis) cosine on every covered layer.  ``None`` keeps
+            the legacy Euclidean cosine everywhere (the legitimate
+            fallback, mirroring ``project_profile`` / ``vector compare``).
         """
         self._raw_profiles: dict[str, dict[int, torch.Tensor]] = dict(probe_profiles)
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
+        self._whitener: Any = whitener
 
         # Per-layer stacked cache, inverted from the previous {probe: {layer: ...}}
         # form so one matmul scores every probe against a hidden state in a single
@@ -66,10 +80,25 @@ class TraitMonitor:
         # where hidden is also present; no .item() on the hot path.
         # Structure: {layer_idx: (V_stacked, W_stacked)}.
         self._layer_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Per-layer Mahalanobis cache, populated only for layers the
+        # whitener covers.  Each entry holds the precomputed (off-hot-path)
+        # whitened probe directions + their Mahalanobis norms plus the
+        # on-device Woodbury factors used to whiten the per-token hidden:
+        #   Vinv[P, D]  : Σ⁻¹ V (so ⟨V, h_c⟩_M = Vinv @ h_c)
+        #   V_Mnorm[P]  : ||V||_M (zeros for probes missing L)
+        #   X[N, D], K[N, N], lam : Woodbury factors for Σ⁻¹ h_c
+        # Layers absent from this dict score Euclidean via _layer_cache.
+        self._layer_white: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
+        ] = {}
         # Probe -> index into the P axis (stable, insertion order).
         self._probe_index: dict[str, int] = {}
         self._cache_device: torch.device | None = None
         self._cache_probe_keys: tuple[str, ...] = ()
+        # Identity of the whitener the cache was built against — a change
+        # (set_whitener) invalidates the Mahalanobis cache.
+        self._cache_whitener_id: int | None = id(whitener)
         # Cache of layer_means cast to float32 on cache_device.
         self._mean_cache: dict[int, torch.Tensor] = {}
 
@@ -112,6 +141,29 @@ class TraitMonitor:
         # Invalidate mean cache; v_unit cache is independent of means.
         self._mean_cache = {}
 
+    @property
+    def whitener(self) -> Any:
+        """The wired :class:`LayerWhitener` (or ``None`` for Euclidean reads)."""
+        return self._whitener
+
+    def set_whitener(self, whitener: Any) -> None:
+        """Wire (or clear) the Mahalanobis whitener and invalidate the cache.
+
+        Idempotent on the same instance — re-wiring the identical whitener
+        is a no-op so a session that hands the monitor its lazily-built
+        whitener twice doesn't pay a needless rebuild.  Any change flushes
+        the Mahalanobis cache so the next scoring call rebuilds the
+        whitened probe directions against the new covariance.
+        """
+        if whitener is self._whitener:
+            return
+        self._whitener = whitener
+        self._layer_white = {}
+        self._layer_cache = {}
+        self._cache_device = None
+        self._cache_probe_keys = ()
+        self._cache_whitener_id = id(whitener)
+
     def _ensure_cache(self, device: torch.device) -> None:
         """Build/refresh the per-device float32 cache of stacked probe matrices + means.
 
@@ -120,17 +172,27 @@ class TraitMonitor:
         produces zero similarity — correct because ``W`` at that slot is also zero and
         the denominator mask is shared). ``W[p] = ||baked_p_L||`` for probes that own
         the layer, else 0. No ``.item()`` calls — norms stay on-device.
+
+        When a whitener is wired, every layer it covers additionally gets a
+        Mahalanobis entry in ``_layer_white`` — the whitened probe
+        directions ``Σ⁻¹V`` and their Mahalanobis norms ``||V||_M``
+        (precomputed here, off the hot path) plus the on-device Woodbury
+        factors ``(X, K, λ)`` so the per-token ``Σ⁻¹ h_c`` apply runs
+        inline without routing through the CPU-forcing
+        :meth:`LayerWhitener.apply_inv`.
         """
         probe_keys = tuple(self._raw_profiles.keys())
         if (
             self._cache_device == device
             and self._cache_probe_keys == probe_keys
             and self._mean_cache.keys() == self._layer_means.keys()
+            and self._cache_whitener_id == id(self._whitener)
             and self._layer_cache
         ):
             return
 
         self._cache_device = device
+        self._cache_whitener_id = id(self._whitener)
         self._probe_index = {name: i for i, name in enumerate(probe_keys)}
         self._cache_probe_keys = probe_keys
         n_probes = len(probe_keys)
@@ -144,7 +206,12 @@ class TraitMonitor:
                 layer_members.setdefault(layer_idx, []).append((pi, v))
                 dim_for_layer[layer_idx] = v.shape[-1]
 
+        whitener = self._whitener
         new_layer_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        new_layer_white: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
+        ] = {}
         for layer_idx, members in layer_members.items():
             dim = dim_for_layer[layer_idx]
             V = torch.zeros((n_probes, dim), device=device, dtype=torch.float32)
@@ -155,24 +222,115 @@ class TraitMonitor:
                 # Keep weight on-device; sync cost deferred to the final result.
                 W[pi] = vn
             new_layer_cache[layer_idx] = (V, W)
+
+        # Mahalanobis read is decided ALL-OR-NOTHING over the scored-layer
+        # set, matching the ``LayerWhitener.covers_all`` gate vector
+        # extraction / manifold fitting / ``vector compare`` already use:
+        # either every probed layer is whitened or none are.  A per-layer
+        # Mahalanobis/Euclidean mix would fold cosines measured under two
+        # different metrics into one aggregated probe score — exactly what
+        # the all-or-nothing discipline exists to forbid.  ``covers_all`` is
+        # trustworthy as "finite, usable factors on every covered layer":
+        # ``LayerWhitener.from_neutral_activations`` skips any layer whose
+        # centered activations or regularized inverse come back non-finite
+        # (the degenerate-whitener case — e.g. gemma-3's late-layer fp16
+        # overflow — leaves the layer uncovered), so a covered set is a
+        # clean set and no local finite-check is needed here.  The per-probe
+        # whitening (``apply_inv``, P × O(ND)) is an off-hot-path cache-build
+        # cost; the hot path whitens the per-token hidden once per layer.
+        scored_layers = list(layer_members.keys())
+        if (
+            whitener is not None
+            and scored_layers
+            and whitener.covers_all(scored_layers)
+        ):
+            for layer_idx in scored_layers:
+                X, K, lam = whitener.woodbury_factors(
+                    layer_idx, device=device, dtype=torch.float32,
+                )
+                V, _W = new_layer_cache[layer_idx]
+                dim = V.shape[-1]
+                Vinv = torch.zeros(
+                    (n_probes, dim), device=device, dtype=torch.float32,
+                )
+                # Floor ‖V‖_M at 1e-8 for *every* row, including probes that
+                # don't own this layer (their Vinv row stays zero).  Without
+                # the floor on the missing-probe rows the per-layer division
+                # ``num / (V_Mnorm · h_Mnorm)`` would be ``0 / 0 = NaN``
+                # there, and ``W[pi]=0 · NaN = NaN`` would poison the
+                # accumulated numerator.  With the floor the missing-probe
+                # sim is a clean ``0 / (1e-8 · h_Mnorm) = 0`` — matching the
+                # Euclidean path's zero-row behavior.
+                V_Mnorm = torch.full(
+                    (n_probes,), 1e-8, device=device, dtype=torch.float32,
+                )
+                for pi, _v in layer_members[layer_idx]:
+                    # V[pi] is the unit Euclidean direction; whiten it once.
+                    vw = self._woodbury_apply(V[pi], X, K, lam)
+                    Vinv[pi] = vw
+                    # ||V||_M = sqrt(Vᵀ Σ⁻¹ V) = sqrt(V · vw).
+                    V_Mnorm[pi] = torch.sqrt(
+                        torch.dot(V[pi], vw).clamp(min=0.0)
+                    ).clamp(min=1e-8)
+                new_layer_white[layer_idx] = (Vinv, V_Mnorm, X, K, lam)
+
         self._layer_cache = new_layer_cache
+        self._layer_white = new_layer_white
 
         self._mean_cache = {
             idx: m.to(device=device, dtype=torch.float32)
             for idx, m in self._layer_means.items()
         }
 
-    def _normalize_hidden(self, layer_idx: int, h: torch.Tensor) -> torch.Tensor:
-        """Center (per layer_means) and L2-normalize a hidden-state tensor.
+    @staticmethod
+    def _woodbury_apply(
+        v: torch.Tensor,
+        X: torch.Tensor,
+        K: torch.Tensor,
+        lam: float,
+    ) -> torch.Tensor:
+        """On-device ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` (Woodbury).
 
-        Works for both 1D (dim,) and 2D (seq, dim) — mean broadcasts over
-        rows, and ``dim=-1, keepdim=True`` is a no-op reshape for 1D.
+        ``v`` is ``[D]`` or ``[n, D]``; ``X`` is ``[N, D]``, ``K`` is
+        ``[N, N]``, all on the same device/dtype.  Pure matmuls, no host
+        sync — the hot-path companion to
+        :meth:`LayerWhitener.apply_inv`.  For a ``[n, D]`` batch this is
+        ``(1/λ)(V − (V Xᵀ) K X)``; for ``[D]`` it broadcasts the same way.
         """
+        Xv = v @ X.transpose(0, 1)        # [..., N]
+        KXv = Xv @ K.transpose(0, 1)      # [..., N]  (K symmetric; t() = K)
+        return (v - KXv @ X) / lam        # [..., D]
+
+    def _layer_sims(self, layer_idx: int, h: torch.Tensor) -> torch.Tensor:
+        """Per-layer probe similarity row(s) for a hidden state.
+
+        ``h`` is ``[D]`` (single token) or ``[n, D]`` (token stack); the
+        returned tensor is ``[P]`` or ``[n, P]`` respectively.  Centers
+        ``h`` by the layer mean, then computes the Mahalanobis cosine when
+        the whitener covers this layer (``⟨V, h_c⟩_M / (||V||_M ||h_c||_M)``)
+        or the plain Euclidean cosine otherwise.  The caller multiplies by
+        the per-layer weight ``W`` and accumulates.
+        """
+        V, _W = self._layer_cache[layer_idx]
         mean = self._mean_cache.get(layer_idx)
-        if mean is not None:
-            h = h - mean
-        hn = h.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        return h / hn
+        h_c = h - mean if mean is not None else h
+        white = self._layer_white.get(layer_idx)
+        if white is None:
+            # Euclidean cosine: ⟨V̂, ĥ_c⟩.
+            hn = h_c.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            h_unit = h_c / hn
+            return h_unit @ V.transpose(0, 1) if h_unit.ndim > 1 else V @ h_unit
+        Vinv, V_Mnorm, X, K, lam = white
+        # ⟨V, h_c⟩_M = (Σ⁻¹ V) · h_c = Vinv · h_c.
+        num = (
+            h_c @ Vinv.transpose(0, 1) if h_c.ndim > 1 else Vinv @ h_c
+        )                                              # [n,P] or [P]
+        # ||h_c||_M = sqrt(h_cᵀ Σ⁻¹ h_c); one Woodbury apply per token.
+        h_inv = self._woodbury_apply(h_c, X, K, lam)
+        h_Mnorm = torch.sqrt(
+            (h_c * h_inv).sum(dim=-1, keepdim=True).clamp(min=0.0)
+        ).clamp(min=1e-8)                              # [n,1] or [1]
+        return num / (V_Mnorm * h_Mnorm)
 
     def _score_probes(self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True) -> dict[str, float]:
         """Score all probes against hidden states.
@@ -199,9 +357,8 @@ class TraitMonitor:
             entry = self._layer_cache.get(layer_idx)
             if entry is None:
                 continue
-            V, W = entry  # V: (P, D), W: (P,)
-            h_unit = self._normalize_hidden(layer_idx, h.float())  # (D,)
-            sims = V @ h_unit  # (P,)
+            _V, W = entry  # W: (P,)
+            sims = self._layer_sims(layer_idx, h.float())  # (P,)
             num.add_(W * sims)
             den.add_(W)
         den.clamp_(min=1e-8)
@@ -284,9 +441,8 @@ class TraitMonitor:
             entry = self._layer_cache.get(layer_idx)
             if entry is None:
                 continue
-            V, W = entry  # V: (P, D), W: (P,)
-            h_unit = self._normalize_hidden(layer_idx, h.float())  # (D,)
-            sims = V @ h_unit  # (P,)
+            _V, W = entry  # W: (P,)
+            sims = self._layer_sims(layer_idx, h.float())  # (P,)
             num.add_(W * sims)
             den.add_(W)
         den.clamp_(min=1e-8)
@@ -329,9 +485,7 @@ class TraitMonitor:
             entry = self._layer_cache.get(layer_idx)
             if entry is None:
                 continue
-            V, _W = entry  # V: (P, D) unit-normed
-            h_unit = self._normalize_hidden(layer_idx, h.float())
-            sims = (V @ h_unit).cpu().tolist()  # one sync per layer
+            sims = self._layer_sims(layer_idx, h.float()).cpu().tolist()  # one sync per layer
             out[layer_idx] = {
                 name: sims[i] for i, name in enumerate(probe_keys)
             }
@@ -423,9 +577,8 @@ class TraitMonitor:
             entry = self._layer_cache.get(layer_idx)
             if entry is None:
                 continue
-            V, W = entry  # V: (P, D), W: (P,)
-            h_unit = self._normalize_hidden(layer_idx, h.float())  # (n, D)
-            sims = h_unit @ V.t()  # (n, P)
+            _V, W = entry  # W: (P,)
+            sims = self._layer_sims(layer_idx, h.float())  # (n, P)
             num.add_(sims * W)  # broadcast over n
             den.add_(W)
         den.clamp_(min=1e-8)
@@ -510,9 +663,8 @@ class TraitMonitor:
             entry = self._layer_cache.get(layer_idx)
             if entry is None:
                 continue
-            V, W = entry
-            h_unit = self._normalize_hidden(layer_idx, h.float())  # (n, D)
-            sims = h_unit @ V.t()  # (n, P)
+            _V, W = entry
+            sims = self._layer_sims(layer_idx, h.float())  # (n, P)
             num.add_(sims * W)
             den.add_(W)
         den.clamp_(min=1e-8)
@@ -637,24 +789,22 @@ class TraitMonitor:
 class AttachedManifoldProbe:
     """One manifold registered on a :class:`ManifoldMonitor`.
 
-    Pairs the loaded :class:`Manifold` artifact with per-layer caches the
-    monitor uses on the hot path: ``node_values_world`` is the per-layer
-    ``(K, D)`` tensor of world-space node activations
-    (``sub.eval_at(domain.embed(node_coords))``), pre-computed once at
-    attach so per-token distance computations are one batched cdist in
-    R-dim per layer.  ``node_values_reduced`` is the same data in the
-    per-layer subspace coords (also ``(K, R)``).  ``ev_weights`` is the
-    per-layer EV ratio used to weight cross-layer aggregation; floored
-    at :data:`_MIN_EV_WEIGHT` so a degenerate layer doesn't crash the
+    Pairs the loaded :class:`Manifold` artifact with the per-layer cache
+    the monitor uses on the hot path: ``node_values_reduced`` is the
+    per-layer ``(K, R)`` tensor of node activations in subspace coords
+    (``(sub.eval_at(domain.embed(node_coords)) - sub.mean) @ sub.basis.T``),
+    pre-computed once at attach so per-token distance computations are one
+    batched cdist in R-dim per layer.  ``ev_weights`` is the per-layer EV
+    ratio used to weight cross-layer aggregation; floored at
+    :data:`_MIN_EV_WEIGHT` so a degenerate layer doesn't crash the
     aggregator.
     """
 
     name: str
     manifold: "Manifold"
     top_n: int = DEFAULT_NEAREST_TOP_N
-    # Per-layer caches, indexed by layer index — same set of layers as
+    # Per-layer cache, indexed by layer index — same set of layers as
     # ``manifold.layers``.
-    node_values_world: dict[int, torch.Tensor] = field(default_factory=dict)
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
     # Cached node coords on the device.  ``(K, n)`` shared across layers.
     embedded_node_coords: torch.Tensor | None = None
@@ -749,12 +899,10 @@ class ManifoldMonitor:
 
         ``top_n`` controls the ``nearest`` list length; default
         :data:`DEFAULT_NEAREST_TOP_N` (3).  The pre-cache runs once at
-        attach: for every layer the manifold covers, compute the
-        per-node world-space activation
-        (``sub.eval_at(domain.embed(node_coords))``) and its reduced
-        in-subspace form (``(K, R)`` for the per-token cdist), and the
-        normalized EV weight (per-layer EV ratio over the layer-union
-        sum, floored at :data:`_MIN_EV_WEIGHT`).
+        attach: for every layer the manifold covers, compute the per-node
+        reduced (in-subspace) activation ``(K, R)`` for the per-token
+        cdist and the normalized EV weight (per-layer EV ratio over the
+        layer-union sum, floored at :data:`_MIN_EV_WEIGHT`).
         """
         if not manifold.layers:
             raise ValueError(
@@ -764,7 +912,6 @@ class ManifoldMonitor:
             raise ValueError(
                 f"manifold {manifold.name!r} carries no node coords / labels"
             )
-        node_values_world: dict[int, torch.Tensor] = {}
         node_values_reduced: dict[int, torch.Tensor] = {}
         ev_weights_raw: dict[int, float] = {}
         # Cache the embedded node coords once — they ride with the
@@ -777,16 +924,14 @@ class ManifoldMonitor:
             embedded_dev = embedded.to(
                 device=sub_f32.mean.device, dtype=torch.float32,
             )
-            # World-space per-node activation: ``(K, D)`` in fp32.
-            v_world = sub_f32.eval_at(embedded_dev)  # (K, D)
             # Reduced (in-subspace) per-node activation: ``(K, R)`` — the
             # working space for the hot-path cdist against the running
             # activation's in-subspace projection.  Centered through
             # ``sub.mean`` so it matches the centered ``h_par_c`` slice
             # ``decompose`` returns.
+            v_world = sub_f32.eval_at(embedded_dev)  # (K, D)
             v_centered = v_world - sub_f32.mean
             v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
-            node_values_world[layer_idx] = v_world.contiguous()
             node_values_reduced[layer_idx] = v_reduced.contiguous()
             ev_weights_raw[layer_idx] = float(
                 manifold.explained_variance.get(layer_idx, 1.0)
@@ -807,7 +952,6 @@ class ManifoldMonitor:
             name=name,
             manifold=manifold,
             top_n=int(top_n),
-            node_values_world=node_values_world,
             node_values_reduced=node_values_reduced,
             embedded_node_coords=embedded,
             ev_weights=ev_weights,
@@ -1104,3 +1248,45 @@ class ManifoldMonitor:
                 residual_per_layer=residual_per_layer,
             )
         return out
+
+    def measure(
+        self,
+        model: torch.nn.Module,
+        tokenizer: Any,
+        layers: torch.nn.ModuleList,
+        device: torch.device,
+        text: str,
+        *,
+        agg_index: int | None = None,
+    ) -> dict[str, ManifoldAggregate]:
+        """One-shot manifold scoring over arbitrary *text* — no generation.
+
+        The manifold analogue of :meth:`TraitMonitor.measure`: runs a
+        single forward pass over *text*, captures the full ``[T, D]``
+        hidden stack across the attached manifolds' layers, and returns
+        :meth:`score_aggregate` keyed by probe name.  Pools the aggregate
+        from the **last content token** via the canonical
+        :func:`saklas.core.vectors.last_content_index` walkback (same
+        single-state discipline as extraction and the generation-time
+        aggregate), unless the caller supplies an explicit ``agg_index``.
+
+        Returns an empty dict when no manifold probe is attached.
+        """
+        from saklas.core.vectors import encode_and_capture_stack
+
+        if not self._probes:
+            return {}
+
+        stacks, content_idx = encode_and_capture_stack(
+            model, tokenizer, text, layers, device,
+        )
+        # Restrict the captured stack to the union of attached-manifold
+        # layers — the forward captured every layer, but scoring only
+        # reads the manifolds' own layer set.
+        wanted = self.attached_layers()
+        captured = {
+            idx: stack for idx, stack in stacks.items() if idx in wanted
+        }
+        if agg_index is None:
+            agg_index = content_idx
+        return self.score_aggregate(captured, agg_index=agg_index)

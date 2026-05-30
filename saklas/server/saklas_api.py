@@ -1569,6 +1569,11 @@ def register_saklas_routes(app: FastAPI) -> None:
                             await asyncio.sleep(0)
                             queue.put_nowait(("done", body))
                         except Exception as e:  # noqa: BLE001
+                            # Don't surface ``str(e)`` — Python exception
+                            # messages routinely echo filesystem paths or
+                            # vendor error text.  Log the full traceback
+                            # server-side, send a generic shape (matching
+                            # the clone/extract SSE workers above).
                             import logging
                             logging.getLogger("saklas.api").exception(
                                 "extract preview failed for session=%s",
@@ -1577,7 +1582,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                             queue.put_nowait((
                                 "error",
                                 {
-                                    "message": str(e) or "preview failed",
+                                    "message": "preview failed",
                                     "code": type(e).__name__,
                                 },
                             ))
@@ -1628,9 +1633,14 @@ def register_saklas_routes(app: FastAPI) -> None:
         """
         from saklas.io.merge import merge_into_pack, MergeError
         from saklas.io.paths import tensor_filename
+        from saklas.server.manifold_routes import _refuse_if_busy
         _resolve_session_id(session, session_id)
 
         async with session.lock:
+            # Refuse (409) while an in-flight extract holds the engine
+            # gen-lock — parity with the manifold mutating routes, so a
+            # merge can't race a concurrent extraction.
+            _refuse_if_busy(session)
             try:
                 dst_folder = await asyncio.to_thread(
                     merge_into_pack,
