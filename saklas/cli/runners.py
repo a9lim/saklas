@@ -893,16 +893,20 @@ def _run_config_validate(args: argparse.Namespace) -> None:
     print(f"{p}: ok")
 
 
-_VARIANT_SUFFIX_RE = re.compile(r"^(raw|sae(?:-[a-z0-9._-]+)?)$")
+_VARIANT_SUFFIX_RE = re.compile(
+    r"^(raw|pca|sae(?:-[a-z0-9._-]+)?(?:-pca)?|"
+    r"role(?:-[a-z0-9._-]+)?(?:-pca)?|from(?:-[a-z0-9._-]+)?)$"
+)
 
 
 def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
     """Peel a trailing ``:<variant>`` off a selector string.
 
-    Returns ``(name_part, variant_or_None)``. ``variant`` is ``"raw"``,
-    ``"sae"``, or ``"sae-<release>"``. Non-variant colon usage
-    (``tag:``, ``namespace:``, ``model:``) passes through unchanged with
-    ``variant=None`` — those prefixes are caught by ``sel.parse`` later.
+    Returns ``(name_part, variant_or_None)``. ``variant`` is one of the
+    tensor suffixes understood by :func:`saklas.io.packs.enumerate_variants`.
+    Non-variant colon usage (``tag:``, ``namespace:``, ``model:``) passes
+    through unchanged with ``variant=None`` — those prefixes are caught by
+    ``sel.parse`` later.
     """
     if ":" not in raw:
         return raw, None
@@ -925,10 +929,13 @@ def _resolve_variant_tensor(
       - ``None`` (no suffix passed): prefer raw safetensors, fall back
         to GGUF.
       - ``"raw"``: require the raw safetensors tensor.
+      - ``"pca"``: require the raw legacy-PCA tensor.
       - ``"sae"``: require the unique SAE variant; raise
         :class:`AmbiguousVariantError` when >1, :class:`UnknownVariantError`
         when 0.
-      - ``"sae-<release>"``: require that specific release.
+      - ``"role"`` / ``"from"``: require the unique role / transferred
+        variant, with the same ambiguity behavior.
+      - ``"<kind>-<id>"``: require that specific variant.
     """
     from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
     from saklas.io.packs import enumerate_variants
@@ -946,21 +953,28 @@ def _resolve_variant_tensor(
     if variant == "raw":
         return variants.get("raw")
 
-    if variant == "sae":
-        sae_paths = {k: v for k, v in variants.items() if k.startswith("sae-")}
-        if len(sae_paths) == 0:
+    if variant == "pca":
+        return variants.get("pca")
+
+    if variant in {"sae", "role", "from"}:
+        prefix = f"{variant}-"
+        display = "SAE" if variant == "sae" else variant
+        id_hint = "release" if variant == "sae" else "id"
+        kind_paths = {k: v for k, v in variants.items() if k.startswith(prefix)}
+        if len(kind_paths) == 0:
             raise UnknownVariantError(
-                f"no SAE variants found in {folder.name} for model {model_id} "
+                f"no {display} variants found in {folder.name} for model {model_id} "
                 f"(available: {sorted(variants) or 'none'})"
             )
-        if len(sae_paths) > 1:
+        if len(kind_paths) > 1:
             raise AmbiguousVariantError(
-                f"{folder.name}: multiple SAE variants for model {model_id}: "
-                f"{sorted(sae_paths)}. Specify with :sae-<release>."
+                f"{folder.name}: multiple {display} variants for model {model_id}: "
+                f"{sorted(kind_paths)}. Specify with :{variant}-<{id_hint}>."
             )
-        return next(iter(sae_paths.values()))
+        return next(iter(kind_paths.values()))
 
-    # ``sae-<release>``
+    # Specific variant key (``sae-<release>``, ``role-<slug>``,
+    # ``from-<safe_src>``, and the ``*-pca`` companions).
     path = variants.get(variant)
     if path is None:
         raise UnknownVariantError(

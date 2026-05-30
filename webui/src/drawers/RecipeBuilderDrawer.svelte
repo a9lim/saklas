@@ -62,6 +62,19 @@
     const t = target.trim();
     setVectorProjection(name, t ? { op, target: t } : null);
   }
+
+  function isVariant(raw: string): raw is Variant {
+    return (
+      raw === "raw" ||
+      raw === "pca" ||
+      raw === "sae" ||
+      raw === "role" ||
+      raw === "from" ||
+      raw.startsWith("sae-") ||
+      raw.startsWith("role-") ||
+      raw.startsWith("from-")
+    );
+  }
 </script>
 
 <section class="drawer-shell" aria-label="Recipe builder drawer">
@@ -144,11 +157,11 @@
                 <span>variant</span>
                 <input
                   value={entry.variant}
-                  placeholder="raw | sae | sae-release"
+                  placeholder="raw | pca | sae-* | role-* | from-*"
                   oninput={(ev) => {
                     const raw = (ev.currentTarget as HTMLInputElement).value.trim();
-                    if (raw === "raw" || raw === "sae" || raw.startsWith("sae-")) {
-                      setVectorVariant(name, raw as Variant);
+                    if (isVariant(raw)) {
+                      setVectorVariant(name, raw);
                     }
                   }}
                 />

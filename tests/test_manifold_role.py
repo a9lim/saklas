@@ -340,6 +340,44 @@ def test_bare_name_resolves_to_manifold_term(tmp_path: Path, monkeypatch: pytest
     assert term.position == "pirate"
 
 
+def test_parse_bare_name_cross_tier_collision_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from saklas.io.manifolds import create_discover_manifold_folder
+    from saklas.io.packs import PackMetadata, hash_folder_files
+    from saklas.io.selectors import AmbiguousSelectorError, invalidate
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    vector_folder = tmp_path / "vectors" / "default" / "civilian.pirate"
+    vector_folder.mkdir(parents=True)
+    (vector_folder / "statements.json").write_text(json.dumps([]))
+    PackMetadata(
+        name="civilian.pirate",
+        description="test",
+        version="1.0.0",
+        license="MIT",
+        tags=[],
+        recommended_alpha=0.5,
+        source="local",
+        files=hash_folder_files(vector_folder),
+    ).write(vector_folder)
+
+    create_discover_manifold_folder(
+        "local", "persona", "test",
+        fit_mode="pca",
+        node_corpora={
+            "pirate": ["arr"],
+            "cowboy": ["howdy"],
+            "professor": ["ahem"],
+        },
+    )
+    invalidate()
+
+    with pytest.raises(AmbiguousSelectorError, match="matches both"):
+        parse_expr("0.7 pirate")
+
+
 def test_namespace_qualified_bare_name_still_resolves(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from saklas.io.manifolds import create_discover_manifold_folder
 

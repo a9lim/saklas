@@ -290,6 +290,32 @@ class TestExtract:
         assert data["profile"]["layers"] == [0, 1]
         assert "on_progress" in session.extract.call_args.kwargs
 
+    def test_extract_json_registers_returned_variant_and_namespace(
+        self, session_and_client: Any,
+    ) -> None:
+        import torch
+        from saklas.core.profile import Profile
+        session, client = session_and_client
+        profile = Profile({0: torch.ones(4)})
+        session.extract.return_value = ("honest.deceptive:role-pirate", profile)
+
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={
+                "name": "honest.deceptive",
+                "source": "honest",
+                "role": "pirate",
+                "namespace": "alice",
+                "register": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["canonical"] == "alice/honest.deceptive:role-pirate"
+        session.steer.assert_called_once_with(
+            "alice/honest.deceptive:role-pirate", profile,
+        )
+
     def test_extract_sse_streams_progress_live(self, session_and_client: Any) -> None:
         """SSE branch must yield each ``on_progress`` message as its own
         event rather than buffering them all until extraction returns.
@@ -339,6 +365,43 @@ class TestExtract:
         assert events[-1] == "done"
         assert "Generating 9 scenarios" in frames[0]
         assert "Extracting difference-of-means" in frames[2]
+
+    def test_extract_sse_registers_returned_variant(
+        self, session_and_client: Any,
+    ) -> None:
+        import torch
+        from saklas.core.profile import Profile
+        session, client = session_and_client
+        profile = Profile({0: torch.ones(4)})
+
+        def _extract(
+            source: Any,
+            baseline: Any = None,
+            *,
+            on_progress: Any = None,
+            **_kwargs: Any,
+        ) -> Any:
+            return "honest.deceptive:role-pirate", profile
+
+        session.extract.side_effect = _extract
+        with client.stream(
+            "POST",
+            "/saklas/v1/sessions/default/extract",
+            json={
+                "name": "honest.deceptive",
+                "source": "honest",
+                "role": "pirate",
+                "register": True,
+            },
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            assert resp.status_code == 200
+            body = b"".join(resp.iter_bytes()).decode()
+
+        assert '"canonical": "honest.deceptive:role-pirate"' in body
+        session.steer.assert_called_once_with(
+            "honest.deceptive:role-pirate", profile,
+        )
 
     def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client: Any) -> None:
         import torch

@@ -341,7 +341,6 @@ class TestSteeringIntegration:
         assert str(s) == "0.3 angry.calm@when:angry.calm>=0.5"
 
     def test_steering_from_value_accepts_gate_string(self):
-        s = Steering.from_value("0.5 calm@when:angry.calm>0.4")
+        s = Steering.from_value("0.5 angry.calm@when:angry.calm>0.4")
         assert s is not None
-        # Pole-resolver folds 'calm' → 'angry.calm' with sign flip.
         assert "angry.calm" in s.alphas

@@ -128,14 +128,15 @@
         rack.  Server-side parser lives in
         <code>saklas.core.steering_expr</code>.
       </p>
-      <pre class="grammar">{`expr     := term (("+" | "-") term)*
-term     := [coeff "*"?] ["!"] selector ["@" trigger]
-selector := atom (("~" | "|") atom)?
-atom     := [ns "/"] NAME ["." NAME] [":" variant]
-trigger  := before | after | both | thinking | response
-            | prompt   (alias of before)
-            | generated (alias of response)
-variant  := raw | sae | sae-<release>
+      <pre class="grammar">{`expr      := term (("+" | "-") term)*
+term      := [coeff "*"?] ["!"] selector ["@" trigger]
+selector  := atom (("~" | "|") atom | "%" position)?
+position  := signed_num ("," signed_num)* | label
+atom      := [ns "/"] NAME ["." NAME] [":" variant]
+trigger   := before | after | both | thinking | response
+             | prompt | generated | when:<probe><op><num>
+variant   := raw | pca | sae | sae-<release>
+             | role | role-<name> | from | from-<source>
 `}</pre>
 
       <p class="prose">examples</p>
@@ -143,8 +144,13 @@ variant  := raw | sae | sae-<release>
 0.4 warm@after               # active only after </think>
 -0.5 wolf                    # bare pole resolves to deer.wolf @ -0.5
 0.6 honest:sae               # pull from the SAE-feature-space tensor
+0.6 honest:pca               # pull from the legacy PCA tensor
+0.6 honest:role-pirate       # role-augmented tensor
+0.6 honest:from-gemma_4_31b  # transferred tensor
 0.5 honest|sycophantic       # remove shared component with sycophantic
 0.5 honest~confident         # keep the shared component, drop the rest
+0.5 personas%pirate          # steer to a manifold node label
+0.4 circumplex%0.6,0.2@response # steer to manifold coordinates
 !sycophantic                 # mean-ablate (coeff = 1.0 fully replaces)
 0.3 a + 0.5 b@thinking - 0.2 c|d   # compose
 `}</pre>

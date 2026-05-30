@@ -380,6 +380,69 @@ class TestForceStatementsRegenerates:
         assert all(p["positive"].startswith("positive ") for p in new_pairs)
 
 
+class TestExplicitPairCacheIdentity:
+    """Explicit pair sources have the same cache-identity discipline as
+    statements.json-backed extraction: the tensor is reusable only for the
+    same normalized pair payload, and force bypasses it.
+    """
+
+    def test_explicit_pairs_cache_keys_by_pair_payload(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        captured = _fake_extract(monkeypatch)
+
+        from saklas.io.datasource import DataSource
+        from saklas.io.selectors import invalidate
+        invalidate()
+
+        handle = _StubHandle(tmp_path)
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
+
+        source_a = DataSource(
+            pairs=[("a positive", "a negative"), ("a positive 2", "a negative 2")],
+            name="custom_axis",
+        )
+        source_b = DataSource(
+            pairs=[("b positive", "b negative"), ("b positive 2", "b negative 2")],
+            name="custom_axis",
+        )
+
+        pipeline.extract(source_a)
+        assert captured.get("call_count") == 1
+
+        # Same explicit pairs: tensor cache is valid.
+        pipeline.extract(source_a)
+        assert captured.get("call_count") == 1
+
+        # Same name, different explicit pairs: tensor cache must miss.
+        pipeline.extract(source_b)
+        assert captured.get("call_count") == 2
+        assert captured["pairs"][0]["positive"] == "b positive"
+
+    def test_explicit_pairs_force_bypasses_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        captured = _fake_extract(monkeypatch)
+
+        from saklas.io.datasource import DataSource
+        from saklas.io.selectors import invalidate
+        invalidate()
+
+        handle = _StubHandle(tmp_path)
+        pipeline = ExtractionPipeline(handle, handle, EventBus())
+        source = DataSource(
+            pairs=[("positive", "negative"), ("positive 2", "negative 2")],
+            name="custom_axis",
+        )
+
+        pipeline.extract(source)
+        pipeline.extract(source, force_statements=True)
+
+        assert captured.get("call_count") == 2
+
+
 class TestExplicitScenariosBypass:
     """scenarios=[...]: pair gen runs, but scenario gen does NOT."""
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import hashlib
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 import torch
@@ -40,6 +41,7 @@ from saklas.core.vectors import (
     load_profile as _load_profile,
     load_contrastive_pairs,
 )
+from saklas.io.atomic import write_json_atomic
 
 
 # Default extraction method for fresh extractions.  v2.1 flips the
@@ -84,6 +86,12 @@ def _extractor_for(
     raise ValueError(
         f"unknown extraction method {method!r} (expected 'dim' | 'pca')"
     )
+
+
+def _pairs_payload_sha256(pairs: list[dict[str, str]]) -> str:
+    """Hash the exact JSON payload shape used for explicit pair caches."""
+    text = json.dumps(pairs, indent=2) + "\n"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # ----------------------------------------------------------------------
@@ -506,27 +514,50 @@ class ExtractionPipeline:
                 ds = DataSource(pairs=source)
             else:
                 ds = source
+            pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
+            incoming_pairs_sha = _pairs_payload_sha256(pairs)
             # User-supplied namespace controls the destination folder; the
             # default ``"local"`` preserves the historical landing site.
             folder = self._packs._local_concept_folder(
                 canonical, namespace=namespace or "local",
             )
             cache_path = _path_for(folder)
-            try:
-                profile, _meta = _load_profile(cache_path)
-                profile = self._packs._promote_profile(profile)
-                _progress(f"Loaded cached profile for '{canonical}'.")
-                return _out_name_for_cache(), Profile(profile, metadata=_meta)
-            except (FileNotFoundError, KeyError, ValueError):
-                pass
+            if not force_statements:
+                try:
+                    profile, _meta = _load_profile(cache_path)
+                    recorded_sha = (
+                        _meta.get("statements_sha256") if _meta else None
+                    )
+                    stmts_path = pathlib.Path(cache_path).parent / "statements.json"
+                    cache_matches_pairs = (
+                        recorded_sha == incoming_pairs_sha
+                        and stmts_path.exists()
+                        and hash_file(stmts_path) == recorded_sha
+                    )
+                    if cache_matches_pairs:
+                        profile = self._packs._promote_profile(profile)
+                        _progress(f"Loaded cached profile for '{canonical}'.")
+                        return _out_name_for_cache(), Profile(
+                            profile, metadata=_meta,
+                        )
+                    _progress(
+                        f"Cached tensor for '{canonical}' was trained on "
+                        "different explicit pairs — re-extracting."
+                    )
+                except (FileNotFoundError, KeyError, ValueError):
+                    pass
 
             _progress(f"Extracting profile ({len(ds.pairs)} pairs)...")
-            pairs = [{"positive": p, "negative": n} for p, n in ds.pairs]
             profile, diagnostics = extractor(
                 model, tokenizer, pairs, layers=layers,
                 **_resolve_extract_kwargs(),
             )
-            _save_profile(profile, cache_path, _save_meta(diagnostics=diagnostics))
+            stmts_path = pathlib.Path(cache_path).parent / "statements.json"
+            write_json_atomic(stmts_path, pairs)
+            _save_profile(profile, cache_path, _save_meta(
+                {"statements_sha256": hash_file(stmts_path)},
+                diagnostics=diagnostics,
+            ))
             self._packs._update_local_pack_files(folder)
             return _build_return(profile, diagnostics)
 
@@ -1200,6 +1231,7 @@ class ManifoldExtractionPipeline:
             node_coords=node_coords,
             layers=layer_subs,
             feature_space=feature_space,
+            node_roles=list(node_roles),
             explained_variance=explained_variance,
             mahalanobis_share=mahalanobis_share,
         )

@@ -7,8 +7,8 @@
   // saklas.io.merge.merge_into_pack server-side; the response is the
   // same VectorInfo shape GET /vectors/{name} returns.
   //
-  // Variant picker covers raw / sae / sae-<release>.  The merge endpoint
-  // body shape is { name, expression } only — no variant field on the
+  // Variant picker covers the shared tensor variant suffixes.  The merge
+  // endpoint body shape is { name, expression } only — no variant field on the
   // wire today.  Variant choice is encoded by appending ":<variant>" to
   // each atom as the user types (or via the chip below the textarea
   // which appends a default-variant suffix to the expression).
@@ -25,7 +25,6 @@
     serializeExpression,
   } from "../lib/expression";
   import type { Variant, VectorRackEntry } from "../lib/types";
-  import Radio from "../lib/Radio.svelte";
   import Disclosure from "../lib/Disclosure.svelte";
 
   // Drawer host forwards { params } — unused.
@@ -35,23 +34,7 @@
   // ----- form state -----
   let name = $state("");
   let expression = $state("");
-  let variant: Variant = $state("raw");
-  let saeRelease = $state("");
-
-  // ----- variant radio bridge -----
-  //
-  // The variant radio surface has three slots — raw, sae (unique), sae-
-  // release — but ``variant`` itself is a string union where the third
-  // slot is open-ended ("sae-<release>").  ``variantKind`` is the
-  // bindable radio group; an effect projects it (plus ``saeRelease``)
-  // back onto ``variant``.
-  type VariantKind = "raw" | "sae" | "sae-release";
-  let variantKind: VariantKind = $state("raw");
-  $effect(() => {
-    if (variantKind === "raw") variant = "raw";
-    else if (variantKind === "sae") variant = "sae";
-    else variant = ("sae-" + saeRelease.trim()) as Variant;
-  });
+  let variantInput = $state("raw");
 
   // ----- validation -----
   let parseError: string | null = $state(null);
@@ -119,10 +102,21 @@
   }
 
   function effectiveVariant(): Variant {
-    if (variant === "raw" || variant === "sae") return variant;
-    // sae-<release>; if the user typed a release, honor it.
-    const r = saeRelease.trim();
-    return (r ? `sae-${r}` : "sae") as Variant;
+    const raw = variantInput.trim();
+    return isVariant(raw) ? raw : "raw";
+  }
+
+  function isVariant(raw: string): raw is Variant {
+    return (
+      raw === "raw" ||
+      raw === "pca" ||
+      raw === "sae" ||
+      raw === "role" ||
+      raw === "from" ||
+      raw.startsWith("sae-") ||
+      raw.startsWith("role-") ||
+      raw.startsWith("from-")
+    );
   }
 
   // ----- submit -----
@@ -223,26 +217,24 @@
 
     <fieldset class="field variant">
       <legend class="label">variant</legend>
-      <Radio bind:group={variantKind} value="raw" label="raw" />
-      <Radio bind:group={variantKind} value="sae" label="sae (unique)" />
-      <span class="radio sae-release-row">
-        <Radio
-          bind:group={variantKind}
-          value="sae-release"
-          label="sae-"
-        />
-        <input
-          type="text"
-          class="release-input"
-          placeholder="gemma-scope-2b-pt-res"
-          bind:value={saeRelease}
-        />
-      </span>
+      <input
+        type="text"
+        class="variant-input"
+        placeholder="raw | pca | sae-* | role-* | from-*"
+        bind:value={variantInput}
+      />
+      {#if variantInput.trim() && !isVariant(variantInput.trim())}
+        <p class="warn">unknown variant suffix</p>
+      {/if}
       <button
         type="button"
         class="apply-variant"
         onclick={applyVariantToExpression}
-        disabled={!expression.trim() || parseError !== null}
+        disabled={
+          !expression.trim() ||
+          parseError !== null ||
+          !isVariant(variantInput.trim())
+        }
         title="Rewrite the expression with this variant on every atom."
       >
         apply to all atoms
@@ -255,7 +247,7 @@
         <code>0.5 wolf~deer</code> (project onto) ·
         <code>0.5 sycophantic|honest</code> (project away) ·
         <code>!hallucinating</code> (mean-ablate) ·
-        <code>0.3 honest:sae</code> (SAE variant)
+        <code>0.3 honest:sae</code> · <code>0.3 honest:role-pirate</code>
       </p>
     </Disclosure>
 
@@ -375,15 +367,8 @@
   .variant legend {
     padding: 0 var(--space-2);
   }
-  .radio {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    color: var(--fg);
-    font-size: var(--text-sm);
-  }
-  .release-input {
-    width: 12em;
+  .variant-input {
+    width: min(24em, 100%);
     padding: var(--space-1) var(--space-3);
     font-size: var(--text-sm);
   }

@@ -114,14 +114,20 @@
   // ---------- variant dropdown ----------
   //
   // Replaces the v1 ``window.prompt``.  A small in-app menu offering
-  // ``raw`` / ``sae`` plus the current ``sae-<release>`` when one is set,
-  // so flipping the variant never leaves the saklas visual language.
+  // common tensor variants plus the current open-ended suffix when one is
+  // set, so flipping variants never leaves the saklas visual language.
 
   let variantOpen = $state(false);
   let variantRef: HTMLDivElement | null = $state(null);
 
   const variantOptions = $derived.by(() => {
-    const opts: VectorRackEntry["variant"][] = ["raw", "sae"];
+    const opts: VectorRackEntry["variant"][] = [
+      "raw",
+      "pca",
+      "sae",
+      "role",
+      "from",
+    ];
     if (!opts.includes(entry.variant)) {
       opts.push(entry.variant);
     }

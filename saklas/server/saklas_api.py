@@ -464,6 +464,22 @@ def _profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
     }
 
 
+def _extract_registry_name(canonical: str, namespace: str | None) -> str:
+    """Return the steerable key for a freshly extracted vector.
+
+    ``session.extract`` returns the concept-local canonical name with any
+    tensor variant suffix, while a non-default destination namespace lives
+    outside that name.  Reattach the namespace at the registry/API boundary so
+    immediate steering uses the same key that disk lookup will resolve later.
+    """
+    if namespace is None:
+        return canonical
+    if ":" in canonical:
+        bare, suffix = canonical.rsplit(":", 1)
+        return f"{namespace}/{bare}:{suffix}"
+    return f"{namespace}/{canonical}"
+
+
 def _probe_info(session: SaklasSession, name: str) -> dict[str, Any]:
     layers: list[int] = []
     try:
@@ -1380,8 +1396,11 @@ def register_saklas_routes(app: FastAPI) -> None:
                                 namespace=req.namespace,
                                 force_statements=req.force,
                             )
+                            registry_name = _extract_registry_name(
+                                canonical, req.namespace,
+                            )
                             if req.auto_register:
-                                session.steer(req.name, profile)
+                                session.steer(registry_name, profile)
                             # Yield once so any pending
                             # ``call_soon_threadsafe`` progress
                             # callbacks scheduled by the worker drain
@@ -1391,7 +1410,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                             # short-circuited by the SSE generator's
                             # ``done`` break.
                             await asyncio.sleep(0)
-                            queue.put_nowait(("done", canonical, profile))
+                            queue.put_nowait(("done", registry_name, profile))
                         except SaklasError as e:
                             import logging
                             logging.getLogger("saklas.api").exception(
@@ -1416,7 +1435,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                             queue.put_nowait((
                                 "error",
                                 {
-                                    "message": str(e) or "internal error",
+                                    "message": "extract failed",
                                     "code": type(e).__name__,
                                 },
                             ))
@@ -1476,11 +1495,12 @@ def register_saklas_routes(app: FastAPI) -> None:
                 namespace=req.namespace,
                 force_statements=req.force,
             )
+            registry_name = _extract_registry_name(canonical, req.namespace)
             if req.auto_register:
-                session.steer(req.name, profile)
+                session.steer(registry_name, profile)
         return {
-            "canonical": canonical,
-            "profile": _profile_to_json(canonical, profile),
+            "canonical": registry_name,
+            "profile": _profile_to_json(registry_name, profile),
             "progress": progress_msgs,
         }
 

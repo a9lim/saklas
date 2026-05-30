@@ -7,6 +7,7 @@ real model is needed.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ def _stub_encoder(
 ) -> dict[int, torch.Tensor]:
     """Synthetic per-layer activations, deterministic per node label."""
     label = text.split()[0]
-    seed = abs(hash(label)) % 100_000
+    seed = int(hashlib.sha256(label.encode("utf-8")).hexdigest()[:8], 16)
     g = torch.Generator().manual_seed(seed)
     base = torch.randn(_DIM, generator=g)
     out: dict[int, torch.Tensor] = {}
@@ -151,6 +152,28 @@ def test_fit_produces_manifold(tmp_path: Path) -> None:
     assert manifold.node_labels == _LABELS
     assert sorted(manifold.layers) == list(range(_N_LAYERS))
     assert manifold.feature_space == "raw"
+
+
+def test_fit_returns_node_roles_without_reload(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from saklas.core.manifold import load_manifold
+    from saklas.io.paths import tensor_filename
+
+    folder = _author_manifold(tmp_path)
+    meta = json.loads((folder / "manifold.json").read_text())
+    for node in meta["nodes"]:
+        node["role"] = node["label"]
+    (folder / "manifold.json").write_text(json.dumps(meta))
+
+    handle = _Handle()
+    handle.model.config = SimpleNamespace(model_type="gemma2")  # type: ignore[attr-defined]
+    manifold = ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
+
+    assert manifold.node_roles == _LABELS
+    assert manifold.nearest_node_role(_LABELS[0]) == _LABELS[0]
+
+    loaded = load_manifold(folder / tensor_filename(handle.model_id))
+    assert loaded.node_roles == _LABELS
 
 
 def test_fit_writes_tensor_and_manifest(tmp_path: Path) -> None:

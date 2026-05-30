@@ -28,7 +28,9 @@ export type Variant =
   | "sae"
   | `sae-${string}`
   | "role"
-  | `role-${string}`;
+  | `role-${string}`
+  | "from"
+  | `from-${string}`;
 
 // ----------------------------------------------------- session info --
 

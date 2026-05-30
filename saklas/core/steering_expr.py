@@ -21,7 +21,8 @@ Grammar::
                  | NAME "@" NAME                       # manifold label similarity
     op          := ">" | ">=" | "<" | "<="
     coeff       := signed_float   (optional; defaults to DEFAULT_COEFF = 0.5)
-    variant     := "raw" | "sae" | "sae-" ID | "role-" ID
+    variant     := "raw" | "pca" | "sae" | "sae-" ID
+                 | "role" | "role-" ID | "from" | "from-" ID
 
 ``!`` mean-ablates the selector (``h' = h − α(h·d̂ − μ·d̂)d̂``; bare
 ``!x`` is α=1.0); it does not compose with ``~`` / ``|`` / ``%``.  The
@@ -319,7 +320,7 @@ def _lex(text: str) -> list[_Tok]:
 class _Atom:
     namespace: Optional[str]
     concept: str  # may contain a single '.' joining two poles
-    variant: str  # 'raw' (default) | 'sae' | 'sae-<release>'
+    variant: str  # 'raw' (default) or an io.selectors tensor variant
     col: int
 
 
@@ -848,11 +849,16 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
             and sel.base.namespace is None
             and "." not in sel.base.concept
         ):
-            from saklas.io.selectors import resolve_bare_name
+            from saklas.io.selectors import (
+                AmbiguousSelectorError,
+                resolve_bare_name,
+            )
             try:
                 pole_hit, manifold_hit = resolve_bare_name(
                     sel.base.concept, namespace=namespace,
                 )
+            except AmbiguousSelectorError:
+                raise
             except Exception:
                 # Errors fall through to the historical resolve_pole
                 # path below; if the same error is genuine, it raises
