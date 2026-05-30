@@ -2166,8 +2166,10 @@ class SaklasSession:
         Gram-Schmidt (the v2.0/v2.1 behavior).  When the whitener is
         unavailable for this session (no neutral-activation cache, e.g.
         a ``probes=[]`` session that hasn't extracted yet) the call
-        gracefully falls back to Euclidean per-layer transparently —
-        ``project_profile``'s coverage check handles per-layer misses.
+        gracefully falls back to Euclidean.  ``project_profile`` decides
+        the metric **all-or-nothing** via ``covers_all`` over the
+        projected layers — LEACE on every one or Gram-Schmidt on all,
+        never a per-layer mix.
 
         Returns a snapshot dict ``{syn_key: prev_value_or_PROFILE_ABSENT}``
         of the synthetic-projection bindings this call clobbered, so

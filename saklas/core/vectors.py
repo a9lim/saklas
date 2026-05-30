@@ -1572,7 +1572,13 @@ def save_profile(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    tensors = {f"layer_{idx}": vec.contiguous().cpu() for idx, vec in profile.items()}
+    # fp32 write invariant: every saklas safetensor writer enforces fp32
+    # on disk (matches gguf_io.py's ``.to(dtype=torch.float32)``), so the
+    # stored dtype is a guarantee rather than a coincidence of the caller.
+    tensors = {
+        f"layer_{idx}": vec.to(dtype=torch.float32).contiguous().cpu()
+        for idx, vec in profile.items()
+    }
     save_file(tensors, str(path))
 
     from saklas import __version__ as _saklas_version
@@ -1714,9 +1720,15 @@ def project_profile(
     are dropped (projection onto an absent direction is undefined).
 
     Near-zero ``||onto|| < 1e-12`` layers are treated the same way: ``"|"``
-    passes base through unchanged, ``"~"`` drops the layer.  Layers absent
-    from the whitener fall back to the Euclidean projection — the whitener
-    may legitimately cover a subset of layers (e.g. SAE-only releases).
+    passes base through unchanged, ``"~"`` drops the layer.
+
+    The metric is decided **all-or-nothing** via
+    :meth:`LayerWhitener.covers_all` over the projected layer set
+    (``base ∩ onto``): LEACE only when the whitener covers *every*
+    projected layer, else plain Gram-Schmidt for *all* layers — never a
+    per-layer mix of LEACE and Euclidean.  Mixing would compare
+    incommensurable magnitudes (``‖·‖_M`` carries a ``1/√λ_L`` factor that
+    ``‖·‖_2`` doesn't, and it doesn't cancel across layers).
     Result tensors are cast back to the source dtype of ``base``.
 
     The returned dict shape matches :func:`extract_contrastive` so it
@@ -1724,6 +1736,14 @@ def project_profile(
     """
     if operator not in ("~", "|"):
         raise ValueError(f"unknown projection operator: {operator!r}")
+    # All-or-nothing metric gate over the layers that actually get
+    # projected (``base ∩ onto``): LEACE on every covered layer or
+    # Gram-Schmidt on all of them (see ``covers_all`` — incommensurable
+    # per-layer scales forbid a mix).
+    projected_layers = sorted(set(base) & set(onto))
+    # Bind the narrowed whitener once (mirrors ``extraction.py``'s
+    # ``maha_whitener`` idiom) so the metric decision is made a single time.
+    maha = whitener if (whitener is not None and whitener.covers_all(projected_layers)) else None
     out: dict[int, torch.Tensor] = {}
     for layer, base_t in base.items():
         onto_t = onto.get(layer)
@@ -1731,9 +1751,9 @@ def project_profile(
             if operator == "|":
                 out[layer] = base_t
             continue
-        # LEACE branch: whitener available + covers this layer.
-        if whitener is not None and whitener.covers(layer):
-            projected = whitener.leace_project(layer, base_t, onto_t, operator)
+        # LEACE branch: whitener covers the full projected set.
+        if maha is not None:
+            projected = maha.leace_project(layer, base_t, onto_t, operator)
             # Drop the layer for ``~`` when ``onto`` is degenerate under
             # the Mahalanobis metric — leace_project returns a zero
             # tensor in that case, mirroring the Euclidean drop rule.
@@ -1741,7 +1761,7 @@ def project_profile(
                 continue
             out[layer] = projected
             continue
-        # Euclidean fallback (no whitener, or layer not covered).
+        # Euclidean Gram-Schmidt (no whitener, or partial coverage).
         a_f = base_t.to(dtype=torch.float32)
         b_f = onto_t.to(dtype=torch.float32)
         b_dot = torch.dot(b_f, b_f).item()

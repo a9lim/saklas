@@ -427,9 +427,10 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
             "cosine ⟨u,v⟩_M = u^T Σ^{-1} v (Belrose et al. 2023), reads "
             "cached neutral activations + layer means under "
             "~/.saklas/models/<id>/ to build the per-layer whitener; "
-            "falls back to Euclidean per layer when the whitener doesn't "
-            "cover that layer.  'euclidean' = standard cosine (the "
-            "v2.0/v2.1 behavior; selected by ``--legacy``)."
+            "decided all-or-nothing — whitens every shared layer or, when "
+            "the whitener doesn't cover them all, falls back to Euclidean "
+            "for all.  'euclidean' = standard cosine (the v2.0/v2.1 "
+            "behavior; selected by ``--legacy``)."
         ),
     )
     p.add_argument(

@@ -295,16 +295,22 @@ over the layer intersection (`strict=True` errors on dropped layers).
 Cross-model probe alignment via per-layer Procrustes.
 `load_or_compute_neutral_activations(...)` is the disk-cached per-model neutrals
 at `models/<id>/neutral_activations.{safetensors,json}` — 90 prompts × layers,
-stored **bf16**, promoted to fp32 on load (Procrustes / the whitener want fp32
-SVD; bf16 input precision is fine). bf16 not fp16: fp16's 65504 ceiling overflows
-gemma-3's extreme late-layer channels to ±inf, which poisons the whitener
-(`λ=‖X‖²_F/(N·D)=inf` → `K=nan`); bf16 keeps the same 2-byte footprint with
-fp32's exponent range. Same hash check as `layer_means` decides staleness, plus
-a non-finite self-heal: a loaded cache containing inf/nan (a legacy fp16
-overflow) is treated as stale and recomputed as bf16. The whitener is also
-defended at the consumer — `LayerWhitener.from_neutral_activations` skips any
-layer whose centered activations or `K` come back non-finite, leaving it
-uncovered so the all-or-nothing `covers_all` gate degrades to Euclidean.
+stored **fp32** (the project-wide invariant — every saklas safetensor artifact is
+fp32, cast at the writer). These neutrals are the data the Mahalanobis whitener
+builds and inverts its covariance from (`K=(NλI+XXᵀ)⁻¹`), so they want full
+precision: bf16 storage would lose input precision *and* open a precision seam,
+since the compute/cache-miss path returns fresh fp32 while the cache-hit path
+would return a promoted-from-bf16 tensor, leaving the whitener non-reproducible
+across the cache boundary. fp32 closes both. fp16 was abandoned earlier for a
+different reason — its 65504 ceiling overflows gemma-3's extreme late-layer
+channels to ±inf, which poisons the whitener (`λ=‖X‖²_F/(N·D)=inf` → `K=nan`);
+fp32 has the range too. Same hash check as `layer_means` decides staleness, plus
+two self-heals: a loaded cache whose dtype isn't fp32 (a legacy bf16/fp16 store)
+is treated as stale and recomputed, and a cache containing inf/nan (a legacy
+fp16 overflow) is likewise recomputed. The whitener is also defended at the
+consumer — `LayerWhitener.from_neutral_activations` skips any layer whose centered
+activations or `K` come back non-finite, leaving it uncovered so the
+all-or-nothing `covers_all` gate degrades to Euclidean.
 
 `fit_alignment(src_acts, tgt_acts, *, min_shared_layers=10) -> {layer: M_L}`
 fits `M_L : ℝ^D_src → ℝ^D_tgt` per shared layer — orthogonal Procrustes (SVD)

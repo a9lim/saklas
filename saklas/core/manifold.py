@@ -1504,17 +1504,19 @@ def save_manifold(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Every saklas safetensor artifact is stored fp32 (cast at the writer);
+    # fits already produce fp32, so the casts are idempotent guarantees.
     tensors: dict[str, torch.Tensor] = {
-        "node_coords": manifold.node_coords.contiguous().cpu(),
+        "node_coords": manifold.node_coords.contiguous().to(torch.float32).cpu(),
     }
     for idx, sub in manifold.layers.items():
-        tensors[f"layer_{idx}.mean"] = sub.mean.contiguous().cpu()
-        tensors[f"layer_{idx}.basis"] = sub.basis.contiguous().cpu()
-        tensors[f"layer_{idx}.node_params"] = sub.node_params.contiguous().cpu()
-        tensors[f"layer_{idx}.rbf_weights"] = sub.rbf_weights.contiguous().cpu()
-        tensors[f"layer_{idx}.poly_coeffs"] = sub.poly_coeffs.contiguous().cpu()
-        tensors[f"layer_{idx}.coord_offset"] = sub.coord_offset.contiguous().cpu()
-        tensors[f"layer_{idx}.coord_scale"] = sub.coord_scale.contiguous().cpu()
+        tensors[f"layer_{idx}.mean"] = sub.mean.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.basis"] = sub.basis.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.node_params"] = sub.node_params.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.rbf_weights"] = sub.rbf_weights.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.poly_coeffs"] = sub.poly_coeffs.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.coord_offset"] = sub.coord_offset.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.coord_scale"] = sub.coord_scale.contiguous().to(torch.float32).cpu()
     save_file(tensors, str(path))
 
     from saklas import __version__ as _saklas_version

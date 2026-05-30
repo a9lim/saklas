@@ -249,15 +249,33 @@ class LayerWhitener:
             )
         means_raw = load_file(str(means_path))
         acts_raw = load_file(str(acts_path))
+        # Refuse a legacy non-fp32 neutral-activation store (the pre-fp32
+        # bf16/fp16 cache).  Unlike ``load_or_compute_neutral_activations``,
+        # which invalidates + recomputes such a cache, ``from_cache`` has no
+        # model to recompute with — and a bf16-sourced whitener would diverge
+        # from a fresh session whitener, reopening the precision seam the fp32
+        # store closes.  Fail loud with a repopulate hint (mirroring the
+        # missing-cache path above) rather than silently building a reduced-
+        # precision metric.  Checks the RAW on-disk dtype, before the
+        # ``.float()`` promotion below would mask it.
+        if any(v.dtype != torch.float32 for v in acts_raw.values()):
+            raise WhitenerError(
+                f"neutral activations cache for {model_id} is a legacy "
+                f"non-fp32 (bf16/fp16) store; saklas requires fp32 for "
+                f"reproducible whitening. Repopulate by running any "
+                f"session-level extract on this model (it rewrites the cache "
+                f"as fp32), then retry."
+            )
         # Both files key tensors by ``layer_<idx>`` (alignment.py and
-        # vectors.save_profile shape).  ``layer_means`` are stored fp32;
-        # ``neutral_activations`` are stored bf16 (a legacy cache may be
-        # fp16) to halve disk usage and promoted to fp32 here because the
-        # small N×N inverse doesn't tolerate reduced-precision condition
-        # number.  ``from_neutral_activations`` skips any layer whose values
-        # come back non-finite (a legacy fp16 cache that overflowed on an
-        # extreme-activation channel), so a corrupt cache degrades to
-        # Euclidean rather than poisoning the inverse.
+        # vectors.save_profile shape).  ``layer_means`` and
+        # ``neutral_activations`` are both stored fp32; the ``.to(fp32)``
+        # casts below stay as a defensive no-op promotion of any legacy
+        # in-memory dtype, since the small N×N inverse doesn't tolerate a
+        # reduced-precision condition number.  ``from_neutral_activations``
+        # skips any layer whose values come back non-finite (a legacy fp16
+        # cache that overflowed on an extreme-activation channel), so a
+        # corrupt cache degrades to Euclidean rather than poisoning the
+        # inverse.
         means = {
             int(k.split("_", 1)[1]): v.to(dtype=torch.float32)
             for k, v in means_raw.items()

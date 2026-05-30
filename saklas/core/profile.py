@@ -318,9 +318,16 @@ class Profile:
         better than plain cosine on activation distributions with strongly
         anisotropic covariance.  The aggregate still weights by Mahalanobis
         norms (analogous to the Euclidean-magnitude weighting), so the
-        scalar result is on the same ``[-1, 1]`` scale.  Layers absent
-        from the whitener silently fall back to plain cosine — the
-        whitener may legitimately cover a subset (e.g. SAE-only releases).
+        scalar result is on the same ``[-1, 1]`` scale.
+
+        The metric is decided **all-or-nothing** via
+        :meth:`LayerWhitener.covers_all` over the shared layer set:
+        Mahalanobis only when the whitener covers *every* shared layer,
+        else plain Euclidean cosine for *all* shared layers — never a
+        per-layer mix.  Mixing would fold cosines measured under two
+        different metrics into one aggregate, comparing incommensurable
+        magnitudes (``‖·‖_M`` carries a ``1/√λ_L`` factor that ``‖·‖_2``
+        doesn't, and it doesn't cancel across the cross-layer aggregate).
 
         Raises :class:`ProfileError` when no layers are shared.
         """
@@ -342,12 +349,19 @@ class Profile:
                 af, bf = af.cpu(), bf.cpu()
             return af, bf
 
+        # All-or-nothing metric gate over the shared set: whiten every
+        # shared layer or none (see ``covers_all`` — incommensurable
+        # per-layer scales forbid a mix).  Bind the narrowed whitener once
+        # so the metric decision (and the type narrowing) is made a single
+        # time, mirroring ``extraction.py``'s ``maha_whitener`` idiom.
+        maha = whitener if (whitener is not None and whitener.covers_all(shared)) else None
+
         if per_layer:
             out: dict[int, float] = {}
             for L in shared:
                 a, b = _aligned(self._tensors[L], other._tensors[L])
-                if whitener is not None and whitener.covers(L):
-                    out[L] = whitener.mahalanobis_cosine(L, a, b)
+                if maha is not None:
+                    out[L] = maha.mahalanobis_cosine(L, a, b)
                 else:
                     out[L] = (
                         torch.dot(a, b) / (a.norm() * b.norm())
@@ -363,12 +377,12 @@ class Profile:
         den = 0.0
         for L in shared:
             a, b = _aligned(self._tensors[L], other._tensors[L])
-            if whitener is not None and whitener.covers(L):
-                na = whitener.mahalanobis_norm(L, a)
-                nb = whitener.mahalanobis_norm(L, b)
+            if maha is not None:
+                na = maha.mahalanobis_norm(L, a)
+                nb = maha.mahalanobis_norm(L, b)
                 if na < 1e-12 or nb < 1e-12:
                     continue
-                cos = whitener.mahalanobis_dot(L, a, b) / (na * nb)
+                cos = maha.mahalanobis_dot(L, a, b) / (na * nb)
             else:
                 na, nb = a.norm().item(), b.norm().item()
                 if na < 1e-12 or nb < 1e-12:
