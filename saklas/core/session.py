@@ -46,6 +46,7 @@ from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 from saklas.core.manifold import Manifold
 from saklas.core.triggers import Trigger
+from saklas.core.vectors import last_content_index
 from saklas.core.vectors import load_profile as _load_profile
 
 _log = logging.getLogger(__name__)
@@ -2879,12 +2880,10 @@ class SaklasSession:
             if not per_token[name]:
                 per_token[name] = [0.0] * n
 
-        # Aggregate pool: last non-special generated token — copy the
-        # exact walkback score_per_token does.
-        special_ids = set(getattr(self._tokenizer, "all_special_ids", []) or [])
-        agg_idx = n - 1
-        while agg_idx > 0 and int(generated_ids[agg_idx]) in special_ids:
-            agg_idx -= 1
+        # Aggregate pool: last non-special generated token — the one
+        # canonical walkback (all_special_ids + added_tokens_encoder),
+        # shared with score_per_token and extraction.
+        agg_idx = last_content_index(generated_ids, self._tokenizer)
         if n_probes and 0 <= agg_idx < len(result):
             agg_row = result[agg_idx]
             agg_vals = {name: agg_row[i] for i, name in enumerate(probe_keys)}
@@ -3942,8 +3941,12 @@ class SaklasSession:
                         continue
                     trimmed_caps[layer_idx] = h
                 if trimmed_caps:
+                    # Pool the aggregate from the last non-special token,
+                    # matching the vector-probe aggregate and extraction —
+                    # not a mean across the generated trajectory.
+                    agg_idx = last_content_index(generated_ids, self._tokenizer)
                     manifold_aggregates = self._manifold_monitor.score_aggregate(
-                        trimmed_caps,
+                        trimmed_caps, agg_index=agg_idx,
                     )
 
         result = GenerationResult(

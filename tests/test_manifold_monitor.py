@@ -309,7 +309,7 @@ def test_score_aggregate_at_node_recovers_authoring_coord():
     probe = mon.attached_probes()["toy"]
 
     # Pick node 0 (coord = -1.0).  Captured stack has T=3 rows, all the
-    # same centroid — pooled mean stays on the centroid.
+    # same centroid — the pooled (last-non-special) row stays on it.
     target_k = 0
     captured: dict[int, torch.Tensor] = {}
     for layer_idx, _sub in m.layers.items():
@@ -329,6 +329,43 @@ def test_score_aggregate_at_node_recovers_authoring_coord():
         assert coord[0] == pytest.approx(-1.0, abs=0.1)
     # Residual is small at a node.
     assert r.residual_mean < 0.1
+
+
+def test_score_aggregate_pools_last_non_special_row_not_mean():
+    """The aggregate pools the chosen row (default last; ``agg_index``
+    overrides), NOT a mean across the trajectory.
+
+    Build a stack whose rows sit at *different* nodes so the two
+    behaviors are distinguishable: a mean would land between the nodes
+    (coord ≈ 0, label "b"), while row-selection recovers the specific
+    node at that row.  This pins the fix for the former
+    ``stack.mean(dim=0)`` pooling.
+    """
+    m = _toy_manifold(dim=8)
+    mon = ManifoldMonitor()
+    mon.add_probe("toy", m)
+    probe = mon.attached_probes()["toy"]
+
+    # T=2: row 0 = node 2 (coord +1, "c"), row 1 = node 0 (coord -1, "a").
+    # row 1 stands in for a trailing special token the session walks past.
+    captured: dict[int, torch.Tensor] = {}
+    for layer_idx, _sub in m.layers.items():
+        node2 = probe.node_values_world[layer_idx][2]
+        node0 = probe.node_values_world[layer_idx][0]
+        captured[layer_idx] = torch.stack([node2, node0])
+
+    # agg_index=0 → the non-special row → node 2 (coord +1, "c").
+    agg0 = mon.score_aggregate(captured, agg_index=0)["toy"]
+    assert agg0.coords[0] == pytest.approx(1.0, abs=0.1)
+    assert agg0.nearest[0][0] == "c"
+    # A mean would have landed at coord ≈ 0 / label "b" — guard against
+    # regressing to mean(dim=0).
+    assert agg0.nearest[0][0] != "b"
+
+    # Default (no agg_index) → final row → node 0 (coord -1, "a").
+    agg_last = mon.score_aggregate(captured)["toy"]
+    assert agg_last.coords[0] == pytest.approx(-1.0, abs=0.1)
+    assert agg_last.nearest[0][0] == "a"
 
 
 def test_score_aggregate_fraction_matches_per_token():

@@ -31,6 +31,7 @@ import torch.nn as nn
 
 from saklas.core.hooks import HiddenCapture
 from saklas.core.monitor import TraitMonitor
+from saklas.core.vectors import last_content_index, special_token_ids
 
 
 # --------------------------------------------------------------------- #
@@ -43,6 +44,56 @@ class _FakeTokenizer:
 
     def __init__(self, special_ids: list[int]) -> None:
         self.all_special_ids = list(special_ids)
+
+
+class _FakeTokenizerAdded:
+    """Tokenizer whose chat markers live in ``added_tokens_encoder`` only.
+
+    Mirrors talkie-style tokenizers that don't promote ``<|end|>`` /
+    ``<|assistant|>`` to ``all_special_ids`` — the canonical
+    ``last_content_index`` walkback must skip these too.
+    """
+
+    def __init__(
+        self, special_ids: list[int], added: dict[str, int],
+    ) -> None:
+        self.all_special_ids = list(special_ids)
+        self.added_tokens_encoder = dict(added)
+
+
+# --------------------------------------------------------------------- #
+# last_content_index — the one canonical "last non-special token" walkback
+# --------------------------------------------------------------------- #
+
+
+def test_last_content_index_skips_trailing_all_special() -> None:
+    tok = _FakeTokenizer([100, 101])
+    # ...content, then two structural markers.
+    assert last_content_index([5, 6, 7, 100, 101], tok) == 2
+
+
+def test_last_content_index_no_specials_is_final_row() -> None:
+    tok = _FakeTokenizer([])
+    assert last_content_index([5, 6, 7], tok) == 2
+
+
+def test_last_content_index_skips_added_tokens_encoder() -> None:
+    # The trailing 999 is NOT in all_special_ids, only added_tokens_encoder
+    # — the weaker all_special_ids-only walkback would wrongly land on it.
+    tok = _FakeTokenizerAdded([100], {"<|end|>": 999})
+    assert special_token_ids(tok) == {100, 999}
+    assert last_content_index([5, 6, 999], tok) == 1
+
+
+def test_last_content_index_all_special_floors_at_zero() -> None:
+    tok = _FakeTokenizer([100])
+    # Every position is special — floor at 0 rather than going negative.
+    assert last_content_index([100, 100, 100], tok) == 0
+
+
+def test_last_content_index_empty_is_zero() -> None:
+    tok = _FakeTokenizer([100])
+    assert last_content_index([], tok) == 0
 
 
 def _build_monitor(

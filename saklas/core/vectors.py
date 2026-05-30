@@ -6,6 +6,7 @@ import functools
 import json
 import logging
 import warnings
+from collections.abc import Sequence
 from importlib import resources as _resources
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -115,6 +116,47 @@ def _capture_all_hidden_states(model: torch.nn.Module, layers: torch.nn.ModuleLi
     return captured_hidden
 
 
+def special_token_ids(tokenizer: Any) -> set[int]:
+    """Token ids that are structural rather than content.
+
+    The canonical "non-content" set every last-content-token pooling site
+    shares: the tokenizer's ``all_special_ids`` *plus* everything in
+    ``added_tokens_encoder``.  The second arm matters for tokenizers that
+    don't promote chat-boundary markers to ``all_special_ids`` (talkie's
+    ``<|user|>``/``<|end|>``/``<|assistant|>`` are added tokens but not
+    "special") — without it, pooling lands on a structural turn marker
+    whose hidden state is disconnected from the content.
+    """
+    skip = set(getattr(tokenizer, "all_special_ids", []) or [])
+    added = getattr(tokenizer, "added_tokens_encoder", None) or {}
+    skip.update(int(v) for v in added.values())
+    return skip
+
+
+def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
+    """Index of the last non-special token in ``token_ids``.
+
+    Walks backward from the final position past every id in
+    :func:`special_token_ids` (``all_special_ids`` + ``added_tokens_encoder``),
+    flooring at 0 so a sequence that is entirely special tokens still
+    yields a valid index.  This is the single definition of "last content
+    token" shared by extraction (:func:`_encode_and_capture_all`), the
+    aggregate vector probe (:meth:`TraitMonitor.score_per_token`), the
+    incremental scoring path (``session._score_incremental``), and the
+    manifold aggregate (:meth:`ManifoldMonitor.score_aggregate`) — every
+    reported single-state value pools from here so the discipline can't
+    drift per-site.
+    """
+    idx = len(token_ids) - 1
+    if idx < 0:
+        return 0
+    skip = special_token_ids(tokenizer)
+    if skip:
+        while idx > 0 and int(token_ids[idx]) in skip:
+            idx -= 1
+    return idx
+
+
 def _encode_and_capture_all(
     model: torch.nn.Module,
     tokenizer: Any,
@@ -217,9 +259,7 @@ def _encode_and_capture_all(
     # structural turn marker — talkie's outlier channels then dominate
     # the captured ref_norm, baking 100×-too-large probe magnitudes
     # that produce gibberish at any nonzero alpha.
-    skip_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-    added = getattr(tokenizer, "added_tokens_encoder", None) or {}
-    skip_ids.update(int(v) for v in added.values())
+    skip_ids = special_token_ids(tokenizer)
     content_end = ids.shape[1] - 1
     if skip_ids:
         id_list = ids[0].tolist()

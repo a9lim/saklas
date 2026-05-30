@@ -395,11 +395,10 @@ class TraitMonitor:
         any_h = next(iter(captured.values()))
         self._ensure_cache(any_h.device)
 
-        # Aggregate pool: last non-special generated token.
-        special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-        agg_idx = n - 1
-        while agg_idx > 0 and int(generated_ids[agg_idx]) in special_ids:
-            agg_idx -= 1
+        # Aggregate pool: last non-special generated token — the one
+        # canonical walkback (all_special_ids + added_tokens_encoder).
+        from saklas.core.vectors import last_content_index
+        agg_idx = last_content_index(generated_ids, tokenizer)
         agg_hidden = {
             layer_idx: h[agg_idx] for layer_idx, h in captured.items()
             if h.shape[0] > agg_idx
@@ -956,13 +955,21 @@ class ManifoldMonitor:
     def score_aggregate(
         self,
         captured_per_layer: dict[int, torch.Tensor],
+        *,
+        agg_index: int | None = None,
     ) -> dict[str, ManifoldAggregate]:
         """End-of-generation manifold aggregates over pooled captures.
 
         ``captured_per_layer[L]`` is the per-layer ``[T, D]`` stack of
         per-token captures the session collected during generation.  The
-        per-layer pooled activation is the mean across tokens; the
-        aggregator computes (1) per-layer + EV-weighted subspace
+        per-layer pooled activation is the hidden state at the **last
+        non-special token** (``agg_index``, default the final row) — the
+        same single-state discipline extraction and the vector-probe
+        aggregate use, *not* a mean across the trajectory (that lives in
+        :meth:`score_single_token`).  The session passes the
+        ``last_content_index`` walkback so trailing special / structural
+        tokens never pull the reported aggregate.  From that pooled state
+        the aggregator computes (1) per-layer + EV-weighted subspace
         fraction, (2) the EV-weighted nearest-node vote (same shape as
         the per-token channel, top-N), and (3) per-layer
         ``invert_parameterization`` to recover authoring coords +
@@ -976,6 +983,9 @@ class ManifoldMonitor:
             return out
 
         # Pool per-layer once — every probe reads the same captures.
+        # Select the last-non-special row (``agg_index``, default the
+        # final token) rather than averaging the trajectory, so the
+        # reported aggregate matches extraction and the vector aggregate.
         pooled: dict[int, torch.Tensor] = {}
         for layer_idx, stack in captured_per_layer.items():
             if stack is None or stack.numel() == 0:
@@ -983,7 +993,9 @@ class ManifoldMonitor:
             if stack.ndim == 1:
                 pooled[layer_idx] = stack.to(torch.float32)
             else:
-                pooled[layer_idx] = stack.to(torch.float32).mean(dim=0)
+                T = stack.shape[0]
+                row = T - 1 if agg_index is None else max(0, min(agg_index, T - 1))
+                pooled[layer_idx] = stack.to(torch.float32)[row]
 
         for name, probe in self._probes.items():
             manifold = probe.manifold
