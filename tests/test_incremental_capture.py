@@ -480,7 +480,6 @@ def test_hidden_capture_non_incremental_appends_full_stack():
 
 def test_hidden_capture_attach_resets_incremental_state():
     """attach() must clear incremental state set by a prior gen."""
-    dim = 4
     layers = nn.ModuleList(_IdentityLayer(0.0) for _ in range(2))
     cap = HiddenCapture()
     cap.attach(layers, [0, 1])
@@ -495,7 +494,6 @@ def test_hidden_capture_attach_resets_incremental_state():
 
 
 def test_hidden_capture_clear_resets_incremental_state():
-    dim = 4
     layers = nn.ModuleList(_IdentityLayer(0.0) for _ in range(2))
     cap = HiddenCapture()
     cap.attach(layers, [0, 1])

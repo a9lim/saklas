@@ -90,8 +90,32 @@ def manifolds_dir() -> Path:
     return saklas_home() / "manifolds"
 
 
+def ensure_within(root: Path, *parts: str) -> Path:
+    """Join ``parts`` onto ``root`` and verify the result stays inside ``root``.
+
+    Path-traversal barrier for user-supplied path components — namespaces,
+    concept / manifold names, model ids, and manifest-relative filenames all
+    reach the filesystem layer from HTTP request bodies, CLI args, and
+    downloaded ``pack.json`` / ``manifold.json`` manifests. A ``..`` segment
+    or an absolute component must not be allowed to escape the ``~/.saklas/``
+    subtree.
+
+    Normalizes the joined path (collapsing ``..`` segments) and rejects a
+    result that does not stay under ``root`` — the normalize-then-prefix-check
+    idiom. Returns the normalized in-bounds path; raises :class:`ValueError`
+    otherwise. ``NAME_REGEX`` / ``_LABEL_REGEX`` already reject traversal
+    syntax upstream, but this is the defense-in-depth barrier at the boundary
+    where the string actually becomes a path.
+    """
+    root_norm = os.path.normpath(os.fspath(root))
+    candidate = os.path.normpath(os.path.join(root_norm, *parts))
+    if candidate != root_norm and not candidate.startswith(root_norm + os.sep):
+        raise ValueError(f"unsafe path component {parts!r} escapes {root_norm!r}")
+    return Path(candidate)
+
+
 def manifold_dir(namespace: str, name: str) -> Path:
-    return manifolds_dir() / namespace / name
+    return ensure_within(manifolds_dir(), namespace, name)
 
 
 def neutral_statements_path() -> Path:
@@ -104,11 +128,11 @@ def safe_model_id(model_id: str) -> str:
 
 
 def concept_dir(namespace: str, concept: str) -> Path:
-    return vectors_dir() / namespace / concept
+    return ensure_within(vectors_dir(), namespace, concept)
 
 
 def model_dir(model_id: str) -> Path:
-    return models_dir() / safe_model_id(model_id)
+    return ensure_within(models_dir(), safe_model_id(model_id))
 
 
 def safe_variant_suffix(release: str | None) -> str:

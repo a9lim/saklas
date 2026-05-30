@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from saklas.core.errors import SaklasError
+from saklas.io.paths import ensure_within
 
 _log = logging.getLogger("saklas.io.packs")
 
@@ -299,7 +300,15 @@ def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[st
     """
     bad: list[str] = []
     for rel, expected in files.items():
-        fp = folder / rel
+        # A manifest entry that resolves outside ``folder`` (a ``..`` or
+        # absolute ``rel`` in a downloaded pack.json) is treated as a failed
+        # file rather than read off-tree — the pack fails integrity and won't
+        # load. ``ensure_within`` is the path-traversal barrier.
+        try:
+            fp = ensure_within(folder, rel)
+        except ValueError:
+            bad.append(rel)
+            continue
         if not fp.exists():
             bad.append(rel)
             continue

@@ -354,6 +354,7 @@ class TestAblation:
             # row for the aggregate (same single-state discipline the
             # default per-token aggregate uses).
             hidden = r.first.hidden_states
+            assert hidden is not None  # return_hidden=True populates it
             agg, _per_token = euclid.score_stack(hidden, accumulate=False)
             return abs(agg[probe])
 
