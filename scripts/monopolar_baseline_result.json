@@ -1,0 +1,84 @@
+{
+  "report": {
+    "agentic": {
+      "n_layers": 34,
+      "cos_mean": 0.3814695648410741,
+      "cos_min": -0.7314572334289551,
+      "cos_max": 0.9484860301017761,
+      "dls_opp": 18,
+      "dls_neu": 17,
+      "evr_opp": 0.055594148114323616,
+      "evr_neu": 0.09720688685774803,
+      "intravar_opp": 2698.1585693359375,
+      "intravar_neu": 4004.994140625
+    },
+    "manipulative": {
+      "n_layers": 34,
+      "cos_mean": 0.5180563129046384,
+      "cos_min": -0.06147181987762451,
+      "cos_max": 0.9622520208358765,
+      "dls_opp": 20,
+      "dls_neu": 20,
+      "evr_opp": 0.04984603077173233,
+      "evr_neu": 0.10071321204304695,
+      "intravar_opp": 2765.7926025390625,
+      "intravar_neu": 3681.983642578125
+    }
+  },
+  "readings": {
+    "heldout-agentic-1": {
+      "agentic__opp": -0.06566520035266876,
+      "agentic__neu": 0.5818171501159668,
+      "manipulative__opp": 0.1125965416431427,
+      "manipulative__neu": 0.6747560501098633
+    },
+    "heldout-passive-1": {
+      "agentic__opp": -0.3036590814590454,
+      "agentic__neu": 0.3329581618309021,
+      "manipulative__opp": -0.17123739421367645,
+      "manipulative__neu": 0.541016161441803
+    },
+    "heldout-manip-1": {
+      "agentic__opp": -0.1582367867231369,
+      "agentic__neu": 0.4172728359699249,
+      "manipulative__opp": 0.21731655299663544,
+      "manipulative__neu": 0.6469115018844604
+    },
+    "heldout-straightfwd-1": {
+      "agentic__opp": -0.30243051052093506,
+      "agentic__neu": 0.18545927107334137,
+      "manipulative__opp": -0.24526003003120422,
+      "manipulative__neu": 0.43592479825019836
+    },
+    "concept-positives-agentic": {
+      "agentic__opp": 0.34795477986335754,
+      "agentic__neu": 0.6917118082443873,
+      "manipulative__opp": 0.08416869957000017,
+      "manipulative__neu": 0.4197046458721161
+    },
+    "synthetic-opp-agentic": {
+      "agentic__opp": -0.022500424801061552,
+      "agentic__neu": 0.6173388510942459,
+      "manipulative__opp": 0.09246206749230623,
+      "manipulative__neu": 0.48282919079065323
+    },
+    "concept-positives-manip": {
+      "agentic__opp": 0.015608260951315364,
+      "agentic__neu": 0.5078891019026438,
+      "manipulative__opp": 0.334809069832166,
+      "manipulative__neu": 0.7425093700488409
+    },
+    "synthetic-opp-manip": {
+      "agentic__opp": -0.08348157396540046,
+      "agentic__neu": 0.4012691800793012,
+      "manipulative__opp": -0.13773841488485536,
+      "manipulative__neu": 0.5800310000777245
+    },
+    "heldout-neutral": {
+      "agentic__opp": -0.05312902691463629,
+      "agentic__neu": -0.10478460391362508,
+      "manipulative__opp": -0.057479109490911166,
+      "manipulative__neu": 0.025408856904444596
+    }
+  }
+}
