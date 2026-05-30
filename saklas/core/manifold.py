@@ -72,21 +72,23 @@ class UnknownManifoldLabelError(KeyError, SaklasError):
 # of rank at most ``K-1``.
 DEFAULT_N_COMPONENTS = 64
 
-# Grid resolution for the inverse parameterization (nearest-point
-# projection onto the manifold).  Used only by the naturalness eval,
-# never by the steering hot path -- the hook steers to a fixed position.
-DEFAULT_INVERSION_RESOLUTION = 512
-
-# Hard ceiling on the grid-scan candidate count (res**n) inside
-# ``invert_parameterization``.  Without it, a high-dimensional manifold
-# explodes: the bundled 8-D ``personas`` at the old per-axis res of 8
-# meant 8**8 = 16.7M candidates and a ~50 GB broadcast inside
-# ``eval_rbf`` -- and ``ManifoldMonitor.score_aggregate`` calls the
-# inverter once per layer on *every* generation, spiking unified memory
-# to ~2x the model.  Capping the candidate budget keeps each call bounded
-# (a few hundred MB) regardless of intrinsic dimension; the scan is
-# already approximate for n >= 3 so this only coarsens an coarse landing.
-_INVERSION_GRID_BUDGET = 100_000
+# Levenberg-Marquardt settings for the inverse parameterization
+# (nearest-point projection of an activation onto the fitted manifold).
+# Used only by the naturalness eval and the read-side ``ManifoldMonitor``
+# aggregate -- never the steering hot path, which steers to a fixed
+# position.  The solve is warm-started from the nearest fit node(s) and
+# Marquardt-damped, so a fixed dozen iterations converges in
+# authoring-coord space *independent of intrinsic dimension*.  This
+# replaces a grid scan that was O(resolution**n): even the n=2 path ran
+# 512**2 = 262k RBF evals per layer, and the budget-capped high-n path
+# degraded to a 4-point-per-axis landing on the bundled 8-D ``personas``.
+DEFAULT_INVERSION_MAX_ITER = 12
+DEFAULT_INVERSION_RESTARTS = 3
+DEFAULT_INVERSION_DAMPING = 1e-3
+# Absolute floor added to the LM normal-equation diagonal so a locally
+# rank-deficient Jacobian (a fold/pinch, or a flat authoring direction)
+# still yields a solvable, well-conditioned system.
+_INVERSION_DIAG_FLOOR = 1e-9
 
 
 # ================================================================ domains ===
@@ -103,11 +105,10 @@ class ManifoldDomain(ABC):
     """Embedding of an n-D intrinsic manifold into R^m, plus a metric.
 
     Subclasses define :meth:`embed` (authoring coords -> embedded
-    coords), :meth:`embed_jacobian`, :meth:`clamp_position` and
-    :meth:`sample_positions`.  :meth:`distance` defaults to the chordal
-    (Euclidean-in-embedding) metric and is rarely overridden -- a
-    periodic axis embedded as a circle already wraps correctly under the
-    chordal metric.
+    coords), :meth:`embed_jacobian` and :meth:`clamp_position`.
+    :meth:`distance` defaults to the chordal (Euclidean-in-embedding)
+    metric and is rarely overridden -- a periodic axis embedded as a
+    circle already wraps correctly under the chordal metric.
     """
 
     @property
@@ -126,15 +127,15 @@ class ManifoldDomain(ABC):
 
     @abstractmethod
     def embed_jacobian(self, coords: torch.Tensor) -> torch.Tensor:
-        """Jacobian ``d embed / d coords`` at a single point: ``(n,) -> (m, n)``."""
+        """Jacobian ``d embed / d coords``: ``(.., n) -> (.., m, n)``.
+
+        Batch-generic over leading dims; the bare ``(n,)`` point returns
+        ``(m, n)`` for :meth:`Manifold.tangent`.
+        """
 
     @abstractmethod
     def clamp_position(self, coords: torch.Tensor) -> torch.Tensor:
         """Clamp open axes to range, wrap periodic axes; ``(.., n) -> (.., n)``."""
-
-    @abstractmethod
-    def sample_positions(self, resolution: int) -> torch.Tensor:
-        """A grid of authoring coords covering the domain: ``(G, n)``."""
 
     @abstractmethod
     def to_spec(self) -> dict[str, Any]:
@@ -202,17 +203,18 @@ class BoxDomain(ManifoldDomain):
     def embed_jacobian(self, coords: torch.Tensor) -> torch.Tensor:
         n = self.intrinsic_dim
         m = self.embed_dim
-        J = torch.zeros(m, n, dtype=coords.dtype, device=coords.device)
+        batch = coords.shape[:-1]
+        J = torch.zeros(*batch, m, n, dtype=coords.dtype, device=coords.device)
         out = 0
         for i, ax in enumerate(self._axes):
             if ax.periodic:
                 w = 2.0 * math.pi / ax.period
-                ci = coords[i]
-                J[out, i] = -w * torch.sin(w * ci)
-                J[out + 1, i] = w * torch.cos(w * ci)
+                ci = coords[..., i]
+                J[..., out, i] = -w * torch.sin(w * ci)
+                J[..., out + 1, i] = w * torch.cos(w * ci)
                 out += 2
             else:
-                J[out, i] = 1.0
+                J[..., out, i] = 1.0
                 out += 1
         return J
 
@@ -224,21 +226,6 @@ class BoxDomain(ManifoldDomain):
             else:
                 out[..., i] = coords[..., i].clamp(min=ax.lo, max=ax.hi)
         return out
-
-    def sample_positions(self, resolution: int) -> torch.Tensor:
-        axis_grids: list[torch.Tensor] = []
-        for ax in self._axes:
-            if ax.periodic:
-                # Exclude the wrap endpoint -- it duplicates 0.
-                axis_grids.append(
-                    torch.linspace(0.0, ax.period, resolution + 1)[:-1]
-                )
-            else:
-                axis_grids.append(
-                    torch.linspace(ax.lo, ax.hi, resolution)
-                )
-        mesh = torch.meshgrid(*axis_grids, indexing="ij")
-        return torch.stack([g.reshape(-1) for g in mesh], dim=-1)
 
     def to_spec(self) -> dict[str, Any]:
         return {
@@ -296,10 +283,13 @@ class SphereDomain(ManifoldDomain):
 
     def embed_jacobian(self, coords: torch.Tensor) -> torch.Tensor:
         n = self._dim
-        sins = torch.sin(coords)
-        coss = torch.cos(coords)
-        J = torch.zeros(n + 1, n, dtype=coords.dtype, device=coords.device)
-        one = torch.ones((), dtype=coords.dtype, device=coords.device)
+        batch = coords.shape[:-1]
+        sins = torch.sin(coords)  # (.., n)
+        coss = torch.cos(coords)  # (.., n)
+        J = torch.zeros(
+            *batch, n + 1, n, dtype=coords.dtype, device=coords.device,
+        )
+        one = torch.ones(batch, dtype=coords.dtype, device=coords.device)
         for k in range(n + 1):
             for l in range(n):
                 if k < n:
@@ -308,18 +298,22 @@ class SphereDomain(ManifoldDomain):
                     if l == k:
                         prefix = one
                         for i in range(k):
-                            prefix = prefix * sins[i]
-                        J[k, l] = -prefix * sins[k]
+                            prefix = prefix * sins[..., i]
+                        J[..., k, l] = -prefix * sins[..., k]
                     else:
                         term = one
                         for i in range(k):
-                            term = term * (coss[l] if i == l else sins[i])
-                        J[k, l] = term * coss[k]
+                            term = term * (
+                                coss[..., l] if i == l else sins[..., i]
+                            )
+                        J[..., k, l] = term * coss[..., k]
                 else:
                     term = one
                     for i in range(n):
-                        term = term * (coss[l] if i == l else sins[i])
-                    J[k, l] = term
+                        term = term * (
+                            coss[..., l] if i == l else sins[..., i]
+                        )
+                    J[..., k, l] = term
         return J
 
     def clamp_position(self, coords: torch.Tensor) -> torch.Tensor:
@@ -330,18 +324,6 @@ class SphereDomain(ManifoldDomain):
             coords[..., self._dim - 1], 2.0 * math.pi
         )
         return out
-
-    def sample_positions(self, resolution: int) -> torch.Tensor:
-        axis_grids: list[torch.Tensor] = []
-        for i in range(self._dim):
-            if i < self._dim - 1:
-                axis_grids.append(torch.linspace(0.0, math.pi, resolution))
-            else:
-                axis_grids.append(
-                    torch.linspace(0.0, 2.0 * math.pi, resolution + 1)[:-1]
-                )
-        mesh = torch.meshgrid(*axis_grids, indexing="ij")
-        return torch.stack([g.reshape(-1) for g in mesh], dim=-1)
 
     def to_spec(self) -> dict[str, Any]:
         return {"type": "sphere", "dim": self._dim}
@@ -381,20 +363,16 @@ class CustomDomain(ManifoldDomain):
         return coords
 
     def embed_jacobian(self, coords: torch.Tensor) -> torch.Tensor:
-        return torch.eye(
+        eye = torch.eye(
             self._embed_dim, dtype=coords.dtype, device=coords.device,
         )
+        batch = coords.shape[:-1]
+        if batch:
+            eye = eye.expand(*batch, self._embed_dim, self._embed_dim)
+        return eye
 
     def clamp_position(self, coords: torch.Tensor) -> torch.Tensor:
         return coords
-
-    def sample_positions(self, resolution: int) -> torch.Tensor:
-        bounds = self._bounds or tuple((0.0, 1.0) for _ in range(self._embed_dim))
-        axis_grids = [
-            torch.linspace(lo, hi, resolution) for lo, hi in bounds
-        ]
-        mesh = torch.meshgrid(*axis_grids, indexing="ij")
-        return torch.stack([g.reshape(-1) for g in mesh], dim=-1)
 
     def to_spec(self) -> dict[str, Any]:
         spec: dict[str, Any] = {"type": "custom", "embed_dim": self._embed_dim}
@@ -524,17 +502,21 @@ def eval_rbf_jacobian(
     poly_coeffs: torch.Tensor,
     query: torch.Tensor,
 ) -> torch.Tensor:
-    """Analytic Jacobian ``d s / d query`` at a single point.
+    """Analytic Jacobian ``d s / d query``.
 
-    ``query`` is ``(m,)``; returns ``(R, m)``.  The kernel derivative is
+    ``query`` is ``(.., m)`` (a single ``(m,)`` point or any batch of
+    them); returns ``(.., R, m)``.  The kernel derivative is
     ``d/dx[r**3] = 3 r (x - p_j)``; the polynomial contributes its linear
-    coefficients.  No autograd.
+    coefficients.  No autograd.  Batch-generic so the inverse
+    parameterization can Jacobian a whole ``(N, S)`` fan of LM iterates in
+    one call; the bare ``(m,)`` path still returns ``(R, m)`` for
+    :meth:`LayerSubspace.jacobian_at`.
     """
-    diff = query - node_params  # (K, m)
-    r = torch.linalg.vector_norm(diff, dim=-1)  # (K,)
-    grad_phi = 3.0 * r.unsqueeze(-1) * diff  # (K, m)
-    j_rbf = rbf_weights.T @ grad_phi  # (R, m)
-    j_poly = poly_coeffs[1:].T  # (R, m)
+    diff = query.unsqueeze(-2) - node_params  # (.., K, m)
+    r = torch.linalg.vector_norm(diff, dim=-1)  # (.., K)
+    grad_phi = 3.0 * r.unsqueeze(-1) * diff  # (.., K, m)
+    j_rbf = torch.einsum("kr,...km->...rm", rbf_weights, grad_phi)  # (.., R, m)
+    j_poly = poly_coeffs[1:].T  # (R, m) -- broadcasts over leading dims
     return j_rbf + j_poly
 
 
@@ -1622,56 +1604,96 @@ def invert_parameterization(
     subspace: LayerSubspace,
     domain: ManifoldDomain,
     query: torch.Tensor,
+    node_coords: torch.Tensor,
     *,
-    resolution: int = DEFAULT_INVERSION_RESOLUTION,
+    max_iter: int = DEFAULT_INVERSION_MAX_ITER,
+    n_restarts: int = DEFAULT_INVERSION_RESTARTS,
+    damping: float = DEFAULT_INVERSION_DAMPING,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Nearest-point projection of ``query`` onto the fitted manifold.
 
     Returns ``(positions, dist)``: ``positions`` ``(.., n)`` are the
     authoring coordinates whose interpolant value minimizes the Euclidean
     distance to each query in reduced-coordinate space, ``dist`` ``(..,)``
-    is that distance.  ``query`` is ``(.., R)``.
+    is that distance.  ``query`` is ``(.., R)``; ``node_coords`` ``(K, n)``
+    are the manifold's authoring node coordinates (the warm-start seeds).
 
-    A dense grid scan over the domain.  The grid is ``resolution`` per
-    axis for ``n <= 2``, coarsened for higher ``n`` (the grid cost is
-    ``resolution**n``) -- the result is then *approximate* for ``n >= 3``.
-    This is the paper's ``s^-1`` map; it is used only by the naturalness
-    eval, never by the steering hot path, so a coarse landing only adds
-    noise to the metric.
+    This is the paper's ``s^-1`` map.  It minimizes ``||s(p) - q||`` over
+    authoring coords ``p`` by damped Gauss-Newton (Levenberg-Marquardt):
+    seed each query at its nearest fit node(s) in reduced space, then take
+    a fixed number of LM steps using the analytic RBF Jacobian chained
+    through the domain's embedding Jacobian, projecting back onto the
+    domain (``clamp_position`` -- open-clamp, periodic-wrap, sphere-retract)
+    after each step.  Cost is independent of intrinsic dimension, unlike
+    the former ``resolution**n`` grid scan, and the landing is continuous
+    rather than quantized to a grid.  ``n_restarts`` warm starts from the
+    top nearest nodes guard against a fold/periodic local minimum; the best
+    final residual per query wins.  Used only by the naturalness eval and
+    ``ManifoldMonitor.score_aggregate`` -- never the steering hot path.
     """
     n = domain.intrinsic_dim
-    if n <= 2:
-        res = resolution
-    else:
-        # Cap total candidates (res**n) at the grid budget so the scan
-        # never allocates a giant candidate set / RBF kernel. floor of the
-        # n-th root keeps res**n <= budget; min() keeps the per-axis grid
-        # no finer than requested.
-        res = max(2, min(resolution, int(_INVERSION_GRID_BUDGET ** (1.0 / n))))
-        log.info(
-            "invert_parameterization: n=%d domain, grid capped to %d per "
-            "axis (%d candidates) — landing is approximate",
-            n, res, res ** n,
+    R = query.shape[-1]
+    lead = query.shape[:-1]
+    device = query.device
+    dtype = query.dtype if query.dtype.is_floating_point else torch.float32
+    flat = query.reshape(-1, R).to(dtype)  # (N, R)
+    N = flat.shape[0]
+
+    # Subspace pieces on the query's device/dtype -- the caller may hand
+    # us a subspace still resident on its load device (the read-side
+    # aggregate moves only ``mean``/``basis``).
+    np_ = subspace.node_params.to(device=device, dtype=dtype)  # (K, m)
+    rw = subspace.rbf_weights.to(device=device, dtype=dtype)
+    pc = subspace.poly_coeffs.to(device=device, dtype=dtype)
+    offset = subspace.coord_offset.to(device=device, dtype=dtype)  # (m,)
+    scale = subspace.coord_scale.to(device=device, dtype=dtype)  # (m,)
+
+    node_coords = node_coords.to(device=device, dtype=dtype)  # (K, n)
+    K = node_coords.shape[0]
+    restarts = max(1, min(int(n_restarts), K))
+
+    def _eval(p: torch.Tensor) -> torch.Tensor:
+        # Inline normalize (avoids ``subspace._normalize`` reaching for the
+        # subspace's own offset/scale on a possibly-foreign device).
+        return eval_rbf(np_, rw, pc, (domain.embed(p) - offset) / scale)
+
+    # Reduced values at the fit nodes -- the RBF is exact at ``node_params``
+    # so this recovers the per-node centroids in reduced coords without a
+    # stored field.  Used to pick each query's nearest node(s) as seeds.
+    node_vals = eval_rbf(np_, rw, pc, np_)  # (K, R)
+    seed_idx = torch.cdist(flat, node_vals).topk(
+        restarts, dim=-1, largest=False,
+    ).indices  # (N, S)
+    p = domain.clamp_position(node_coords[seed_idx])  # (N, S, n)
+    q = flat.unsqueeze(1)  # (N, 1, R) -- broadcasts over the S restarts
+
+    for _ in range(int(max_iter)):
+        emb = (domain.embed(p) - offset) / scale  # (N, S, m)
+        resid = eval_rbf(np_, rw, pc, emb) - q  # (N, S, R)
+        j_auth = (
+            eval_rbf_jacobian(np_, rw, pc, emb) / scale  # (N, S, R, m)
+        ) @ domain.embed_jacobian(p)  # @ (N, S, m, n) -> (N, S, R, n)
+        jt = j_auth.transpose(-1, -2)  # (N, S, n, R)
+        jtj = jt @ j_auth  # (N, S, n, n)
+        jtr = jt @ resid.unsqueeze(-1)  # (N, S, n, 1)
+        # Marquardt-scaled damping (relative to each diagonal) plus a small
+        # absolute floor for rank-deficient directions.
+        diag = torch.diagonal(jtj, dim1=-2, dim2=-1)  # (N, S, n)
+        reg = torch.diag_embed(
+            damping * diag.clamp(min=_INVERSION_DIAG_FLOOR)
+            + _INVERSION_DIAG_FLOOR
         )
+        step = torch.linalg.solve(jtj + reg, jtr).squeeze(-1)  # (N, S, n)
+        p = domain.clamp_position(p - step)
 
-    cand = domain.sample_positions(res).to(
-        device=query.device, dtype=query.dtype,
-    )  # (G, n)
-    embedded = domain.embed(cand)  # (G, m)
-    normalized = subspace._normalize(embedded)
-    vals = eval_rbf(
-        subspace.node_params, subspace.rbf_weights, subspace.poly_coeffs,
-        normalized,
-    )  # (G, R)
-
-    flat = query.reshape(-1, query.shape[-1])  # (N, R)
-    d = torch.cdist(flat, vals)  # (N, G)
-    best = d.argmin(dim=-1)  # (N,)
-    pos = cand[best]  # (N, n)
-    dist = d.gather(1, best.unsqueeze(1)).squeeze(1)  # (N,)
+    # Best restart per query by final reduced-space residual norm.
+    final_res = torch.linalg.vector_norm(_eval(p) - q, dim=-1)  # (N, S)
+    best = final_res.argmin(dim=-1)  # (N,)
+    pos = p.gather(1, best[:, None, None].expand(N, 1, n)).squeeze(1)  # (N, n)
+    dist = final_res.gather(1, best[:, None]).squeeze(1)  # (N,)
     return (
-        pos.reshape(*query.shape[:-1], n),
-        dist.reshape(query.shape[:-1]),
+        pos.reshape(*lead, n),
+        dist.reshape(lead),
     )
 
 
@@ -1730,23 +1752,25 @@ def trajectory_naturalness(
     traj_dists: torch.Tensor,
     behavior: LayerSubspace,
     domain: ManifoldDomain,
+    node_coords: torch.Tensor,
 ) -> torch.Tensor:
     """Per-step Bhattacharyya distance from a trajectory to a behavior manifold.
 
     ``traj_dists`` is ``(T, V)`` -- the sequence of next-token
     distributions a generation produced.  ``behavior`` is a behavior
     manifold from :func:`fit_behavior_manifold`, ``domain`` its
-    :class:`ManifoldDomain`.  For each step the nearest point on the
-    behavior manifold is found (in Hellinger space) and the Bhattacharyya
-    distance to it is returned -- low means the step sits on the natural
-    behavior manifold, high flags an off-manifold "teleportation"
-    artifact.
+    :class:`ManifoldDomain`, and ``node_coords`` ``(K, n)`` the manifold's
+    authoring node coordinates (warm-start seeds for the inverse map).
+    For each step the nearest point on the behavior manifold is found (in
+    Hellinger space) and the Bhattacharyya distance to it is returned --
+    low means the step sits on the natural behavior manifold, high flags
+    an off-manifold "teleportation" artifact.
 
     Returns a ``(T,)`` tensor of per-step distances.
     """
     h = to_hellinger(traj_dists)  # (T, V)
     coords = (h - behavior.mean) @ behavior.basis.T  # (T, R)
-    pos, _ = invert_parameterization(behavior, domain, coords)
+    pos, _ = invert_parameterization(behavior, domain, coords, node_coords)
     embedded = domain.embed(pos)  # (T, m)
     curve_coords = eval_rbf(
         behavior.node_params, behavior.rbf_weights, behavior.poly_coeffs,
@@ -1825,7 +1849,7 @@ def _next_token_distribution(
 
 __all__ = [
     "DEFAULT_N_COMPONENTS",
-    "DEFAULT_INVERSION_RESOLUTION",
+    "DEFAULT_INVERSION_MAX_ITER",
     "ManifoldDomain",
     "BoxDomain",
     "SphereDomain",

@@ -1050,7 +1050,7 @@ class ManifoldMonitor:
 
                 # Inverse projection — coords + residual per layer.
                 pos, res = invert_parameterization(
-                    sub, manifold.domain, h_reduced,
+                    sub, manifold.domain, h_reduced, manifold.node_coords,
                 )
                 pos_t = pos.reshape(-1)
                 res_val = float(res.reshape(-1)[0].item())

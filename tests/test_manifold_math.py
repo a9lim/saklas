@@ -358,7 +358,7 @@ def test_invert_parameterization_recovers_known_position():
         sub.node_params, sub.rbf_weights, sub.poly_coeffs,
         sub._normalize(embedded),
     )
-    pos, dist = invert_parameterization(sub, domain, query.unsqueeze(0))
+    pos, dist = invert_parameterization(sub, domain, query.unsqueeze(0), coords)
     assert torch.allclose(pos[0], target_pos, atol=5e-2)
     assert dist.item() < 1e-2
 

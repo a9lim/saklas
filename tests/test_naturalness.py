@@ -85,22 +85,24 @@ def test_fit_behavior_manifold_interpolates_nodes():
 
 def test_on_manifold_trajectory_scores_low():
     dists = _curve_dists(8, 32)
-    domain, _coords, params = _loop_domain(8)
+    domain, coords, params = _loop_domain(8)
     behavior = fit_behavior_manifold(dists, params)
     # A trajectory made of the node centroids sits exactly on the curve.
-    on_manifold = trajectory_naturalness(dists, behavior, domain)
+    on_manifold = trajectory_naturalness(dists, behavior, domain, coords)
     assert torch.all(on_manifold < 1e-2)
 
 
 def test_off_manifold_trajectory_scores_higher():
     torch.manual_seed(0)
     dists = _curve_dists(8, 32)
-    domain, _coords, params = _loop_domain(8)
+    domain, coords, params = _loop_domain(8)
     behavior = fit_behavior_manifold(dists, params)
-    on_manifold = trajectory_naturalness(dists, behavior, domain).mean()
+    on_manifold = trajectory_naturalness(dists, behavior, domain, coords).mean()
     # Random distributions are off the learned behavior manifold.
     random_traj = torch.softmax(torch.randn(8, 32), dim=-1)
-    off_manifold = trajectory_naturalness(random_traj, behavior, domain).mean()
+    off_manifold = trajectory_naturalness(
+        random_traj, behavior, domain, coords,
+    ).mean()
     assert off_manifold > on_manifold
     assert off_manifold > 1e-2
 
@@ -161,11 +163,11 @@ def test_naturalness_end_to_end_mock():
         compute_node_behavior_centroid(model, tok, torch.device("cpu"), g)
         for g in groups
     ])
-    domain, _coords, params = _loop_domain(len(groups))
+    domain, coords, params = _loop_domain(len(groups))
     behavior = fit_behavior_manifold(centroids, params)
     traj = compute_trajectory_distributions(
         model, tok, torch.device("cpu"), "some generated text here",
     )
-    scores = trajectory_naturalness(traj, behavior, domain)
+    scores = trajectory_naturalness(traj, behavior, domain, coords)
     assert scores.shape[0] == traj.shape[0]
     assert torch.all(scores >= 0)

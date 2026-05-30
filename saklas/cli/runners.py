@@ -2139,9 +2139,8 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
     mf = ManifoldFolder.load(mfolder)
     node_groups = mf.node_groups()
     domain = domain_from_spec(mf.domain)
-    node_params = domain.embed(
-        torch.tensor(mf.node_coords, dtype=torch.float32)
-    )
+    node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
+    node_params = domain.embed(node_coords)
 
     _print_startup(args)
     session = _make_session(args)
@@ -2168,7 +2167,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
         traj = compute_trajectory_distributions(
             session.model, session.tokenizer, session.device, text,
         )
-        per_step = trajectory_naturalness(traj, behavior, domain)
+        per_step = trajectory_naturalness(traj, behavior, domain, node_coords)
         return text, float(per_step.mean()), float(per_step.max())
 
     rows: list[dict[str, Any]] = []
