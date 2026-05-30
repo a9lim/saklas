@@ -1249,9 +1249,15 @@ def extract_difference_of_means(
     covariance.
 
     The ``whitener`` parameter is a :class:`saklas.core.mahalanobis.LayerWhitener`
-    (or ``None`` for the Euclidean fallback).  Layers absent from the
-    whitener fall back to Euclidean per-layer — the whitener may
-    legitimately cover a subset of layers in edge cases.
+    (or ``None`` for the Euclidean fallback).  The metric choice is
+    **all-or-nothing**: Mahalanobis scoring is used only when the whitener
+    covers *every* scored layer (``LayerWhitener.covers_all``); on partial
+    coverage (or no whitener) every layer falls back to Euclidean.  Mixing
+    the two across layers would compare incommensurable scales — ``‖·‖_M``
+    carries a per-layer ``1/√λ_L`` factor that ``‖·‖_2`` lacks, and that
+    factor doesn't cancel from the cross-layer-normalized share.  In
+    practice a session whitener covers all layers, so this is full
+    Mahalanobis; the gate only bites on a degenerate/partial cache.
 
     **DLS replaces edge-drop in v2.1.**  The ``drop_edges`` parameter
     is gone; layer selection is data-driven via :func:`compute_dls_mask`.
@@ -1275,6 +1281,15 @@ def extract_difference_of_means(
         )
         assert sae_layer_set is not None
         sae_layers = sorted(sae_layer_set)
+        # All-or-nothing metric gate (see ``LayerWhitener.covers_all``): the
+        # whitened and Euclidean per-layer scores are on different scales,
+        # so we whiten every scored layer or none.  Partial coverage (or no
+        # whitener) → Euclidean across the board.  Bind a coverage-gated
+        # whitener so the metric decision narrows the type for the branch.
+        maha_w = (
+            whitener if whitener is not None
+            and whitener.covers_all(sae_layers) else None
+        )
         directions: dict[int, torch.Tensor] = {}
         score_tensors: list[torch.Tensor] = []
         diagnostics_per_layer: dict[int, dict[str, float]] = {}
@@ -1296,11 +1311,11 @@ def extract_difference_of_means(
 
             # Score: Mahalanobis norm of the decoded model-space direction
             # (same shape as the raw branch — see ``score`` docstring).
-            # Whitener-absent or layer-uncovered → Euclidean fallback so
-            # SAE extraction without a populated neutral_activations cache
-            # still works.
-            if whitener is not None and whitener.covers(idx):
-                m_norm = whitener.mahalanobis_norm(idx, v_model)
+            # Whitener-absent or partial coverage → Euclidean for every
+            # layer (``maha_w`` is None unless coverage is complete) so SAE
+            # extraction without a populated neutral_activations cache works.
+            if maha_w is not None:
+                m_norm = maha_w.mahalanobis_norm(idx, v_model)
                 score_value = m_norm / max(ref_norm, 1e-8)
                 score_tensors.append(torch.tensor(score_value, dtype=torch.float32))
             else:
@@ -1366,9 +1381,15 @@ def extract_difference_of_means(
         role=role, model_type=model_type,
     )
 
-    # Per-layer DiM in residual-stream space.
+    # Per-layer DiM in residual-stream space.  All-or-nothing metric gate
+    # over the full scored-layer set (``range(n_layers)``): whiten every
+    # layer or none (see ``LayerWhitener.covers_all``).
     raw = {}
     diagnostics_per_layer = {}
+    maha_w = (
+        whitener if whitener is not None
+        and whitener.covers_all(range(n_layers)) else None
+    )
 
     if n_pairs < 2:
         # Single pair degenerates: mean over one element is just the
@@ -1381,10 +1402,10 @@ def extract_difference_of_means(
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
             activation_norm = norm_sums_cpu[idx]
-            if whitener is not None and whitener.covers(idx):
+            if maha_w is not None:
                 # Mahalanobis on the single diff vector; ``activation_norm``
                 # is pos+neg sum, mirrors the Euclidean form's denominator.
-                m_norm = whitener.mahalanobis_norm(idx, diff_vec)
+                m_norm = maha_w.mahalanobis_norm(idx, diff_vec)
                 score = m_norm / max(activation_norm, 1e-8)
             else:
                 score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
@@ -1403,20 +1424,18 @@ def extract_difference_of_means(
         means = torch.stack([mean_diffs[idx] for idx in range(n_layers)])
         means_norms = means.norm(dim=-1)
 
-        if whitener is not None:
+        if maha_w is not None:
             # Mahalanobis branch: per-layer matvec via Woodbury through
             # ``LayerWhitener.mahalanobis_norm``.  Loop instead of batch
             # because each layer has its own ``Σ_L^{-1}`` and ``X_L``;
-            # extraction is one-shot, not a hot path.  Layers absent from
-            # the whitener fall back to Euclidean for that layer.
+            # extraction is one-shot, not a hot path.  ``maha_w`` is only
+            # set when the whitener covers every layer (all-or-nothing), so
+            # no per-layer coverage check is needed here.
             scores_cpu = []
             for idx in range(n_layers):
                 ref_L = max(ref_norms[idx], 1e-8)
-                if whitener.covers(idx):
-                    m_norm = whitener.mahalanobis_norm(idx, means[idx])
-                    scores_cpu.append(m_norm / ref_L)
-                else:
-                    scores_cpu.append(float(means_norms[idx].item()) / ref_L)
+                m_norm = maha_w.mahalanobis_norm(idx, means[idx])
+                scores_cpu.append(m_norm / ref_L)
         else:
             # Euclidean fallback: original batched path, single GPU→CPU
             # transfer.  Score = ||mean_diff||_2 / ref_norm — lands in

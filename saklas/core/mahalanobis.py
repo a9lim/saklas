@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import torch
 
@@ -257,6 +257,20 @@ class LayerWhitener:
     def covers(self, layer: int) -> bool:
         return layer in self._X
 
+    def covers_all(self, layers: "Iterable[int]") -> bool:
+        """True iff every layer in ``layers`` is covered.
+
+        Backs the *all-or-nothing* metric gate shared by vector extraction
+        and manifold fitting: the per-layer Mahalanobis and Euclidean
+        scores live on different scales (``‖·‖_M`` carries a ``1/√λ_L``
+        factor that ``‖·‖_2`` doesn't), so mixing metrics across the layers
+        of one cross-layer-normalized share weight would compare
+        incommensurable magnitudes.  Callers fall back to all-Euclidean
+        when this returns ``False`` rather than whitening only the covered
+        subset.  Empty ``layers`` → ``True`` (vacuous).
+        """
+        return all(layer in self._X for layer in layers)
+
     def ridge(self, layer: int) -> float:
         """Per-layer regularization parameter ``λ_L``."""
         if layer not in self._lambda:
@@ -307,6 +321,53 @@ class LayerWhitener:
         KXv = K @ Xv  # (N,)
         out = (v32 - X.transpose(0, 1) @ KXv) / lam
         return out.to(dtype=v_in_dtype)
+
+    def subspace_gram(self, layer: int, basis: torch.Tensor) -> torch.Tensor:
+        """Return the reduced-space inverse-covariance Gram ``B Σ_L^{-1} Bᵀ``.
+
+        ``basis`` is ``(R, D)`` with rows spanning a subspace of the
+        layer's activation space — typically a manifold's per-layer PCA
+        frame.  The returned ``(R, R)`` matrix is the inverse covariance
+        *restricted* to that subspace's reduced coordinates: for a reduced
+        vector ``c ∈ ℝ^R`` whose model-space realization is ``Bᵀ c``,
+
+            cᵀ (B Σ^{-1} Bᵀ) c = ‖Bᵀ c‖²_M = (Bᵀ c)ᵀ Σ^{-1} (Bᵀ c).
+
+        Manifold steering uses this to whiten its per-layer share weight —
+        the subspace-restricted analogue of the vector path's ``‖d‖_M``
+        bake score.  When ``Σ = I`` and ``B`` is orthonormal it reduces to
+        ``B Bᵀ = I_R``, so the whitened share collapses to the Euclidean
+        spread (``‖coords‖_F``) the unwhitened path computes — the natural
+        sanity check.
+
+        Computed via the same Woodbury identity as :meth:`apply_inv`,
+        vectorized over the ``R`` basis rows (one ``X Bᵀ`` matvec, one
+        ``K``-apply, one ``Xᵀ`` matvec) so the cost is ``O(N D R)`` with no
+        ``D × D`` inverse::
+
+            Σ_reg^{-1} Bᵀ = (1/λ)[Bᵀ − Xᵀ K (X Bᵀ)]
+
+        Promoted to fp32 on CPU; this is fit-time setup, not a hot path.
+        """
+        if layer not in self._X:
+            raise WhitenerError(f"whitener does not cover layer {layer}")
+        B = basis.to(dtype=torch.float32, device="cpu")
+        if B.dim() != 2 or B.shape[1] != self._dim[layer]:
+            raise WhitenerError(
+                f"layer {layer}: basis shape {tuple(B.shape)} does not match "
+                f"whitener dim {self._dim[layer]}"
+            )
+        X = self._X[layer]      # (N, D)
+        K = self._K[layer]      # (N, N)
+        lam = self._lambda[layer]
+        Bt = B.transpose(0, 1)          # (D, R)
+        XBt = X @ Bt                    # (N, R)
+        KXBt = K @ XBt                  # (N, R)
+        inv_Bt = (Bt - X.transpose(0, 1) @ KXBt) / lam  # (D, R) = Σ^{-1} Bᵀ
+        gram = B @ inv_Bt               # (R, R)
+        # The true Gram is symmetric PSD; symmetrize away finite-precision
+        # asymmetry so downstream quadratic forms can't pick up drift.
+        return 0.5 * (gram + gram.transpose(0, 1))
 
     def mahalanobis_dot(
         self, layer: int, u: torch.Tensor, v: torch.Tensor,

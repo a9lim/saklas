@@ -136,6 +136,74 @@ class TestApplyInv:
             w.apply_inv(0, torch.zeros(8))
 
 
+class TestCoversAll:
+    def test_true_for_covered_set_and_empty(self):
+        w = _build_whitener(layers=(0, 1))
+        assert w.covers_all([0, 1]) is True
+        assert w.covers_all([]) is True  # vacuous
+
+    def test_false_for_partial_or_missing(self):
+        w = _build_whitener(layers=(0, 1))
+        assert w.covers_all([0, 1, 2]) is False
+        assert w.covers_all([7]) is False
+
+
+class TestSubspaceGram:
+    """``subspace_gram(layer, B) = B Σ⁻¹ Bᵀ`` — the reduced-space inverse
+    covariance backing the whitened manifold share."""
+
+    def test_matches_direct(self):
+        """Woodbury form equals the dense ``B inv(Σ) Bᵀ``."""
+        d, n, R = 12, 30, 4
+        X = _make_acts(42, n=n, d=d)
+        w = LayerWhitener.from_neutral_activations({0: X}, {0: torch.zeros(d)})
+        lam = w.ridge(0)
+        Sigma = X.transpose(0, 1) @ X / n + lam * torch.eye(d)
+        Sigma_inv = torch.linalg.inv(Sigma)
+        B = torch.randn(R, d, generator=torch.Generator().manual_seed(5))
+        gram = w.subspace_gram(0, B)
+        direct = B @ Sigma_inv @ B.transpose(0, 1)
+        assert torch.allclose(gram, direct, atol=1e-4, rtol=1e-4)
+
+    def test_symmetric(self):
+        w = _build_whitener(layers=(0,), d=16)
+        B = torch.randn(5, 16, generator=torch.Generator().manual_seed(2))
+        gram = w.subspace_gram(0, B)
+        assert torch.allclose(gram, gram.transpose(0, 1), atol=1e-6)
+
+    def test_isotropic_orthonormal_near_scaled_identity(self):
+        """Σ ≈ I + orthonormal basis → ``B Σ⁻¹ Bᵀ ≈ (1/(1+λ)) I_R``:
+        near-diagonal, equal positive diagonal, ~zero off-diagonal.  This
+        is the property that makes the whitened manifold share reduce to
+        the Euclidean ``‖coords‖_F`` spread under isotropic covariance.
+        """
+        d, n, R = 16, 600, 5
+        X = _make_acts(3, n=n, d=d)  # N(0, I)
+        w = LayerWhitener.from_neutral_activations(
+            {0: X}, {0: torch.zeros(d)}, ridge_scale=0.05,
+        )
+        Q, _ = torch.linalg.qr(
+            torch.randn(d, R, generator=torch.Generator().manual_seed(1))
+        )
+        B = Q.transpose(0, 1)  # (R, d), orthonormal rows
+        gram = w.subspace_gram(0, B)
+        diag = torch.diag(gram)
+        off = gram - torch.diag(diag)
+        assert off.abs().max() < 0.1
+        assert (diag > 0).all()
+        assert (diag.max() - diag.min()) < 0.15  # equal scale on every axis
+
+    def test_unknown_layer_raises(self):
+        w = _build_whitener(layers=(0,))
+        with pytest.raises(WhitenerError):
+            w.subspace_gram(7, torch.zeros(3, 16))
+
+    def test_dim_mismatch_raises(self):
+        w = _build_whitener(layers=(0,), d=16)
+        with pytest.raises(WhitenerError):
+            w.subspace_gram(0, torch.zeros(3, 8))
+
+
 class TestMahalanobisCosine:
     def test_isotropic_matches_euclidean(self):
         """When activations are isotropic, Mahalanobis cosine ≈ Euclidean.
@@ -452,6 +520,42 @@ class TestExtractDifferenceOfMeansWithWhitener:
                 f"layer {L}: Mahalanobis mag {m_profile[L].norm()} drifted from "
                 f"Euclidean mag {eu_profile[L].norm()} (ratio={ratio:.3f})"
             )
+
+    def test_partial_coverage_falls_back_to_all_euclidean(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A whitener missing even one scored layer → the whole extraction
+        runs Euclidean (all-or-nothing), bit-identical to ``whitener=None``.
+        Guards against per-layer metric mixing across the share."""
+        from saklas.core import vectors as V
+
+        torch.manual_seed(0)
+        monkeypatch.setattr(
+            V, "_encode_and_capture_all", self._stub_separable_with_seed(7),
+        )
+        pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(15)]
+        common = dict(layers=[object()] * 6, device=torch.device("cpu"), dls=False)
+
+        # Whitener covers layers 0..4 but NOT 5 → partial coverage over the
+        # six scored layers.
+        d = 8
+        acts = {L: _make_acts(L * 13 + 1, n=300, d=d) for L in range(5)}
+        means = {L: torch.zeros(d) for L in range(5)}
+        w_partial = LayerWhitener.from_neutral_activations(
+            acts, means, ridge_scale=0.1,
+        )
+        assert not w_partial.covers_all(range(6))
+
+        torch.manual_seed(0)
+        eu_profile, _ = V.extract_difference_of_means(
+            _FakeModel(), _FakeTok(), pairs, **common,  # pyright: ignore[reportArgumentType]  # stub uses len()
+        )
+        torch.manual_seed(0)
+        partial_profile, _ = V.extract_difference_of_means(
+            _FakeModel(), _FakeTok(), pairs, whitener=w_partial, **common,  # pyright: ignore[reportArgumentType]  # stub uses len()
+        )
+        # All-or-nothing: partial coverage == no whitener, on every layer.
+        assert set(partial_profile) == set(eu_profile)
+        for L in eu_profile:
+            assert torch.allclose(partial_profile[L], eu_profile[L], atol=1e-6)
 
     def test_hook_share_invariant_under_anisotropic_sigma(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Hook share = ||m_L||_M / Σ ||m_L'||_M (the algebraic invariant)."""

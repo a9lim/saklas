@@ -1146,6 +1146,10 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
         node_coords=coords,
         layers=layers,
         explained_variance=ev,
+        # A per-model whitened share, so the transfer test can assert it
+        # is dropped (Σ is per-model; the source metric is invalid in
+        # target space).
+        mahalanobis_share={4: 1.0, 5: 2.0, 6: 3.0},
     )
     from saklas.io.paths import tensor_filename
     out = folder / tensor_filename(model_id)
@@ -1189,6 +1193,11 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     for L in src_man.layers:
         assert torch.allclose(tgt_man.layers[L].mean, src_man.layers[L].mean, atol=1e-5)
         assert torch.allclose(tgt_man.layers[L].basis, src_man.layers[L].basis, atol=1e-5)
+    # The source's per-model Mahalanobis share is dropped on transfer (Σ is
+    # per-model); EV — a fit-quality ratio — carries.
+    assert src_man.mahalanobis_share  # source had one
+    assert tgt_man.mahalanobis_share == {}
+    assert tgt_man.explained_variance == src_man.explained_variance
     # Provenance lands in the sidecar.
     with open(out.with_suffix(".json")) as f:
         sc = json.load(f)

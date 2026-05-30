@@ -216,7 +216,16 @@ def bootstrap_probes(
     # DLS + layer_means flow into both extractors uniformly.
     extract_kwargs: dict[str, Any] = {"dls": dls, "layer_means": layer_means}
     bake_label = "euclidean"
-    if method == "dim" and whitener is not None:
+    # All-or-nothing metric gate: only pass the whitener (and label the
+    # bake "mahalanobis") when it covers every scored layer — matches the
+    # extractor's internal ``covers_all`` decision so the label reflects the
+    # metric actually used.  The bundled-probe path is residual-stream only
+    # (no SAE), so the scored set is every model layer.
+    if (
+        method == "dim"
+        and whitener is not None
+        and whitener.covers_all(range(len(layers)))
+    ):
         extract_kwargs["whitener"] = whitener
         bake_label = "mahalanobis"
     for name, cdir, ts, ds, stmts_path in progress(datasets_to_extract, desc="Extracting probes", unit="probe"):

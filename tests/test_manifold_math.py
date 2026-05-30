@@ -565,10 +565,12 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
             9: fit_layer_subspace(cb, node_params),
         },
         feature_space="raw",
+        mahalanobis_share={4: 1.5, 9: 2.0},
     )
     path = tmp_path / "mood" / "model.safetensors"
     save_manifold(manifold, path, {"method": "manifold_pca",
-                                   "nodes_sha256": "abc123"})
+                                   "nodes_sha256": "abc123",
+                                   "share_metric": "mahalanobis"})
     loaded = load_manifold(path)
 
     assert loaded.name == "mood"
@@ -577,6 +579,10 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
     assert sorted(loaded.layers) == [4, 9]
     assert loaded.feature_space == "raw"
     assert loaded.metadata["nodes_sha256"] == "abc123"
+    # New v4+ companion fields round-trip: the per-layer whitened share
+    # and the metric label that records which weighting the fit used.
+    assert loaded.mahalanobis_share == {4: 1.5, 9: 2.0}
+    assert loaded.metadata["share_metric"] == "mahalanobis"
     assert torch.allclose(loaded.node_coords, manifold.node_coords)
     for idx in (4, 9):
         a, b = manifold.layers[idx], loaded.layers[idx]
@@ -590,6 +596,31 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
         manifold.manifold_point(4, (0.3,)),
         atol=1e-4,
     )
+
+
+def test_load_manifold_without_share_fields_defaults_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fit with no whitener (no ``mahalanobis_share`` / ``share_metric``)
+    round-trips with an empty share dict and no crash — the apply path
+    then falls back to the Euclidean spread."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    ca, domain, node_params = _circle(7, dim=20)
+    manifold = Manifold(
+        name="mood",
+        domain=domain,
+        node_labels=[f"n{i}" for i in range(7)],
+        node_coords=torch.tensor([[i / 7] for i in range(7)]),
+        layers={3: fit_layer_subspace(ca, node_params)},
+        feature_space="raw",
+    )  # no mahalanobis_share
+    path = tmp_path / "mood" / "model.safetensors"
+    save_manifold(manifold, path, {"method": "manifold_pca",
+                                   "nodes_sha256": "abc"})
+    loaded = load_manifold(path)
+    assert loaded.mahalanobis_share == {}
+    assert "share_metric" not in loaded.metadata
+    assert "mahalanobis_share_per_layer" not in loaded.metadata
 
 
 def test_layer_subspace_to_device_dtype():

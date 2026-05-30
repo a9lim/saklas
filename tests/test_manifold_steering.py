@@ -12,6 +12,7 @@ from torch import nn
 from saklas.core.hooks import (
     _MANIFOLD_GAIN_ADDITIVE,
     _MANIFOLD_GAIN_ANGULAR,
+    _manifold_layer_shares,
     SteeringHook,
     SteeringManager,
 )
@@ -19,6 +20,7 @@ from saklas.core.manifold import (
     BoxAxis,
     BoxDomain,
     Manifold,
+    eval_rbf,
     fit_layer_subspace,
 )
 from saklas.core.errors import ManifoldArityError, OverlappingManifoldError
@@ -424,6 +426,50 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     # weights normalize the per-layer distribution.
     assert (alpha_0 + alpha_1) == pytest.approx(
         user_alpha * _MANIFOLD_GAIN_ANGULAR, abs=1e-4,
+    )
+
+
+def _euclidean_shares(manifold: Manifold) -> dict[int, float]:
+    """Reference Euclidean ``‖coords‖_F`` share, normalized across layers."""
+    raw = {}
+    for L, sub in manifold.layers.items():
+        c = eval_rbf(
+            sub.node_params, sub.rbf_weights, sub.poly_coeffs, sub.node_params,
+        )
+        raw[L] = float(torch.linalg.vector_norm(c).item())
+    tot = sum(raw.values())
+    return {L: v / tot for L, v in raw.items()}
+
+
+def test_manifold_shares_use_baked_when_full_coverage():
+    """A baked Mahalanobis share covering every layer is used (normalized)
+    in place of the Euclidean centroid-spread."""
+    manifold = _manifold(layers=(0, 1))
+    manifold.mahalanobis_share = {0: 1.0, 1: 3.0}
+    shares = _manifold_layer_shares(manifold)
+    assert shares[0] == pytest.approx(0.25)
+    assert shares[1] == pytest.approx(0.75)
+    # And it is NOT the Euclidean spread (which weights by centroid scale).
+    assert shares != pytest.approx(_euclidean_shares(manifold))
+
+
+def test_manifold_shares_fall_back_to_euclidean_when_no_baked():
+    """Empty baked share (no whitener at fit time) → Euclidean spread."""
+    manifold = _manifold(layers=(0, 1))
+    assert manifold.mahalanobis_share == {}
+    assert _manifold_layer_shares(manifold) == pytest.approx(
+        _euclidean_shares(manifold)
+    )
+
+
+def test_manifold_shares_fall_back_when_partial_baked_coverage():
+    """A baked share missing a layer → Euclidean for ALL layers (no metric
+    mixing), matching the all-or-nothing gate.  The stray ``{0: ...}`` entry
+    must be ignored, not blended in."""
+    manifold = _manifold(layers=(0, 1))
+    manifold.mahalanobis_share = {0: 1.0}  # layer 1 missing → partial
+    assert _manifold_layer_shares(manifold) == pytest.approx(
+        _euclidean_shares(manifold)
     )
 
 

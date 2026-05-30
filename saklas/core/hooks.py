@@ -805,15 +805,30 @@ def _profile_layer_shares(profile: dict[int, torch.Tensor]) -> dict[int, float]:
 
 
 def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
-    layer_scores: dict[int, float] = {}
-    for layer_idx, sub in manifold.layers.items():
-        node_coords = eval_rbf(
-            sub.node_params, sub.rbf_weights, sub.poly_coeffs,
-            sub.node_params,
-        )  # (K, R) — exact centered coords at the fit nodes
-        layer_scores[layer_idx] = float(
-            torch.linalg.vector_norm(node_coords).item()
-        )
+    # Prefer the whitened (Mahalanobis) per-layer share baked at fit time —
+    # the subspace-restricted analogue of vector steering's ``‖d‖_M`` bake
+    # score (see ``LayerWhitener.subspace_gram`` /
+    # ``ManifoldExtractionPipeline.fit``).  Requires *full* layer coverage:
+    # the share is a cross-layer-normalized weight, so mixing whitened and
+    # Euclidean scalars across layers would compare incommensurable
+    # metrics.  When the baked share is absent (no whitener at fit time —
+    # CPU test stubs) or partial, fall back to the Euclidean centroid-
+    # spread ``‖coords‖_F``.
+    baked = getattr(manifold, "mahalanobis_share", None)
+    if baked and all(layer_idx in baked for layer_idx in manifold.layers):
+        layer_scores: dict[int, float] = {
+            layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
+        }
+    else:
+        layer_scores = {}
+        for layer_idx, sub in manifold.layers.items():
+            node_coords = eval_rbf(
+                sub.node_params, sub.rbf_weights, sub.poly_coeffs,
+                sub.node_params,
+            )  # (K, R) — exact centered coords at the fit nodes
+            layer_scores[layer_idx] = float(
+                torch.linalg.vector_norm(node_coords).item()
+            )
     total_score = sum(layer_scores.values())
     if total_score <= 1e-12:
         n_layers = max(1, len(manifold.layers))

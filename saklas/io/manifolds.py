@@ -1526,8 +1526,15 @@ def transfer_manifold(
             f"({sorted(src.layers)})"
         )
 
+    # Drop the source model's Mahalanobis share: Σ is per-model, so the
+    # whitened share baked under ``from_model`` is meaningless in
+    # ``to_model`` space.  An empty dict makes the apply-time weighting
+    # fall back to the Euclidean centroid-spread on the transferred basis,
+    # which is metric-valid for the target.  (EV is a fit-quality ratio,
+    # not a per-model metric, so it carries.)
     transferred = _dc_replace(
         src, layers=new_layers, explained_variance=new_ev,
+        mahalanobis_share={},
     )
 
     out_path = folder / tensor_filename(to_model, transferred_from=from_model)

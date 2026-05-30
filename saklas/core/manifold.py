@@ -682,6 +682,17 @@ class Manifold:
     # normalization falls back to "no quality correction" so legacy
     # fits keep their pre-v4 behavior.
     explained_variance: dict[int, float] = field(default_factory=dict)
+    # Per-layer Mahalanobis share weight recorded at fit time when a
+    # whitener was available — ``share_L = ‖Bᵀ coords_k‖_M`` summed over
+    # nodes, the subspace-restricted analogue of vector steering's
+    # ``‖d‖_M`` bake score (see ``LayerWhitener.subspace_gram``).  When
+    # populated *and* covering every layer, ``hooks._manifold_layer_shares``
+    # uses it in place of the Euclidean centroid-spread; an empty dict
+    # (no whitener at fit time, e.g. CPU test stubs, or partial layer
+    # coverage) falls back to the Euclidean ``‖coords‖_F`` weighting.
+    # These are raw per-layer scalars — the apply-time normalization to
+    # ``Σ_L share_L = 1`` lives in ``_manifold_layer_shares``.
+    mahalanobis_share: dict[int, float] = field(default_factory=dict)
 
     @property
     def layer_indices(self) -> list[int]:
@@ -702,6 +713,7 @@ class Manifold:
             metadata=dict(self.metadata),
             node_roles=list(self.node_roles),
             explained_variance=dict(self.explained_variance),
+            mahalanobis_share=dict(self.mahalanobis_share),
         )
 
     def _position_tensor(
@@ -1526,8 +1538,20 @@ def save_manifold(
             str(idx): float(v)
             for idx, v in manifold.explained_variance.items()
         }
+    # Per-layer Mahalanobis share weight (whitened bake-score analogue).
+    # Stored as ``{str(idx): float}`` like EV; absent when no whitener was
+    # available at fit time, in which case the apply-time share weighting
+    # falls back to the Euclidean centroid-spread.
+    if manifold.mahalanobis_share:
+        sidecar["mahalanobis_share_per_layer"] = {
+            str(idx): float(v)
+            for idx, v in manifold.mahalanobis_share.items()
+        }
     for key in (
         "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
+        # Share-weighting metric ("mahalanobis" / "euclidean") — the
+        # manifold analogue of the vector sidecar's ``bake`` field.
+        "share_metric",
         # Discover-mode fields.  ``fit_mode`` discriminates authored vs
         # discover at read time; ``hyperparams`` records the knobs the
         # fitter was called with (max_dim / var_threshold / k_nn /
@@ -1591,6 +1615,11 @@ def load_manifold(path: str | Path) -> Manifold:
         int(k): float(v) for k, v in ev_raw.items()
     }
 
+    maha_raw = sidecar.get("mahalanobis_share_per_layer") or {}
+    mahalanobis_share: dict[int, float] = {
+        int(k): float(v) for k, v in maha_raw.items()
+    }
+
     return Manifold(
         name=sidecar.get("name", path.parent.name),
         domain=domain,
@@ -1603,6 +1632,7 @@ def load_manifold(path: str | Path) -> Manifold:
         # pre-Phase-A fit); the loaded list stays empty in that case.
         node_roles=list(sidecar.get("node_roles", [])),
         explained_variance=explained_variance,
+        mahalanobis_share=mahalanobis_share,
     )
 
 

@@ -427,8 +427,23 @@ class ExtractionPipeline:
             if method == "dim":
                 handle_whitener = getattr(self._handle, "whitener", None)
                 if handle_whitener is not None:
-                    out["whitener"] = handle_whitener
-                    bake_label = "mahalanobis"
+                    # All-or-nothing metric gate, matching the extractor's
+                    # internal ``covers_all`` decision so ``bake_label``
+                    # reflects the metric actually used.  Withhold the
+                    # whitener on partial coverage → the extractor sees
+                    # ``None`` and runs all-Euclidean, and the label stays
+                    # "euclidean".  Scored layers are the SAE-covered model
+                    # layers (SAE path) or every model layer (raw path).
+                    n_layers = len(self._handle.layers)
+                    if sae_backend is not None:
+                        scored = sorted(
+                            set(sae_backend.layers) & set(range(n_layers))
+                        )
+                    else:
+                        scored = list(range(n_layers))
+                    if handle_whitener.covers_all(scored):
+                        out["whitener"] = handle_whitener
+                        bake_label = "mahalanobis"
             return out
 
         def _build_return(
@@ -828,6 +843,7 @@ class ManifoldExtractionPipeline:
             compute_node_centroid,
             discover_coords,
             domain_from_spec,
+            eval_rbf,
             fit_layer_subspace,
             load_manifold,
             save_manifold,
@@ -1117,11 +1133,31 @@ class ManifoldExtractionPipeline:
 
         # 4. Per-layer fit.  Stack centroids -> (K, D); for the SAE
         #    variant reconstruct through the SAE before fitting.
+        #
+        # Mahalanobis share weighting (parity with the vector bake metric):
+        # the whitener is resolved here, *after* the cache-hit return and
+        # the fail-fast SAE/role checks, since ``handle.whitener`` can
+        # trigger a lazy neutral-activation build — the same deferral the
+        # vector pipeline applies to its bake whitener.  We only bake the
+        # whitened share when the whitener covers *every* fit layer, so the
+        # apply-time cross-layer normalization compares like with like;
+        # partial coverage (or a handle without ``.whitener`` — CPU test
+        # stubs) leaves the dict empty and the apply path falls back to the
+        # Euclidean centroid-spread.  The basis is model-space for both raw
+        # and SAE fits (centroids are decoded back before the fit), so the
+        # residual-stream whitener applies to the SAE variant unchanged.
+        _whitener = getattr(self._handle, "whitener", None)
+        maha_whitener = (
+            _whitener
+            if _whitener is not None and _whitener.covers_all(fit_layers)
+            else None
+        )
         _progress(
             f"Fitting RBF interpolant across {len(fit_layers)} layers..."
         )
         layer_subs = {}
         explained_variance: dict[int, float] = {}
+        mahalanobis_share: dict[int, float] = {}
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
             fit_kwargs["n_components"] = max_subspace_dim_override
@@ -1139,6 +1175,23 @@ class ManifoldExtractionPipeline:
             )
             layer_subs[idx] = sub
             explained_variance[idx] = ev_ratio
+            if maha_whitener is not None:
+                # ``coords`` are the reduced node values the RBF
+                # interpolates (exact at the fit nodes — same basis the
+                # Euclidean ``_manifold_layer_shares`` uses).  ``M_R``
+                # restricts Σ⁻¹ to the subspace; the whitened per-layer
+                # spread is ``sqrt(Σ_k coords_kᵀ M_R coords_k)`` =
+                # ``sqrt(Σ_k ‖Bᵀ coords_k‖²_M)``.  Reduces to the Euclidean
+                # ``‖coords‖_F`` when Σ = I.
+                coords = eval_rbf(
+                    sub.node_params, sub.rbf_weights, sub.poly_coeffs,
+                    sub.node_params,
+                )  # (K, R)
+                gram = maha_whitener.subspace_gram(idx, sub.basis)  # (R, R)
+                quad = float(
+                    (coords @ gram * coords).sum().clamp_min(0.0).item()
+                )
+                mahalanobis_share[idx] = quad ** 0.5
 
         manifold = Manifold(
             name=mf.name,
@@ -1148,12 +1201,20 @@ class ManifoldExtractionPipeline:
             layers=layer_subs,
             feature_space=feature_space,
             explained_variance=explained_variance,
+            mahalanobis_share=mahalanobis_share,
         )
 
         # 5. Persist + refresh the folder integrity manifest.
         metadata: dict[str, Any] = {
             "method": method,
             "nodes_sha256": nodes_sha,
+            # Which metric the per-layer share weighting used — the
+            # manifold analogue of the vector sidecar's ``bake`` field.
+            # "mahalanobis" iff the whitened share was baked (whitener
+            # covered every fit layer); "euclidean" on fallback.
+            "share_metric": (
+                "mahalanobis" if maha_whitener is not None else "euclidean"
+            ),
         }
         if sae_backend is not None:
             metadata["sae_release"] = sae_backend.release
