@@ -876,6 +876,7 @@ class ManifoldExtractionPipeline:
             domain_from_spec,
             eval_rbf,
             fit_layer_subspace,
+            layer_lever,
             load_manifold,
             save_manifold,
         )
@@ -1189,6 +1190,16 @@ class ManifoldExtractionPipeline:
         layer_subs = {}
         explained_variance: dict[int, float] = {}
         mahalanobis_share: dict[int, float] = {}
+        # Per-layer steering lever (drives apply-time gain normalization).
+        # Baked when the whitener is present — it carries the centered
+        # neutral activations, which (re-centered by the layer means) are
+        # the raw-activation stand-ins ``layer_lever`` needs.  Same gate as
+        # Fisher PCA + the Mahalanobis share, so all three agree.
+        lever: dict[int, float] = {}
+        _layer_means = (
+            getattr(self._handle, "layer_means", None)
+            if maha_whitener is not None else None
+        )
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
             fit_kwargs["n_components"] = max_subspace_dim_override
@@ -1201,8 +1212,17 @@ class ManifoldExtractionPipeline:
                     feat = sae_backend.encode_layer(idx, stacked.to(device))
                     recon = sae_backend.decode_layer(idx, feat)
                 stacked = recon.detach().to("cpu", torch.float32)
+            # ``maha_whitener`` is the covers_all-gated whitener (None
+            # unless it covers every fit layer).  When present it switches
+            # ``fit_layer_subspace`` to whitened/Fisher PCA — de-rogued
+            # subspace selection that also collapses the angular norm
+            # artifact (see ``fit_layer_subspace`` docstring).  The same
+            # gate drives the Mahalanobis share below, so subspace metric
+            # and share metric always agree.
             sub, ev_ratio = fit_layer_subspace(
-                stacked, node_params, **fit_kwargs,
+                stacked, node_params,
+                whitener=maha_whitener, layer=idx,
+                **fit_kwargs,
             )
             layer_subs[idx] = sub
             explained_variance[idx] = ev_ratio
@@ -1224,6 +1244,20 @@ class ManifoldExtractionPipeline:
                 )
                 mahalanobis_share[idx] = quad ** 0.5
 
+                # Steering lever from the neutral activations: uncenter the
+                # whitener's centered observations with the layer mean to
+                # recover the raw activation stand-ins, then measure the
+                # typical in-subspace norm fraction.  Skipped (left absent →
+                # ``N = 1`` at apply) if the layer mean isn't resolvable.
+                if _layer_means is not None and idx in _layer_means:
+                    X_c, _K, _lam = maha_whitener.woodbury_factors(
+                        idx, device=torch.device("cpu"), dtype=torch.float32,
+                    )
+                    mu = _layer_means[idx].to(
+                        device="cpu", dtype=torch.float32,
+                    ).reshape(-1)
+                    lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
+
         manifold = Manifold(
             name=mf.name,
             domain=domain,
@@ -1234,6 +1268,7 @@ class ManifoldExtractionPipeline:
             node_roles=list(node_roles),
             explained_variance=explained_variance,
             mahalanobis_share=mahalanobis_share,
+            lever=lever,
         )
 
         # 5. Persist + refresh the folder integrity manifest.
@@ -1245,6 +1280,15 @@ class ManifoldExtractionPipeline:
             # "mahalanobis" iff the whitened share was baked (whitener
             # covered every fit layer); "euclidean" on fallback.
             "share_metric": (
+                "mahalanobis" if maha_whitener is not None else "euclidean"
+            ),
+            # Which metric the per-layer PCA *subspace selection* used.
+            # Gated by the same ``maha_whitener`` as the share, so the two
+            # always agree: "mahalanobis" => whitened/Fisher PCA (de-rogued
+            # directions, collapsed angular norm artifact); "euclidean" =>
+            # ordinary centroid PCA (the legacy shape, what no-whitener
+            # fits carry).
+            "subspace_metric": (
                 "mahalanobis" if maha_whitener is not None else "euclidean"
             ),
         }

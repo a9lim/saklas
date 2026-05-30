@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from saklas.core.hooks import (
+    _MANIFOLD_GAIN_ANGULAR,
     SteeringManager,
     _redistribute_budget,
 )
@@ -185,7 +186,9 @@ def _peaked_manifold(n_layers: int = 4, dim: int = 8) -> Manifold:
 
     Layer 0 gets a large centroid scale (high Euclidean share), the rest
     tiny — so layer 0's ``α · share_L · _MANIFOLD_GAIN_ANGULAR`` exceeds
-    1.0 at the default gain (8.0) for any α above ~0.13.
+    1.0 (with share_0 ≈ 1 and base gain 2.0, for any α above ~0.5),
+    forcing the water-fill cap + redistribute.  No lever stamped, so the
+    apply path uses ``N = 1`` (the un-normalized base gain).
     """
     torch.manual_seed(0)
     domain = BoxDomain([BoxAxis("u", periodic=False, lo=-1.0, hi=1.0)])
@@ -219,8 +222,9 @@ class TestManifoldAngularBudget:
     def test_peaked_share_no_layer_past_theta_max(self) -> None:
         mgr = SteeringManager(injection_mode="angular")
         m = _peaked_manifold()
-        # α=1.0 with the dominant layer's share ≈ 1.0 and gain 8.0 would
-        # ask for an 8× θ_max rotation on layer 0 absent the redistribute.
+        # α=1.0 with the dominant layer's share ≈ 1.0 and base gain 2.0
+        # would ask for a 2× θ_max rotation on layer 0 absent the
+        # redistribute.
         mgr.add_manifold("peaked", m, (0.0,), alpha=1.0)
         n_layers = max(m.layers) + 2
         layers = nn.ModuleList([_Passthrough() for _ in range(n_layers)])
@@ -250,6 +254,8 @@ class TestManifoldAngularBudget:
             for _t, _b, _m, _tg, alpha in hook.manifold_groups:
                 total += alpha
         # Raw cumulative budget = α · _MANIFOLD_GAIN_ANGULAR (share sums to
-        # 1) = 1.0 · 8.0 = 8.0, capped to the ceiling = n_fit_layers.
+        # 1; no lever ⇒ N=1) = 1.0 · 2.0, capped to the ceiling = n_fit.
         n_fit = len(m.layers)
-        assert total == pytest.approx(min(8.0, n_fit), abs=1e-4)
+        assert total == pytest.approx(
+            min(1.0 * _MANIFOLD_GAIN_ANGULAR, n_fit), abs=1e-4,
+        )

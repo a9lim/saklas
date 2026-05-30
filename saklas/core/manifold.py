@@ -42,12 +42,15 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 from safetensors.torch import load_file, save_file
 
 from saklas.core.errors import SaklasError
+
+if TYPE_CHECKING:
+    from saklas.core.mahalanobis import LayerWhitener
 
 log = logging.getLogger(__name__)
 
@@ -585,6 +588,8 @@ def fit_layer_subspace(
     node_params: torch.Tensor,
     *,
     n_components: int = DEFAULT_N_COMPONENTS,
+    whitener: "LayerWhitener | None" = None,
+    layer: int | None = None,
 ) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer.
 
@@ -596,13 +601,46 @@ def fit_layer_subspace(
     RBF is fitted from the normalized coordinates to the reduced
     activations.
 
-    Returns ``(LayerSubspace, explained_variance_ratio)``.  The EV ratio
-    is ``Σ σ_i² (retained) / Σ σ_i² (all)``, capturing the fraction of
-    inter-node centroid variance the chosen ``R``-dim subspace retains
-    — a per-layer fit-quality signal.  Used by manifold-steering's
-    additive-mode α normalization (poorly-fitted layers under-blend at
-    a given α, the ratio compensates).  Computed from the SVD that
-    already runs, so this is free.
+    **Basis selection — Euclidean vs whitened (Fisher) PCA.**  With
+    ``whitener=None`` (the default) the subspace is ordinary PCA of the
+    centered centroids: it maximizes raw between-node variance
+    ``vᵀ S_b v``.  On real LMs that objective *chases massive-activation
+    channels* — they carry the most raw variance regardless of whether
+    they carry node signal — so the fitted subspace, its ``mean``, and the
+    resulting steering direction all end up dominated by a handful of rogue
+    dims, and the angular hook's per-step norm swings wildly (the rogue-
+    aligned ``mean`` makes ``‖h‖`` uncontrolled even when ``‖h - mean‖`` is
+    preserved).
+
+    Passing a ``whitener`` (covering ``layer``) switches to **whitened /
+    Fisher PCA**: it maximizes the *ratio* ``vᵀ S_b v / vᵀ Σ v`` where
+    ``Σ`` is the neutral-background covariance — the LDA objective.  A
+    rogue dim has enormous background variance ``vᵀ Σ v``, so it is divided
+    down to nothing — the exact cancellation difference-of-means steering
+    gets for free by differencing two means.  The directions that survive
+    are where nodes separate *more than the background fluctuates*, i.e.
+    the genuine concept signal.  Solved as the generalized eigenproblem
+    ``(S_b, Σ)`` via the whitener's low-rank Woodbury ``Σ⁻¹``: eigvecs
+    ``a`` of ``G = X Σ⁻¹ Xᵀ`` (``K×K``), directions ``v_r = Σ⁻¹ Xᵀ a_r``.
+    The result is re-expressed in a **Euclidean-orthonormal** basis (QR,
+    span-preserving) so :func:`decompose` / :func:`subspace_rotate` /
+    :func:`subspace_replace` — the steering hot path — are untouched; only
+    *which* subspace they operate in moves.  The de-rogued subspace barely
+    overlaps the rogue-dominated ``mean``, so the angular norm artifact
+    collapses for free (no explicit norm-restore needed).  The caller
+    gates this all-or-nothing on ``whitener.covers_all`` over the fit
+    layers, mirroring the DiM-bake / monitor / share gates.
+
+    Returns ``(LayerSubspace, explained_variance_ratio)``.  Under
+    Euclidean PCA the EV ratio is ``Σ σ_i² (retained) / Σ σ_i² (all)`` —
+    the fraction of raw inter-node variance retained.  Under whitened PCA
+    it is the fraction of *whitened* between-variance retained
+    (``Σ μ (retained) / Σ μ (all)`` over the generalized eigenvalues) —
+    the metric-appropriate fit-quality signal there.  Either feeds
+    manifold-steering's additive-mode ``1/√mean_EV`` α normalization
+    (poorly-fitted layers under-blend at a given α; the ratio
+    compensates); angular mode ignores it.  Computed from the
+    decomposition that already runs, so this is free.
     """
     centroids = centroids.to(torch.float32)
     node_params = node_params.to(torch.float32)
@@ -611,23 +649,58 @@ def fit_layer_subspace(
         raise ValueError(f"a manifold needs >= 3 nodes to fit, got {K}")
     mean = centroids.mean(dim=0)
     X = centroids - mean  # (K, D)
-    _, S, Vh = torch.linalg.svd(X, full_matrices=False)
-    rank = int((S > 1e-6 * S[0].clamp(min=1e-12)).sum().item())
-    R = max(1, min(n_components, K - 1, rank))
-    basis = Vh[:R].contiguous()  # (R, D)
-    coords = X @ basis.T          # (K, R) -- the values the RBF interpolates
 
-    # Per-layer explained variance ratio.  Total variance is
-    # ``Σ σ²`` (full spectrum); retained is ``Σ σ²[:R]``.  Falls back
-    # to 1.0 on a degenerate (all-zero singular values) layer rather
-    # than NaN — the downstream normalizer will treat it as
-    # "well-fitted" and skip the boost.
-    total_var = float(S.pow(2).sum().item())
-    retained_var = float(S[:R].pow(2).sum().item())
-    if total_var > 1e-12:
-        ev_ratio = retained_var / total_var
+    if whitener is not None and layer is not None:
+        # Whitened (Fisher) PCA — generalized eigenproblem (S_b, Σ) via
+        # the whitener's low-rank Woodbury Σ⁻¹.  ``G = X Σ⁻¹ Xᵀ`` is K×K;
+        # its eigvecs ``a`` give the discriminant directions
+        # ``v_r = Σ⁻¹ Xᵀ a_r`` (largest-eigenvalue first).  Re-expressed in
+        # a Euclidean-orthonormal basis via QR (span-preserving) so the
+        # steering hot path is unchanged — see the docstring.
+        G = whitener.subspace_gram(layer, X)            # (K, K) = X Σ⁻¹ Xᵀ
+        mu, A = torch.linalg.eigh(G)                    # ascending
+        mu_pos = mu.clamp_min(0.0)
+        rank = int(
+            (mu_pos > 1e-6 * mu_pos[-1].clamp(min=1e-12)).sum().item()
+        )
+        R = max(1, min(n_components, K - 1, rank))
+        top = torch.argsort(mu, descending=True)[:R]
+        XtA = X.transpose(0, 1) @ A[:, top]             # (D, R) = Xᵀ a_r
+        directions = torch.stack(
+            [whitener.apply_inv(layer, XtA[:, j]) for j in range(R)]
+        )                                               # (R, D) = Σ⁻¹ Xᵀ a_r
+        # QR on the (D, R) direction matrix gives an orthonormal column
+        # span identical to the discriminant directions' span; transpose
+        # back to (R, D) orthonormal rows the LayerSubspace expects.
+        basis = torch.linalg.qr(
+            directions.transpose(0, 1)
+        ).Q.transpose(0, 1).contiguous()                # (R, D)
+        coords = X @ basis.T                            # (K, R)
+        # EV ratio in the *whitened* metric — fraction of between-variance
+        # captured by the retained generalized eigenvalues.
+        total_w = float(mu_pos.sum().item())
+        retained_w = float(mu_pos[top].sum().item())
+        ev_ratio = retained_w / total_w if total_w > 1e-12 else 1.0
     else:
-        ev_ratio = 1.0
+        # Euclidean PCA — ordinary SVD of the centered centroids (no
+        # whitener wired, or partial layer coverage at the call site).
+        _, S, Vh = torch.linalg.svd(X, full_matrices=False)
+        rank = int((S > 1e-6 * S[0].clamp(min=1e-12)).sum().item())
+        R = max(1, min(n_components, K - 1, rank))
+        basis = Vh[:R].contiguous()  # (R, D)
+        coords = X @ basis.T          # (K, R) -- the values the RBF interpolates
+
+        # Per-layer explained variance ratio.  Total variance is
+        # ``Σ σ²`` (full spectrum); retained is ``Σ σ²[:R]``.  Falls back
+        # to 1.0 on a degenerate (all-zero singular values) layer rather
+        # than NaN — the downstream normalizer will treat it as
+        # "well-fitted" and skip the boost.
+        total_var = float(S.pow(2).sum().item())
+        retained_var = float(S[:R].pow(2).sum().item())
+        if total_var > 1e-12:
+            ev_ratio = retained_var / total_var
+        else:
+            ev_ratio = 1.0
 
     lo = node_params.min(dim=0).values
     hi = node_params.max(dim=0).values
@@ -693,6 +766,17 @@ class Manifold:
     # These are raw per-layer scalars — the apply-time normalization to
     # ``Σ_L share_L = 1`` lives in ``_manifold_layer_shares``.
     mahalanobis_share: dict[int, float] = field(default_factory=dict)
+    # Per-layer steering *lever* ``f_L = E_neutral[‖h_par_c‖/‖h‖]`` recorded
+    # at fit time (see :func:`layer_lever`).  ``SteeringManager.apply_to_model``
+    # divides the manifold gain by the share-weighted lever
+    # ``N = Σ_L share_L·f_L`` so the per-α behavioral magnitude is invariant
+    # to subspace dimension ``R`` and to subspace-selection metric (Euclidean
+    # vs whitened) — without it, a bigger ``R`` or a rogue-heavy fit steers
+    # disproportionately harder at the same user α.  Empty dict on a fit with
+    # no neutral activations at fit time (e.g. CPU test stubs); the apply path
+    # then falls back to no lever normalization (``N = 1``), preserving the
+    # pre-lever gain scale for that degenerate case.
+    lever: dict[int, float] = field(default_factory=dict)
 
     @property
     def layer_indices(self) -> list[int]:
@@ -714,6 +798,7 @@ class Manifold:
             node_roles=list(self.node_roles),
             explained_variance=dict(self.explained_variance),
             mahalanobis_share=dict(self.mahalanobis_share),
+            lever=dict(self.lever),
         )
 
     def _position_tensor(
@@ -917,6 +1002,43 @@ def decompose(
     h_par_c = coords @ basis             # (.., D)
     h_perp = centered - h_par_c          # (.., D)
     return h_par_c, h_perp
+
+
+def layer_lever(
+    neutral: torch.Tensor,
+    mean: torch.Tensor,
+    basis: torch.Tensor,
+) -> float:
+    """Per-layer steering *lever* — ``E_neutral[‖h_par_c‖ / ‖h‖]``.
+
+    ``neutral`` is ``(N, D)`` *raw* (un-centered) activations — the cached
+    neutral-prompt stack, a stand-in for the running activations the hook
+    sees at decode.  ``mean`` / ``basis`` define the manifold's per-layer
+    affine subspace.  Returns the mean fraction of a running activation's
+    norm that lives inside the subspace.
+
+    This is the quantity manifold steering must normalize the gain by to
+    behave consistently across subspace dimension and selection metric.
+    The angular hook rotates ``h_par_c`` (the in-subspace component) by a
+    fixed angle ``α·θ_max``; the resulting fractional displacement of the
+    full activation is ``(‖h_par_c‖/‖h‖)·2sin(θ/2)`` — i.e. proportional
+    to this lever.  A larger subspace (bigger ``R``) captures more of
+    ``‖h‖`` ⇒ bigger lever ⇒ harder steering at the same α; a de-rogued
+    (whitened) subspace excludes the high-norm rogue channels ⇒ smaller
+    lever ⇒ gentler.  ``SteeringManager.apply_to_model`` divides the gain
+    by the share-weighted lever ``N = Σ_L share_L·lever_L`` so the per-α
+    behavioral magnitude is invariant to both — a 4-dim and a 16-dim fit,
+    or a Euclidean and a whitened fit, reach comparable effect at the same
+    user α (up to the angular operator's per-layer ``θ_max`` ceiling,
+    which a small lever can saturate).
+
+    fp32 throughout; called once per layer at fit time (off the hot path).
+    """
+    h = neutral.to(torch.float32)
+    h_par_c, _ = decompose(h, mean.to(torch.float32), basis.to(torch.float32))
+    num = torch.linalg.vector_norm(h_par_c, dim=-1)
+    den = torch.linalg.vector_norm(h, dim=-1).clamp_min(1e-9)
+    return float((num / den).mean().item())
 
 
 def subspace_replace(
@@ -1549,11 +1671,26 @@ def save_manifold(
             str(idx): float(v)
             for idx, v in manifold.mahalanobis_share.items()
         }
+    # Per-layer steering lever ``f_L = E_neutral[‖h_par_c‖/‖h‖]`` — drives
+    # the apply-time gain normalization (``effective_gain = base/N``,
+    # ``N = Σ_L share_L·f_L``) that makes the per-α effect invariant to
+    # subspace dim and selection metric.  Absent on a fit with no neutral
+    # activations available; the apply path then uses ``N = 1``.
+    if manifold.lever:
+        sidecar["lever_per_layer"] = {
+            str(idx): float(v) for idx, v in manifold.lever.items()
+        }
     for key in (
         "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
         # Share-weighting metric ("mahalanobis" / "euclidean") — the
         # manifold analogue of the vector sidecar's ``bake`` field.
         "share_metric",
+        # PCA subspace-selection metric ("mahalanobis" => whitened/Fisher
+        # PCA, "euclidean" => ordinary centroid PCA).  Provenance only —
+        # the fitted basis is baked into the tensor, so the runtime hot
+        # path needs nothing from this field; surfaced by `vector manifold
+        # show` and the inspector.
+        "subspace_metric",
         # Discover-mode fields.  ``fit_mode`` discriminates authored vs
         # discover at read time; ``hyperparams`` records the knobs the
         # fitter was called with (max_dim / var_threshold / k_nn /
@@ -1622,6 +1759,9 @@ def load_manifold(path: str | Path) -> Manifold:
         int(k): float(v) for k, v in maha_raw.items()
     }
 
+    lever_raw = sidecar.get("lever_per_layer") or {}
+    lever: dict[int, float] = {int(k): float(v) for k, v in lever_raw.items()}
+
     return Manifold(
         name=sidecar.get("name", path.parent.name),
         domain=domain,
@@ -1635,6 +1775,7 @@ def load_manifold(path: str | Path) -> Manifold:
         node_roles=list(sidecar.get("node_roles", [])),
         explained_variance=explained_variance,
         mahalanobis_share=mahalanobis_share,
+        lever=lever,
     )
 
 

@@ -766,37 +766,55 @@ class SteeringHook:
 _STEER_GAIN = 2.0
 
 
-# Per-mode gains that pin the user-facing alpha scale for manifold
-# steering, analogous to :data:`_STEER_GAIN` for vector steering.
-# Manifold injection rotates / blends only ``h_par`` (the projection
-# of ``h`` into the manifold's R-dim affine subspace, where ``R`` is
-# typically 8) — roughly ``sqrt(R/D) ≈ 4%`` of ``||h||`` at typical
-# hidden dims.  The per-α behavioral effect is therefore far smaller
-# than vector steering's full-residual rotation, and the gain
-# compensates for the geometry.  Without it, share-weighted manifold
-# steering at ``α ≤ 1`` produces no visible behavioral change; the
-# layer-compounding in the pre-share-weighted hook was implicitly
-# serving as a gain.
+# Per-mode *base* gains for manifold steering, analogous to
+# :data:`_STEER_GAIN` for vector steering.  Manifold injection moves only
+# ``h_par`` (the projection of ``h`` into the manifold's R-dim affine
+# subspace) — a fraction of ``||h||`` that varies with subspace dimension
+# and with whether the subspace is rogue-heavy (Euclidean PCA) or
+# de-rogued (whitened/Fisher PCA).  The per-α behavioral magnitude
+# therefore scales with that fraction, which would make a 16-dim fit
+# steer harder than a 4-dim fit, and a Euclidean fit harder than a
+# whitened one, at the same user α.
 #
-# Calibrated so ``α ≈ 0.5`` on the bundled ``personas`` manifold
-# (gemma-4-31b-it, R=8, ~30 manifold-covered layers) lands in the
-# coherent persona-expression band — vector-comparable so users don't
-# carry two α-regimes in their head.
+# ``apply_to_model`` removes that dependence by dividing the base gain by
+# the manifold's share-weighted *lever* ``N = Σ_L share_L · f_L`` where
+# ``f_L = E_neutral[||h_par_c||/||h||]`` is baked at fit time (see
+# :func:`saklas.core.manifold.layer_lever`).  So the *effective* gain is
+# ``base / N``: a small-lever fit (de-rogued, or small R) gets a
+# proportionally larger gain, equalizing the per-α effect across subspace
+# dimension and selection metric.  The base is thus a pure, lever-
+# normalized scale — calibrated (sweep on the bundled whitened
+# ``personas`` fit) so ``α ≈ 0.5`` lands in the coherent persona band on
+# the reference model regardless of the fit's R or metric.
 #
-# Per-mode because the operators are differently lossy.  Angular
-# (``subspace_rotate``) is geometrically clean: rotate ``h_par`` toward
-# the target by an exact angle, no rescale.  Additive
-# (``subspace_replace``) blends ``h_par`` toward target then
-# norm-restores ``||h||``, which partially undoes the steering —
-# empirically replace needs ~2× the cumulative budget rotate does to
-# produce comparable behavior.  Mirrors vector steering's pattern of
-# ``_STEER_GAIN`` applying only to additive vector mode (here both
-# modes need a gain, additive needs more); the additive gain is
-# stamped as ``angular × _STEER_GAIN`` so the multiplicative
-# relationship between the operators stays consistent across
-# vector/manifold steering.
-_MANIFOLD_GAIN_ANGULAR = 8.0
-_MANIFOLD_GAIN_ADDITIVE = _MANIFOLD_GAIN_ANGULAR * _STEER_GAIN  # = 16.0
+# Per-mode because the operators are differently lossy: angular
+# (``subspace_rotate``) rotates ``h_par`` by an exact angle, no rescale;
+# additive (``subspace_replace``) blends then norm-restores, which
+# partially undoes the move, so it needs ~2× the budget — stamped as
+# ``angular × _STEER_GAIN`` to keep the vector/manifold relationship
+# consistent.  The lever ``N`` subsumes the former additive-only
+# ``1/√EV`` quality factor: ``N`` measures the actual steering lever
+# directly (and for both modes), where EV was only a proxy for it.
+#
+# Calibrated on the gemma-4-31b whitened-``personas`` α/R sweep: with the
+# lever normalization, ``base = 2.0`` puts ``α ≈ 0.5`` at the mild-coherent
+# point and ``α ≈ 1.0`` at strong persona expression — so the vector-
+# comparable "``α ≈ 0.5``, tune per target" idiom carries over unchanged,
+# with headroom to push (α is clamped to [0, 1], so the base is the
+# strength ceiling).  The lever normalization makes this hold across
+# subspace dimension and selection metric; per-persona strength variance
+# remains (a hard persona like ``caveman`` peaks near its coherence edge
+# at α≈1, where a robust one like ``hacker`` still has room — tune α down
+# per target).
+_MANIFOLD_GAIN_ANGULAR = 2.0
+_MANIFOLD_GAIN_ADDITIVE = _MANIFOLD_GAIN_ANGULAR * _STEER_GAIN  # = 4.0
+
+# Floor on the share-weighted lever ``N`` so a near-degenerate (tiny-
+# lever) fit can't send the effective gain ``base / N`` to infinity.
+_MIN_MANIFOLD_LEVER = 0.01
+
+# One-time saturation warnings, keyed by manifold name.
+_warned_manifold_saturated: set[str] = set()
 
 
 def _redistribute_budget(
@@ -1183,56 +1201,37 @@ class SteeringManager:
 
             shares: dict[int, float] = m.get("shares", {})
 
-            # Dispatch the per-mode gain.  Angular and additive
-            # manifold injections have different per-α behavioral
-            # magnitudes (see the gain constants' docstring); the
-            # session injection mode determines which one we calibrate
-            # against here.  Per-call ``Steering.injection_mode``
-            # overrides flow through ``self.injection_mode`` already.
+            # Dispatch the per-mode base gain.  Per-call
+            # ``Steering.injection_mode`` overrides flow through
+            # ``self.injection_mode`` already.
             if self.injection_mode == "angular":
-                manifold_gain = _MANIFOLD_GAIN_ANGULAR
+                base_gain = _MANIFOLD_GAIN_ANGULAR
             else:
-                manifold_gain = _MANIFOLD_GAIN_ADDITIVE
+                base_gain = _MANIFOLD_GAIN_ADDITIVE
 
-            # Additive-mode fit-quality normalization (v4+ manifolds
-            # only).  The replace operator's per-α behavioral magnitude
-            # scales with the per-layer centroid magnitude ``||target
-            # - h_par||``, which in turn reflects how much of the
-            # inter-node variance the chosen R-dim subspace captured.
-            # A poorly-fitted manifold (mean EV ratio ≪ 1) blends
-            # weakly at a given α; ``1/√mean_EV`` boosts α to roughly
-            # equalize behavioral strength across manifolds of varying
-            # fit quality.  Angular mode skips this — ``subspace_rotate``
-            # is direction-only (the rotation angle is α·θ_max
-            # independent of ``||target||``), so EV affects coherence
-            # of the rotation direction but not its magnitude, and no
-            # α correction can help with that.  Falls back to 1.0 on
-            # pre-v4 manifolds with no EV recorded — legacy fits
-            # behave as they did before this change.
-            if (
-                self.injection_mode == "additive"
-                and manifold.explained_variance
-            ):
-                mean_ev = sum(manifold.explained_variance.values()) / len(
-                    manifold.explained_variance
-                )
-                # Clamp the boost so a degenerate near-zero-EV manifold
-                # doesn't multiply α by ∞.  At mean_ev=0.01 the factor
-                # caps at 10×, well past any sensible regime.
-                quality_factor = 1.0 / math.sqrt(max(mean_ev, 0.01))
+            # Lever normalization (replaces the former additive-only
+            # ``1/√EV`` quality factor — see the gain constants' docstring).
+            # The per-α behavioral magnitude scales with the manifold's
+            # *lever* ``f_L = E_neutral[||h_par_c||/||h||]``: a bigger
+            # subspace (larger R) or a rogue-heavy Euclidean fit captures
+            # more of ``||h||`` ⇒ steers harder at the same α.  Dividing the
+            # gain by the share-weighted lever ``N = Σ_L share_L·f_L`` makes
+            # the effect invariant to subspace dimension *and* to
+            # subspace-selection metric, so a 4-dim and a 16-dim fit — or a
+            # Euclidean and a whitened fit — reach comparable behavior at the
+            # same user α.  Baked all-or-nothing alongside the whitened
+            # share; a fit without it (no neutral activations at fit time)
+            # uses ``N = 1`` (the un-normalized base gain) for that
+            # degenerate path.
+            lever = getattr(manifold, "lever", None)
+            if lever and all(L in lever for L in manifold.layers):
+                N = sum(shares[L] * lever[L] for L in manifold.layers)
+                gain = base_gain / max(N, _MIN_MANIFOLD_LEVER)
             else:
-                quality_factor = 1.0
+                gain = base_gain
 
-            # ``_MANIFOLD_GAIN_*`` pin the user-facing α scale into
-            # vector-comparable territory; share-weighting alone leaves the
-            # cumulative budget at ``α · θ_max`` which is too small to drive
-            # a visible effect through the manifold's ``h_par``-only
-            # injection geometry.  The ``quality_factor`` is 1.0 outside
-            # additive-mode + v4-manifold combinations.
             raw_alpha: dict[int, float] = {
-                layer_idx: (
-                    alpha * shares[layer_idx] * manifold_gain * quality_factor
-                )
+                layer_idx: alpha * shares[layer_idx] * gain
                 for layer_idx in manifold.layers
             }
             # Angular mode reads ``effective_alpha`` as a rotation budget
@@ -1248,6 +1247,32 @@ class SteeringManager:
             # share-weighted value.
             if self.injection_mode == "angular":
                 eff_alpha = _redistribute_budget(raw_alpha)
+                # Saturation tell: water-fill caps each layer at θ_max, so
+                # the cumulative budget maxes at ``n_layers``.  If it pins
+                # near that ceiling, the manifold's lever is maxed — the
+                # rotation operator can't push the persona harder no matter
+                # how much α rises (switch to additive, or raise θ_max).
+                # This is the small-lever regime a heavily de-rogued fit can
+                # hit; warn once so a flat-at-high-α sweep isn't mistaken
+                # for a calibration bug.
+                n_lay = len(eff_alpha)
+                if (
+                    alpha > 0.0
+                    and n_lay > 0
+                    and sum(eff_alpha.values()) >= 0.98 * n_lay
+                    and mname not in _warned_manifold_saturated
+                ):
+                    _warned_manifold_saturated.add(mname)
+                    import warnings
+                    warnings.warn(
+                        f"manifold {mname!r} saturates the angular rotation "
+                        f"budget at α={alpha:.2f} (every layer at θ_max): the "
+                        f"rotation operator is maxed (small in-subspace lever "
+                        f"and/or high α·gain), so it can't steer harder past "
+                        f"this point. Use additive mode or raise theta_max to "
+                        f"push further.",
+                        stacklevel=2,
+                    )
             else:
                 eff_alpha = raw_alpha
 

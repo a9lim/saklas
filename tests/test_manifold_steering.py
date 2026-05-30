@@ -13,6 +13,7 @@ from saklas.core.hooks import (
     _MANIFOLD_GAIN_ADDITIVE,
     _MANIFOLD_GAIN_ANGULAR,
     _manifold_layer_shares,
+    InjectionMode,
     SteeringHook,
     SteeringManager,
 )
@@ -60,12 +61,24 @@ def _circle(k: int, dim: int, scale: float = 1.0) -> torch.Tensor:
     return out
 
 
-def _manifold(layers: Sequence[int] = (0, 1)) -> Manifold:
-    """A 1-D periodic (loop) manifold over 6 nodes."""
+def _manifold(
+    layers: Sequence[int] = (0, 1),
+    *,
+    lever: float | dict[int, float] | None = None,
+) -> Manifold:
+    """A 1-D periodic (loop) manifold over 6 nodes.
+
+    ``lever`` stamps a per-layer steering lever ``f_L`` (a float applies to
+    every layer, a dict gives per-layer values).  ``None`` leaves the lever
+    empty, so ``apply_to_model`` falls back to ``N = 1`` (no normalization)
+    — the pre-lever gain scale, which most of these hook-math tests assert
+    against.  A stamped lever exercises the ``effective_gain = base / N``
+    path.
+    """
     domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
-    return Manifold(
+    mf = Manifold(
         name="mood",
         domain=domain,
         node_labels=[f"n{i}" for i in range(6)],
@@ -76,6 +89,13 @@ def _manifold(layers: Sequence[int] = (0, 1)) -> Manifold:
         },
         feature_space="raw",
     )
+    if lever is not None:
+        mf.lever = (
+            {L: float(lever) for L in layers}
+            if isinstance(lever, (int, float))
+            else dict(lever)
+        )
+    return mf
 
 
 def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
@@ -282,8 +302,8 @@ def test_manager_share_weighting_sums_to_user_alpha():
     regime (where the cap does bite) is covered by
     ``test_manager_angular_budget_caps_per_layer`` below.
     """
-    # 0.1 · 8.0 = 0.8 ≤ 1.0, so even a single layer holds the whole
-    # budget without saturating.
+    # 0.1 · 2.0 = 0.2 ≤ 1.0, so even a single layer holds the whole
+    # budget without saturating. (No lever on these stubs ⇒ N=1.)
     user_alpha = 0.1
     for n_layers in (1, 2, 4):
         manifold = _manifold(layers=tuple(range(n_layers)))
@@ -316,15 +336,22 @@ def test_manager_angular_budget_caps_per_layer():
     n_layers)``.  Additive mode keeps the raw share-weighted value (a
     blend fraction, no θ_max ceiling).
     """
+    import saklas.core.hooks as hooks_mod
     n_layers = 3
-    manifold = _manifold(layers=tuple(range(n_layers)))
-    # α=1.0, gain 8.0 ⇒ raw cumulative 8.0 ≫ n_layers=3 ⇒ every layer
-    # saturates at 1.0.
+    lever = 0.2
+    # Small lever ⇒ effective gain = base / N = 2.0 / 0.2 = 10; at α=1.0 the
+    # raw cumulative budget 10 ≫ n_layers=3 ⇒ every layer saturates at 1.0.
+    manifold = _manifold(layers=tuple(range(n_layers)), lever=lever)
+    eff_gain = _MANIFOLD_GAIN_ANGULAR / lever
     mgr = SteeringManager(injection_mode="angular")
     mgr.add_manifold("mood", manifold, position=(0.5,), alpha=1.0)
-    mgr.apply_to_model(
-        _model_layers(n_layers), torch.device("cpu"), torch.float32,
-    )
+    # The saturation tell fires once per manifold name; clear it so this
+    # test sees its own warning regardless of order.
+    hooks_mod._warned_manifold_saturated.discard("mood")
+    with pytest.warns(UserWarning, match="saturates the angular rotation budget"):
+        mgr.apply_to_model(
+            _model_layers(n_layers), torch.device("cpu"), torch.float32,
+        )
     budgets = [
         grp[4]
         for hook in mgr.hooks.values()
@@ -333,12 +360,13 @@ def test_manager_angular_budget_caps_per_layer():
     assert budgets, "expected manifold groups to be attached"
     for b in budgets:
         assert b <= 1.0 + 1e-6, f"layer rotates past θ_max: {b}"
+    # Saturated ⇒ cumulative pins at the ceiling min(α · eff_gain, n_layers).
     assert sum(budgets) == pytest.approx(
-        min(1.0 * _MANIFOLD_GAIN_ANGULAR, n_layers), abs=1e-4,
+        min(1.0 * eff_gain, n_layers), abs=1e-4,
     )
 
-    # Additive: same α, no per-layer cap — the raw share-weighted blend
-    # fractions stand (they can exceed 1.0; the operator norm-restores).
+    # Additive: same α / lever, no per-layer cap — the raw share-weighted
+    # blend fractions stand (they exceed 1.0; the operator norm-restores).
     mgr_add = SteeringManager(injection_mode="additive")
     mgr_add.add_manifold("mood", manifold, position=(0.5,), alpha=1.0)
     mgr_add.apply_to_model(
@@ -349,64 +377,61 @@ def test_manager_angular_budget_caps_per_layer():
         for hook in mgr_add.hooks.values()
         for grp in hook.manifold_groups
     ]
-    # Cumulative additive budget is the un-capped α · _MANIFOLD_GAIN_ADDITIVE.
+    # Cumulative additive budget is the un-capped α · (_MANIFOLD_GAIN_ADDITIVE / N).
     assert sum(add_budgets) == pytest.approx(
-        1.0 * _MANIFOLD_GAIN_ADDITIVE, abs=1e-4,
+        1.0 * _MANIFOLD_GAIN_ADDITIVE / lever, abs=1e-4,
     )
 
 
-def test_manager_additive_ev_normalization():
-    """Additive mode boosts α inversely with the manifold's mean EV
-    ratio.  Two single-layer manifolds with different stamped EVs
-    should produce different effective α at the same user α; the
-    poorly-fitted one gets the larger boost.  Angular mode skips this
-    normalization (direction-only operator)."""
-    user_alpha = 0.3
-    well_fitted_ev = 0.95
-    poor_fitted_ev = 0.30
+def test_manager_lever_normalization():
+    """Both modes divide the gain by the share-weighted lever ``N``.
 
-    def _make(ev: float) -> Manifold:
-        m = _manifold(layers=(0,))
-        m.explained_variance[0] = ev
-        return m
+    Two single-layer manifolds identical but for their stamped lever
+    ``f_L`` should produce effective α inversely proportional to ``N`` (a
+    smaller-lever fit gets a proportionally larger gain).  This is the
+    normalization that makes the per-α effect invariant to subspace
+    dimension and selection metric — and it applies to *both* injection
+    modes (it replaces the former additive-only ``1/√EV`` quality
+    factor).  A manifold with no lever falls back to ``N = 1`` (the
+    un-normalized base gain).
+    """
+    # Kept small enough that angular stays unsaturated for both levers
+    # (effective α = base·user_α/N ≤ 1, so the per-layer water-fill cap
+    # doesn't pin either value and flatten the ratio): the larger
+    # effective α is the additive small-lever case 4·0.15/0.4 = 1.5, which
+    # additive leaves uncapped; the largest angular value is 2·0.15/0.4 =
+    # 0.75 ≤ 1.
+    user_alpha = 0.15
+    big_lever = 0.8
+    small_lever = 0.4
 
-    well = _make(well_fitted_ev)
-    poor = _make(poor_fitted_ev)
+    def _eff(mode: InjectionMode, mf: Manifold) -> float:
+        mgr = SteeringManager(injection_mode=mode)
+        mgr.add_manifold("m", mf, position=(0.5,), alpha=user_alpha)
+        mgr.apply_to_model(
+            _model_layers(1), torch.device("cpu"), torch.float32,
+        )
+        return mgr.hooks[0].manifold_groups[0][4]
 
-    # Additive mode: EV normalization is applied (poor manifold gets
-    # boosted by 1/√EV).
-    mgr_well_add = SteeringManager(injection_mode="additive")
-    mgr_well_add.add_manifold("w", well, position=(0.5,), alpha=user_alpha)
-    mgr_well_add.apply_to_model(
-        _model_layers(1), torch.device("cpu"), torch.float32,
-    )
-    mgr_poor_add = SteeringManager(injection_mode="additive")
-    mgr_poor_add.add_manifold("p", poor, position=(0.5,), alpha=user_alpha)
-    mgr_poor_add.apply_to_model(
-        _model_layers(1), torch.device("cpu"), torch.float32,
-    )
-    alpha_well_add = mgr_well_add.hooks[0].manifold_groups[0][4]
-    alpha_poor_add = mgr_poor_add.hooks[0].manifold_groups[0][4]
-    assert alpha_poor_add > alpha_well_add
-    # Ratio matches 1/√EV.
-    expected_ratio = math.sqrt(well_fitted_ev / poor_fitted_ev)
-    actual_ratio = alpha_poor_add / alpha_well_add
-    assert actual_ratio == pytest.approx(expected_ratio, rel=0.01)
+    modes: list[InjectionMode] = ["angular", "additive"]
+    for mode in modes:
+        big = _manifold(layers=(0,), lever=big_lever)
+        small = _manifold(layers=(0,), lever=small_lever)
+        none = _manifold(layers=(0,))  # no lever -> N = 1
 
-    # Angular mode: EV is ignored; both manifolds get the same α.
-    mgr_well_ang = SteeringManager(injection_mode="angular")
-    mgr_well_ang.add_manifold("w", well, position=(0.5,), alpha=user_alpha)
-    mgr_well_ang.apply_to_model(
-        _model_layers(1), torch.device("cpu"), torch.float32,
-    )
-    mgr_poor_ang = SteeringManager(injection_mode="angular")
-    mgr_poor_ang.add_manifold("p", poor, position=(0.5,), alpha=user_alpha)
-    mgr_poor_ang.apply_to_model(
-        _model_layers(1), torch.device("cpu"), torch.float32,
-    )
-    alpha_well_ang = mgr_well_ang.hooks[0].manifold_groups[0][4]
-    alpha_poor_ang = mgr_poor_ang.hooks[0].manifold_groups[0][4]
-    assert alpha_well_ang == pytest.approx(alpha_poor_ang, abs=1e-6)
+        a_big = _eff(mode, big)
+        a_small = _eff(mode, small)
+        a_none = _eff(mode, none)
+        # Smaller lever ⇒ larger effective gain (base / N).
+        assert a_small > a_big
+        # Ratio is exactly the inverse lever ratio (single layer ⇒
+        # N = lever; share = 1).
+        assert a_small / a_big == pytest.approx(big_lever / small_lever, rel=1e-4)
+        # No-lever fit uses the un-normalized base gain (N = 1).
+        base = _MANIFOLD_GAIN_ANGULAR if mode == "angular" else _MANIFOLD_GAIN_ADDITIVE
+        assert a_none == pytest.approx(user_alpha * base, abs=1e-6)
+        # And the big-lever effective α is base·α/N.
+        assert a_big == pytest.approx(user_alpha * base / big_lever, abs=1e-4)
 
 
 def test_manager_per_mode_gain_dispatch():
@@ -422,7 +447,7 @@ def test_manager_per_mode_gain_dispatch():
     # ``user_alpha · gain`` exactly — clean comparison across modes.
     # Kept in the unsaturated angular regime (``α · gain ≤ 1``) so the
     # per-layer water-fill cap doesn't pin the angular value and mask the
-    # gain comparison: 0.1 · 8.0 = 0.8 ≤ 1.0.
+    # gain comparison: 0.1 · 2.0 = 0.2 ≤ 1.0. (No lever ⇒ N=1.)
     user_alpha = 0.1
     mgr_ang = SteeringManager(injection_mode="angular")
     mgr_ang.add_manifold("m", manifold, position=(0.5,), alpha=user_alpha)
@@ -474,7 +499,7 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     )
     # Kept in the unsaturated regime (each layer's budget ≤ 1.0) so the
     # angular water-fill cap doesn't flatten the 1:2 ratio: the wider
-    # share is ``(2/3) · α · 8`` ≤ 1.0 for α ≤ 0.1875.
+    # share is ``(2/3) · α · 2`` ≤ 1.0 for α ≤ 0.75. (No lever ⇒ N=1.)
     user_alpha = 0.15
     mgr = SteeringManager(injection_mode="angular")
     mgr.add_manifold("mood", manifold, position=(0.5,), alpha=user_alpha)
