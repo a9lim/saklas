@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 
@@ -92,4 +92,4 @@ def register_manifold_probe_routes(app: FastAPI) -> None:
         if name not in attached_names:
             raise HTTPException(404, f"manifold probe '{name}' not attached")
         session.remove_manifold_probe(name)
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)

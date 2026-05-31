@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from saklas.server import saklas_api as _api
@@ -46,7 +46,7 @@ def register_probe_routes(app: FastAPI) -> None:
             session.probe(name)
         except (KeyError, ValueError, FileNotFoundError) as e:
             raise HTTPException(400, f"probe '{name}' not available: {e}")
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.delete("/saklas/v1/sessions/{session_id}/probes/{name}", status_code=204)
     def deactivate_probe(session_id: str, name: str):
@@ -54,7 +54,7 @@ def register_probe_routes(app: FastAPI) -> None:
         if name not in session.probes:
             raise HTTPException(404, f"probe '{name}' not active")
         session.unprobe(name)
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/probe")
     async def score_probe_oneshot(session_id: str, req: ScoreProbeRequest):

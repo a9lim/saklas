@@ -7,7 +7,7 @@ from typing import Any, cast
 import logging
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 
 from saklas.server.saklas_api import (
     CreateSessionRequest,
@@ -48,7 +48,7 @@ def register_session_routes(app: FastAPI) -> None:
             "DELETE /saklas/v1/sessions/%s: single-session mode, no-op",
             session_id,
         )
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.patch("/saklas/v1/sessions/{session_id}")
     def patch_session(session_id: str, req: PatchSessionRequest):
@@ -76,7 +76,7 @@ def register_session_routes(app: FastAPI) -> None:
     def clear_session(session_id: str):
         _resolve_session_id(session, session_id)
         session.clear_history()
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/rewind", status_code=204)
     def rewind_session(session_id: str):
@@ -84,4 +84,4 @@ def register_session_routes(app: FastAPI) -> None:
         if not session.history:
             raise HTTPException(400, "History is empty")
         session.rewind()
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)

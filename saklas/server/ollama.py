@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from saklas.core.errors import SaklasError
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
@@ -537,8 +537,10 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     @app.head("/")
     def api_head_root():
-        # Ollama clients hit HEAD / to probe liveness.
-        return JSONResponse(status_code=200, content=None)
+        # Ollama clients hit HEAD / to probe liveness.  A HEAD response
+        # carries no body, so return a bodyless 200 rather than a JSON
+        # payload (which advertised a bogus Content-Length / content-type).
+        return Response(status_code=200)
 
     # -----------------------------------------------------------------------
     # Generation endpoints

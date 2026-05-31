@@ -33,7 +33,7 @@ from collections import deque
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
@@ -834,7 +834,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         _resolve_session_id(session, session_id)
         async with session.lock:
             session.clear_history()
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/transcript")
     def tree_transcript(session_id: str, req: TreeTranscriptRequest):
@@ -1401,7 +1401,7 @@ def register_saklas_routes(app: FastAPI) -> None:
             app.state.default_steering = (
                 _replace(ds, alphas=new_alphas) if new_alphas else None
             )
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/extract")
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
