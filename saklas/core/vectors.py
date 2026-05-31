@@ -985,6 +985,7 @@ def extract_contrastive(
     *,
     sae: "SaeBackend | None" = None,
     concept_label: str | None = None,
+    whitener: "Any | None" = None,
     dls: bool = True,
     layer_means: dict[int, torch.Tensor] | None = None,
     role: str | None = None,
@@ -1013,6 +1014,22 @@ def extract_contrastive(
     diagnostics machinery — only the per-layer direction computation
     differs.
 
+    **Whitened / Fisher PCA (``whitener`` given, raw multi-pair path).**
+    With a ``whitener`` covering every scored layer (all-or-nothing, the
+    same gate DiM / manifold-fit / monitor use), the per-layer direction
+    is the top generalized eigenvector of ``(diffᵀdiff, Σ)`` rather than
+    the ordinary principal component of the diffs — the de-rogued
+    selection :func:`saklas.core.manifold.fit_layer_subspace` uses for
+    manifolds, here at ``R = 1``.  Rogue dims carry huge background
+    variance ``vᵀΣv`` so they divide out of the ratio.  The score becomes
+    the whitened EV ratio (top generalized eigenvalue / Σ) — the
+    metric-appropriate analogue of the Euclidean explained-variance ratio.
+    A single pair (no covariance to fit) whitens only the score, matching
+    the DiM single-pair path.  **The SAE feature-space branch ignores the
+    whitener** — the residual-stream Σ doesn't apply in feature space, and
+    a unit principal component carries no signal magnitude to whiten — so
+    SAE-PCA stays on EVR.
+
     **DLS replaces edge-drop in v2.1.**  The `drop_edges` parameter is
     gone; the layer mask is now derived from the data itself via
     :func:`compute_dls_mask` (centered Selective-Steering, Dang & Ngo
@@ -1033,6 +1050,12 @@ def extract_contrastive(
         concept_label: Optional human-readable name surfaced in the
             soft-warning text when diagnostics flag a degenerate probe.
             Defaults to a generic label.
+        whitener: Optional :class:`~saklas.core.mahalanobis.LayerWhitener`.
+            When it covers every scored layer, the raw multi-pair path
+            switches to whitened/Fisher PCA and the score to the whitened
+            EV ratio (see above); single-pair whitens the score only.
+            Ignored on the SAE branch and on partial coverage (Euclidean
+            PCA + EVR for all layers).
         dls: When ``True`` (default since v2.1), apply the centered
             DLS mask via :func:`compute_dls_mask`.  When ``False``,
             keep every layer — the path tests use for small mock models
@@ -1155,6 +1178,21 @@ def extract_contrastive(
     raw = {}
     diagnostics_per_layer = {}
 
+    # All-or-nothing metric gate over the full scored-layer set
+    # (``range(n_layers)``), mirroring the DiM path: whiten every layer or
+    # none.  When set, multi-pair extraction selects each layer's direction
+    # by **whitened / Fisher PCA** — the top generalized eigenvector of
+    # ``(diffᵀdiff, Σ)`` — instead of ordinary PCA of the diffs, the exact
+    # de-rogued subspace selection ``fit_layer_subspace`` uses for
+    # manifolds.  The score becomes the whitened EV ratio (top generalized
+    # eigenvalue / sum) — the metric-appropriate analogue of the Euclidean
+    # explained-variance ratio.  Single-pair (no covariance to fit)
+    # whitens only the score, matching the DiM single-pair path.
+    maha_w = (
+        whitener if whitener is not None
+        and whitener.covers_all(range(n_layers)) else None
+    )
+
     if n_pairs < 2:
         # Single pair: score as diff norm relative to activation magnitude.
         # This produces values in roughly the same range as the
@@ -1170,7 +1208,13 @@ def extract_contrastive(
             ref_norm = norm_sums_cpu[idx] / n_norm_samples
             direction = _normalize(diff_vec, ref_norm=ref_norm)
             activation_norm = norm_sums_cpu[idx]  # pos_norm + neg_norm
-            score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
+            if maha_w is not None:
+                # Mahalanobis score on the single diff (no PCA to whiten at
+                # N=1) — mirrors the DiM single-pair path.
+                m_norm = maha_w.mahalanobis_norm(idx, diff_vec)
+                score = m_norm / max(activation_norm, 1e-8)
+            else:
+                score = diff_norms_cpu[idx] / max(activation_norm, 1e-8)
             raw[idx] = (direction, score)
             # Single-pair diagnostics carry only what's defined for N=1
             # (intra mean = the single diff norm, std = 0, alignment / proj
@@ -1179,6 +1223,39 @@ def extract_contrastive(
             diagnostics_per_layer[idx] = _compute_layer_diagnostics(
                 diff_vec.unsqueeze(0),
                 direction,
+                score,
+            )
+    elif maha_w is not None:
+        # Whitened / Fisher PCA, per layer (each layer has its own Σ_L⁻¹,
+        # so no batched SVD — extraction is one-shot, not a hot path).
+        # ``G = X_diff Σ⁻¹ X_diffᵀ`` is ``(N, N)`` (``subspace_gram`` over
+        # the N diff rows); its top eigvec ``a`` gives the discriminant
+        # direction ``v = Σ⁻¹ X_diffᵀ a`` — same construction as
+        # ``fit_layer_subspace`` at ``R = 1``.  Rogue dims have huge
+        # background variance ``vᵀΣv`` so they divide out of the ratio.
+        for idx in range(n_layers):
+            Xd = torch.stack(diffs_per_layer[idx])  # (N, D) fp32
+            ref_norm = norm_sums_cpu[idx] / n_norm_samples
+            G = maha_w.subspace_gram(idx, Xd)            # (N, N) = Xd Σ⁻¹ Xdᵀ
+            mu, A = torch.linalg.eigh(G)                  # ascending
+            mu_pos = mu.clamp_min(0.0)
+            top = int(torch.argmax(mu).item())
+            XtA = Xd.transpose(0, 1) @ A[:, top]          # (D,) = X_diffᵀ a
+            direction = maha_w.apply_inv(idx, XtA)        # (D,) = Σ⁻¹ X_diffᵀ a
+            # Orient so "positive" stays positive (device-agnostic dot).
+            dots = Xd @ direction.to(Xd.device)
+            if (dots < 0).sum() > (dots > 0).sum():
+                direction = -direction
+            total_w = float(mu_pos.sum().item())
+            score = (
+                float(mu_pos[top].item()) / total_w if total_w > 1e-12 else 1.0
+            )
+            raw[idx] = (
+                _normalize(direction.to(device), ref_norm=ref_norm), score,
+            )
+            diagnostics_per_layer[idx] = _compute_layer_diagnostics(
+                Xd,
+                direction.detach().to(Xd.device),
                 score,
             )
     else:

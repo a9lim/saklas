@@ -1491,10 +1491,41 @@ def _run_transfer(args: argparse.Namespace) -> None:
         else:
             median_quality = 0.5 * (ordered[mid - 1] + ordered[mid])
 
+    # Build the target-model whitener so the transferred share is re-baked
+    # in the *target* metric (else it inherits the source model's
+    # anisotropy).  Both the fit and cached-alignment paths leave the
+    # target neutral-activation cache on disk (the alignment was computed
+    # from it), so read it directly and center by its own per-layer mean —
+    # the neutral mean *is* the probe-centering baseline, so this needs no
+    # layer_means cache.  Soft ``None`` on any miss → ``transfer_profile``
+    # leaves the Euclidean (source-share) bake untouched.
+    target_whitener = None
+    try:
+        import torch as _torch
+        from safetensors.torch import load_file as _load_file
+
+        from saklas.core.mahalanobis import LayerWhitener
+        from saklas.io.paths import model_dir as _model_dir
+
+        _acts_path = _model_dir(args.tgt_model) / "neutral_activations.safetensors"
+        if _acts_path.is_file():
+            _raw = _load_file(str(_acts_path))
+            _acts = {
+                int(k.split("_", 1)[1]): v.to(_torch.float32)
+                for k, v in _raw.items()
+            }
+            _means = {L: t.mean(dim=0) for L, t in _acts.items()}
+            target_whitener = LayerWhitener.from_neutral_activations(_acts, _means)
+    except Exception:
+        # Best-effort: a missing/degenerate target neutral cache just
+        # means the transfer stays Euclidean (sidecar records the bake).
+        target_whitener = None
+
     transferred = transfer_profile(
         src_profile, M,
         source_model_id=args.src_model,
         transfer_quality_estimate=median_quality,
+        whitener=target_whitener,
     )
 
     # Persist the alignment-map hash on the transferred sidecar so
@@ -2343,6 +2374,37 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
 
     median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
 
+    # Target whitener + layer means for the share/lever re-bake (mirrors
+    # ``_run_transfer``).  Read the target neutral cache directly and
+    # center by its own per-layer mean — the neutral mean *is* the
+    # probe-centering baseline, so no layer_means cache is needed and
+    # ``layer_lever`` gets the same means the whitener centers by.  Soft
+    # ``None`` → ``transfer_manifold`` clears share + lever (Euclidean
+    # fallback at apply).
+    target_whitener = None
+    target_layer_means = None
+    try:
+        import torch as _torch
+        from safetensors.torch import load_file as _load_file
+
+        from saklas.core.mahalanobis import LayerWhitener
+        from saklas.io.paths import model_dir as _model_dir
+
+        _acts_path = _model_dir(args.tgt_model) / "neutral_activations.safetensors"
+        if _acts_path.is_file():
+            _raw = _load_file(str(_acts_path))
+            _acts = {
+                int(k.split("_", 1)[1]): v.to(_torch.float32)
+                for k, v in _raw.items()
+            }
+            target_layer_means = {L: t.mean(dim=0) for L, t in _acts.items()}
+            target_whitener = LayerWhitener.from_neutral_activations(
+                _acts, target_layer_means,
+            )
+    except Exception:
+        target_whitener = None
+        target_layer_means = None
+
     try:
         out_path = transfer_manifold(
             folder,
@@ -2350,6 +2412,8 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
             to_model=args.tgt_model,
             alignment=M,
             transfer_quality_estimate=median_quality,
+            whitener=target_whitener,
+            layer_means=target_layer_means,
             force=args.force,
         )
     except (FileNotFoundError, FileExistsError, ManifoldFormatError) as e:

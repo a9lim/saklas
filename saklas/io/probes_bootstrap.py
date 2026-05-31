@@ -212,8 +212,9 @@ def bootstrap_probes(
     method_label = (
         "difference_of_means" if method == "dim" else "contrastive_pca"
     )
-    # Whitener only affects DiM; PCA stays on EVR scoring (legacy path).
-    # DLS + layer_means flow into both extractors uniformly.
+    # Both extractors consume the whitener now: DiM bakes a Mahalanobis
+    # share, PCA selects a whitened/Fisher direction.  DLS + layer_means
+    # flow into both uniformly.
     extract_kwargs: dict[str, Any] = {"dls": dls, "layer_means": layer_means}
     bake_label = "euclidean"
     # All-or-nothing metric gate: only pass the whitener (and label the
@@ -222,8 +223,7 @@ def bootstrap_probes(
     # metric actually used.  The bundled-probe path is residual-stream only
     # (no SAE), so the scored set is every model layer.
     if (
-        method == "dim"
-        and whitener is not None
+        whitener is not None
         and whitener.covers_all(range(len(layers)))
     ):
         extract_kwargs["whitener"] = whitener

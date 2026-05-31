@@ -1230,6 +1230,53 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     assert out.name in mf.files
 
 
+def test_transfer_manifold_rebakes_share_and_lever_in_target_space(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A target whitener covering the transferred layers re-bakes the
+    Mahalanobis share + steering lever in target space (instead of
+    dropping them) and records ``share_metric == "mahalanobis"``."""
+    import torch
+    from saklas.core.mahalanobis import LayerWhitener
+    from saklas.core.manifold import load_manifold
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
+    )
+    src_model = "google/gemma-3-4b-it"
+    tgt_model = "Qwen/Qwen2.5-7B-Instruct"
+    src_tensor = _fit_real_manifold(folder, src_model, dim=6)
+    src_man = load_manifold(src_tensor)
+    align = {L: torch.eye(6) for L in src_man.layers}
+
+    # Target whitener + layer means over the fitted layers {4, 5, 6}.
+    g = torch.Generator().manual_seed(99)
+    acts = {L: torch.randn(120, 6, generator=g) for L in src_man.layers}
+    means = {L: torch.zeros(6) for L in src_man.layers}
+    w = LayerWhitener.from_neutral_activations(acts, means)
+
+    out = transfer_manifold(
+        folder, from_model=src_model, to_model=tgt_model,
+        alignment=align, whitener=w, layer_means=means,
+    )
+    tgt_man = load_manifold(out)
+
+    # Share + lever recomputed (not dropped), one per transferred layer.
+    assert set(tgt_man.mahalanobis_share.keys()) == set(src_man.layers)
+    assert set(tgt_man.lever.keys()) == set(src_man.layers)
+    for L in src_man.layers:
+        assert tgt_man.mahalanobis_share[L] > 0.0
+        assert 0.0 < tgt_man.lever[L] <= 1.0 + 1e-6
+    # They are *target*-metric values, not the source's hand-set share.
+    assert tgt_man.mahalanobis_share != src_man.mahalanobis_share
+    with open(out.with_suffix(".json")) as f:
+        sc = json.load(f)
+    assert sc["share_metric"] == "mahalanobis"
+
+
 def test_transfer_manifold_rotation_maps_subspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

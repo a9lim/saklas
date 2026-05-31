@@ -896,7 +896,11 @@ class SaklasSession:
                 self._model, self._tokenizer, self._layers, self._model_info,
                 probe_categories,
                 method=extraction_method,
-                whitener=self._whitener if extraction_method == "dim" else None,
+                # Both DiM and PCA now consume the whitener (DiM bakes a
+                # Mahalanobis share; PCA selects a whitened/Fisher direction
+                # on the raw path).  ``bootstrap_probes`` gates it
+                # all-or-nothing internally.
+                whitener=self._whitener,
                 layer_means=self._layer_means,
                 dls=self._dls,
             )
@@ -911,7 +915,9 @@ class SaklasSession:
         # ``@when:`` gates can fire on either tier without grammar
         # changes.  ``layer_means`` is passed for symmetry but the
         # manifold-side math uses each fit's per-layer mean.
-        self._manifold_monitor = ManifoldMonitor(layer_means=self._layer_means)
+        self._manifold_monitor = ManifoldMonitor(
+            layer_means=self._layer_means, whitener=self._whitener,
+        )
 
         # Prefix KV cache (opt-in, off by default).  Populated by
         # :meth:`cache_prefix`; consumed by :meth:`_generate_core` when the
@@ -1106,6 +1112,13 @@ class SaklasSession:
             monitor = getattr(self, "_monitor", None)
             if monitor is not None and self._whitener is not None:
                 monitor.set_whitener(self._whitener)
+            # Same for the manifold monitor: a lazily-built whitener flips
+            # its fraction + nearest-node readout to the whitened form for
+            # any attached manifold whose layers it covers, rebuilding the
+            # per-probe ``_LayerWhiten`` caches.
+            mmon = getattr(self, "_manifold_monitor", None)
+            if mmon is not None and self._whitener is not None:
+                mmon.set_whitener(self._whitener)
         return self._whitener
 
     def _build_whitener_from_cache_or_compute(self) -> "Any":

@@ -810,6 +810,36 @@ class AttachedManifoldProbe:
     embedded_node_coords: torch.Tensor | None = None
     # Per-layer EV weight, normalized to sum to 1 across attached layers.
     ev_weights: dict[int, float] = field(default_factory=dict)
+    # Per-layer Mahalanobis bundle, populated at attach **only** when the
+    # wired whitener covers every layer of this manifold (all-or-nothing
+    # per probe).  Each entry is ``_LayerWhiten`` — the precomputed factors
+    # that turn the per-token fraction + nearest-node distance into their
+    # whitened forms (M-orthogonal subspace projection + Mahalanobis
+    # distance).  Empty dict → the Euclidean readout (the legacy path).
+    whitened: dict[int, "_LayerWhiten"] = field(default_factory=dict)
+
+
+@dataclass
+class _LayerWhiten:
+    """Precomputed per-layer Mahalanobis factors for a manifold probe.
+
+    Built at attach from the wired :class:`LayerWhitener` + the layer's
+    subspace.  ``m_r_inv`` and ``chol`` are the ``(R, R)`` inverse and
+    lower-Cholesky factor of the subspace-restricted inverse covariance
+    ``M_R = B Σ⁻¹ Bᵀ`` (:meth:`LayerWhitener.subspace_gram`); ``node_white``
+    is the ``(K, R)`` node coords transformed into the whitened metric
+    (``v_reduced @ chol``) so a plain cdist against the transformed query
+    yields the true Mahalanobis distance restricted to the subspace.
+    ``(X, K_inv, lam)`` are the on-device Woodbury factors for the per-token
+    ``Σ⁻¹ x`` apply.  All tensors live on the manifold's fit device.
+    """
+
+    m_r_inv: torch.Tensor      # (R, R) = (B Σ⁻¹ Bᵀ)⁻¹
+    chol: torch.Tensor         # (R, R) lower-tri, M_R = chol @ cholᵀ
+    node_white: torch.Tensor   # (K, R) = node_values_reduced @ chol
+    X: torch.Tensor            # (N, D) centered neutral observations
+    K_inv: torch.Tensor        # (N, N) Woodbury inverse
+    lam: float                 # ridge λ
 
 
 class ManifoldMonitor:
@@ -842,6 +872,8 @@ class ManifoldMonitor:
     def __init__(
         self,
         layer_means: dict[int, torch.Tensor] | None = None,
+        *,
+        whitener: Any = None,
     ) -> None:
         # Stashed for symmetry with TraitMonitor; the manifold-side math
         # never reads global layer means — fraction centers on each
@@ -850,6 +882,13 @@ class ManifoldMonitor:
             dict(layer_means) if layer_means else {}
         )
         self._probes: dict[str, AttachedManifoldProbe] = {}
+        # Optional Mahalanobis whitener.  When wired and covering a
+        # manifold's fit layers, the per-token fraction + nearest-node
+        # distance switch to their whitened forms — the read-side analogue
+        # of the whitened/Fisher subspace the manifold was *fitted* in, and
+        # the peer of ``TraitMonitor``'s whitened cosine.  ``None`` keeps
+        # the Euclidean readout.
+        self._whitener: Any = whitener
         # Mirror TraitMonitor's pending-flag pattern so the TUI / webui
         # streaming surfaces can poll for "is a new per-token reading
         # available."
@@ -859,6 +898,142 @@ class ManifoldMonitor:
     def probe_names(self) -> list[str]:
         """Attached manifold-probe names in insertion order."""
         return list(self._probes.keys())
+
+    @property
+    def whitener(self) -> Any:
+        """The wired :class:`LayerWhitener` (or ``None`` for Euclidean reads)."""
+        return self._whitener
+
+    def set_whitener(self, whitener: Any) -> None:
+        """Wire (or clear) the Mahalanobis whitener and rebuild probe caches.
+
+        Idempotent on the same instance.  Any change re-derives the
+        per-probe :class:`_LayerWhiten` factors (a manifold whose layers
+        the new whitener covers gains a whitened readout; one it doesn't
+        falls back to Euclidean), so the next scoring call reflects the
+        new metric.  Mirrors :meth:`TraitMonitor.set_whitener` — the
+        session pushes the lazily-built whitener through here.
+        """
+        if whitener is self._whitener:
+            return
+        self._whitener = whitener
+        for probe in self._probes.values():
+            probe.whitened = self._build_whitened(probe.manifold, probe)
+
+    @staticmethod
+    def _woodbury_apply(
+        v: torch.Tensor, X: torch.Tensor, K: torch.Tensor, lam: float,
+    ) -> torch.Tensor:
+        """On-device ``Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K (X v))`` (Woodbury).
+
+        Identical formula to :meth:`TraitMonitor._woodbury_apply` — kept
+        local so the manifold hot path doesn't reach across classes (and
+        the trait hot path stays a self-contained staticmethod for the
+        throughput invariant).  ``v`` is ``[D]``; X ``[N, D]``, K ``[N, N]``.
+        """
+        Xv = v @ X.transpose(0, 1)        # [N]
+        KXv = Xv @ K.transpose(0, 1)      # [N]  (K symmetric)
+        return (v - KXv @ X) / lam        # [D]
+
+    def _build_whitened(
+        self, manifold: "Manifold", probe: AttachedManifoldProbe,
+    ) -> dict[int, _LayerWhiten]:
+        """Build the per-layer :class:`_LayerWhiten` map for a probe.
+
+        Returns an empty dict unless the wired whitener covers **every**
+        fit layer of ``manifold`` (all-or-nothing per probe, mirroring the
+        fraction/distance metric gate the fit + DiM bake use).  Off the hot
+        path — runs once at attach / on ``set_whitener``.
+        """
+        whitener = self._whitener
+        if whitener is None or not manifold.layers:
+            return {}
+        layers = list(manifold.layers.keys())
+        if not whitener.covers_all(layers):
+            return {}
+        out: dict[int, _LayerWhiten] = {}
+        for layer_idx, sub in manifold.layers.items():
+            v_reduced = probe.node_values_reduced.get(layer_idx)
+            if v_reduced is None:
+                return {}  # cache not built for this layer — bail to Euclidean
+            dev = v_reduced.device
+            basis = sub.basis.to(device=torch.device("cpu"), dtype=torch.float32)
+            # M_R = B Σ⁻¹ Bᵀ (R, R), PD for an orthonormal B and ridge-PD Σ.
+            m_r = whitener.subspace_gram(layer_idx, basis)  # CPU fp32
+            R = m_r.shape[0]
+            try:
+                chol = torch.linalg.cholesky(m_r)
+            except Exception:
+                # Defensive jitter for a near-singular subspace gram.
+                eye = torch.eye(R, dtype=m_r.dtype)
+                jitter = 1e-8 * float(m_r.diagonal().mean().clamp_min(1e-12))
+                chol = torch.linalg.cholesky(m_r + jitter * eye)
+            m_r_inv = torch.cholesky_inverse(chol)
+            X, K_inv, lam = whitener.woodbury_factors(
+                layer_idx, device=dev, dtype=torch.float32,
+            )
+            chol_dev = chol.to(device=dev, dtype=torch.float32)
+            out[layer_idx] = _LayerWhiten(
+                m_r_inv=m_r_inv.to(device=dev, dtype=torch.float32),
+                chol=chol_dev,
+                node_white=(v_reduced.to(torch.float32) @ chol_dev),
+                X=X, K_inv=K_inv, lam=lam,
+            )
+        return out
+
+    def _layer_geometry(
+        self,
+        probe: AttachedManifoldProbe,
+        layer_idx: int,
+        h: torch.Tensor,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Per-layer readout pieces, shared by the per-token + aggregate paths.
+
+        Returns ``(frac, cdist_query, invert_query, cdist_nodes)``:
+
+        * ``frac`` — scalar tensor in ``[0, 1]``, the in-subspace energy
+          share.  Euclidean: ``‖h_par_c‖ / ‖h − mean‖``.  Whitened: the
+          **M-orthogonal** share ``‖P_M(h−mean)‖_M / ‖h−mean‖_M`` =
+          ``sqrt(gᵀ M_R⁻¹ g) / ‖x‖_M`` with ``g = B Σ⁻¹ x`` (an M-norm
+          contraction, so still ``≤ 1``).
+        * ``cdist_query`` — ``(1, R)`` query for the nearest-node cdist, in
+          the metric space matching ``cdist_nodes`` (Euclidean reduced
+          coords, or ``c @ chol`` so a plain cdist is the Mahalanobis
+          distance).
+        * ``invert_query`` — ``(R,)`` query in the RBF's reduced-coord
+          space for ``invert_parameterization`` (Euclidean projection
+          coords, or the M-orthogonal projection coords ``c = M_R⁻¹ g``).
+        * ``cdist_nodes`` — ``(K, R)`` node coords in the same metric space
+          as ``cdist_query``.
+        """
+        sub = probe.manifold.layers[layer_idx]
+        mean = sub.mean.to(device=h.device, dtype=torch.float32)
+        basis = sub.basis.to(device=h.device, dtype=torch.float32)
+        wh = probe.whitened.get(layer_idx)
+        if wh is None:
+            h_par_c, _h_perp = decompose(h, mean, basis)
+            num = torch.linalg.vector_norm(h_par_c)
+            denom = torch.linalg.vector_norm(h - mean).clamp(
+                min=_FRACTION_EPSILON,
+            )
+            frac = (num / denom).clamp(min=0.0, max=1.0)
+            h_reduced = h_par_c @ basis.transpose(0, 1)  # (R,)
+            nodes = probe.node_values_reduced[layer_idx].to(
+                device=h.device, dtype=torch.float32,
+            )
+            return frac, h_reduced.reshape(1, -1), h_reduced, nodes
+        # Whitened: M-orthogonal subspace projection + Mahalanobis distance.
+        x = h - mean
+        sx = self._woodbury_apply(x, wh.X, wh.K_inv, wh.lam)  # Σ⁻¹ x  (D,)
+        x_mnorm = torch.sqrt(
+            (x * sx).sum().clamp(min=0.0)
+        ).clamp(min=_FRACTION_EPSILON)
+        g = basis @ sx                       # (R,) = B Σ⁻¹ x
+        c = wh.m_r_inv @ g                   # (R,) = M_R⁻¹ g  (M-proj coords)
+        par_mnorm = torch.sqrt((g * c).sum().clamp(min=0.0))  # ‖P_M x‖_M
+        frac = (par_mnorm / x_mnorm).clamp(min=0.0, max=1.0)
+        cdist_query = (c.reshape(1, -1) @ wh.chol)  # (1, R) — Lᵀc as row
+        return frac, cdist_query, c, wh.node_white
 
     @property
     def layer_means(self) -> dict[int, torch.Tensor]:
@@ -956,6 +1131,10 @@ class ManifoldMonitor:
             embedded_node_coords=embedded,
             ev_weights=ev_weights,
         )
+        # Build the Mahalanobis bundle when the wired whitener covers this
+        # manifold's layers (all-or-nothing per probe); empty otherwise →
+        # Euclidean readout.
+        probe.whitened = self._build_whitened(manifold, probe)
         self._probes[name] = probe
 
     def remove_probe(self, name: str) -> None:
@@ -1022,35 +1201,24 @@ class ManifoldMonitor:
             dist_acc: torch.Tensor | None = None
             frac_acc: torch.Tensor | None = None
             for layer_idx in shared:
-                sub = manifold.layers[layer_idx]
                 h = hidden_per_layer[layer_idx].to(torch.float32)
                 if h.ndim > 1:
                     # Hot-path captures are 1-D ``[D]`` slices, but
                     # defensively flatten to the last dim.
                     h = h.reshape(-1, h.shape[-1])[-1]
-                mean = sub.mean.to(device=h.device, dtype=torch.float32)
-                basis = sub.basis.to(device=h.device, dtype=torch.float32)
-                h_par_c, h_perp = decompose(h, mean, basis)
                 w = w_shared[layer_idx]
-                # Subspace fraction — accumulate on-device, no per-layer sync.
-                num = torch.linalg.vector_norm(h_par_c)
-                denom = torch.linalg.vector_norm(h - mean).clamp(
-                    min=_FRACTION_EPSILON,
+                # Whichever metric (Euclidean or whitened M-orthogonal),
+                # ``_layer_geometry`` returns the fraction + the cdist
+                # query/nodes in matching coords.
+                frac, cdist_query, _invert, cdist_nodes = self._layer_geometry(
+                    probe, layer_idx, h,
                 )
-                frac = (num / denom).clamp(min=0.0, max=1.0)
                 frac_contrib = w * frac
                 frac_acc = (
                     frac_contrib if frac_acc is None
                     else frac_acc + frac_contrib
                 )
-                # Per-node distance in reduced-subspace coords.  ``h_par_c``
-                # in world-space coords; project to reduced via the same
-                # ``basis`` so the cdist runs in R-dim, K is small.
-                h_reduced = (h_par_c @ basis.T).reshape(1, -1)  # (1, R)
-                v_reduced = probe.node_values_reduced[layer_idx].to(
-                    device=h.device, dtype=torch.float32,
-                )  # (K, R)
-                dists = torch.cdist(h_reduced, v_reduced).reshape(-1)  # (K,)
+                dists = torch.cdist(cdist_query, cdist_nodes).reshape(-1)  # (K,)
                 contrib = w * dists
                 dist_acc = (
                     contrib if dist_acc is None else dist_acc + contrib
@@ -1180,39 +1348,38 @@ class ManifoldMonitor:
                 h = pooled[layer_idx].to(torch.float32)
                 if h.ndim > 1:
                     h = h.reshape(-1, h.shape[-1])[-1]
-                mean = sub.mean.to(device=h.device, dtype=torch.float32)
-                basis = sub.basis.to(device=h.device, dtype=torch.float32)
-                h_par_c, _h_perp = decompose(h, mean, basis)
-                num = torch.linalg.vector_norm(h_par_c)
-                centered_norm = torch.linalg.vector_norm(h - mean).clamp(
-                    min=_FRACTION_EPSILON,
+                # Shared metric branch: ``frac`` is the (whitened
+                # M-orthogonal or Euclidean) in-subspace share; ``cdist_*``
+                # are matched-space nearest-node coords; ``invert_query`` is
+                # the reduced-coord query for ``invert_parameterization``
+                # (the M-orthogonal projection coords when whitened).
+                frac_t, cdist_query, invert_query, cdist_nodes = (
+                    self._layer_geometry(probe, layer_idx, h)
                 )
-                frac = float(
-                    (num / centered_norm).clamp(min=0.0, max=1.0).item()
-                )
+                frac = float(frac_t.item())
                 frac_per_layer[layer_idx] = frac
                 w = w_shared[layer_idx]
                 frac_mean += w * frac
 
-                # Nearest-node distances in reduced-subspace coords.
-                h_reduced = (h_par_c @ basis.T).reshape(1, -1)  # (1, R)
-                v_reduced = probe.node_values_reduced[layer_idx].to(
-                    device=h.device, dtype=torch.float32,
-                )
-                dists = torch.cdist(h_reduced, v_reduced).reshape(-1)
+                dists = torch.cdist(cdist_query, cdist_nodes).reshape(-1)
                 dist_list = dists.cpu().tolist()
                 for k in range(K):
                     dist_acc[k] += w * dist_list[k]
 
                 # Inverse projection — coords + residual per layer.
                 pos, res = invert_parameterization(
-                    sub, manifold.domain, h_reduced, manifold.node_coords,
+                    sub, manifold.domain, invert_query.reshape(1, -1),
+                    manifold.node_coords,
                 )
                 pos_t = pos.reshape(-1)
                 res_val = float(res.reshape(-1)[0].item())
-                # Normalize residual by the in-subspace magnitude so the
-                # number is comparable across layers / generations.
-                par_norm_val = float(num.item())
+                # Normalize residual by the in-subspace reduced-coord
+                # magnitude (‖h_par_c‖ in the Euclidean case, ‖M-proj
+                # coords‖ when whitened) so the number is comparable across
+                # layers / generations.
+                par_norm_val = float(
+                    torch.linalg.vector_norm(invert_query).item()
+                )
                 if par_norm_val < _FRACTION_EPSILON:
                     norm_residual = 0.0
                 else:

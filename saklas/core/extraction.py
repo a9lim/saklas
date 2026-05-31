@@ -432,7 +432,13 @@ class ExtractionPipeline:
             nonlocal bake_label
             out = dict(eager_kwargs)
             out["layer_means"] = getattr(self._handle, "layer_means", None)
-            if method == "dim":
+            # DiM consumes the whitener on both the raw and SAE paths (it
+            # bakes the Mahalanobis norm of the decoded direction either
+            # way).  PCA consumes it only on the **raw** path — whitened /
+            # Fisher PCA needs the residual-stream Σ, which doesn't apply in
+            # SAE feature space, and a unit principal component carries no
+            # signal magnitude to whiten — so SAE-PCA stays on EVR.
+            if method == "dim" or (method == "pca" and sae_backend is None):
                 handle_whitener = getattr(self._handle, "whitener", None)
                 if handle_whitener is not None:
                     # All-or-nothing metric gate, matching the extractor's

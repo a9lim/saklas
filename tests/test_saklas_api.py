@@ -1565,3 +1565,58 @@ class TestRoleSampling:
         assert sc is not None
         assert sc.user_role is None
         assert sc.assistant_role is None
+
+
+class TestPairwiseMetric:
+    """``GET /vectors/pairwise`` Euclidean default + Mahalanobis toggle."""
+
+    def _setup(self, session_and_client):
+        import torch
+        from saklas import Profile
+        session, client = session_and_client
+        # Two dim-4 vectors over layers {0, 1}.
+        torch.manual_seed(1)
+        session.vectors = {
+            "x": Profile({0: torch.randn(4), 1: torch.randn(4)}),
+            "y": Profile({0: torch.randn(4), 1: torch.randn(4)}),
+        }
+        return session, client
+
+    def test_default_euclidean(self, session_and_client):
+        import torch
+        session, client = self._setup(session_and_client)
+        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["metric"] == "euclidean"
+        # Cell [0][0] is the plain cosine between x@0 and y@0.
+        vx, vy = session.vectors["x"][0], session.vectors["y"][0]
+        cos = float(torch.dot(vx, vy) / (vx.norm() * vy.norm()))
+        assert body["matrix"][0][0] == pytest.approx(cos, abs=1e-5)
+
+    def test_mahalanobis_toggle(self, session_and_client):
+        import torch
+        from saklas.core.mahalanobis import LayerWhitener
+        session, client = self._setup(session_and_client)
+        g = torch.Generator().manual_seed(4)
+        acts = {L: torch.randn(80, 4, generator=g) for L in (0, 1)}
+        means = {L: torch.zeros(4) for L in (0, 1)}
+        w = LayerWhitener.from_neutral_activations(acts, means)
+        session.whitener = w
+        r = client.get(
+            "/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y&metric=mahalanobis"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["metric"] == "mahalanobis"
+        # Cell [0][0] is the Mahalanobis cosine in layer 0's frame.
+        vx, vy = session.vectors["x"][0], session.vectors["y"][0]
+        ref = w.mahalanobis_cosine(0, vx, vy)
+        assert body["matrix"][0][0] == pytest.approx(ref, abs=1e-5)
+
+    def test_invalid_metric_400(self, session_and_client):
+        _session, client = self._setup(session_and_client)
+        r = client.get(
+            "/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y&metric=bogus"
+        )
+        assert r.status_code == 400

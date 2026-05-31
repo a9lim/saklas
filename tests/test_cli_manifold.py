@@ -512,6 +512,7 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
 
     def fake_transfer(folder_arg: Path, *, from_model: str, to_model: str,
                       alignment: Any, transfer_quality_estimate: Any = None,
+                      whitener: Any = None, layer_means: Any = None,
                       force: bool = False) -> Path:
         calls.append({
             "folder": folder_arg, "from": from_model, "to": to_model,
