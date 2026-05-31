@@ -9,21 +9,27 @@ import pytest
 
 from saklas.io.manifolds import (
     MANIFOLD_FORMAT_VERSION,
+    DiscoverGenerationPlan,
     ManifoldFolder,
     ManifoldFormatError,
     ManifoldSidecar,
+    append_discover_manifold_node,
     clear_manifold_tensors,
     create_discover_manifold_folder,
     create_manifold_folder,
+    init_discover_manifold_folder,
     hash_manifold_files,
     iter_manifold_folders,
     manifold_summary,
     merge_discover_manifolds,
     min_nodes,
+    plan_discover_generation,
+    read_manifold_scenarios,
     refresh_manifold,
     remove_manifold_folder,
     transfer_manifold,
     update_manifold_folder,
+    write_manifold_scenarios,
 )
 
 
@@ -1487,3 +1493,178 @@ def test_manifold_summary_reports_transfer_variant(
     assert summ["tensor_variants"]["src__m"] == ["raw"]
     assert summ["tensor_variants"]["tgt__m"] == ["from-src__m"]
 
+
+
+# --------------------------------------------- streaming discover writers ---
+
+def test_init_and_append_discover_streaming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The streaming skeleton + per-node append round-trips through load."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    labels = ["alpha", "beta", "gamma", "default"]
+    folder = init_discover_manifold_folder(
+        "local", "stream", "streamed discover", fit_mode="pca",
+        labels=labels, hyperparams={"max_subspace_dim": 4},
+    )
+    # Skeleton present, no node corpus yet.
+    assert (folder / "manifold.json").exists()
+    assert (folder / "nodes").is_dir()
+    assert list((folder / "nodes").glob("*.json")) == []
+
+    write_manifold_scenarios(folder, ["work", "home"])
+    assert json.loads((folder / "scenarios.json").read_text()) == {
+        "scenarios": ["work", "home"]
+    }
+
+    for i, label in enumerate(labels):
+        append_discover_manifold_node(
+            folder, i, label, [f"{label} one", f"{label} two"],
+        )
+
+    mf = ManifoldFolder.load(folder)
+    assert mf.is_discover
+    assert mf.node_labels == labels
+    assert dict(mf.node_groups())["beta"] == ["beta one", "beta two"]
+
+
+def test_create_discover_persists_scenarios(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The all-at-once writer writes scenarios.json iff the kwarg is set."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "scn", "d", fit_mode="pca",
+        node_corpora={"a": ["x"], "b": ["y"], "default": ["z"]},
+        scenarios=["d1", "d2", "d3"],
+    )
+    assert json.loads((folder / "scenarios.json").read_text()) == {
+        "scenarios": ["d1", "d2", "d3"]
+    }
+    folder2 = create_discover_manifold_folder(
+        "local", "noscn", "d", fit_mode="pca",
+        node_corpora={"a": ["x"], "b": ["y"]},
+    )
+    assert not (folder2 / "scenarios.json").exists()
+
+
+def test_init_discover_rejects_duplicate_and_bad_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    with pytest.raises(ManifoldFormatError):
+        init_discover_manifold_folder(
+            "local", "dup", "", fit_mode="pca", labels=["a", "a"],
+        )
+    with pytest.raises(ManifoldFormatError):
+        init_discover_manifold_folder(
+            "local", "bad", "", fit_mode="pca", labels=["a", "bad.label"],
+        )
+    with pytest.raises(ManifoldFormatError):
+        init_discover_manifold_folder(
+            "local", "wrongmode", "", fit_mode="authored", labels=["a", "b"],
+        )
+
+
+def test_append_discover_rejects_empty_statements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = init_discover_manifold_folder(
+        "local", "emptychk", "", fit_mode="pca", labels=["a", "b"],
+    )
+    with pytest.raises(ManifoldFormatError):
+        append_discover_manifold_node(folder, 0, "a", [])
+    with pytest.raises(ManifoldFormatError):
+        append_discover_manifold_node(folder, 0, "a", ["   "])
+
+
+# ----------------------------------------- discover generation planner ---
+
+def test_plan_fresh_creates_skeleton_all_pending(tmp_path: Path):
+    folder = tmp_path / "m"
+    plan = plan_discover_generation(
+        folder, "m", "desc", fit_mode="pca",
+        labels=["a", "b", "c"], hyperparams={"max_subspace_dim": 4},
+    )
+    assert isinstance(plan, DiscoverGenerationPlan)
+    assert not plan.resumed
+    assert plan.pending == ("a", "b", "c")
+    assert plan.scenarios is None
+    assert plan.added == ()
+    assert plan.index_of == {"a": 0, "b": 1, "c": 2}
+    assert (folder / "manifold.json").exists()
+    assert (folder / "nodes").is_dir()
+
+
+def test_plan_resume_reports_only_missing(tmp_path: Path):
+    folder = tmp_path / "m"
+    labels = ["a", "b", "c", "d"]
+    plan = plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=labels)
+    write_manifold_scenarios(folder, ["s1", "s2"])
+    # Simulate a kill after 2 of 4 nodes.
+    for lbl in ["a", "b"]:
+        append_discover_manifold_node(folder, plan.index_of[lbl], lbl, [f"{lbl} one"])
+    plan2 = plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=labels)
+    assert plan2.resumed
+    assert plan2.pending == ("c", "d")           # only the missing ones
+    assert plan2.scenarios == ("s1", "s2")        # locked to the original domains
+    assert plan2.added == ()
+    assert plan2.index_of == {"a": 0, "b": 1, "c": 2, "d": 3}
+
+
+def test_plan_add_nodes_extends_manifest(tmp_path: Path):
+    folder = tmp_path / "m"
+    labels = ["a", "b", "c"]
+    plan = plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=labels)
+    write_manifold_scenarios(folder, ["s1"])
+    for lbl in labels:
+        append_discover_manifold_node(folder, plan.index_of[lbl], lbl, [f"{lbl} x"])
+    # Re-plan with a superset roster — add-nodes.
+    plan2 = plan_discover_generation(
+        folder, "m", "d", fit_mode="pca", labels=labels + ["d", "e"],
+    )
+    assert plan2.resumed
+    assert plan2.added == ("d", "e")
+    assert plan2.pending == ("d", "e")            # only the new labels
+    assert plan2.scenarios == ("s1",)             # locked
+    mj = json.loads((folder / "manifold.json").read_text())
+    assert [n["label"] for n in mj["nodes"]] == ["a", "b", "c", "d", "e"]
+    for lbl in ["d", "e"]:
+        append_discover_manifold_node(folder, plan2.index_of[lbl], lbl, [f"{lbl} x"])
+    mf = ManifoldFolder.load(folder)
+    assert mf.node_labels == ["a", "b", "c", "d", "e"]
+
+
+def test_plan_partial_rejected_by_load_but_resumable(tmp_path: Path):
+    """A partial fails strict load yet the lenient planner resumes it."""
+    folder = tmp_path / "m"
+    plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=["a", "b"])
+    append_discover_manifold_node(folder, 0, "a", ["x"])
+    with pytest.raises(ManifoldFormatError):
+        ManifoldFolder.load(folder)
+    plan2 = plan_discover_generation(folder, "m", "d", fit_mode="pca", labels=["a", "b"])
+    assert plan2.pending == ("b",)
+
+
+def test_plan_rejects_non_discover_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    domain = {"type": "box", "axes": [
+        {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "authored", "d", domain, _author_nodes(["a", "b", "c"]),
+    )
+    with pytest.raises(ManifoldFormatError):
+        plan_discover_generation(
+            folder, "authored", "d", fit_mode="pca", labels=["x", "y"],
+        )
+
+
+def test_read_manifold_scenarios_roundtrip(tmp_path: Path):
+    folder = tmp_path / "m"
+    folder.mkdir()
+    assert read_manifold_scenarios(folder) is None
+    write_manifold_scenarios(folder, ["alpha", "beta"])
+    assert read_manifold_scenarios(folder) == ["alpha", "beta"]

@@ -993,6 +993,7 @@ def create_discover_manifold_folder(
     node_corpora: dict[str, list[str]],
     hyperparams: Optional[dict[str, Any]] = None,
     node_roles: Optional[dict[str, str | None]] = None,
+    scenarios: Optional[list[str]] = None,
 ) -> Path:
     """Author a fresh discover-mode manifold artifact folder on disk.
 
@@ -1001,6 +1002,11 @@ def create_discover_manifold_folder(
     Writes ``manifold.json`` (no ``domain``, no per-node ``coords``,
     empty ``files`` manifest) and the ``nodes/`` corpus.  Returns the
     folder path.
+
+    ``scenarios`` (when given) is persisted to ``scenarios.json`` as the
+    generation-provenance record — the discover-manifold analogue of the
+    vector pipeline's ``scenarios.json``, so a later re-fit/refresh can
+    regenerate against the same shared domains instead of drifting.
 
     Coords are derived per-model at fit time
     (:func:`saklas.core.manifold.discover_coords` runs over the per-node
@@ -1076,7 +1082,369 @@ def create_discover_manifold_folder(
         "files": {},
     }
     write_json_atomic(folder / "manifold.json", payload)
+    if scenarios is not None:
+        write_manifold_scenarios(folder, scenarios)
     return folder
+
+
+def write_manifold_scenarios(folder: Path, scenarios: list[str]) -> None:
+    """Persist the shared scenario list to ``<folder>/scenarios.json``.
+
+    Discover-mode generation provenance — the domains the node corpora
+    were generated against — mirroring the ``{"scenarios": [...]}``
+    schema the vector extraction pipeline writes.  Both the all-at-once
+    :func:`create_discover_manifold_folder` (via its ``scenarios``
+    kwarg) and the streaming path (as the ``on_scenarios`` sink of
+    :meth:`SaklasSession.generate_statements`) route through here.
+    """
+    write_json_atomic(
+        folder / "scenarios.json",
+        {"scenarios": [str(s) for s in scenarios]},
+    )
+
+
+def init_discover_manifold_folder(
+    namespace: str,
+    name: str,
+    description: str,
+    *,
+    fit_mode: str,
+    labels: list[str],
+    hyperparams: Optional[dict[str, Any]] = None,
+    node_roles: Optional[dict[str, str | None]] = None,
+) -> Path:
+    """Create a discover-mode skeleton for *streaming* node writes.
+
+    Writes ``manifold.json`` (label-only nodes, empty ``files``
+    manifest) and an empty ``nodes/`` dir, then returns the folder.
+    Node corpora are written incrementally via
+    :func:`append_discover_manifold_node` (one file per completed node)
+    and the scenario provenance via :func:`write_manifold_scenarios` —
+    the streaming companion to :func:`create_discover_manifold_folder`
+    for big-roster generation, where holding every corpus in memory at
+    once is wasteful and a crash should keep the nodes already finished.
+
+    ``labels`` is the full node label list in on-disk order; each must
+    be unique and match :data:`_LABEL_REGEX`.  Raises
+    :class:`ManifoldFormatError` on a bad name / namespace / fit_mode /
+    label / role, and :class:`FileExistsError` when a manifold already
+    lives at the path.
+    """
+    if not NAME_REGEX.match(name):
+        raise ManifoldFormatError(
+            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
+        )
+    if not NAME_REGEX.match(namespace):
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} invalid; "
+            f"must match {NAME_REGEX.pattern}"
+        )
+    if fit_mode not in _FIT_MODES_DISCOVER:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
+            f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
+        )
+    if not labels:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} needs at least one node label"
+        )
+    seen: set[str] = set()
+    for label in labels:
+        if not isinstance(label, str) or not _LABEL_REGEX.match(label):
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} label {label!r} invalid; "
+                f"a node label is a grammar-addressable identifier "
+                f"(no '.', reserved as the bipolar separator) — "
+                f"must match {_LABEL_REGEX.pattern}"
+            )
+        if label in seen:
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} duplicate node label {label!r}"
+            )
+        seen.add(label)
+
+    roles_resolved: dict[str, str | None] = {label: None for label in labels}
+    if node_roles is not None:
+        unknown = set(node_roles) - set(labels)
+        if unknown:
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} node_roles carries labels "
+                f"not in the roster: {sorted(unknown)}"
+            )
+        for label, role in node_roles.items():
+            roles_resolved[label] = _validate_node_role(name, label, role)
+
+    folder = manifold_dir(namespace, name)
+    if (folder / "manifold.json").exists():
+        raise FileExistsError(f"manifold {namespace}/{name} already exists")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "nodes").mkdir(exist_ok=True)
+
+    payload: dict[str, Any] = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": description,
+        "fit_mode": fit_mode,
+        "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
+        "nodes": [
+            _node_payload_discover(label, roles_resolved[label])
+            for label in labels
+        ],
+        "files": {},
+    }
+    write_json_atomic(folder / "manifold.json", payload)
+    return folder
+
+
+def append_discover_manifold_node(
+    folder: Path, index: int, label: str, statements: list[str],
+) -> None:
+    """Write one discover-mode node corpus to ``nodes/NN_<label>.json``.
+
+    Streaming companion to :func:`init_discover_manifold_folder`:
+    ``index`` is the node's position in the skeleton's label order, so
+    the ``NN_`` filename prefix matches ``manifold.json``.  Each file is
+    written atomically; unlike :func:`_write_node_corpus` there is no
+    whole-corpus staging swap — that is the point, so a run that dies
+    part-way keeps the nodes it already finished.
+    """
+    if not isinstance(label, str) or not _LABEL_REGEX.match(label):
+        raise ManifoldFormatError(
+            f"discover manifold node label {label!r} invalid; "
+            f"must match {_LABEL_REGEX.pattern}"
+        )
+    if (
+        not isinstance(statements, list)
+        or not statements
+        or not all(isinstance(s, str) and s.strip() for s in statements)
+    ):
+        raise ManifoldFormatError(
+            f"discover manifold node {label!r} needs a non-empty list "
+            f"of non-blank statement strings"
+        )
+    nodes_dir = folder / "nodes"
+    nodes_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(
+        nodes_dir / _node_filename(index, label),
+        [str(s) for s in statements],
+    )
+
+
+def read_manifold_scenarios(folder: Path) -> list[str] | None:
+    """Return the persisted shared scenario list, or ``None`` if absent.
+
+    Reads the ``{"scenarios": [...]}`` provenance file
+    :func:`write_manifold_scenarios` writes; tolerates the richer
+    CLI/server shape (extra keys alongside ``"scenarios"``).  Returns
+    ``None`` when there is no ``scenarios.json`` or it carries no list —
+    the signal a streaming run uses to lock resumed/added nodes onto the
+    original domains.
+    """
+    p = Path(folder) / "scenarios.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    scn = data.get("scenarios") if isinstance(data, dict) else None
+    if not isinstance(scn, list):
+        return None
+    return [str(s) for s in scn]
+
+
+def _discover_manifest_payload(
+    name: str,
+    description: str,
+    fit_mode: str,
+    labels: list[str],
+    roles: dict[str, str | None],
+    hyperparams: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the label-only discover ``manifold.json`` dict."""
+    return {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": description,
+        "fit_mode": fit_mode,
+        "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
+        "nodes": [_node_payload_discover(label, roles.get(label)) for label in labels],
+        "files": {},
+    }
+
+
+@dataclass(frozen=True)
+class DiscoverGenerationPlan:
+    """Resume / extend plan for streaming discover-manifold generation.
+
+    Returned by :func:`plan_discover_generation`.  ``index_of`` maps each
+    label to its on-disk node index (the ``NN_`` filename prefix);
+    ``pending`` is the declared labels whose corpus file is not yet on
+    disk (the ones a run still needs to generate, in node order);
+    ``scenarios`` is the locked domain list read back from
+    ``scenarios.json`` (``None`` on a fresh folder); ``added`` is the
+    labels appended to ``manifold.json`` this call (the add-nodes case);
+    ``resumed`` is ``True`` when an existing ``manifold.json`` was found.
+    """
+
+    folder: Path
+    index_of: dict[str, int]
+    pending: tuple[str, ...]
+    scenarios: tuple[str, ...] | None
+    added: tuple[str, ...]
+    resumed: bool
+
+
+def plan_discover_generation(
+    folder: Path,
+    name: str,
+    description: str,
+    *,
+    fit_mode: str,
+    labels: list[str],
+    hyperparams: Optional[dict[str, Any]] = None,
+    node_roles: Optional[dict[str, str | None]] = None,
+) -> DiscoverGenerationPlan:
+    """Ensure a streamable discover skeleton at ``folder`` covering every
+    label in ``labels``, and report which node corpora still need writing.
+
+    Resume + add-nodes in one — the single planner every discover-generate
+    surface (the bundled regen scripts, ``vector manifold generate``, the
+    HTTP generate route) calls:
+
+    - A fresh ``folder`` gets a label-only skeleton (`manifold.json` +
+      empty ``nodes/``) and every label is ``pending``.
+    - An existing discover folder keeps its node order, **appends** any
+      labels new to it (the add-nodes case — the existing fit goes stale
+      on the next read since the corpus hash changes), and reports as
+      ``pending`` the declared labels whose ``nodes/NN_<label>.json`` is
+      absent — so a run killed half-way resumes the missing nodes instead
+      of starting over.
+    - ``scenarios.json`` (when present) is read back into
+      ``plan.scenarios`` so the caller can lock the resumed/added nodes
+      onto the original domains rather than regenerating fresh ones.
+
+    The read is deliberately lenient — it does **not** route through
+    :meth:`ManifoldFolder.load`, which rejects a partially-written folder
+    by design (the missing-node-corpus guard) — so the planner can
+    inspect the very partial it is resuming.  Description is refreshed to
+    the caller's value; fit hyperparams on an existing folder are kept
+    (a resume fills corpus, it does not silently re-spec the fit — use
+    ``--force`` / a fresh folder to change those).
+
+    Raises :class:`ManifoldFormatError` on a non-discover ``fit_mode``, a
+    bad/duplicate label, a ``node_roles`` key outside the roster, or an
+    existing folder whose ``manifold.json`` is not discover-mode.
+    """
+    folder = Path(folder)
+    if fit_mode not in _FIT_MODES_DISCOVER:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
+            f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
+        )
+    if not labels:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} needs at least one node label"
+        )
+    seen: set[str] = set()
+    for label in labels:
+        if not isinstance(label, str) or not _LABEL_REGEX.match(label):
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} label {label!r} invalid; "
+                f"must match {_LABEL_REGEX.pattern}"
+            )
+        if label in seen:
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} duplicate node label {label!r}"
+            )
+        seen.add(label)
+    roles_in = node_roles or {}
+    unknown = set(roles_in) - set(labels)
+    if unknown:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} node_roles carries labels not in "
+            f"the roster: {sorted(unknown)}"
+        )
+
+    meta_path = folder / "manifold.json"
+    nodes_dir = folder / "nodes"
+
+    if not meta_path.exists():
+        # Fresh skeleton — everything is pending.
+        roles_resolved = {
+            label: _validate_node_role(name, label, roles_in.get(label))
+            for label in labels
+        }
+        folder.mkdir(parents=True, exist_ok=True)
+        nodes_dir.mkdir(exist_ok=True)
+        write_json_atomic(
+            meta_path,
+            _discover_manifest_payload(
+                name, description, fit_mode, labels, roles_resolved, hyperparams,
+            ),
+        )
+        return DiscoverGenerationPlan(
+            folder=folder,
+            index_of={label: i for i, label in enumerate(labels)},
+            pending=tuple(labels),
+            scenarios=None,
+            added=(),
+            resumed=False,
+        )
+
+    # Resume / extend an existing folder.
+    try:
+        data = json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise ManifoldFormatError(
+            f"manifold.json in {folder} is unreadable: {e}"
+        ) from e
+    if data.get("fit_mode", "authored") not in _FIT_MODES_DISCOVER:
+        raise ManifoldFormatError(
+            f"manifold at {folder} is not discover-mode; cannot "
+            f"stream-generate into it"
+        )
+    existing_nodes = data.get("nodes") or []
+    existing_labels = [n["label"] for n in existing_nodes]
+    existing_roles: dict[str, str | None] = {
+        n["label"]: n.get("role") for n in existing_nodes
+    }
+    new_labels = [label for label in labels if label not in existing_labels]
+    full_labels = existing_labels + new_labels
+    if new_labels:
+        # Add-nodes: append the new labels (validating their roles) and
+        # rewrite manifold.json atomically.  Existing roles/hyperparams
+        # are preserved; description refreshes to the caller's value.
+        merged_roles: dict[str, str | None] = dict(existing_roles)
+        for label in new_labels:
+            merged_roles[label] = _validate_node_role(
+                name, label, roles_in.get(label),
+            )
+        data["description"] = description
+        data["nodes"] = [
+            _node_payload_discover(label, merged_roles.get(label))
+            for label in full_labels
+        ]
+        write_json_atomic(meta_path, data)
+    elif data.get("description") != description:
+        data["description"] = description
+        write_json_atomic(meta_path, data)
+
+    nodes_dir.mkdir(exist_ok=True)
+    index_of = {label: i for i, label in enumerate(full_labels)}
+    pending = tuple(
+        label for label in full_labels
+        if not (nodes_dir / _node_filename(index_of[label], label)).exists()
+    )
+    scn = read_manifold_scenarios(folder)
+    return DiscoverGenerationPlan(
+        folder=folder,
+        index_of=index_of,
+        pending=pending,
+        scenarios=tuple(scn) if scn is not None else None,
+        added=tuple(new_labels),
+        resumed=True,
+    )
 
 
 def merge_discover_manifolds(
@@ -1997,6 +2365,12 @@ __all__ = [
     "iter_manifold_folders",
     "create_manifold_folder",
     "create_discover_manifold_folder",
+    "init_discover_manifold_folder",
+    "append_discover_manifold_node",
+    "write_manifold_scenarios",
+    "read_manifold_scenarios",
+    "plan_discover_generation",
+    "DiscoverGenerationPlan",
     "merge_discover_manifolds",
     "update_manifold_folder",
     "clear_manifold_tensors",

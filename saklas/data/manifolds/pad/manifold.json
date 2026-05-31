@@ -1,0 +1,32 @@
+{
+  "format_version": 4,
+  "name": "pad",
+  "description": "Mehrabian-Russell PAD affect space as a 3-D pleasure x arousal x dominance box (A. Mehrabian & J. A. Russell, 'An Approach to Environmental Psychology', 1974). Extends the bundled `circumplex` manifold with the dominance (potency/control) axis the 2-D Russell model leaves out. The nine V-A plane nodes are circumplex's first-person mood corpora reused verbatim at dominance 0 (the D=0 equator), so the PAD plane is exactly the circumplex disk; six added nodes vary dominance: `dominant`/`submissive` are the pure +/-D poles, `furious`/`fearful` place anger and fear at their PAD-correct dominance signs, and `triumphant`/`humiliated` anchor the +P+A+D and -P-A-D corners (pride vs defeat) so the high- and low-dominance half-spaces are constrained across valence, not only at negative valence. furious (-P+A+D) and fearful (-P+A-D) share valence and arousal and differ only in dominance, so they isolate the new axis. This folds the bundled affect vectors into one surface: happy.sad is the pleasure chord, angry.calm runs through `furious`, fearful.unflinching through `fearful`, and authoritative.submissive is the dominance axis itself, the donor the other two only sampled obliquely (cf. the documented angry.calm <-> authoritative.submissive entanglement, anger encoded as dominance). Authored, not discover-mode: the coordinate system is declared, so the same (pleasure, arousal, dominance) point is steering-comparable across model families and users.",
+  "fit_mode": "authored",
+  "domain": {
+    "type": "box",
+    "axes": [
+      {"name": "pleasure", "periodic": false, "lo": -1.0, "hi": 1.0},
+      {"name": "arousal", "periodic": false, "lo": -1.0, "hi": 1.0},
+      {"name": "dominance", "periodic": false, "lo": -1.0, "hi": 1.0}
+    ]
+  },
+  "nodes": [
+    {"label": "elated", "coords": [0.7071, 0.7071, 0.0]},
+    {"label": "happy", "coords": [1.0, 0.0, 0.0]},
+    {"label": "serene", "coords": [0.7071, -0.7071, 0.0]},
+    {"label": "calm", "coords": [0.0, -1.0, 0.0]},
+    {"label": "weary", "coords": [-0.7071, -0.7071, 0.0]},
+    {"label": "gloomy", "coords": [-1.0, 0.0, 0.0]},
+    {"label": "distressed", "coords": [-0.7071, 0.7071, 0.0]},
+    {"label": "alert", "coords": [0.0, 1.0, 0.0]},
+    {"label": "neutral", "coords": [0.0, 0.0, 0.0]},
+    {"label": "dominant", "coords": [0.0, 0.0, 1.0]},
+    {"label": "submissive", "coords": [0.0, 0.0, -1.0]},
+    {"label": "furious", "coords": [-0.5, 0.6, 0.9]},
+    {"label": "fearful", "coords": [-0.5, 0.6, -0.9]},
+    {"label": "triumphant", "coords": [0.6, 0.5, 0.9]},
+    {"label": "humiliated", "coords": [-0.6, -0.4, -0.9]}
+  ],
+  "files": {}
+}

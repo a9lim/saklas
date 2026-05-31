@@ -21,40 +21,40 @@ The roster is drawn from two recent persona-interpretability papers:
   personas drawn from real humans, fictional characters, and real /
   fictional AI systems.
 
-100 personas — sized big enough to give the assistant axis a real
-chance to fall out as PC1 (the 29-persona pilot landed a
-"calculating-modern vs expressive-mythic" axis instead, with PC1
-explaining only 17.1% of variance, suggesting sample size was the
-binding constraint rather than corpus quality).  Anthropic's
-275-persona result hit a 0.92 cross-model PC1 correlation; 100 is
-our compromise between paper-fidelity and a tractable one-time
-generation budget.  Coverage across the PSM trichotomy:
+107 personas (plus a `default` anchor) after the 2026-05-31 recut.
+The prior 100-node roster packed most of its mass in a low-variance
+ball near the assistant baseline — redundant trade / critic / service
+near-synonyms (robot≈android, witch≈wizard, knight≈samurai,
+scientist≈researcher, electrician≈plumber, ...) — while leaving whole
+semantic axes empty.  The recut used whitened per-node centroid
+distances (Mahalanobis, the metric the discover-pca fit itself uses)
+on gemma-3-4b and gemma-4-31b — cross-model rank-corr 0.76 on the
+pairwise distances, so the redundancy structure is model-invariant —
+to cut 38 redundant / near-baseline nodes and add 45 that span the
+previously-empty regions.
 
-- "assistant-spirit" (13, was assistant-cluster): assistant, consultant,
-  analyst, evaluator, reviewer, auditor, advisor, researcher, mediator,
-  impostor, conservative, secretary, liberal — mixes the original
-  examines / reports roles with an impostor archetype and two political
-  identities after the 2026-05-26 audit
-- everyday human roles (25): teacher, doctor, librarian, farmer,
-  soldier, nurse, lawyer, chef, journalist, mechanic, electrician,
-  carpenter, plumber, accountant, baker, gardener, fisherman, pilot,
-  sailor, athlete, engineer, scientist, banker, salesperson, driver
-- pre-modern roles (12): caveman, monk, knight, scribe, alchemist,
-  blacksmith, peasant, samurai, viking, gladiator, druid, shaman
-- creative / expressive (13): poet, bard, jester, philosopher, painter,
-  sculptor, dancer, novelist, comedian, musician, actor, playwright,
-  sage
-- fantastical (12): oracle, ghost, phoenix, wizard, vampire, mermaid,
-  dragon, centaur, sphinx, banshee, golem, witch
-- AI / non-human / mixed (12, was AI / non-human): robot, cyborg,
-  chatbot, probe, android, drone, loner, alien, mecha, deer, trickster,
-  goblin — the original cluster was the weakest (7 of 12 entries were
-  systems or hardware, not characters).  Now mixes sci-fi character
-  archetypes with an animal cross-reference (deer, matches saklas's
-  deer.wolf bipolar vector), a fantastical mischief-creature (goblin),
-  and two psych archetypes (loner, trickster) that didn't fit elsewhere
-- harmful cluster (13): virus, saboteur, spy, narcissist, demon,
-  assassin, thief, conman, hacker, cultist, tyrant, traitor, vandal
+New / expanded axes:
+
+- modern social subculture (8, NEW): nerd, jock, gamer, furry,
+  weeaboo, influencer, stoner, femboy
+- institutional / power (6, NEW): ceo, emperor, president, diplomat,
+  judge, bureaucrat — legitimate authority, vs the old roster's lone
+  illegitimate `tyrant`
+- ideological compass (6): conservative, liberal, libertarian,
+  communist, anarchist, bigot
+- relational / psychological (8): loner, friend, rival, stranger,
+  lover, stalker, lunatic, paranoid
+- distinct-register specialists (5): detective, therapist, nomad,
+  pirate, child
+- divine / sacred (4, NEW): god, angel, prophet, saint
+- nonhuman animals (5): deer, wolf, raven, serpent, lion
+- inanimate / object (7, NEW): tree, river, storm, flame, mirror,
+  clock, computer — speculative; may collapse into one
+  "personified-object" cluster (validate against centroids post-gen)
+
+PCA over per-node centroids still recovers the assistant axis as a
+leading component; the recut widens the spread feeding the trailing
+components instead of piling mass on PC1.
 
 Vanilla (baseline-space) — not role-augmented.  The corpora are
 generated under the standard assistant chat-template baseline so the
@@ -64,7 +64,7 @@ would be a separate manifold (different ``manifold.json``, different
 node corpora pooled under per-node role substitutions).
 
 Generation cost at defaults (n_scenarios=9, statements_per_concept=5):
-one scenario call + 100 * 9 = 901 cell calls producing 4500 statements.
+one scenario call + 107 * 9 = 964 cell calls producing 4815 statements.
 At ~15 sec/call on Gemma-4-31B, roughly 4 hours.  One-time,
 mirrors the bundled-vector regen pattern.
 
@@ -79,7 +79,6 @@ import argparse
 import json
 import os
 import shutil
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -100,6 +99,14 @@ DEFAULT_MODEL_ID = "google/gemma-4-31b-it"
 N_SCENARIOS = 9
 STATEMENTS_PER_CONCEPT = 5
 
+# Curated shared scenarios.  ``None`` lets the model generate the shared
+# domain set (now persisted to scenarios.json either way).  Set this to
+# an explicit list to bypass generation — the lever for the hyper-diverse
+# persona roster, whose breadth (caveman … god … tree) otherwise pushes
+# the auto-scenario prompt toward cosmic-drama settings that homogenize
+# every node's register.  Locked once the scenario set is workshopped.
+SCENARIOS: list[str] | None = None
+
 # Anchor node — its corpus is the bundled neutrals (saklas/data/
 # neutral_statements.json), the same artifact that defines mu_neutral
 # for DLS layer selection, probe centering, and the Mahalanobis
@@ -114,75 +121,93 @@ ANCHOR_LABEL = "default"
 # Roster — order is grouped by cluster for readability; the on-disk
 # order follows this list (NN_<label>.json zero-padded indices).
 PERSONAS: list[str] = [
-    # Audit pass 2026-05-26 swapped out 13 abstract / non-character /
-    # near-synonym entries from the original 2026-04 roster, replacing
-    # them with concrete personas that span more semantic dimensions:
-    # psychological archetypes (impostor, loner, trickster), political
-    # identities (conservative, liberal), and an animal cross-reference
-    # (deer, matches saklas's bundled deer.wolf vector).  The original
-    # by-cluster grouping is preserved as a reading aid below, but each
-    # cluster now carries at least one off-theme entry — the per-cluster
-    # mass argument for PC1 anchoring is correspondingly weaker.  PCA
-    # over per-node centroids doesn't see cluster labels; the labels
-    # were always just for the file's reader.
+    # 2026-05-31 recut.  Data-driven de-duplication (whitened per-node
+    # centroid distances; cross-model rank-corr 0.76 on gemma-3-4b /
+    # gemma-4-31b, so redundancy is model-invariant) cut 38 redundant /
+    # near-baseline nodes; 45 added to span previously-empty axes
+    # (divine, inanimate/object, nonhuman-animal, legitimate-power,
+    # ideological spread, altered-state, relational, modern subculture).
+    # Grouping below is a reading aid only — PCA over centroids never
+    # sees the cluster labels.
 
-    # was "assistant-cluster" — now mixes "examines / reports" roles
-    # with two political identities and an impostor archetype.
-    "assistant", "consultant", "analyst", "evaluator", "reviewer",
-    "auditor", "advisor", "researcher", "mediator", "impostor",
-    "conservative", "secretary", "liberal",
-    # everyday human roles (25) — largest cluster; covers PSM's "real
-    # humans" leg with breadth across professions.
-    "teacher", "doctor", "librarian", "farmer", "soldier", "nurse",
-    "lawyer", "chef", "journalist", "mechanic", "electrician",
-    "carpenter", "plumber", "accountant", "baker", "gardener",
-    "fisherman", "pilot", "sailor", "athlete", "engineer", "scientist",
-    "banker", "salesperson", "driver",
-    # pre-modern roles (12) — cross-cultural to avoid Eurocentric bias
-    # (samurai, viking, druid, shaman alongside the medieval-European
-    # anchors).
-    "caveman", "monk", "knight", "scribe", "alchemist", "blacksmith",
-    "peasant", "samurai", "viking", "gladiator", "druid", "shaman",
-    # creative / expressive (13) — verbal / visual / performative arts.
-    # storyteller swapped for actor (performative, distinct from
-    # playwright + bard + novelist).
-    "poet", "bard", "jester", "philosopher", "painter", "sculptor",
-    "dancer", "novelist", "comedian", "musician", "actor",
-    "playwright", "sage",
-    # fantastical (12) — mythological creatures.  leviathan swapped
-    # for phoenix (clearer first-person voice; biblical anchors are
-    # harder to inhabit than broadly-mythological ones).
-    "oracle", "ghost", "phoenix", "wizard", "vampire", "mermaid",
-    "dragon", "centaur", "sphinx", "banshee", "golem", "witch",
-    # was "AI / non-human" — was the weakest cluster (7 of 12 entries
-    # were systems or hardware, not characters).  Now mixes robot/
-    # chatbot/android/drone/alien with sci-fi character archetypes
-    # (cyborg, mecha, probe), plus three off-cluster picks (goblin —
-    # mischief-creature fantastical; deer — animal cross-referencing
-    # saklas's deer.wolf bipolar vector; loner + trickster — psych
-    # archetypes that didn't fit anywhere else and didn't seem worth
-    # creating a one-off cluster for).
-    "robot", "cyborg", "chatbot", "probe", "android", "drone", "loner",
-    "alien", "mecha", "deer", "trickster", "goblin",
-    # harmful cluster (13) — proportional expansion of Anthropic's
-    # named harmful slots.  Anti-allegory clause keeps them as
-    # character archetypes, not harm instructions.
-    "virus", "saboteur", "spy", "narcissist", "demon", "assassin",
-    "thief", "conman", "hacker", "cultist", "tyrant", "traitor",
-    "vandal",
+    # assistant-spirit / critic (3) — collapsed from 13; the
+    # consultant/evaluator/reviewer/auditor/advisor/mediator pile-up
+    # sat in a near-baseline ball, all <1x median from `default`.
+    "assistant", "analyst", "impostor",
+    # everyday human roles (16) — pruned from 25; trade and service
+    # near-synonyms collapsed to one representative each (mechanic for
+    # the trades, chef for food, sailor for the sea, pilot for vehicles).
+    "teacher", "doctor", "librarian", "farmer", "soldier", "lawyer",
+    "chef", "journalist", "mechanic", "sailor", "pilot", "athlete",
+    "engineer", "scientist", "banker", "salesperson",
+    # modern social subculture / identity (8, NEW) — contemporary
+    # internet-and-social personas; the old roster had nothing here.
+    # Expect an internal cluster (validate); a NEW region regardless.
+    "nerd", "jock", "gamer", "furry", "weeaboo", "influencer",
+    "stoner", "femboy",
+    # institutional / power (6, NEW) — legitimate authority, vs the old
+    # roster's lone illegitimate `tyrant`.  `bureaucrat` is the cog to
+    # the others' throne (institution-from-below).
+    "ceo", "emperor", "president", "diplomat", "judge", "bureaucrat",
+    # political / ideological (6) — completes the compass (libertarian
+    # = the missing right-lib quadrant; bigot = social-prejudice pole).
+    "conservative", "liberal", "libertarian", "communist", "anarchist",
+    "bigot",
+    # relational / psychological (8) — attachment (friend/rival/
+    # stranger/lover) + its pathologies (loner/stalker) + disorder
+    # states (lunatic/paranoid).
+    "loner", "friend", "rival", "stranger", "lover", "stalker",
+    "lunatic", "paranoid",
+    # distinct-register specialists (5)
+    "detective", "therapist", "nomad", "pirate", "child",
+    # pre-modern roles (7) — pruned from 12; warrior cluster
+    # (samurai/gladiator) and nature-mystic cluster (shaman) collapsed.
+    "caveman", "monk", "knight", "alchemist", "blacksmith", "viking",
+    "druid",
+    # creative / expressive (7) — pruned from 13; writer (bard/
+    # playwright/scribe) and performer (sculptor/dancer/comedian/actor)
+    # piles collapsed.
+    "poet", "novelist", "jester", "philosopher", "painter", "musician",
+    "oracle",
+    # divine / sacred (4, NEW) — the old roster gestured at it only
+    # from the dark side (`demon`).
+    "god", "angel", "prophet", "saint",
+    # fantastical (8) — wizard/dragon/centaur cut (dupes of witch/
+    # vampire / weak first-person voice).
+    "ghost", "phoenix", "witch", "vampire", "mermaid", "sphinx",
+    "banshee", "golem",
+    # nonhuman animal (5, NEW spread) — was only `deer`.
+    "deer", "wolf", "raven", "serpent", "lion",
+    # inanimate / object (7, NEW axis) — was only `golem`.  Most
+    # speculative add: may collapse into one personified-object
+    # cluster.  Even if so, it's a genuinely new region (object-ness).
+    "tree", "river", "storm", "flame", "mirror", "clock", "computer",
+    # AI / synthetic (5) — android/chatbot/probe cut (android≈robot at
+    # 0.38x median; cyborg/mecha KEPT — both high-variance, not dupes).
+    "robot", "cyborg", "drone", "mecha", "alien",
+    # harmful cluster (12) — `trickster` is distinct from `conman` per
+    # the whitened-distance check (1.04x median, not the synonym it
+    # reads as); goblin/saboteur/traitor cut.  Anti-allegory clause
+    # keeps these character archetypes, not harm instructions.
+    "trickster", "virus", "spy", "narcissist", "demon", "assassin",
+    "thief", "conman", "hacker", "cultist", "tyrant", "vandal",
 ]
 
 DESCRIPTION = (
-    "Persona archetypes drawn from Anthropic's Assistant Axis paper "
-    "(arXiv 2601.10387) and the Persona Selection Model framing. 100 "
-    "nodes spanning everyday human roles, pre-modern roles, creative "
-    "archetypes, fantastical characters, AI / sci-fi non-human "
-    "personas, the named harmful cluster, plus psychological "
-    "archetypes (impostor, loner, trickster) and political identities "
-    "(conservative, liberal) added in the 2026-05-26 audit to broaden "
-    "semantic coverage beyond profession/genre. PCA over per-node "
-    "centroids recovers a low-dim persona structure as the leading "
-    "components on role-supporting model families."
+    "Persona archetypes for discover-mode PCA manifold steering. 107 "
+    "nodes (plus a `default` anchor) spanning everyday and pre-modern "
+    "human roles, modern social subcultures, institutional and "
+    "political identities, relational and psychological archetypes, "
+    "creative and divine figures, fantastical creatures, nonhuman "
+    "animals, inanimate objects, AI / synthetic personas, and the "
+    "named harmful cluster. Lineage is Anthropic's Assistant Axis "
+    "paper (arXiv 2601.10387) plus the Persona Selection Model "
+    "framing; the 2026-05-31 recut data-pruned redundant / "
+    "near-baseline nodes (whitened per-node centroid distances, "
+    "cross-model consistent) and filled previously-empty semantic "
+    "axes. PCA over per-node centroids recovers a low-dim persona "
+    "structure as the leading components on role-supporting model "
+    "families."
 )
 
 
@@ -210,125 +235,128 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    from saklas.io.manifolds import (
+        append_discover_manifold_node,
+        plan_discover_generation,
+        write_manifold_scenarios,
+    )
+
     target = MANIFOLDS_DIR / MANIFOLD_NAME
-    if target.exists() and not args.force:
+    # `--force` is a clean slate; the default is *resume* (fill whatever
+    # nodes are missing).  Writing directly to the package data tree means
+    # a killed run picks up where it left off instead of starting over.
+    if args.force and target.exists():
+        shutil.rmtree(target)
+
+    # Anchor corpus (bundled neutrals) resolved up front so a missing or
+    # malformed neutrals file fails before the model loads.  Its corpus
+    # is the single source of truth for "where the model sits when not
+    # pushed by a concept"; `anchor_origin: true` translates the fit's
+    # origin onto it.
+    if not NEUTRALS_PATH.exists():
+        raise SystemExit(
+            f"neutrals missing at {NEUTRALS_PATH} — run "
+            f"scripts/regenerate_bundled_statements.py "
+            f"--only-neutrals first (anchor node sources its corpus "
+            f"from this file)"
+        )
+    neutrals = json.loads(NEUTRALS_PATH.read_text())
+    if not isinstance(neutrals, list) or len(neutrals) < 9:
+        raise SystemExit(
+            f"neutrals at {NEUTRALS_PATH} malformed or too short "
+            f"(got {type(neutrals).__name__}, "
+            f"len={len(neutrals) if hasattr(neutrals, '__len__') else '?'})"
+        )
+
+    # Plan first (no model) — creates the skeleton if absent, reports the
+    # pending nodes + the locked scenarios from a prior run.  `anchor_origin`
+    # / `max_subspace_dim: 8` per AGENTS.md "Bundled manifolds" regime.
+    plan = plan_discover_generation(
+        target, MANIFOLD_NAME, DESCRIPTION,
+        fit_mode="pca", labels=PERSONAS + [ANCHOR_LABEL],
+        hyperparams={"anchor_origin": True, "max_subspace_dim": 8},
+    )
+    n_total = len(plan.index_of)
+    pending_poles = [label for label in plan.pending if label != ANCHOR_LABEL]
+    if plan.resumed and plan.pending:
         print(
-            f"[skip] {target.relative_to(REPO)} already exists "
-            f"(pass --force to overwrite)",
-            file=sys.stderr,
+            f"[resume] {n_total - len(plan.pending)}/{n_total} nodes already "
+            f"present in {target.relative_to(REPO)}; generating "
+            f"{len(plan.pending)} missing"
+        )
+    if not plan.pending:
+        print(
+            f"[done] {target.relative_to(REPO)} already complete "
+            f"({n_total} nodes) — pass --force to regenerate"
         )
         return
 
-    # Redirect SAKLAS_HOME to a tempdir for the duration of the regen.
-    # The canonical create_discover_manifold_folder writes to
-    # manifold_dir(ns, name) = ~/.saklas/manifolds/<ns>/<name>/; with
-    # SAKLAS_HOME pointing at the tempdir the write lands there, and
-    # we copy the result into the package data tree.  Bundled-vector
-    # materialization (triggered by session.from_pretrained) also lands
-    # in the tempdir — wasteful but cheap (JSON copies) and the tempdir
-    # is wiped on exit.
-    with tempfile.TemporaryDirectory(prefix="saklas-regen-") as tmp:
-        os.environ["SAKLAS_HOME"] = tmp
+    if pending_poles:
+        n_cells = len(pending_poles) * args.n_scenarios
+        # SAKLAS_HOME → tempdir isolates the session's bundled
+        # materialization; the manifold itself writes directly to the
+        # package data tree (`target`, an explicit path, env-independent),
+        # so finished nodes persist across a kill for resume.
+        with tempfile.TemporaryDirectory(prefix="saklas-regen-") as tmp:
+            os.environ["SAKLAS_HOME"] = tmp
+            from saklas.core.session import SaklasSession
 
-        # Imports deferred until after SAKLAS_HOME is set.
-        from saklas.core.session import SaklasSession
-        from saklas.io.manifolds import create_discover_manifold_folder
-
-        print(f"loading generator model: {args.model}")
-        session = SaklasSession.from_pretrained(
-            args.model,
-            device="auto",
-            probes=[],  # skip probe bootstrap — we only need generation
-        )
-
-        n_cells = len(PERSONAS) * args.n_scenarios
-        n_statements = n_cells * args.statements_per_concept
-        print(
-            f"generating {args.n_scenarios} shared scenarios + "
-            f"{args.statements_per_concept} statements per "
-            f"(scenario x persona) cell for {len(PERSONAS)} personas "
-            f"(1 + {n_cells} = {1 + n_cells} LM calls, "
-            f"{n_statements} statements total)..."
-        )
-        t0 = time.time()
-        corpora = session.generate_statements(
-            PERSONAS,
-            n_scenarios=args.n_scenarios,
-            statements_per_cell=args.statements_per_concept,
-            on_progress=lambda msg: print(f"  {msg}", flush=True),
-        )
-        print(f"generation finished in {time.time() - t0:.1f}s")
-
-        # Inject the anchor node.  Its corpus is the bundled neutrals
-        # verbatim — single source of truth for "where the model sits
-        # when not pushed by a concept".  Pooled through the same
-        # `compute_node_centroid` path as every other node, so its
-        # centroid lands in standard assistant-baseline activation space
-        # alongside the 100 personas.  Stage 4's `anchor_origin: true`
-        # hyperparam then makes the fit translate origin to this node.
-        if not NEUTRALS_PATH.exists():
-            raise SystemExit(
-                f"neutrals missing at {NEUTRALS_PATH} — run "
-                f"scripts/regenerate_bundled_statements.py "
-                f"--only-neutrals first (anchor node sources its corpus "
-                f"from this file)"
+            print(f"loading generator model: {args.model}")
+            session = SaklasSession.from_pretrained(
+                args.model, device="auto", probes=[],
             )
-        neutrals = json.loads(NEUTRALS_PATH.read_text())
-        if not isinstance(neutrals, list) or len(neutrals) < 9:
-            raise SystemExit(
-                f"neutrals at {NEUTRALS_PATH} malformed or too short "
-                f"(got {type(neutrals).__name__}, "
-                f"len={len(neutrals) if hasattr(neutrals, '__len__') else '?'})"
+            print(f"[stream] writing nodes directly to {target.relative_to(REPO)}")
+            print(
+                f"generating {args.n_scenarios} shared scenarios + "
+                f"{args.statements_per_concept} statements per (scenario x "
+                f"persona) cell for {len(pending_poles)} personas "
+                f"(1 + {n_cells} = {1 + n_cells} LM calls)..."
             )
-        if ANCHOR_LABEL in corpora:
-            raise SystemExit(
-                f"persona roster collides with anchor label "
-                f"{ANCHOR_LABEL!r} — rename the persona or pick a "
-                f"different ANCHOR_LABEL"
+
+            def _on_scenarios(scn: list[str]) -> None:
+                write_manifold_scenarios(target, scn)
+                print(f"  scenarios ({len(scn)}): {scn}", flush=True)
+
+            def _on_corpus(label: str, statements: list[str]) -> None:
+                append_discover_manifold_node(
+                    target, plan.index_of[label], label, statements,
+                )
+                print(
+                    f"  [{plan.index_of[label] + 1}/{n_total}] wrote node "
+                    f"{label!r} ({len(statements)} statements)",
+                    flush=True,
+                )
+
+            t0 = time.time()
+            session.generate_statements(
+                pending_poles,
+                scenarios=list(plan.scenarios) if plan.scenarios is not None else SCENARIOS,
+                n_scenarios=args.n_scenarios,
+                statements_per_cell=args.statements_per_concept,
+                on_progress=lambda msg: print(f"  {msg}", flush=True),
+                on_scenarios=_on_scenarios,
+                on_corpus=_on_corpus,
             )
-        corpora[ANCHOR_LABEL] = neutrals
+            print(f"generation finished in {time.time() - t0:.1f}s")
+
+            del session
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Anchor node — not generated; its corpus is the bundled neutrals
+    # verbatim, written at its roster index (needs no model).
+    if ANCHOR_LABEL in plan.pending:
+        append_discover_manifold_node(
+            target, plan.index_of[ANCHOR_LABEL], ANCHOR_LABEL, neutrals,
+        )
         print(
             f"injected anchor node {ANCHOR_LABEL!r} with "
             f"{len(neutrals)} statements from {NEUTRALS_PATH.name}"
         )
 
-        # Write the manifold via the canonical writer.  Namespace is
-        # arbitrary here — only the corpus contents move to package data.
-        # `hyperparams.anchor_origin=True` lights up the discover-pca
-        # origin-anchoring path; the fit pipeline reads it back and
-        # locates the anchor node by its canonical label.
-        folder = create_discover_manifold_folder(
-            "local", MANIFOLD_NAME, DESCRIPTION,
-            fit_mode="pca",
-            node_corpora=corpora,
-            # `anchor_origin: true` -> stage-4 fit translates origin onto
-            # the anchor node (canonical label `"default"`).
-            # `max_subspace_dim: 8` pins per-layer PCA at R=8 to match
-            # the manifold's intrinsic dimension and keep the α-regime
-            # comparable to the pre-anchor bundled state (recommended
-            # alpha ~0.20, see AGENTS.md "Bundled manifolds + steering-
-            # coefficient regime").  Without this pin R defaults to 64
-            # and the per-α activation displacement scales accordingly.
-            hyperparams={"anchor_origin": True, "max_subspace_dim": 8},
-        )
-
-        # Copy the generated folder out to the package data tree.
-        MANIFOLDS_DIR.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(folder, target)
-
-        # Free GPU memory before we leave the tempdir context.
-        del session
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    total = sum(len(s) for s in corpora.values())
-    n_personas = len(corpora) - (1 if ANCHOR_LABEL in corpora else 0)
     print(
         f"[done] wrote {target.relative_to(REPO)} "
-        f"({n_personas} personas + 1 anchor node "
-        f"({ANCHOR_LABEL!r}), {total} statements total)"
+        f"({len(PERSONAS)} personas + 1 anchor node ({ANCHOR_LABEL!r}))"
     )
     print(
         f"  -> run `saklas vector manifold discover default/{MANIFOLD_NAME}` "

@@ -36,6 +36,7 @@ from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
     _sanitize_hyperparams,
+    append_discover_manifold_node,
     create_discover_manifold_folder,
     create_manifold_folder,
     domain_label,
@@ -43,6 +44,7 @@ from saklas.io.manifolds import (
     manifold_summary,
     merge_discover_manifolds,
     min_nodes,
+    plan_discover_generation,
     remove_manifold_folder,
     update_manifold_folder,
 )
@@ -643,13 +645,6 @@ def register_manifold_routes(app: FastAPI) -> None:
                 "(shared-scenario structure is meaningless with one)",
             )
         folder = manifold_dir(req.namespace, req.name)
-        if (folder / "manifold.json").exists():
-            if not req.force:
-                raise HTTPException(
-                    409,
-                    f"manifold {req.namespace}/{req.name} already exists "
-                    f"(pass force=true to overwrite)",
-                )
 
         # ``role_per_node`` mirrors the CLI ``--role-per-node`` flag —
         # each concept slug doubles as that node's assistant-role
@@ -661,34 +656,44 @@ def register_manifold_routes(app: FastAPI) -> None:
             node_roles_map = {c: c for c in req.concepts}
 
         def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            corpora = session.generate_statements(
-                list(req.concepts),
-                n_scenarios=req.n_scenarios,
-                statements_per_cell=req.statements_per_concept,
-                on_progress=on_progress,
-            )
-            if folder.exists():
+            # ``force`` is a clean slate; the default *resumes* — fill
+            # missing nodes + append any concepts new to the roster,
+            # locked onto the saved scenarios.
+            if req.force and (folder / "manifold.json").exists():
                 shutil.rmtree(folder)
             try:
-                out_folder = create_discover_manifold_folder(
-                    req.namespace, req.name, req.description,
-                    fit_mode=req.fit_mode,
-                    node_corpora=corpora,
-                    hyperparams=req.hyperparams,
-                    node_roles=node_roles_map,
+                plan = plan_discover_generation(
+                    folder, req.name, req.description,
+                    fit_mode=req.fit_mode, labels=list(req.concepts),
+                    hyperparams=req.hyperparams, node_roles=node_roles_map,
                 )
-            except (FileExistsError, ManifoldFormatError) as e:
+            except ManifoldFormatError as e:
                 raise HTTPException(400, str(e))
-            write_json_atomic(
-                out_folder / "scenarios.json",
-                {
-                    "generator": "session.generate_statements",
-                    "n_scenarios": req.n_scenarios,
-                    "statements_per_concept": req.statements_per_concept,
-                    "concepts": list(req.concepts),
-                    "model_id": session.model_id,
-                },
-            )
+            if plan.pending:
+                captured_scenarios: list[str] = []
+                session.generate_statements(
+                    list(plan.pending),
+                    scenarios=list(plan.scenarios) if plan.scenarios is not None else None,
+                    n_scenarios=req.n_scenarios,
+                    statements_per_cell=req.statements_per_concept,
+                    on_progress=on_progress,
+                    on_scenarios=captured_scenarios.extend,
+                    on_corpus=lambda label, stmts: append_discover_manifold_node(
+                        folder, plan.index_of[label], label, stmts,
+                    ),
+                )
+                if plan.scenarios is None:
+                    write_json_atomic(
+                        folder / "scenarios.json",
+                        {
+                            "scenarios": captured_scenarios,
+                            "generator": "session.generate_statements",
+                            "n_scenarios": req.n_scenarios,
+                            "statements_per_concept": req.statements_per_concept,
+                            "concepts": list(plan.index_of),
+                            "model_id": session.model_id,
+                        },
+                    )
             _evict_manifold(session, req.namespace, req.name)
             ns, mf = _find_manifold(req.namespace, req.name)
             body = _manifold_json(ns, mf, session, full=True)

@@ -208,6 +208,39 @@ def _humanize_concept(name: str) -> str:
     return name.replace("_", " ")
 
 
+def _scenario_prompt(concept_list_str: str, n: int) -> str:
+    """Build the shared scenario-domain prompt for an N-concept list.
+
+    One builder for both scenario paths — the bipolar contrast path
+    (:meth:`SaklasSession.generate_scenarios`, two poles) and the
+    multi-concept discover / persona path (the inline scenario block in
+    :meth:`SaklasSession.generate_statements`).
+
+    The phrasing asks only that each domain *admit* every literal
+    concept's perspective, not that the concepts take *distinct* ones.
+    The distinct-perspective demand pulls a hyper-diverse roster
+    (god, tree, caveman, CEO, ...) toward maximally-divisive domains
+    (war, crime, death), contaminating every node's centroid with the
+    same dramatic-scenario signal; for a bipolar axis the contrast is
+    enforced downstream by moment-shared statement generation, so the
+    softer phrasing costs it nothing.  The "literal concept" anchor is
+    load-bearing for non-human axes (deer/wolf, brick/feather) — without
+    it the model defaults to human-social framing and reads every axis
+    as allegory.
+    """
+    return (
+        f"Concepts: {concept_list_str}.\n\n"
+        f"List {n} varied, distinctive situational domains. Every "
+        f"domain should let every literal concept have a perspective. "
+        f"List only the domains.\n\n"
+        f"Format:\n"
+        f"1. [domain]\n"
+        f"2. [domain]\n"
+        f"...\n"
+        f"{n}. [domain]"
+    )
+
+
 def _split_composite_source(
     concept: str, baseline: str | None,
 ) -> tuple[str, str | None]:
@@ -1316,17 +1349,7 @@ class SaklasSession:
             # humanizes to "the opposite of <concept>".
             baseline_h = f"the opposite of {concept_h}"
         concept_list_str = f'"{concept_h}", "{baseline_h}"'
-        prompt = (
-            f"Concepts: {concept_list_str}.\n\n"
-            f"List {n} varied, distinctive situational domains. Every "
-            f"literal concept should have a distinct perspective on "
-            f"each domain. List only the domains.\n\n"
-            f"Format:\n"
-            f"1. [domain]\n"
-            f"2. [domain]\n"
-            f"...\n"
-            f"{n}. [domain]"
-        )
+        prompt = _scenario_prompt(concept_list_str, n)
         max_new_tokens = max(300, n * 40)
         best: list[str] = []
         for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
@@ -1377,6 +1400,9 @@ class SaklasSession:
         statements_per_cell: int = _N_PAIRS_PER_SCENARIO,
         share_moment: bool = False,
         on_progress: Callable[[str], None] | None = None,
+        on_scenarios: Callable[[list[str]], None] | None = None,
+        on_corpus: Callable[[str, list[str]], None] | None = None,
+        neutrals: bool = False,
         role: str | None = None,
     ) -> dict[str, list[str]]:
         """Unified statement-corpus generator for a flat list of concepts.
@@ -1388,14 +1414,17 @@ class SaklasSession:
         scenario-aligned" — the load-bearing structural invariant for
         downstream contrastive diffs and discover-mode centroid pools.
 
-        ``len(concepts) == 1`` is the neutrals path: no concept naming
-        in either the scenario or statement prompt, so the activation
+        ``neutrals=True`` is the neutrals path: no concept naming in
+        either the scenario or statement prompt, so the activation
         average becomes the model's natural-voice baseline across
         diverse everyday domains.  Used to build the probe-centering
-        ``mu_neutral`` reference that DLS + Mahalanobis depend on.  The
-        returned dict still uses the concept slug as its single key
-        (caller picks the slug as a marker).  ``share_moment=True`` is
-        rejected for N=1 — nothing to share moments across.
+        ``mu_neutral`` reference that DLS + Mahalanobis depend on; it
+        takes exactly one concept (and not ``share_moment``) and the
+        returned dict uses that slug as its single key (caller picks the
+        slug as a marker).  Naming is the **default** for every other
+        call — including a single named concept (e.g. a one-node
+        discover resume), which generates that concept's corpus, not a
+        neutral baseline.
 
         Two cell-fill modes (for N >= 2):
 
@@ -1438,6 +1467,20 @@ class SaklasSession:
         ordered scenario-first then within-scenario.  The dict's key
         order is the concept order the caller passed in.
 
+        Streaming sinks (both default ``None`` — no behavior change):
+        ``on_scenarios(scenarios)`` fires once with the effective
+        scenario list (passed or generated) so the caller can persist
+        provenance (e.g. a discover manifold's ``scenarios.json``).
+        ``on_corpus(concept, statements)`` fires once per *completed*
+        concept; when set, corpora are streamed to it and **not**
+        retained, so the return dict is empty and peak memory stays at
+        one concept's corpus rather than the whole roster — the path big
+        manifolds take, and which leaves finished nodes on disk if a run
+        dies mid-way.  In ``share_moment=False`` mode the concept loop
+        runs outer so each node finishes before the next; in
+        ``share_moment=True`` mode the moment-shared nodes all complete
+        together and are emitted after the scenario loop.
+
         Short-cell padding: if a cell LLM call yields fewer than
         ``statements_per_cell`` parseable rows after every retry, the
         cell is padded by repeating its last entry (or a placeholder
@@ -1455,6 +1498,16 @@ class SaklasSession:
                 "generate_statements: share_moment=True needs >= 2 "
                 "concepts (otherwise there's no shared moment to "
                 "anchor against)"
+            )
+        if neutrals and (len(concepts) != 1 or share_moment):
+            # The neutrals baseline is a single unnamed corpus — the
+            # mu_neutral reference.  Naming is the default for every
+            # other call, including a single named concept (e.g. a
+            # one-node discover resume).
+            raise ValueError(
+                "generate_statements: neutrals=True is the single-concept "
+                "baseline path (no concept naming) — pass exactly one "
+                "concept and not share_moment"
             )
         if n_scenarios <= 0 or statements_per_cell <= 0:
             raise ValueError(
@@ -1481,7 +1534,7 @@ class SaklasSession:
 
         # ---- Scenarios ------------------------------------------------
         if scenarios is None:
-            if len(concepts) == 1:
+            if neutrals:
                 # Neutrals path: no concept naming in the prompt, so
                 # mu_neutral represents the model's natural-voice
                 # baseline across diverse everyday domains rather than
@@ -1500,17 +1553,8 @@ class SaklasSession:
                     f"{n_scenarios}. [domain]"
                 )
             else:
-                scenario_prompt = (
-                    f"Concepts: {concept_list_str}.\n\n"
-                    f"List {n_scenarios} varied, distinctive situational "
-                    f"domains. Every literal concept should have a "
-                    f"distinct perspective on each domain. List only the "
-                    f"domains.\n\n"
-                    f"Format:\n"
-                    f"1. [domain]\n"
-                    f"2. [domain]\n"
-                    f"...\n"
-                    f"{n_scenarios}. [domain]"
+                scenario_prompt = _scenario_prompt(
+                    concept_list_str, n_scenarios,
                 )
             if on_progress:
                 on_progress(
@@ -1537,9 +1581,24 @@ class SaklasSession:
                 )
 
         # ---- Statements ----------------------------------------------
+        # Effective scenarios (passed or generated) are now fixed — hand
+        # them to the provenance sink so the caller can persist a
+        # ``scenarios.json`` the way the vector extraction pipeline does.
+        if on_scenarios is not None:
+            on_scenarios(list(scenarios))
+
         corpora: dict[str, list[str]] = {c: [] for c in concepts}
         K = statements_per_cell
         N = len(concepts)
+
+        def _emit(label: str, statements: list[str]) -> None:
+            # Stream each completed node to ``on_corpus`` (bounded memory
+            # + crash-recoverable partial corpora on a big manifold), or
+            # retain it for the all-at-once return when no sink is set.
+            if on_corpus is not None:
+                on_corpus(label, statements)
+            else:
+                corpora[label] = statements
 
         if share_moment:
             # ``Speakers: a="pirate", b="caveman", c="robot"`` — one line
@@ -1607,16 +1666,21 @@ class SaklasSession:
                 for group in groups_best:
                     for c, stmt in zip(concepts, group):
                         corpora[c].append(stmt)
+            # Moment-shared nodes all complete together (one call per
+            # scenario covers every speaker), so emit after the loop.
+            for c in concepts:
+                _emit(c, corpora[c])
         else:
-            for s_idx, scenario in enumerate(scenarios, 1):
-                for c, h in zip(concepts, humanized):
+            for c_idx, (c, h) in enumerate(zip(concepts, humanized), 1):
+                acc: list[str] = []
+                for s_idx, scenario in enumerate(scenarios, 1):
                     if on_progress:
                         on_progress(
-                            f"Domain {s_idx}/{len(scenarios)} "
-                            f"({scenario}): generating {K} statements "
-                            f"for '{h}'..."
+                            f"Concept {c_idx}/{N} ('{h}'), domain "
+                            f"{s_idx}/{len(scenarios)} ({scenario}): "
+                            f"generating {K} statements..."
                         )
-                    if len(concepts) == 1:
+                    if neutrals:
                         # Neutrals: no concept anchor, no qualifier
                         # nudging affect-register.  The principled
                         # definition of ``mu_neutral`` is "where the
@@ -1684,9 +1748,10 @@ class SaklasSession:
                         ]
                     while len(cell_best) < K:
                         cell_best.append(cell_best[-1])
-                    corpora[c].extend(cell_best)
+                    acc.extend(cell_best)
+                _emit(c, acc)
 
-        return corpora
+        return {} if on_corpus is not None else corpora
 
     @staticmethod
     def _parse_grouped_statements(

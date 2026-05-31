@@ -172,6 +172,72 @@ def test_calls_lm_once_per_scenario_in_share_moment_mode():
     assert session._scenario_call_count == 1
 
 
+# ----------------------------------------------------- streaming sinks ---
+
+def test_streaming_sinks_match_all_at_once_independent():
+    """on_corpus streams the same per-concept corpora the return dict
+    would carry; with a sink set the method retains nothing (empty
+    return) and emits each node in concept-completion order."""
+    concepts = ["pirate", "caveman", "robot", "scholar"]
+    ref = _fake_session_class()().generate_statements(
+        concepts, n_scenarios=_N_SCENARIOS, statements_per_cell=_K,
+    )
+    streamed: dict[str, list[str]] = {}
+    order: list[str] = []
+    seen_scenarios: list[list[str]] = []
+
+    def _corpus(label: str, stmts: list[str]) -> None:
+        order.append(label)
+        streamed[label] = list(stmts)
+
+    out = _fake_session_class()().generate_statements(
+        concepts, n_scenarios=_N_SCENARIOS, statements_per_cell=_K,
+        on_scenarios=lambda s: seen_scenarios.append(list(s)),
+        on_corpus=_corpus,
+    )
+    assert out == {}                       # streaming retains nothing
+    assert streamed == ref                 # identical content
+    assert order == concepts               # concept-outer completion order
+    assert len(seen_scenarios) == 1        # fires exactly once
+    assert len(seen_scenarios[0]) == _N_SCENARIOS
+
+
+def test_streaming_sinks_share_moment_emit_per_node():
+    """share_moment streams every node after the scenario loop (one emit
+    per concept, in roster order) and still returns empty under a sink."""
+    concepts = ["pirate", "caveman", "robot"]
+    streamed: dict[str, list[str]] = {}
+    order: list[str] = []
+
+    def _corpus(label: str, stmts: list[str]) -> None:
+        order.append(label)
+        streamed[label] = list(stmts)
+
+    out = _fake_session_class(share_moment=True)().generate_statements(
+        concepts, n_scenarios=_N_SCENARIOS, statements_per_cell=_K,
+        share_moment=True, on_corpus=_corpus,
+    )
+    assert out == {}
+    assert order == concepts
+    for c in concepts:
+        assert len(streamed[c]) == _N_SCENARIOS * _K
+
+
+def test_on_scenarios_echoes_passed_scenarios_without_generating():
+    """Explicit scenarios are echoed to on_scenarios and skip the
+    scenario-generation LM call entirely."""
+    session = _fake_session_class()()
+    seen: list[list[str]] = []
+    session.generate_statements(
+        ["pirate", "robot"],
+        scenarios=["alpha", "beta"],
+        statements_per_cell=_K,
+        on_scenarios=lambda s: seen.append(list(s)),
+    )
+    assert seen == [["alpha", "beta"]]
+    assert session._scenario_call_count == 0
+
+
 # ----------------------------------------------------- prompt-shape invariants ---
 
 def test_scenario_prompt_contains_every_concept_name():
@@ -534,6 +600,7 @@ def test_single_concept_returns_dict_with_one_key():
         ["neutral"],
         n_scenarios=_N_SCENARIOS,
         statements_per_cell=_K,
+        neutrals=True,
     )
     assert list(out.keys()) == ["neutral"]
     assert len(out["neutral"]) == _N_SCENARIOS * _K
@@ -548,6 +615,7 @@ def test_single_concept_scenario_prompt_omits_concept_naming():
         ["neutral"],
         n_scenarios=_N_SCENARIOS,
         statements_per_cell=_K,
+        neutrals=True,
     )
     scenario_prompt = session._calls[0][0]
     # Bracketed concept name should be absent (the N≥2 prompt has
@@ -571,6 +639,7 @@ def test_single_concept_statement_prompt_omits_concept_naming():
         ["neutral"],
         n_scenarios=_N_SCENARIOS,
         statements_per_cell=_K,
+        neutrals=True,
     )
     # First call is scenarios; the next n_scenarios calls are per-cell
     # statement prompts.  All of them should be concept-free.
@@ -595,10 +664,33 @@ def test_single_concept_calls_lm_once_per_scenario():
         ["neutral"],
         n_scenarios=_N_SCENARIOS,
         statements_per_cell=_K,
+        neutrals=True,
     )
     # 1 scenario call + n_scenarios cell calls (single concept, so
     # no inner loop iterations).
     assert len(session._calls) == 1 + _N_SCENARIOS
+
+
+def test_single_concept_names_by_default():
+    """Without neutrals=True a single concept is *named* (the discover
+    one-node resume case) — the statement prompt carries Concept:."""
+    session = _fake_session_class()()
+    out = session.generate_statements(
+        ["pirate"],
+        n_scenarios=_N_SCENARIOS,
+        statements_per_cell=_K,
+    )
+    assert list(out.keys()) == ["pirate"]
+    assert len(out["pirate"]) == _N_SCENARIOS * _K
+    # Scenario prompt names the concept; statement prompts carry Concept:.
+    assert "pirate" in session._calls[0][0]
+    assert any("Concept:" in prompt for prompt, _s, _m in session._calls[1:])
+
+
+def test_neutrals_flag_rejects_multiple_concepts():
+    session = _fake_session_class()()
+    with pytest.raises(ValueError, match="single-concept baseline"):
+        session.generate_statements(["a", "b"], neutrals=True)
 
 
 # -------------------------------------------------------- scenarios override ---

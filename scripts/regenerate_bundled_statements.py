@@ -241,6 +241,7 @@ def generate_neutrals(session: SaklasSession, n: int) -> list[str]:
         n_scenarios=n_scenarios,
         statements_per_cell=statements_per_cell,
         on_progress=lambda m: print(f"  [neutral] {m}", flush=True),
+        neutrals=True,  # the unnamed mu_neutral baseline path
     )
     return corpora["neutral"][:n]
 

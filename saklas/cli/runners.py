@@ -1990,7 +1990,8 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
         ManifoldFormatError,
-        create_discover_manifold_folder,
+        append_discover_manifold_node,
+        plan_discover_generation,
     )
     from saklas.io.paths import manifold_dir
 
@@ -2009,16 +2010,46 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
         namespace, name = name.split("/", 1)
 
     folder = manifold_dir(namespace, name)
-    if (folder / "manifold.json").exists():
-        if not args.force:
-            print(
-                f"manifold generate: {namespace}/{name} already exists "
-                f"(pass -f/--force to overwrite)",
-                file=sys.stderr,
-            )
-            sys.exit(2)
+    # ``-f/--force`` is a clean slate; the default *resumes* — fills any
+    # missing node corpora and appends concepts new to the roster (locked
+    # onto the saved scenarios), so a run killed half-way picks up where
+    # it left off and adding a node is a plain re-run.
+    if args.force and (folder / "manifold.json").exists():
         import shutil
         shutil.rmtree(folder)
+
+    # ``--role-per-node``: the concept slug doubles as that node's
+    # assistant-role substitution at fit time (engine validates the slug;
+    # an unsupported family raises later at the matching discover/fit call).
+    node_roles: dict[str, str | None] | None = None
+    if getattr(args, "role_per_node", False):
+        node_roles = {concept: concept for concept in args.concepts}
+
+    # Plan first — no model load needed to learn there is nothing to do.
+    try:
+        plan = plan_discover_generation(
+            folder, name, args.description,
+            fit_mode="pca", labels=list(args.concepts), node_roles=node_roles,
+        )
+    except ManifoldFormatError as e:
+        print(f"manifold generate failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    n_total = len(plan.index_of)
+    if not plan.pending:
+        print(
+            f"manifold {namespace}/{name} already complete ({n_total} nodes)"
+            f" — pass -f/--force to regenerate"
+        )
+        return
+    if plan.resumed and len(plan.pending) < n_total:
+        print(
+            f"resuming {namespace}/{name}: "
+            f"{n_total - len(plan.pending)}/{n_total} nodes present, "
+            f"generating {len(plan.pending)}"
+        )
+    if plan.added:
+        print(f"adding {len(plan.added)} new node(s): {', '.join(plan.added)}")
 
     _print_startup(args)
     session = _make_session(args)
@@ -2026,64 +2057,43 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
 
     print(
         f"generating {args.n_scenarios} scenarios + "
-        f"{args.statements_per_concept} statements per "
-        f"(scenario × concept) cell for {len(args.concepts)} concepts..."
+        f"{args.statements_per_concept} statements per (scenario × concept) "
+        f"cell for {len(plan.pending)} concept(s)..."
     )
+    captured_scenarios: list[str] = []
     try:
-        corpora = session.generate_statements(
-            list(args.concepts),
+        session.generate_statements(
+            list(plan.pending),
+            scenarios=list(plan.scenarios) if plan.scenarios is not None else None,
             n_scenarios=args.n_scenarios,
             statements_per_cell=args.statements_per_concept,
             on_progress=lambda m: print(f"  {m}"),
+            on_scenarios=captured_scenarios.extend,
+            on_corpus=lambda label, stmts: append_discover_manifold_node(
+                folder, plan.index_of[label], label, stmts,
+            ),
         )
     except ValueError as e:
         print(f"manifold generate failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # ``--role-per-node``: the concept slug doubles as the assistant-role
-    # substitution at that node's fit time.  Validated against the engine's
-    # role-slug regex by ``create_discover_manifold_folder`` itself; an
-    # unsupported family raises later at fit time (the folder is model-
-    # agnostic, so we don't pay the family check here).
-    node_roles: dict[str, str | None] | None = None
-    if getattr(args, "role_per_node", False):
-        node_roles = {concept: concept for concept in args.concepts}
-
-    try:
-        out_folder = create_discover_manifold_folder(
-            namespace, name, args.description,
-            fit_mode="pca",  # default; the user can override at discover time
-            node_corpora=corpora,
-            node_roles=node_roles,
+    # Record scenario provenance on the first run; a resume keeps the
+    # already-locked ``scenarios.json``.  The canonical ``"scenarios"``
+    # key (vector-pipeline convention) plus generator metadata.
+    if plan.scenarios is None:
+        write_json_atomic(
+            folder / "scenarios.json",
+            {
+                "scenarios": captured_scenarios,
+                "generator": "session.generate_statements",
+                "n_scenarios": args.n_scenarios,
+                "statements_per_concept": args.statements_per_concept,
+                "concepts": list(plan.index_of),
+                "model_id": session.model_id,
+            },
         )
-    except (FileExistsError, ManifoldFormatError) as e:
-        print(f"manifold generate failed: {e}", file=sys.stderr)
-        sys.exit(1)
 
-    # Record the scenarios alongside the corpora as provenance — mirror
-    # the convention extract uses (``local/<canonical>/scenarios.json``).
-    # The scenarios themselves aren't preserved in ``generate_statements``'s
-    # return value, but they live inside each statement (recoverable
-    # from corpus reading); writing a stub provenance file flags
-    # whether the corpora went through the generator vs hand-author.
-    write_json_atomic(
-        out_folder / "scenarios.json",
-        {
-            "generator": "session.generate_statements",
-            "n_scenarios": args.n_scenarios,
-            "statements_per_concept": args.statements_per_concept,
-            "concepts": list(args.concepts),
-            "model_id": session.model_id,
-        },
-    )
-
-    total = sum(len(s) for s in corpora.values())
-    print(
-        f"wrote {namespace}/{name} "
-        f"({len(corpora)} concepts × "
-        f"{args.n_scenarios} scenarios × "
-        f"{args.statements_per_concept} statements = {total} statements)"
-    )
+    print(f"wrote {namespace}/{name} ({n_total} nodes)")
     print(
         f"  → run `saklas vector manifold discover {namespace}/{name}` to fit"
     )
