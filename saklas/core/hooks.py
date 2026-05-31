@@ -8,7 +8,12 @@ from typing import Any, Literal
 
 import torch
 
-from saklas.core.manifold import eval_rbf, subspace_replace, subspace_rotate
+from saklas.core.manifold import (
+    eval_rbf,
+    rotate_toward,
+    subspace_replace,
+    subspace_rotate,
+)
 from saklas.core.triggers import Trigger, TriggerContext
 
 
@@ -19,15 +24,6 @@ from saklas.core.triggers import Trigger, TriggerContext
 DEFAULT_THETA_MAX: float = math.pi / 2
 
 InjectionMode = Literal["angular", "additive"]
-
-# Per-position guard for the angular Givens rotation: when the hidden
-# state is already aligned (or anti-aligned) with the steering direction,
-# the in-plane orthogonal axis is undefined and the rotation has no
-# meaningful effect.  Below this magnitude on the orthogonal component,
-# we leave the position unchanged (avoids the
-# ``cos_t * h_unit + sin_t * 0 = cos_t * h_unit`` pathology that would
-# silently shrink the residual norm).
-_ANGULAR_PERP_EPSILON: float = 1e-6
 
 
 def _angular_inplace(
@@ -54,9 +50,17 @@ def _angular_inplace(
     :meth:`SteeringHook._refresh_angular_cache` sets this when α is
     effectively zero, so the ``sin_t == 0`` Python guard the v2.1 entry
     used to carry is unnecessary and would force a CPU sync if ``sin_t``
-    is a tensor).  Per-position positions whose orthogonal component to
-    ``d_hat`` falls below :data:`_ANGULAR_PERP_EPSILON` are left
-    untouched.
+    is a tensor).  Positions already (anti-)aligned with ``d_hat`` are
+    left untouched by :func:`~saklas.core.manifold.rotate_toward`'s own
+    near-aligned guard.
+
+    The rotation itself is :func:`~saklas.core.manifold.rotate_toward` —
+    the Givens kernel shared with manifold angular steering
+    (:func:`~saklas.core.manifold.subspace_rotate`).  This path applies it
+    to the *full* unit activation toward the concept direction ``d̂``;
+    manifold steering applies the same kernel to the centered in-subspace
+    component.  Only the magnitude extraction (``‖h‖`` here) and reassembly
+    differ.
     """
     if d_hat is None or cos_t is None or sin_t is None:
         return
@@ -68,27 +72,10 @@ def _angular_inplace(
     h_unit = h_f32 / h_norm
 
     d_hat_f32 = d_hat.to(torch.float32)
-    cos0 = (h_unit * d_hat_f32).sum(dim=-1, keepdim=True)
-    # ``d_perp`` is the in-plane vector orthogonal to ``h_unit`` pointing
-    # toward ``d_hat``; its magnitude equals sin(α_h) where α_h is the
-    # current angle between h and d̂.
-    d_perp = d_hat_f32 - cos0 * h_unit
-    d_perp_norm = torch.linalg.vector_norm(d_perp, dim=-1, keepdim=True)
-    safe_norm = d_perp_norm.clamp(min=_ANGULAR_PERP_EPSILON)
-    d_perp_unit = d_perp / safe_norm
-
-    rotated_unit = cos_t * h_unit + sin_t * d_perp_unit
-    # Where the perpendicular is below threshold, the rotation is
-    # ill-defined; preserve h_unit there (no rotation has effect when
-    # h is already on the steering axis).  We always run the
-    # ``torch.where`` rather than gate it on ``.any()`` — the gate would
-    # be a data-dependent host conditional, forcing a CPU sync and
-    # graph-breaking under ``torch.compile(mode="reduce-overhead")``.
-    # The unconditional ``where`` adds a single elementwise compare +
-    # blend per position, which is far cheaper than the sync the gate
-    # would cost.
-    near_aligned = d_perp_norm < _ANGULAR_PERP_EPSILON
-    rotated_unit = torch.where(near_aligned, h_unit, rotated_unit)
+    # ``w_norm`` (the near-aligned tell) is unused on the vector path —
+    # rotate_toward's internal ``where`` is the whole guard needed here;
+    # only manifold steering folds it into a wider degeneracy condition.
+    rotated_unit, _w_norm = rotate_toward(h_unit, d_hat_f32, cos_t, sin_t)
 
     hidden.copy_((rotated_unit * h_norm).to(hidden.dtype))
 
