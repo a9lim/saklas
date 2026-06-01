@@ -20,6 +20,7 @@ from saklas.core.vectors import (
     _fold_centroids_to_affine_manifold,
     extract_difference_of_means,
     fold_vector_to_subspace,
+    folded_vector_directions,
 )
 
 
@@ -166,6 +167,50 @@ def test_fold_degenerate_pair_drops_layer():
         "c", pos, neg, pos_label="p", neg_label="n", dls=False,
     )
     assert sorted(mfld.layers) == [0]
+
+
+def test_folded_vector_directions_view():
+    """The Profile-view = {L: δ̂_L · share_L}; per-layer cosine against the
+    underlying δ̂ is ±1 (direction preserved), magnitude tracks the share."""
+    d = 8
+    d0, d1 = _unit(torch.randn(d)), _unit(torch.randn(d))
+    pos = {0: 2.0 * d0, 1: 0.5 * d1}      # ‖δ_0‖ = 4, ‖δ_1‖ = 1
+    neg = {0: -2.0 * d0, 1: -0.5 * d1}
+    mfld = _fold_centroids_to_affine_manifold(
+        "c", pos, neg, pos_label="p", neg_label="n",
+    )
+    dirs = folded_vector_directions(mfld)
+    assert sorted(dirs) == [0, 1]
+    for L, unit in ((0, d0), (1, d1)):
+        v = dirs[L]
+        # direction preserved (cosine ±1), magnitude = share = ‖δ_L‖₂
+        assert torch.allclose(v / v.norm(), unit, atol=1e-5)
+        assert float(v.norm()) == pytest.approx(mfld.mahalanobis_share[L], abs=1e-4)
+    # ratio of layer magnitudes == ratio of ‖δ‖ (4:1) — the per-layer profile
+    assert float(dirs[0].norm() / dirs[1].norm()) == pytest.approx(4.0, abs=1e-3)
+
+
+def test_folded_vector_directions_rejects_curved():
+    """A curved (RBF-fitted, non-affine) manifold has no single direction —
+    the view must refuse it."""
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
+    )
+    torch.manual_seed(0)
+    K, dim = 5, 10
+    centroids = torch.randn(K, dim)
+    node_params = torch.linspace(0.0, 1.0, K).reshape(K, 1)
+    curved, _ev = fit_layer_subspace(centroids, node_params)
+    assert not curved.is_affine
+    mfld = Manifold(
+        name="m",
+        domain=BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)]),
+        node_labels=[f"n{i}" for i in range(K)],
+        node_coords=node_params,
+        layers={0: curved},
+    )
+    with pytest.raises(ValueError, match="affine"):
+        folded_vector_directions(mfld)
 
 
 def test_fold_share_matches_dim_bake_exactly(monkeypatch: pytest.MonkeyPatch):

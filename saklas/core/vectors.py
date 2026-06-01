@@ -1878,6 +1878,40 @@ def fold_vector_to_subspace(
     )
 
 
+def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
+    """Baked-direction view of a folded (affine ``R = 1``) vector manifold.
+
+    Returns ``{L: δ̂_L · share_L}`` — the steering-vector-equivalent baked
+    directions, proportional *per layer* to what
+    :func:`extract_difference_of_means` bakes (``‖baked_L‖ ∝ ‖δ_L‖_M``).  The
+    global per-concept scale differs (the folded share is the un-normalized
+    ``‖δ_L‖_M``, not the ``ref_norm``-weighted normalized share today's bake
+    folds in), so this view is *exact* for scale-invariant ops — per-layer and
+    aggregate cosine, ``vector compare``/``why`` — and merely
+    proportional for cross-concept magnitude (``merge`` / GGUF export, which
+    migrate to read the folded artifact natively).
+
+    Lets the unified folded Manifold back the legacy direction-math surface
+    (``Profile``-returning ``extract()``, ``vector compare``/``why``) without a
+    second *stored* representation — the concept's only on-disk artifact stays
+    the folded Manifold; this is a downstream in-memory view.
+
+    Raises :class:`ValueError` on a curved or multi-dim manifold — the
+    single-direction view is only meaningful for a folded ``R = 1`` vector.
+    """
+    out: dict[int, torch.Tensor] = {}
+    share_map = getattr(manifold, "mahalanobis_share", None) or {}
+    for idx, sub in manifold.layers.items():
+        if not sub.is_affine or sub.rank != 1:
+            raise ValueError(
+                "folded_vector_directions requires affine R=1 layers; "
+                f"layer {idx} is rank {sub.rank}, affine={sub.is_affine}"
+            )
+        share = float(share_map.get(idx, 1.0))
+        out[idx] = sub.basis.reshape(-1).to(torch.float32) * share
+    return out
+
+
 def save_profile(
     profile: dict[int, torch.Tensor],
     path: str | Path,
