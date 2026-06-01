@@ -131,11 +131,8 @@ class _Stub(SaklasSession):
         from saklas.core.session import GenState
         self._gen_phase = GenState.IDLE
         self._internal_steering_pop = False
-        # v2.1 session-level defaults consulted by ``_resolve_*``
-        # helpers when the override LIFO has no entries.
-        from saklas.core.hooks import DEFAULT_THETA_MAX as _DTM
-        self._injection_mode = "angular"
-        self._theta_max = _DTM
+        # Session-level default consulted by ``_resolve_projection_metric``
+        # when the override LIFO has no entries.
         self._projection_metric = "mahalanobis"
         self._whitener = None
         self._layer_means = {}

@@ -50,7 +50,7 @@ from saklas.core.results import (
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
-from saklas.core.manifold import Manifold
+from saklas.core.manifold import Manifold, SynthesizedSubspace
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import last_content_index
 from saklas.core.vectors import load_profile as _load_profile
@@ -352,6 +352,72 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
 
 
+def _vector_push_fragment(
+    profile: dict[int, torch.Tensor],
+) -> "tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]":
+    """A folded vector / pole / projection → a rank-1 push fragment per layer.
+
+    ``basis_dirs[L]`` is the unit baked direction ``(1, D)``; ``coord_dirs[L]``
+    is its baked magnitude ``[‖d_L‖]`` (the share-carrying pole coordinate), so
+    ``synthesize_subspace``'s ``Δ = coeff · (coord @ basis) = coeff · d_L``
+    reproduces the baked direction exactly.  Degenerate (zero-norm) layers drop.
+    """
+    basis_dirs: dict[int, torch.Tensor] = {}
+    coord_dirs: dict[int, torch.Tensor] = {}
+    for L, vec in profile.items():
+        v = vec.to(torch.float32).reshape(-1)
+        n = float(torch.linalg.vector_norm(v).item())
+        if n < 1e-12:
+            continue
+        basis_dirs[L] = (v / n).reshape(1, -1)
+        coord_dirs[L] = torch.tensor([n], dtype=torch.float32)
+    return basis_dirs, coord_dirs
+
+
+def _manifold_is_affine(manifold: "Manifold") -> bool:
+    """True iff every layer subspace is flat — an affine ``%`` joins the merge.
+
+    A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
+    a curved ``%`` gets its own three-op instead.
+    """
+    layers = getattr(manifold, "layers", None)
+    if not layers:
+        return False
+    return all(sub.is_affine for sub in layers.values())
+
+
+def _affine_manifold_push(
+    manifold: "Manifold", position: "tuple[float, ...] | str",
+) -> "tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]":
+    """An affine ``%`` term → a rank-R push fragment per layer.
+
+    **Label-form only.**  The node's per-layer real coords
+    (``LayerSubspace.node_coords[idx]``) are the push target on the manifold's
+    per-layer basis.  Coord-form on an affine manifold has no interpolant to
+    map authoring coords to per-layer reduced coords, so it raises (deferred).
+    """
+    from saklas.core.steering_expr import SteeringExprError
+
+    if not isinstance(position, str):
+        raise SteeringExprError(
+            f"coord-form position {tuple(position)!r} is not supported on the "
+            f"affine manifold {manifold.name!r}; steer by node label "
+            f"(e.g. '{manifold.name}%<label>')"
+        )
+    idx = manifold.nearest_node_index(position)
+    basis_dirs: dict[int, torch.Tensor] = {}
+    coord_dirs: dict[int, torch.Tensor] = {}
+    for L, sub in manifold.layers.items():
+        if sub.node_coords is None:
+            raise SteeringExprError(
+                f"affine manifold {manifold.name!r} layer {L} carries no "
+                f"per-layer node_coords; re-fit to steer it by node label"
+            )
+        basis_dirs[L] = sub.basis
+        coord_dirs[L] = sub.node_coords[idx]
+    return basis_dirs, coord_dirs
+
+
 class _SteeringContext:
     """Context manager returned by SaklasSession.steering().
 
@@ -366,17 +432,15 @@ class _SteeringContext:
     ablation.  Bare-alpha inputs to the public ``steering()`` API are
     normalized before we get here.
 
-    ``_injection_mode`` and ``_theta_max`` carry the per-call overrides
-    forward through the stack so nested scopes can flip the steering
-    math (or the angular cap) for the duration of the inner block.
-    ``None`` means "inherit": stack walks the LIFO from top, picking the
-    first non-``None`` value, falling through to the session default if
-    every scope is ``None``.
+    ``_projection_metric`` carries the per-call ``~``/``|`` metric override
+    forward through the stack so nested scopes can flip it for the duration
+    of the inner block.  ``None`` means "inherit": the stack walks the LIFO
+    from top, picking the first non-``None`` value, falling through to the
+    session default if every scope is ``None``.
     """
 
     __slots__ = (
-        "_session", "_entries", "_entered",
-        "_injection_mode", "_theta_max", "_projection_metric",
+        "_session", "_entries", "_entered", "_projection_metric",
         "_synthetic_snapshots", "_active_role", "_prev_active_role",
     )
 
@@ -385,8 +449,6 @@ class _SteeringContext:
         session: "SaklasSession",
         entries: dict[str, SteeringStackEntry],
         *,
-        injection_mode: str | None = None,
-        theta_max: float | None = None,
         projection_metric: str | None = None,
         synthetic_snapshots: dict[str, "object"] | None = None,
         active_role: str | None = None,
@@ -394,8 +456,6 @@ class _SteeringContext:
         self._session = session
         self._entries = entries
         self._entered = False
-        self._injection_mode = injection_mode
-        self._theta_max = theta_max
         self._projection_metric = projection_metric
         # Pre-materialize snapshots of any synthetic-projection keys
         # this scope wrote to ``session._profiles`` — value is the prior
@@ -419,8 +479,6 @@ class _SteeringContext:
         # no stale state for __exit__ to pop.
         self._session._push_steering(
             self._entries,
-            injection_mode=self._injection_mode,
-            theta_max=self._theta_max,
             projection_metric=self._projection_metric,
         )
         # Save / overwrite the session-level active_role.  Inner scopes
@@ -490,8 +548,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        injection_mode: str = "angular",
-        theta_max: float | None = None,
         projection_metric: str = "mahalanobis",
         dls: bool = True,
         compile: bool = False,
@@ -505,11 +561,6 @@ class SaklasSession:
         HF-loading heavy lifting. To wrap an already-loaded model use the
         plain ``__init__(model, tokenizer, ...)`` form.
 
-        ``injection_mode`` selects the steering math: ``"angular"``
-        (default, v2.1+) maps user α to a rotation angle; ``"additive"``
-        is the legacy v1.x additive + norm-preserving path.  ``theta_max``
-        sets the maximum rotation angle under angular mode (default π/2,
-        i.e. α=1 fully aligns the residual with the concept direction).
         ``projection_metric`` selects the metric used when materializing
         ``~`` / ``|`` projection terms in steering expressions:
         ``"mahalanobis"`` (default since v2.1) uses the closed-form
@@ -624,8 +675,6 @@ class SaklasSession:
             probes=probes,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
-            injection_mode=injection_mode,
-            theta_max=theta_max,
             projection_metric=projection_metric,
             dls=dls,
             cuda_graphs=cuda_graphs,
@@ -640,8 +689,6 @@ class SaklasSession:
         probes: list[str] | None = None,
         system_prompt: str | None = None,
         max_tokens: int = 1024,
-        injection_mode: str = "angular",
-        theta_max: float | None = None,
         projection_metric: str = "mahalanobis",
         dls: bool = True,
         cuda_graphs: bool = False,
@@ -667,20 +714,6 @@ class SaklasSession:
         # populated lazily by ``_ensure_manifold_loaded`` on scope entry.
         self._manifolds: dict[str, Manifold] = {}
 
-        # Transient steering manager — used only during generation.  The
-        # session-level injection_mode + θ_max are stamped onto every hook
-        # at apply time; per-call ``Steering.injection_mode`` overrides
-        # this default in ``_rebuild_steering_hooks``.
-        from saklas.core.hooks import DEFAULT_THETA_MAX
-        if injection_mode not in ("angular", "additive"):
-            raise ValueError(
-                f"injection_mode must be 'angular' or 'additive', "
-                f"got {injection_mode!r}"
-            )
-        self._injection_mode: str = injection_mode
-        self._theta_max: float = (
-            DEFAULT_THETA_MAX if theta_max is None else float(theta_max)
-        )
         if projection_metric not in ("mahalanobis", "euclidean"):
             raise ValueError(
                 f"projection_metric must be 'mahalanobis' or 'euclidean', "
@@ -707,10 +740,7 @@ class SaklasSession:
         elif return_top_k > 256:
             return_top_k = 256
         self._default_return_top_k: int = int(return_top_k)
-        self._steering = SteeringManager(
-            injection_mode=self._injection_mode,
-            theta_max=self._theta_max,
-        )
+        self._steering = SteeringManager()
         # CUDA-graphs / StaticCache routing (Phase B, v2.2).  Probe
         # support once at construction so the per-generation hot path
         # only consults a boolean.  Off when (a) user opted out, (b)
@@ -740,16 +770,12 @@ class SaklasSession:
         # (later entries overwrite earlier ones) is what the steering
         # manager installs when a generation begins.
         self._steering_stack: list[dict[str, SteeringStackEntry]] = []
-        # Parallel LIFO of per-scope (injection_mode, theta_max,
-        # projection_metric) overrides.  Each element matches its sibling
-        # in ``_steering_stack``; ``None`` means "inherit".  Walked
-        # top-down by ``_resolve_steering_override`` to find the active
-        # value, with the session default as the floor.  Triplet shape so
-        # all three knobs (steering math, rotation cap, projection
-        # metric) compose under nesting.
-        self._steering_override_stack: list[
-            tuple[str | None, float | None, str | None]
-        ] = []
+        # Parallel LIFO of per-scope ``projection_metric`` overrides.  Each
+        # element matches its sibling in ``_steering_stack``; ``None`` means
+        # "inherit".  Walked top-down by ``_resolve_projection_metric`` to find
+        # the active value, with the session default as the floor.  (Steering
+        # math / rotation cap retired in 4.0 — there is one injection backend.)
+        self._steering_override_stack: list[str | None] = []
 
         # Active assistant-role label for the current ``session.steering()``
         # scope — populated when every role-tagged term in the resolved
@@ -2021,16 +2047,10 @@ class SaklasSession:
                 RoleBaselineMismatchWarning,
                 stacklevel=2,
             )
-        # Per-call overrides ride along with the entries.  ``None`` means
-        # "inherit"; the resolver folds session defaults at hook-install.
-        mode_override = getattr(steering_obj, "injection_mode", None)
-        theta_override = getattr(steering_obj, "theta_max", None)
+        # Per-call projection-metric override rides along with the entries.
+        # ``None`` means "inherit"; the resolver folds the session default at
+        # materialize time.
         metric_override = getattr(steering_obj, "projection_metric", None)
-        if mode_override is not None and mode_override not in ("angular", "additive"):
-            raise ValueError(
-                f"Steering.injection_mode must be 'angular' or 'additive', "
-                f"got {mode_override!r}"
-            )
         if metric_override is not None and metric_override not in (
             "mahalanobis", "euclidean",
         ):
@@ -2040,8 +2060,6 @@ class SaklasSession:
             )
         return _SteeringContext(
             self, resolved,
-            injection_mode=mode_override,
-            theta_max=theta_override,
             projection_metric=metric_override,
             synthetic_snapshots=snapshots,
             active_role=active_role,
@@ -2382,19 +2400,15 @@ class SaklasSession:
         self,
         entries: dict[str, SteeringStackEntry],
         *,
-        injection_mode: str | None = None,
-        theta_max: float | None = None,
         projection_metric: str | None = None,
     ) -> None:
         """Push an entries dict onto the steering stack and rebuild hooks.
 
-        ``injection_mode`` / ``theta_max`` / ``projection_metric`` are
-        per-scope overrides; any ``None`` field falls through to the
-        next outer scope (LIFO walk) and ultimately to the session-level
-        default.  ``projection_metric`` doesn't drive hook rebuild on its
-        own (projection materialization happens in ``steering()`` before
-        ``__enter__``); it's recorded here for symmetry with the other
-        two so :meth:`_resolve_steering_override` can answer "what
+        ``projection_metric`` is a per-scope override; ``None`` falls through
+        to the next outer scope (LIFO walk) and ultimately to the session-level
+        default.  It doesn't drive hook rebuild on its own (projection
+        materialization happens in ``steering()`` before ``__enter__``); it's
+        recorded here so :meth:`_resolve_projection_metric` can answer "what
         metric does the active scope want?" uniformly.
 
         If ``_rebuild_steering_hooks`` raises (e.g. an unknown vector
@@ -2438,9 +2452,7 @@ class SaklasSession:
             )
         with self._gen_lock:
             self._steering_stack.append(dict(entries))
-            self._steering_override_stack.append(
-                (injection_mode, theta_max, projection_metric),
-            )
+            self._steering_override_stack.append(projection_metric)
             try:
                 self._rebuild_steering_hooks()
             except BaseException:
@@ -2514,30 +2526,6 @@ class SaklasSession:
         for entry in self._steering_stack:
             flat.update(entry)
         return flat
-
-    def _resolve_steering_override(
-        self,
-    ) -> tuple[str, float]:
-        """Effective ``(injection_mode, theta_max)`` for the active scope.
-
-        Walks the override LIFO from the top, picking the first non-None
-        value for each field; falls back to the session-level default
-        when no scope set it.  Symmetric across the two fields so a
-        scope can override mode without setting θ_max and vice versa.
-        """
-        eff_mode: str | None = None
-        eff_theta: float | None = None
-        for mode, theta, _pm in reversed(self._steering_override_stack):
-            if eff_mode is None and mode is not None:
-                eff_mode = mode
-            if eff_theta is None and theta is not None:
-                eff_theta = theta
-            if eff_mode is not None and eff_theta is not None:
-                break
-        return (
-            eff_mode if eff_mode is not None else self._injection_mode,
-            eff_theta if eff_theta is not None else self._theta_max,
-        )
 
     def _steering_needs_probe_gating(self) -> bool:
         """Return True iff any active steering trigger carries a
@@ -2618,7 +2606,7 @@ class SaklasSession:
         """
         if override is not None:
             return override
-        for _mode, _theta, pm in reversed(self._steering_override_stack):
+        for pm in reversed(self._steering_override_stack):
             if pm is not None:
                 return pm
         return self._projection_metric
@@ -2627,8 +2615,42 @@ class SaklasSession:
         self,
         entries: dict[str, SteeringStackEntry],
     ) -> None:
-        """Load entries into ``SteeringManager`` without installing hooks."""
+        """Lower the active steering entries into the ``SteeringManager`` (4.0).
+
+        Classifies every entry and composes the one unified backend:
+
+        - **push** terms (vectors, poles, ``~``/``|`` projections, affine-``%``
+          manifolds) and **ablation** terms (``!``) are grouped by trigger;
+          each group is synthesized into one merged affine subspace via
+          :func:`~saklas.core.manifold.synthesize_subspace` and registered with
+          :meth:`SteeringManager.add_subspace`;
+        - **curved-``%``** manifold terms each get their own three-op via
+          :meth:`SteeringManager.add_manifold`.
+
+        A push fragment is ``(unit-dir rows, ‖d_L‖ coord, coeff)`` so the
+        synthesizer's ``Δ = Σ coeff·(coord @ basis)`` recovers the baked
+        direction; the coeff is the term's ``along`` (the strength composes into
+        the merged target).  Ablation directions slide their axis to the
+        neutral-anchored origin (coord 0 = mean-replacement).  The neutral
+        anchor is :attr:`layer_means`; a layer with no anchor is skipped.
+        """
+        from saklas.core.manifold import synthesize_subspace
+
         self._steering.clear_all()
+        # Raw attr (not the lazily-building ``layer_means`` property): real
+        # sessions populate it at construction / first extraction, and a
+        # model-less context (test stub) keeps an empty dict rather than
+        # triggering a model-dependent build.  An empty anchor ⇒ the synthesizer
+        # skips every layer (no steering), the same degenerate path the old
+        # ablation took without ``layer_means``.
+        neutral_means = self._layer_means
+
+        # trigger -> {"push": [(basis_dirs, coord_dirs, coeff)], "ablate": [dirs]}
+        grouped: dict[Trigger, dict[str, list[Any]]] = {}
+
+        def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
+            return grouped.setdefault(trigger, {"push": [], "ablate": []})
+
         for name, entry in entries.items():
             if isinstance(entry, AblationTerm):
                 target = entry.target
@@ -2636,11 +2658,11 @@ class SaklasSession:
                     raise VectorNotRegisteredError(
                         f"No vector registered for ablation target '{target}'"
                     )
-                self._steering.add_ablation(
-                    target, self._profiles[target],
-                    alpha=entry.coeff, trigger=entry.trigger,
-                    layer_means=self._layer_means,
-                )
+                ablate_dirs = {
+                    L: v.to(torch.float32).reshape(-1)
+                    for L, v in self._profiles[target].items()
+                }
+                _bucket(entry.trigger)["ablate"].append(ablate_dirs)
                 continue
             if isinstance(entry, ManifoldTerm):
                 manifold = self._manifolds.get(entry.manifold)
@@ -2648,40 +2670,90 @@ class SaklasSession:
                     raise ManifoldNotRegisteredError(
                         f"No manifold registered for '{entry.manifold}'"
                     )
-                self._steering.add_manifold(
-                    entry.manifold, manifold,
-                    position=entry.position,
-                    along=entry.along, onto=entry.onto,
-                    trigger=entry.trigger,
-                )
+                if _manifold_is_affine(manifold):
+                    # Affine ``%`` (e.g. ``personas%pirate``) joins the merged
+                    # subspace as a rank-R push toward the node's per-layer coords.
+                    basis_dirs, coord_dirs = _affine_manifold_push(
+                        manifold, entry.position,
+                    )
+                    _bucket(entry.trigger)["push"].append(
+                        (basis_dirs, coord_dirs, entry.along),
+                    )
+                else:
+                    self._steering.add_manifold(
+                        entry.manifold, manifold,
+                        position=entry.position,
+                        along=entry.along, onto=entry.onto,
+                        trigger=entry.trigger,
+                    )
                 continue
             alpha, trigger = entry
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-            self._steering.add_vector(
-                name, self._profiles[name], alpha, trigger,
+            basis_dirs, coord_dirs = _vector_push_fragment(self._profiles[name])
+            _bucket(trigger)["push"].append((basis_dirs, coord_dirs, alpha))
+
+        # One merged affine subspace per active trigger group.
+        for i, (trigger, terms) in enumerate(grouped.items()):
+            if not terms["push"] and not terms["ablate"]:
+                continue
+            synth = synthesize_subspace(
+                terms["push"], terms["ablate"], neutral_means=neutral_means,
             )
+            if not synth.layers:
+                continue
+            lever = self._dispatch_lever(synth)
+            self._steering.add_subspace(
+                f"__affine__{i}", synth, lever=lever, trigger=trigger,
+            )
+
+    def _dispatch_lever(
+        self, synth: "SynthesizedSubspace",
+    ) -> "dict[int, float] | None":
+        """Per-layer steering lever for a synthesized subspace, from neutrals.
+
+        ``layer_lever`` over the cached neutral activations (raw = the
+        whitener's centered ``X_L`` + the layer mean) gives the fraction of a
+        running activation's norm that lives in the merged subspace, which
+        :meth:`SteeringManager.apply_to_model` divides into the gain for R-/
+        metric-invariance.  Returns ``None`` (⇒ ``N = 1``) when no whitener
+        covers the subspace's layers — the CPU-stub / no-neutral path, where
+        steering strength is uncalibrated anyway (the GPU gate owns that).
+        """
+        from saklas.core.manifold import layer_lever
+
+        layers = list(synth.layers)
+        try:
+            whitener = self.whitener
+        except Exception:
+            whitener = None
+        if whitener is None or not whitener.covers_all(layers):
+            return None
+        means = self._layer_means
+        if not all(L in means for L in layers):
+            return None
+        lever: dict[int, float] = {}
+        for L in layers:
+            mean_L = means[L].to(torch.float32).reshape(-1)
+            raw_L = whitener._X[L].to(torch.float32) + mean_L  # (N, D) raw neutrals
+            lever[L] = layer_lever(raw_L, mean_L, synth.layers[L].basis)
+        return lever
 
     def _install_composed_steering(self) -> None:
         """Attach the currently-composed steering entries to model layers."""
-        eff_mode, eff_theta = self._resolve_steering_override()
         self._steering.apply_to_model(
             self._layers, self._device, self._dtype,
-            injection_mode=eff_mode,  # pyright: ignore[reportArgumentType]  # str narrowed to InjectionMode by session-level validation
-            theta_max=eff_theta,
         )
 
     def _rebuild_steering_hooks(self) -> None:
         """Tear down existing hooks and install from the flattened stack head.
 
         Called on every push/pop.  When the stack is empty this is a clean
-        ``clear_all``.  One hook installation per active layer regardless
-        of nesting depth — ``SteeringManager.apply_to_model`` composes
-        per-layer vectors internally and groups entries by trigger within
-        each layer.  Dispatches by entry type: plain tuples route to
-        :meth:`SteeringManager.add_vector`, :class:`AblationTerm` values
-        route to :meth:`SteeringManager.add_ablation` using the term's
-        ``target`` as the registry key.
+        ``clear_all``.  One hook installation per active layer regardless of
+        nesting depth — ``_compose_steering_entries`` synthesizes the merged
+        affine subspace(s) + registers curved manifolds, and
+        ``SteeringManager.apply_to_model`` lowers them to per-layer
+        ``inject_three_op`` groups.
         """
         flat = self._flatten_steering_stack()
         if not flat:

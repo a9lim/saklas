@@ -53,13 +53,9 @@ class _Stub(SaklasSession):
         # Internal-cleanup bypass for the phase guard; stubs never run
         # gen so it stays False.
         self._internal_steering_pop = False
-        # Session-level defaults consulted by _resolve_steering_override
-        # and _resolve_projection_metric when the LIFO has no overrides.
-        # Mirror the v2.1 SaklasSession defaults so the stub flows through
-        # the same code paths the real session uses.
-        self._injection_mode = "angular"
-        from saklas.core.hooks import DEFAULT_THETA_MAX
-        self._theta_max = DEFAULT_THETA_MAX
+        # Session-level default consulted by _resolve_projection_metric when
+        # the LIFO has no overrides.  Mirror the SaklasSession default so the
+        # stub flows through the same code paths the real session uses.
         self._projection_metric = "mahalanobis"
         # No whitener in stub mode — _materialize_projections silently
         # falls back to Euclidean per-layer when whitener is None.  Stub

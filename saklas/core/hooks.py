@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -13,74 +12,11 @@ from saklas.core.manifold import (
     LayerSubspace,
     ManifoldDomain,
     SynthesizedSubspace,
+    _ortho_basis,
     eval_rbf,
     inject_three_op,
-    rotate_toward,
 )
 from saklas.core.triggers import Trigger, TriggerContext
-
-
-# Default rotation cap for angular injection.  ``π/2`` (90°) means user
-# α=1 fully aligns the residual with the concept direction (saturating,
-# no past-rotation flip).  Per the user's design choice on the
-# prototype plan; users can override per-session.
-DEFAULT_THETA_MAX: float = math.pi / 2
-
-InjectionMode = Literal["angular", "additive"]
-
-
-def _angular_inplace(
-    hidden: torch.Tensor,
-    d_hat: torch.Tensor | None,
-    cos_t: float | torch.Tensor | None,
-    sin_t: float | torch.Tensor | None,
-) -> None:
-    """Rotate ``hidden`` in-place toward ``d_hat`` by the cached angle.
-
-    The rotation lives in the 2D subspace spanned by each position's
-    ``hidden[i]`` and the global direction ``d_hat``, with angle ``θ``
-    encoded by ``cos_t`` / ``sin_t``.  Both may be Python floats (the
-    direct-call test path) or 0-dim tensors (the hook fast path under
-    ``torch.compile``: pinning the angle to a tensor input avoids
-    recompiles when α changes between generations and avoids constant-
-    folding the angle into a CUDA-graph capture).
-
-    Norm is preserved exactly: rotation is unitary in the
-    ``(h_unit, e_perp)`` basis, and we restore the original per-position
-    magnitude.
-
-    No-op when ``d_hat is None`` (degenerate composed tensor —
-    :meth:`SteeringHook._refresh_angular_cache` sets this when α is
-    effectively zero, so the ``sin_t == 0`` Python guard the v2.1 entry
-    used to carry is unnecessary and would force a CPU sync if ``sin_t``
-    is a tensor).  Positions already (anti-)aligned with ``d_hat`` are
-    left untouched by :func:`~saklas.core.manifold.rotate_toward`'s own
-    near-aligned guard.
-
-    The rotation itself is :func:`~saklas.core.manifold.rotate_toward` —
-    the Givens kernel shared with manifold angular steering
-    (:func:`~saklas.core.manifold.subspace_rotate`).  This path applies it
-    to the *full* unit activation toward the concept direction ``d̂``;
-    manifold steering applies the same kernel to the centered in-subspace
-    component.  Only the magnitude extraction (``‖h‖`` here) and reassembly
-    differ.
-    """
-    if d_hat is None or cos_t is None or sin_t is None:
-        return
-
-    h_f32 = hidden.to(torch.float32)
-    h_norm = torch.linalg.vector_norm(
-        h_f32, dim=-1, keepdim=True,
-    ).clamp_(min=1e-12)
-    h_unit = h_f32 / h_norm
-
-    d_hat_f32 = d_hat.to(torch.float32)
-    # ``w_norm`` (the near-aligned tell) is unused on the vector path —
-    # rotate_toward's internal ``where`` is the whole guard needed here;
-    # only manifold steering folds it into a wider degeneracy condition.
-    rotated_unit, _w_norm = rotate_toward(h_unit, d_hat_f32, cos_t, sin_t)
-
-    hidden.copy_((rotated_unit * h_norm).to(hidden.dtype))
 
 
 class HiddenCapture:
@@ -217,48 +153,27 @@ class HiddenCapture:
 
 
 class SteeringHook:
-    """Pre-composed steering vectors and ablation data for a single layer.
+    """Per-layer steering state: zero or more subspace / manifold groups.
 
-    Fast path (``Trigger.BOTH`` additive only, no ablation): a single
-    composed tensor is added unconditionally at hook time — no per-step
-    trigger check.
-
-    Slow path: entries are grouped by trigger equality into
-    ``composed_groups`` (additive) and ``ablation_groups`` (mean
-    replacement). At hook time, ablation groups fire first, then additive
-    groups; the unconditional norm-preservation rescale wraps the combined
-    op.
+    The 4.0 unified backend.  Every steering term — vectors, poles,
+    ``~``/``|`` projections, ``!`` ablations, affine and curved ``%`` — lowers
+    to a per-layer :func:`inject_three_op` group: the dispatch-synthesized
+    merged affine subspace, plus zero or more mutually-orthogonal curved
+    manifolds.  There is no additive/angular vector fast path any more, so a
+    steered layer always runs the (ctx-consulting) slow hook — per-step
+    triggers and probe gates work uniformly, at the cost of the StaticCache /
+    graph-capture path that the old composed-tensor fast path enabled.
     """
 
-    def __init__(
-        self,
-        *,
-        injection_mode: InjectionMode = "angular",
-        theta_max: float = DEFAULT_THETA_MAX,
-    ) -> None:
-        # Populated on the fast path (BOTH only, no ablation). Mutually
-        # exclusive with ``composed_groups``/``ablation_groups`` — recompose
-        # sets exactly one code path live.
-        self.composed: torch.Tensor | None = None
-        # Slow path: list of (trigger, composed_tensor) pairs. Iterated per
-        # hook call; each group's trigger is consulted against ``_ctx``.
-        self.composed_groups: list[tuple[Trigger, torch.Tensor]] = []
-        # Ablation groups: (Trigger, D_unit [K,dim], m [K], alpha [K]).
-        # D_unit rows are per-direction unit vectors; m[k] = μ_L · d̂_k;
-        # alpha[k] is the user coefficient (no _STEER_GAIN — ablation is
-        # a conservative replace, not a tunable push).
-        self.ablation_groups: list[
-            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
-        # Manifold groups: (Trigger, subspace, domain, target_coord [n],
-        # origin_coord [n], along, onto).  ``target_coord`` /
-        # ``origin_coord`` are **authoring coordinates** (the kernel slides the
-        # foot in coord space, not toward a fixed world point), so there is no
-        # per-layer world-target precompute — the RBF eval lives in
-        # :func:`inject_three_op` warm-started from the per-token foot.
-        # ``along`` / ``onto`` are the per-layer effective coefficients
-        # (share-weighted + lever-normalized at apply time).  Any manifold
-        # group forces the slow path.
+    def __init__(self) -> None:
+        # Subspace / manifold groups: (Trigger, subspace, domain,
+        # target_coord [n], origin_coord [n], along, onto).  The merged affine
+        # subspace (from the dispatch synthesizer) and each curved manifold are
+        # both groups here; ``inject_three_op``'s ``is_affine`` branch picks the
+        # analytic-vs-foot-following path.  ``target_coord`` / ``origin_coord``
+        # are authoring coordinates; ``along`` / ``onto`` are the per-layer
+        # effective coefficients (share-weighted + lever-normalized at apply
+        # time).  See :meth:`_apply_manifold_groups`.
         self.manifold_groups: list[
             tuple[
                 Trigger, LayerSubspace, ManifoldDomain,
@@ -266,34 +181,13 @@ class SteeringHook:
             ]
         ] = []
         # Per-token nearest-point foot state, parallel to ``manifold_groups``
-        # (``None`` = cold, seed at the origin).  ``inject_three_op`` returns
-        # the refined foot each fire; we stash the *last position* of it as the
-        # next token's warm start.  Reset to all-``None`` at recompose and by
+        # (``None`` = cold, seed at the origin).  Affine groups ignore it (the
+        # foot is ``q`` exactly); curved groups warm-start the Gauss-Newton
+        # follower from it.  ``inject_three_op`` returns the refined foot each
+        # fire; we stash the *last position* of it as the next token's warm
+        # start.  Reset at recompose and by
         # :meth:`SteeringManager.reset_manifold_feet` at each generation start.
         self._manifold_feet: list[torch.Tensor | None] = []
-        # Injection-mode state.  Angular cache is populated only on the
-        # fast path; the slow path computes per-fire from active groups.
-        self.injection_mode: InjectionMode = injection_mode
-        self.theta_max: float = theta_max
-        # Angular fast-path cache (None unless angular + fast path).
-        # ``_cos_t`` / ``_sin_t`` are 0-dim tensors when the cache is
-        # warm (allocated lazily on the layer's device in
-        # ``_refresh_angular_cache``) so that ``torch.compile`` sees a
-        # single tensor input across recomposes — Python-scalar inputs
-        # would burn a guard per α and force recompile on every
-        # generation.  Allocated once via ``empty(())`` and refreshed
-        # in-place via ``copy_`` against a CPU staging tensor.  When
-        # the cache is cold (no fast-path steering active) the
-        # tensors stay as ``None`` and the hot path early-exits on
-        # ``self._d_hat is None``.
-        self._d_hat: torch.Tensor | None = None
-        self._theta: float = 0.0
-        self._cos_t: torch.Tensor | None = None
-        self._sin_t: torch.Tensor | None = None
-        # Slow-path angular: per-group α-budget (Σ_i |α_i| × ||baked_i||)
-        # parallel to ``composed_groups`` so the hot path can sum-then-
-        # rotate without re-traversing the entries list.
-        self.angular_strengths: list[tuple[Trigger, float]] = []
         # Shared mutable context threaded in by SteeringManager.  Read-only
         # from the hook's perspective; the generation loop mutates fields.
         self._ctx: TriggerContext | None = None
@@ -301,130 +195,28 @@ class SteeringHook:
 
     def recompose(
         self,
-        additive_entries: list[tuple[torch.Tensor, float, Trigger]],
-        ablation_entries: list[tuple[torch.Tensor, torch.Tensor, float, Trigger]],
-        device: torch.device,
-        dtype: torch.dtype,
+        manifold_entries: "list[tuple[LayerSubspace, ManifoldDomain, torch.Tensor, torch.Tensor, float, float, Trigger]] | None",
         ctx: TriggerContext,
         *,
-        manifold_entries: "list[tuple[LayerSubspace, ManifoldDomain, torch.Tensor, torch.Tensor, float, float, Trigger]] | None" = None,
-        injection_mode: InjectionMode | None = None,
-        theta_max: float | None = None,
+        device: torch.device,
     ) -> None:
-        """Pre-compose additive and ablation state for this layer.
+        """Pre-compose this layer's subspace / manifold groups.
 
-        ``additive_entries`` are ``(baked_direction, effective_alpha,
-        trigger)`` triples; entries sharing a trigger value (dataclass
-        equality) collapse into one composed tensor.  ``ablation_entries``
-        are ``(baked_direction, layer_mean, user_alpha, trigger)``
-        quadruples; per-trigger groups collapse into one stacked-direction
-        matrix with companion mean-scalar and coefficient vectors.  ``ctx``
-        is the shared per-generation TriggerContext mutated by the
-        generation loop and read here at hook-fire time.
+        Each entry is ``(subspace, domain, target_coord, origin_coord, along,
+        onto, trigger)`` — the merged affine subspace (one entry, possibly per
+        active trigger group) and each curved manifold are both groups here.
+        ``ctx`` is the shared per-generation :class:`TriggerContext` the
+        generation loop mutates and the hook reads at fire time.
 
-        ``injection_mode`` and ``theta_max`` override the values stamped
-        on the hook at construction.  Manager passes them on every
-        ``apply_to_model`` so that flipping the session-level mode
-        between calls re-warms the angular cache without rebuilding
-        hook objects.
-
-        For ``injection_mode="additive"`` the per-trigger ``composed``
-        tensor is ``Σ_i α_i × baked_i`` (summed addend) — this is
-        bit-identical to the v1.x hook math.  For ``"angular"`` we
-        additionally cache a unit direction ``d̂`` and a Python-scalar
-        rotation angle so the hot path can run the Givens rotation with
-        no extra GPU ops or sync points.
+        Subspace tensors are cast to **fp32** (the RBF / Gauss-Newton math is
+        fp32 regardless of the model dtype; ``inject_three_op`` casts the
+        result back to ``hidden.dtype`` per fire).  An entry with both
+        coefficients zero is a no-op and drops here.  A new group set
+        cold-starts every foot-follower.
         """
         self._ctx = ctx
-        if injection_mode is not None:
-            self.injection_mode = injection_mode
-        if theta_max is not None:
-            self.theta_max = theta_max
 
-        # --- additive grouping (existing semantics) ---
-        add_groups: dict[Trigger, list[tuple[torch.Tensor, float]]] = {}
-        for vec, alpha, trig in additive_entries:
-            add_groups.setdefault(trig, []).append((vec, alpha))
-
-        composed_groups: list[tuple[Trigger, torch.Tensor]] = []
-        # Parallel α-strength per group for angular's α/θ map.  Kept in
-        # lock-step with ``composed_groups`` so slow-path sum-then-rotate
-        # can recover the per-fire rotation magnitude from active groups.
-        angular_strengths: list[tuple[Trigger, float]] = []
-        for trig, vecs in add_groups.items():
-            # All-zero alphas → group contributes nothing; skip the matmul
-            # so that a stale entry with alpha=0 doesn't inject NaN on any
-            # bad-extraction vectors it carries.
-            if all(alpha == 0.0 for _, alpha in vecs):
-                continue
-            stacked = torch.stack(
-                [v.to(device=device, dtype=dtype) for v, _ in vecs]
-            )
-            alphas_t = torch.tensor(
-                [alpha for _, alpha in vecs], device=device, dtype=dtype,
-            )
-            composed = (alphas_t.unsqueeze(1) * stacked).sum(dim=0)
-            composed_groups.append((trig, composed))
-
-            # Angular rotation magnitude:
-            #   strength = ||Σ_i α_i × (baked_i / ||baked_i||)||
-            # Collapses to ``|α|`` for single-term (the obvious α → θ map),
-            # captures cancellation when terms point opposing directions
-            # (||·|| < Σ|α_i|), and stays concept-agnostic — the per-layer
-            # ``||baked||`` weights set the *direction* d̂ via the
-            # share-weighted ``composed``, but they don't inflate the
-            # rotation magnitude itself.
-            stacked_f32 = stacked.to(torch.float32)
-            baked_norms = torch.linalg.vector_norm(
-                stacked_f32, dim=-1,
-            ).clamp(min=1e-12)
-            unit_stacked = stacked_f32 / baked_norms.unsqueeze(-1)
-            alphas_f32 = alphas_t.to(torch.float32)
-            composed_unit_sum = (
-                alphas_f32.unsqueeze(1) * unit_stacked
-            ).sum(dim=0)
-            strength_t = torch.linalg.vector_norm(composed_unit_sum)
-            angular_strengths.append((trig, float(strength_t.item())))
-
-        # --- ablation grouping ---
-        abl_groups: dict[
-            Trigger, list[tuple[torch.Tensor, torch.Tensor, float]]
-        ] = {}
-        for baked, layer_mean, alpha, trig in ablation_entries:
-            # Zero alpha ⇒ no-op ablation; drop at compose time so the hot
-            # path never iterates dead rows.
-            if alpha == 0.0:
-                continue
-            abl_groups.setdefault(trig, []).append((baked, layer_mean, alpha))
-
-        ablation_groups: list[
-            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
-        for trig, rows in abl_groups.items():
-            # Compute each unit direction + mean scalar in fp32 for
-            # stability (fp16 sum-of-squares overflows at hidden_dim ≥ 2048,
-            # and mean projections can be close to zero), then cast to hook
-            # dtype for the hot path.
-            d_units_f32: list[torch.Tensor] = []
-            m_vals_f32: list[torch.Tensor] = []
-            alphas_list: list[float] = []
-            for baked, layer_mean, alpha in rows:
-                b32 = baked.to(device=device, dtype=torch.float32)
-                m32 = layer_mean.to(device=device, dtype=torch.float32)
-                n = torch.linalg.vector_norm(b32).clamp(min=1e-12)
-                d_hat = b32 / n
-                d_units_f32.append(d_hat)
-                m_vals_f32.append((m32 * d_hat).sum())
-                alphas_list.append(alpha)
-            D_unit = torch.stack(d_units_f32).to(dtype=dtype)
-            m = torch.stack(m_vals_f32).to(dtype=dtype)
-            alpha_vec = torch.tensor(alphas_list, device=device, dtype=dtype)
-            ablation_groups.append((trig, D_unit, m, alpha_vec))
-
-        self.ablation_groups = ablation_groups
-        self.angular_strengths = angular_strengths
-
-        # --- manifold grouping ---
+        # --- subspace / manifold grouping ---
         # ``target_coord`` / ``origin_coord`` are authoring coordinates; the
         # subspace tensors stay **fp32** (the RBF / Gauss-Newton math is fp32
         # regardless of the model dtype, and quantizing ``node_params`` /
@@ -456,227 +248,18 @@ class SteeringHook:
         # New group set ⇒ cold-start every foot-follower (seed at origin).
         self._manifold_feet = [None] * len(manifold_groups)
 
-        # --- fast-path collapse decision ---
-        if not composed_groups and not ablation_groups and not manifold_groups:
-            self.composed = None
-            self.composed_groups = []
-            self._d_hat = None
-            return
-
-        # Fast path only when the single contributor is additive/BOTH and
-        # no ablation or manifold group is attached.  Either forces the
-        # slow path so the hook_fn can sequence the ops.
-        if (
-            not ablation_groups
-            and not manifold_groups
-            and len(composed_groups) == 1
-            and composed_groups[0][0] == Trigger.BOTH
-        ):
-            self.composed = composed_groups[0][1]
-            self.composed_groups = []
-            # Pre-compute angular fast-path cache so the hot path skips
-            # the GPU sync of ``vector_norm(composed).item()``.
-            self._refresh_angular_cache(angular_strengths[0][1])
-        else:
-            self.composed = None
-            self.composed_groups = composed_groups
-            self._d_hat = None
-
-    def _refresh_angular_cache(self, theta_strength: float) -> None:
-        """Populate ``_d_hat`` / ``_theta`` / ``_cos_t`` / ``_sin_t``
-        from the current ``self.composed`` tensor.
-
-        Only called on the fast path (single-group BOTH).  The slow
-        path computes per-fire from active groups.
-
-        ``theta_strength = ||Σ_i α_i × (baked_i / ||baked_i||)||`` is the
-        rotation magnitude (clamped to ``θ_max``).  The caller passes it
-        from the parallel ``angular_strengths`` list so we don't
-        re-traverse the entries.  Falls back to identity (no rotation)
-        when either ``composed`` or the strength is degenerate.
-
-        ``_cos_t`` / ``_sin_t`` are 0-dim tensors on the layer's device
-        (allocated lazily on first non-degenerate refresh, reused via
-        in-place ``copy_`` thereafter).  Pinning them as tensor inputs
-        keeps the hook compatible with ``torch.compile`` and CUDA-graph
-        capture across α changes — Python scalars would force recompile
-        per generation.
-        """
-        composed = self.composed
-        if composed is None or theta_strength <= 1e-12:
-            self._d_hat = None
-            self._theta = 0.0
-            return
-        c_f32 = composed.detach().to(torch.float32)
-        c_norm_t = torch.linalg.vector_norm(c_f32)
-        c_norm = float(c_norm_t.item())
-        if c_norm <= 1e-12:
-            # All α-weighted terms cancelled out; treat as no-op.
-            self._d_hat = None
-            self._theta = 0.0
-            return
-        # ``d_hat`` lives on the same device/dtype as ``composed`` so the
-        # hot-path projection broadcasts cleanly against ``hidden``.
-        # We use the share-baked composed tensor here — high-share layers
-        # contribute more to the rotation *target*, but the rotation
-        # *magnitude* stays concept-agnostic via ``theta_strength``.
-        self._d_hat = (c_f32 / c_norm).to(dtype=composed.dtype)
-        ratio = theta_strength
-        if ratio > 1.0:
-            ratio = 1.0
-        self._theta = ratio * self.theta_max
-        cos_v = math.cos(self._theta)
-        sin_v = math.sin(self._theta)
-        # Lazy alloc on the composed tensor's device; subsequent
-        # refreshes mutate in place so the tensor *address* the
-        # captured graph or compiled artifact saw stays valid.
-        # Locals so pyright narrows the post-alloc fill_ calls — the
-        # ``self.<attr>`` writes don't propagate the type narrowing
-        # back to the attribute reads.
-        cos_buf = self._cos_t
-        sin_buf = self._sin_t
-        if cos_buf is None or cos_buf.device != composed.device:
-            cos_buf = torch.empty(
-                (), device=composed.device, dtype=torch.float32,
-            )
-            sin_buf = torch.empty(
-                (), device=composed.device, dtype=torch.float32,
-            )
-            self._cos_t = cos_buf
-            self._sin_t = sin_buf
-        assert sin_buf is not None  # paired alloc above
-        cos_buf.fill_(cos_v)
-        sin_buf.fill_(sin_v)
-
     def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
-        # Fast path: single composed additive tensor, no ablation, no
-        # trigger check.
-        if self.composed is not None:
-            hidden = output if isinstance(output, torch.Tensor) else output[0]
-            if self.injection_mode == "angular":
-                _angular_inplace(
-                    hidden,
-                    self._d_hat,
-                    self._cos_t,
-                    self._sin_t,
-                )
-            else:
-                # Additive (legacy): in-place add + norm-preserving rescale.
-                norm_pre = torch.linalg.vector_norm(
-                    hidden, dim=-1, keepdim=True, dtype=torch.float32,
-                )
-                hidden.add_(self.composed)
-                norm_post = torch.linalg.vector_norm(
-                    hidden, dim=-1, keepdim=True, dtype=torch.float32,
-                ).clamp_(min=1e-6)
-                hidden.mul_((norm_pre / norm_post).to(hidden.dtype))
-            return output
-
-        add_groups = self.composed_groups
-        abl_groups = self.ablation_groups
-        mfld_groups = self.manifold_groups
-        if not add_groups and not abl_groups and not mfld_groups:
+        groups = self.manifold_groups
+        if not groups:
             return output
         ctx = self._ctx
         if ctx is None:
             return output
-
-        # Cheap pre-check: any group active this step? Skip the fp32 norm
-        # capture entirely if not (e.g. AFTER_THINKING during prefill).
-        any_active = False
-        for trig, *_ in abl_groups:
-            if trig.active(ctx):
-                any_active = True
-                break
-        if not any_active:
-            for trig, _ in add_groups:
-                if trig.active(ctx):
-                    any_active = True
-                    break
-        if not any_active:
-            for grp in mfld_groups:
-                if grp[0].active(ctx):
-                    any_active = True
-                    break
-        if not any_active:
+        # Cheap pre-check: any group active this step?  Skip the work entirely
+        # if not (e.g. an ``AFTER_THINKING`` group during prefill).
+        if not any(grp[0].active(ctx) for grp in groups):
             return output
-
         hidden = output if isinstance(output, torch.Tensor) else output[0]
-
-        if self.injection_mode == "additive":
-            norm_pre = torch.linalg.vector_norm(
-                hidden, dim=-1, keepdim=True, dtype=torch.float32,
-            )
-
-            # Ablation first: replace the component along each d̂ with the
-            # neutral-baseline mean (α · (h·d̂ - μ·d̂) subtracted per direction).
-            for trig, D_unit, m, alpha_vec in abl_groups:
-                if not trig.active(ctx):
-                    continue
-                coeffs = hidden @ D_unit.T
-                coeffs.sub_(m).mul_(alpha_vec)
-                hidden.sub_(coeffs @ D_unit)
-
-            # Additive second: inject into the already-cleaned residual stream.
-            for trig, composed in add_groups:
-                if trig.active(ctx):
-                    hidden.add_(composed)
-
-            norm_post = torch.linalg.vector_norm(
-                hidden, dim=-1, keepdim=True, dtype=torch.float32,
-            ).clamp_(min=1e-6)
-            hidden.mul_((norm_pre / norm_post).to(hidden.dtype))
-            # Manifold replace runs last — it is a destructive overwrite
-            # of the in-subspace component, so it dominates at the layers
-            # it covers; running after additive/ablation makes that
-            # ordering explicit.
-            self._apply_manifold_groups(hidden, ctx)
-            return output
-
-        # --- angular slow path ---
-        # Ablation runs unchanged (mean-replace lives in additive space).
-        # Then sum active additive groups into one composed tensor and
-        # rotate once toward its direction.  Skipping the post-additive
-        # norm rescale because rotation is exactly norm-preserving.
-        for trig, D_unit, m, alpha_vec in abl_groups:
-            if not trig.active(ctx):
-                continue
-            coeffs = hidden @ D_unit.T
-            coeffs.sub_(m).mul_(alpha_vec)
-            hidden.sub_(coeffs @ D_unit)
-
-        active_composed: torch.Tensor | None = None
-        active_strength: float = 0.0
-        for (trig, composed), (_, strength) in zip(
-            add_groups, self.angular_strengths,
-        ):
-            if not trig.active(ctx):
-                continue
-            active_composed = (
-                composed if active_composed is None else active_composed + composed
-            )
-            # Approximation for cross-trigger strengths: sum.  Triggers
-            # are typically mutually exclusive (BEFORE_THINKING vs
-            # AFTER_THINKING) so this is the cooperating-cooperating
-            # case; opposing trigger groups would over-rotate, but
-            # constructing one in practice requires explicit user intent.
-            active_strength += strength
-
-        if active_composed is not None and active_strength > 1e-12:
-            c_f32 = active_composed.to(torch.float32)
-            c_norm_t = torch.linalg.vector_norm(c_f32)
-            c_norm = float(c_norm_t.item())
-            if c_norm > 1e-12:
-                d_hat = (c_f32 / c_norm).to(dtype=hidden.dtype)
-                ratio = active_strength
-                if ratio > 1.0:
-                    ratio = 1.0
-                theta = ratio * self.theta_max
-                _angular_inplace(
-                    hidden, d_hat, math.cos(theta), math.sin(theta),
-                )
-
-        # Manifold replace runs last (see the additive branch).
         self._apply_manifold_groups(hidden, ctx)
         return output
 
@@ -702,9 +285,9 @@ class SteeringHook:
         decode position forward, and carrying the last prompt position from
         prefill into the first decode step.
 
-        Runs after ablation and additive so the in-subspace operation wins at
-        the layers it covers; the injection mode no longer matters here (vectors
-        still read :attr:`injection_mode`, manifolds never do).
+        The only steering path in 4.0 — the merged affine subspace and every
+        curved manifold are both groups here, dispatched by the kernel's
+        ``is_affine`` branch (analytic slide vs foot-following GN).
         """
         if not self.manifold_groups:
             return
@@ -749,61 +332,9 @@ class SteeringHook:
             self._handle = None
 
 
-# Gain that pins the user-facing alpha scale, applied **only under
-# additive mode** (the default is angular, which maps α directly to a
-# rotation angle and takes no gain).  Per-layer shares
-# (score_L / Σ scores) are baked into the stored direction magnitudes at
-# extraction time, so the additive hook math collapses to a single flat
-# scalar:
-#
-#     effective_injection = user_alpha * _STEER_GAIN * baked_direction_L
-#
-# (Angular mode never multiplies by ``_STEER_GAIN``: its per-layer budget
-# is ``user_alpha · share_L``, water-filled to ≤ θ_max per layer, and the
-# share is read straight back off ``||baked_L||`` — see
-# ``SteeringManager.apply_to_model``.)
-#
-# The same two invariances fall out of the baking step (they just moved
-# from apply-time to extract-time), and hold for both injection modes
-# because both read the per-layer share off the baked magnitude:
-#
-#   - Layer-count invariance: total injection is independent of n_layers,
-#     so models of different depths hit the same behavioral effect at the
-#     same user alpha.  Without this, deeper models over-inject (e.g.
-#     gemma-4-E4B at 42 layers vs gemma-4-31B at 60 layers would drift
-#     by ~1.5× in coherent α).
-#
-#   - Score-magnitude invariance: absolute extraction scores vary wildly
-#     between architectures (diffuse Llama-3.2-3B ≈0.07, sharp gemma-3-4b
-#     ≈0.25 for the same pairs), but only the *relative* per-layer shares
-#     matter here — high-signal layers still get proportionally more push
-#     within a profile.
-#
-# The gain is calibrated so that a user alpha of ~0.5 lands in the
-# coherent additive-steering band on the reference model (gemma-4-31B-it)
-# across the 26 bundled concepts.  Raising the gain shifts every model's
-# coherent α lower; lowering does the opposite.  Smaller or non-standard-
-# geometry models (MatFormer, MoE, heavily safety-trained) may still need
-# proportionally higher alpha due to residual architectural effects
-# (activation magnitude, attention layout) this normalization doesn't
-# capture.
-#
-# History: recalibrated from 3.5 → 2.0 alongside discriminative layer
-# selection (DLS, Dang & Ngo 2026 — the share-bake gate that replaced the
-# earlier fixed edge-drop heuristic).  DLS keeps only the layers where the
-# pos / neg projections straddle the neutral baseline (polarity, not
-# intensity), which both trims early tokenization / late unembedding
-# layers *and* tightens the retained directions' cross-layer coherence —
-# so per-α directional rotation rises and 2.0 lands the additive cliff
-# above α≈0.9 on the reference model, giving a wide coherent band
-# (~0.3-0.85) with headroom for the untested-architecture tail.
-_STEER_GAIN = 2.0
-
-
-# *Base* gain for manifold steering, analogous to
-# :data:`_STEER_GAIN` for vector steering.  One gain now, not a per-mode
-# pair — the along/onto decomposition replaced the angular/additive
-# mode split, so the two coefficients share a single base.  Each op moves
+# *Base* gain for the unified subspace/manifold steering backend — one gain
+# for every term (vectors, poles, projections, ablations, affine and curved
+# ``%``), since 4.0 lowers them all to the one along/onto kernel.  Each op moves
 # a piece of ``h`` whose size is a fraction of ``||h||`` that varies with
 # subspace dimension ``R`` and with whether the subspace is rogue-heavy
 # (Euclidean PCA) or de-rogued (whitened/Fisher PCA); the per-α magnitude
@@ -842,6 +373,44 @@ _MANIFOLD_GAIN = 1.0
 # Floor on the share-weighted lever ``N`` so a near-degenerate (tiny-
 # lever) fit can't send the effective gain ``base / N`` to infinity.
 _MIN_MANIFOLD_LEVER = 0.01
+
+# Max |cosine| between two *curved* manifold subspaces sharing a layer before
+# they are deemed overlapping (``OverlappingManifoldError``).  Curved manifolds
+# that share a layer must be (near-)orthogonal — each overwrites its own
+# in-subspace component, so overlapping spans would clobber each other.  The
+# merged affine subspace is instead always orthogonalized against the curved
+# spans (``_orthogonalize_affine_against``), so affine-vs-curved never raises.
+_CURVED_ORTHO_TOL = 1e-3
+
+
+def _orthogonalize_affine_against(
+    sub: LayerSubspace,
+    target: torch.Tensor,
+    curved_basis: torch.Tensor,
+) -> "tuple[LayerSubspace, torch.Tensor] | None":
+    """Project a merged affine subspace out of the curved manifolds' span.
+
+    Strips the curved-span component from the affine basis rows *and* the push
+    displacement so the merged affine subspace and the orthogonal curved
+    manifolds at a layer operate on disjoint directions — the curved manifold
+    wins the shared directions (ARCHITECTURE §6 precedence), the affine slide
+    handles the complement.  ``sub`` is the synthesized affine ``LayerSubspace``
+    (orthonormal ``basis``), ``target`` its ``(R,)`` push coord, ``curved_basis``
+    the stacked ``(Rc, D)`` orthonormal rows of every curved manifold at this
+    layer.  Returns the re-orthonormalized ``(subspace', target')`` or ``None``
+    when the affine span lies entirely inside the curved span (nothing left to
+    steer there).
+    """
+    basis = sub.basis.to(torch.float32)              # (R, D)
+    cb = curved_basis.to(torch.float32)              # (Rc, D)
+    delta = basis.T @ target.to(torch.float32)       # (D,) world push displacement
+    residual = basis - (basis @ cb.T) @ cb           # (R, D) rows ⟂ curved span
+    new_basis, _kept = _ortho_basis(list(residual))
+    if new_basis.shape[0] == 0:
+        return None
+    delta_perp = delta - (delta @ cb.T) @ cb         # drop the curved-span part
+    new_target = new_basis @ delta_perp              # (R',)
+    return LayerSubspace.affine(sub.mean, new_basis), new_target
 
 # Gauss-Newton steps taken on a *cold* foot (seed at origin ``O``).  The
 # warm path takes one step per token; the cold fire — the prefill window,
@@ -918,18 +487,6 @@ def _redistribute_budget(
     return {L: signs[L] * capped[L] for L in per_layer_raw}
 
 
-def _profile_layer_shares(profile: dict[int, torch.Tensor]) -> dict[int, float]:
-    norms: dict[int, float] = {}
-    total = 0.0
-    for layer_idx, vec in profile.items():
-        n = float(torch.linalg.vector_norm(vec.to(torch.float32)).item())
-        norms[layer_idx] = n
-        total += n
-    if total <= 1e-12:
-        return {}
-    return {layer_idx: n / total for layer_idx, n in norms.items()}
-
-
 def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     # Prefer the whitened (Mahalanobis) per-layer share baked at fit time —
     # the subspace-restricted analogue of vector steering's ``‖d‖_M`` bake
@@ -972,90 +529,29 @@ class SteeringManager:
     trigger-gated groups contribute at each forward.
     """
 
-    def __init__(
-        self,
-        *,
-        injection_mode: InjectionMode = "angular",
-        theta_max: float = DEFAULT_THETA_MAX,
-    ) -> None:
+    def __init__(self) -> None:
         self.hooks: dict[int, SteeringHook] = {}
-        self.vectors: dict[str, dict[str, Any]] = {}
-        self.ablations: dict[str, dict[str, Any]] = {}
         self.manifolds: dict[str, dict[str, Any]] = {}
         # Dispatch-synthesized merged affine subspaces (one per active trigger
         # group), the 4.0 unified vector/pole/projection/ablation/affine-``%``
         # backend.  Each value is ``{synth, lever, trigger}``; ``apply_to_model``
         # lowers them to per-layer ``inject_three_op`` entries alongside curved
-        # manifolds (Step 5).
+        # manifolds.
         self.subspaces: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
-        self.injection_mode: InjectionMode = injection_mode
-        self.theta_max: float = theta_max
 
     def all_fast_path(self) -> bool:
-        """True iff every attached hook is in fast-path mode.
+        """True iff no steering hook is attached (the unsteered path).
 
-        Fast path = single ``Trigger.BOTH`` additive group with no
-        ablation, collapsed by ``SteeringHook.recompose`` into a stable
-        ``self.composed`` tensor.  In this regime the hook fires
-        unconditional in-place ops with no read of the mutable
-        :class:`TriggerContext` per step — which is the precondition
-        for ``torch.compile(mode="reduce-overhead")`` graph capture and
-        for the StaticCache routing in :mod:`saklas.core.cuda_graphs`.
-
-        Slow path = trigger groups, ablation, or probe gates: hooks
-        consult ``ctx`` per fire so a captured graph can't represent the
-        per-step decision.  Empty manager (no hooks attached) returns
-        True — there's nothing to break, and unsteered generations are
+        The 4.0 backend lowers every steering term to a slow (ctx-consulting)
+        :func:`inject_three_op` group, so there is no longer a composed-tensor
+        fast path.  An attached hook therefore always forces the slow path,
+        which is the StaticCache / ``torch.compile`` graph-capture
+        ineligibility signal :mod:`saklas.core.cuda_graphs` reads — graph
+        capture stays available only for unsteered generation (no hooks),
         the cheapest case.
         """
-        for hook in self.hooks.values():
-            if hook.composed is None:
-                return False
-        return True
-
-    def add_vector(
-        self,
-        name: str,
-        profile: dict[int, torch.Tensor],
-        alpha: float,
-        trigger: Trigger = Trigger.BOTH,
-    ) -> None:
-        # Shares are computed lazily in ``apply_to_model`` — only the
-        # angular path reads them, and ``_profile_layer_shares`` does a
-        # host ``.item()`` sync per layer.  Additive reads ``||baked_L||``
-        # back out of the tensor magnitude and never touches shares, so
-        # eager computation here would burn the sync on every add for
-        # nothing under the default-after-mode-flip additive case.
-        self.vectors[name] = {
-            "profile": profile,
-            "alpha": alpha,
-            "trigger": trigger,
-        }
-
-    def add_ablation(
-        self,
-        name: str,
-        profile: dict[int, torch.Tensor],
-        alpha: float,
-        trigger: Trigger,
-        layer_means: dict[int, torch.Tensor],
-    ) -> None:
-        """Register a mean-replacement ablation target.
-
-        At ``apply_to_model`` time, for every layer present in both
-        ``profile`` and ``layer_means``, a per-layer
-        ``(baked_direction, layer_mean, alpha, trigger)`` entry is attached
-        to the corresponding :class:`SteeringHook`.  Profile layers missing
-        from ``layer_means`` are silently skipped — ablation without a
-        baseline mean is undefined.
-        """
-        self.ablations[name] = {
-            "profile": profile,
-            "alpha": alpha,
-            "trigger": trigger,
-            "layer_means": layer_means,
-        }
+        return not self.hooks
 
     def add_manifold(
         self,
@@ -1161,102 +657,28 @@ class SteeringManager:
         model_layers: torch.nn.ModuleList,
         device: torch.device,
         dtype: torch.dtype,
-        *,
-        injection_mode: InjectionMode | None = None,
-        theta_max: float | None = None,
     ) -> None:
         """Group entries by layer, recompose hooks, attach to model.
 
-        ``injection_mode`` and ``theta_max`` override the manager-level
-        values stamped at construction.  Defaulting both to ``None``
-        means "use whatever was set on the manager"; callers (the
-        session) pass concrete values when the per-call steering carries
-        an override.
-
-        Under ``injection_mode="additive"`` the user α is multiplied by
-        :data:`_STEER_GAIN` so the v1.x steering scale is reproduced
-        bit-identically.  Under ``"angular"`` the gain is dropped — α
-        maps directly to a rotation angle (the user's reason for
-        switching modes in the first place).
+        Lowers every registered term — the dispatch-synthesized merged affine
+        subspace(s) and each curved manifold — to per-layer
+        :func:`inject_three_op` groups, orthogonalizing the affine subspace
+        against the curved manifolds so they compose with zero cross-talk,
+        then recomposing the per-layer hooks.  ``dtype`` is the model dtype the
+        hook casts the fp32 subspace result back to.
         """
-        if injection_mode is not None:
-            self.injection_mode = injection_mode
-        if theta_max is not None:
-            self.theta_max = theta_max
-
-        additive_by_layer: dict[
-            int, list[tuple[torch.Tensor, float, Trigger]]
-        ] = {}
-        for v in self.vectors.values():
-            profile = v["profile"]
-            user_alpha = v["alpha"]
-            trigger = v.get("trigger", Trigger.BOTH)
-
-            if self.injection_mode == "angular":
-                # Share-weight α per layer so per-layer θ scales with
-                # ``share_L = ||baked_L|| / Σ_L' ||baked_L'||``.  Without
-                # this, every layer rotates by the same |α|·θ_max and the
-                # rotations compound through the residual stream — for an
-                # N-layer model the cumulative rotation lands at ~N·|α|·
-                # θ_max, which crashes coherence at any nontrivial α.
-                # With share-weighting, the per-layer ``Σ θ_L`` collapses
-                # to ``|α|·θ_max``, matching the additive-path intuition
-                # that high-signal layers carry most of the steering and
-                # the user-facing α is bounded in the same band.
-                # Compute shares here (not at add_vector) — this is the
-                # only path that reads them, and the computation host-syncs
-                # per layer.
-                shares: dict[int, float] = _profile_layer_shares(profile)
-                if not shares:
-                    # Profile is degenerate (all-zero); skip silently.
-                    continue
-                # Raw per-layer budget in θ_max units (1.0 ⇒ full θ_max
-                # rotation at that layer).  Water-fill so a peaked-share
-                # layer never rotates past θ_max while the trimmed excess
-                # is redistributed to unsaturated layers — preserving the
-                # cumulative budget Σ_L θ_L = min(|α|, n_layers)·θ_max
-                # instead of silently dropping it on the capped layer.
-                raw_budget: dict[int, float] = {
-                    layer_idx: user_alpha * shares.get(layer_idx, 0.0)
-                    for layer_idx in profile
-                }
-                capped_budget = _redistribute_budget(raw_budget)
-                for layer_idx, vec in profile.items():
-                    additive_by_layer.setdefault(layer_idx, []).append(
-                        (vec, capped_budget.get(layer_idx, 0.0), trigger),
-                    )
-            else:
-                # Additive (legacy): the v1.x ``α × _STEER_GAIN`` math.
-                # Share is already baked into ``||baked_L||`` so per-layer
-                # weighting falls out of the magnitude — no extra scaling
-                # needed at apply time.
-                effective_alpha = user_alpha * _STEER_GAIN
-                for layer_idx, vec in profile.items():
-                    additive_by_layer.setdefault(layer_idx, []).append(
-                        (vec, effective_alpha, trigger),
-                    )
-
-        ablation_by_layer: dict[
-            int, list[tuple[torch.Tensor, torch.Tensor, float, Trigger]]
-        ] = {}
-        for a in self.ablations.values():
-            alpha = a["alpha"]
-            trigger = a["trigger"]
-            means = a["layer_means"]
-            for layer_idx, vec in a["profile"].items():
-                if layer_idx not in means:
-                    continue
-                ablation_by_layer.setdefault(layer_idx, []).append(
-                    (vec, means[layer_idx], alpha, trigger),
-                )
 
         # Manifold entries: stamp the per-layer subspace + domain + authoring
         # ``target`` / ``origin`` coords and the two share-weighted,
         # lever-normalized op coefficients.  The kernel slides the foot in
         # *coordinate* space, so there is no fixed world-target precompute —
-        # only the (layer-independent) authoring coords.  One manifold per
-        # layer (two would each overwrite the in-subspace component; their
-        # composition is ill-defined).
+        # only the (layer-independent) authoring coords.  Two *curved* manifolds
+        # may share a layer only if their subspaces are (near-)orthogonal
+        # (``_CURVED_ORTHO_TOL``); overlapping ones raise
+        # ``OverlappingManifoldError`` (each would clobber the other's
+        # in-subspace component).  ``curved_basis_by_layer`` accumulates the
+        # curved spans so the merged affine subspace can be orthogonalized
+        # against them below.
         #
         # **Gain (share-weight every op).**  Each of ``along`` / ``onto``
         # gets the same per-layer factor ``share_L · (base/N)``:
@@ -1282,7 +704,8 @@ class SteeringManager:
                 torch.Tensor, torch.Tensor, float, float, Trigger,
             ]],
         ] = {}
-        manifold_owner: dict[int, str] = {}
+        curved_owner: dict[int, str] = {}
+        curved_basis_by_layer: dict[int, torch.Tensor] = {}
         for mname, m in self.manifolds.items():
             manifold = m["manifold"]
             position = m["position"]
@@ -1349,14 +772,25 @@ class SteeringManager:
             mfld_origins = getattr(manifold, "origin", None) or {}
 
             for layer_idx, sub in manifold.layers.items():
-                if layer_idx in manifold_owner:
-                    from saklas.core.errors import OverlappingManifoldError
-                    raise OverlappingManifoldError(
-                        f"manifolds '{manifold_owner[layer_idx]}' and "
-                        f"'{mname}' both cover layer {layer_idx}; manifold "
-                        f"steering allows only one manifold per layer"
-                    )
-                manifold_owner[layer_idx] = mname
+                B_new = sub.basis.to(torch.float32)
+                prev = curved_basis_by_layer.get(layer_idx)
+                if prev is not None:
+                    # Two curved manifolds share this layer — compose only if
+                    # their subspaces are (near-)orthogonal.
+                    cross = float((B_new @ prev.T).abs().max().item())
+                    if cross > _CURVED_ORTHO_TOL:
+                        from saklas.core.errors import OverlappingManifoldError
+                        raise OverlappingManifoldError(
+                            f"manifolds '{curved_owner[layer_idx]}' and "
+                            f"'{mname}' both cover layer {layer_idx} with "
+                            f"non-orthogonal subspaces (max |cosine| = "
+                            f"{cross:.3f} > {_CURVED_ORTHO_TOL}); curved "
+                            f"manifolds sharing a layer must be orthogonal"
+                        )
+                    curved_basis_by_layer[layer_idx] = torch.cat([prev, B_new])
+                else:
+                    curved_basis_by_layer[layer_idx] = B_new
+                    curved_owner[layer_idx] = mname
                 # ``O_L`` (this layer's neutral foot) or ``zeros(n)`` when the
                 # layer baked no origin (CPU stub / pre-origin fit).
                 O_L = mfld_origins.get(layer_idx)
@@ -1412,9 +846,19 @@ class SteeringManager:
 
             for L in layer_set:
                 sub_L = synth.layers[L]
+                sub_target = synth.target_coord[L].to(torch.float32)
+                # Orthogonalize the affine subspace against any curved manifold
+                # sharing this layer (curved wins the shared directions); drop
+                # the layer if the affine span lies entirely inside the curved
+                # span (nothing left for the merged subspace to steer there).
+                curved = curved_basis_by_layer.get(L)
+                if curved is not None:
+                    res = _orthogonalize_affine_against(sub_L, sub_target, curved)
+                    if res is None:
+                        continue
+                    sub_L, sub_target = res
                 r_l = sub_L.rank
                 sub_domain = CustomDomain(r_l)
-                sub_target = synth.target_coord[L].to(torch.float32)
                 # Affine origin is span-coord 0 (neutral → coord 0, §5); the
                 # foot seed / cold-start is unused on the affine shortcut.
                 sub_origin = torch.zeros(r_l, dtype=torch.float32)
@@ -1424,11 +868,7 @@ class SteeringManager:
                     eff_along_L, 0.0, sub_trigger,
                 ))
 
-        active_layers = (
-            set(additive_by_layer)
-            | set(ablation_by_layer)
-            | set(manifold_by_layer)
-        )
+        active_layers = set(manifold_by_layer)
 
         # Detach hooks for layers that no longer have any contribution.
         for idx in list(self.hooks):
@@ -1438,19 +878,13 @@ class SteeringManager:
 
         for idx in active_layers:
             if idx not in self.hooks:
-                hook = SteeringHook(
-                    injection_mode=self.injection_mode,
-                    theta_max=self.theta_max,
-                )
+                hook = SteeringHook()
                 hook.attach(model_layers[idx])
                 self.hooks[idx] = hook
             self.hooks[idx].recompose(
-                additive_entries=additive_by_layer.get(idx, []),
-                ablation_entries=ablation_by_layer.get(idx, []),
-                manifold_entries=manifold_by_layer.get(idx, []),
-                injection_mode=self.injection_mode,
-                theta_max=self.theta_max,
-                device=device, dtype=dtype, ctx=self.ctx,
+                manifold_by_layer.get(idx, []),
+                self.ctx,
+                device=device,
             )
 
     def reset_manifold_feet(self) -> None:
@@ -1466,11 +900,9 @@ class SteeringManager:
             hook._manifold_feet = [None] * len(hook.manifold_groups)
 
     def clear_all(self) -> None:
-        """Detach all hooks and clear vectors + ablations + manifolds + subspaces."""
+        """Detach all hooks and clear manifolds + subspaces."""
         for hook in self.hooks.values():
             hook.detach()
         self.hooks.clear()
-        self.vectors.clear()
-        self.ablations.clear()
         self.manifolds.clear()
         self.subspaces.clear()

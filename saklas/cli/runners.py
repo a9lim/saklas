@@ -57,55 +57,13 @@ def _resolve_probes(raw: list[str] | None) -> list[str]:
 def _make_session(args: argparse.Namespace):
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes)
-    # ``--legacy`` is a v2.0-backcompat shorthand: additive injection +
-    # Euclidean projection + DLS off.  Mutually exclusive with
-    # ``--steer-mode`` / ``--projection-metric`` / ``--no-dls``.
-    legacy = bool(getattr(args, "legacy", False))
-    injection_explicit = getattr(args, "injection_mode", None)
-    metric_explicit = getattr(args, "projection_metric", None)
-    if legacy and injection_explicit is not None:
-        print(
-            f"--legacy and --steer-mode are mutually exclusive "
-            f"(--legacy implies --steer-mode additive); got "
-            f"--steer-mode {injection_explicit}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if legacy and metric_explicit is not None:
-        print(
-            f"--legacy and --projection-metric are mutually exclusive "
-            f"(--legacy implies --projection-metric euclidean); got "
-            f"--projection-metric {metric_explicit}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if legacy and bool(getattr(args, "no_dls", False)):
-        print(
-            "--legacy and --no-dls are mutually exclusive "
-            "(--legacy already implies DLS off)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    # ``--legacy`` also flips the runtime ``~`` / ``|`` projection
-    # metric to Euclidean (the v2.0/v2.1 plain Gram-Schmidt behavior),
-    # and disables DLS (v2.1 introduced data-driven layer selection;
-    # the v2.0 stack used the old ``drop_edges=(2,2)`` heuristic which
-    # is gone in v2.1 — under ``--legacy`` we keep every layer rather
-    # than re-implement the removed edge-drop just for backcompat).
-    if legacy:
-        injection_mode = "additive"
-        projection_metric = "euclidean"
-        dls = False
-    else:
-        # Steering-injection options: ``None`` flows through to the v2.1
-        # session defaults (angular + π/2).  CLI flag and YAML are both
-        # already merged onto ``args`` by ``_load_effective_config``.
-        injection_mode = injection_explicit or "angular"
-        projection_metric = getattr(args, "projection_metric", None) or "mahalanobis"
-        # ``--no-dls`` opts out of the discriminative-layer mask without
-        # toggling the rest of the v2.1 stack.
-        dls = not bool(getattr(args, "no_dls", False))
-    theta_max = getattr(args, "theta_max", None)
+    # ``--projection-metric`` selects the runtime ``~`` / ``|`` metric
+    # (``mahalanobis`` default — closed-form LEACE; ``euclidean`` is plain
+    # Gram-Schmidt); ``--no-dls`` opts out of the discriminative-layer mask.
+    # Both the CLI flag and YAML are already merged onto ``args`` by
+    # ``_load_effective_config``.
+    projection_metric = getattr(args, "projection_metric", None) or "mahalanobis"
+    dls = not bool(getattr(args, "no_dls", False))
     # ``--compile`` and ``--cuda-graphs`` opt *in* to the CUDA-side
     # perf path.  Defaults are off — compile's per-token speedup is
     # variable (~1.2–3× when it works, ~equal otherwise), the
@@ -126,8 +84,6 @@ def _make_session(args: argparse.Namespace):
         probes=probe_categories,
         system_prompt=getattr(args, "system_prompt", None),
         max_tokens=getattr(args, "max_tokens", 1024),
-        injection_mode=injection_mode,
-        theta_max=theta_max,
         projection_metric=projection_metric,
         dls=dls,
         compile=compile_enabled,
@@ -172,17 +128,7 @@ def _load_effective_config(args: argparse.Namespace):
     args.system_prompt = composed.system_prompt
     args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
     args.config_vectors = composed.vectors
-    # Steering-injection options on tui/serve: YAML wins when CLI is unset.
-    if (
-        composed.injection_mode is not None
-        and getattr(args, "injection_mode", None) is None
-    ):
-        args.injection_mode = composed.injection_mode
-    if (
-        composed.theta_max is not None
-        and getattr(args, "theta_max", None) is None
-    ):
-        args.theta_max = composed.theta_max
+    # Projection metric on tui/serve: YAML wins when the CLI flag is unset.
     if (
         composed.projection_metric is not None
         and getattr(args, "projection_metric", None) is None
@@ -940,23 +886,9 @@ def _run_compare(args: argparse.Namespace) -> None:
     from saklas.io.paths import vectors_dir
     from saklas.core.profile import Profile, ProfileError
 
-    # ``--legacy`` is a v2.0-backcompat shorthand for ``--metric euclidean``.
-    # Mutually exclusive with an explicit ``--metric``.  Default since
-    # v2.1 is ``"mahalanobis"`` — ``args.metric is None`` means "use the
-    # default" (and ``--legacy`` overrides to euclidean).
-    legacy = bool(getattr(args, "legacy", False))
-    explicit_metric = vars(args).get("metric") is not None
-    if legacy and explicit_metric:
-        print(
-            "compare: --legacy and --metric are mutually exclusive "
-            "(--legacy implies --metric euclidean)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if legacy:
-        metric = "euclidean"
-    else:
-        metric = getattr(args, "metric", None) or "mahalanobis"
+    # Default metric is ``"mahalanobis"`` (since v2.1); ``--metric euclidean``
+    # selects plain weighted cosine.
+    metric = getattr(args, "metric", None) or "mahalanobis"
 
     # Mahalanobis path: load the per-model whitener once up front, share
     # across every ``cosine_similarity`` call below.  Failure is fatal —

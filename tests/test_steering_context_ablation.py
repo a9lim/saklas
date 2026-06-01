@@ -59,8 +59,6 @@ def _skeleton_session() -> SaklasSession:
     from saklas.core.session import GenState
     session._gen_phase = GenState.IDLE
     session._internal_steering_pop = False
-    session._injection_mode = "additive"
-    session._theta_max = 1.5707963267948966
     session._projection_metric = "mahalanobis"
     session._whitener = None
     # Skeleton session has no real model — stub the lazy whitener
@@ -81,15 +79,17 @@ def test_session_steering_dispatches_ablation_to_manager():
         "!refusal": AblationTerm(coeff=1.0, trigger=Trigger.BOTH, target="refusal"),
     })
     with session.steering(steering):
-        assert "refusal" in session._steering.ablations
-        entry = session._steering.ablations["refusal"]
-        assert entry["alpha"] == 1.0
-        assert entry["trigger"] == Trigger.BOTH
+        # 4.0: ``!`` lowers to an ablation axis (target 0) inside the merged
+        # affine subspace — one ``add_subspace`` entry per trigger group, an
+        # ``inject_three_op`` group on the covered layer.
+        assert session._steering.subspaces
+        synth = next(iter(session._steering.subspaces.values()))["synth"]
+        assert 1 in synth.layers
         assert 1 in session._steering.hooks
-        assert session._steering.hooks[1].ablation_groups
+        assert session._steering.hooks[1].manifold_groups
 
-    # Post-exit: ablation cleared, hook detached.
-    assert not session._steering.ablations
+    # Post-exit: steering cleared, hook detached.
+    assert not session._steering.subspaces
     assert not session._steering.hooks
 
 
@@ -112,9 +112,9 @@ def test_session_steering_string_with_ablation_end_to_end():
     session._layer_means[1] = torch.tensor([0.5, 0.0, 0.0])
 
     with session.steering("!refusal"):
-        assert "refusal" in session._steering.ablations
-        entry = session._steering.ablations["refusal"]
-        assert entry["alpha"] == 1.0
-        assert entry["trigger"] == Trigger.BOTH
+        assert session._steering.subspaces
+        synth = next(iter(session._steering.subspaces.values()))["synth"]
+        assert 1 in synth.layers
+        assert session._steering.hooks[1].manifold_groups
 
-    assert not session._steering.ablations
+    assert not session._steering.subspaces

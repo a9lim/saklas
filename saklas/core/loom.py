@@ -270,8 +270,6 @@ class Recipe:
             alphas=flipped,
             thinking=parsed.thinking,
             trigger=parsed.trigger,
-            injection_mode=parsed.injection_mode,
-            theta_max=parsed.theta_max,
             projection_metric=parsed.projection_metric,
         )
         return Recipe(steering=format_expr(new))

@@ -255,12 +255,9 @@ class _StubSession(SaklasSession):
     """
 
     def __init__(self) -> None:
-        from saklas.core.hooks import DEFAULT_THETA_MAX
         self._profiles = {}
         self._steering_stack = []
         self._steering_override_stack = []
-        self._injection_mode = "angular"
-        self._theta_max = DEFAULT_THETA_MAX
         self._projection_metric = "mahalanobis"
         self._whitener = None
         self._layer_means = {}

@@ -69,15 +69,6 @@ class Steering:
         ``Trigger.BOTH`` — steer every token.  Entries given as
         ``(alpha, Trigger)`` tuples ignore this default; projection
         entries carry their own trigger inside the ``ProjectedTerm``.
-    injection_mode: per-call override for the steering math.
-        ``"angular"`` rotates the residual toward the concept direction;
-        ``"additive"`` is the legacy v1.x add-and-rescale path.  ``None``
-        (default) inherits the session-level setting passed to
-        :class:`SaklasSession`.  Programmatic only — the canonical
-        expression grammar does not (yet) round-trip this field.
-    theta_max: per-call override for the angular rotation cap (radians).
-        Defaults to the session value (``π/2`` unless overridden).  Has
-        no effect under ``injection_mode="additive"``.
     projection_metric: per-call override for the metric used when
         materializing ``~`` / ``|`` projection terms.  ``"mahalanobis"``
         uses the closed-form LEACE projector against the session's
@@ -92,8 +83,6 @@ class Steering:
     alphas: Mapping[str, AlphaEntry]
     thinking: bool | None = None
     trigger: Trigger = Trigger.BOTH
-    injection_mode: str | None = None
-    theta_max: float | None = None
     projection_metric: str | None = None
 
     @classmethod

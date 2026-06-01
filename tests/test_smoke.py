@@ -73,6 +73,35 @@ def happy_profile(model_and_tokenizer: Any, layers: Any) -> Any:
     return _extract_profile(model, tokenizer, "happy", layers)
 
 
+def _steer_subspace(mgr: Any, *pairs: Any) -> None:
+    """4.0: route baked ``(profile, alpha)`` pairs through the unified backend.
+
+    Every vector lowers to a rank-1 push fragment (unit dir + baked-magnitude
+    coord), all composed into one merged affine subspace via
+    ``synthesize_subspace`` + ``add_subspace`` — the dispatch the session does.
+    Anchored at zero (enough for the smoke "steering changes the output"
+    assertions; the GPU gate owns strength calibration).
+    """
+    from saklas.core.manifold import synthesize_subspace
+
+    push: list[Any] = []
+    neutral_means: dict[int, torch.Tensor] = {}
+    for profile, alpha in pairs:
+        basis_dirs: dict[int, torch.Tensor] = {}
+        coord_dirs: dict[int, torch.Tensor] = {}
+        for L, vec in profile.items():
+            v = vec.to(torch.float32).reshape(-1)
+            n = float(v.norm())
+            if n < 1e-12:
+                continue
+            basis_dirs[L] = (v / n).reshape(1, -1)
+            coord_dirs[L] = torch.tensor([n])
+            neutral_means.setdefault(L, torch.zeros_like(v))
+        push.append((basis_dirs, coord_dirs, alpha))
+    synth = synthesize_subspace(push, [], neutral_means=neutral_means)
+    mgr.add_subspace("steer", synth)
+
+
 class TestVectorExtraction:
     def test_returns_valid_profile(self, happy_profile: Any, model_and_tokenizer: Any) -> None:
         model, _ = model_and_tokenizer
@@ -120,7 +149,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_profile, 1.5)
+        _steer_subspace(mgr, (happy_profile, 1.5))
         mgr.apply_to_model(layers, device, dtype)
 
         state1 = GenerationState()
@@ -150,7 +179,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_profile, 2.0)
+        _steer_subspace(mgr, (happy_profile, 2.0))
         mgr.apply_to_model(layers, device, dtype)
         state_s = GenerationState()
         steered = generate_steered(model, tokenizer, input_ids.clone(), config, state_s)
@@ -200,7 +229,7 @@ class TestTraitMonitor:
         # Steer toward happy
         mgr = SteeringManager()
         # α=0.6 sits mid coherent band (0.4–0.8); α=1 is at the cliff per CLAUDE.md.
-        mgr.add_vector("happy", happy_profile, 0.6)
+        _steer_subspace(mgr, (happy_profile, 0.6))
         mgr.apply_to_model(layers, device, dtype)
 
         input_ids = tokenizer.apply_chat_template(
@@ -261,11 +290,12 @@ class TestTraitMonitor:
         # Steered + monitored timing
         # 3 steering vectors
         mgr = SteeringManager()
-        mgr.add_vector("happy", happy_profile, 0.8)
         curious_profile = _extract_profile(model, tokenizer, "curious", layers)
-        mgr.add_vector("curious", curious_profile, 0.5)
         concise_profile = _extract_profile(model, tokenizer, "concise", layers)
-        mgr.add_vector("concise", concise_profile, 0.3)
+        # 3 vectors → one merged affine subspace (the dispatch composes them).
+        _steer_subspace(
+            mgr, (happy_profile, 0.8), (curious_profile, 0.5), (concise_profile, 0.3),
+        )
         mgr.apply_to_model(layers, device, dtype)
 
         state1 = GenerationState()

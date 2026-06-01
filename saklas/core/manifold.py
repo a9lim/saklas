@@ -30,12 +30,11 @@ how :mod:`saklas.core.vectors` holds the low-level extraction primitives.
 The RBF fit solves a small dense symmetric-indefinite saddle system with
 ``torch.linalg.solve`` -- node counts are tiny (on the order of ten to
 thirty) and fitting is a one-shot operation, not a hot path. scipy is not
-pulled in. ``eval_rbf``, :func:`eval_rbf_jacobian`, :func:`rotate_toward`,
-:func:`_gn_step` and :func:`inject_three_op` are the functions reachable
-from the generation hot path (``rotate_toward`` is the Givens kernel the
-vector angular path in :mod:`saklas.core.hooks` shares; ``inject_three_op``
-is the unified along/onto manifold injection); all are
-allocation-light and free of host syncs.
+pulled in. ``eval_rbf``, :func:`eval_rbf_jacobian`, :func:`_gn_step` and
+:func:`inject_three_op` are the functions reachable from the generation
+hot path (``inject_three_op`` is the unified along/onto subspace/manifold
+injection — the single steering backend); all are allocation-light and
+free of host syncs.
 """
 from __future__ import annotations
 
@@ -1361,74 +1360,11 @@ class Manifold:
         return j_act_authoring.T.contiguous()              # (n, D)
 
 
-# Per-position guard against degenerate rotation planes in
-# :func:`rotate_toward` / :func:`subspace_rotate`.  The vector hot path
-# (`hooks._angular_inplace`) reaches it through :func:`rotate_toward`
-# rather than defining its own threshold, so the two angular surfaces
-# share one definition of "too near-aligned to rotate".
+# Per-position guard against a degenerate normal-transport renorm in
+# :func:`inject_three_op` (the off-manifold residual collapsing onto the
+# tangent at a new foot near a fold): below this the transported residual
+# is dropped rather than fabricated from a near-zero direction.
 _ROTATE_EPSILON: float = 1e-6
-
-
-def rotate_toward(
-    u: torch.Tensor,
-    target_unit: torch.Tensor,
-    cos_t: "float | torch.Tensor",
-    sin_t: "float | torch.Tensor",
-    *,
-    eps: float = _ROTATE_EPSILON,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Givens-rotate unit vector(s) ``u`` toward ``target_unit`` by angle θ.
-
-    The shared rotation kernel behind *both* angular steering surfaces:
-
-    - **vector** angular steering (``hooks._angular_inplace``) rotates the
-      full unit activation ``h/‖h‖`` toward the concept direction ``d̂``;
-    - **manifold** angular steering (:func:`subspace_rotate`) rotates the
-      centered in-subspace component ``h_par_c/‖h_par_c‖`` toward the
-      centered target ``(target − mean)``-unit.
-
-    Both reduce to the same operation — "rotate one unit vector toward
-    another, within the 2-D plane they span, by a precomputed angle" — so
-    the geometry lives here once and the two call sites differ only in how
-    they extract ``u`` (full ``h`` vs the decomposed ``h_par_c``) and how
-    they reassemble the result (rescale to ‖h‖ vs ``mean + … + h_perp``).
-
-    ``u`` is ``(.., D)`` per-position unit vectors; ``target_unit`` is the
-    ``(D,)`` (broadcastable) unit direction to rotate toward; ``cos_t`` /
-    ``sin_t`` encode θ — Python floats on the direct-call/test path, 0-dim
-    tensors on the ``torch.compile`` hot path (pinning the angle to a
-    tensor input avoids a recompile per α change).
-
-    Returns ``(rotated_unit, w_norm)``.  ``rotated_unit = cos_t·u +
-    sin_t·ŵ`` where ``ŵ`` is the in-plane axis orthogonal to ``u``
-    pointing toward ``target_unit``; this is ``u`` rotated by θ toward the
-    target inside ``span(u, target_unit)``, with ``‖rotated_unit‖ = 1``
-    preserved.  Positions whose in-plane perpendicular ``‖w‖ < eps`` (``u``
-    already (anti-)aligned with the target, so the rotation plane is
-    undefined) fall back to ``u`` via ``torch.where``.  ``w_norm`` (the
-    pre-clamp ``‖w‖``) is returned so a caller can fold ``‖w‖ < eps`` into
-    a wider degeneracy guard — :func:`subspace_rotate` ORs it with
-    ``‖h_par_c‖ < eps`` against the *original* ``h_par_c``; the vector path
-    ignores it (the ``where`` here is the whole guard it needs).
-
-    Hot-path safe: no ``.item()``, no host sync; the allocation footprint
-    matches the inlined form both call sites carried before extraction.
-    """
-    cos0 = (u * target_unit).sum(dim=-1, keepdim=True)
-    # ``w`` is the component of ``target_unit`` orthogonal to ``u`` — the
-    # in-plane axis we rotate toward.  ‖w‖ = sin(angle between u, target).
-    w = target_unit - cos0 * u
-    w_norm = torch.linalg.vector_norm(w, dim=-1, keepdim=True)
-    w_unit = w / w_norm.clamp(min=eps)
-    rotated = cos_t * u + sin_t * w_unit
-    # Near-aligned positions: the plane is ill-defined, so no rotation has
-    # any effect — preserve ``u``.  Run the ``where`` unconditionally
-    # rather than gating on ``.any()``: the gate would be a data-dependent
-    # host conditional, forcing a CPU sync and a graph break under
-    # ``torch.compile(mode="reduce-overhead")``; the elementwise blend is
-    # far cheaper than that sync.
-    rotated = torch.where(w_norm < eps, u, rotated)
-    return rotated, w_norm
 
 
 def decompose(
@@ -2768,7 +2704,6 @@ __all__ = [
     "eval_rbf_jacobian",
     "fit_layer_subspace",
     "decompose",
-    "rotate_toward",
     "inject_three_op",
     "PcaDiagnostics",
     "SpectralDiagnostics",

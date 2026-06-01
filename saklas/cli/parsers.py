@@ -115,25 +115,11 @@ _EXPERIMENT_VERBS: list[tuple[str, str]] = [
 
 
 def _add_injection_args(p: argparse.ArgumentParser) -> None:
-    """Steering-injection options shared between ``tui`` and ``serve``.
+    """Steering / extraction options shared between ``tui`` and ``serve``.
 
-    ``None`` defaults flow through to the YAML override layer (or
-    ultimately to the v2.1 session defaults: angular + π/2).
+    ``None`` defaults flow through to the YAML override layer (or ultimately
+    to the session defaults: Mahalanobis projection + DLS on).
     """
-    p.add_argument(
-        "--steer-mode", dest="injection_mode",
-        choices=["angular", "additive"], default=None,
-        help="Steering injection math.  'angular' (default) maps user α "
-             "to a rotation angle; 'additive' is the legacy v1.x add+"
-             "rescale path.  Unset = inherit YAML / session default.",
-    )
-    p.add_argument(
-        "--theta-max", dest="theta_max", type=float, default=None,
-        metavar="RAD",
-        help="Maximum rotation angle for angular mode (radians).  Default "
-             "π/2 (≈1.5708) — α=1 fully aligns the residual with the "
-             "concept direction.  No effect under --steer-mode additive.",
-    )
     p.add_argument(
         "--projection-metric", dest="projection_metric",
         choices=["mahalanobis", "euclidean"], default=None,
@@ -142,7 +128,7 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
              "closed-form LEACE projector against the per-model whitener "
              "(Belrose et al. 2023) — provably erases linearly-decodable "
              "concept information along ``onto`` from ``base``.  "
-             "'euclidean' is plain Gram-Schmidt (the v2.0/v2.1 behavior).  "
+             "'euclidean' is plain Gram-Schmidt.  "
              "Unset = inherit YAML / session default.",
     )
     p.add_argument(
@@ -153,20 +139,7 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
              "neg-class means project to the same side of the neutral "
              "baseline along ``d̂`` are dropped — they encode concept "
              "intensity rather than concept polarity.  Pass ``--no-dls`` "
-             "to keep every layer (the v2.0–v2.1 behavior, modulo the "
-             "removed ``edge_drop`` heuristic).  Mutually exclusive "
-             "with ``--legacy`` (which already implies ``--no-dls``).",
-    )
-    p.add_argument(
-        "--legacy", action="store_true",
-        help="v2.0 backcompat preset for steering: equivalent to "
-             "``--steer-mode additive`` plus PCA extraction on first-run "
-             "probe bootstrap, Euclidean ``~`` / ``|`` projection, and "
-             "DLS off (instead of v2.1's DiM + Mahalanobis bake + "
-             "angular + LEACE projection + DLS).  Useful for "
-             "A/B-comparing the pre-v2.1 stack on the same model.  "
-             "Mutually exclusive with ``--steer-mode``, "
-             "``--projection-metric``, and ``--no-dls``.",
+             "to keep every layer.",
     )
     p.add_argument(
         "--compile", dest="compile", action="store_true",
@@ -412,8 +385,7 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
             "~/.saklas/models/<id>/ to build the per-layer whitener; "
             "decided all-or-nothing — whitens every shared layer or, when "
             "the whitener doesn't cover them all, falls back to Euclidean "
-            "for all.  'euclidean' = standard cosine (the v2.0/v2.1 "
-            "behavior; selected by ``--legacy``)."
+            "for all.  'euclidean' = standard weighted cosine."
         ),
     )
     p.add_argument(
@@ -423,13 +395,6 @@ def _build_vector_compare(p: argparse.ArgumentParser) -> None:
             "(λ_L = (||X_L||_F²/(N·D)) × ridge_scale). Only consulted "
             "with --metric mahalanobis; default 1.0 (mean diagonal of "
             "the un-regularized sample covariance)."
-        ),
-    )
-    p.add_argument(
-        "--legacy", action="store_true",
-        help=(
-            "v2.0 backcompat preset: equivalent to ``--metric euclidean``."
-            "  Mutually exclusive with ``--metric``."
         ),
     )
 

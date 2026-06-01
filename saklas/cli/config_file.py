@@ -19,13 +19,11 @@ log = logging.getLogger(__name__)
 _KNOWN_KEYS = {
     "model", "vectors", "thinking",
     "temperature", "top_p", "max_tokens", "system_prompt",
-    "injection_mode", "theta_max",
     "projection_metric",
     "compile", "cuda_graphs",
     "return_top_k",
 }
 
-_VALID_INJECTION_MODES = ("angular", "additive")
 _VALID_PROJECTION_METRICS = ("mahalanobis", "euclidean")
 
 
@@ -43,8 +41,6 @@ class ConfigFile:
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     system_prompt: Optional[str] = None
-    injection_mode: Optional[str] = None     # "angular" | "additive"; None = default
-    theta_max: Optional[float] = None        # radians; None = default π/2
     projection_metric: Optional[str] = None  # "mahalanobis" | "euclidean"; None = default
     compile: Optional[bool] = None           # CUDA torch.compile auto-enable; None = default (on)
     cuda_graphs: Optional[bool] = None       # CUDA StaticCache + graph capture; None = default (on)
@@ -141,31 +137,6 @@ class ConfigFile:
                     ) from e
                 vectors = text
 
-        injection_mode = data.get("injection_mode")
-        if injection_mode is not None:
-            if (
-                not isinstance(injection_mode, str)
-                or injection_mode not in _VALID_INJECTION_MODES
-            ):
-                raise ConfigFileError(
-                    f"{path}: injection_mode must be one of "
-                    f"{list(_VALID_INJECTION_MODES)} "
-                    f"(got {injection_mode!r})"
-                )
-
-        theta_max = data.get("theta_max")
-        if theta_max is not None:
-            if not isinstance(theta_max, (int, float)) or isinstance(theta_max, bool):
-                raise ConfigFileError(
-                    f"{path}: theta_max must be a number (radians); "
-                    f"got {type(theta_max).__name__} {theta_max!r}"
-                )
-            if theta_max <= 0:
-                raise ConfigFileError(
-                    f"{path}: theta_max must be > 0 (got {theta_max!r})"
-                )
-            theta_max = float(theta_max)
-
         projection_metric = data.get("projection_metric")
         if projection_metric is not None:
             if (
@@ -221,8 +192,6 @@ class ConfigFile:
             top_p=data.get("top_p"),
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
-            injection_mode=injection_mode,
-            theta_max=theta_max,
             projection_metric=projection_metric,
             compile=compile_v,
             cuda_graphs=cuda_graphs_v,
@@ -242,7 +211,6 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
         for f in (
             "model", "thinking", "temperature",
             "top_p", "max_tokens", "system_prompt", "vectors",
-            "injection_mode", "theta_max",
             "projection_metric", "compile", "cuda_graphs",
             "return_top_k",
         ):

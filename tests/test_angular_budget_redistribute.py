@@ -106,73 +106,17 @@ class TestRedistributeBudget:
             assert abs(out[k]) == pytest.approx(mags[k], abs=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# End-to-end: peaked-share vector profile under angular mode never asks a
-# layer to rotate past θ_max, and the cumulative budget is conserved.
-# ---------------------------------------------------------------------------
+# ``_Passthrough`` returns ``(hidden,)`` so a hook can mutate it in place —
+# shared by the manifold-along budget tests below.  (The former vector
+# angular-budget tests are gone: a vector no longer water-fills — the merged
+# affine subspace clamps its per-layer slide.  ``_redistribute_budget`` survives
+# only on the curved-manifold ``along`` path, exercised by
+# ``TestManifoldAlongBudget``.)
 
 
 class _Passthrough(nn.Module):
     def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor]:
         return (hidden,)
-
-
-def _peaked_profile(dim: int = 16) -> dict[int, torch.Tensor]:
-    """One layer dominates the share (large ||baked||), two are small."""
-    torch.manual_seed(0)
-    big = torch.randn(dim)
-    big = big / big.norm() * 10.0      # ||baked|| = 10
-    small1 = torch.randn(dim)
-    small1 = small1 / small1.norm() * 1.0
-    small2 = torch.randn(dim)
-    small2 = small2 / small2.norm() * 1.0
-    return {0: big, 1: small1, 2: small2}
-
-
-def _effective_alphas(mgr: SteeringManager) -> dict[int, float]:
-    """The per-layer angular strength the hooks will rotate by.
-
-    Each peaked-share layer carries a single BOTH additive group; the
-    hook stamps the angular strength (≈ |effective_alpha| for a single
-    unit-direction term) into ``angular_strengths``.  We read it back to
-    assert the per-layer rotation budget.
-    """
-    out: dict[int, float] = {}
-    for idx, hook in mgr.hooks.items():
-        # Fast path stamps _theta directly; slow path keeps strengths.
-        if hook.composed is not None:
-            out[idx] = hook._theta / hook.theta_max
-        elif hook.angular_strengths:
-            out[idx] = sum(min(1.0, s) for _t, s in hook.angular_strengths)
-    return out
-
-
-class TestVectorAngularBudget:
-    def test_peaked_share_no_layer_past_theta_max(self) -> None:
-        mgr = SteeringManager(injection_mode="angular")
-        profile = _peaked_profile()
-        # α large enough that the dominant layer's raw budget (≈ α·0.83)
-        # would exceed 1.0 without the cap.
-        mgr.add_vector("c", profile, alpha=2.0)
-        layers = nn.ModuleList([_Passthrough() for _ in range(3)])
-        mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
-
-        eff = _effective_alphas(mgr)
-        assert eff, "expected angular budgets to be recorded"
-        for idx, budget in eff.items():
-            assert budget <= 1.0 + 1e-6, (
-                f"layer {idx} rotates past θ_max: budget={budget}"
-            )
-
-    def test_budget_conserved_under_cap(self) -> None:
-        # Cumulative budget = min(α, n_layers) when α fits under the
-        # ceiling.  Here α=2.0 over 3 layers ⇒ Σ budget == 2.0.
-        mgr = SteeringManager(injection_mode="angular")
-        mgr.add_vector("c", _peaked_profile(), alpha=2.0)
-        layers = nn.ModuleList([_Passthrough() for _ in range(3)])
-        mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
-        eff = _effective_alphas(mgr)
-        assert sum(eff.values()) == pytest.approx(2.0, abs=1e-4)
 
 
 # ---------------------------------------------------------------------------

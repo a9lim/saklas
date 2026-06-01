@@ -42,6 +42,7 @@ import pytest
 
 from saklas.core.model import _LAYER_ACCESSORS, get_layers
 from saklas.core.hooks import HiddenCapture, SteeringManager
+from saklas.core.manifold import synthesize_subspace
 from saklas.core.triggers import Trigger
 
 
@@ -190,11 +191,15 @@ def test_steering_vector_changes_logits(model_type: str):
     direction = torch.randn(cfg.hidden_size)
     direction = direction / direction.norm()
 
-    mgr = SteeringManager()  # angular default
-    mgr.add_vector(
-        "probe", {len(layers) // 2: direction.clone()}, alpha=1.0,
-        trigger=Trigger.BOTH,
+    # 4.0: a vector lowers to a rank-1 push fragment synthesized into one
+    # merged affine subspace, then ``add_subspace`` → ``inject_three_op``.
+    L = len(layers) // 2
+    synth = synthesize_subspace(
+        push=[({L: direction.reshape(1, -1)}, {L: torch.tensor([1.0])}, 1.0)],
+        ablate=[], neutral_means={L: torch.zeros(cfg.hidden_size)},
     )
+    mgr = SteeringManager()
+    mgr.add_subspace("probe", synth, trigger=Trigger.BOTH)
     mgr.apply_to_model(layers, device=torch.device("cpu"), dtype=torch.float32)
     try:
         with torch.no_grad():

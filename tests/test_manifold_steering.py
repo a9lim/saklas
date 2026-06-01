@@ -157,15 +157,12 @@ def _recompose_manifold(
         torch.zeros(n) if O_L is None else O_L.reshape(-1).to(torch.float32)
     )
     hook.recompose(
-        additive_entries=[],
-        ablation_entries=[],
-        manifold_entries=[(
+        [(
             sub, domain, target_coord, origin_coord,
             along, onto, Trigger.BOTH,
         )],
+        ctx,
         device=torch.device("cpu"),
-        dtype=torch.float32,
-        ctx=ctx,
     )
 
 
@@ -250,7 +247,7 @@ def test_hook_forces_slow_path():
     manifold = _manifold()
     hook = SteeringHook()
     _recompose_manifold(hook, manifold, 0, along=0.5)
-    assert hook.composed is None
+    # 4.0 has no fast path — a manifold group is the only (slow) shape.
     assert len(hook.manifold_groups) == 1
 
 
@@ -288,12 +285,11 @@ def test_hook_trigger_gating_skips_inactive():
     origin = torch.zeros(1)
     # GENERATED_ONLY trigger, but the context is in prefill (prompt) -> inactive.
     hook.recompose(
-        additive_entries=[],
-        ablation_entries=[],
-        manifold_entries=[(
+        [(
             sub, domain, target, origin, 0.6, 0.0, Trigger.GENERATED_ONLY,
         )],
-        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
+        ctx,
+        device=torch.device("cpu"),
     )
     ctx.is_prefill = True  # prompt phase -> GENERATED_ONLY inactive
     hidden = torch.randn(1, 3, _DIM)
@@ -559,10 +555,13 @@ def test_manager_reset_manifold_feet_cold_starts():
         assert hook._manifold_feet == [None]
 
 
-def test_pure_additive_still_fast_path():
-    # Regression: a plain additive vector keeps the fast path.
-    mgr = SteeringManager(injection_mode="angular")
-    profile = {0: torch.randn(_DIM), 1: torch.randn(_DIM)}
-    mgr.add_vector("v", profile, alpha=0.5, trigger=Trigger.BOTH)
-    mgr.apply_to_model(_model_layers(3), torch.device("cpu"), torch.float32)
+def test_any_steering_forces_slow_path():
+    # 4.0: there is no composed-tensor fast path — any attached hook forces the
+    # slow (ctx-consulting) ``inject_three_op`` path, so ``all_fast_path`` is
+    # True only for the unsteered manager (no hooks).
+    mgr = SteeringManager()
     assert mgr.all_fast_path() is True
+    mgr.add_manifold("mood", _manifold(layers=(0, 1)), position=(0.5,),
+                     along=0.5, onto=0.0)
+    mgr.apply_to_model(_model_layers(3), torch.device("cpu"), torch.float32)
+    assert mgr.all_fast_path() is False
