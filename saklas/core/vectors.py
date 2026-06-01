@@ -550,118 +550,135 @@ def _emit_diagnostics_warning(
         )
 
 
-def compute_dls_mask(
+def _dls_axis_keep(
+    mu_pos: torch.Tensor,
+    mu_neg: torch.Tensor,
+    mu_neutral: torch.Tensor,
+    direction_unit: torch.Tensor,
+) -> bool:
+    """Centered opposite-sign discriminative test for one axis.
+
+    Returns ``True`` iff ``(μ_pos − μ_neutral)·d̂`` and
+    ``(μ_neg − μ_neutral)·d̂`` have opposite signs — the axis carries
+    concept *polarity* rather than mere intensity.  All inputs are fp32
+    CPU ``[D]``; ``direction_unit`` is assumed unit-normed by the caller
+    (only the sign of the product matters, but unit input keeps the
+    numerics sane).  The shared kernel behind both the scalar
+    :func:`compute_dls_mask` and the per-axis
+    :func:`compute_dls_mask_per_axis`.
+    """
+    proj_pos = float(((mu_pos - mu_neutral) * direction_unit).sum())
+    proj_neg = float(((mu_neg - mu_neutral) * direction_unit).sum())
+    return proj_pos * proj_neg < 0.0
+
+
+def compute_dls_mask_per_axis(
     mu_pos: dict[int, torch.Tensor],
     mu_neg: dict[int, torch.Tensor],
-    directions: dict[int, torch.Tensor],
+    bases: dict[int, torch.Tensor],
     layer_means: dict[int, torch.Tensor] | None,
-) -> set[int]:
-    """Discriminative-Layer-Selection (Dang & Ngo 2026, Eq. 9) keep set.
+) -> dict[int, set[int]]:
+    """Per-axis Discriminative-Layer-Selection (Dang & Ngo 2026, Eq. 9).
 
-    Returns the set of layer indices that pass the centered-DLS check::
+    The ``R``-dimensional generalization of :func:`compute_dls_mask`: each
+    layer carries a basis ``[R, D]`` (the per-layer ``LayerSubspace.basis``
+    rows), and every row ``d̂_r`` is tested independently against the same
+    centered opposite-sign check::
 
-        μ̃_pos = (μ_pos − μ_neutral) · d̂
-        μ̃_neg = (μ_neg − μ_neutral) · d̂
-        keep iff μ̃_pos · μ̃_neg < 0
+        μ̃_pos = (μ_pos − μ_neutral) · d̂_r
+        μ̃_neg = (μ_neg − μ_neutral) · d̂_r
+        keep axis r iff μ̃_pos · μ̃_neg < 0
 
-    Layers where both pos- and neg-class means project to the same side of
-    the neutral baseline along ``d̂`` are non-discriminative — they encode
-    something correlated with concept *intensity* but not concept
-    *polarity*, and steering through them rotates a residual that's
-    already aligned with the same pole as the neutral baseline (i.e.
-    they don't carry the contrast).  Dropping them concentrates share
-    on layers that genuinely encode the pos/neg axis.
+    Returns ``{layer: {kept axis indices}}``.  A layer absent from the dict
+    (or mapped to an empty set) is fully dropped — exactly the legacy
+    "drop the whole layer" behavior when its single axis fails.  The
+    consumer slices the effective basis to the kept rows at
+    ``add_manifold`` time, so DLS survives the vector→subspace fold without
+    a separate scalar path.
 
-    **Centering** is required.  Without subtracting ``μ_neutral`` raw
-    activations all project positively along ``d̂`` at most layers
-    because of shared base-rate variance, and the sign-of-projection
-    test fires near-uniformly across layers (verified empirically: the
-    literal-paper uncentered version on gemma-4-e4b-it / angry.calm
-    keeps 17/42 in fragmented patterns vs. centered 31/42 in the
-    expected mid-stack band).  When ``layer_means`` is ``None``,
-    centering is undefined and the helper returns *all* layers — DLS
-    is disabled silently and the caller falls back to "keep
-    everything."  Real session-driven extraction always passes
-    ``layer_means`` (built before extraction during ``bootstrap_probes``);
-    fixture / mock paths skip it.
+    **R=1 parity.**  When every basis is a single row (a folded vector or a
+    plain direction), this is bit-identical to :func:`compute_dls_mask`
+    lifted to ``{L: {0}}`` (kept layers) / absent (dropped layers): same
+    fp32-CPU casting, same unit-norming, same ``_dls_axis_keep`` kernel,
+    same conservative-keep on missing baseline, same all-fail fallback.
+    :func:`compute_dls_mask` is now a thin wrapper over this function.
+
+    **Centering** is required — see :func:`compute_dls_mask`'s history note.
+    ``layer_means`` ``None``/empty disables DLS and keeps every axis of
+    every layer.  ``mu_pos``/``mu_neg``/``bases`` share a layer set (the
+    caller builds them aligned); a layer missing from ``bases`` in the
+    disabled early-out keeps a nominal single axis so the scalar wrapper
+    still reports it.
 
     Args:
-        mu_pos: per-layer mean of positive-class final-content-token
-            hidden states, fp32, shape ``[D]`` per layer.
-        mu_neg: same for the negative class.  Must cover the same layer
-            set as ``mu_pos``.
-        directions: per-layer unsigned direction vectors (typically
-            ``unit(μ_pos − μ_neg)`` for DiM, or the principal component
-            for PCA).  Same layer set as ``mu_pos``.  Magnitude doesn't
-            matter — only sign of projection — but unit-normed input
-            is recommended for numerical sanity.
-        layer_means: per-layer neutral baseline (90-prompt mean, cached
-            under ``~/.saklas/models/<id>/layer_means.safetensors``).
-            ``None`` disables DLS (returns all layers).
+        mu_pos: per-layer positive-class mean, fp32 ``[D]`` per layer.
+        mu_neg: per-layer negative-class mean, same layer set.
+        bases: per-layer ``[R, D]`` basis (rows are the candidate axes).
+            Zero-norm rows are degenerate and dropped (excluded from the
+            all-fail fallback).
+        layer_means: per-layer neutral baseline; ``None``/empty disables.
 
     Returns:
-        ``set[int]`` of layers that pass the discriminative check.  Empty
-        set is *not* returned — if every layer fails, returns the full
-        layer set with a warning, on the principle that something is
-        better than nothing for a degenerate concept (the caller's
-        downstream extractor diagnostics will already flag the probe
-        quality).
+        ``{layer: {axis indices}}`` over kept (layer, axis) pairs.  If no
+        axis anywhere passes, falls back to every checkable axis with a
+        one-time warning (mirrors the scalar keep-all-checkable fallback).
     """
     # Empty-dict is treated identically to ``None`` — both mean "no
-    # baseline available, fall back to keep-all silently."  Without
-    # the explicit early-out, every layer in the loop would hit
-    # ``mu_n = layer_means.get(L) → None`` and fall through the
-    # conservative-keep branch, which produces the same observable
-    # result but routes through confusing per-layer logic.  This
-    # guard also catches the v2.1 footgun where ``probes=[]``
-    # sessions had ``self._layer_means = {}`` propagate to the
-    # helper, silently disabling DLS even when neutrals were
-    # cacheable — fixed at the session layer via the lazy
-    # ``layer_means`` property, but the helper-level guard is cheap
-    # insurance against future leak paths.
+    # baseline available, fall back to keep-all silently" (the same
+    # ``probes=[]`` footgun guard the scalar form carried).
     if layer_means is None or not layer_means:
-        return set(mu_pos)
-    keep: set[int] = set()
-    # ``checkable`` is the set of layers we *attempted* the
-    # discriminative test on — i.e. layers with a valid direction.
-    # Layers explicitly skipped for missing direction or zero-norm
-    # direction are excluded from the all-failed fallback (they're
-    # degenerate by construction; re-including them via the fallback
-    # would silently undo the skip).
-    checkable: set[int] = set()
+        out: dict[int, set[int]] = {}
+        for L in mu_pos:
+            B = bases.get(L)
+            r = int(B.shape[0]) if B is not None else 1
+            out[L] = set(range(r))
+        return out
+    keep: dict[int, set[int]] = {}
+    # ``checkable`` collects the (layer, axis) pairs we *attempted* the
+    # test on — rows with a valid (non-degenerate) direction.  Rows
+    # skipped for zero norm are excluded from the all-failed fallback
+    # (degenerate by construction; re-including them would undo the skip).
+    checkable: dict[int, set[int]] = {}
+    any_pass = False
     for L in mu_pos:
-        d = directions.get(L)
-        if d is None:
+        B = bases.get(L)
+        if B is None:
             continue
-        d32 = d.to(dtype=torch.float32, device="cpu").reshape(-1)
-        d_norm = float(d32.norm())
-        if d_norm < 1e-12:
-            continue  # degenerate direction — drop, do not include in fallback
-        checkable.add(L)
+        B32 = B.to(dtype=torch.float32, device="cpu").reshape(int(B.shape[0]), -1)
         mu_n = layer_means.get(L)
-        if mu_n is None:
-            # Layer-means doesn't cover this layer.  Conservative: keep —
-            # we'd rather over-include than mistakenly drop a real
-            # discriminative layer due to missing baseline data.
-            keep.add(L)
-            continue
-        d_hat = d32 / d_norm
-        mu_n_cpu = mu_n.to(dtype=torch.float32, device="cpu").reshape(-1)
+        mu_n_cpu = (
+            mu_n.to(dtype=torch.float32, device="cpu").reshape(-1)
+            if mu_n is not None
+            else None
+        )
         mu_p_cpu = mu_pos[L].to(dtype=torch.float32, device="cpu").reshape(-1)
         mu_g_cpu = mu_neg[L].to(dtype=torch.float32, device="cpu").reshape(-1)
-        proj_pos = float(((mu_p_cpu - mu_n_cpu) * d_hat).sum())
-        proj_neg = float(((mu_g_cpu - mu_n_cpu) * d_hat).sum())
-        if proj_pos * proj_neg < 0.0:
-            keep.add(L)
-    if not keep:
-        # All checkable layers failed the discriminative check.  Probe
-        # is degenerate on this model (the diagnostics warning will
-        # fire separately).  Keep the *checkable* set rather than every
-        # layer in ``mu_pos`` — re-including layers explicitly skipped
-        # for missing/zero-norm directions would silently undo the
-        # skip.  When no layers are checkable at all (caller passed
-        # all-degenerate directions) the fallback returns an empty
-        # set; the share-bake step's all-zero handler kicks in.
+        layer_checkable: set[int] = set()
+        layer_keep: set[int] = set()
+        for r in range(int(B32.shape[0])):
+            row = B32[r]
+            row_norm = float(row.norm())
+            if row_norm < 1e-12:
+                continue  # degenerate axis — drop, exclude from fallback
+            layer_checkable.add(r)
+            if mu_n_cpu is None:
+                # Baseline doesn't cover this layer.  Conservative: keep —
+                # over-include rather than drop a real discriminative axis
+                # for missing baseline data.
+                layer_keep.add(r)
+                continue
+            if _dls_axis_keep(mu_p_cpu, mu_g_cpu, mu_n_cpu, row / row_norm):
+                layer_keep.add(r)
+        if layer_checkable:
+            checkable[L] = layer_checkable
+        if layer_keep:
+            keep[L] = layer_keep
+            any_pass = True
+    if not any_pass:
+        # Every checkable axis failed — probe degenerate on this model
+        # (the diagnostics warning fires separately).  Keep the checkable
+        # set rather than every layer; when nothing is checkable the
+        # fallback is empty and the share-bake all-zero handler kicks in.
         warnings.warn(
             "DLS: no layers pass the discriminative check; falling back "
             "to keep-all-checkable.  Probe likely degenerate on this "
@@ -671,6 +688,47 @@ def compute_dls_mask(
         )
         return checkable
     return keep
+
+
+def compute_dls_mask(
+    mu_pos: dict[int, torch.Tensor],
+    mu_neg: dict[int, torch.Tensor],
+    directions: dict[int, torch.Tensor],
+    layer_means: dict[int, torch.Tensor] | None,
+) -> set[int]:
+    """Discriminative-Layer-Selection keep set (scalar / single-direction).
+
+    The R=1 face of :func:`compute_dls_mask_per_axis`: each layer's single
+    ``directions[L]`` is a one-row basis, and a layer is kept iff that row
+    passes the centered opposite-sign check (or is conservatively kept on a
+    missing baseline).  Bit-identical to the historical implementation — it
+    is now a thin wrapper so the vector and subspace paths share one DLS
+    kernel.
+
+    Layers where both pos- and neg-class means project to the same side of
+    the neutral baseline along ``d̂`` are non-discriminative (they encode
+    concept *intensity*, not *polarity*); dropping them concentrates share
+    on layers that genuinely carry the contrast.  See
+    :func:`compute_dls_mask_per_axis` for the centering rationale and the
+    all-fail fallback.
+
+    Args:
+        mu_pos: per-layer positive-class mean, fp32 ``[D]`` per layer.
+        mu_neg: same for the negative class (same layer set as ``mu_pos``).
+        directions: per-layer unsigned direction (``unit(μ_pos − μ_neg)``
+            for DiM, principal component for PCA).  Magnitude is irrelevant
+            (only projection sign matters); unit input recommended.
+        layer_means: per-layer neutral baseline; ``None`` disables DLS
+            (returns every layer).
+
+    Returns:
+        ``set[int]`` of layers passing the discriminative check; the
+        keep-all-checkable fallback fires (with a warning) if every layer
+        fails.
+    """
+    bases = {L: d.reshape(1, -1) for L, d in directions.items()}
+    per_axis = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, layer_means)
+    return {L for L, axes in per_axis.items() if axes}
 
 
 def _capture_diffs_for_pairs(
