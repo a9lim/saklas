@@ -1241,10 +1241,8 @@ class ManifoldExtractionPipeline:
                 # spread is ``sqrt(Σ_k coords_kᵀ M_R coords_k)`` =
                 # ``sqrt(Σ_k ‖Bᵀ coords_k‖²_M)``.  Reduces to the Euclidean
                 # ``‖coords‖_F`` when Σ = I.
-                coords = eval_rbf(
-                    sub.node_params, sub.rbf_weights, sub.poly_coeffs,
-                    sub.node_params,
-                )  # (K, R)
+                _np, _rw, _pc = sub.rbf_params()
+                coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
                 gram = maha_whitener.subspace_gram(idx, sub.basis)  # (R, R)
                 quad = float(
                     (coords @ gram * coords).sum().clamp_min(0.0).item()

@@ -492,9 +492,8 @@ def _euclidean_shares(manifold: Manifold) -> dict[int, float]:
     """Reference Euclidean ``‖coords‖_F`` share, normalized across layers."""
     raw = {}
     for L, sub in manifold.layers.items():
-        c = eval_rbf(
-            sub.node_params, sub.rbf_weights, sub.poly_coeffs, sub.node_params,
-        )
+        _np, _rw, _pc = sub.rbf_params()
+        c = eval_rbf(_np, _rw, _pc, _np)
         raw[L] = float(torch.linalg.vector_norm(c).item())
     tot = sum(raw.values())
     return {L: v / tot for L, v in raw.items()}

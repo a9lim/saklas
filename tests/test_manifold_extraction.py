@@ -312,7 +312,8 @@ def test_fit_natural_manifold(tmp_path: Path) -> None:
     assert isinstance(manifold.domain, BoxDomain)
     assert manifold.domain.axes[0].periodic is False
     for sub in manifold.layers.values():
-        assert sub.node_params.shape[0] == len(_LABELS)
+        _np, _, _ = sub.rbf_params()
+        assert _np.shape[0] == len(_LABELS)
 
 
 def test_fit_n2_box_manifold(tmp_path: Path) -> None:

@@ -1979,10 +1979,8 @@ def transfer_manifold(
             # the *target* Σ⁻¹ to the transferred basis; the whitened share
             # is ``sqrt(Σ_k coords_kᵀ M_R coords_k)`` — the same formula the
             # fit pipeline bakes, now in target space.
-            coords = eval_rbf(
-                sub_f.node_params, sub_f.rbf_weights, sub_f.poly_coeffs,
-                sub_f.node_params,
-            )  # (K, R)
+            _np, _rw, _pc = sub_f.rbf_params()
+            coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
             gram = whitener.subspace_gram(layer, sub_f.basis)  # (R, R)
             quad = float(
                 (coords @ gram * coords).sum().clamp_min(0.0).item()

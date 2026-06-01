@@ -25,6 +25,7 @@ from saklas.core.manifold import (
     fit_layer_subspace as _fit_layer_subspace_with_ev,  # returns (LayerSubspace, ev_ratio)
     fit_rbf_interpolant,
     inject_three_op,
+    LayerSubspace,
     invert_parameterization,
     load_manifold,
     save_manifold,
@@ -409,10 +410,12 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
     assert torch.allclose(loaded.node_coords, manifold.node_coords)
     for idx in (4, 9):
         a, b = manifold.layers[idx], loaded.layers[idx]
+        _, a_rw, a_pc = a.rbf_params()
+        _, b_rw, b_pc = b.rbf_params()
         assert torch.allclose(a.mean, b.mean)
         assert torch.allclose(a.basis, b.basis)
-        assert torch.allclose(a.rbf_weights, b.rbf_weights)
-        assert torch.allclose(a.poly_coeffs, b.poly_coeffs)
+        assert torch.allclose(a_rw, b_rw)
+        assert torch.allclose(a_pc, b_pc)
     # evaluation matches after the round-trip
     assert torch.allclose(
         loaded.manifold_point(4, (0.3,)),
@@ -644,3 +647,141 @@ def test_inject_norm_cap_bounds_output():
                 assert torch.isfinite(out).all()
                 ratio = out.norm() / h.norm()
                 assert ratio <= 3.0 + 1e-4
+
+
+# ------------------------------------------------- affine (flat) subspace ---
+#
+# A folded steering vector is the degenerate n = R = 1 case: an affine
+# subspace whose "surface" fills its span, so H_n ≡ 0 and inject_three_op
+# takes the analytic shortcut (no GN solve / RBF eval / tangent solve).
+
+def _folded_vector(dim: int = 16, seed: int = 0):
+    """An affine folded-vector subspace (n = R = 1) + its CustomDomain(1)."""
+    torch.manual_seed(seed)
+    raw = torch.randn(dim)
+    basis = (raw / raw.norm()).reshape(1, dim)     # (1, D) unit direction
+    mean = 20.0 + torch.randn(dim)                 # realistic DC offset
+    return LayerSubspace.affine(mean, basis), CustomDomain(1)
+
+
+def test_affine_factory_and_is_affine():
+    sub, _ = _folded_vector()
+    assert sub.is_affine
+    assert sub.node_params is None
+    assert sub.rank == 1
+    # identity normalization so authoring coords == reduced coords
+    assert torch.allclose(sub.coord_offset, torch.zeros(1))
+    assert torch.allclose(sub.coord_scale, torch.ones(1))
+    # a curved fit is not affine
+    curved, _dom = _grid_manifold()
+    assert not curved.is_affine
+
+
+def test_affine_rbf_params_raises():
+    sub, _ = _folded_vector()
+    with pytest.raises(ValueError, match="affine"):
+        sub.rbf_params()
+
+
+def test_affine_eval_at_is_pure_affine():
+    sub, _ = _folded_vector()
+    for c in (-1.3, 0.0, 0.4, 2.1):
+        coord = torch.tensor([c])
+        assert torch.allclose(sub.eval_at(coord), coord @ sub.basis + sub.mean)
+    # batched
+    coords = torch.tensor([[-0.5], [0.0], [1.0]])
+    assert torch.allclose(sub.eval_at(coords), coords @ sub.basis + sub.mean)
+
+
+def test_affine_jacobian_is_basis_T():
+    sub, _ = _folded_vector()
+    # single point: (D, m) == basis.T, position-independent
+    jac = sub.jacobian_at(torch.tensor([0.7]))
+    assert torch.allclose(jac, sub.basis.transpose(-1, -2))
+    # batched: broadcast across the leading dim
+    jb = sub.jacobian_at(torch.tensor([[0.1], [0.9]]))
+    assert jb.shape == (2, sub.basis.shape[1], 1)
+    assert torch.allclose(jb[0], sub.basis.transpose(-1, -2))
+
+
+def test_affine_inject_identity_at_zero():
+    sub, domain = _folded_vector()
+    h = sub.eval_at(torch.tensor([0.6])) + 0.2 * torch.randn(16)
+    out, foot = inject_three_op(
+        h, sub, domain, torch.tensor([0.9]), torch.tensor([0.6]),
+        0.0, 0.0, 0.0,
+    )
+    assert torch.allclose(out, h, atol=1e-4)
+    # the returned foot is q exactly (the in-subspace reduced coord of h)
+    assert torch.allclose(foot, (h - sub.mean) @ sub.basis.T, atol=1e-5)
+
+
+def test_affine_inject_along_lands_coord_at_target():
+    sub, domain = _folded_vector()
+    h = sub.eval_at(torch.tensor([-0.4])) + 0.3 * torch.randn(16)
+    target = torch.tensor([1.5])
+    out, _ = inject_three_op(
+        h, sub, domain, target, torch.tensor([-0.4]), 1.0, 0.0, 0.0,
+    )
+    q_out = (out - sub.mean) @ sub.basis.T          # reduced coord of the output
+    assert torch.allclose(q_out, target, atol=1e-4)
+    # half-slide lands at the linear midpoint between q and target
+    q_in = (h - sub.mean) @ sub.basis.T
+    out_h, _ = inject_three_op(
+        h, sub, domain, target, torch.tensor([-0.4]), 0.5, 0.0, 0.0,
+    )
+    q_half = (out_h - sub.mean) @ sub.basis.T
+    assert torch.allclose(q_half, 0.5 * (q_in + target), atol=1e-4)
+
+
+def test_affine_inject_onto_is_vacuous():
+    # H_n ≡ 0 on a flat subspace, so onto must have no effect.
+    sub, domain = _folded_vector()
+    h = sub.eval_at(torch.tensor([0.2])) + 0.3 * torch.randn(16)
+    pos, seed = torch.tensor([0.2]), torch.tensor([0.2])
+    out0, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 0.0, 0.0)
+    out1, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 1.0, 0.0)
+    assert torch.allclose(out0, out1, atol=1e-5)
+
+
+def test_affine_inject_toward_collapses_off_subspace():
+    sub, domain = _folded_vector()
+    h = sub.eval_at(torch.tensor([0.3])) + 0.4 * torch.randn(16)
+    _, perp_in = decompose(h, sub.mean, sub.basis)
+    # toward=1 zeroes H_o
+    out, _ = inject_three_op(
+        h, sub, domain, torch.tensor([0.3]), torch.tensor([0.3]), 0.0, 0.0, 1.0,
+    )
+    _, perp_out = decompose(out, sub.mean, sub.basis)
+    assert torch.allclose(perp_out, torch.zeros_like(perp_out), atol=1e-4)
+    # toward=0.5 halves it
+    out_h, _ = inject_three_op(
+        h, sub, domain, torch.tensor([0.3]), torch.tensor([0.3]), 0.0, 0.0, 0.5,
+    )
+    _, perp_h = decompose(out_h, sub.mean, sub.basis)
+    assert torch.allclose(perp_h, 0.5 * perp_in, atol=1e-4)
+
+
+def test_affine_manifold_point_round_trip():
+    # A flat Manifold (folded vector) over two poles at ±s; manifold_point
+    # recovers each pole centroid exactly.
+    torch.manual_seed(3)
+    dim = 12
+    c_pos = 20.0 + torch.randn(dim)
+    c_neg = 20.0 + torch.randn(dim)
+    mean = 0.5 * (c_pos + c_neg)
+    diff = c_pos - c_neg
+    s = float(diff.norm()) / 2.0
+    basis = (diff / diff.norm()).reshape(1, dim)
+    sub = LayerSubspace.affine(mean, basis)
+    mfld = Manifold(
+        name="folded",
+        domain=CustomDomain(1),
+        node_labels=["pos", "neg"],
+        node_coords=torch.tensor([[s], [-s]]),
+        layers={7: sub},
+    )
+    assert torch.allclose(mfld.manifold_point(7, (s,)), c_pos, atol=1e-4)
+    assert torch.allclose(mfld.manifold_point(7, (-s,)), c_neg, atol=1e-4)
+    # midpoint coord lands at the mean
+    assert torch.allclose(mfld.manifold_point(7, (0.0,)), mean, atol=1e-4)

@@ -947,9 +947,9 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     else:
         layer_scores = {}
         for layer_idx, sub in manifold.layers.items():
+            _np, _rw, _pc = sub.rbf_params()
             node_coords = eval_rbf(
-                sub.node_params, sub.rbf_weights, sub.poly_coeffs,
-                sub.node_params,
+                _np, _rw, _pc, _np,
             )  # (K, R) — exact centered coords at the fit nodes
             layer_scores[layer_idx] = float(
                 torch.linalg.vector_norm(node_coords).item()

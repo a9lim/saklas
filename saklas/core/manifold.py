@@ -630,28 +630,95 @@ class LayerSubspace:
     ``coord_offset`` / ``coord_scale`` carry the unit-box normalization
     applied to the embedded coordinates before the fit (the RBF kernel
     amplifies coordinate scale, so normalization is mandatory).
+
+    **Affine (flat) case.**  When ``node_params`` / ``rbf_weights`` /
+    ``poly_coeffs`` are ``None`` the subspace carries no RBF surface — the
+    "surface" *is* the whole affine subspace (a folded steering vector at
+    ``n = R``), so the reduced coordinates equal the authoring coordinates
+    by an identity map and ``manifold_point(c) = mean + c @ basis``.  The
+    affine case has ``H_n ≡ 0`` (the surface fills its subspace), so
+    ``inject_three_op`` takes an analytic shortcut that skips the
+    Gauss-Newton foot solve, the RBF eval, and the tangent Gram-solve —
+    load-bearing for throughput, since a folded vector is the common
+    steering case and the curved per-token solve would blow the
+    throughput invariant.  Build one via :meth:`affine`; query via
+    :attr:`is_affine`.
     """
 
-    mean: torch.Tensor          # (D,)   centering mean over the node centroids
-    basis: torch.Tensor         # (R, D) orthonormal PCA rows
-    node_params: torch.Tensor   # (K, m) normalized embedded node coordinates
-    rbf_weights: torch.Tensor   # (K, R) RBF weights
-    poly_coeffs: torch.Tensor   # (m+1, R) affine polynomial coefficients
-    coord_offset: torch.Tensor  # (m,)   unit-box normalization offset
-    coord_scale: torch.Tensor   # (m,)   unit-box normalization scale
+    mean: torch.Tensor                  # (D,)   centering mean over the node centroids
+    basis: torch.Tensor                 # (R, D) orthonormal PCA rows
+    node_params: torch.Tensor | None    # (K, m) normalized embedded coords; None = affine
+    rbf_weights: torch.Tensor | None    # (K, R) RBF weights; None = affine
+    poly_coeffs: torch.Tensor | None    # (m+1, R) affine polynomial coeffs; None = affine
+    coord_offset: torch.Tensor          # (m,)   unit-box normalization offset
+    coord_scale: torch.Tensor           # (m,)   unit-box normalization scale
 
     @property
     def rank(self) -> int:
         return int(self.basis.shape[0])
 
+    @property
+    def is_affine(self) -> bool:
+        """True for a flat (no-RBF) subspace — the surface fills its span.
+
+        The analytic-shortcut marker: ``inject_three_op`` and ``eval_at``
+        branch on this to skip all RBF / Gauss-Newton machinery.  A folded
+        steering vector (``n = R``, the chord) is built affine; every
+        RBF-fitted manifold (curved, or merely space-filling like a discover
+        fit at ``R = n``) is not.
+        """
+        return self.node_params is None
+
+    @classmethod
+    def affine(cls, mean: torch.Tensor, basis: torch.Tensor) -> "LayerSubspace":
+        """Build a flat (affine, no-RBF) subspace from ``mean`` + ``basis``.
+
+        The authoring coordinates map to reduced coordinates by identity
+        (``coord_offset = 0``, ``coord_scale = 1``), so
+        ``eval_at(c) = c @ basis + mean`` exactly.  ``basis`` is ``(R, D)``;
+        the implied intrinsic dimension is ``n = R`` (the surface fills the
+        span).  Backs the folded-vector representation (Phase 2 §1).
+        """
+        r = int(basis.shape[0])
+        ref = mean
+        return cls(
+            mean=mean,
+            basis=basis,
+            node_params=None,
+            rbf_weights=None,
+            poly_coeffs=None,
+            coord_offset=torch.zeros(r, device=ref.device, dtype=ref.dtype),
+            coord_scale=torch.ones(r, device=ref.device, dtype=ref.dtype),
+        )
+
+    def rbf_params(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The validated ``(node_params, rbf_weights, poly_coeffs)`` triple.
+
+        Raises on an affine (flat) subspace — every RBF call site operates on
+        the curved path, and the affine path has analytic equivalents that
+        must never reach the interpolant.  Doubles as a guardrail: a stray
+        affine subspace routed through the RBF machinery raises loudly
+        instead of silently dereferencing ``None``.
+        """
+        np_, rw, pc = self.node_params, self.rbf_weights, self.poly_coeffs
+        if np_ is None or rw is None or pc is None:
+            raise ValueError(
+                "LayerSubspace.rbf_params() called on an affine (flat) "
+                "subspace; the affine path has analytic equivalents and must "
+                "not reach the RBF interpolant"
+            )
+        return np_, rw, pc
+
     def to(self, *, device: torch.device, dtype: torch.dtype) -> "LayerSubspace":
         """Return a copy with every tensor on ``device`` in ``dtype``."""
+        def _cast(t: torch.Tensor | None) -> torch.Tensor | None:
+            return None if t is None else t.to(device=device, dtype=dtype)
         return LayerSubspace(
             mean=self.mean.to(device=device, dtype=dtype),
             basis=self.basis.to(device=device, dtype=dtype),
-            node_params=self.node_params.to(device=device, dtype=dtype),
-            rbf_weights=self.rbf_weights.to(device=device, dtype=dtype),
-            poly_coeffs=self.poly_coeffs.to(device=device, dtype=dtype),
+            node_params=_cast(self.node_params),
+            rbf_weights=_cast(self.rbf_weights),
+            poly_coeffs=_cast(self.poly_coeffs),
             coord_offset=self.coord_offset.to(device=device, dtype=dtype),
             coord_scale=self.coord_scale.to(device=device, dtype=dtype),
         )
@@ -661,17 +728,24 @@ class LayerSubspace:
 
     def eval_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """World-space activation ``(.., D)`` at embedded domain coords ``(.., m)``."""
-        reduced = eval_rbf(
-            self.node_params, self.rbf_weights, self.poly_coeffs,
-            self._normalize(embedded),
-        )
+        if self.is_affine:
+            # Flat: reduced coords == authoring coords (identity map), the
+            # surface fills the subspace ⇒ pure affine, no RBF eval.
+            return embedded @ self.basis + self.mean
+        reduced = eval_rbf(*self.rbf_params(), self._normalize(embedded))
         return reduced @ self.basis + self.mean
 
     def jacobian_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """Activation Jacobian ``d activation / d embedded``: ``(m,) -> (D, m)``."""
+        if self.is_affine:
+            # d(embedded @ basis + mean)/d embedded = basis.T, position-
+            # independent; broadcast across any leading batch dims.
+            jac = self.basis.transpose(-1, -2)  # (D, R) == (D, m)
+            if embedded.ndim > 1:
+                jac = jac.expand(*embedded.shape[:-1], *jac.shape)
+            return jac
         j_norm = eval_rbf_jacobian(
-            self.node_params, self.rbf_weights, self.poly_coeffs,
-            self._normalize(embedded),
+            *self.rbf_params(), self._normalize(embedded),
         )  # (R, m) w.r.t. normalized coords
         j_embedded = j_norm / self.coord_scale  # chain through the normalization
         return self.basis.T @ j_embedded  # (D, m)
@@ -1274,17 +1348,39 @@ def inject_three_op(
     h_f32 = h.to(torch.float32)
     mean = subspace.mean.to(torch.float32)            # (D,)
     basis = subspace.basis.to(torch.float32)          # (R, D)
-    np_ = subspace.node_params.to(torch.float32)
-    rw = subspace.rbf_weights.to(torch.float32)
-    pc = subspace.poly_coeffs.to(torch.float32)
-    offset = subspace.coord_offset.to(torch.float32)  # (m,)
-    scale = subspace.coord_scale.to(torch.float32)    # (m,)
     target = target_coord.to(device=h_f32.device, dtype=torch.float32)
 
     centered = h_f32 - mean                            # (.., D)
     q = centered @ basis.T                             # (.., R) reduced coords of h_par
     h_par = q @ basis                                  # (.., D) in-subspace reconstruction
     h_perp = centered - h_par                          # (.., D) = H_o
+
+    if subspace.is_affine:
+        # --- flat (folded-vector) shortcut --------------------------------
+        # The surface fills the subspace, so reduced coords *are* authoring
+        # coords (identity map): the foot is ``q`` exactly, ``H_n ≡ 0`` and
+        # ``onto`` is vacuous (ignored).  No GN solve, no RBF eval, no
+        # tangent Gram-solve — the cost the common steering case can't pay.
+        # ALONG slides ``q`` toward ``target`` geodesically (CustomDomain ⇒
+        # linear); TOWARD scales the off-subspace residual ``H_o``.
+        p_new = domain.geodesic(q, target, along)      # (.., n==R)
+        new_par = p_new @ basis                        # (.., D)
+        new_perp = (1.0 - toward) * h_perp             # (.., D)
+        h_new = mean + new_par + new_perp
+        norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
+        norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
+        cap = norm_cap * norm_pre
+        h_new = torch.where(
+            norm_post > cap, h_new * (cap / norm_post.clamp(min=1e-6)), h_new,
+        )
+        return h_new.to(h.dtype), q
+
+    np_, rw, pc = subspace.rbf_params()
+    np_ = np_.to(torch.float32)
+    rw = rw.to(torch.float32)
+    pc = pc.to(torch.float32)
+    offset = subspace.coord_offset.to(torch.float32)  # (m,)
+    scale = subspace.coord_scale.to(torch.float32)    # (m,)
 
     # --- foot p* : nearest point on M to q, warm-started from foot_seed ---
     p = foot_seed
@@ -1763,11 +1859,15 @@ def save_manifold(
         "node_coords": manifold.node_coords.contiguous().to(torch.float32).cpu(),
     }
     for idx, sub in manifold.layers.items():
+        # NOTE: affine (flat) subspace serialization lands in Phase 2 §4
+        # (folded-vector extraction); ``rbf_params()`` raises here until then,
+        # so a flat artifact can't be silently half-written.
+        np_, rw, pc = sub.rbf_params()
         tensors[f"layer_{idx}.mean"] = sub.mean.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.basis"] = sub.basis.contiguous().to(torch.float32).cpu()
-        tensors[f"layer_{idx}.node_params"] = sub.node_params.contiguous().to(torch.float32).cpu()
-        tensors[f"layer_{idx}.rbf_weights"] = sub.rbf_weights.contiguous().to(torch.float32).cpu()
-        tensors[f"layer_{idx}.poly_coeffs"] = sub.poly_coeffs.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.node_params"] = np_.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.rbf_weights"] = rw.contiguous().to(torch.float32).cpu()
+        tensors[f"layer_{idx}.poly_coeffs"] = pc.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.coord_offset"] = sub.coord_offset.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.coord_scale"] = sub.coord_scale.contiguous().to(torch.float32).cpu()
     save_file(tensors, str(path))
@@ -2022,9 +2122,10 @@ def invert_parameterization(
     # Subspace pieces on the query's device/dtype -- the caller may hand
     # us a subspace still resident on its load device (the read-side
     # aggregate moves only ``mean``/``basis``).
-    np_ = subspace.node_params.to(device=device, dtype=dtype)  # (K, m)
-    rw = subspace.rbf_weights.to(device=device, dtype=dtype)
-    pc = subspace.poly_coeffs.to(device=device, dtype=dtype)
+    np_, rw, pc = subspace.rbf_params()
+    np_ = np_.to(device=device, dtype=dtype)  # (K, m)
+    rw = rw.to(device=device, dtype=dtype)
+    pc = pc.to(device=device, dtype=dtype)
     offset = subspace.coord_offset.to(device=device, dtype=dtype)  # (m,)
     scale = subspace.coord_scale.to(device=device, dtype=dtype)  # (m,)
 
@@ -2141,8 +2242,7 @@ def trajectory_naturalness(
     pos, _ = invert_parameterization(behavior, domain, coords, node_coords)
     embedded = domain.embed(pos)  # (T, m)
     curve_coords = eval_rbf(
-        behavior.node_params, behavior.rbf_weights, behavior.poly_coeffs,
-        behavior._normalize(embedded),
+        *behavior.rbf_params(), behavior._normalize(embedded),
     )  # (T, R)
     curve_h = curve_coords @ behavior.basis + behavior.mean  # (T, V)
     # In Hellinger space ||h_a - h_b||^2 = 2 - 2*BC, so the Bhattacharyya
