@@ -652,6 +652,15 @@ class LayerSubspace:
     poly_coeffs: torch.Tensor | None    # (m+1, R) affine polynomial coeffs; None = affine
     coord_offset: torch.Tensor          # (m,)   unit-box normalization offset
     coord_scale: torch.Tensor           # (m,)   unit-box normalization scale
+    node_coords: torch.Tensor | None = None
+    # (K, R) per-layer **real, neutral-anchored** reduced node coordinates
+    # ``(c_i − ν*)·basisᵀ`` — affine (flat) subspaces only; ``None`` on a
+    # curved subspace (which carries the shared ``Manifold.node_coords`` +
+    # RBF instead).  This is the per-layer steer target source: a flat
+    # subspace's pole / node sits at distance ∝ ‖δ_L‖ from the neutral
+    # origin here, so the synthesizer reads ``node_coords[index]`` per layer
+    # as the ``along`` target.  The shared ``Manifold.node_coords`` stays the
+    # label/display layout; *these* are the geometry (§5 neutral-anchor).
 
     @property
     def rank(self) -> int:
@@ -670,14 +679,23 @@ class LayerSubspace:
         return self.node_params is None
 
     @classmethod
-    def affine(cls, mean: torch.Tensor, basis: torch.Tensor) -> "LayerSubspace":
+    def affine(
+        cls,
+        mean: torch.Tensor,
+        basis: torch.Tensor,
+        *,
+        node_coords: torch.Tensor | None = None,
+    ) -> "LayerSubspace":
         """Build a flat (affine, no-RBF) subspace from ``mean`` + ``basis``.
 
         The authoring coordinates map to reduced coordinates by identity
         (``coord_offset = 0``, ``coord_scale = 1``), so
         ``eval_at(c) = c @ basis + mean`` exactly.  ``basis`` is ``(R, D)``;
         the implied intrinsic dimension is ``n = R`` (the surface fills the
-        span).  Backs the folded-vector representation (Phase 2 §1).
+        span).  Backs the folded-vector / flat-subspace representation
+        (Phase 2 §1).  ``node_coords`` ``(K, R)`` carries the per-layer real
+        neutral-anchored node positions (the steer-target source — §5);
+        ``None`` for a bare span with no associated nodes.
         """
         r = int(basis.shape[0])
         ref = mean
@@ -689,6 +707,7 @@ class LayerSubspace:
             poly_coeffs=None,
             coord_offset=torch.zeros(r, device=ref.device, dtype=ref.dtype),
             coord_scale=torch.ones(r, device=ref.device, dtype=ref.dtype),
+            node_coords=node_coords,
         )
 
     def rbf_params(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -721,6 +740,7 @@ class LayerSubspace:
             poly_coeffs=_cast(self.poly_coeffs),
             coord_offset=self.coord_offset.to(device=device, dtype=dtype),
             coord_scale=self.coord_scale.to(device=device, dtype=dtype),
+            node_coords=_cast(self.node_coords),
         )
 
     def _normalize(self, embedded: torch.Tensor) -> torch.Tensor:
@@ -749,6 +769,173 @@ class LayerSubspace:
         )  # (R, m) w.r.t. normalized coords
         j_embedded = j_norm / self.coord_scale  # chain through the normalization
         return self.basis.T @ j_embedded  # (D, m)
+
+
+def _pca_basis(
+    X: torch.Tensor,
+    *,
+    n_components: int = DEFAULT_N_COMPONENTS,
+    whitener: "LayerWhitener | None" = None,
+    layer: int | None = None,
+) -> tuple[torch.Tensor, float]:
+    """μ-centered PCA basis — Euclidean (default) or whitened/Fisher.
+
+    ``X`` is the ``(K, D)`` **μ-centered** centroid scatter (the caller has
+    already subtracted the centroid mean — never the neutral anchor, per the
+    §5 basis caveat: anchor-centering the scatter injects the neutral offset
+    as a spurious axis and breaks PCA@2 ≡ DiM).  Returns ``(basis,
+    ev_ratio)``: ``basis`` is ``(R, D)`` orthonormal rows,
+    ``R = min(n_components, K-1, rank)``.
+
+    With ``whitener``/``layer`` set (the caller having gated all-or-nothing
+    on ``covers_all``) the basis is the whitened/Fisher discriminant — the
+    generalized eigenproblem ``(S_b, Σ)`` via the low-rank Woodbury ``Σ⁻¹``
+    (``G = X Σ⁻¹ Xᵀ``, eigvecs ``a``, directions ``Σ⁻¹ Xᵀ a``),
+    re-expressed in a Euclidean-orthonormal basis via QR (span-preserving) so
+    the steering hot path is untouched; ``ev_ratio`` is the retained fraction
+    of whitened between-variance.  Otherwise ordinary SVD of ``X`` and the
+    raw inter-node variance ratio.  Shared by :func:`fit_layer_subspace`
+    (curved RBF) and :func:`fit_affine_subspace` (flat) so both pick the
+    basis identically — only what's built on top differs.
+    """
+    K = int(X.shape[0])
+    if whitener is not None and layer is not None:
+        # Whitened (Fisher) PCA — generalized eigenproblem (S_b, Σ) via the
+        # whitener's low-rank Woodbury Σ⁻¹.  ``G = X Σ⁻¹ Xᵀ`` is K×K; its
+        # eigvecs ``a`` give the discriminant directions ``v_r = Σ⁻¹ Xᵀ a_r``.
+        G = whitener.subspace_gram(layer, X)            # (K, K) = X Σ⁻¹ Xᵀ
+        mu, A = torch.linalg.eigh(G)                    # ascending
+        mu_pos = mu.clamp_min(0.0)
+        rank = int((mu_pos > 1e-6 * mu_pos[-1].clamp(min=1e-12)).sum().item())
+        R = max(1, min(n_components, K - 1, rank))
+        top = torch.argsort(mu, descending=True)[:R]
+        XtA = X.transpose(0, 1) @ A[:, top]             # (D, R) = Xᵀ a_r
+        directions = torch.stack(
+            [whitener.apply_inv(layer, XtA[:, j]) for j in range(R)]
+        )                                               # (R, D) = Σ⁻¹ Xᵀ a_r
+        # QR → orthonormal column span identical to the discriminant span;
+        # transpose back to (R, D) rows the LayerSubspace expects.
+        basis = torch.linalg.qr(
+            directions.transpose(0, 1)
+        ).Q.transpose(0, 1).contiguous()                # (R, D)
+        total_w = float(mu_pos.sum().item())
+        retained_w = float(mu_pos[top].sum().item())
+        ev_ratio = retained_w / total_w if total_w > 1e-12 else 1.0
+    else:
+        # Euclidean PCA — ordinary SVD of the centered centroids (no whitener
+        # wired, or partial layer coverage at the call site).
+        _, S, Vh = torch.linalg.svd(X, full_matrices=False)
+        rank = int((S > 1e-6 * S[0].clamp(min=1e-12)).sum().item())
+        R = max(1, min(n_components, K - 1, rank))
+        basis = Vh[:R].contiguous()                     # (R, D)
+        # Per-layer EV ratio.  Falls back to 1.0 on a degenerate (all-zero
+        # singular value) layer rather than NaN.
+        total_var = float(S.pow(2).sum().item())
+        retained_var = float(S[:R].pow(2).sum().item())
+        ev_ratio = retained_var / total_var if total_var > 1e-12 else 1.0
+    return basis, ev_ratio
+
+
+def fit_affine_subspace(
+    centroids: torch.Tensor,
+    *,
+    neutral_mean: torch.Tensor | None = None,
+    n_components: int = DEFAULT_N_COMPONENTS,
+    whitener: "LayerWhitener | None" = None,
+    layer: int | None = None,
+    orient_to: int | None = 0,
+) -> tuple[LayerSubspace, torch.Tensor, float]:
+    """Fit a flat (affine, no-RBF) subspace from per-node centroids (§5).
+
+    The flat half of the unified fit: ``fit_mode=pca`` produces these, and a
+    steering vector is the ``K = 2`` case.  Derives the per-layer basis by
+    **μ-centered** PCA (Euclidean default, whitened/Fisher when the whitener
+    covers ``layer``), then **neutral-anchors** the frame:
+
+    - ``anchor = neutral_mean`` if given, else the centroid mean ``μ`` (the
+      degenerate fallback when no neutral baseline is available — CPU stubs).
+    - ``mean = P_basis(anchor) = (anchor·basisᵀ)·basis`` — the anchor's
+      projection *into the span*, dropping its off-span component (§5: keeps
+      the residual / read-side fraction clean; the dropped part provably
+      cancels in the steered output anyway).
+    - ``node_coords = (centroids − anchor)·basisᵀ`` ``(K, R)`` — **real**,
+      anchor-relative reduced coords.  Neutral → coord 0 by construction, so
+      the affine origin is implicitly 0 (no stored origin).  A node sits at
+      distance ∝ ‖δ_L‖ from the origin, so ``along`` displaces more where the
+      concept signal is bigger — the intrinsic per-layer lever.
+
+    **Basis caveat (do NOT break PCA@2 ≡ DiM).**  The basis comes from the
+    **μ-centered** scatter, *not* the anchor-centered one: at ``K = 2`` the
+    μ-centered SVD's sole axis is ``δ̂ = unit(c₀ − c₁)`` (difference-of-means
+    exactly), while anchor-centering would inject ``(μ − ν)`` as a spurious
+    axis.  Frame (mean + coords) anchors at neutral; basis stays μ-centered.
+
+    ``orient_to`` flips each basis row so node ``orient_to``'s μ-centered
+    projection is non-negative — a deterministic sign convention that makes
+    the ``K = 2`` / node-0-is-pos case reproduce the DiM ``+δ̂`` orientation
+    (``orient_to=None`` leaves the raw SVD/QR sign).
+
+    Returns ``(LayerSubspace.affine(mean, basis, node_coords), mu_coords,
+    ev_ratio)`` where ``mu_coords = (centroids − μ)·basisᵀ`` is the
+    *μ-centered* reduced coords the caller feeds :func:`subspace_share` for
+    the anchor-independent budget weight (coords carry the Euclidean
+    position, share carries the Mahalanobis budget — §5).
+    """
+    centroids = centroids.to(torch.float32)
+    K = int(centroids.shape[0])
+    if K < 2:
+        raise ValueError(f"an affine subspace needs >= 2 nodes, got {K}")
+    mu = centroids.mean(dim=0)
+    X = centroids - mu  # (K, D) μ-centered
+    basis, ev_ratio = _pca_basis(
+        X, n_components=n_components, whitener=whitener, layer=layer,
+    )
+    if orient_to is not None:
+        proj = basis @ (centroids[orient_to] - mu)      # (R,)
+        signs = torch.where(proj < 0, -1.0, 1.0)        # flip rows facing away
+        basis = (basis * signs.unsqueeze(1)).contiguous()
+    if neutral_mean is not None:
+        anchor = neutral_mean.to(torch.float32).reshape(-1)
+    else:
+        anchor = mu
+    mean = (anchor @ basis.T) @ basis                   # P_basis(anchor) (D,)
+    node_coords = (centroids - anchor) @ basis.T        # (K, R) anchor-relative
+    mu_coords = X @ basis.T                             # (K, R) μ-centered (share)
+    sub = LayerSubspace.affine(mean, basis, node_coords=node_coords)
+    return sub, mu_coords, ev_ratio
+
+
+def subspace_share(
+    mu_coords: torch.Tensor,
+    basis: torch.Tensor,
+    *,
+    whitener: "LayerWhitener | None" = None,
+    layer: int | None = None,
+) -> float:
+    """Per-layer budget share — the μ-centered (anchor-independent) spread.
+
+    ``share_L = sqrt(Σ_k coords_kᵀ M_R coords_k)`` whitened (``M_R = B Σ⁻¹ Bᵀ``
+    via ``subspace_gram``), else ``‖coords‖_F`` Euclidean — the whitened /
+    Euclidean spread of the node centroids around their *own* mean, restricted
+    to the subspace.  Drives the apply-time cross-layer budget normalization
+    (``Σ_L share_L = 1``).  **Anchor-independent** (μ-centered, not
+    neutral-centered): the budget measures *signal spread*, not where neutral
+    happens to sit.  At ``K = 2`` / ``R = 1`` this is ``‖δ_L‖_M / √2``
+    (whitened) or ``‖δ_L‖₂ / √2`` (Euclidean) — proportional to the DiM bake
+    share, so the *normalized* per-layer profile is the DiM one exactly (the
+    √2 cancels).  ``mu_coords`` is the second return of
+    :func:`fit_affine_subspace`, or ``(centroids − μ)·basisᵀ`` for a curved
+    fit (the μ-centered node values, == ``eval_rbf(node_params)`` at the fit
+    nodes).
+    """
+    mu_coords = mu_coords.to(torch.float32)
+    if mu_coords.ndim == 1:
+        mu_coords = mu_coords.reshape(-1, 1)
+    if whitener is not None and layer is not None:
+        M_R = whitener.subspace_gram(layer, basis.to(torch.float32))  # (R, R)
+        quad = float((mu_coords @ M_R * mu_coords).sum().clamp_min(0.0).item())
+        return quad ** 0.5
+    return float(torch.linalg.norm(mu_coords).item())
 
 
 def fit_layer_subspace(
@@ -818,57 +1005,16 @@ def fit_layer_subspace(
     mean = centroids.mean(dim=0)
     X = centroids - mean  # (K, D)
 
-    if whitener is not None and layer is not None:
-        # Whitened (Fisher) PCA — generalized eigenproblem (S_b, Σ) via
-        # the whitener's low-rank Woodbury Σ⁻¹.  ``G = X Σ⁻¹ Xᵀ`` is K×K;
-        # its eigvecs ``a`` give the discriminant directions
-        # ``v_r = Σ⁻¹ Xᵀ a_r`` (largest-eigenvalue first).  Re-expressed in
-        # a Euclidean-orthonormal basis via QR (span-preserving) so the
-        # steering hot path is unchanged — see the docstring.
-        G = whitener.subspace_gram(layer, X)            # (K, K) = X Σ⁻¹ Xᵀ
-        mu, A = torch.linalg.eigh(G)                    # ascending
-        mu_pos = mu.clamp_min(0.0)
-        rank = int(
-            (mu_pos > 1e-6 * mu_pos[-1].clamp(min=1e-12)).sum().item()
-        )
-        R = max(1, min(n_components, K - 1, rank))
-        top = torch.argsort(mu, descending=True)[:R]
-        XtA = X.transpose(0, 1) @ A[:, top]             # (D, R) = Xᵀ a_r
-        directions = torch.stack(
-            [whitener.apply_inv(layer, XtA[:, j]) for j in range(R)]
-        )                                               # (R, D) = Σ⁻¹ Xᵀ a_r
-        # QR on the (D, R) direction matrix gives an orthonormal column
-        # span identical to the discriminant directions' span; transpose
-        # back to (R, D) orthonormal rows the LayerSubspace expects.
-        basis = torch.linalg.qr(
-            directions.transpose(0, 1)
-        ).Q.transpose(0, 1).contiguous()                # (R, D)
-        coords = X @ basis.T                            # (K, R)
-        # EV ratio in the *whitened* metric — fraction of between-variance
-        # captured by the retained generalized eigenvalues.
-        total_w = float(mu_pos.sum().item())
-        retained_w = float(mu_pos[top].sum().item())
-        ev_ratio = retained_w / total_w if total_w > 1e-12 else 1.0
-    else:
-        # Euclidean PCA — ordinary SVD of the centered centroids (no
-        # whitener wired, or partial layer coverage at the call site).
-        _, S, Vh = torch.linalg.svd(X, full_matrices=False)
-        rank = int((S > 1e-6 * S[0].clamp(min=1e-12)).sum().item())
-        R = max(1, min(n_components, K - 1, rank))
-        basis = Vh[:R].contiguous()  # (R, D)
-        coords = X @ basis.T          # (K, R) -- the values the RBF interpolates
-
-        # Per-layer explained variance ratio.  Total variance is
-        # ``Σ σ²`` (full spectrum); retained is ``Σ σ²[:R]``.  Falls back
-        # to 1.0 on a degenerate (all-zero singular values) layer rather
-        # than NaN — the downstream normalizer will treat it as
-        # "well-fitted" and skip the boost.
-        total_var = float(S.pow(2).sum().item())
-        retained_var = float(S[:R].pow(2).sum().item())
-        if total_var > 1e-12:
-            ev_ratio = retained_var / total_var
-        else:
-            ev_ratio = 1.0
+    # Basis selection (Euclidean / whitened-Fisher) is shared with the flat
+    # ``fit_affine_subspace`` via ``_pca_basis`` so both pick the subspace
+    # identically; only what's built on top (RBF surface vs. analytic affine)
+    # differs.  ``coords`` are the μ-centered reduced node values the RBF
+    # interpolates (the curved path stays μ-anchored here; the neutral-anchor
+    # of ``mean`` is layered on by the fit pipeline / Step 3c).
+    basis, ev_ratio = _pca_basis(
+        X, n_components=n_components, whitener=whitener, layer=layer,
+    )
+    coords = X @ basis.T  # (K, R)
 
     lo = node_params.min(dim=0).values
     hi = node_params.max(dim=0).values
@@ -2078,10 +2224,17 @@ def save_manifold(
         tensors[f"layer_{idx}.mean"] = sub.mean.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.basis"] = sub.basis.contiguous().to(torch.float32).cpu()
         if sub.is_affine:
-            # Flat (folded-vector) subspace: no RBF surface, and the coord
-            # normalization is identity — rebuilt from the basis shape by
-            # ``LayerSubspace.affine`` on load.  Persist mean + basis only;
-            # the *absence* of ``node_params`` on disk is the affine marker.
+            # Flat (folded-vector / subspace) layer: no RBF surface, and the
+            # coord normalization is identity — rebuilt from the basis shape
+            # by ``LayerSubspace.affine`` on load.  Persist mean + basis (the
+            # *absence* of ``node_params`` on disk is the affine marker), plus
+            # the per-layer **real, neutral-anchored** node coords ``(K, R)``
+            # when present — the steer-target source (§5).  Older affine
+            # artifacts without it load with ``node_coords=None``.
+            if sub.node_coords is not None:
+                tensors[f"layer_{idx}.node_coords"] = (
+                    sub.node_coords.contiguous().to(torch.float32).cpu()
+                )
             continue
         np_, rw, pc = sub.rbf_params()
         tensors[f"layer_{idx}.node_params"] = np_.contiguous().to(torch.float32).cpu()
@@ -2194,11 +2347,13 @@ def load_manifold(path: str | Path) -> Manifold:
     layers: dict[int, LayerSubspace] = {}
     for idx, parts in by_layer.items():
         if "node_params" not in parts:
-            # Affine (flat / folded-vector) layer — only mean + basis on disk;
-            # the coord normalization is identity, rebuilt from the basis
-            # shape.  Read side of ``save_manifold``'s affine branch.
+            # Affine (flat / folded-vector) layer — only mean + basis on disk
+            # (the coord normalization is identity, rebuilt from the basis
+            # shape), plus the per-layer real node coords when the writer
+            # stamped them.  Read side of ``save_manifold``'s affine branch.
             layers[idx] = LayerSubspace.affine(
                 mean=parts["mean"], basis=parts["basis"],
+                node_coords=parts.get("node_coords"),
             )
             continue
         layers[idx] = LayerSubspace(

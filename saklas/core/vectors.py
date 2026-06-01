@@ -1346,89 +1346,83 @@ def _fold_centroids_to_affine_manifold(
 ) -> "Any":  # -> saklas.core.manifold.Manifold
     """Fold per-layer pos/neg centroids into an affine ``R = 1`` manifold.
 
-    The folded-vector representation (saklas 4.0 Phase 2 §1): a steering
-    vector *is* the degenerate ``n = R = 1`` manifold — a line through the
-    two pole centroids that fills its 1-D subspace (``H_n ≡ 0``).  Per
-    retained layer ``L``:
+    The folded-vector representation (saklas 4.0 §5): a steering vector *is*
+    the ``K = 2`` case of a flat affine subspace — a line through the two pole
+    centroids that fills its 1-D span (``H_n ≡ 0``).  Per retained layer
+    ``L``, :func:`~saklas.core.manifold.fit_affine_subspace` (pos = node 0,
+    so the basis orients ``+δ̂``) gives:
 
     * ``basis`` = unit ``δ̂_L`` where ``δ_L = mean_pos_L − mean_neg_L`` — the
-      **raw** difference-of-means direction.  (Not the whitened ``Σ⁻¹δ``
-      Fisher discriminant; that is the separate δ→Σ⁻¹δ commit, staged after
-      this one so the injection-semantics change and the direction change
-      are independently attributable.)
-    * ``mean`` = the pole midpoint ``½(mean_pos_L + mean_neg_L)``.
-    * ``node_coords`` = the shared unit poles ``[[+1], [−1]]``.  The
-      authoring-coordinate scale is unit; the *per-layer magnitude* lives
-      entirely in the baked share + lever, because a unit ``basis`` discards
-      ``‖δ_L‖`` and the coords are shared across layers (nothing per-layer to
-      put in them).
+      **raw** difference-of-means direction (PCA@2 ≡ DiM exactly; not the
+      whitened ``Σ⁻¹δ`` Fisher discriminant — that is the δ→Σ⁻¹δ gate flip,
+      staged at Step 8 so the injection-semantics change and the direction
+      change are independently attributable).
+    * ``mean`` = ``P_basis(ν_L)`` — the neutral mean projected into the span
+      (neutral-anchored frame, §5); falls back to the pole midpoint ``μ`` when
+      no neutral baseline is supplied.
+    * ``LayerSubspace.node_coords`` = the **real**, neutral-anchored pole
+      coords ``(c_± − ν_L)·δ̂_L`` ``(2, 1)``.  The per-layer magnitude lives
+      *here* now (``coord_+ − coord_− = ‖δ_L‖``), not in the share — neutral →
+      coord 0, so a pole sits at distance ∝ ‖δ_L‖ from the origin.
 
-    **Share — exact ``R = 1`` parity with the DiM bake.**
-    ``mahalanobis_share[L] = ‖δ_L‖_M`` (Mahalanobis norm of the raw diff via
-    the whitener) when the whitener covers every retained layer, else
-    ``‖δ_L‖₂``.  This is the *same* per-layer scalar today's
-    :func:`extract_difference_of_means` bakes: its hook share works out to
-    ``∝ ‖δ_L‖_M`` once ``ref_norm`` cancels through the share-bake, so
-    ``hooks._manifold_layer_shares`` (which renormalizes this dict to
-    ``Σ_L share_L = 1``) reproduces today's vector layer profile *exactly*.
-    The unit ``basis`` carries no magnitude, so the share is the only place
-    the per-layer ``‖δ_L‖`` survives — folded vectors therefore *always*
-    populate the share dict (a curved manifold may leave it empty and let
-    the apply path recompute from coords; a folded vector cannot).
+    **Share — the per-layer budget (§5).**  ``mahalanobis_share[L]`` is the
+    μ-centered whitened spread :func:`~saklas.core.manifold.subspace_share`
+    (``‖δ_L‖_M / √2`` at K=2, whitened) when the whitener covers every
+    retained layer, else the Euclidean ``‖δ_L‖₂ / √2``.  The ``√2`` is a
+    constant that **cancels under the apply-time ``Σ_L share_L = 1``
+    normalization**, so ``hooks._manifold_layer_shares`` reproduces today's
+    DiM hook profile exactly (the normalized share is the DiM one — coords
+    carry the position, share carries the budget).
 
-    **Origin** ``O_L`` = the foot of the neutral mean on the line, in
-    authoring coords: ``(μ_L − mean_L)·δ̂_L``.  An affine subspace's surface
-    fills its span, so the foot is the trivial projection — no Gauss-Newton
-    inversion.  It lands near ``0`` for a continuum (midpoint ≈ neutral) and
-    off toward a pole for a categorical pair (``dog.cat``); ``!`` slides the
-    foot here either way.
+    **Origin** is implicitly ``0`` (neutral → coord 0 by the neutral anchor),
+    so no origin is stored — the flat ``!`` ablation target is coord 0 (§2).
 
-    **DLS** is consumed at fit time: per-axis DLS at ``R = 1`` keeps a layer
-    iff its single basis row passes the centered opposite-sign test —
-    bit-identical to today's scalar :func:`compute_dls_mask`.  Dropped layers
-    are simply absent from the returned manifold (matching the legacy
-    dropped-layer behavior).
+    **DLS** is per-axis at ``R = 1`` (keep-or-drop the layer): the basis row
+    is kept iff the pole projections straddle the neutral baseline —
+    bit-identical to the historical scalar test, dropped layers absent from
+    the returned manifold.
 
-    Returns a :class:`~saklas.core.manifold.Manifold`; the caller persists it
-    (the routing + save wiring is the next commit).  ``share_metric`` is
-    recorded on ``manifold.metadata`` for that save.
+    Returns a :class:`~saklas.core.manifold.Manifold`; the caller persists it.
+    ``share_metric`` is recorded on ``manifold.metadata`` for that save.
     """
     from saklas.core.manifold import (
-        CustomDomain, LayerSubspace, Manifold, layer_lever,
+        CustomDomain, LayerSubspace, Manifold, fit_affine_subspace,
+        layer_lever, subspace_share,
     )
 
     shared = sorted(set(mean_pos_per_layer) & set(mean_neg_per_layer))
 
-    # Per-layer raw δ, unit direction, midpoint (fp32).  Degenerate pairs
-    # (zero diff — no direction to steer) drop out here.
-    deltas: dict[int, torch.Tensor] = {}
-    units: dict[int, torch.Tensor] = {}
-    mids: dict[int, torch.Tensor] = {}
+    # Per-layer affine fit over [pos, neg] (pos = node 0 ⇒ +δ̂ orientation).
+    # Degenerate pairs (zero diff — no direction to steer) drop out first so
+    # the K=2 fit never sees a zero scatter.  δ stays *raw* (no whitener into
+    # the fit) until the Step 8 gate flip — the whitener only weights the
+    # share / lever below.
+    fits: dict[int, tuple["LayerSubspace", torch.Tensor, torch.Tensor]] = {}
     for idx in shared:
         mp = mean_pos_per_layer[idx].to(torch.float32).reshape(-1)
         mn = mean_neg_per_layer[idx].to(torch.float32).reshape(-1)
-        delta = mp - mn
-        norm = float(delta.norm())
-        if norm <= 1e-12:
+        if float((mp - mn).norm()) <= 1e-12:
             continue
-        deltas[idx] = delta
-        units[idx] = delta / norm
-        mids[idx] = 0.5 * (mp + mn)
-
-    # Per-axis DLS at R=1 (collapses to today's scalar DLS).
-    if dls:
-        bases = {idx: units[idx].reshape(1, -1) for idx in units}
-        per_axis = compute_dls_mask_per_axis(
-            mean_pos_per_layer, mean_neg_per_layer, bases, layer_means,
+        cent = torch.stack([mp, mn])               # (2, D); node 0 = pos
+        nu = (
+            layer_means[idx].to(torch.float32).reshape(-1)
+            if layer_means is not None and idx in layer_means
+            else None
         )
-        kept = [idx for idx in units if per_axis.get(idx)]
-    else:
-        kept = list(units)
+        sub, mu_coords, _ev = fit_affine_subspace(cent, neutral_mean=nu, orient_to=0)
+        fits[idx] = (sub, mu_coords, cent)
 
-    # All-or-nothing whitener gate (parity with the DiM bake metric): the
-    # whitened share is used only when it covers every retained layer, so the
-    # cross-layer normalization in ``_manifold_layer_shares`` compares like
-    # with like.
+    # Per-axis DLS at R=1 (collapses to the scalar keep-or-drop).
+    if dls:
+        node_centroids = {idx: fits[idx][2] for idx in fits}
+        bases = {idx: fits[idx][0].basis for idx in fits}
+        per_axis = compute_dls_axes(node_centroids, bases, layer_means)
+        kept = [idx for idx in fits if per_axis.get(idx)]
+    else:
+        kept = list(fits)
+
+    # All-or-nothing whitener gate for the share/lever metric (parity with
+    # the DiM bake): whitened only when it covers every retained layer.
     maha_w = (
         whitener
         if whitener is not None and whitener.covers_all(kept)
@@ -1438,34 +1432,26 @@ def _fold_centroids_to_affine_manifold(
     layers: dict[int, "LayerSubspace"] = {}
     mahalanobis_share: dict[int, float] = {}
     lever: dict[int, float] = {}
-    origin: dict[int, torch.Tensor] = {}
     for idx in kept:
-        basis = units[idx].reshape(1, -1)          # (1, D) unit δ̂
-        mean = mids[idx]                           # (D,) midpoint
-        layers[idx] = LayerSubspace.affine(mean, basis)
-
-        # Per-layer share = ‖δ_L‖ in the bake metric (exact DiM parity).
-        if maha_w is not None:
-            mahalanobis_share[idx] = float(maha_w.mahalanobis_norm(idx, deltas[idx]))
-        else:
-            mahalanobis_share[idx] = float(deltas[idx].norm())
-
-        if layer_means is not None and idx in layer_means:
+        sub, mu_coords, _cent = fits[idx]
+        layers[idx] = sub
+        # Per-layer budget = μ-centered whitened/Euclidean spread.
+        mahalanobis_share[idx] = subspace_share(
+            mu_coords, sub.basis, whitener=maha_w, layer=idx,
+        )
+        # Lever from the whitener's neutral activations (uncentered by the
+        # layer mean to recover the raw-activation stand-ins ``layer_lever``
+        # needs).  No origin store — affine origin is coord 0 (§2).
+        if maha_w is not None and layer_means is not None and idx in layer_means:
             mu = layer_means[idx].to(torch.float32).reshape(-1)
-            # Origin: foot of neutral on the line (authoring coord, R=1).
-            origin[idx] = torch.tensor(
-                [float((mu - mean) @ units[idx])], dtype=torch.float32,
+            X_c, _K, _lam = maha_w.woodbury_factors(
+                idx, device=torch.device("cpu"), dtype=torch.float32,
             )
-            # Lever from the whitener's neutral activations (uncentered by μ
-            # to recover the raw-activation stand-ins ``layer_lever`` needs).
-            if maha_w is not None:
-                X_c, _K, _lam = maha_w.woodbury_factors(
-                    idx, device=torch.device("cpu"), dtype=torch.float32,
-                )
-                lever[idx] = layer_lever(X_c + mu, mean, basis)
+            lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
 
-    # Bipolar: pos at +1, neg at −1 on a 1-D CustomDomain.  Shared unit
-    # coords — the per-layer magnitude is in the share, not here.
+    # Shared display layout: pos at +1, neg at −1 on a 1-D CustomDomain (the
+    # label/display frame; the real per-layer steer coords live on each
+    # ``LayerSubspace.node_coords``).
     node_coords = torch.tensor([[1.0], [-1.0]], dtype=torch.float32)
     manifold = Manifold(
         name=name,
@@ -1476,7 +1462,6 @@ def _fold_centroids_to_affine_manifold(
         feature_space=feature_space,
         mahalanobis_share=mahalanobis_share,
         lever=lever,
-        origin=origin,
     )
     manifold.metadata["share_metric"] = (
         "mahalanobis" if maha_w is not None else "euclidean"
@@ -1541,22 +1526,26 @@ def fold_directions_to_subspace(
     ``R = 1`` manifold (a one-pole ray).
 
     The monopolar sibling of :func:`_fold_centroids_to_affine_manifold`: where
-    a bipolar concept folds a line through two pole centroids (mean = the
-    midpoint), a derived direction (a ``merge`` linear-combination, a `~`/`|`
-    projection of one concept onto another) has no pole pair — just a
-    direction to push along.  So the subspace is anchored at the **neutral
-    mean** (``mean = μ_L`` ⇒ origin ``O_L = (μ_L − mean)·d̂ = 0``) with a single
-    ``+1`` pole node, and steering ``along`` toward ``+1`` pushes the running
-    activation's ``d̂`` component away from neutral; ``!`` (``along``-to-``O``)
-    slides it back to neutral, i.e. ablates the direction.
+    a bipolar concept folds a line through two pole centroids, a derived
+    direction (a ``merge`` linear-combination, a `~`/`|` projection of one
+    concept onto another) has no pole pair — just a direction to push along.
+    So the subspace is neutral-anchored at ``mean = P_basis(ν_L) = (ν_L·d̂)d̂``
+    (the neutral mean projected into the 1-D span, §5) with a single ``+`` pole
+    node; steering ``along`` toward the pole pushes the running activation's
+    ``d̂`` component away from neutral, and ``!`` (``along``-to-coord-0) slides
+    it back to neutral, i.e. ablates the direction.
 
-    Per layer: ``basis = d̂_L``; ``share = ‖d_L‖_M`` (whitened) / ``‖d_L‖₂``
-    (Euclidean), the same per-layer weight a folded vector carries so the
-    apply-time share normalization is uniform; ``lever`` from the neutral
-    activations when the whitener is present.  No DLS — a derived direction has
-    no polarity to run the centered opposite-sign test against; the caller's
-    layer set is folded verbatim.  ``neutral_means=None`` (CPU stubs) anchors
-    at the origin with no lever.
+    Per layer: ``basis = d̂_L``; ``LayerSubspace.node_coords = [[‖d_L‖]]`` —
+    the real coord of the pole, a step of ``‖d_L‖`` along ``d̂`` from the
+    neutral origin (coord 0).  ``share = ‖d_L‖_M`` (whitened) / ``‖d_L‖₂``
+    (Euclidean) — the direction magnitude itself is the budget (a single
+    direction has no node cloud to take a μ-centered spread over, so this is
+    *not* :func:`~saklas.core.manifold.subspace_share`'s √2-scaled form; the
+    apply-time normalization handles the cross-layer scale either way).
+    ``lever`` from the neutral activations when the whitener is present.  No
+    DLS — a derived direction has no polarity for the straddle test; the
+    caller's layer set folds verbatim.  No origin store (coord 0, §2).
+    ``neutral_means=None`` (CPU stubs) anchors at coord 0 with no lever.
     """
     from saklas.core.manifold import (
         CustomDomain, LayerSubspace, Manifold, layer_lever,
@@ -1572,30 +1561,37 @@ def fold_directions_to_subspace(
     layers: dict[int, "LayerSubspace"] = {}
     mahalanobis_share: dict[int, float] = {}
     lever: dict[int, float] = {}
-    origin: dict[int, torch.Tensor] = {}
     for idx in present:
         d = directions[idx].to(torch.float32).reshape(-1)
         norm = float(d.norm())
         if norm <= 1e-12:
             continue
         basis = (d / norm).reshape(1, -1)          # (1, D) unit d̂
-        if neutral_means is not None and idx in neutral_means:
-            mean = neutral_means[idx].to(torch.float32).reshape(-1)
-        else:
-            mean = torch.zeros_like(d)
-        layers[idx] = LayerSubspace.affine(mean, basis)
+        nu = (
+            neutral_means[idx].to(torch.float32).reshape(-1)
+            if neutral_means is not None and idx in neutral_means
+            else None
+        )
+        # Neutral-anchored: mean = P_basis(ν) (off-span part of ν dropped);
+        # the pole sits at the real coord ‖d‖ along d̂ from the origin.
+        mean = (nu @ basis.T) @ basis if nu is not None else torch.zeros_like(d)
+        node_coords_L = torch.tensor([[norm]], dtype=torch.float32)
+        layers[idx] = LayerSubspace.affine(mean, basis, node_coords=node_coords_L)
         mahalanobis_share[idx] = (
             float(maha_w.mahalanobis_norm(idx, d))
             if maha_w is not None else norm
         )
-        # Neutral-anchored ⇒ the foot of neutral on the line is the origin.
-        origin[idx] = torch.zeros(1, dtype=torch.float32)
-        if maha_w is not None and neutral_means is not None and idx in neutral_means:
+        # Lever from the whitener's neutral activations (uncentered by the
+        # actual ν, not the projected mean, to recover the raw-activation
+        # stand-ins).
+        if maha_w is not None and nu is not None:
             X_c, _K, _lam = maha_w.woodbury_factors(
                 idx, device=torch.device("cpu"), dtype=torch.float32,
             )
-            lever[idx] = layer_lever(X_c + mean, mean, basis)
+            lever[idx] = layer_lever(X_c + nu, mean, basis)
 
+    # Shared display layout: a single ``+`` pole at coord 1 (the real per-layer
+    # pole distance ‖d_L‖ lives on each ``LayerSubspace.node_coords``).
     node_coords = torch.tensor([[1.0]], dtype=torch.float32)
     manifold = Manifold(
         name=name,
@@ -1606,7 +1602,6 @@ def fold_directions_to_subspace(
         feature_space=feature_space,
         mahalanobis_share=mahalanobis_share,
         lever=lever,
-        origin=origin,
     )
     manifold.metadata["share_metric"] = (
         "mahalanobis" if maha_w is not None else "euclidean"
