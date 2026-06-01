@@ -9,8 +9,10 @@ from typing import Any, Literal
 import torch
 
 from saklas.core.manifold import (
+    CustomDomain,
     LayerSubspace,
     ManifoldDomain,
+    SynthesizedSubspace,
     eval_rbf,
     inject_three_op,
     rotate_toward,
@@ -980,6 +982,12 @@ class SteeringManager:
         self.vectors: dict[str, dict[str, Any]] = {}
         self.ablations: dict[str, dict[str, Any]] = {}
         self.manifolds: dict[str, dict[str, Any]] = {}
+        # Dispatch-synthesized merged affine subspaces (one per active trigger
+        # group), the 4.0 unified vector/pole/projection/ablation/affine-``%``
+        # backend.  Each value is ``{synth, lever, trigger}``; ``apply_to_model``
+        # lowers them to per-layer ``inject_three_op`` entries alongside curved
+        # manifolds (Step 5).
+        self.subspaces: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
         self.injection_mode: InjectionMode = injection_mode
         self.theta_max: float = theta_max
@@ -1110,6 +1118,42 @@ class SteeringManager:
             "onto": float(onto),
             "trigger": trigger,
             "shares": _manifold_layer_shares(manifold),
+        }
+
+    def add_subspace(
+        self,
+        name: str,
+        synth: SynthesizedSubspace,
+        *,
+        lever: dict[int, float] | None = None,
+        trigger: Trigger = Trigger.BOTH,
+    ) -> None:
+        """Register a dispatch-synthesized merged affine subspace (4.0).
+
+        ``synth`` (one per active trigger group) carries the per-layer affine
+        :class:`LayerSubspace`, the ``along`` ``target_coord`` (every active
+        push term's coeff-scaled pole already composed in), and the
+        un-normalized per-layer budget ``share`` (``‖Δ_L‖``).  ``lever`` is the
+        per-layer steering lever ``f_L = E_neutral[‖h_par_c‖/‖h‖]`` the
+        *session* computes at dispatch over the cached neutral activations
+        (:func:`saklas.core.manifold.layer_lever`); ``None`` ⇒ ``N = 1`` (no
+        lever normalization — the degenerate / CPU-stub path).
+
+        At :meth:`apply_to_model` each layer becomes a per-layer
+        ``(subspace, CustomDomain(R_L), target_coord, origin=0, eff_along,
+        onto=0)`` entry routed through the same :func:`inject_three_op` hot
+        path as a curved manifold — the affine analytic shortcut slides the
+        in-subspace component toward ``target_coord`` with
+        ``eff_along_L = clamp(share_L · base_gain / N, 0, 1)``.  No ``onto``
+        (the surface fills its span) and no θ_max water-fill (the slide to a
+        neutral-anchored real-coord target is intrinsically bounded — the foot
+        lands at most on the composed pole at ``eff_along = 1``); the budget is
+        a plain per-layer clamp.
+        """
+        self.subspaces[name] = {
+            "synth": synth,
+            "lever": lever,
+            "trigger": trigger,
         }
 
     def apply_to_model(
@@ -1327,6 +1371,59 @@ class SteeringManager:
                     eff_along[layer_idx], eff_onto[layer_idx], trigger,
                 ))
 
+        # Dispatch-synthesized merged affine subspaces (4.0 unified backend).
+        # Each ``synth`` is already neutral-anchored with its ``along`` target
+        # composed from every active push term's coeff-scaled pole; here we only
+        # set the per-layer slide budget ``eff_along_L = clamp(share_L·base/N)``
+        # and lower each layer to a ``CustomDomain(R_L)`` ``inject_three_op``
+        # entry (the affine analytic shortcut — no GN / RBF / foot solve).  The
+        # target carries the strength, so there is no separate user-α multiply
+        # here and no θ_max water-fill (the slide is intrinsically bounded — it
+        # lands at most on the composed pole); ``onto = 0`` (the surface fills
+        # its span).  Curved-vs-affine orthogonalization + the relaxed overlap
+        # check land with the session dispatch flip (Step 5b); here a subspace
+        # simply joins ``manifold_by_layer``.
+        for s in self.subspaces.values():
+            synth: SynthesizedSubspace = s["synth"]
+            sub_trigger: Trigger = s["trigger"]
+            lever: dict[int, float] | None = s["lever"]
+            layer_set = list(synth.layers)
+            if not layer_set:
+                continue
+
+            # Normalize the per-layer budget share across the subspace's layers
+            # (Σ_L share_L = 1) so the slide is layer-count-invariant.
+            raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
+            total_share = sum(raw_share.values())
+            if total_share <= 1e-12:
+                shares = {L: 1.0 / len(layer_set) for L in layer_set}
+            else:
+                shares = {L: raw_share[L] / total_share for L in layer_set}
+
+            # Lever-normalized base gain (``N = Σ_L share_L·f_L``; ``N = 1``
+            # without a lever — the degenerate / CPU-stub path).  Mirrors the
+            # curved-manifold gain so the per-α effect is R-/metric-invariant
+            # across a rank-1 vector and a rank-8 ``personas%`` term.
+            if lever and all(L in lever for L in layer_set):
+                N = sum(shares[L] * lever[L] for L in layer_set)
+                gain = _MANIFOLD_GAIN / max(N, _MIN_MANIFOLD_LEVER)
+            else:
+                gain = _MANIFOLD_GAIN
+
+            for L in layer_set:
+                sub_L = synth.layers[L]
+                r_l = sub_L.rank
+                sub_domain = CustomDomain(r_l)
+                sub_target = synth.target_coord[L].to(torch.float32)
+                # Affine origin is span-coord 0 (neutral → coord 0, §5); the
+                # foot seed / cold-start is unused on the affine shortcut.
+                sub_origin = torch.zeros(r_l, dtype=torch.float32)
+                eff_along_L = max(0.0, min(1.0, shares[L] * gain))
+                manifold_by_layer.setdefault(L, []).append((
+                    sub_L, sub_domain, sub_target, sub_origin,
+                    eff_along_L, 0.0, sub_trigger,
+                ))
+
         active_layers = (
             set(additive_by_layer)
             | set(ablation_by_layer)
@@ -1369,10 +1466,11 @@ class SteeringManager:
             hook._manifold_feet = [None] * len(hook.manifold_groups)
 
     def clear_all(self) -> None:
-        """Detach all hooks and clear vectors + ablations + manifolds."""
+        """Detach all hooks and clear vectors + ablations + manifolds + subspaces."""
         for hook in self.hooks.values():
             hook.detach()
         self.hooks.clear()
         self.vectors.clear()
         self.ablations.clear()
         self.manifolds.clear()
+        self.subspaces.clear()
