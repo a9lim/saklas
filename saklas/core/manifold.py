@@ -895,7 +895,7 @@ def fit_affine_subspace(
         signs = torch.where(proj < 0, -1.0, 1.0)        # flip rows facing away
         basis = (basis * signs.unsqueeze(1)).contiguous()
     if neutral_mean is not None:
-        anchor = neutral_mean.to(torch.float32).reshape(-1)
+        anchor = neutral_mean.to(device=centroids.device, dtype=torch.float32).reshape(-1)
     else:
         anchor = mu
     mean = (anchor @ basis.T) @ basis                   # P_basis(anchor) (D,)
@@ -945,8 +945,9 @@ def fit_layer_subspace(
     n_components: int = DEFAULT_N_COMPONENTS,
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
+    neutral_mean: torch.Tensor | None = None,
 ) -> tuple[LayerSubspace, float]:
-    """Fit a PCA subspace + RBF interpolant for one layer.
+    """Fit a PCA subspace + RBF interpolant for one layer (curved).
 
     ``centroids`` is ``(K, D)`` -- one per-node mean activation -- and
     ``node_params`` is ``(K, m)`` -- the corresponding embedded domain
@@ -986,6 +987,16 @@ def fit_layer_subspace(
     gates this all-or-nothing on ``whitener.covers_all`` over the fit
     layers, mirroring the DiM-bake / monitor / share gates.
 
+    **Neutral-anchor (§5).**  ``neutral_mean`` (the layer's neutral baseline)
+    anchors the frame: ``mean = P_basis(neutral)`` and the RBF interpolates
+    **neutral-relative** reduced coords, so neutral lands at reduced-coord 0
+    and the surface passes through each centroid's in-span projection
+    ``eval_at(node_i) = P_basis(centroid_i)``.  ``None`` falls back to the
+    centroid mean ``μ`` as the anchor (the degenerate path — CPU stubs / no
+    neutral cache).  The basis is always derived from the **μ-centered**
+    scatter regardless (the basis caveat); only the anchor moves.  The
+    dropped off-anchor component cancels in the steered output.
+
     Returns ``(LayerSubspace, explained_variance_ratio)``.  Under
     Euclidean PCA the EV ratio is ``Σ σ_i² (retained) / Σ σ_i² (all)`` —
     the fraction of raw inter-node variance retained.  Under whitened PCA
@@ -1002,19 +1013,30 @@ def fit_layer_subspace(
     K = centroids.shape[0]
     if K < 3:
         raise ValueError(f"a manifold needs >= 3 nodes to fit, got {K}")
-    mean = centroids.mean(dim=0)
-    X = centroids - mean  # (K, D)
+    mu = centroids.mean(dim=0)
+    X = centroids - mu  # (K, D) μ-centered (basis caveat: never anchor-center)
 
     # Basis selection (Euclidean / whitened-Fisher) is shared with the flat
     # ``fit_affine_subspace`` via ``_pca_basis`` so both pick the subspace
     # identically; only what's built on top (RBF surface vs. analytic affine)
-    # differs.  ``coords`` are the μ-centered reduced node values the RBF
-    # interpolates (the curved path stays μ-anchored here; the neutral-anchor
-    # of ``mean`` is layered on by the fit pipeline / Step 3c).
+    # differs.
     basis, ev_ratio = _pca_basis(
         X, n_components=n_components, whitener=whitener, layer=layer,
     )
-    coords = X @ basis.T  # (K, R)
+    # Neutral-anchor the frame (§5): ``mean = P_basis(anchor)`` and the RBF
+    # interpolates **anchor-relative** reduced coords, so neutral lands at
+    # reduced-coord 0 and ``eval_at(node_i) = P_basis(centroid_i)`` (the
+    # R-dim surface passes through the centroids' in-span projections).  The
+    # anchor is the supplied neutral mean, else the centroid mean ``μ`` (the
+    # degenerate fallback — CPU stubs / no-neutral cache).  The off-anchor
+    # component dropped by the projection provably cancels in the steered
+    # output; projecting only cleans the residual / read-side fraction.
+    if neutral_mean is not None:
+        anchor = neutral_mean.to(device=centroids.device, dtype=torch.float32).reshape(-1)
+    else:
+        anchor = mu
+    mean = (anchor @ basis.T) @ basis           # P_basis(anchor) (D,)
+    coords = (centroids - anchor) @ basis.T     # (K, R) anchor-relative RBF targets
 
     lo = node_params.min(dim=0).values
     hi = node_params.max(dim=0).values

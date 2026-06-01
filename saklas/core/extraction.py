@@ -825,12 +825,12 @@ class ManifoldExtractionPipeline:
             compute_node_centroid,
             discover_coords,
             domain_from_spec,
-            eval_rbf,
             fit_layer_subspace,
             invert_parameterization,
             layer_lever,
             load_manifold,
             save_manifold,
+            subspace_share,
         )
         from saklas.io.manifolds import (
             ManifoldFolder, ManifoldSidecar, min_nodes,
@@ -1148,10 +1148,12 @@ class ManifoldExtractionPipeline:
         # the raw-activation stand-ins ``layer_lever`` needs.  Same gate as
         # Fisher PCA + the Mahalanobis share, so all three agree.
         lever: dict[int, float] = {}
-        _layer_means = (
-            getattr(self._handle, "layer_means", None)
-            if maha_whitener is not None else None
-        )
+        # Neutral baseline (probe-centering means), **ungated** by the
+        # whitener: the curved fit's neutral-anchor (``mean = P_basis(ν)``,
+        # §5) and the lever both consume it.  ``None`` on a CPU-stub handle ⇒
+        # the fit falls back to the centroid-mean anchor and the lever is
+        # skipped.  (Also drives the origin foot below.)
+        _handle_means = getattr(self._handle, "layer_means", None)
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
             fit_kwargs["n_components"] = max_subspace_dim_override
@@ -1170,40 +1172,47 @@ class ManifoldExtractionPipeline:
             # subspace selection that also collapses the angular norm
             # artifact (see ``fit_layer_subspace`` docstring).  The same
             # gate drives the Mahalanobis share below, so subspace metric
-            # and share metric always agree.
+            # and share metric always agree.  ``neutral_mean`` neutral-anchors
+            # the frame (independent of the whitener — the anchor needs only
+            # the layer mean).
+            neutral_L = (
+                _handle_means[idx]
+                if _handle_means is not None and idx in _handle_means
+                else None
+            )
             sub, ev_ratio = fit_layer_subspace(
                 stacked, node_params,
-                whitener=maha_whitener, layer=idx,
+                whitener=maha_whitener, layer=idx, neutral_mean=neutral_L,
                 **fit_kwargs,
             )
             layer_subs[idx] = sub
             explained_variance[idx] = ev_ratio
             if maha_whitener is not None:
-                # ``coords`` are the reduced node values the RBF
-                # interpolates (exact at the fit nodes — same basis the
-                # Euclidean ``_manifold_layer_shares`` uses).  ``M_R``
-                # restricts Σ⁻¹ to the subspace; the whitened per-layer
-                # spread is ``sqrt(Σ_k coords_kᵀ M_R coords_k)`` =
-                # ``sqrt(Σ_k ‖Bᵀ coords_k‖²_M)``.  Reduces to the Euclidean
-                # ``‖coords‖_F`` when Σ = I.
-                _np, _rw, _pc = sub.rbf_params()
-                coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
-                gram = maha_whitener.subspace_gram(idx, sub.basis)  # (R, R)
-                quad = float(
-                    (coords @ gram * coords).sum().clamp_min(0.0).item()
+                # Per-layer budget = the **μ-centered** (anchor-independent)
+                # whitened spread (§5 / ``subspace_share``): the share measures
+                # signal spread, not where neutral sits.  We center on the
+                # centroid mean ``μ`` *explicitly* rather than reading
+                # ``eval_rbf(node_params)``, because the surface is now
+                # neutral-anchored (the RBF node values are ``(c−ν)·Bᵀ``, not
+                # μ-centered).  At K=2 this is ``‖δ_L‖_M/√2`` ∝ the DiM bake
+                # share; ``subspace_share`` unifies it with the flat path.
+                mu_centered = stacked.to(torch.float32)
+                mu_centered = mu_centered - mu_centered.mean(dim=0)
+                mu_coords = mu_centered @ sub.basis.to(torch.float32).T  # (K, R)
+                mahalanobis_share[idx] = subspace_share(
+                    mu_coords, sub.basis, whitener=maha_whitener, layer=idx,
                 )
-                mahalanobis_share[idx] = quad ** 0.5
 
                 # Steering lever from the neutral activations: uncenter the
                 # whitener's centered observations with the layer mean to
                 # recover the raw activation stand-ins, then measure the
                 # typical in-subspace norm fraction.  Skipped (left absent →
                 # ``N = 1`` at apply) if the layer mean isn't resolvable.
-                if _layer_means is not None and idx in _layer_means:
+                if _handle_means is not None and idx in _handle_means:
                     X_c, _K, _lam = maha_whitener.woodbury_factors(
                         idx, device=torch.device("cpu"), dtype=torch.float32,
                     )
-                    mu = _layer_means[idx].to(
+                    mu = _handle_means[idx].to(
                         device="cpu", dtype=torch.float32,
                     ).reshape(-1)
                     lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
@@ -1216,7 +1225,6 @@ class ManifoldExtractionPipeline:
         # layer; layers whose mean isn't resolvable (CPU stub) are simply
         # absent, and the apply path seeds them at ``zeros(n)``.
         origin: dict[int, torch.Tensor] = {}
-        _handle_means = getattr(self._handle, "layer_means", None)
         if _handle_means is not None:
             for idx, sub in layer_subs.items():
                 if idx not in _handle_means:

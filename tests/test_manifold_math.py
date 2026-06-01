@@ -258,7 +258,11 @@ def test_fit_layer_subspace_eval_at_nodes():
         layers={0: sub},
     )
     p0 = man.manifold_point(0, (0.0,))
-    assert torch.allclose(p0, centroids[0], atol=1e-3)
+    # The R-dim surface passes through each centroid's **in-span projection**
+    # (neutral-anchor §5: with no neutral the anchor is μ and mean = P_basis(μ),
+    # dropping the common off-span offset the old full-μ mean carried for free).
+    p_basis = (centroids[0] @ sub.basis.T) @ sub.basis
+    assert torch.allclose(p0, p_basis, atol=1e-3)
 
 
 def test_fit_layer_subspace_n2_box():
@@ -273,10 +277,33 @@ def test_fit_layer_subspace_n2_box():
     )
     got = man.manifold_point(0, (0.5, 0.5))
     assert got.shape == (24,)
-    # a corner node reproduces its centroid
+    # a corner node reproduces its centroid's in-span projection (the surface
+    # is R-dim; neutral-anchor §5 keeps only the in-span component of mean)
     assert torch.allclose(
-        man.manifold_point(0, (0.0, 0.0)), centroids[0], atol=1e-3,
+        man.manifold_point(0, (0.0, 0.0)),
+        (centroids[0] @ sub.basis.T) @ sub.basis, atol=1e-3,
     )
+
+
+def test_fit_layer_subspace_neutral_anchored():
+    """A neutral baseline anchors the curved frame: ``mean = P_basis(ν)`` and
+    the neutral lands at reduced-coord 0 (§5).  The basis is unchanged — it
+    stays μ-centered regardless of the anchor (the basis caveat)."""
+    centroids, _domain, node_params = _circle(6, dim=12)
+    nu = 3.0 + torch.randn(12)
+    sub_n, _ = _fit_layer_subspace_with_ev(
+        centroids, node_params, neutral_mean=nu,
+    )
+    sub_mu, _ = _fit_layer_subspace_with_ev(centroids, node_params)  # no neutral
+    # Basis identical (μ-centered regardless of anchor); only mean/coords move.
+    assert torch.allclose(sub_n.basis, sub_mu.basis, atol=1e-5)
+    # mean = projection of neutral into the span.
+    assert torch.allclose(
+        sub_n.mean, (nu @ sub_n.basis.T) @ sub_n.basis, atol=1e-4,
+    )
+    # Neutral → reduced-coord 0.
+    q = (nu - sub_n.mean) @ sub_n.basis.T
+    assert torch.allclose(q, torch.zeros(sub_n.rank), atol=1e-4)
 
 
 def test_fit_layer_subspace_rejects_too_few_nodes():
