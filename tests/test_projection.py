@@ -624,6 +624,99 @@ class TestComputeDlsMaskPerAxis:
                 assert per_axis[L] == {0}, f"seed={seed} L={L}"
 
 
+class TestComputeDlsAxes:
+    """N-node per-axis DLS straddle — the form a flat subspace of any node
+    count (a vector at K=2, ``personas`` at K=101) prunes axes with.  The
+    load-bearing invariant is bit-for-bit parity with the bipolar
+    :func:`compute_dls_mask_per_axis` at N=2."""
+
+    def test_n_node_straddle_keep_drop(self):
+        # Three nodes, neutral at 0.  Axis 0 (x): projections {+2, 0.5, -1}
+        # straddle zero ⇒ KEEP.  Axis 1 (y): projections {1, 2, 3} all
+        # positive ⇒ no straddle ⇒ DROP (a common offset, not a contrast).
+        from saklas.core.vectors import compute_dls_axes
+        node_centroids = {
+            7: torch.tensor([
+                [2.0, 1.0],
+                [0.5, 2.0],
+                [-1.0, 3.0],
+            ]),
+        }
+        bases = {7: torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
+        layer_means = {7: torch.zeros(2)}
+        out = compute_dls_axes(node_centroids, bases, layer_means)
+        assert out == {7: {0}}
+
+    def test_n_node_disabled_keeps_every_axis(self):
+        from saklas.core.vectors import compute_dls_axes
+        node_centroids = {0: torch.randn(4, 3), 1: torch.randn(4, 3)}
+        bases = {0: torch.eye(3), 1: torch.eye(3)}
+        out = compute_dls_axes(node_centroids, bases, None)
+        assert out == {0: {0, 1, 2}, 1: {0, 1, 2}}
+
+    def test_n_node_missing_baseline_conservative_keep(self):
+        # A layer whose neutral baseline is absent keeps every checkable axis.
+        from saklas.core.vectors import compute_dls_axes
+        node_centroids = {3: torch.randn(5, 4)}
+        bases = {3: torch.eye(4)}
+        out = compute_dls_axes(node_centroids, bases, {})  # empty ⇒ disabled
+        assert out == {3: {0, 1, 2, 3}}
+
+    def test_n_node_degenerate_row_skipped(self):
+        from saklas.core.vectors import compute_dls_axes
+        node_centroids = {0: torch.tensor([[1.0, 0.0], [-1.0, 0.0]])}
+        bases = {0: torch.tensor([[1.0, 0.0], [0.0, 0.0]])}  # row 1 zero-norm
+        layer_means = {0: torch.zeros(2)}
+        out = compute_dls_axes(node_centroids, bases, layer_means)
+        assert out == {0: {0}}
+
+    def test_n_node_all_fail_fallback(self):
+        import warnings as _warnings
+        from saklas.core.vectors import compute_dls_axes
+        # Every node on the same side of neutral on both axes ⇒ no straddle.
+        node_centroids = {0: torch.tensor([[0.5, 0.7], [0.3, 0.4], [0.6, 0.9]])}
+        bases = {0: torch.eye(2)}
+        layer_means = {0: torch.zeros(2)}
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            out = compute_dls_axes(node_centroids, bases, layer_means)
+        assert out == {0: {0, 1}}
+        msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+        assert any("DLS" in m for m in msgs)
+
+    def test_two_node_parity_with_bipolar(self):
+        """The spine invariant: stacking ``[μ_pos, μ_neg]`` into the N-node
+        core reproduces the bipolar keep set bit for bit, across randomized
+        inputs and every edge branch."""
+        from saklas.core.vectors import (
+            compute_dls_axes,
+            compute_dls_mask_per_axis,
+        )
+        for seed in range(40):
+            torch.manual_seed(seed)
+            n_layers = int(torch.randint(1, 6, ()).item())
+            dim = int(torch.randint(2, 9, ()).item())
+            rank = int(torch.randint(1, 4, ()).item())
+            mu_pos, mu_neg, bases, layer_means = {}, {}, {}, {}
+            for L in range(n_layers):
+                mu_pos[L] = torch.randn(dim)
+                mu_neg[L] = torch.randn(dim)
+                # Mix real / degenerate rows and present / absent baselines.
+                rows = torch.randn(rank, dim)
+                if (seed + L) % 7 == 0:
+                    rows[0] = torch.zeros(dim)
+                bases[L] = rows
+                if (seed + L) % 5 != 0:
+                    layer_means[L] = torch.randn(dim)
+            lm = None if seed % 11 == 0 else layer_means
+            bipolar = compute_dls_mask_per_axis(mu_pos, mu_neg, bases, lm)
+            stacked = {
+                L: torch.stack([mu_pos[L], mu_neg[L]]) for L in mu_pos
+            }
+            n_node = compute_dls_axes(stacked, bases, lm)
+            assert n_node == bipolar, f"seed={seed}"
+
+
 # ------------------------------- v2.1 nested projection scope restore ---
 
 class TestNestedProjectionScopeLeak:

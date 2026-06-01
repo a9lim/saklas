@@ -550,97 +550,58 @@ def _emit_diagnostics_warning(
         )
 
 
-def _dls_axis_keep(
-    mu_pos: torch.Tensor,
-    mu_neg: torch.Tensor,
-    mu_neutral: torch.Tensor,
-    direction_unit: torch.Tensor,
-) -> bool:
-    """Centered opposite-sign discriminative test for one axis.
-
-    Returns ``True`` iff ``(μ_pos − μ_neutral)·d̂`` and
-    ``(μ_neg − μ_neutral)·d̂`` have opposite signs — the axis carries
-    concept *polarity* rather than mere intensity.  All inputs are fp32
-    CPU ``[D]``; ``direction_unit`` is assumed unit-normed by the caller
-    (only the sign of the product matters, but unit input keeps the
-    numerics sane).  The shared kernel behind both the scalar
-    :func:`compute_dls_mask` and the per-axis
-    :func:`compute_dls_mask_per_axis`.
-    """
-    proj_pos = float(((mu_pos - mu_neutral) * direction_unit).sum())
-    proj_neg = float(((mu_neg - mu_neutral) * direction_unit).sum())
-    return proj_pos * proj_neg < 0.0
-
-
-def compute_dls_mask_per_axis(
-    mu_pos: dict[int, torch.Tensor],
-    mu_neg: dict[int, torch.Tensor],
+def compute_dls_axes(
+    node_centroids: dict[int, torch.Tensor],
     bases: dict[int, torch.Tensor],
     layer_means: dict[int, torch.Tensor] | None,
 ) -> dict[int, set[int]]:
-    """Per-axis Discriminative-Layer-Selection (Dang & Ngo 2026, Eq. 9).
+    """Per-axis Discriminative-Layer-Selection over **N node centroids**.
 
-    The ``R``-dimensional generalization of :func:`compute_dls_mask`: each
-    layer carries a basis ``[R, D]`` (the per-layer ``LayerSubspace.basis``
-    rows), and every row ``d̂_r`` is tested independently against the same
-    centered opposite-sign check::
+    The N-node generalization of the bipolar opposite-sign test (Dang & Ngo
+    2026, Eq. 9) — the form a flat *subspace* of any node count uses.  Each
+    layer carries a basis ``[R, D]`` (its ``LayerSubspace.basis`` rows) and
+    ``node_centroids[L]`` is the ``[K, D]`` stack of that layer's per-node
+    mean activations.  Every row ``d̂_r`` is kept iff the node projections
+    relative to the neutral baseline, ``{(c_i − ν)·d̂_r : i}``, **straddle
+    zero** (both a negative and a positive present) — the axis then
+    discriminates node *position* across the baseline rather than encoding a
+    common offset / intensity every node shares.
 
-        μ̃_pos = (μ_pos − μ_neutral) · d̂_r
-        μ̃_neg = (μ_neg − μ_neutral) · d̂_r
-        keep axis r iff μ̃_pos · μ̃_neg < 0
+    **N=2 parity (the spine invariant).**  With
+    ``node_centroids[L] = stack([μ_pos, μ_neg])`` the straddle
+    ``min < 0 < max`` is exactly the bipolar opposite-sign product test, bit
+    for bit — :func:`compute_dls_mask_per_axis` is the 2-node sugar over this
+    core, and the scalar :func:`compute_dls_mask` the ``R = 1`` face of that.
+    So a 2-node subspace reproduces today's vector DLS keep set exactly, and
+    an N-node subspace (e.g. ``personas``) prunes per-axis the same way.
 
-    Returns ``{layer: {kept axis indices}}``.  A layer absent from the dict
-    (or mapped to an empty set) is fully dropped — exactly the legacy
-    "drop the whole layer" behavior when its single axis fails.  The
-    consumer slices the effective basis to the kept rows at
-    ``add_manifold`` time, so DLS survives the vector→subspace fold without
-    a separate scalar path.
-
-    **R=1 parity.**  When every basis is a single row (a folded vector or a
-    plain direction), this is bit-identical to :func:`compute_dls_mask`
-    lifted to ``{L: {0}}`` (kept layers) / absent (dropped layers): same
-    fp32-CPU casting, same unit-norming, same ``_dls_axis_keep`` kernel,
-    same conservative-keep on missing baseline, same all-fail fallback.
-    :func:`compute_dls_mask` is now a thin wrapper over this function.
-
-    **Centering** is required — see :func:`compute_dls_mask`'s history note.
-    ``layer_means`` ``None``/empty disables DLS and keeps every axis of
-    every layer.  ``mu_pos``/``mu_neg``/``bases`` share a layer set (the
-    caller builds them aligned); a layer missing from ``bases`` in the
-    disabled early-out keeps a nominal single axis so the scalar wrapper
-    still reports it.
+    Returns ``{layer: {kept axis indices}}``; a layer absent / mapped to an
+    empty set is fully dropped.  ``layer_means`` ``None``/empty disables DLS
+    (every axis of every layer kept).  A layer whose baseline ``ν`` is missing
+    keeps every checkable axis conservatively (over-include rather than drop a
+    real discriminative axis for missing data).  Degenerate (zero-norm) rows
+    are dropped and excluded from the all-fail fallback; when no axis anywhere
+    passes, falls back to the full checkable set with a one-time warning.
 
     Args:
-        mu_pos: per-layer positive-class mean, fp32 ``[D]`` per layer.
-        mu_neg: per-layer negative-class mean, same layer set.
+        node_centroids: per-layer ``[K, D]`` stack of node mean activations.
         bases: per-layer ``[R, D]`` basis (rows are the candidate axes).
-            Zero-norm rows are degenerate and dropped (excluded from the
-            all-fail fallback).
         layer_means: per-layer neutral baseline; ``None``/empty disables.
-
-    Returns:
-        ``{layer: {axis indices}}`` over kept (layer, axis) pairs.  If no
-        axis anywhere passes, falls back to every checkable axis with a
-        one-time warning (mirrors the scalar keep-all-checkable fallback).
     """
-    # Empty-dict is treated identically to ``None`` — both mean "no
-    # baseline available, fall back to keep-all silently" (the same
-    # ``probes=[]`` footgun guard the scalar form carried).
     if layer_means is None or not layer_means:
         out: dict[int, set[int]] = {}
-        for L in mu_pos:
+        for L in node_centroids:
             B = bases.get(L)
             r = int(B.shape[0]) if B is not None else 1
             out[L] = set(range(r))
         return out
     keep: dict[int, set[int]] = {}
-    # ``checkable`` collects the (layer, axis) pairs we *attempted* the
-    # test on — rows with a valid (non-degenerate) direction.  Rows
-    # skipped for zero norm are excluded from the all-failed fallback
-    # (degenerate by construction; re-including them would undo the skip).
+    # ``checkable`` collects the (layer, axis) pairs we *attempted* the test
+    # on — rows with a valid (non-degenerate) direction.  Rows skipped for
+    # zero norm are excluded from the all-failed fallback.
     checkable: dict[int, set[int]] = {}
     any_pass = False
-    for L in mu_pos:
+    for L in node_centroids:
         B = bases.get(L)
         if B is None:
             continue
@@ -651,8 +612,10 @@ def compute_dls_mask_per_axis(
             if mu_n is not None
             else None
         )
-        mu_p_cpu = mu_pos[L].to(dtype=torch.float32, device="cpu").reshape(-1)
-        mu_g_cpu = mu_neg[L].to(dtype=torch.float32, device="cpu").reshape(-1)
+        C = node_centroids[L].to(dtype=torch.float32, device="cpu")
+        if C.ndim == 1:
+            C = C.reshape(1, -1)
+        C = C.reshape(int(C.shape[0]), -1)              # (K, D)
         layer_checkable: set[int] = set()
         layer_keep: set[int] = set()
         for r in range(int(B32.shape[0])):
@@ -667,7 +630,11 @@ def compute_dls_mask_per_axis(
                 # for missing baseline data.
                 layer_keep.add(r)
                 continue
-            if _dls_axis_keep(mu_p_cpu, mu_g_cpu, mu_n_cpu, row / row_norm):
+            projs = (C - mu_n_cpu) @ (row / row_norm)   # (K,) node projections
+            # Straddle zero: both a negative and a positive projection ⇒ the
+            # axis separates nodes across the baseline.  At K=2 this is the
+            # bipolar ``proj_pos · proj_neg < 0`` opposite-sign test exactly.
+            if float(projs.min()) < 0.0 and float(projs.max()) > 0.0:
                 layer_keep.add(r)
         if layer_checkable:
             checkable[L] = layer_checkable
@@ -675,10 +642,10 @@ def compute_dls_mask_per_axis(
             keep[L] = layer_keep
             any_pass = True
     if not any_pass:
-        # Every checkable axis failed — probe degenerate on this model
-        # (the diagnostics warning fires separately).  Keep the checkable
-        # set rather than every layer; when nothing is checkable the
-        # fallback is empty and the share-bake all-zero handler kicks in.
+        # Every checkable axis failed — probe degenerate on this model (the
+        # diagnostics warning fires separately).  Keep the checkable set
+        # rather than every layer; when nothing is checkable the fallback is
+        # empty and the share-bake all-zero handler kicks in.
         warnings.warn(
             "DLS: no layers pass the discriminative check; falling back "
             "to keep-all-checkable.  Probe likely degenerate on this "
@@ -688,6 +655,35 @@ def compute_dls_mask_per_axis(
         )
         return checkable
     return keep
+
+
+def compute_dls_mask_per_axis(
+    mu_pos: dict[int, torch.Tensor],
+    mu_neg: dict[int, torch.Tensor],
+    bases: dict[int, torch.Tensor],
+    layer_means: dict[int, torch.Tensor] | None,
+) -> dict[int, set[int]]:
+    """Bipolar (2-node) per-axis DLS — sugar over :func:`compute_dls_axes`.
+
+    Stacks each layer's ``[μ_pos, μ_neg]`` into the ``[2, D]`` node-centroid
+    form and delegates to the N-node straddle core.  At ``K = 2`` the straddle
+    ``min < 0 < max`` *is* the centered opposite-sign product test
+    ``(μ_pos − ν)·d̂_r · (μ_neg − ν)·d̂_r < 0``, so this reproduces the
+    historical bipolar keep set bit for bit; the scalar :func:`compute_dls_mask`
+    is the ``R = 1`` face (a single basis row).  The consumer slices the
+    effective basis to the kept rows at apply time, so DLS survives the
+    vector→subspace fold without a separate scalar path.
+
+    ``mu_neg`` must cover every layer of ``mu_pos`` (the caller builds them
+    aligned).  ``layer_means`` ``None``/empty disables DLS; see
+    :func:`compute_dls_axes` for the centering rationale, the missing-baseline
+    conservative-keep, and the all-fail fallback.
+    """
+    node_centroids = {
+        L: torch.stack([mu_pos[L].reshape(-1), mu_neg[L].reshape(-1)])
+        for L in mu_pos
+    }
+    return compute_dls_axes(node_centroids, bases, layer_means)
 
 
 def compute_dls_mask(
