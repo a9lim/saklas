@@ -2736,7 +2736,16 @@ class SaklasSession:
         for L in layers:
             mean_L = means[L].to(torch.float32).reshape(-1)
             raw_L = whitener._X[L].to(torch.float32) + mean_L  # (N, D) raw neutrals
-            lever[L] = layer_lever(raw_L, mean_L, synth.layers[L].basis)
+            # The lever is fit-time math over the cached (CPU) neutral set; the
+            # synth basis may live on the model device (the manifold it came
+            # from was promoted by ``_ensure_manifold_loaded``).  Align the
+            # small ``(R, D)`` basis onto the neutrals' device rather than
+            # hauling the whole neutral stack to the GPU — otherwise the
+            # ``centered @ basis.T`` decompose mismatches CPU vs MPS/CUDA.
+            basis_L = synth.layers[L].basis.to(
+                device=raw_L.device, dtype=torch.float32,
+            )
+            lever[L] = layer_lever(raw_L, mean_L, basis_L)
         return lever
 
     def _install_composed_steering(self) -> None:
