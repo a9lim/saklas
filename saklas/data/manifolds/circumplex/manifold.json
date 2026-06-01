@@ -1,5 +1,5 @@
 {
-  "format_version": 4,
+  "format_version": 5,
   "name": "circumplex",
   "description": "Russell's affective circumplex as a 2-D valence x arousal disk (J. A. Russell, 'A circumplex model of affect', 1980). Nine first-person mood corpora placed at their canonical (valence, arousal) coordinates: four cardinal moods on the axes (happy, alert, gloomy, calm), four diagonal moods at the unit-circle diagonals (elated, distressed, weary, serene), and a neutral node at the origin. Authored, not discover-mode — the coordinate system is declared rather than derived, so the same (valence, arousal) point is steering-comparable across model families and across users. Each node carries 27 statements spanning nine diverse scenarios (work, social, weather, food, sleep, exercise, travel, news, home) so the per-node centroid captures mood-specific activation patterns rather than scenario-specific drift.",
   "fit_mode": "authored",

@@ -882,6 +882,7 @@ class ManifoldExtractionPipeline:
             domain_from_spec,
             eval_rbf,
             fit_layer_subspace,
+            invert_parameterization,
             layer_lever,
             load_manifold,
             save_manifold,
@@ -1264,6 +1265,30 @@ class ManifoldExtractionPipeline:
                     ).reshape(-1)
                     lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
 
+        # Origin ``O_L`` — the per-layer foot of the neutral mean on ``M``, in
+        # authoring coords ``(n,)``.  Each layer's cold-start foot seed (and the
+        # ``!`` slide-to target in Phase 2): per-layer because each layer embeds
+        # the shared authoring coords differently, so neutral's foot differs by
+        # depth.  Needs the neutral mean (the probe-centering baseline) per
+        # layer; layers whose mean isn't resolvable (CPU stub) are simply
+        # absent, and the apply path seeds them at ``zeros(n)``.
+        origin: dict[int, torch.Tensor] = {}
+        _handle_means = getattr(self._handle, "layer_means", None)
+        if _handle_means is not None:
+            for idx, sub in layer_subs.items():
+                if idx not in _handle_means:
+                    continue
+                mu = _handle_means[idx].to(
+                    device="cpu", dtype=torch.float32,
+                ).reshape(-1)
+                # Reduced coords of the neutral mean in this layer's subspace,
+                # then nearest-point invert onto ``M``.
+                q = (mu - sub.mean) @ sub.basis.T  # (R,)
+                O_coords, _dist = invert_parameterization(
+                    sub, domain, q, node_coords,
+                )
+                origin[idx] = O_coords.reshape(-1).to(torch.float32)
+
         manifold = Manifold(
             name=mf.name,
             domain=domain,
@@ -1275,6 +1300,7 @@ class ManifoldExtractionPipeline:
             explained_variance=explained_variance,
             mahalanobis_share=mahalanobis_share,
             lever=lever,
+            origin=origin,
         )
 
         # 5. Persist + refresh the folder integrity manifest.

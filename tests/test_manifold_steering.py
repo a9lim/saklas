@@ -1,4 +1,11 @@
-"""Hook-level tests for manifold steering injection — CPU only."""
+"""Hook + manager level tests for three-op manifold steering — CPU only.
+
+These cover the *integration* layer — ``SteeringManager.apply_to_model``'s
+gain assembly (share-weight + lever-normalize + along water-fill + onto/toward
+clamp), ``add_manifold``'s plumbing, the hook's foot-following state, and the
+slow-path forcing.  The kernel math itself (geodesic slide, onto/toward
+collapse, norm cap) lives in ``test_manifold_math.py``.
+"""
 from __future__ import annotations
 
 import math
@@ -10,10 +17,8 @@ import torch
 from torch import nn
 
 from saklas.core.hooks import (
-    _MANIFOLD_GAIN_ADDITIVE,
-    _MANIFOLD_GAIN_ANGULAR,
+    _MANIFOLD_GAIN,
     _manifold_layer_shares,
-    InjectionMode,
     SteeringHook,
     SteeringManager,
 )
@@ -21,8 +26,10 @@ from saklas.core.manifold import (
     BoxAxis,
     BoxDomain,
     Manifold,
+    decompose,
     eval_rbf,
     fit_layer_subspace,
+    invert_parameterization,
 )
 from saklas.core.errors import ManifoldArityError, OverlappingManifoldError
 from saklas.core.steering_expr import SteeringExprError
@@ -34,25 +41,25 @@ def fit_layer_subspace_only(*args: Any, **kwargs: Any) -> Any:
     sub, _ev = fit_layer_subspace(*args, **kwargs)
     return sub
 
+
 _DIM = 8
 
 
 @pytest.fixture(autouse=True)
 def _seed_rng():
-    """Seed torch globally before each test.
-
-    Several tests in this module draw random hidden states with
-    ``torch.randn`` and then assert on values like cosine ~ 1.0 within a
-    tight tolerance.  Without a per-test seed the global RNG state
-    leaked between tests, making the angular-rotation-precision
-    assertions flaky depending on test execution order.
-    """
     torch.manual_seed(0)
 
 
 def _circle(k: int, dim: int, scale: float = 1.0) -> torch.Tensor:
+    """K activation centroids on a planar circle, with a DC offset.
+
+    The 20.0 common-mode component mimics a real LM activation's large,
+    persona-agnostic norm — without it the per-node centroids vary wildly
+    in magnitude and the soft norm-cap inside ``inject_three_op`` fires on
+    synthetic fits, masking the geometry under test.
+    """
     out = torch.zeros(k, dim)
-    base = torch.full((dim,), 0.4)
+    base = torch.full((dim,), 20.0)
     for i in range(k):
         theta = 2.0 * math.pi * i / k
         out[i] = base.clone()
@@ -70,10 +77,7 @@ def _manifold(
 
     ``lever`` stamps a per-layer steering lever ``f_L`` (a float applies to
     every layer, a dict gives per-layer values).  ``None`` leaves the lever
-    empty, so ``apply_to_model`` falls back to ``N = 1`` (no normalization)
-    — the pre-lever gain scale, which most of these hook-math tests assert
-    against.  A stamped lever exercises the ``effective_gain = base / N``
-    path.
+    empty, so ``apply_to_model`` falls back to ``N = 1`` (no normalization).
     """
     domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
@@ -115,135 +119,196 @@ def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
         node_labels=[f"n{i}" for i in range(9)],
         node_coords=coords,
         layers={
-            L: fit_layer_subspace_only(torch.randn(9, _DIM), node_params)
+            L: fit_layer_subspace_only(20.0 + torch.randn(9, _DIM), node_params)
             for L in layers
         },
         feature_space="raw",
     )
 
 
-# ------------------------------------------------------------- hook level ---
+def _model_layers(n: int) -> nn.ModuleList:
+    return nn.ModuleList([nn.Identity() for _ in range(n)])
+
+
+# ----------------------------------------------------------------- helpers ---
 
 def _recompose_manifold(
-    hook: SteeringHook, manifold: Manifold, layer: int, alpha: float,
+    hook: SteeringHook,
+    manifold: Manifold,
+    layer: int,
+    *,
+    along: float = 0.5,
+    onto: float = 0.0,
+    toward: float = 0.0,
     position: Sequence[float] = (0.5,),
 ) -> None:
+    """Stamp one three-op manifold group onto ``hook`` directly.
+
+    Mirrors what ``apply_to_model`` hands ``recompose``: the per-layer
+    subspace + domain + authoring target/origin coords + the (already
+    effective) per-layer coefficients.
+    """
     ctx = TriggerContext()
     sub = manifold.layers[layer]
-    target = manifold.manifold_point(layer, position)
+    domain = manifold.domain
+    n = domain.intrinsic_dim
+    target_coord = torch.tensor([float(c) for c in position], dtype=torch.float32)
+    O_L = (getattr(manifold, "origin", None) or {}).get(layer)
+    origin_coord = (
+        torch.zeros(n) if O_L is None else O_L.reshape(-1).to(torch.float32)
+    )
     hook.recompose(
         additive_entries=[],
         ablation_entries=[],
-        manifold_entries=[(sub.basis, sub.mean, target, alpha, Trigger.BOTH)],
+        manifold_entries=[(
+            sub, domain, target_coord, origin_coord,
+            along, onto, toward, Trigger.BOTH,
+        )],
         device=torch.device("cpu"),
         dtype=torch.float32,
         ctx=ctx,
     )
 
 
-def test_hook_alpha_zero_is_noop():
+def _coeffs(hook: SteeringHook, gi: int = 0) -> tuple[float, float, float]:
+    """The per-layer (along, onto, toward) on group ``gi``."""
+    _trig, _sub, _domain, _target, _origin, along, onto, toward = (
+        hook.manifold_groups[gi]
+    )
+    return along, onto, toward
+
+
+# ------------------------------------------------------------- hook level ---
+
+def test_hook_all_zero_is_noop():
     manifold = _manifold()
-    hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold, 0, alpha=0.0)
+    hook = SteeringHook()
+    _recompose_manifold(hook, manifold, 0, along=0.0, onto=0.0, toward=0.0)
+    # A fully-zero term drops at recompose — no group, nothing fires.
+    assert hook.manifold_groups == []
     hidden = torch.randn(1, 4, _DIM)
     before = hidden.clone()
     hook.hook_fn(None, None, hidden)
     assert torch.allclose(hidden, before, atol=1e-5)
 
 
-def test_hook_preserves_centered_norm_angular():
-    """Angular-mode manifold steering dispatches to ``subspace_rotate``,
-    which preserves ``||h - mean||`` (the magnitude *inside* the
-    manifold's coordinate system) but not ``||h||`` itself — the
-    rotation in the affine subspace plane is exact, no global rescale.
-    """
+def test_hook_along_changes_hidden():
     manifold = _manifold()
-    sub = manifold.layers[0]
-    hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold, 0, alpha=0.7)
-    hidden = torch.randn(1, 5, _DIM)
-    centered_before = (hidden - sub.mean).norm(dim=-1).clone()
-    hook.hook_fn(None, None, hidden)
-    centered_after = (hidden - sub.mean).norm(dim=-1)
-    assert torch.allclose(centered_after, centered_before, atol=1e-4)
-
-
-def test_hook_alpha_one_rotates_h_par_into_in_plane_perp():
-    """At α=1 with default θ_max=π/2 the angular manifold path rotates
-    ``h_par`` exactly 90° in the plane toward the target — so its
-    centered direction matches the in-plane perpendicular axis ``w_unit``
-    (the part of ``target - mean`` orthogonal to ``h_par`` inside the
-    subspace).  This is the angular analogue of subspace_replace's
-    α=1 snap; magnitudes are preserved, the direction is set to the
-    "as far as θ_max lets us go toward target" axis.
-    """
-    manifold = _manifold()
-    sub = manifold.layers[0]
-    hook = SteeringHook(injection_mode="angular")
-
-    hidden = torch.randn(1, 3, _DIM)
-    # Compute the expected w_unit per position *before* the hook fires.
-    centered_before = hidden[0] - sub.mean
-    h_par_c_before = (centered_before @ sub.basis.T) @ sub.basis
-    target = manifold.manifold_point(0, (0.5,))
-    target_c = target - sub.mean
-    target_unit = target_c / target_c.norm()
-    expected_w = []
-    for pos in range(hidden.shape[1]):
-        u = h_par_c_before[pos] / h_par_c_before[pos].norm()
-        cos0 = (u * target_unit).sum()
-        w = target_unit - cos0 * u
-        expected_w.append(w / w.norm())
-
-    _recompose_manifold(hook, manifold, 0, alpha=1.0)
-    hook.hook_fn(None, None, hidden)
-
-    for pos in range(hidden.shape[1]):
-        centered = hidden[0, pos] - sub.mean
-        h_par_after = (centered @ sub.basis.T) @ sub.basis
-        cos = torch.dot(h_par_after, expected_w[pos]) / h_par_after.norm()
-        assert cos.item() == pytest.approx(1.0, abs=1e-3)
-
-
-def test_hook_changes_hidden_state():
-    manifold = _manifold()
-    hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold, 0, alpha=0.5)
-    hidden = torch.randn(1, 2, _DIM)
-    before = hidden.clone()
-    hook.hook_fn(None, None, hidden)
-    assert not torch.allclose(hidden, before, atol=1e-3)
-
-
-def test_hook_additive_mode_applies_manifold():
-    manifold = _manifold()
-    hook = SteeringHook(injection_mode="additive")
-    _recompose_manifold(hook, manifold, 0, alpha=0.6)
+    hook = SteeringHook()
+    _recompose_manifold(hook, manifold, 0, along=0.7)
     hidden = torch.randn(1, 3, _DIM)
     before = hidden.clone()
     hook.hook_fn(None, None, hidden)
     assert not torch.allclose(hidden, before, atol=1e-3)
-    assert torch.allclose(hidden.norm(dim=-1), before.norm(dim=-1), atol=1e-4)
 
 
-def test_manifold_forces_slow_path():
+def test_hook_onto_collapses_onto_surface():
+    """``onto=1`` drives the off-manifold in-subspace residual ``H_n`` to
+    zero — the post-fire activation's in-subspace part lands *on* the manifold
+    surface (its nearest-point distance to M collapses toward 0), even though
+    its norm need not shrink (the on-manifold foot can be larger than a
+    near-origin off-manifold point).
+    """
     manifold = _manifold()
-    hook = SteeringHook(injection_mode="angular")
-    _recompose_manifold(hook, manifold, 0, alpha=0.5)
+    sub = manifold.layers[0]
+    domain = manifold.domain
+    hook = SteeringHook()
+    # Pure onto: no slide, no off-subspace collapse — isolate the H_n scale.
+    _recompose_manifold(hook, manifold, 0, along=0.0, onto=1.0, toward=0.0)
+    hidden = torch.randn(1, 4, _DIM) + sub.mean
+    q_before = (hidden[0] - sub.mean) @ sub.basis.T
+    _, dist_before = invert_parameterization(
+        sub, domain, q_before, manifold.node_coords,
+    )
+    hook.hook_fn(None, None, hidden)
+    q_after = (hidden[0] - sub.mean) @ sub.basis.T
+    _, dist_after = invert_parameterization(
+        sub, domain, q_after, manifold.node_coords,
+    )
+    # On the surface after collapse: residual to M near zero, and strictly
+    # smaller than before.
+    assert (dist_after < dist_before).all()
+    assert dist_after.max().item() < 0.1
+
+
+def test_hook_toward_collapses_off_subspace_residual():
+    """``toward=1`` drives the off-subspace residual ``H_o`` to zero — the
+    orthogonal complement of the subspace shrinks toward 0."""
+    manifold = _manifold()
+    sub = manifold.layers[0]
+    hook = SteeringHook()
+    _recompose_manifold(hook, manifold, 0, along=0.0, onto=0.0, toward=1.0)
+    hidden = torch.randn(1, 4, _DIM) + sub.mean
+    _, h_perp_before = decompose(hidden - sub.mean + sub.mean, sub.mean, sub.basis)
+    perp_before = h_perp_before.norm(dim=-1).clone()
+    hook.hook_fn(None, None, hidden)
+    _, h_perp_after = decompose(hidden, sub.mean, sub.basis)
+    assert (h_perp_after.norm(dim=-1) < perp_before).all()
+
+
+def test_hook_forces_slow_path():
+    manifold = _manifold()
+    hook = SteeringHook()
+    _recompose_manifold(hook, manifold, 0, along=0.5)
     assert hook.composed is None
     assert len(hook.manifold_groups) == 1
 
 
+def test_hook_foot_following_warm_carry():
+    """After a fire the hook stashes the last-position foot ``(B, 1, n)`` so
+    the next decode step warm-starts; ``recompose`` resets it to cold."""
+    manifold = _manifold()
+    hook = SteeringHook()
+    _recompose_manifold(hook, manifold, 0, along=0.6)
+    # Cold after recompose.
+    assert hook._manifold_feet == [None]
+    # Prefill fire: (B=1, T=4) -> stash (1, 1, n).
+    hidden = torch.randn(1, 4, _DIM)
+    hook.hook_fn(None, None, hidden)
+    foot = hook._manifold_feet[0]
+    assert foot is not None
+    n = manifold.domain.intrinsic_dim
+    assert foot.shape == (1, 1, n)
+    # A decode fire reuses the warm foot (shape matches) and updates it.
+    decode = torch.randn(1, 1, _DIM)
+    hook.hook_fn(None, None, decode)
+    assert hook._manifold_feet[0] is not None
+    assert hook._manifold_feet[0].shape == (1, 1, n)
+
+
+def test_hook_trigger_gating_skips_inactive():
+    """A manifold group whose trigger is inactive doesn't fire (and doesn't
+    advance the foot)."""
+    manifold = _manifold()
+    hook = SteeringHook()
+    ctx = TriggerContext()
+    sub = manifold.layers[0]
+    domain = manifold.domain
+    target = torch.tensor([0.5])
+    origin = torch.zeros(1)
+    # GENERATED_ONLY trigger, but the context is in prefill (prompt) -> inactive.
+    hook.recompose(
+        additive_entries=[],
+        ablation_entries=[],
+        manifold_entries=[(
+            sub, domain, target, origin, 0.6, 0.0, 0.0, Trigger.GENERATED_ONLY,
+        )],
+        device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
+    )
+    ctx.is_prefill = True  # prompt phase -> GENERATED_ONLY inactive
+    hidden = torch.randn(1, 3, _DIM)
+    before = hidden.clone()
+    hook.hook_fn(None, None, hidden)
+    assert torch.allclose(hidden, before, atol=1e-5)
+    assert hook._manifold_feet[0] is None  # never advanced
+
+
 # ---------------------------------------------------------- manager level ---
-
-def _model_layers(n: int) -> nn.ModuleList:
-    return nn.ModuleList([nn.Identity() for _ in range(n)])
-
 
 def test_manager_attaches_manifold_hooks():
     manifold = _manifold(layers=(0, 1))
-    mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=0.5)
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.5, onto=0.5, toward=0.5)
     layers = _model_layers(4)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     assert sorted(mgr.hooks) == [0, 1]
@@ -252,11 +317,13 @@ def test_manager_attaches_manifold_hooks():
 
 def test_manager_steer_n2_manifold():
     manifold = _manifold2d(layers=(0,))
-    mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("disk", manifold, position=(0.3, 0.8), alpha=0.7)
+    mgr = SteeringManager()
+    # along=0.3 keeps the single-layer budget (0.3·gain=0.6) under the
+    # water-fill cap, so no saturation warning pollutes the run.
+    mgr.add_manifold("disk", manifold, position=(0.3, 0.8), along=0.3, onto=0.0, toward=0.0)
     layers = _model_layers(2)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
-    hidden = torch.randn(1, 3, _DIM)
+    hidden = torch.randn(1, 3, _DIM) + 20.0
     before = hidden.clone()
     layers[0](hidden)
     assert not torch.allclose(hidden, before, atol=1e-3)
@@ -264,225 +331,138 @@ def test_manager_steer_n2_manifold():
 
 def test_manager_position_length_mismatch_raises():
     manifold = _manifold2d(layers=(0,))
-    mgr = SteeringManager(injection_mode="angular")
-    # A 2-D manifold steered with a single coordinate.  The dedicated
-    # ``ManifoldArityError`` still subclasses ``SteeringExprError`` so the
-    # parse-time family catch keeps working.
+    mgr = SteeringManager()
+    # A 2-D manifold steered with a single coordinate.  ``ManifoldArityError``
+    # still subclasses ``SteeringExprError`` so the family catch keeps working.
     with pytest.raises(ManifoldArityError) as exc:
-        mgr.add_manifold("disk", manifold, position=(0.5,), alpha=0.5)
+        mgr.add_manifold("disk", manifold, position=(0.5,), along=0.5, onto=0.5, toward=0.5)
     assert isinstance(exc.value, SteeringExprError)
 
 
-def test_manager_alpha_clamped():
-    # User α is clamped to [0, 1]; with a single covered layer share_L ==
-    # 1.0, so the raw per-layer budget would be ``1.0 · _MANIFOLD_GAIN_
-    # ANGULAR`` (8.0).  Under angular mode that budget is the rotation
-    # angle in θ_max units, and a single layer can't rotate past θ_max —
-    # the water-fill caps it at 1.0 (one full θ_max).  (The excess has
-    # nowhere to go on a one-layer manifold, so it saturates.)
+def test_manager_coeffs_clamped_to_unit():
+    """User coefficients clamp to [0, 1].  With a single covered layer
+    share_L == 1, so along's raw budget would be ``1.0 · _MANIFOLD_GAIN``;
+    the water-fill caps it at 1.0.  onto/toward clamp per layer."""
     manifold = _manifold(layers=(0,))
-    mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=5.0)
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=5.0, onto=5.0, toward=5.0)
     layers = _model_layers(1)
-    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
-    _trig, _basis, _mean, _target, alpha = mgr.hooks[0].manifold_groups[0]
-    assert alpha == pytest.approx(1.0, abs=1e-6)
+    with pytest.warns(UserWarning, match="saturates the 'along' displacement"):
+        mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+    along, onto, toward = _coeffs(mgr.hooks[0])
+    assert along == pytest.approx(1.0, abs=1e-6)
+    assert onto == pytest.approx(1.0, abs=1e-6)
+    assert toward == pytest.approx(1.0, abs=1e-6)
 
 
-def test_manager_share_weighting_sums_to_user_alpha():
-    """Per-layer α is share-weighted so the cumulative budget
-    ``Σ_L α_L = α · gain`` regardless of how many layers the manifold
-    covers — analogous to vector steering's ``Σ_L share_L · α · θ_max =
-    α · θ_max`` invariant.  This is the layer-count-invariance property
-    that keeps the user-facing α-regime independent of model depth.
-
-    Tested in the *unsaturated* regime: ``α · gain ≤ 1`` so the angular
-    water-fill cap (no layer past θ_max) never bites and the cumulative
-    budget is exactly ``α · gain`` for every layer count.  The saturated
-    regime (where the cap does bite) is covered by
-    ``test_manager_angular_budget_caps_per_layer`` below.
-    """
-    # 0.1 · 2.0 = 0.2 ≤ 1.0, so even a single layer holds the whole
-    # budget without saturating. (No lever on these stubs ⇒ N=1.)
-    user_alpha = 0.1
+def test_manager_along_share_weighting_sums():
+    """Per-layer along is share-weighted so the cumulative budget
+    ``Σ_L along_L = along · base`` regardless of layer count — the
+    layer-count-invariance property (tested in the unsaturated regime
+    where the water-fill cap never bites; no lever ⇒ N=1)."""
+    user_along = 0.1
     for n_layers in (1, 2, 4):
         manifold = _manifold(layers=tuple(range(n_layers)))
-        mgr = SteeringManager(injection_mode="angular")
+        mgr = SteeringManager()
         mgr.add_manifold(
-            "mood", manifold, position=(0.5,), alpha=user_alpha,
+            "mood", manifold, position=(0.5,),
+            along=user_along, onto=0.0, toward=0.0,
         )
         mgr.apply_to_model(
             _model_layers(n_layers), torch.device("cpu"), torch.float32,
         )
         total = sum(
-            grp[4]
+            _coeffs(hook)[0]
             for hook in mgr.hooks.values()
-            for grp in hook.manifold_groups
         )
-        expected = user_alpha * _MANIFOLD_GAIN_ANGULAR
+        expected = user_along * _MANIFOLD_GAIN
         assert total == pytest.approx(expected, abs=1e-4), (
-            f"share-weighted budget at n={n_layers} layers: "
-            f"{total} ≠ {expected}"
+            f"share-weighted along at n={n_layers}: {total} ≠ {expected}"
         )
 
 
-def test_manager_angular_budget_caps_per_layer():
-    """Angular manifold steering never rotates a layer past θ_max.
-
-    With a high user α, the raw per-layer budget (``α · share_L · gain``)
-    blows past 1.0 (= θ > θ_max) — ``subspace_rotate`` does NOT clamp, so
-    the manager's water-fill must.  Assert no per-layer budget exceeds
-    1.0 and the cumulative budget is the saturated ceiling ``min(α · gain,
-    n_layers)``.  Additive mode keeps the raw share-weighted value (a
-    blend fraction, no θ_max ceiling).
-    """
+def test_manager_along_waterfill_caps_per_layer():
+    """along never slides a layer past the target.  With a small lever the
+    effective gain blows the raw per-layer budget past 1.0; the water-fill
+    caps each layer at 1.0 and the cumulative pins at the ceiling."""
     import saklas.core.hooks as hooks_mod
     n_layers = 3
     lever = 0.2
-    # Small lever ⇒ effective gain = base / N = 2.0 / 0.2 = 10; at α=1.0 the
-    # raw cumulative budget 10 ≫ n_layers=3 ⇒ every layer saturates at 1.0.
     manifold = _manifold(layers=tuple(range(n_layers)), lever=lever)
-    eff_gain = _MANIFOLD_GAIN_ANGULAR / lever
-    mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=1.0)
-    # The saturation tell fires once per manifold name; clear it so this
-    # test sees its own warning regardless of order.
+    eff_gain = _MANIFOLD_GAIN / lever  # = 10
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=1.0, onto=0.0, toward=0.0)
     hooks_mod._warned_manifold_saturated.discard("mood")
-    with pytest.warns(UserWarning, match="saturates the angular rotation budget"):
+    with pytest.warns(UserWarning, match="saturates the 'along' displacement"):
         mgr.apply_to_model(
             _model_layers(n_layers), torch.device("cpu"), torch.float32,
         )
-    budgets = [
-        grp[4]
-        for hook in mgr.hooks.values()
-        for grp in hook.manifold_groups
-    ]
+    budgets = [_coeffs(hook)[0] for hook in mgr.hooks.values()]
     assert budgets, "expected manifold groups to be attached"
     for b in budgets:
-        assert b <= 1.0 + 1e-6, f"layer rotates past θ_max: {b}"
-    # Saturated ⇒ cumulative pins at the ceiling min(α · eff_gain, n_layers).
-    assert sum(budgets) == pytest.approx(
-        min(1.0 * eff_gain, n_layers), abs=1e-4,
-    )
+        assert b <= 1.0 + 1e-6, f"layer slides past target: {b}"
+    assert sum(budgets) == pytest.approx(min(1.0 * eff_gain, n_layers), abs=1e-4)
 
-    # Additive: same α / lever, no per-layer cap — the raw share-weighted
-    # blend fractions stand (they exceed 1.0; the operator norm-restores).
-    mgr_add = SteeringManager(injection_mode="additive")
-    mgr_add.add_manifold("mood", manifold, position=(0.5,), alpha=1.0)
-    mgr_add.apply_to_model(
-        _model_layers(n_layers), torch.device("cpu"), torch.float32,
-    )
-    add_budgets = [
-        grp[4]
-        for hook in mgr_add.hooks.values()
-        for grp in hook.manifold_groups
-    ]
-    # Cumulative additive budget is the un-capped α · (_MANIFOLD_GAIN_ADDITIVE / N).
-    assert sum(add_budgets) == pytest.approx(
-        1.0 * _MANIFOLD_GAIN_ADDITIVE / lever, abs=1e-4,
-    )
+
+def test_manager_onto_toward_clamped_not_waterfilled():
+    """onto/toward are bounded collapse fractions: clamped to [0, 1] per
+    layer, NOT water-filled (saturation at a layer just means fully
+    collapsed there — there is nothing to redistribute)."""
+    n_layers = 3
+    lever = 0.2  # eff_gain = 10 ⇒ per-layer raw blows past 1.0 → clamps
+    manifold = _manifold(layers=tuple(range(n_layers)), lever=lever)
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.0, onto=1.0, toward=1.0)
+    mgr.apply_to_model(_model_layers(n_layers), torch.device("cpu"), torch.float32)
+    for hook in mgr.hooks.values():
+        _along, onto, toward = _coeffs(hook)
+        assert 0.0 <= onto <= 1.0 + 1e-6
+        assert 0.0 <= toward <= 1.0 + 1e-6
+    # At least one layer should be fully saturated (eff_gain ≫ 1).
+    ontos = [_coeffs(h)[1] for h in mgr.hooks.values()]
+    assert max(ontos) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_manager_three_coeffs_independent():
+    """along / onto / toward flow through independently — a term with only
+    one nonzero coefficient leaves the other two at zero per layer."""
+    manifold = _manifold(layers=(0,))
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.1, onto=0.0, toward=0.0)
+    mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
+    along, onto, toward = _coeffs(mgr.hooks[0])
+    assert along > 0.0
+    assert onto == 0.0
+    assert toward == 0.0
 
 
 def test_manager_lever_normalization():
-    """Both modes divide the gain by the share-weighted lever ``N``.
-
-    Two single-layer manifolds identical but for their stamped lever
-    ``f_L`` should produce effective α inversely proportional to ``N`` (a
-    smaller-lever fit gets a proportionally larger gain).  This is the
-    normalization that makes the per-α effect invariant to subspace
-    dimension and selection metric — and it applies to *both* injection
-    modes (it replaces the former additive-only ``1/√EV`` quality
-    factor).  A manifold with no lever falls back to ``N = 1`` (the
-    un-normalized base gain).
-    """
-    # Kept small enough that angular stays unsaturated for both levers
-    # (effective α = base·user_α/N ≤ 1, so the per-layer water-fill cap
-    # doesn't pin either value and flatten the ratio): the larger
-    # effective α is the additive small-lever case 4·0.15/0.4 = 1.5, which
-    # additive leaves uncapped; the largest angular value is 2·0.15/0.4 =
-    # 0.75 ≤ 1.
-    user_alpha = 0.15
+    """The gain divides by the share-weighted lever ``N`` (one base now —
+    the angular/additive split is gone).  Smaller lever ⇒ larger effective
+    along; no lever ⇒ ``N = 1`` (un-normalized base)."""
+    user_along = 0.15
     big_lever = 0.8
     small_lever = 0.4
 
-    def _eff(mode: InjectionMode, mf: Manifold) -> float:
-        mgr = SteeringManager(injection_mode=mode)
-        mgr.add_manifold("m", mf, position=(0.5,), alpha=user_alpha)
-        mgr.apply_to_model(
-            _model_layers(1), torch.device("cpu"), torch.float32,
-        )
-        return mgr.hooks[0].manifold_groups[0][4]
+    def _eff(mf: Manifold) -> float:
+        mgr = SteeringManager()
+        mgr.add_manifold("m", mf, position=(0.5,), along=user_along, onto=0.0, toward=0.0)
+        mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
+        return _coeffs(mgr.hooks[0])[0]
 
-    modes: list[InjectionMode] = ["angular", "additive"]
-    for mode in modes:
-        big = _manifold(layers=(0,), lever=big_lever)
-        small = _manifold(layers=(0,), lever=small_lever)
-        none = _manifold(layers=(0,))  # no lever -> N = 1
-
-        a_big = _eff(mode, big)
-        a_small = _eff(mode, small)
-        a_none = _eff(mode, none)
-        # Smaller lever ⇒ larger effective gain (base / N).
-        assert a_small > a_big
-        # Ratio is exactly the inverse lever ratio (single layer ⇒
-        # N = lever; share = 1).
-        assert a_small / a_big == pytest.approx(big_lever / small_lever, rel=1e-4)
-        # No-lever fit uses the un-normalized base gain (N = 1).
-        base = _MANIFOLD_GAIN_ANGULAR if mode == "angular" else _MANIFOLD_GAIN_ADDITIVE
-        assert a_none == pytest.approx(user_alpha * base, abs=1e-6)
-        # And the big-lever effective α is base·α/N.
-        assert a_big == pytest.approx(user_alpha * base / big_lever, abs=1e-4)
-
-
-def test_manager_per_mode_gain_dispatch():
-    """The manifold gain is per-mode: ``_MANIFOLD_GAIN_ANGULAR`` under
-    angular, ``_MANIFOLD_GAIN_ADDITIVE`` under additive.  The additive
-    gain is calibrated against the angular one via vector's
-    ``_STEER_GAIN``, mirroring the precedent that additive operators
-    need ~2× the calibration of angular ones.  Same user α, same
-    manifold, different mode → different per-layer effective α.
-    """
-    manifold = _manifold(layers=(0,))
-    # Single-layer manifold so share_L = 1.0 and the per-layer α is
-    # ``user_alpha · gain`` exactly — clean comparison across modes.
-    # Kept in the unsaturated angular regime (``α · gain ≤ 1``) so the
-    # per-layer water-fill cap doesn't pin the angular value and mask the
-    # gain comparison: 0.1 · 2.0 = 0.2 ≤ 1.0. (No lever ⇒ N=1.)
-    user_alpha = 0.1
-    mgr_ang = SteeringManager(injection_mode="angular")
-    mgr_ang.add_manifold("m", manifold, position=(0.5,), alpha=user_alpha)
-    mgr_ang.apply_to_model(
-        _model_layers(1), torch.device("cpu"), torch.float32,
-    )
-    mgr_add = SteeringManager(injection_mode="additive")
-    mgr_add.add_manifold("m", manifold, position=(0.5,), alpha=user_alpha)
-    mgr_add.apply_to_model(
-        _model_layers(1), torch.device("cpu"), torch.float32,
-    )
-
-    alpha_ang = mgr_ang.hooks[0].manifold_groups[0][4]
-    alpha_add = mgr_add.hooks[0].manifold_groups[0][4]
-    assert alpha_ang == pytest.approx(
-        user_alpha * _MANIFOLD_GAIN_ANGULAR, abs=1e-6,
-    )
-    assert alpha_add == pytest.approx(
-        user_alpha * _MANIFOLD_GAIN_ADDITIVE, abs=1e-6,
-    )
-    assert alpha_add > alpha_ang  # additive's higher gain manifests in α
+    a_big = _eff(_manifold(layers=(0,), lever=big_lever))
+    a_small = _eff(_manifold(layers=(0,), lever=small_lever))
+    a_none = _eff(_manifold(layers=(0,)))  # no lever -> N = 1
+    assert a_small > a_big
+    assert a_small / a_big == pytest.approx(big_lever / small_lever, rel=1e-4)
+    assert a_none == pytest.approx(user_along * _MANIFOLD_GAIN, abs=1e-6)
+    assert a_big == pytest.approx(user_along * _MANIFOLD_GAIN / big_lever, abs=1e-4)
 
 
 def test_manager_share_weighting_weights_by_centroid_spread():
-    """The per-layer share is proportional to the per-layer centroid
-    spread (``||centroids_L - mean_L||_F``) — the manifold analogue of
-    vector steering's ``||baked_L||``.  Layers where the personas
-    cluster more widely (more discriminative signal) absorb a larger
-    slice of α; layers where the centroids collapse near the manifold
-    origin take a smaller slice.
-    """
-    # Two-layer manifold where layer 1 has a 2× wider centroid spread
-    # than layer 0 (scale=1.0 vs scale=2.0 in ``_circle``).  Build it
-    # by hand rather than via ``_manifold`` which uses
-    # ``1.0 + 0.2 * L`` — too small a contrast to test cleanly.
+    """The per-layer share is proportional to centroid spread — the
+    wider-spread (more discriminative) layer absorbs a larger slice of
+    along, and the total still sums to ``along · _MANIFOLD_GAIN``."""
     domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
@@ -497,26 +477,15 @@ def test_manager_share_weighting_weights_by_centroid_spread():
         },
         feature_space="raw",
     )
-    # Kept in the unsaturated regime (each layer's budget ≤ 1.0) so the
-    # angular water-fill cap doesn't flatten the 1:2 ratio: the wider
-    # share is ``(2/3) · α · 2`` ≤ 1.0 for α ≤ 0.75. (No lever ⇒ N=1.)
-    user_alpha = 0.15
-    mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=user_alpha)
-    mgr.apply_to_model(
-        _model_layers(2), torch.device("cpu"), torch.float32,
-    )
-    alpha_0 = mgr.hooks[0].manifold_groups[0][4]
-    alpha_1 = mgr.hooks[1].manifold_groups[0][4]
-    assert alpha_1 > alpha_0      # wider-spread layer gets more budget
-    # Spreads are 1:2, so shares should be roughly 1:2 too.
-    assert alpha_1 / alpha_0 == pytest.approx(2.0, rel=0.05)
-    # And the total still sums to ``user_alpha · _MANIFOLD_GAIN_ANGULAR`` — the
-    # gain pins the α-scale into vector-comparable territory; share
-    # weights normalize the per-layer distribution.
-    assert (alpha_0 + alpha_1) == pytest.approx(
-        user_alpha * _MANIFOLD_GAIN_ANGULAR, abs=1e-4,
-    )
+    user_along = 0.15
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=user_along, onto=0.0, toward=0.0)
+    mgr.apply_to_model(_model_layers(2), torch.device("cpu"), torch.float32)
+    along_0 = _coeffs(mgr.hooks[0])[0]
+    along_1 = _coeffs(mgr.hooks[1])[0]
+    assert along_1 > along_0
+    assert along_1 / along_0 == pytest.approx(2.0, rel=0.05)
+    assert (along_0 + along_1) == pytest.approx(user_along * _MANIFOLD_GAIN, abs=1e-4)
 
 
 def _euclidean_shares(manifold: Manifold) -> dict[int, float]:
@@ -532,19 +501,15 @@ def _euclidean_shares(manifold: Manifold) -> dict[int, float]:
 
 
 def test_manifold_shares_use_baked_when_full_coverage():
-    """A baked Mahalanobis share covering every layer is used (normalized)
-    in place of the Euclidean centroid-spread."""
     manifold = _manifold(layers=(0, 1))
     manifold.mahalanobis_share = {0: 1.0, 1: 3.0}
     shares = _manifold_layer_shares(manifold)
     assert shares[0] == pytest.approx(0.25)
     assert shares[1] == pytest.approx(0.75)
-    # And it is NOT the Euclidean spread (which weights by centroid scale).
     assert shares != pytest.approx(_euclidean_shares(manifold))
 
 
 def test_manifold_shares_fall_back_to_euclidean_when_no_baked():
-    """Empty baked share (no whitener at fit time) → Euclidean spread."""
     manifold = _manifold(layers=(0, 1))
     assert manifold.mahalanobis_share == {}
     assert _manifold_layer_shares(manifold) == pytest.approx(
@@ -553,9 +518,6 @@ def test_manifold_shares_fall_back_to_euclidean_when_no_baked():
 
 
 def test_manifold_shares_fall_back_when_partial_baked_coverage():
-    """A baked share missing a layer → Euclidean for ALL layers (no metric
-    mixing), matching the all-or-nothing gate.  The stray ``{0: ...}`` entry
-    must be ignored, not blended in."""
     manifold = _manifold(layers=(0, 1))
     manifold.mahalanobis_share = {0: 1.0}  # layer 1 missing → partial
     assert _manifold_layer_shares(manifold) == pytest.approx(
@@ -566,11 +528,10 @@ def test_manifold_shares_fall_back_when_partial_baked_coverage():
 def test_manager_rejects_overlapping_manifolds():
     m1 = _manifold(layers=(0, 1))
     m2 = _manifold(layers=(1, 2))
-    mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("a", m1, position=(0.3,), alpha=0.5)
-    mgr.add_manifold("b", m2, position=(0.7,), alpha=0.5)
+    mgr = SteeringManager()
+    mgr.add_manifold("a", m1, position=(0.3,), along=0.5, onto=0.0, toward=0.0)
+    mgr.add_manifold("b", m2, position=(0.7,), along=0.5, onto=0.0, toward=0.0)
     layers = _model_layers(4)
-    # ``OverlappingManifoldError`` still subclasses ``SteeringExprError``.
     with pytest.raises(OverlappingManifoldError) as exc:
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     assert isinstance(exc.value, SteeringExprError)
@@ -578,12 +539,28 @@ def test_manager_rejects_overlapping_manifolds():
 
 def test_manager_clear_all_drops_manifolds():
     manifold = _manifold(layers=(0,))
-    mgr = SteeringManager(injection_mode="angular")
-    mgr.add_manifold("mood", manifold, position=(0.5,), alpha=0.5)
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.5, onto=0.0, toward=0.0)
     mgr.apply_to_model(_model_layers(2), torch.device("cpu"), torch.float32)
     mgr.clear_all()
     assert mgr.manifolds == {}
     assert mgr.hooks == {}
+
+
+def test_manager_reset_manifold_feet_cold_starts():
+    """``reset_manifold_feet`` re-seeds every hook's foot to cold (None)."""
+    manifold = _manifold(layers=(0, 1))
+    mgr = SteeringManager()
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.6, onto=0.0, toward=0.0)
+    layers = _model_layers(2)
+    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+    # Fire once to warm the feet.
+    for idx, hook in mgr.hooks.items():
+        hook.hook_fn(None, None, torch.randn(1, 3, _DIM))
+        assert hook._manifold_feet[0] is not None
+    mgr.reset_manifold_feet()
+    for hook in mgr.hooks.values():
+        assert hook._manifold_feet == [None]
 
 
 def test_pure_additive_still_fast_path():

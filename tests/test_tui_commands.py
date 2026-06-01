@@ -192,7 +192,7 @@ def test_unsteer_removes_manifold_term():
 
     app = _make_app()
     term = ManifoldTerm(
-        coeff=0.7, trigger=Trigger.BOTH, manifold="circumplex",
+        along=0.7, onto=0.7, toward=0.7, trigger=Trigger.BOTH, manifold="circumplex",
         position=(0.3, 0.8),
     )
     app._manifold_terms = {"circumplex%0.3,0.8": term}
@@ -218,7 +218,7 @@ def test_unsteer_namespace_sweeps_manifold_terms():
     app = _make_app()
     app._alphas = {"alice/foo": 0.5}
     term = ManifoldTerm(
-        coeff=0.6, trigger=Trigger.BOTH, manifold="alice/circ",
+        along=0.6, onto=0.6, toward=0.6, trigger=Trigger.BOTH, manifold="alice/circ",
         position=(0.1,),
     )
     app._manifold_terms = {"alice/circ%0.1": term}
@@ -1995,7 +1995,7 @@ def test_active_alphas_merges_manifold_terms(monkeypatch: pytest.MonkeyPatch, tm
     app = _make_app()
     app._alphas = {"honest": 0.5, "warm": 0.3}
     term = ManifoldTerm(
-        coeff=0.7, trigger=Trigger.BOTH, manifold="circumplex",
+        along=0.7, onto=0.7, toward=0.7, trigger=Trigger.BOTH, manifold="circumplex",
         position=(0.3, 0.8),
     )
     app._manifold_terms = {"circumplex%0.3,0.8": term}

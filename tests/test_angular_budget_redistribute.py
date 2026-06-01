@@ -14,12 +14,14 @@ a peaked-share synthetic profile / manifold produces no per-layer
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 import torch.nn as nn
 
 from saklas.core.hooks import (
-    _MANIFOLD_GAIN_ANGULAR,
+    _MANIFOLD_GAIN,
     SteeringManager,
     _redistribute_budget,
 )
@@ -185,7 +187,7 @@ def _peaked_manifold(n_layers: int = 4, dim: int = 8) -> Manifold:
     """1-D BoxDomain manifold with one layer's centroid spread dominant.
 
     Layer 0 gets a large centroid scale (high Euclidean share), the rest
-    tiny — so layer 0's ``α · share_L · _MANIFOLD_GAIN_ANGULAR`` exceeds
+    tiny — so layer 0's ``along · share_L · _MANIFOLD_GAIN`` exceeds
     1.0 (with share_0 ≈ 1 and base gain 2.0, for any α above ~0.5),
     forcing the water-fill cap + redistribute.  No lever stamped, so the
     apply path uses ``N = 1`` (the un-normalized base gain).
@@ -218,44 +220,47 @@ def _peaked_manifold(n_layers: int = 4, dim: int = 8) -> Manifold:
     )
 
 
-class TestManifoldAngularBudget:
-    def test_peaked_share_no_layer_past_theta_max(self) -> None:
-        mgr = SteeringManager(injection_mode="angular")
+def _group_along(hook: Any) -> list[float]:
+    """The per-layer along budget (index 5 of the three-op group tuple)."""
+    return [grp[5] for grp in hook.manifold_groups]
+
+
+class TestManifoldAlongBudget:
+    def test_peaked_share_no_layer_past_target(self) -> None:
+        mgr = SteeringManager()
         m = _peaked_manifold()
-        # α=1.0 with the dominant layer's share ≈ 1.0 and base gain 2.0
-        # would ask for a 2× θ_max rotation on layer 0 absent the
-        # redistribute.
-        mgr.add_manifold("peaked", m, (0.0,), alpha=1.0)
+        # along=1.0 with the dominant layer's share ≈ 1.0 and base gain 2.0
+        # would ask for a 2× full-slide on layer 0 absent the water-fill.
+        mgr.add_manifold("peaked", m, (0.0,), along=1.0, onto=0.0, toward=0.0)
         n_layers = max(m.layers) + 2
         layers = nn.ModuleList([_Passthrough() for _ in range(n_layers)])
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
 
-        # Read the effective_alpha stamped on each manifold group: it is
-        # the rotation budget subspace_rotate multiplies θ_max by.
+        # The per-layer along budget is the geodesic-slide fraction; the
+        # water-fill caps it at 1.0 (= fully on the target at that layer).
         seen = 0
         for idx, hook in mgr.hooks.items():
-            for _trig, _basis, _mean, _target, alpha in hook.manifold_groups:
+            for along in _group_along(hook):
                 seen += 1
-                assert alpha <= 1.0 + 1e-6, (
-                    f"layer {idx} manifold rotation past θ_max: {alpha}"
+                assert along <= 1.0 + 1e-6, (
+                    f"layer {idx} manifold slides past target: {along}"
                 )
         assert seen == len(m.layers)
 
-    def test_manifold_budget_conserved(self) -> None:
-        mgr = SteeringManager(injection_mode="angular")
+    def test_manifold_along_budget_conserved(self) -> None:
+        mgr = SteeringManager()
         m = _peaked_manifold()
-        mgr.add_manifold("peaked", m, (0.0,), alpha=1.0)
+        mgr.add_manifold("peaked", m, (0.0,), along=1.0, onto=0.0, toward=0.0)
         n_layers = max(m.layers) + 2
         layers = nn.ModuleList([_Passthrough() for _ in range(n_layers)])
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
 
-        total = 0.0
-        for hook in mgr.hooks.values():
-            for _t, _b, _m, _tg, alpha in hook.manifold_groups:
-                total += alpha
-        # Raw cumulative budget = α · _MANIFOLD_GAIN_ANGULAR (share sums to
-        # 1; no lever ⇒ N=1) = 1.0 · 2.0, capped to the ceiling = n_fit.
+        total = sum(
+            along for hook in mgr.hooks.values() for along in _group_along(hook)
+        )
+        # Raw cumulative budget = along · _MANIFOLD_GAIN (share sums to 1; no
+        # lever ⇒ N=1) = 1.0 · 2.0, capped to the ceiling = n_fit.
         n_fit = len(m.layers)
         assert total == pytest.approx(
-            min(1.0 * _MANIFOLD_GAIN_ANGULAR, n_fit), abs=1e-4,
+            min(1.0 * _MANIFOLD_GAIN, n_fit), abs=1e-4,
         )

@@ -9,10 +9,11 @@ from typing import Any, Literal
 import torch
 
 from saklas.core.manifold import (
+    LayerSubspace,
+    ManifoldDomain,
     eval_rbf,
+    inject_three_op,
     rotate_toward,
-    subspace_replace,
-    subspace_rotate,
 )
 from saklas.core.triggers import Trigger, TriggerContext
 
@@ -247,14 +248,27 @@ class SteeringHook:
         self.ablation_groups: list[
             tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
-        # Manifold groups: (Trigger, basis [R,dim], mean [dim],
-        # target [dim], alpha).  ``target`` is the spline point at the
-        # term's fixed position ``t`` — precomputed at recompose time, so
-        # the hot path only does the subspace-replace matmuls.  Any
+        # Manifold groups: (Trigger, subspace, domain, target_coord [n],
+        # origin_coord [n], along, onto, toward).  ``target_coord`` /
+        # ``origin_coord`` are **authoring coordinates** (the three-op kernel
+        # slides the foot in coord space, not toward a fixed world point), so
+        # there is no per-layer world-target precompute — the RBF eval lives
+        # in :func:`inject_three_op` warm-started from the per-token foot.
+        # ``along`` / ``onto`` / ``toward`` are the per-layer effective
+        # coefficients (share-weighted + lever-normalized at apply time).  Any
         # manifold group forces the slow path.
         self.manifold_groups: list[
-            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor, float]
+            tuple[
+                Trigger, LayerSubspace, ManifoldDomain,
+                torch.Tensor, torch.Tensor, float, float, float,
+            ]
         ] = []
+        # Per-token nearest-point foot state, parallel to ``manifold_groups``
+        # (``None`` = cold, seed at the origin).  ``inject_three_op`` returns
+        # the refined foot each fire; we stash the *last position* of it as the
+        # next token's warm start.  Reset to all-``None`` at recompose and by
+        # :meth:`SteeringManager.reset_manifold_feet` at each generation start.
+        self._manifold_feet: list[torch.Tensor | None] = []
         # Injection-mode state.  Angular cache is populated only on the
         # fast path; the slow path computes per-fire from active groups.
         self.injection_mode: InjectionMode = injection_mode
@@ -291,7 +305,7 @@ class SteeringHook:
         dtype: torch.dtype,
         ctx: TriggerContext,
         *,
-        manifold_entries: "list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, Trigger]] | None" = None,
+        manifold_entries: "list[tuple[LayerSubspace, ManifoldDomain, torch.Tensor, torch.Tensor, float, float, float, Trigger]] | None" = None,
         injection_mode: InjectionMode | None = None,
         theta_max: float | None = None,
     ) -> None:
@@ -409,23 +423,37 @@ class SteeringHook:
         self.angular_strengths = angular_strengths
 
         # --- manifold grouping ---
-        # ``target`` is the spline point at the term's fixed position,
-        # already computed by the manager; the hot path only runs the
-        # subspace-replace matmuls.  Zero-alpha entries drop here.
+        # ``target_coord`` / ``origin_coord`` are authoring coordinates; the
+        # subspace tensors stay **fp32** (the RBF / Gauss-Newton math is fp32
+        # regardless of the model dtype, and quantizing ``node_params`` /
+        # ``rbf_weights`` to bf16 would wreck the interpolant precision).
+        # ``inject_three_op`` re-casts internally, so fp32 here is the precise
+        # carrier, not an extra cost.  An entry with all three coefficients
+        # zero is a no-op and drops here.
         manifold_groups: list[
-            tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor, float]
+            tuple[
+                Trigger, LayerSubspace, ManifoldDomain,
+                torch.Tensor, torch.Tensor, float, float, float,
+            ]
         ] = []
-        for basis, mean, target, alpha, trig in (manifold_entries or []):
-            if alpha == 0.0:
+        for sub, domain, target, origin, along, onto, toward, trig in (
+            manifold_entries or []
+        ):
+            if along == 0.0 and onto == 0.0 and toward == 0.0:
                 continue
             manifold_groups.append((
                 trig,
-                basis.to(device=device, dtype=dtype),
-                mean.to(device=device, dtype=dtype),
-                target.to(device=device, dtype=dtype),
-                float(alpha),
+                sub.to(device=device, dtype=torch.float32),
+                domain,
+                target.to(device=device, dtype=torch.float32),
+                origin.to(device=device, dtype=torch.float32),
+                float(along),
+                float(onto),
+                float(toward),
             ))
         self.manifold_groups = manifold_groups
+        # New group set ⇒ cold-start every foot-follower (seed at origin).
+        self._manifold_feet = [None] * len(manifold_groups)
 
         # --- fast-path collapse decision ---
         if not composed_groups and not ablation_groups and not manifold_groups:
@@ -654,42 +682,60 @@ class SteeringHook:
     def _apply_manifold_groups(
         self, hidden: torch.Tensor, ctx: TriggerContext,
     ) -> None:
-        """Apply every active manifold group as a subspace blend or rotation.
+        """Apply every active manifold group via the unified three-op kernel.
 
-        Dispatches on :attr:`injection_mode`:
+        Each group runs :func:`inject_three_op` — the single along/onto/toward
+        injection that replaced the angular/additive mode split.  The three
+        per-layer coefficients are already share-weighted + lever-normalized at
+        :meth:`SteeringManager.apply_to_model` time, so the hot path just routes
+        them through the kernel and threads the per-token foot.
 
-        - ``"additive"`` -> :func:`subspace_replace`: blend ``hidden``'s
-          projection onto the manifold's PCA subspace toward the
-          precomputed spline target by ``alpha`` and restore the original
-          per-position norm.  Destructive in-subspace overwrite.
-        - ``"angular"`` -> :func:`subspace_rotate`: Givens-rotate
-          ``hidden``'s in-subspace component toward the target by
-          ``α · θ_max`` inside the subspace plane; the orthogonal
-          residual is kept verbatim, ``||hidden - mean||`` is preserved
-          by construction, no rescale.
+        **Foot-following.**  The nearest-point foot on ``M`` is a function of
+        the running activation, so we track it across tokens instead of
+        re-solving from scratch.  ``self._manifold_feet[i]`` holds the previous
+        token's refined foot (``None`` = cold).  Cold ⇒ seed at the origin ``O``
+        and take :data:`_MANIFOLD_COLD_GN_STEPS` Gauss-Newton steps (the prefill
+        fire converges the foot across the whole prompt window); warm ⇒ one
+        step from the carried foot.  After each fire we stash the *last
+        position's* foot (``foot[..., -1:, :]``) — broadcasting the single
+        decode position forward, and carrying the last prompt position from
+        prefill into the first decode step.
 
-        Runs after ablation and additive so the in-subspace operation
-        wins at the layers it covers, regardless of mode.
+        Runs after ablation and additive so the in-subspace operation wins at
+        the layers it covers; the injection mode no longer matters here (vectors
+        still read :attr:`injection_mode`, manifolds never do).
         """
         if not self.manifold_groups:
             return
-        if self.injection_mode == "angular":
-            theta_max = self.theta_max
-            for trig, basis, mean, target, alpha in self.manifold_groups:
-                if not trig.active(ctx):
-                    continue
-                hidden.copy_(
-                    subspace_rotate(
-                        hidden, mean, basis, target, alpha, theta_max,
-                    )
-                )
-        else:
-            for trig, basis, mean, target, alpha in self.manifold_groups:
-                if not trig.active(ctx):
-                    continue
-                hidden.copy_(
-                    subspace_replace(hidden, mean, basis, target, alpha)
-                )
+        for i, (
+            trig, sub, domain, target, origin, along, onto, toward,
+        ) in enumerate(self.manifold_groups):
+            if not trig.active(ctx):
+                continue
+            lead = hidden.shape[:-1]
+            seed = self._manifold_feet[i]
+            # Warm only when the carried foot's leading shape broadcasts onto
+            # this fire (B unchanged, one decode position).  A prefill→decode
+            # transition stashes ``(B, 1, n)``, which matches the ``(B, 1, …)``
+            # decode hidden; any other mismatch (re-prefill, batch change) falls
+            # back to a cold seed rather than a shape error.
+            if seed is not None and seed.shape[:-1] == lead:
+                foot_seed = seed
+                gn_steps = 1
+            else:
+                n = int(origin.shape[-1])
+                foot_seed = origin.reshape(
+                    (1,) * len(lead) + (n,)
+                ).expand(*lead, n)
+                gn_steps = _MANIFOLD_COLD_GN_STEPS
+            h_new, foot = inject_three_op(
+                hidden, sub, domain, target, foot_seed,
+                along, onto, toward, gn_steps=gn_steps,
+            )
+            hidden.copy_(h_new)
+            # Carry the last position's foot forward (decode keeps its single
+            # position; prefill hands its final prompt position to decode).
+            self._manifold_feet[i] = foot[..., -1:, :].detach()
 
     def attach(self, layer_module: torch.nn.Module) -> None:
         """Register forward hook on a layer module."""
@@ -753,15 +799,15 @@ class SteeringHook:
 _STEER_GAIN = 2.0
 
 
-# Per-mode *base* gains for manifold steering, analogous to
-# :data:`_STEER_GAIN` for vector steering.  Manifold injection moves only
-# ``h_par`` (the projection of ``h`` into the manifold's R-dim affine
-# subspace) — a fraction of ``||h||`` that varies with subspace dimension
-# and with whether the subspace is rogue-heavy (Euclidean PCA) or
-# de-rogued (whitened/Fisher PCA).  The per-α behavioral magnitude
-# therefore scales with that fraction, which would make a 16-dim fit
-# steer harder than a 4-dim fit, and a Euclidean fit harder than a
-# whitened one, at the same user α.
+# *Base* gain for three-op manifold steering, analogous to
+# :data:`_STEER_GAIN` for vector steering.  One gain now, not a per-mode
+# pair — the along/onto/toward decomposition replaced the angular/additive
+# mode split, so the three coefficients share a single base.  Each op moves
+# a piece of ``h`` whose size is a fraction of ``||h||`` that varies with
+# subspace dimension ``R`` and with whether the subspace is rogue-heavy
+# (Euclidean PCA) or de-rogued (whitened/Fisher PCA); the per-α magnitude
+# would otherwise scale with that fraction (a 16-dim fit steering harder
+# than a 4-dim fit, a Euclidean fit harder than a whitened one).
 #
 # ``apply_to_model`` removes that dependence by dividing the base gain by
 # the manifold's share-weighted *lever* ``N = Σ_L share_L · f_L`` where
@@ -769,36 +815,39 @@ _STEER_GAIN = 2.0
 # :func:`saklas.core.manifold.layer_lever`).  So the *effective* gain is
 # ``base / N``: a small-lever fit (de-rogued, or small R) gets a
 # proportionally larger gain, equalizing the per-α effect across subspace
-# dimension and selection metric.  The base is thus a pure, lever-
-# normalized scale — calibrated (sweep on the bundled whitened
-# ``personas`` fit) so ``α ≈ 0.5`` lands in the coherent persona band on
-# the reference model regardless of the fit's R or metric.
+# dimension and selection metric.  Because ``f_L`` ≈ the in-subspace norm
+# fraction (≈ ``1/n_layers`` scale) and the shares sum to 1, ``base / N`` ≈
+# ``n_layers``, so the per-layer ``coeff · share_L · (base/N)`` lands ≈
+# ``coeff`` on average — i.e. ``along/onto/toward`` read as ≈ [0, 1]
+# fractions per layer, concentrated at the high-share layers.  ``N``
+# subsumes the former additive-only ``1/√EV`` quality factor (EV was only a
+# proxy for the lever; now recorded as a fit-quality diagnostic only).
 #
-# Per-mode because the operators are differently lossy: angular
-# (``subspace_rotate``) rotates ``h_par`` by an exact angle, no rescale;
-# additive (``subspace_replace``) blends then norm-restores, which
-# partially undoes the move, so it needs ~2× the budget — stamped as
-# ``angular × _STEER_GAIN`` to keep the vector/manifold relationship
-# consistent.  The lever ``N`` subsumes the former additive-only
-# ``1/√EV`` quality factor: ``N`` measures the actual steering lever
-# directly (and for both modes), where EV was only a proxy for it.
-#
-# Calibrated on the gemma-4-31b whitened-``personas`` α/R sweep: with the
-# lever normalization, ``base = 2.0`` puts ``α ≈ 0.5`` at the mild-coherent
-# point and ``α ≈ 1.0`` at strong persona expression — so the vector-
-# comparable "``α ≈ 0.5``, tune per target" idiom carries over unchanged,
-# with headroom to push (α is clamped to [0, 1], so the base is the
-# strength ceiling).  The lever normalization makes this hold across
-# subspace dimension and selection metric; per-persona strength variance
-# remains (a hard persona like ``caveman`` peaks near its coherence edge
-# at α≈1, where a robust one like ``hacker`` still has room — tune α down
-# per target).
-_MANIFOLD_GAIN_ANGULAR = 2.0
-_MANIFOLD_GAIN_ADDITIVE = _MANIFOLD_GAIN_ANGULAR * _STEER_GAIN  # = 4.0
+# Calibrated on the gemma-3-4b whitened-``circumplex`` MPS sweep (the three-op
+# Phase-1 validation): the coherent ``along`` band runs to effective ~0.4 with
+# collapse beyond, and the lever normalization makes effective ≈ 0.4·user_α, so
+# ``base = 1.0`` lands ``α ≈ 0.5`` at the mild-coherent point and ``α ≈ 1.0`` at
+# the strong/coherence-edge (the vector-comparable "``α ≈ 0.5``, tune per
+# target" idiom; α is clamped to [0, 1] so the base is the strength ceiling).
+# Per-persona strength variance persists (``happy`` collapses near α≈1 where
+# ``elated`` still holds — tune down per target).  Recalibrated 2.0 → 1.0 from
+# the old rotation-kernel value: the geodesic-lerp ``along`` over-steers at the
+# old gain.  NOTE (phase-1 sweep item): the three ops share this base; the
+# collapse ops (``onto`` / ``toward``) may want their own (smaller) base if the
+# share-weighted concentration proves too aggressive — splitting it is a
+# one-constant change here.  The gemma-4-31b sweep (#8) refines the number.
+_MANIFOLD_GAIN = 1.0
 
 # Floor on the share-weighted lever ``N`` so a near-degenerate (tiny-
 # lever) fit can't send the effective gain ``base / N`` to infinity.
 _MIN_MANIFOLD_LEVER = 0.01
+
+# Gauss-Newton steps taken on a *cold* foot (seed at origin ``O``).  The
+# warm path takes one step per token; the cold fire — the prefill window,
+# or the first decode step under a non-prompt trigger — converges the foot
+# better with a handful so the early tokens steer from an accurate foot.
+# Cheap: O(R) per position, off the model-forward critical path.
+_MANIFOLD_COLD_GN_STEPS = 4
 
 # One-time saturation warnings, keyed by manifold name.
 _warned_manifold_saturated: set[str] = set()
@@ -1006,29 +1055,33 @@ class SteeringManager:
         name: str,
         manifold: object,
         position: tuple[float, ...] | str,
-        alpha: float,
+        along: float,
+        onto: float,
+        toward: float,
         trigger: Trigger = Trigger.BOTH,
     ) -> None:
-        """Register a manifold-steering term.
+        """Register a three-op manifold-steering term.
 
-        At ``apply_to_model`` time, for every layer the manifold covers,
-        the manifold point at ``position`` is precomputed and a per-layer
-        ``(basis, mean, target, alpha, trigger)`` entry is attached to the
-        corresponding :class:`SteeringHook`.
+        At ``apply_to_model`` time, for every layer the manifold covers, the
+        per-layer subspace + domain + authoring ``target`` / ``origin`` coords
+        are attached to the corresponding :class:`SteeringHook` along with the
+        share-weighted + lever-normalized per-layer ``along`` / ``onto`` /
+        ``toward`` coefficients; the hot path runs :func:`inject_three_op`.
 
-        ``position`` is either a tuple of authoring coordinates (coord
-        form) or a node-label string (label form, sugar for that node's
-        coords).  Labels are resolved through
-        :meth:`Manifold.resolve_position` here so the downstream
-        ``manifolds`` dict always carries a plain coord tuple.  An
-        unknown label raises
+        ``position`` is either a tuple of authoring coordinates (coord form)
+        or a node-label string (label form, sugar for that node's coords).
+        Labels are resolved through :meth:`Manifold.resolve_position` here so
+        the downstream ``manifolds`` dict always carries a plain coord tuple.
+        An unknown label raises
         :class:`saklas.core.manifold.UnknownManifoldLabelError`; arity
         mismatches against the manifold's domain (only meaningful for
         coord-form input) raise
         :class:`saklas.core.steering_expr.SteeringExprError`.
 
-        ``alpha`` is the blend fraction (clamped to ``[0, 1]``); no
-        ``_STEER_GAIN`` applies — it is a fraction, not an additive push.
+        ``along`` / ``onto`` / ``toward`` are the user coefficients (each
+        clamped to ``[0, 1]`` at apply time): ``along`` slides the foot toward
+        ``position`` geodesically, ``onto`` collapses the off-manifold
+        in-subspace residual, ``toward`` collapses the off-subspace residual.
         """
         resolve = getattr(manifold, "resolve_position", None)
         if resolve is not None:
@@ -1054,7 +1107,9 @@ class SteeringManager:
         self.manifolds[name] = {
             "manifold": manifold,
             "position": tuple(float(c) for c in resolved),
-            "alpha": alpha,
+            "along": float(along),
+            "onto": float(onto),
+            "toward": float(toward),
             "trigger": trigger,
             "shares": _manifold_layer_shares(manifold),
         }
@@ -1153,115 +1208,109 @@ class SteeringManager:
                     (vec, means[layer_idx], alpha, trigger),
                 )
 
-        # Manifold entries: precompute the manifold target per layer once.
-        # ``position`` is fixed for the whole generation, so the RBF eval
-        # never reaches the hot path.  Only one manifold may cover a
-        # given layer — two would each destructively overwrite the
-        # in-subspace component, so their composition is ill-defined.
+        # Manifold entries: stamp the per-layer subspace + domain + authoring
+        # ``target`` / ``origin`` coords and the three share-weighted,
+        # lever-normalized op coefficients.  The three-op kernel slides the
+        # foot in *coordinate* space, so there is no fixed world-target
+        # precompute — only the (layer-independent) authoring coords.  One
+        # manifold per layer (two would each overwrite the in-subspace
+        # component; their composition is ill-defined).
         #
-        # Per-layer α is share-weighted, exactly analogous to vector
-        # steering's ``share_L = ||baked_L|| / Σ ||baked||``.  The
-        # manifold's per-layer "signal strength" is the Frobenius norm
-        # of the centered node centroids in subspace coords — i.e. how
-        # widely the per-node centroids spread inside this layer's
-        # affine PCA subspace, which is the manifold analogue of "how
-        # discriminative is this layer for the steered concept."  Those
-        # shares are cached when the manifold is registered (by evaluating
-        # the RBF at its fit nodes once), so alpha changes do not repeat
-        # host syncs or small RBF evaluations.  Layers with weak persona
-        # separation get a small slice of α; the cumulative budget
-        # ``Σ_L α · share_L = α`` regardless of how many layers the
-        # manifold covers, so the user-facing α-regime is
-        # layer-count-invariant and matches the vector-steering
-        # idiom.  Degenerate (all-zero) shares fall back to uniform
-        # ``1/N`` so behavior stays defined even on a pathological fit.
+        # **Gain (share-weight every op).**  Each of ``along`` / ``onto`` /
+        # ``toward`` gets the same per-layer factor ``share_L · (base/N)``:
+        # ``share_L`` (whitened Mahalanobis share, else Euclidean
+        # centroid-spread) is how discriminative the manifold is at that layer;
+        # ``N = Σ_L share_L·f_L`` is the share-weighted lever that makes the
+        # per-α effect invariant to subspace dimension and selection metric
+        # (see the gain constants' docstring).  Because ``base/N ≈ n_layers``,
+        # the per-layer ``coeff · share_L · (base/N)`` lands ≈ ``coeff`` on
+        # average — so the three coefficients read as ≈ [0, 1] per-layer
+        # fractions, concentrated at the high-share layers.
+        #
+        # ``along`` is a displacement budget → **water-filled** (cap 1.0/layer,
+        # excess redistributed) so a peaked-share layer never slides past the
+        # target and the cumulative budget is conserved.  ``onto`` / ``toward``
+        # are bounded collapse fractions → **clamped** to ``[0, 1]`` per layer
+        # (saturation at a layer just means "fully collapsed there"; there is
+        # nothing to redistribute).
         manifold_by_layer: dict[
             int,
-            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, Trigger]],
+            list[tuple[
+                LayerSubspace, ManifoldDomain,
+                torch.Tensor, torch.Tensor, float, float, float, Trigger,
+            ]],
         ] = {}
         manifold_owner: dict[int, str] = {}
         for mname, m in self.manifolds.items():
             manifold = m["manifold"]
             position = m["position"]
             trigger = m["trigger"]
-            alpha = max(0.0, min(1.0, float(m["alpha"])))
+            along = max(0.0, min(1.0, float(m["along"])))
+            onto = max(0.0, min(1.0, float(m["onto"])))
+            toward = max(0.0, min(1.0, float(m["toward"])))
 
             shares: dict[int, float] = m.get("shares", {})
 
-            # Dispatch the per-mode base gain.  Per-call
-            # ``Steering.injection_mode`` overrides flow through
-            # ``self.injection_mode`` already.
-            if self.injection_mode == "angular":
-                base_gain = _MANIFOLD_GAIN_ANGULAR
-            else:
-                base_gain = _MANIFOLD_GAIN_ADDITIVE
-
-            # Lever normalization (replaces the former additive-only
-            # ``1/√EV`` quality factor — see the gain constants' docstring).
-            # The per-α behavioral magnitude scales with the manifold's
-            # *lever* ``f_L = E_neutral[||h_par_c||/||h||]``: a bigger
-            # subspace (larger R) or a rogue-heavy Euclidean fit captures
-            # more of ``||h||`` ⇒ steers harder at the same α.  Dividing the
-            # gain by the share-weighted lever ``N = Σ_L share_L·f_L`` makes
-            # the effect invariant to subspace dimension *and* to
-            # subspace-selection metric, so a 4-dim and a 16-dim fit — or a
-            # Euclidean and a whitened fit — reach comparable behavior at the
-            # same user α.  Baked all-or-nothing alongside the whitened
-            # share; a fit without it (no neutral activations at fit time)
-            # uses ``N = 1`` (the un-normalized base gain) for that
-            # degenerate path.
+            # Lever-normalized base gain (one base now — the along/onto/toward
+            # split replaced the per-mode angular/additive pair).  ``N`` is
+            # baked all-or-nothing alongside the whitened share; a fit without
+            # it uses ``N = 1`` (the un-normalized base) for that degenerate
+            # path.
             lever = getattr(manifold, "lever", None)
             if lever and all(L in lever for L in manifold.layers):
                 N = sum(shares[L] * lever[L] for L in manifold.layers)
-                gain = base_gain / max(N, _MIN_MANIFOLD_LEVER)
+                gain = _MANIFOLD_GAIN / max(N, _MIN_MANIFOLD_LEVER)
             else:
-                gain = base_gain
+                gain = _MANIFOLD_GAIN
 
-            raw_alpha: dict[int, float] = {
-                layer_idx: alpha * shares[layer_idx] * gain
-                for layer_idx in manifold.layers
+            # ``along`` water-fills (rotation/displacement budget, cap 1.0);
+            # ``onto`` / ``toward`` clamp per layer (collapse fractions).
+            raw_along: dict[int, float] = {
+                L: along * shares[L] * gain for L in manifold.layers
             }
-            # Angular mode reads ``effective_alpha`` as a rotation budget
-            # in θ_max units (``subspace_rotate`` computes ``θ =
-            # effective_alpha · θ_max``).  A peaked-share layer can push
-            # that budget past 1.0 — i.e. rotate ``h_par`` more than θ_max,
-            # which ``subspace_rotate`` does *not* clamp.  Water-fill the
-            # per-layer budget so no layer rotates past θ_max and the
-            # trimmed excess is redistributed to unsaturated layers,
-            # preserving the cumulative rotation budget.  Additive mode is
-            # a blend fraction with its own per-position norm restore, so
-            # there is no θ_max ceiling to enforce — leave it as the raw
-            # share-weighted value.
-            if self.injection_mode == "angular":
-                eff_alpha = _redistribute_budget(raw_alpha)
-                # Saturation tell: water-fill caps each layer at θ_max, so
-                # the cumulative budget maxes at ``n_layers``.  If it pins
-                # near that ceiling, the manifold's lever is maxed — the
-                # rotation operator can't push the persona harder no matter
-                # how much α rises (switch to additive, or raise θ_max).
-                # This is the small-lever regime a heavily de-rogued fit can
-                # hit; warn once so a flat-at-high-α sweep isn't mistaken
-                # for a calibration bug.
-                n_lay = len(eff_alpha)
-                if (
-                    alpha > 0.0
-                    and n_lay > 0
-                    and sum(eff_alpha.values()) >= 0.98 * n_lay
-                    and mname not in _warned_manifold_saturated
-                ):
-                    _warned_manifold_saturated.add(mname)
-                    import warnings
-                    warnings.warn(
-                        f"manifold {mname!r} saturates the angular rotation "
-                        f"budget at α={alpha:.2f} (every layer at θ_max): the "
-                        f"rotation operator is maxed (small in-subspace lever "
-                        f"and/or high α·gain), so it can't steer harder past "
-                        f"this point. Use additive mode or raise theta_max to "
-                        f"push further.",
-                        stacklevel=2,
-                    )
-            else:
-                eff_alpha = raw_alpha
+            eff_along = _redistribute_budget(raw_along)
+            eff_onto = {
+                L: max(0.0, min(1.0, onto * shares[L] * gain))
+                for L in manifold.layers
+            }
+            eff_toward = {
+                L: max(0.0, min(1.0, toward * shares[L] * gain))
+                for L in manifold.layers
+            }
+
+            # Saturation tell for ``along``: water-fill caps each layer at 1.0,
+            # so the cumulative budget maxes at ``n_layers``.  Pinned near that
+            # ceiling ⇒ every layer slides fully onto the target — the slide
+            # operator is maxed (small in-subspace lever and/or high α·gain),
+            # so ``along`` can't push harder.  Warn once so a flat-at-high-α
+            # sweep isn't mistaken for a calibration bug.
+            n_lay = len(eff_along)
+            if (
+                along > 0.0
+                and n_lay > 0
+                and sum(eff_along.values()) >= 0.98 * n_lay
+                and mname not in _warned_manifold_saturated
+            ):
+                _warned_manifold_saturated.add(mname)
+                import warnings
+                warnings.warn(
+                    f"manifold {mname!r} saturates the 'along' displacement "
+                    f"budget at along={along:.2f} (every layer fully on the "
+                    f"target): the slide operator is maxed (small in-subspace "
+                    f"lever and/or high coeff·gain), so it can't push the "
+                    f"position harder past this point.",
+                    stacklevel=2,
+                )
+
+            # Target is layer-independent (one authoring position); clamp it
+            # into the domain once.  The cold-start origin seed ``O_L`` is
+            # per-layer (each layer's neutral foot) — picked inside the loop.
+            domain = manifold.domain
+            n_dim = domain.intrinsic_dim
+            target_coord = domain.clamp_position(
+                torch.tensor([float(c) for c in position], dtype=torch.float32)
+            )
+            mfld_origins = getattr(manifold, "origin", None) or {}
 
             for layer_idx, sub in manifold.layers.items():
                 if layer_idx in manifold_owner:
@@ -1272,10 +1321,20 @@ class SteeringManager:
                         f"steering allows only one manifold per layer"
                     )
                 manifold_owner[layer_idx] = mname
-                target = manifold.manifold_point(layer_idx, position)
-                manifold_by_layer.setdefault(layer_idx, []).append(
-                    (sub.basis, sub.mean, target, eff_alpha[layer_idx], trigger),
-                )
+                # ``O_L`` (this layer's neutral foot) or ``zeros(n)`` when the
+                # layer baked no origin (CPU stub / pre-origin fit).
+                O_L = mfld_origins.get(layer_idx)
+                if O_L is None:
+                    origin_coord = torch.zeros(n_dim, dtype=torch.float32)
+                else:
+                    origin_coord = domain.clamp_position(
+                        O_L.reshape(-1).to(torch.float32)
+                    )
+                manifold_by_layer.setdefault(layer_idx, []).append((
+                    sub, domain, target_coord, origin_coord,
+                    eff_along[layer_idx], eff_onto[layer_idx],
+                    eff_toward[layer_idx], trigger,
+                ))
 
         active_layers = (
             set(additive_by_layer)
@@ -1305,6 +1364,18 @@ class SteeringManager:
                 theta_max=self.theta_max,
                 device=device, dtype=dtype, ctx=self.ctx,
             )
+
+    def reset_manifold_feet(self) -> None:
+        """Cold-start every hook's per-token foot at the next forward.
+
+        The foot-follower carries the nearest-point foot across decode steps
+        as a warm start; that state is per-*generation*.  The session calls
+        this at each generation start (alongside ``ctx.reset()``) so a new run
+        re-seeds at the origin ``O`` instead of inheriting the previous run's
+        final foot.  Hooks with no manifold group are unaffected (empty list).
+        """
+        for hook in self.hooks.values():
+            hook._manifold_feet = [None] * len(hook.manifold_groups)
 
     def clear_all(self) -> None:
         """Detach all hooks and clear vectors + ablations + manifolds."""

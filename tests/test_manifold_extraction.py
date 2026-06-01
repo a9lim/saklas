@@ -518,20 +518,18 @@ def test_discover_round_trip_through_load_manifold(tmp_path: Path) -> None:
         assert m2.layers[L].basis.shape == m1.layers[L].basis.shape
 
 
-def test_discover_subspace_replace_moves_toward_target(tmp_path: Path) -> None:
-    """End-to-end behavior check: subspace_replace at α=1 moves the in-subspace
-    component substantially toward the manifold target.
+def test_discover_inject_three_op_moves_toward_target(tmp_path: Path) -> None:
+    """End-to-end behavior check: ``inject_three_op`` with along=onto=1 snaps
+    the in-subspace component onto the manifold target.
 
-    A strict ``cos == 1`` assertion would catch the pre-existing affine
-    shift introduced by ``subspace_replace``'s norm rescale around the
-    origin (the rescale scales ``target`` but not ``mean`` by the same
-    factor, so the centered coords drift by ``(s-1)·mean@basis.T``).  On
-    discover-mode fits where ``mean`` carries real activation
-    magnitude, the cosine lands at ~0.94 rather than 1.0.  What we can
-    assert is *direction-reducing*: the output's in-subspace component
-    is much closer to ``target_coords`` than the input's was.
+    This is the three-op analogue of the old ``subspace_replace`` α=1 snap:
+    ``along=1`` slides the projected foot all the way onto the target coord,
+    ``onto=1`` collapses the off-manifold in-subspace residual ``H_n``, so the
+    output's reduced coords land on ``target_coords``.  We assert
+    direction-reducing (the in-subspace distance to target at least halves),
+    robust to the soft norm cap firing on a synthetic fit.
     """
-    from saklas.core.manifold import subspace_replace
+    from saklas.core.manifold import inject_three_op
     # Seed the global RNG before the fit: the stub encoder perturbs each
     # layer's centroid with a generator-less ``torch.randn``, so without
     # this the fitted subspace jitters with test order and the borderline
@@ -545,32 +543,31 @@ def test_discover_subspace_replace_moves_toward_target(tmp_path: Path) -> None:
 
     layer = 0
     sub = manifold.layers[layer]
-    position = manifold.node_coords[0]
+    domain = manifold.domain
+    n = domain.intrinsic_dim
+    position = manifold.node_coords[0].to(torch.float32)  # a coord on M
     target = manifold.manifold_point(layer, position)
     target_coords = (target - sub.mean) @ sub.basis.T
 
-    # Generate hidden states far from any natural manifold point so the
-    # ``alpha=1`` snap has real distance to close.  Using ``randn``
-    # without a guaranteed-far baseline lets the random draw occasionally
-    # land already-near target; the rescale shift then dominates the
-    # remaining residual and the "halve the distance" assertion gets
-    # tight.  A scaled offset keeps the test focused on the snap's
-    # direction-reducing behavior rather than on what randn happens to
-    # produce.
+    # Hidden states far from any natural manifold point so the snap has real
+    # distance to close.
     g = torch.Generator().manual_seed(0)
     hidden = 3.0 * torch.randn(1, 3, _DIM, generator=g)
-    out = subspace_replace(hidden, sub.mean, sub.basis, target, alpha=1.0)
+    seed = position.reshape((1,) * 2 + (n,)).expand(1, 3, n)
+    out, _foot = inject_three_op(
+        hidden, sub, domain, position, seed,
+        along=1.0, onto=1.0, toward=0.0, gn_steps=4,
+    )
 
     for pos in range(hidden.shape[1]):
         h_in = (hidden[0, pos] - sub.mean) @ sub.basis.T
         h_out = (out[0, pos] - sub.mean) @ sub.basis.T
         dist_before = torch.linalg.norm(h_in - target_coords).item()
         dist_after = torch.linalg.norm(h_out - target_coords).item()
-        # ``alpha=1`` should close most of the gap toward target — at
-        # least halve the in-subspace coordinate distance.  Without the
-        # snap, ``dist_after >= dist_before``.
+        # along=onto=1 should close most of the gap toward target — at least
+        # halve the in-subspace coordinate distance.
         assert dist_after < 0.5 * dist_before, (
-            f"position {pos}: subspace_replace barely moved h_in "
+            f"position {pos}: inject_three_op barely moved h_in "
             f"({dist_before:.3f}) toward target (now {dist_after:.3f})"
         )
 

@@ -18,16 +18,16 @@ from saklas.core.manifold import (
     CustomDomain,
     Manifold,
     SphereDomain,
+    decompose,
     domain_from_spec,
     eval_rbf,
     eval_rbf_jacobian,
     fit_layer_subspace as _fit_layer_subspace_with_ev,  # returns (LayerSubspace, ev_ratio)
     fit_rbf_interpolant,
+    inject_three_op,
     invert_parameterization,
     load_manifold,
     save_manifold,
-    subspace_replace,
-    subspace_rotate,
 )
 
 
@@ -363,190 +363,6 @@ def test_invert_parameterization_recovers_known_position():
     assert dist.item() < 1e-2
 
 
-# ------------------------------------------------------------ subspace_replace ---
-
-def _ortho_basis(r: int, dim: int) -> torch.Tensor:
-    q, _ = torch.linalg.qr(torch.randn(dim, r))
-    return q.T.contiguous()  # (r, dim) orthonormal rows
-
-
-def test_subspace_replace_alpha_zero_is_identity():
-    torch.manual_seed(0)
-    dim = 32
-    h = torch.randn(4, dim)
-    mean = torch.randn(dim)
-    basis = _ortho_basis(3, dim)
-    target = torch.randn(3) @ basis + mean
-    out = subspace_replace(h, mean, basis, target, alpha=0.0)
-    assert torch.allclose(out, h, atol=1e-5)
-
-
-def test_subspace_replace_preserves_norm():
-    torch.manual_seed(1)
-    dim = 48
-    h = torch.randn(5, dim)
-    mean = torch.randn(dim)
-    basis = _ortho_basis(4, dim)
-    target = torch.randn(4) @ basis + mean
-    for alpha in (0.25, 0.5, 1.0):
-        out = subspace_replace(h, mean, basis, target, alpha=alpha)
-        assert torch.allclose(out.norm(dim=-1), h.norm(dim=-1), atol=1e-4)
-
-
-def test_subspace_replace_alpha_one_lands_on_target():
-    torch.manual_seed(2)
-    dim = 24
-    h = torch.randn(dim)
-    mean = torch.randn(dim)
-    basis = _ortho_basis(3, dim)
-    target = torch.randn(3) @ basis + mean
-    out = subspace_replace(h, mean, basis, target, alpha=1.0)
-    h_par = (h - mean) @ basis.T @ basis + mean
-    h_perp = h - h_par
-    expected_dir = h_perp + target
-    cos = torch.dot(out, expected_dir) / (out.norm() * expected_dir.norm())
-    assert cos.item() == pytest.approx(1.0, abs=1e-4)
-
-
-# ------------------------------------------------------------ subspace_rotate ---
-
-def test_subspace_rotate_alpha_zero_is_identity():
-    torch.manual_seed(0)
-    dim = 32
-    h = torch.randn(4, dim)
-    mean = torch.randn(dim)
-    basis = _ortho_basis(3, dim)
-    target = torch.randn(3) @ basis + mean
-    out = subspace_rotate(h, mean, basis, target, alpha=0.0, theta_max=math.pi / 2)
-    assert torch.allclose(out, h, atol=1e-5)
-
-
-def test_subspace_rotate_preserves_centered_norm():
-    """``||h - mean||`` is invariant — rotation in the subspace plane
-    leaves ``||h_par||`` exact and ``h_perp`` untouched, so the centered
-    magnitude is conserved without a norm-restore step."""
-    torch.manual_seed(1)
-    dim = 48
-    h = torch.randn(5, dim)
-    mean = torch.randn(dim)
-    basis = _ortho_basis(4, dim)
-    target = torch.randn(4) @ basis + mean
-    centered_before = (h - mean).norm(dim=-1)
-    for alpha in (0.1, 0.25, 0.5, 1.0):
-        out = subspace_rotate(
-            h, mean, basis, target, alpha=alpha, theta_max=math.pi / 2,
-        )
-        centered_after = (out - mean).norm(dim=-1)
-        assert torch.allclose(centered_after, centered_before, atol=1e-4)
-
-
-def test_subspace_rotate_preserves_h_perp():
-    """The orthogonal-to-subspace component is the part the manifold has
-    no opinion about — keep it bit-stable through the rotation."""
-    torch.manual_seed(2)
-    dim = 40
-    h = torch.randn(3, dim)
-    mean = torch.randn(dim)
-    basis = _ortho_basis(3, dim)
-    target = torch.randn(3) @ basis + mean
-    centered = h - mean
-    h_par_before = (centered @ basis.T) @ basis
-    h_perp_before = centered - h_par_before
-    out = subspace_rotate(
-        h, mean, basis, target, alpha=0.6, theta_max=math.pi / 2,
-    )
-    centered_after = out - mean
-    h_par_after = (centered_after @ basis.T) @ basis
-    h_perp_after = centered_after - h_par_after
-    assert torch.allclose(h_perp_after, h_perp_before, atol=1e-4)
-
-
-def test_subspace_rotate_alpha_one_aligns_h_par_with_target():
-    """At α=1 with θ_max=π/2 the rotation lands ``h_par`` orthogonal to
-    its starting direction, in the plane toward the target — its
-    *centered direction* coincides with the in-plane perpendicular axis
-    pointing from ``h_par`` toward the target.  This is the angular
-    analogue of subspace_replace's "snap onto target" — magnitudes are
-    preserved (h_par magnitude stays), directions are matched modulo the
-    rotation plane's in-plane orthogonal vector."""
-    torch.manual_seed(3)
-    dim = 24
-    h = torch.randn(dim)
-    mean = torch.randn(dim)
-    basis = _ortho_basis(3, dim)
-    target = torch.randn(3) @ basis + mean
-
-    centered = h - mean
-    h_par_c = (centered @ basis.T) @ basis
-    target_c = target - mean
-    u = h_par_c / h_par_c.norm()
-    target_unit = target_c / target_c.norm()
-    cos0 = (u * target_unit).sum()
-    w = target_unit - cos0 * u
-    w_unit = w / w.norm()
-
-    out = subspace_rotate(
-        h, mean, basis, target, alpha=1.0, theta_max=math.pi / 2,
-    )
-    centered_after = out - mean
-    h_par_after = (centered_after @ basis.T) @ basis
-    # h_par_after should be norm * w_unit (cos(π/2)=0, sin(π/2)=1).
-    cos = torch.dot(h_par_after, w_unit) / h_par_after.norm()
-    assert cos.item() == pytest.approx(1.0, abs=1e-3)
-    assert h_par_after.norm().item() == pytest.approx(
-        h_par_c.norm().item(), abs=1e-3,
-    )
-
-
-def test_subspace_norms_fp32_accumulate_at_large_dim():
-    """Defense-in-depth fp32 norm parity with the vector hot path.
-
-    Both injection primitives now pass ``dtype=torch.float32`` to every
-    ``vector_norm`` (matching ``hooks.py``).  With fp16 inputs at a large
-    hidden dim the fp16 sum-of-squares would overflow / lose precision;
-    the fp32 accumulation keeps the norm-preservation invariants exact to
-    the fp16 round-trip tolerance.  This pins the regression so a future
-    refactor can't silently drop the explicit dtype back to incidental.
-    """
-    torch.manual_seed(7)
-    dim = 4096                       # >= 2048: fp16 sum-of-squares overflows
-    h = (torch.randn(3, dim) * 4.0).to(torch.float16)
-    mean = (torch.randn(dim) * 4.0).to(torch.float16)
-    basis = _ortho_basis(4, dim).to(torch.float16)
-    target = ((torch.randn(4) @ basis.float()) + mean.float()).to(torch.float16)
-
-    # subspace_replace: ||h|| preserved.
-    norm_pre = h.float().norm(dim=-1)
-    out_r = subspace_replace(h, mean, basis, target, alpha=0.5)
-    assert out_r.dtype == torch.float16
-    assert torch.allclose(out_r.float().norm(dim=-1), norm_pre, rtol=2e-2)
-    assert torch.isfinite(out_r.float()).all()
-
-    # subspace_rotate: ||h - mean|| preserved.
-    centered_pre = (h.float() - mean.float()).norm(dim=-1)
-    out_a = subspace_rotate(
-        h, mean, basis, target, alpha=0.5, theta_max=math.pi / 2,
-    )
-    assert out_a.dtype == torch.float16
-    centered_post = (out_a.float() - mean.float()).norm(dim=-1)
-    assert torch.allclose(centered_post, centered_pre, rtol=2e-2)
-    assert torch.isfinite(out_a.float()).all()
-
-
-def test_subspace_rotate_degenerate_h_par_is_identity():
-    """At the manifold origin (h ≈ mean) the rotation plane is
-    undefined — fall back to identity rather than emit NaN."""
-    torch.manual_seed(4)
-    dim = 16
-    mean = torch.randn(dim)
-    basis = _ortho_basis(3, dim)
-    # Put h exactly on the manifold mean -- h_par_c is zero.
-    h = mean.clone().unsqueeze(0)
-    target = torch.randn(3) @ basis + mean
-    out = subspace_rotate(
-        h, mean, basis, target, alpha=0.7, theta_max=math.pi / 2,
-    )
-    assert torch.allclose(out, h, atol=1e-5)
 
 
 # ----------------------------------------------------------------- save/load ---
@@ -566,6 +382,9 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
         },
         feature_space="raw",
         mahalanobis_share={4: 1.5, 9: 2.0},
+        # Per-layer authoring-coordinate foot of the neutral mean (the circle
+        # is 1-D, so each ``O_L`` is ``(1,)``).
+        origin={4: torch.tensor([0.42]), 9: torch.tensor([0.55])},
     )
     path = tmp_path / "mood" / "model.safetensors"
     save_manifold(manifold, path, {"method": "manifold_pca",
@@ -583,6 +402,10 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
     # and the metric label that records which weighting the fit used.
     assert loaded.mahalanobis_share == {4: 1.5, 9: 2.0}
     assert loaded.metadata["share_metric"] == "mahalanobis"
+    # The per-layer ``origin`` round-trips through the sidecar.
+    assert sorted(loaded.origin) == [4, 9]
+    for idx in (4, 9):
+        assert torch.allclose(loaded.origin[idx], manifold.origin[idx])
     assert torch.allclose(loaded.node_coords, manifold.node_coords)
     for idx in (4, 9):
         a, b = manifold.layers[idx], loaded.layers[idx]
@@ -621,6 +444,9 @@ def test_load_manifold_without_share_fields_defaults_empty(
     assert loaded.mahalanobis_share == {}
     assert "share_metric" not in loaded.metadata
     assert "mahalanobis_share_per_layer" not in loaded.metadata
+    # A manifold saved with ``origin=None`` round-trips with absence
+    # preserved — no ``origin`` tensor written, loads back as ``None``.
+    assert loaded.origin == {}
 
 
 def test_layer_subspace_to_device_dtype():
@@ -630,3 +456,191 @@ def test_layer_subspace_to_device_dtype():
     assert moved.basis.dtype == torch.float64
     assert moved.mean.dtype == torch.float64
     assert moved.rbf_weights.dtype == torch.float64
+
+
+# ----------------------------------------------------------------- geodesics ---
+
+def test_geodesic_box_open_lerp():
+    d = BoxDomain([
+        BoxAxis("u", periodic=False, lo=-1.0, hi=1.0),
+        BoxAxis("v", periodic=False, lo=-1.0, hi=1.0),
+    ])
+    a = torch.tensor([-1.0, 0.0])
+    b = torch.tensor([1.0, 1.0])
+    assert torch.allclose(d.geodesic(a, b, 0.0), a)
+    assert torch.allclose(d.geodesic(a, b, 1.0), b)
+    assert torch.allclose(d.geodesic(a, b, 0.5), torch.tensor([0.0, 0.5]))
+
+
+def test_geodesic_box_periodic_takes_short_arc():
+    d = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
+    a = torch.tensor([0.9])
+    b = torch.tensor([0.1])  # short way is +0.2 across the seam, not -0.8
+    assert torch.allclose(d.geodesic(a, b, 0.5), torch.tensor([0.0]), atol=1e-6)
+    assert torch.allclose(d.geodesic(a, b, 0.25), torch.tensor([0.95]), atol=1e-6)
+    assert torch.allclose(d.geodesic(a, b, 1.0), torch.tensor([0.1]), atol=1e-6)
+
+
+def test_geodesic_box_batched_frac():
+    d = BoxDomain([
+        BoxAxis("u", periodic=False, lo=-1.0, hi=1.0),
+        BoxAxis("v", periodic=False, lo=-1.0, hi=1.0),
+    ])
+    a = torch.tensor([[-1.0, 0.0], [0.0, 0.0]])
+    b = torch.tensor([[1.0, 1.0], [1.0, 0.5]])
+    frac = torch.tensor([[0.0], [1.0]])
+    out = d.geodesic(a, b, frac)
+    assert torch.allclose(out[0], a[0]) and torch.allclose(out[1], b[1])
+
+
+def test_geodesic_sphere_slerp_stays_on_sphere_and_bisects():
+    sph = SphereDomain(2)
+    a = torch.tensor([0.4, 0.5])
+    b = torch.tensor([1.2, 2.0])
+    assert torch.allclose(sph.embed(sph.geodesic(a, b, 0.0)), sph.embed(a), atol=1e-5)
+    assert torch.allclose(sph.embed(sph.geodesic(a, b, 1.0)), sph.embed(b), atol=1e-5)
+    mid = sph.geodesic(a, b, 0.5)
+    emid = sph.embed(mid)
+    assert torch.allclose((emid * emid).sum(), torch.tensor(1.0), atol=1e-5)
+    ea, eb = sph.embed(a), sph.embed(b)
+    full = torch.arccos((ea * eb).sum().clamp(-1, 1))
+    half = torch.arccos((ea * emid).sum().clamp(-1, 1))
+    assert torch.allclose(half, full / 2, atol=1e-4)
+
+
+def test_geodesic_sphere_unembed_roundtrip():
+    sph = SphereDomain(3)
+    ang = torch.tensor([[0.7, 1.3, 2.1], [1.9, 0.4, 5.0]])
+    assert torch.allclose(
+        sph.embed(sph.clamp_position(sph._unembed(sph.embed(ang)))),
+        sph.embed(ang), atol=1e-5,
+    )
+
+
+def test_geodesic_sphere_degenerate_fallback():
+    sph = SphereDomain(2)
+    a = torch.tensor([0.5, 1.0])
+    assert torch.allclose(sph.embed(sph.geodesic(a, a, 0.5)), sph.embed(a), atol=1e-5)
+
+
+def test_geodesic_custom_linear():
+    cd = CustomDomain(3)
+    a = torch.tensor([0.0, 0.0, 0.0])
+    b = torch.tensor([2.0, 4.0, 6.0])
+    assert torch.allclose(cd.geodesic(a, b, 0.5), torch.tensor([1.0, 2.0, 3.0]))
+
+
+# ------------------------------------------------------------- inject_three_op ---
+
+def _grid_manifold(dim: int = 16, seed: int = 0):
+    """A curved 3x3-grid manifold with a realistic large common-mode norm.
+
+    Returns ``(subspace, domain)``. The DC offset mirrors real LM activations
+    (rogue/massive-activation channels dominate ‖h‖), so node centroids have
+    comparable norm and the kernel's soft norm cap stays dormant.
+    """
+    torch.manual_seed(seed)
+    coords = torch.tensor([[u, v] for u in (0.0, 0.5, 1.0) for v in (0.0, 0.5, 1.0)])
+    domain = BoxDomain([
+        BoxAxis("u", periodic=False, lo=0.0, hi=1.0),
+        BoxAxis("v", periodic=False, lo=0.0, hi=1.0),
+    ])
+    w_lin = torch.randn(2, dim)
+    w_quad = torch.randn(2, dim)
+    centroids = 20.0 + coords @ w_lin + (coords ** 2) @ w_quad + 0.05 * torch.randn(9, dim)
+    sub = fit_layer_subspace(centroids, domain.embed(coords))
+    return sub, domain
+
+
+def _on_surface(sub: Any, domain: Any, coord: Any) -> torch.Tensor:
+    return sub.eval_at(domain.embed(torch.tensor(coord, dtype=torch.float32)))
+
+
+def test_inject_identity_at_zero():
+    sub, domain = _grid_manifold()
+    h = _on_surface(sub, domain, [0.4, 0.6]) + 0.2 * torch.randn(16)
+    out, _ = inject_three_op(
+        h, sub, domain, torch.tensor([0.9, 0.1]), torch.tensor([0.4, 0.6]),
+        0.0, 0.0, 0.0, gn_steps=20,
+    )
+    assert torch.allclose(out, h, atol=1e-3)
+
+
+def test_inject_along_slides_on_surface():
+    sub, domain = _grid_manifold()
+    a, b = [0.0, 0.0], [1.0, 1.0]
+    h = _on_surface(sub, domain, a)  # on the surface, H_n = 0
+    out, _ = inject_three_op(
+        h, sub, domain, torch.tensor(b), torch.tensor(a),
+        1.0, 0.0, 0.0, gn_steps=20,
+    )
+    assert torch.allclose(out, _on_surface(sub, domain, b), atol=5e-3)
+    # half-slide lands on the geodesic midpoint foot
+    out_h, _ = inject_three_op(
+        h, sub, domain, torch.tensor(b), torch.tensor(a),
+        0.5, 0.0, 0.0, gn_steps=20,
+    )
+    assert torch.allclose(out_h, _on_surface(sub, domain, [0.5, 0.5]), atol=5e-3)
+
+
+def test_inject_onto_collapses_to_surface():
+    sub, domain = _grid_manifold()
+    h = _on_surface(sub, domain, [0.5, 0.5]) + 0.3 * torch.randn(16)
+    out, foot = inject_three_op(
+        h, sub, domain, torch.tensor([0.5, 0.5]), torch.tensor([0.5, 0.5]),
+        0.0, 1.0, 0.0, gn_steps=20,
+    )
+    # in-subspace part of the output lies on the surface at the found foot
+    q_out = (out - sub.mean) @ sub.basis.T
+    surface = sub.eval_at(domain.embed(foot)) - sub.mean
+    assert torch.allclose(q_out @ sub.basis, surface, atol=5e-3)
+
+
+def test_inject_onto_half_halves_off_manifold_residual():
+    sub, domain = _grid_manifold()
+    h = _on_surface(sub, domain, [0.4, 0.4]) + 0.3 * torch.randn(16)
+    pos, seed = torch.tensor([0.4, 0.4]), torch.tensor([0.4, 0.4])
+    out0, foot = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.0, 0.0, gn_steps=20)
+    out_h, _ = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.5, 0.0, gn_steps=20)
+    surf = sub.eval_at(domain.embed(foot)) - sub.mean
+    hn0 = ((out0 - sub.mean) @ sub.basis.T @ sub.basis) - surf
+    hnh = ((out_h - sub.mean) @ sub.basis.T @ sub.basis) - surf
+    assert torch.allclose(hnh, 0.5 * hn0, atol=5e-3)
+
+
+def test_inject_toward_collapses_off_subspace():
+    sub, domain = _grid_manifold()
+    h = _on_surface(sub, domain, [0.3, 0.7]) + 0.4 * torch.randn(16)
+    out, _ = inject_three_op(
+        h, sub, domain, torch.tensor([0.3, 0.7]), torch.tensor([0.3, 0.7]),
+        0.0, 0.0, 1.0, gn_steps=20,
+    )
+    _, perp = decompose(out, sub.mean, sub.basis)
+    assert torch.allclose(perp, torch.zeros_like(perp), atol=1e-4)
+
+
+def test_inject_along_onto_preserve_off_subspace():
+    sub, domain = _grid_manifold()
+    h = _on_surface(sub, domain, [0.2, 0.8]) + 0.3 * torch.randn(16)
+    _, perp_in = decompose(h, sub.mean, sub.basis)
+    out, _ = inject_three_op(
+        h, sub, domain, torch.tensor([0.9, 0.2]), torch.tensor([0.2, 0.8]),
+        0.7, 0.5, 0.0, gn_steps=20,
+    )
+    _, perp_out = decompose(out, sub.mean, sub.basis)
+    assert torch.allclose(perp_out, perp_in, atol=1e-4)
+
+
+def test_inject_norm_cap_bounds_output():
+    sub, domain = _grid_manifold()
+    h = _on_surface(sub, domain, [0.5, 0.5]) + 0.3 * torch.randn(16)
+    for a in (0.0, 0.5, 1.0):
+        for o in (0.0, 1.0):
+            for t in (0.0, 1.0):
+                out, _ = inject_three_op(
+                    h, sub, domain, torch.tensor([0.9, 0.1]),
+                    torch.tensor([0.5, 0.5]), a, o, t, gn_steps=20, norm_cap=3.0,
+                )
+                assert torch.isfinite(out).all()
+                ratio = out.norm() / h.norm()
+                assert ratio <= 3.0 + 1e-4

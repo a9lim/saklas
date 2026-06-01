@@ -2820,7 +2820,8 @@ class SaklasSession:
                     )
                 self._steering.add_manifold(
                     entry.manifold, manifold,
-                    position=entry.position, alpha=entry.coeff,
+                    position=entry.position,
+                    along=entry.along, onto=entry.onto, toward=entry.toward,
                     trigger=entry.trigger,
                 )
                 continue
@@ -4720,6 +4721,9 @@ class SaklasSession:
                 # Reset the steering manager's TriggerContext for this gen;
                 # ``generate_steered`` mutates it at lifecycle boundaries.
                 self._steering.ctx.reset()
+                # Cold-start every manifold foot-follower so this gen re-seeds
+                # at the origin instead of inheriting the prior run's foot.
+                self._steering.reset_manifold_feet()
                 self._gen_phase = GenState.RUNNING
 
                 generated_ids, elapsed = self._run_generation_loop(

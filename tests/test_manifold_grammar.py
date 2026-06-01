@@ -221,6 +221,103 @@ def test_format_round_trip(expr: str) -> None:
     assert a == b
 
 
+# ------------------------------------------------ three-op coeff grammar ---
+
+def test_single_coeff_is_along_only():
+    # Collapse ops default off: one coeff is a pure directional slide.
+    term = _only_term("0.6 circumplex%happy")
+    assert isinstance(term, ManifoldTerm)
+    assert (term.along, term.onto, term.toward) == pytest.approx(
+        (0.6, 0.0, 0.0)
+    )
+    assert term.coeff == pytest.approx(0.6)  # representative = along
+
+
+def test_two_coeffs_are_along_onto():
+    # Two coeffs opt into onto; toward stays off (only the 3-form touches it).
+    term = _only_term("0.6,0.3 circumplex%happy")
+    assert isinstance(term, ManifoldTerm)
+    assert term.along == pytest.approx(0.6)
+    assert term.onto == pytest.approx(0.3)
+    assert term.toward == pytest.approx(0.0)
+
+
+def test_three_coeffs_are_explicit():
+    term = _only_term("0.6,0.3,0.2 circumplex%happy")
+    assert isinstance(term, ManifoldTerm)
+    assert (term.along, term.onto, term.toward) == pytest.approx(
+        (0.6, 0.3, 0.2)
+    )
+
+
+def test_two_coeffs_with_coord_position():
+    # The post-``%`` comma list is the POSITION; the pre-selector comma
+    # run is the coefficient run.  They must not bleed into each other.
+    term = _only_term("0.6,0.3 circumplex%0.3,0.8")
+    assert isinstance(term, ManifoldTerm)
+    assert term.along == pytest.approx(0.6)
+    assert term.onto == pytest.approx(0.3)
+    assert term.toward == pytest.approx(0.0)
+    assert term.position == (0.3, 0.8)
+
+
+def test_single_coeff_with_coord_position_unchanged():
+    # One coeff, coord-list position — the historical shape (along-only now).
+    term = _only_term("0.6 circumplex%0.3,0.8")
+    assert (term.along, term.onto, term.toward) == pytest.approx(
+        (0.6, 0.0, 0.0)
+    )
+    assert term.position == (0.3, 0.8)
+
+
+def test_negative_sign_propagates_across_run():
+    term = _only_term("-0.6,0.3 circumplex%happy")
+    assert isinstance(term, ManifoldTerm)
+    assert term.along == pytest.approx(-0.6)
+    assert term.onto == pytest.approx(-0.3)
+    assert term.toward == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("expr", [
+    "0.6 circumplex%happy",        # 1 coeff → shortest is 1
+    "0.6,0.3 circumplex%happy",    # onto == toward → shortest is 2
+    "0.6,0.3,0.2 circumplex%happy",  # all distinct → 3
+    "0.6,0.3 persona%pirate",      # label-form, 2 coeffs
+    "0.5,0.2,0.1 circumplex%0.3,0.8",  # 3 coeffs + coord position
+    "0.6,0.3 circumplex%0.3,0.8",  # 2 coeffs + coord position
+])
+def test_three_op_format_round_trips_byte_for_byte(expr: str) -> None:
+    assert format_expr(parse_expr(expr)) == expr
+
+
+def test_three_op_coeffs_sum_on_merge():
+    steering = parse_expr(
+        "0.6,0.3 circumplex%happy + 0.1,0.2 circumplex%happy"
+    )
+    assert len(steering.alphas) == 1
+    term = next(iter(steering.alphas.values()))
+    assert isinstance(term, ManifoldTerm)
+    assert term.along == pytest.approx(0.7)
+    assert term.onto == pytest.approx(0.5)
+    assert term.toward == pytest.approx(0.0)
+
+
+def test_rejects_four_coeffs():
+    with pytest.raises(SteeringExprError):
+        parse_expr("0.6,0.3,0.2,0.1 circumplex%happy")
+
+
+@pytest.mark.parametrize("expr", [
+    "0.6,0.3 honest",          # plain vector term
+    "0.6,0.3 angry~calm",      # projection term
+    "0.6,0.3 !angry",          # ablation term
+])
+def test_rejects_comma_coeffs_on_non_manifold(expr: str) -> None:
+    with pytest.raises(SteeringExprError) as exc:
+        parse_expr(expr)
+    assert "manifold % position" in str(exc.value)
+
+
 # ------------------------------------------------------------- reference ---
 
 def test_referenced_manifolds():

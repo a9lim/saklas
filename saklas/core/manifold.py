@@ -30,11 +30,12 @@ how :mod:`saklas.core.vectors` holds the low-level extraction primitives.
 The RBF fit solves a small dense symmetric-indefinite saddle system with
 ``torch.linalg.solve`` -- node counts are tiny (on the order of ten to
 thirty) and fitting is a one-shot operation, not a hot path. scipy is not
-pulled in. ``eval_rbf``, :func:`rotate_toward`, :func:`subspace_replace`
-and :func:`subspace_rotate` are the functions reachable from the
-generation hot path (``rotate_toward`` is the Givens kernel the vector
-angular path in :mod:`saklas.core.hooks` shares); all are allocation-light
-and free of host syncs.
+pulled in. ``eval_rbf``, :func:`eval_rbf_jacobian`, :func:`rotate_toward`,
+:func:`_gn_step` and :func:`inject_three_op` are the functions reachable
+from the generation hot path (``rotate_toward`` is the Givens kernel the
+vector angular path in :mod:`saklas.core.hooks` shares; ``inject_three_op``
+is the unified along/onto/toward manifold injection); all are
+allocation-light and free of host syncs.
 """
 from __future__ import annotations
 
@@ -150,6 +151,26 @@ class ManifoldDomain(ABC):
         """Chordal distance between embedded points ``(.., m)`` -> ``(..,)``."""
         return torch.linalg.vector_norm(a - b, dim=-1)
 
+    def geodesic(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        frac: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Point ``frac`` of the way along the geodesic ``a -> b`` in *authoring*
+        coords. ``a``/``b`` are ``(.., n)``; ``frac`` is a scalar or ``(.., 1)``;
+        returns ``(.., n)`` clamped to the domain.
+
+        The default is the straight coordinate lerp -- correct for any flat,
+        non-wrapping domain (``CustomDomain``, and the open-axis part of a
+        ``BoxDomain``). :class:`BoxDomain` overrides it for periodic axes
+        (wrap-aware shortest arc) and :class:`SphereDomain` for great-circle
+        slerp. This is the operator the three-op ``along`` step slides the
+        projected foot through, so the path stays *on the surface* rather than
+        cutting the ambient chord the old additive injection took.
+        """
+        return self.clamp_position(a + frac * (b - a))
+
 
 @dataclass(frozen=True)
 class BoxAxis:
@@ -231,6 +252,29 @@ class BoxDomain(ManifoldDomain):
             else:
                 out[..., i] = coords[..., i].clamp(min=ax.lo, max=ax.hi)
         return out
+
+    def geodesic(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        frac: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-axis lerp; periodic axes take the wrap-aware shortest arc.
+
+        Open axes lerp straight (then clamp to range). Periodic axes route the
+        delta through the signed minimal representative
+        ``remainder(Δ + period/2, period) - period/2`` so the slide crosses the
+        seam when that is the shorter path around the circle, then ``clamp``
+        wraps the result back into ``[0, period)``.
+        """
+        delta = b - a
+        for i, ax in enumerate(self._axes):
+            if ax.periodic:
+                half = ax.period / 2.0
+                delta[..., i] = (
+                    torch.remainder(delta[..., i] + half, ax.period) - half
+                )
+        return self.clamp_position(a + frac * delta)
 
     def to_spec(self) -> dict[str, Any]:
         return {
@@ -329,6 +373,54 @@ class SphereDomain(ManifoldDomain):
             coords[..., self._dim - 1], 2.0 * math.pi
         )
         return out
+
+    def _unembed(self, e: torch.Tensor) -> torch.Tensor:
+        """Recover hyperspherical angles ``(.., n)`` from a unit vector ``(.., n+1)``.
+
+        Inverse of :meth:`embed`. The polar angles ``phi_0..phi_{n-2}`` come from
+        ``atan2(||tail||, e_k) in [0, pi]``; the azimuth ``phi_{n-1}`` uses the
+        signed ``atan2(e_n, e_{n-1})`` so the full circle is recovered (the
+        polar formula would fold it into ``[0, pi]``). ``clamp_position`` wraps
+        the azimuth into ``[0, 2*pi)``.
+        """
+        n = self._dim
+        angles: list[torch.Tensor] = []
+        for k in range(n):
+            if k < n - 1:
+                tail = torch.linalg.vector_norm(e[..., k + 1:], dim=-1)
+                angles.append(torch.atan2(tail, e[..., k]))
+            else:
+                angles.append(torch.atan2(e[..., n], e[..., n - 1]))
+        return torch.stack(angles, dim=-1)
+
+    def geodesic(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        frac: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Great-circle slerp between two angle tuples, via the unit-vector embed.
+
+        Embeds both endpoints to unit vectors, spherical-linear-interpolates in
+        the ambient ``R^(n+1)`` (with a linear fallback when the two points
+        nearly coincide, ``sin(omega) -> 0``), renormalizes, and unembeds back
+        to angles. The result is the on-sphere path, not the chord through the
+        ball.
+        """
+        ea = self.embed(a)
+        eb = self.embed(b)
+        dot = (ea * eb).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+        omega = torch.arccos(dot)                       # (.., 1)
+        sin_omega = torch.sin(omega)
+        small = sin_omega.abs() < 1e-6
+        denom = sin_omega.clamp_min(1e-9)
+        w_a = torch.sin((1.0 - frac) * omega) / denom
+        w_b = torch.sin(frac * omega) / denom
+        e = w_a * ea + w_b * eb
+        e_lin = (1.0 - frac) * ea + frac * eb           # omega -> 0 fallback
+        e = torch.where(small, e_lin, e)
+        e = e / torch.linalg.vector_norm(e, dim=-1, keepdim=True).clamp_min(1e-9)
+        return self.clamp_position(self._unembed(e))
 
     def to_spec(self) -> dict[str, Any]:
         return {"type": "sphere", "dim": self._dim}
@@ -779,6 +871,21 @@ class Manifold:
     # then falls back to no lever normalization (``N = 1``), preserving the
     # pre-lever gain scale for that degenerate case.
     lever: dict[int, float] = field(default_factory=dict)
+    # Origin ``O_L`` — the **per-layer** foot of the neutral mean on ``M``, in
+    # authoring coordinates ``(n,)``, keyed by layer.  Always a point *on* the
+    # manifold (each is an ``invert_parameterization`` result), so always affine;
+    # there is no linear/affine field.  Two roles in three-op steering: the
+    # cold-start seed for that layer's per-token nearest-point foot-follower
+    # (``inject_three_op``), and the slide-to target of the ``!`` operator
+    # (Phase 2).  Per-layer rather than a single shared coord because each layer
+    # embeds the shared authoring coords into activation space differently (its
+    # own PCA + RBF), so neutral's foot genuinely differs by depth — and the
+    # hot-path follower runs one Gauss-Newton step from a *single* seed with no
+    # restarts (unlike ``invert_parameterization``), so a per-layer seed in the
+    # right basin avoids a wrong-basin foot on periodic / curved domains.  Empty
+    # dict on a fit with no neutral means available (CPU test stubs); the apply
+    # path then seeds that layer's foot at the coord-space origin ``zeros(n)``.
+    origin: dict[int, torch.Tensor] = field(default_factory=dict)
 
     @property
     def layer_indices(self) -> list[int]:
@@ -801,6 +908,10 @@ class Manifold:
             explained_variance=dict(self.explained_variance),
             mahalanobis_share=dict(self.mahalanobis_share),
             lever=dict(self.lever),
+            origin={
+                L: o.to(device=device, dtype=dtype)
+                for L, o in self.origin.items()
+            },
         )
 
     def _position_tensor(
@@ -1057,8 +1168,8 @@ def decompose(
     ``h_perp`` is the orthogonal residual; together they sum to
     ``h - mean`` exactly.
 
-    The shared decomposition step that backs :func:`subspace_replace`,
-    :func:`subspace_rotate`, and the read-side ``ManifoldMonitor``.  All
+    The shared decomposition step that backs :func:`inject_three_op` and
+    the read-side ``ManifoldMonitor``.  All
     three intermediates are kept in the input's dtype — callers that need
     fp32 (the injection functions, the monitor) cast their inputs first.
     """
@@ -1106,176 +1217,135 @@ def layer_lever(
     return float((num / den).mean().item())
 
 
-def subspace_replace(
+_TANGENT_GRAM_RIDGE = 1e-6
+
+
+def inject_three_op(
     h: torch.Tensor,
-    mean: torch.Tensor,
-    basis: torch.Tensor,
-    target: torch.Tensor,
-    alpha: float | torch.Tensor,
-) -> torch.Tensor:
-    """Soft subspace-replace: blend ``h``'s in-subspace component to ``target``.
+    subspace: LayerSubspace,
+    domain: ManifoldDomain,
+    target_coord: torch.Tensor,
+    foot_seed: torch.Tensor,
+    along: "float | torch.Tensor",
+    onto: "float | torch.Tensor",
+    toward: "float | torch.Tensor",
+    *,
+    gn_steps: int = 1,
+    norm_cap: float = 3.0,
+    damping: float = DEFAULT_INVERSION_DAMPING,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The unified three-operation manifold injection (replaces angular/additive).
 
-    ``h`` is ``(.., D)`` running activations; ``mean`` ``(D,)`` and
-    ``basis`` ``(R, D)`` define the manifold's affine PCA subspace;
-    ``target`` ``(D,)`` is the manifold point to steer toward; ``alpha``
-    is the blend fraction.
+    Decomposes ``h = mean + H_m + H_n + H_o`` against the layer's affine
+    subspace and its RBF surface ``M``, then applies three near-orthogonal
+    operations, each a coefficient in ``[0, 1]``:
 
-    The activation decomposes as ``h = h_par + h_perp`` where ``h_par``
-    is the reconstruction inside the subspace and ``h_perp`` the
-    orthogonal residual.  Only ``h_par`` is moved -- toward ``target`` --
-    and the residual is kept verbatim::
+    - **along** (``a``): slide the projected foot from its current position
+      ``p*`` toward ``target_coord`` *geodesically in authoring-coord space*
+      (``domain.geodesic``), and transport the off-manifold residual ``H_n`` to
+      stay normal at the new foot (project onto the new tangent's normal space,
+      renorm to the preserved ``‖H_n‖``).  Tangential / directional; leaves
+      ``H_o`` untouched.  Replaces the old additive chord — by sliding *on the
+      surface* it never cuts through the off-manifold low-density region.
+    - **onto** (``o``): scale ``H_n`` by ``(1 − o)`` — collapse onto the surface
+      within the subspace.  Vacuous when the surface fills its subspace
+      (``H_n ≈ 0``).
+    - **toward** (``t``): scale ``H_o`` by ``(1 − t)`` — collapse onto the
+      affine subspace.  The R-dim generalization of the ``~``/``|`` operators.
 
-        h' = h + alpha * (target - h_par)
+    All subspace arithmetic runs in **reduced (R-dim) coordinates**; because
+    ``basis`` is orthonormal, ``‖H_n_reduced‖ = ‖H_n‖`` exactly, so the
+    transport's norm-preservation holds and the cost is ``O(R)`` not ``O(D)``.
+    fp32 throughout (fp16 sum-of-squares overflows at large ``D``).
 
-    so ``alpha=0`` is the identity and ``alpha=1`` snaps the in-subspace
-    component fully onto the manifold.  The result is rescaled to ``h``'s
-    original per-position norm, matching every other saklas injection
-    hook.  This generalizes the ``~`` / ``|`` line-projection operators
-    from a 1-D direction to an R-dimensional subspace.
+    ``foot_seed`` ``(.., n)`` is the warm start for the nearest-point foot — the
+    previous token's foot on the hot path, refined by ``gn_steps`` shared
+    :func:`_gn_step` iterations (one per token in steady state).  Returns
+    ``(h_new, foot)`` where ``foot`` ``(.., n)`` is *this* token's refined
+    pre-slide foot, to seed the next token.
 
-    Pairs with the ``"additive"`` session injection mode for manifold
-    terms — the destructive linear blend matches additive vector
-    steering's overwrite-and-rescale shape.  Under ``"angular"`` the
-    manifold hook routes to :func:`subspace_rotate` instead.
-
-    Returns a new tensor; the caller copies it in place.  fp32
-    intermediates throughout (fp16 sum-of-squares overflows at large
-    hidden dim).
+    Order is fixed **along → onto → toward**: the transport (along) must run
+    before ``onto`` scales the transported residual.  No global norm
+    preservation — ``onto``/``toward`` are *meant* to shrink ``‖h − mean‖``, and
+    the apply-time lever normalization controls the per-α magnitude; a soft cap
+    ``‖h_new‖ ≤ norm_cap·‖h‖`` guards only against off-domain RBF extrapolation
+    blowup.
     """
     h_f32 = h.to(torch.float32)
-    mean_f32 = mean.to(torch.float32)
-    basis_f32 = basis.to(torch.float32)
-    target_f32 = target.to(torch.float32)
+    mean = subspace.mean.to(torch.float32)            # (D,)
+    basis = subspace.basis.to(torch.float32)          # (R, D)
+    np_ = subspace.node_params.to(torch.float32)
+    rw = subspace.rbf_weights.to(torch.float32)
+    pc = subspace.poly_coeffs.to(torch.float32)
+    offset = subspace.coord_offset.to(torch.float32)  # (m,)
+    scale = subspace.coord_scale.to(torch.float32)    # (m,)
+    target = target_coord.to(device=h_f32.device, dtype=torch.float32)
 
-    h_par_c, _h_perp = decompose(h_f32, mean_f32, basis_f32)
-    h_par = h_par_c + mean_f32               # (.., D) in-subspace part
-    delta = target_f32 - h_par               # (.., D) in-subspace correction
-    h_new = h_f32 + alpha * delta
+    centered = h_f32 - mean                            # (.., D)
+    q = centered @ basis.T                             # (.., R) reduced coords of h_par
+    h_par = q @ basis                                  # (.., D) in-subspace reconstruction
+    h_perp = centered - h_par                          # (.., D) = H_o
 
-    norm_pre = torch.linalg.vector_norm(
-        h_f32, dim=-1, keepdim=True, dtype=torch.float32,
+    # --- foot p* : nearest point on M to q, warm-started from foot_seed ---
+    p = foot_seed
+    for _ in range(int(gn_steps)):
+        p, _ = _gn_step(p, q, np_, rw, pc, offset, scale, domain, damping)
+
+    foot_red = eval_rbf(np_, rw, pc, (domain.embed(p) - offset) / scale)  # (.., R)
+    Hn_red = q - foot_red                              # (.., R) off-manifold-in-subspace (reduced)
+    Hn_norm = torch.linalg.vector_norm(Hn_red, dim=-1, keepdim=True)      # (.., 1)
+
+    # --- ALONG: geodesic slide of the foot, with H_n transport ---
+    p_new = domain.geodesic(p, target, along)          # (.., n)
+    emb_new = (domain.embed(p_new) - offset) / scale   # (.., m)
+    foot_new_red = eval_rbf(np_, rw, pc, emb_new)      # (.., R)
+
+    # World-reduced tangent columns of M at p_new: dRBF/dcoord chained through
+    # the embedding Jacobian (the reduced-space analogue of Manifold.tangent).
+    tangent = (
+        eval_rbf_jacobian(np_, rw, pc, emb_new) / scale  # (.., R, m)
+    ) @ domain.embed_jacobian(p_new)                     # (.., R, n)
+    # Project H_n onto the normal space at p_new (remove its tangent component).
+    gram = tangent.transpose(-1, -2) @ tangent           # (.., n, n)
+    n_dim = gram.shape[-1]
+    eye = torch.eye(n_dim, device=gram.device, dtype=gram.dtype)
+    rhs = tangent.transpose(-1, -2) @ Hn_red.unsqueeze(-1)  # (.., n, 1)
+    bsz = gram.shape[:-2]
+    coeff = torch.linalg.solve(
+        (gram + _TANGENT_GRAM_RIDGE * eye).reshape(-1, n_dim, n_dim).contiguous(),
+        rhs.reshape(-1, n_dim, 1).contiguous(),
+    ).reshape(*bsz, n_dim, 1)
+    Hn_tan = (tangent @ coeff).squeeze(-1)               # (.., R) tangent component
+    Hn_normal = Hn_red - Hn_tan                          # (.., R) normal at p_new
+    Hn_normal_norm = torch.linalg.vector_norm(Hn_normal, dim=-1, keepdim=True)
+    # Renorm to the preserved ‖H_n‖; if the projection collapsed (H_n went
+    # tangent at the new foot — a large slide near a fold), drop it rather than
+    # fabricate a direction (risk-2 mitigation), via a hot-path-safe ``where``.
+    Hn_trans = Hn_normal * (Hn_norm / Hn_normal_norm.clamp(min=_ROTATE_EPSILON))
+    Hn_trans = torch.where(
+        Hn_normal_norm < _ROTATE_EPSILON, torch.zeros_like(Hn_trans), Hn_trans,
     )
-    norm_post = torch.linalg.vector_norm(
-        h_new, dim=-1, keepdim=True, dtype=torch.float32,
-    ).clamp(min=1e-6)
-    h_new = h_new * (norm_pre / norm_post)
-    return h_new.to(h.dtype)
 
+    # --- ONTO: scale the transported off-manifold residual ---
+    Hn_final = (1.0 - onto) * Hn_trans                   # (.., R)
 
-def subspace_rotate(
-    h: torch.Tensor,
-    mean: torch.Tensor,
-    basis: torch.Tensor,
-    target: torch.Tensor,
-    alpha: float | torch.Tensor,
-    theta_max: float,
-) -> torch.Tensor:
-    """Angular-in-subspace: rotate ``h``'s in-subspace component toward ``target``.
+    new_par = (foot_new_red + Hn_final) @ basis          # (.., D) back to world
 
-    The angular analogue of :func:`subspace_replace` and the manifold-
-    side companion to the angular vector-steering hot path.  Decomposes
-    ``h = mean + h_par_c + h_perp`` where ``h_par_c`` is the centered
-    in-subspace component and ``h_perp`` the orthogonal residual.  In the
-    2-D plane spanned (within the subspace) by ``h_par_c`` and the
-    centered target ``target - mean``, ``h_par_c`` is rotated toward the
-    target by angle ``θ = α · θ_max`` -- a Givens rotation that preserves
-    ``||h_par_c||`` exactly.  ``h_perp`` is left untouched, so
-    ``||h - mean|| = ||h' - mean||`` by construction and no norm-restore
-    is needed.
+    # --- TOWARD: scale the off-subspace residual ---
+    new_perp = (1.0 - toward) * h_perp                   # (.., D)
 
-    Compared to :func:`subspace_replace`:
+    h_new = mean + new_par + new_perp                    # (.., D)
 
-    - **Magnitude of the in-subspace component** is preserved here;
-      replace overrides it (the target's magnitude wins at ``α=1``).
-    - **No global norm-restore.**  Replace has to rescale ``h`` because
-      the linear blend changes ``||h_par||``; the rotation doesn't.
-    - **At α=1** rotate lands at a full ``θ_max`` rotation toward the
-      target (default ``π/2``), not at the target itself.  The target's
-      *direction* in subspace coordinates is matched (under a sign /
-      anti-alignment caveat); the magnitude stays the running
-      activation's.
-
-    Suitable for manifolds whose intrinsic geometry is flat (open
-    :class:`BoxDomain`, :class:`CustomDomain` -- including every
-    discover-mode fit), where the in-subspace direction toward a node
-    is what carries persona / state identity rather than its absolute
-    magnitude.  For curved domains :func:`subspace_replace` keeps the
-    "land on the surface" semantics; the hook dispatches by session
-    injection mode rather than by domain class so the user gets the
-    same angular ↔ additive knob they have for vector steering.
-
-    Returns a new tensor; the caller copies it in place.  fp32
-    intermediates throughout (fp16 sum-of-squares overflows at large
-    hidden dim).  Per-position degeneracies -- ``||h_par_c|| < ε`` (we
-    are at the manifold origin) or ``||w|| < ε`` (h_par already
-    (anti-)aligned with the target) -- fall back to identity through a
-    ``torch.where`` mask, matching the angular vector hot path's
-    near-aligned guard.
-    """
-    h_f32 = h.to(torch.float32)
-    mean_f32 = mean.to(torch.float32)
-    basis_f32 = basis.to(torch.float32)
-    target_f32 = target.to(torch.float32)
-
-    h_par_c, h_perp = decompose(h_f32, mean_f32, basis_f32)
-
-    target_c = target_f32 - mean_f32                     # (D,) in subspace
-    target_norm = torch.linalg.vector_norm(
-        target_c, dtype=torch.float32,
-    ).clamp(min=_ROTATE_EPSILON)
-    target_unit = target_c / target_norm                 # (D,)
-
-    h_par_norm = torch.linalg.vector_norm(
-        h_par_c, dim=-1, keepdim=True, dtype=torch.float32,
-    )                                                    # (.., 1)
-    safe_par_norm = h_par_norm.clamp(min=_ROTATE_EPSILON)
-    u = h_par_c / safe_par_norm                          # (.., D) per-position unit
-
-    # ``theta`` accepts a Python scalar or a 0-dim tensor; the hook calls
-    # us with a Python float since ``theta_max`` is stamped at recompose
-    # time, but allow tensor inputs for callers that want a per-position
-    # angle (e.g. tests, or a future per-layer-share schedule).
-    cos_t: float | torch.Tensor
-    sin_t: float | torch.Tensor
-    if isinstance(alpha, torch.Tensor) or isinstance(theta_max, torch.Tensor):
-        theta_t = (
-            alpha if isinstance(alpha, torch.Tensor) else torch.as_tensor(alpha)
-        ) * (
-            theta_max
-            if isinstance(theta_max, torch.Tensor)
-            else torch.as_tensor(theta_max)
-        )
-        cos_t = torch.cos(theta_t)
-        sin_t = torch.sin(theta_t)
-    else:
-        theta = float(alpha) * float(theta_max)
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-
-    # Rotate the in-subspace unit toward the centered target via the
-    # shared Givens kernel (same operation the vector angular hot path
-    # runs on the full activation).  ``w_norm`` feeds the dual degeneracy
-    # guard below.
-    rotated_unit, w_norm = rotate_toward(u, target_unit, cos_t, sin_t)
-    h_par_new = h_par_norm * rotated_unit                # (.., D)
-
-    # Identity fallback at ill-defined rotation planes:
-    #   - h_par_c ≈ 0: we are at the manifold origin, no "direction
-    #     from which to rotate" — leave hidden alone (a separate
-    #     translation toward the target is what subspace_replace
-    #     would do; angular preserves the centered magnitude).
-    #   - w ≈ 0: h_par already (anti-)aligned with target; the 2-D
-    #     rotation plane is undefined.  Anti-aligned is the case where
-    #     a rotation could most aggressively flip the persona signal,
-    #     but the plane to do it in isn't determined by geometry alone
-    #     — identity is the conservative fallback.
-    degenerate = (
-        (h_par_norm < _ROTATE_EPSILON) | (w_norm < _ROTATE_EPSILON)
-    )                                                    # (.., 1)
-    h_par_new = torch.where(degenerate, h_par_c, h_par_new)
-
-    h_new = mean_f32 + h_par_new + h_perp
-    return h_new.to(h.dtype)
+    # Soft safety cap: only fires on pathological off-domain RBF extrapolation
+    # (clamp_position keeps p_new in-box for open axes, so this is belt-and-
+    # suspenders, not the norm semantic — onto/toward are allowed to shrink ‖h‖).
+    norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
+    norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
+    cap = norm_cap * norm_pre
+    h_new = torch.where(
+        norm_post > cap, h_new * (cap / norm_post.clamp(min=1e-6)), h_new,
+    )
+    return h_new.to(h.dtype), p
 
 
 # ======================================================= coord discovery ===
@@ -1676,10 +1746,11 @@ def save_manifold(
     The safetensors payload carries, per layer ``L``: ``layer_<L>.mean``,
     ``layer_<L>.basis``, ``layer_<L>.node_params``,
     ``layer_<L>.rbf_weights``, ``layer_<L>.poly_coeffs``,
-    ``layer_<L>.coord_offset``, ``layer_<L>.coord_scale``; plus one
-    shared bare ``node_coords`` tensor.  The sidecar carries the manifold
-    identity (name, domain spec, ordered node labels, feature space) plus
-    the provenance fields in ``metadata``.
+    ``layer_<L>.coord_offset``, ``layer_<L>.coord_scale``; plus a shared
+    bare ``node_coords`` tensor.  The sidecar carries the manifold identity
+    (name, domain spec, ordered node labels, feature space), the per-layer
+    ``origin_per_layer`` (the authoring-coordinate foot of the neutral mean,
+    keyed by layer), plus the provenance fields in ``metadata``.
     """
     from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
 
@@ -1739,6 +1810,14 @@ def save_manifold(
     if manifold.lever:
         sidecar["lever_per_layer"] = {
             str(idx): float(v) for idx, v in manifold.lever.items()
+        }
+    # Per-layer origin ``O_L`` (the authoring-coordinate foot of the neutral
+    # mean) — the cold-start foot seed.  Stored ``{str(L): [coord, ...]}`` like
+    # the other per-layer bakes; absent on a fit with no neutral means.
+    if manifold.origin:
+        sidecar["origin_per_layer"] = {
+            str(idx): [float(c) for c in o.reshape(-1).tolist()]
+            for idx, o in manifold.origin.items()
         }
     for key in (
         "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
@@ -1822,6 +1901,14 @@ def load_manifold(path: str | Path) -> Manifold:
     lever_raw = sidecar.get("lever_per_layer") or {}
     lever: dict[int, float] = {int(k): float(v) for k, v in lever_raw.items()}
 
+    # Per-layer origin ``O_L`` (authoring-coordinate foot of neutral).  Absent
+    # on a pre-origin fit → empty dict; the apply path seeds at ``zeros(n)``.
+    origin_raw = sidecar.get("origin_per_layer") or {}
+    origin: dict[int, torch.Tensor] = {
+        int(k): torch.tensor([float(c) for c in v], dtype=torch.float32)
+        for k, v in origin_raw.items()
+    }
+
     return Manifold(
         name=sidecar.get("name", path.parent.name),
         domain=domain,
@@ -1836,7 +1923,61 @@ def load_manifold(path: str | Path) -> Manifold:
         explained_variance=explained_variance,
         mahalanobis_share=mahalanobis_share,
         lever=lever,
+        origin=origin,
     )
+
+
+def _gn_step(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    node_params: torch.Tensor,
+    rbf_weights: torch.Tensor,
+    poly_coeffs: torch.Tensor,
+    coord_offset: torch.Tensor,
+    coord_scale: torch.Tensor,
+    domain: ManifoldDomain,
+    damping: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One damped Gauss-Newton (Levenberg-Marquardt) step of the nearest-point
+    inversion ``argmin_p ||s(p) - q||``.
+
+    ``p`` ``(.., n)`` are authoring coords, ``q`` ``(.., R)`` the reduced-space
+    targets (broadcastable against ``p``'s leading dims -- the inversion fans
+    ``p`` over ``S`` restarts against a ``(.., 1, R)`` query). The remaining
+    args are the subspace's RBF tensors **already cast to ``p``'s device/dtype**
+    (the caller hoists that out of the loop). Returns ``(p_new, resid_norm)``:
+    the clamped post-step position and the *pre-step* reduced-space residual
+    norm ``(..,)`` -- the latter lets a warm-started caller (the steering
+    foot-follower) gate on whether a single step actually reduced the residual.
+
+    Shared by :func:`invert_parameterization` (looped ``max_iter`` times over
+    ``S`` warm starts) and the three-op steering kernel (one step per token,
+    warm-started from the previous foot), so the LM math lives in exactly one
+    place.
+    """
+    emb = (domain.embed(p) - coord_offset) / coord_scale          # (.., m)
+    resid = eval_rbf(node_params, rbf_weights, poly_coeffs, emb) - q  # (.., R)
+    j_auth = (
+        eval_rbf_jacobian(node_params, rbf_weights, poly_coeffs, emb)
+        / coord_scale                                             # (.., R, m)
+    ) @ domain.embed_jacobian(p)                                  # (.., R, n)
+    jt = j_auth.transpose(-1, -2)                                 # (.., n, R)
+    jtj = jt @ j_auth                                             # (.., n, n)
+    jtr = jt @ resid.unsqueeze(-1)                                # (.., n, 1)
+    diag = torch.diagonal(jtj, dim1=-2, dim2=-1)                  # (.., n)
+    reg = torch.diag_embed(
+        damping * diag.clamp(min=_INVERSION_DIAG_FLOOR) + _INVERSION_DIAG_FLOOR
+    )
+    A = jtj + reg                                                 # (.., n, n)
+    n_dim = A.shape[-1]
+    bsz = A.shape[:-2]
+    step = torch.linalg.solve(
+        A.reshape(-1, n_dim, n_dim).contiguous(),
+        jtr.reshape(-1, n_dim, 1).contiguous(),
+    ).reshape(*bsz, n_dim)                                        # (.., n)
+    p_new = domain.clamp_position(p - step)
+    resid_norm = torch.linalg.vector_norm(resid, dim=-1)         # (..,)
+    return p_new, resid_norm
 
 
 def invert_parameterization(
@@ -1906,37 +2047,12 @@ def invert_parameterization(
     p = domain.clamp_position(node_coords[seed_idx])  # (N, S, n)
     q = flat.unsqueeze(1)  # (N, 1, R) -- broadcasts over the S restarts
 
+    # Each step shares the LM body with the steering foot-follower via
+    # ``_gn_step``; ``q`` is ``(N, 1, R)`` and broadcasts over the ``S``
+    # restarts.  The internal ``reshape(-1, n, n)`` there also dodges
+    # ``torch.linalg.solve``'s size-1-leading-batch out-resize warning on MPS.
     for _ in range(int(max_iter)):
-        emb = (domain.embed(p) - offset) / scale  # (N, S, m)
-        resid = eval_rbf(np_, rw, pc, emb) - q  # (N, S, R)
-        j_auth = (
-            eval_rbf_jacobian(np_, rw, pc, emb) / scale  # (N, S, R, m)
-        ) @ domain.embed_jacobian(p)  # @ (N, S, m, n) -> (N, S, R, n)
-        jt = j_auth.transpose(-1, -2)  # (N, S, n, R)
-        jtj = jt @ j_auth  # (N, S, n, n)
-        jtr = jt @ resid.unsqueeze(-1)  # (N, S, n, 1)
-        # Marquardt-scaled damping (relative to each diagonal) plus a small
-        # absolute floor for rank-deficient directions.
-        diag = torch.diagonal(jtj, dim1=-2, dim2=-1)  # (N, S, n)
-        reg = torch.diag_embed(
-            damping * diag.clamp(min=_INVERSION_DIAG_FLOOR)
-            + _INVERSION_DIAG_FLOOR
-        )
-        # Collapse the ``(N, S)`` batch into one leading dim and solve on
-        # contiguous inputs.  A size-1 leading batch — the single-query
-        # ``score_aggregate`` path runs at ``N=1`` — otherwise trips
-        # ``torch.linalg.solve``'s internal out-resize deprecation warning
-        # on MPS (it squeezes ``[1, S, n, n] → [S, n, n]`` internally);
-        # doing the squeeze explicitly here avoids it, bit-for-bit
-        # identical result.
-        A = jtj + reg                                    # (N, S, n, n)
-        n_dim = A.shape[-1]
-        bsz = A.shape[:-2]                               # (N, S)
-        step = torch.linalg.solve(
-            A.reshape(-1, n_dim, n_dim).contiguous(),
-            jtr.reshape(-1, n_dim, 1).contiguous(),
-        ).reshape(*bsz, n_dim)                           # (N, S, n)
-        p = domain.clamp_position(p - step)
+        p, _ = _gn_step(p, q, np_, rw, pc, offset, scale, domain, damping)
 
     # Best restart per query by final reduced-space residual norm.
     final_res = torch.linalg.vector_norm(_eval(p) - q, dim=-1)  # (N, S)
@@ -2115,8 +2231,7 @@ __all__ = [
     "fit_layer_subspace",
     "decompose",
     "rotate_toward",
-    "subspace_replace",
-    "subspace_rotate",
+    "inject_three_op",
     "PcaDiagnostics",
     "SpectralDiagnostics",
     "derive_pca_coords",

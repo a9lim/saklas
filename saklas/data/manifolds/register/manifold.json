@@ -1,5 +1,5 @@
 {
-  "format_version": 4,
+  "format_version": 5,
   "name": "register",
   "description": "SKETCH (structure only; node corpora not yet assembled). Discover-mode manifold folding the seven bundled register/style vectors into one derived surface: formal.casual, direct.indirect, verbose.concise, creative.conventional, humorous.serious, warm.clinical, technical.accessible. Nodes are the fourteen vector poles plus a neutral `default` anchor; each pole's corpus is to be assembled by splitting the corresponding bundled vector's contrastive pair statements (statements.json) into its positive/negative pole, so no new generation is required. fit_mode is `pca` (discover): the intrinsic dimensionality is genuinely unknown, which is exactly what makes this a discover rather than authored candidate. Hypothesis: the fourteen poles collapse to ~2-3 latent dims, a buttoned-up/formality axis (formal + clinical + technical + concise + direct) versus an expressive/warm-involvement axis (casual + warm + humorous + creative + accessible), with the Heylighen-Dewaele formality dimension as the theory anchor. var_threshold (default 0.70) picks the dim; max_subspace_dim caps it. If the fit lands at 2-D, the payoff is interpolated registers (e.g. a semi-formal warm-technical point) the linear vectors can only reach by ad-hoc composition.",
   "fit_mode": "pca",

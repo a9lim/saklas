@@ -150,7 +150,14 @@ def _sanitize_hyperparams(
 # materialize_bundled_manifolds to refresh the bundled fit on next
 # session start; user-fit v3 manifolds will need ``saklas vector
 # manifold fit`` to pick up the new field.
-MANIFOLD_FORMAT_VERSION = 4
+# v5 adds the per-layer ``origin_per_layer`` sidecar field (the per-layer
+# authoring-coordinate foot of the neutral mean, ``{str(L): [coord, ...]}``,
+# the cold-start foot seed).  Loading stays back-compatible — an absent
+# field loads as an empty dict (the apply path seeds a zero-coord foot per
+# layer), so no migration is needed; the bump just forces
+# materialize_bundled_manifolds to refresh the bundled fit so the origins
+# get baked on the next fit.
+MANIFOLD_FORMAT_VERSION = 5
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
@@ -1999,6 +2006,11 @@ def transfer_manifold(
     transferred = _dc_replace(
         src, layers=new_layers, explained_variance=new_ev,
         mahalanobis_share=new_share, lever=new_lever,
+        # ``origin`` is the per-layer foot of the *source* model's neutral
+        # mean — a per-model quantity invalid in target space (same reason
+        # share + lever are cleared); the apply path falls back to a
+        # zero-coord seed per layer.
+        origin={},
     )
 
     out_path = folder / tensor_filename(to_model, transferred_from=from_model)
