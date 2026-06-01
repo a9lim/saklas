@@ -785,3 +785,62 @@ def test_affine_manifold_point_round_trip():
     assert torch.allclose(mfld.manifold_point(7, (-s,)), c_neg, atol=1e-4)
     # midpoint coord lands at the mean
     assert torch.allclose(mfld.manifold_point(7, (0.0,)), mean, atol=1e-4)
+
+
+def test_save_load_affine_manifold_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flat (folded-vector) manifold survives save/load: ``is_affine``
+    preserved, mean/basis bit-identical, eval matches, and the on-disk
+    payload carries *no* RBF triple (the absence-of-node_params marker)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    sub_a, _ = _folded_vector(dim=18, seed=1)
+    sub_b, _ = _folded_vector(dim=18, seed=2)
+    manifold = Manifold(
+        name="folded",
+        domain=CustomDomain(1),
+        node_labels=["pos", "neg"],
+        node_coords=torch.tensor([[0.8], [-0.8]]),
+        layers={5: sub_a, 11: sub_b},
+        feature_space="raw",
+        mahalanobis_share={5: 1.2, 11: 0.7},
+        origin={5: torch.tensor([0.0]), 11: torch.tensor([0.0])},
+    )
+    path = tmp_path / "folded" / "model.safetensors"
+    save_manifold(manifold, path, {"method": "folded_vector",
+                                   "share_metric": "mahalanobis"})
+
+    # The on-disk payload omits the RBF triple + coord normalization for the
+    # flat layers — only mean + basis (plus the shared node_coords).
+    from safetensors.torch import load_file as _load_file
+    raw = _load_file(str(path))
+    assert "node_coords" in raw
+    for idx in (5, 11):
+        assert f"layer_{idx}.mean" in raw
+        assert f"layer_{idx}.basis" in raw
+        assert f"layer_{idx}.node_params" not in raw
+        assert f"layer_{idx}.rbf_weights" not in raw
+        assert f"layer_{idx}.poly_coeffs" not in raw
+        assert f"layer_{idx}.coord_offset" not in raw
+        assert f"layer_{idx}.coord_scale" not in raw
+
+    loaded = load_manifold(path)
+    assert sorted(loaded.layers) == [5, 11]
+    assert loaded.mahalanobis_share == {5: 1.2, 11: 0.7}
+    assert torch.allclose(loaded.node_coords, manifold.node_coords)
+    for idx in (5, 11):
+        a, b = manifold.layers[idx], loaded.layers[idx]
+        assert b.is_affine
+        assert b.node_params is None
+        assert torch.allclose(a.mean, b.mean)
+        assert torch.allclose(a.basis, b.basis)
+        # identity coord normalization is rebuilt from the basis shape
+        assert torch.allclose(b.coord_offset, torch.zeros(b.rank))
+        assert torch.allclose(b.coord_scale, torch.ones(b.rank))
+        # evaluation matches after the round-trip
+        for c in (-0.5, 0.0, 0.8):
+            assert torch.allclose(
+                loaded.manifold_point(idx, (c,)),
+                manifold.manifold_point(idx, (c,)),
+                atol=1e-4,
+            )

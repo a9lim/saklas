@@ -1847,6 +1847,13 @@ def save_manifold(
     (name, domain spec, ordered node labels, feature space), the per-layer
     ``origin_per_layer`` (the authoring-coordinate foot of the neutral mean,
     keyed by layer), plus the provenance fields in ``metadata``.
+
+    **Affine (flat / folded-vector) layers** write only ``layer_<L>.mean`` +
+    ``layer_<L>.basis`` — there is no RBF triple and the coord normalization
+    is identity (reconstructed from the basis shape by
+    :meth:`LayerSubspace.affine` on load).  The *absence* of ``node_params``
+    on disk is the read-side affine marker ``load_manifold`` keys on, so a
+    folded-vector artifact and a fitted manifold share one save/load path.
     """
     from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
 
@@ -1859,12 +1866,15 @@ def save_manifold(
         "node_coords": manifold.node_coords.contiguous().to(torch.float32).cpu(),
     }
     for idx, sub in manifold.layers.items():
-        # NOTE: affine (flat) subspace serialization lands in Phase 2 §4
-        # (folded-vector extraction); ``rbf_params()`` raises here until then,
-        # so a flat artifact can't be silently half-written.
-        np_, rw, pc = sub.rbf_params()
         tensors[f"layer_{idx}.mean"] = sub.mean.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.basis"] = sub.basis.contiguous().to(torch.float32).cpu()
+        if sub.is_affine:
+            # Flat (folded-vector) subspace: no RBF surface, and the coord
+            # normalization is identity — rebuilt from the basis shape by
+            # ``LayerSubspace.affine`` on load.  Persist mean + basis only;
+            # the *absence* of ``node_params`` on disk is the affine marker.
+            continue
+        np_, rw, pc = sub.rbf_params()
         tensors[f"layer_{idx}.node_params"] = np_.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.rbf_weights"] = rw.contiguous().to(torch.float32).cpu()
         tensors[f"layer_{idx}.poly_coeffs"] = pc.contiguous().to(torch.float32).cpu()
@@ -1974,6 +1984,14 @@ def load_manifold(path: str | Path) -> Manifold:
 
     layers: dict[int, LayerSubspace] = {}
     for idx, parts in by_layer.items():
+        if "node_params" not in parts:
+            # Affine (flat / folded-vector) layer — only mean + basis on disk;
+            # the coord normalization is identity, rebuilt from the basis
+            # shape.  Read side of ``save_manifold``'s affine branch.
+            layers[idx] = LayerSubspace.affine(
+                mean=parts["mean"], basis=parts["basis"],
+            )
+            continue
         layers[idx] = LayerSubspace(
             mean=parts["mean"],
             basis=parts["basis"],
