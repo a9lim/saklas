@@ -1050,11 +1050,23 @@ class ManifoldExtractionPipeline:
                 ref_stack, method=mf.fit_mode, **hyperparams,
             )
             k = derived_coords.shape[1]
-            floor = min_nodes(k)
+            # Node-count floor.  The curved (spectral) path fits an RBF
+            # surface and needs the poisedness floor ``min_nodes(k) = 2k+1``.
+            # The flat (``pca``) path fits an *affine* subspace with no RBF —
+            # it only needs ``k+1`` affinely-independent centroids to span a
+            # k-dim subspace, so a rank-1 (k=1) fit is valid at K=2: that is a
+            # difference-of-means steering vector (ARCHITECTURE §1/§5, "a
+            # vector = a 2-node fit_mode=pca folder").
+            if mf.fit_mode == "pca":
+                floor = k + 1
+                floor_reason = "to span the affine subspace"
+            else:
+                floor = min_nodes(k)
+                floor_reason = "for the RBF fit"
             if K < floor:
                 raise ValueError(
                     f"discover manifold {mf.name!r}: picked k={k} needs "
-                    f">= {floor} nodes for the RBF fit, got K={K}"
+                    f">= {floor} nodes {floor_reason}, got K={K}"
                 )
             # Origin anchoring (pca-discover only).  Find the anchor
             # node by label, take its row from ``derived_coords`` as the

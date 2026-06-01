@@ -597,17 +597,49 @@ def test_discover_inject_three_op_moves_toward_target(tmp_path: Path) -> None:
         )
 
 
-def test_discover_enforces_min_nodes_after_picking_k(tmp_path: Path) -> None:
-    """If the picker picks a k for which the heap is too small, fit raises.
-
-    With only 4 nodes and ``max_dim=4`` (forcing picked_k=4 in the
-    cumulative-variance scan since cumvar can't cross 0.70 lower), the
-    ``min_nodes(4) = 9`` floor blocks the fit.
+def test_discover_pca_two_node_is_steering_vector(tmp_path: Path) -> None:
+    """A 2-node ``fit_mode=pca`` folder *is* a difference-of-means steering
+    vector — the 4.0 unification (ARCHITECTURE §1/§5, "a vector = a 2-node
+    folder").  K=2 ⇒ a rank-1 affine subspace; the RBF poisedness floor
+    ``min_nodes(1)=3`` does **not** gate the flat path (only ``k+1=2``
+    centroids are needed to span a 1-D subspace).  Each layer's two node
+    coords straddle the origin — the μ-centered pos/neg contrast is the DiM
+    axis itself.
     """
-    labels = ["a", "b", "c", "d"]
     folder = _discover_folder(
-        tmp_path, fit_mode="pca", labels=labels,
-        hyperparams={"max_dim": 4, "var_threshold": 0.999},
+        tmp_path, name="anger", fit_mode="pca",
+        labels=["angry", "calm"],
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
     )
-    with pytest.raises(ValueError, match=r"min_nodes|>= \d+ nodes"):
-        ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert manifold.domain.intrinsic_dim == 1          # rank-1 == a vector
+    assert manifold.node_labels == ["angry", "calm"]
+    assert manifold.node_coords.shape == (2, 1)
+    assert manifold.layers                             # survived DLS
+    for sub in manifold.layers.values():
+        assert sub.is_affine                           # flat — no RBF surface
+        assert sub.rank == 1
+        assert sub.node_coords is not None
+        assert sub.node_coords.shape == (2, 1)         # (K, R) = (2, 1)
+        # μ-centered ⇒ the angry/calm coords sit on opposite sides of 0:
+        # the difference-of-means axis, with neutral implicitly between.
+        assert sub.node_coords[0, 0] * sub.node_coords[1, 0] < 0
+
+
+def test_discover_pca_flat_fit_skips_rbf_floor(tmp_path: Path) -> None:
+    """The flat (``pca``) path is gated by the affine-span floor ``k+1``, not
+    the RBF poisedness floor ``2k+1``: a flat subspace has no interpolant to
+    keep poised.  Three nodes picking ``k=2`` fit fine (``3 == k+1``) where the
+    old ``min_nodes(2)=5`` floor would have raised.  The ``2k+1`` floor stays in
+    force on the curved (``spectral``) path.
+    """
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca", labels=["a", "b", "c"],
+        hyperparams={"max_dim": 2, "var_threshold": 0.999},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert manifold.domain.intrinsic_dim <= 2
+    assert manifold.layers
+    for sub in manifold.layers.values():
+        assert sub.is_affine
