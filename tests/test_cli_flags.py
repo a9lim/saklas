@@ -900,19 +900,12 @@ def test_split_variant_suffix_parses_sae_variants():
     from saklas.cli.runners import _split_variant_suffix
     assert _split_variant_suffix("honest") == ("honest", None)
     assert _split_variant_suffix("honest:raw") == ("honest", "raw")
-    assert _split_variant_suffix("honest:pca") == ("honest", "pca")
     assert _split_variant_suffix("honest:sae") == ("honest", "sae")
     assert _split_variant_suffix("honest:sae-my-release") == (
         "honest", "sae-my-release",
     )
-    assert _split_variant_suffix("honest:sae-my-release-pca") == (
-        "honest", "sae-my-release-pca",
-    )
     assert _split_variant_suffix("honest:role-pirate") == (
         "honest", "role-pirate",
-    )
-    assert _split_variant_suffix("honest:role-pirate-pca") == (
-        "honest", "role-pirate-pca",
     )
     assert _split_variant_suffix("honest:from-google__gemma-4-31b-it") == (
         "honest", "from-google__gemma-4-31b-it",
@@ -933,20 +926,15 @@ def test_resolve_variant_tensor_accepts_full_variant_family(tmp_path: Path):
     model_id = "fake/model"
     folder = tmp_path / "angry.calm"
     folder.mkdir()
-    pca = folder / tensor_filename(model_id, method="pca")
     role = folder / tensor_filename(model_id, role="pirate")
-    role_pca = folder / tensor_filename(model_id, role="pirate", method="pca")
     transferred = folder / tensor_filename(
         model_id, transferred_from="google/gemma-4-31b-it",
     )
-    for path in (pca, role, transferred):
+    for path in (role, transferred):
         path.write_bytes(b"x")
 
-    assert _resolve_variant_tensor(folder, model_id, "pca") == pca
     assert _resolve_variant_tensor(folder, model_id, "role") == role
     assert _resolve_variant_tensor(folder, model_id, "role-pirate") == role
-    role_pca.write_bytes(b"x")
-    assert _resolve_variant_tensor(folder, model_id, "role-pirate-pca") == role_pca
     assert (
         _resolve_variant_tensor(folder, model_id, "from-google__gemma-4-31b-it")
         == transferred

@@ -123,13 +123,6 @@ def test_tensor_filename_roundtrip_role():
     assert parsed == ("google__gemma-2-2b-it", "role-pirate")
 
 
-def test_tensor_filename_role_with_method_pca():
-    name = paths.tensor_filename("google/gemma-2-2b-it", role="pirate", method="pca")
-    assert name == "google__gemma-2-2b-it_role-pirate_pca.safetensors"
-    parsed = paths.parse_tensor_filename(name)
-    assert parsed == ("google__gemma-2-2b-it", "role-pirate-pca")
-
-
 def test_tensor_filename_role_excludes_sae():
     import pytest as _pytest
 
@@ -166,6 +159,3 @@ def test_sidecar_filename_role_partners_tensor():
     assert paths.sidecar_filename("google/gemma-2-2b-it", role="pirate") == (
         "google__gemma-2-2b-it_role-pirate.json"
     )
-    assert paths.sidecar_filename(
-        "google/gemma-2-2b-it", role="pirate", method="pca"
-    ) == "google__gemma-2-2b-it_role-pirate_pca.json"

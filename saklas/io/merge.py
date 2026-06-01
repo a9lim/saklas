@@ -118,10 +118,8 @@ def _variant_tensor_path(
 ) -> Path:
     """Resolve a per-model tensor path honoring ``:variant`` suffix.
 
-    Pre-v2.1 merge always loaded ``cf.tensor_path(sid)`` regardless of
-    parsed variant, so ``default/foo:pca`` silently picked the raw DiM
-    tensor instead of the PCA one.  ``enumerate_variants`` is the
-    canonical lookup — ``"raw"`` / ``"pca"`` / ``"sae-<release>"`` etc.
+    ``enumerate_variants`` is the canonical lookup — ``"raw"`` /
+    ``"sae-<release>"`` / ``"role-<name>"`` / ``"from-<safe_src>"``.
     """
     from saklas.io.packs import enumerate_variants
 

@@ -847,8 +847,8 @@ def _run_config_validate(args: argparse.Namespace) -> None:
 
 
 _VARIANT_SUFFIX_RE = re.compile(
-    r"^(raw|pca|sae(?:-[a-z0-9._-]+)?(?:-pca)?|"
-    r"role(?:-[a-z0-9._-]+)?(?:-pca)?|from(?:-[a-z0-9._-]+)?)$"
+    r"^(raw|sae(?:-[a-z0-9._-]+)?|"
+    r"role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
 )
 
 
@@ -882,7 +882,6 @@ def _resolve_variant_tensor(
       - ``None`` (no suffix passed): prefer raw safetensors, fall back
         to GGUF.
       - ``"raw"``: require the raw safetensors tensor.
-      - ``"pca"``: require the raw legacy-PCA tensor.
       - ``"sae"``: require the unique SAE variant; raise
         :class:`AmbiguousVariantError` when >1, :class:`UnknownVariantError`
         when 0.
@@ -906,9 +905,6 @@ def _resolve_variant_tensor(
     if variant == "raw":
         return variants.get("raw")
 
-    if variant == "pca":
-        return variants.get("pca")
-
     if variant in {"sae", "role", "from"}:
         prefix = f"{variant}-"
         display = "SAE" if variant == "sae" else variant
@@ -927,7 +923,7 @@ def _resolve_variant_tensor(
         return next(iter(kind_paths.values()))
 
     # Specific variant key (``sae-<release>``, ``role-<slug>``,
-    # ``from-<safe_src>``, and the ``*-pca`` companions).
+    # ``from-<safe_src>``).
     path = variants.get(variant)
     if path is None:
         raise UnknownVariantError(

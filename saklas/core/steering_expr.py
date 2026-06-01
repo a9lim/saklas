@@ -27,7 +27,7 @@ Grammar::
                                                        # 2→along,onto.
                                                        # Optional; defaults
                                                        # to DEFAULT_COEFF = 0.5
-    variant     := "raw" | "pca" | "sae" | "sae-" ID
+    variant     := "raw" | "sae" | "sae-" ID
                  | "role" | "role-" ID | "from" | "from-" ID
 
 ``!`` mean-ablates the selector (``h' = h − α(h·d̂ − μ·d̂)d̂``; bare

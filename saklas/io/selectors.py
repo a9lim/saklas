@@ -26,7 +26,7 @@ from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata
 from saklas.io.paths import manifolds_dir, vectors_dir
 
 _VARIANT_REGEX = _re.compile(
-    r"^(raw|pca|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
+    r"^(raw|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
 )
 
 

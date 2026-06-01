@@ -438,23 +438,22 @@ def test_variants_for_concept_includes_role(tmp_path: Path):
     assert result["role-pirate"].name == "google__gemma-2-2b-it_role-pirate.safetensors"
 
 
-def test_variants_for_concept_role_and_pca_combo(tmp_path: Path):
-    """Role and role-PCA variants are surfaced under distinct keys."""
+def test_variants_for_concept_role(tmp_path: Path):
+    """A role variant is surfaced under its ``role-<name>`` key, distinct
+    from the raw DiM tensor."""
     from saklas.io.packs import enumerate_variants
 
     folder = tmp_path / "honest.deceptive"
     folder.mkdir()
+    (folder / "google__gemma-2-2b-it.safetensors").write_bytes(b"")
+    (folder / "google__gemma-2-2b-it.json").write_text("{}")
     (folder / "google__gemma-2-2b-it_role-pirate.safetensors").write_bytes(b"")
     (folder / "google__gemma-2-2b-it_role-pirate.json").write_text("{}")
-    (folder / "google__gemma-2-2b-it_role-pirate_pca.safetensors").write_bytes(b"")
-    (folder / "google__gemma-2-2b-it_role-pirate_pca.json").write_text("{}")
 
     result = enumerate_variants(folder, "google/gemma-2-2b-it")
-    assert set(result.keys()) == {"role-pirate", "role-pirate-pca"}
+    assert set(result.keys()) == {"raw", "role-pirate"}
+    assert result["raw"].name == "google__gemma-2-2b-it.safetensors"
     assert result["role-pirate"].name == "google__gemma-2-2b-it_role-pirate.safetensors"
-    assert result["role-pirate-pca"].name == (
-        "google__gemma-2-2b-it_role-pirate_pca.safetensors"
-    )
 
 
 def test_sidecar_role_roundtrip(tmp_path: Path):

@@ -1225,8 +1225,8 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path: Any, monkeypatch: Any
                      concept_label: Any = None, **_kwargs: Any) -> Any:
         captured["sae"] = sae
         return ({0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}, {})
-    # Stub both extractors — pipeline dispatches to DiM by default in v2.1+,
-    # PCA via ``method="pca"``.  Test is method-agnostic; intercept both.
+    # Stub the extractor at both the source module and the pipeline's
+    # import binding so the dispatch reaches the fake.
     monkeypatch.setattr(V, "extract_difference_of_means", fake_extract)
     monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
 
@@ -1296,9 +1296,8 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path: Any, monkeypatch: Any
     expected_tensor = concept_folder / "m_sae-mock-release.safetensors"
     assert expected_tensor.exists()
 
-    # Sidecar carries sae metadata.  Default method is DiM (v2.1+); the
-    # SAE branch records ``"dim_sae"``.  Pass ``method="pca"`` to recover
-    # the legacy ``"pca_center_sae"`` label.
+    # Sidecar carries sae metadata.  The SAE-DiM branch records the
+    # ``"dim_sae"`` method label.
     with open(expected_tensor.with_suffix(".json")) as f:
         sidecar = json.load(f)
     assert sidecar["method"] == "dim_sae"
