@@ -710,6 +710,40 @@ class LayerSubspace:
             node_coords=node_coords,
         )
 
+    def select_axes(self, kept: Sequence[int]) -> "LayerSubspace":
+        """Restrict an affine subspace to a subset of its basis rows (DLS prune).
+
+        Slices ``basis`` + ``node_coords`` to the ``kept`` axis indices and
+        recomputes ``mean`` as the projection of the *same* anchor into the
+        reduced span (``mean' = P_{basis[kept]}(anchor)``) — recovered from the
+        stored ``mean`` without the raw anchor, since the anchor's per-axis
+        coords are ``mean @ basisᵀ`` (the basis is orthonormal).  Affine only
+        — a curved subspace's per-axis pruning would force an RBF re-fit, so
+        the split is flat-yes / curved-no (§5).  ``kept`` indexes into
+        ``[0, rank)``; an empty ``kept`` is a caller error (drop the layer).
+
+        Bakes the DLS keep set into the stored basis at fit time (the N-node
+        analogue of the folded vector dropping a non-discriminative *layer*),
+        so the steer/apply path needs no separate per-axis mask.
+        """
+        if not self.is_affine:
+            raise ValueError(
+                "select_axes is affine-only (curved has no per-axis DLS)"
+            )
+        idx = list(kept)
+        if not idx:
+            raise ValueError(
+                "select_axes: empty kept set — drop the layer instead"
+            )
+        basis_k = self.basis[idx].contiguous()                 # (|kept|, D)
+        anchor_coords = self.mean @ self.basis.T               # (R,) anchor coords
+        mean_k = anchor_coords[idx] @ basis_k                  # P_{basis[kept]}(anchor)
+        nc_k = (
+            self.node_coords[:, idx].contiguous()
+            if self.node_coords is not None else None
+        )
+        return LayerSubspace.affine(mean_k, basis_k, node_coords=nc_k)
+
     def rbf_params(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The validated ``(node_params, rbf_weights, poly_coeffs)`` triple.
 

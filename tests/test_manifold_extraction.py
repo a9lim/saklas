@@ -417,6 +417,31 @@ def test_discover_pca_produces_custom_domain(tmp_path: Path) -> None:
     assert sorted(manifold.layers) == list(range(_N_LAYERS))
 
 
+def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
+    """PCA discover fits a **flat affine** subspace per layer (no RBF surface)
+    — the 4.0 reclassification (ARCHITECTURE §1/§5): a personas-shaped artifact
+    is a rank-k flat subspace, not a curved manifold.  Each layer carries the
+    real per-layer node coords ``(K, R)``; the basis is Euclidean (δ-raw
+    invariant — the whitened gate flips at Step 8)."""
+    folder = _discover_folder(
+        tmp_path, fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    assert manifold.layers  # at least one layer survived DLS
+    for sub in manifold.layers.values():
+        assert sub.is_affine                          # flat — no RBF surface
+        with pytest.raises(ValueError, match="affine"):
+            sub.rbf_params()                          # no RBF triple
+        assert sub.node_coords is not None            # real per-layer coords
+        assert sub.node_coords.shape[0] == 5          # one row per node
+        assert sub.node_coords.shape[1] == sub.rank   # (K, R)
+    # subspace_metric records Euclidean (δ-raw invariant) even if a whitener
+    # covered — the share may still be whitened; the two need not agree here.
+    sidecar = json.loads((folder / "stub-model.json").read_text())
+    assert sidecar["subspace_metric"] == "euclidean"
+
+
 def test_discover_records_fit_mode_and_diagnostics(tmp_path: Path) -> None:
     """The sidecar carries fit_mode + diagnostics so the inspector can render."""
     folder = _discover_folder(

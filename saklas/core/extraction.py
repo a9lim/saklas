@@ -825,6 +825,7 @@ class ManifoldExtractionPipeline:
             compute_node_centroid,
             discover_coords,
             domain_from_spec,
+            fit_affine_subspace,
             fit_layer_subspace,
             invert_parameterization,
             layer_lever,
@@ -832,6 +833,7 @@ class ManifoldExtractionPipeline:
             save_manifold,
             subspace_share,
         )
+        from saklas.core.vectors import compute_dls_axes
         from saklas.io.manifolds import (
             ManifoldFolder, ManifoldSidecar, min_nodes,
         )
@@ -1157,75 +1159,122 @@ class ManifoldExtractionPipeline:
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
             fit_kwargs["n_components"] = max_subspace_dim_override
-        for idx in fit_layers:
-            stacked = torch.stack(
-                [per_node[k][idx] for k in range(K)]
-            )  # (K, D) fp32 CPU
+
+        def _stacked_centroids(idx: int) -> torch.Tensor:
+            s = torch.stack([per_node[k][idx] for k in range(K)])  # (K, D) fp32 CPU
             if sae_backend is not None:
                 with torch.no_grad():
-                    feat = sae_backend.encode_layer(idx, stacked.to(device))
+                    feat = sae_backend.encode_layer(idx, s.to(device))
                     recon = sae_backend.decode_layer(idx, feat)
-                stacked = recon.detach().to("cpu", torch.float32)
-            # ``maha_whitener`` is the covers_all-gated whitener (None
-            # unless it covers every fit layer).  When present it switches
-            # ``fit_layer_subspace`` to whitened/Fisher PCA — de-rogued
-            # subspace selection that also collapses the angular norm
-            # artifact (see ``fit_layer_subspace`` docstring).  The same
-            # gate drives the Mahalanobis share below, so subspace metric
-            # and share metric always agree.  ``neutral_mean`` neutral-anchors
-            # the frame (independent of the whitener — the anchor needs only
-            # the layer mean).
-            neutral_L = (
+                s = recon.detach().to("cpu", torch.float32)
+            return s
+
+        def _neutral_for(idx: int) -> "torch.Tensor | None":
+            return (
                 _handle_means[idx]
                 if _handle_means is not None and idx in _handle_means
                 else None
             )
-            sub, ev_ratio = fit_layer_subspace(
-                stacked, node_params,
-                whitener=maha_whitener, layer=idx, neutral_mean=neutral_L,
-                **fit_kwargs,
+
+        def _bake_share_lever(
+            idx: int, sub: Any, mu_coords: torch.Tensor,
+        ) -> None:
+            # Per-layer budget = the **μ-centered** (anchor-independent)
+            # whitened spread (§5 / ``subspace_share``): the share measures
+            # signal spread, not where neutral sits.  ``mahalanobis_share`` is
+            # *kept* (the budget weight) even while the basis stays Euclidean
+            # (δ-raw invariant) — coords carry the position, share the budget.
+            # The lever (typical in-subspace norm fraction) divides the
+            # apply-time gain for R-/metric-invariance.  Both gated on the
+            # covers-all whitener; absent ⇒ Euclidean spread + ``N = 1``.
+            if maha_whitener is None:
+                return
+            mahalanobis_share[idx] = subspace_share(
+                mu_coords, sub.basis, whitener=maha_whitener, layer=idx,
             )
-            layer_subs[idx] = sub
-            explained_variance[idx] = ev_ratio
-            if maha_whitener is not None:
-                # Per-layer budget = the **μ-centered** (anchor-independent)
-                # whitened spread (§5 / ``subspace_share``): the share measures
-                # signal spread, not where neutral sits.  We center on the
-                # centroid mean ``μ`` *explicitly* rather than reading
-                # ``eval_rbf(node_params)``, because the surface is now
-                # neutral-anchored (the RBF node values are ``(c−ν)·Bᵀ``, not
-                # μ-centered).  At K=2 this is ``‖δ_L‖_M/√2`` ∝ the DiM bake
-                # share; ``subspace_share`` unifies it with the flat path.
+            if _handle_means is not None and idx in _handle_means:
+                X_c, _K, _lam = maha_whitener.woodbury_factors(
+                    idx, device=torch.device("cpu"), dtype=torch.float32,
+                )
+                mu = _handle_means[idx].to(
+                    device="cpu", dtype=torch.float32,
+                ).reshape(-1)
+                lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
+
+        if mf.fit_mode == "pca":
+            # FLAT affine fit — the discover-``pca`` path is a flat rank-``k``
+            # subspace, not an RBF surface (ARCHITECTURE §1/§5).  Per layer:
+            # ``fit_affine_subspace`` (μ-centered PCA basis at the derived
+            # intrinsic dim ``k``, neutral-anchored frame, real per-layer node
+            # coords).  **Euclidean basis for now** (no whitener into the fit)
+            # per the δ-raw invariant — the whitened-PCA gate flips at the
+            # Step 8 GPU spot-check; the whitener still weights the share/lever.
+            # The shared ``node_coords`` stays the derived PCA layout
+            # (display/labels); the real per-layer steer coords live on each
+            # ``LayerSubspace.node_coords``.
+            affine_kwargs = dict(fit_kwargs)
+            # rank = the derived intrinsic dim (the shared layout's width — set
+            # for every fit_mode, so always bound here unlike the discover-only
+            # ``k``); ``max_subspace_dim`` override in ``fit_kwargs`` wins.
+            affine_kwargs.setdefault("n_components", int(node_coords.shape[1]))
+            raw_fits: dict[int, tuple[Any, torch.Tensor]] = {}
+            stacks: dict[int, torch.Tensor] = {}
+            for idx in fit_layers:
+                stacked = _stacked_centroids(idx)
+                stacks[idx] = stacked
+                sub, mu_coords, ev_ratio = fit_affine_subspace(
+                    stacked, neutral_mean=_neutral_for(idx),
+                    orient_to=0, **affine_kwargs,
+                )
+                raw_fits[idx] = (sub, mu_coords)
+                explained_variance[idx] = ev_ratio
+            # Per-axis DLS straddle over all fit layers at once (flat → DLS;
+            # the global all-fail fallback matches the folded-vector path).
+            dls_kept = compute_dls_axes(
+                {idx: stacks[idx] for idx in raw_fits},
+                {idx: raw_fits[idx][0].basis for idx in raw_fits},
+                _handle_means,
+            )
+            for idx, (sub, mu_coords) in raw_fits.items():
+                kept = sorted(dls_kept.get(idx, set()))
+                if not kept:
+                    continue  # no axis straddles the baseline → drop the layer
+                if len(kept) < sub.rank:
+                    sub = sub.select_axes(kept)
+                    mu_coords = mu_coords[:, kept]
+                layer_subs[idx] = sub
+                _bake_share_lever(idx, sub, mu_coords)
+        else:
+            # CURVED (authored / spectral): RBF surface fit, neutral-anchored.
+            for idx in fit_layers:
+                stacked = _stacked_centroids(idx)
+                # ``neutral_mean`` neutral-anchors the frame; ``maha_whitener``
+                # still selects the (whitened/Fisher) basis on the curved path
+                # — see the Step-3 basis-metric note (curved keeps its existing
+                # whitened selection pending the Step 8 gate decision).
+                sub, ev_ratio = fit_layer_subspace(
+                    stacked, node_params,
+                    whitener=maha_whitener, layer=idx,
+                    neutral_mean=_neutral_for(idx), **fit_kwargs,
+                )
+                layer_subs[idx] = sub
+                explained_variance[idx] = ev_ratio
+                # μ-centered share (NOT ``eval_rbf(node_params)`` — the surface
+                # is neutral-anchored, so its node values aren't μ-centered).
                 mu_centered = stacked.to(torch.float32)
                 mu_centered = mu_centered - mu_centered.mean(dim=0)
                 mu_coords = mu_centered @ sub.basis.to(torch.float32).T  # (K, R)
-                mahalanobis_share[idx] = subspace_share(
-                    mu_coords, sub.basis, whitener=maha_whitener, layer=idx,
-                )
-
-                # Steering lever from the neutral activations: uncenter the
-                # whitener's centered observations with the layer mean to
-                # recover the raw activation stand-ins, then measure the
-                # typical in-subspace norm fraction.  Skipped (left absent →
-                # ``N = 1`` at apply) if the layer mean isn't resolvable.
-                if _handle_means is not None and idx in _handle_means:
-                    X_c, _K, _lam = maha_whitener.woodbury_factors(
-                        idx, device=torch.device("cpu"), dtype=torch.float32,
-                    )
-                    mu = _handle_means[idx].to(
-                        device="cpu", dtype=torch.float32,
-                    ).reshape(-1)
-                    lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
+                _bake_share_lever(idx, sub, mu_coords)
 
         # Origin ``O_L`` — the per-layer foot of the neutral mean on ``M``, in
-        # authoring coords ``(n,)``.  Each layer's cold-start foot seed (and the
-        # ``!`` slide-to target in Phase 2): per-layer because each layer embeds
-        # the shared authoring coords differently, so neutral's foot differs by
-        # depth.  Needs the neutral mean (the probe-centering baseline) per
-        # layer; layers whose mean isn't resolvable (CPU stub) are simply
-        # absent, and the apply path seeds them at ``zeros(n)``.
+        # authoring coords ``(n,)``.  **Curved only** — a flat affine subspace's
+        # surface fills its span, so neutral's foot is reduced-coord 0 (the
+        # ``!`` ablation target) with no stored origin (§2); routing an affine
+        # subspace through ``invert_parameterization`` would also hit
+        # ``rbf_params()`` and raise.  Each layer's cold-start foot seed; layers
+        # whose mean isn't resolvable (CPU stub) are simply absent.
         origin: dict[int, torch.Tensor] = {}
-        if _handle_means is not None:
+        if mf.fit_mode != "pca" and _handle_means is not None:
             for idx, sub in layer_subs.items():
                 if idx not in _handle_means:
                     continue
@@ -1265,14 +1314,16 @@ class ManifoldExtractionPipeline:
             "share_metric": (
                 "mahalanobis" if maha_whitener is not None else "euclidean"
             ),
-            # Which metric the per-layer PCA *subspace selection* used.
-            # Gated by the same ``maha_whitener`` as the share, so the two
-            # always agree: "mahalanobis" => whitened/Fisher PCA (de-rogued
-            # directions, collapsed angular norm artifact); "euclidean" =>
-            # ordinary centroid PCA (the legacy shape, what no-whitener
-            # fits carry).
+            # Which metric the per-layer PCA *subspace selection* used.  The
+            # flat (``pca``) path is **Euclidean for now** (δ-raw invariant —
+            # the whitened-PCA gate flips at Step 8), so it records "euclidean"
+            # even when the whitener covers (the share is still whitened — the
+            # two need NOT agree here).  The curved path keeps its whitened/
+            # Fisher selection when the whitener covers ("mahalanobis" =>
+            # de-rogued directions), else Euclidean.
             "subspace_metric": (
-                "mahalanobis" if maha_whitener is not None else "euclidean"
+                "euclidean" if mf.fit_mode == "pca"
+                else ("mahalanobis" if maha_whitener is not None else "euclidean")
             ),
         }
         if sae_backend is not None:
