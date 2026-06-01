@@ -19,6 +19,7 @@ from saklas.core.manifold import load_manifold, save_manifold
 from saklas.core.vectors import (
     _fold_centroids_to_affine_manifold,
     extract_difference_of_means,
+    fold_directions_to_subspace,
     fold_vector_to_subspace,
     folded_vector_directions,
 )
@@ -211,6 +212,41 @@ def test_folded_vector_directions_rejects_curved():
     )
     with pytest.raises(ValueError, match="affine"):
         folded_vector_directions(mfld)
+
+
+def test_fold_directions_to_subspace_neutral_anchored():
+    """A derived direction folds to a one-pole ray anchored at neutral:
+    basis = d̂, mean = neutral, origin = 0, share = ‖d‖, single +1 node."""
+    d = 8
+    dir0, dir1 = torch.randn(d), torch.randn(d)
+    directions = {2: dir0, 5: dir1}
+    neutral = {2: 10.0 + torch.randn(d), 5: 3.0 + torch.randn(d)}
+    mfld = fold_directions_to_subspace(
+        "merged", directions, neutral, label="merged",
+    )
+    assert mfld.node_labels == ["merged"]
+    assert torch.allclose(mfld.node_coords, torch.tensor([[1.0]]))
+    assert mfld.metadata["share_metric"] == "euclidean"
+    for L, raw in ((2, dir0), (5, dir1)):
+        sub = mfld.layers[L]
+        assert sub.is_affine and sub.rank == 1
+        assert torch.allclose(sub.basis.reshape(-1), raw / raw.norm(), atol=1e-5)
+        assert torch.allclose(sub.mean, neutral[L], atol=1e-5)        # anchored at neutral
+        assert mfld.mahalanobis_share[L] == pytest.approx(float(raw.norm()), abs=1e-4)
+        assert mfld.origin[L].item() == pytest.approx(0.0, abs=1e-6)  # neutral foot = 0
+    # +1 pole lands a unit step along d̂ from neutral
+    assert torch.allclose(
+        mfld.manifold_point(2, (1.0,)), neutral[2] + dir0 / dir0.norm(), atol=1e-4,
+    )
+
+
+def test_fold_directions_drops_zero_and_anchors_at_origin_without_neutral():
+    d = 5
+    directions = {0: torch.randn(d), 1: torch.zeros(d)}   # layer 1 degenerate
+    mfld = fold_directions_to_subspace("m", directions, None)  # no neutral
+    assert sorted(mfld.layers) == [0]
+    assert torch.allclose(mfld.layers[0].mean, torch.zeros(d))    # origin anchor
+    assert mfld.lever == {}                                        # no whitener/neutral
 
 
 def test_fold_share_matches_dim_bake_exactly(monkeypatch: pytest.MonkeyPatch):

@@ -1878,6 +1878,92 @@ def fold_vector_to_subspace(
     )
 
 
+def fold_directions_to_subspace(
+    name: str,
+    directions: dict[int, torch.Tensor],
+    neutral_means: dict[int, torch.Tensor] | None,
+    *,
+    whitener: "Any | None" = None,
+    label: str = "+",
+    feature_space: str = "raw",
+) -> "Any":  # -> saklas.core.manifold.Manifold
+    """Fold an arbitrary per-layer *direction* into a neutral-anchored affine
+    ``R = 1`` manifold (a one-pole ray).
+
+    The monopolar sibling of :func:`_fold_centroids_to_affine_manifold`: where
+    a bipolar concept folds a line through two pole centroids (mean = the
+    midpoint), a derived direction (a ``merge`` linear-combination, a `~`/`|`
+    projection of one concept onto another) has no pole pair — just a
+    direction to push along.  So the subspace is anchored at the **neutral
+    mean** (``mean = μ_L`` ⇒ origin ``O_L = (μ_L − mean)·d̂ = 0``) with a single
+    ``+1`` pole node, and steering ``along`` toward ``+1`` pushes the running
+    activation's ``d̂`` component away from neutral; ``!`` (``along``-to-``O``)
+    slides it back to neutral, i.e. ablates the direction.
+
+    Per layer: ``basis = d̂_L``; ``share = ‖d_L‖_M`` (whitened) / ``‖d_L‖₂``
+    (Euclidean), the same per-layer weight a folded vector carries so the
+    apply-time share normalization is uniform; ``lever`` from the neutral
+    activations when the whitener is present.  No DLS — a derived direction has
+    no polarity to run the centered opposite-sign test against; the caller's
+    layer set is folded verbatim.  ``neutral_means=None`` (CPU stubs) anchors
+    at the origin with no lever.
+    """
+    from saklas.core.manifold import (
+        CustomDomain, LayerSubspace, Manifold, layer_lever,
+    )
+
+    present = sorted(directions)
+    maha_w = (
+        whitener
+        if whitener is not None and whitener.covers_all(present)
+        else None
+    )
+
+    layers: dict[int, "LayerSubspace"] = {}
+    mahalanobis_share: dict[int, float] = {}
+    lever: dict[int, float] = {}
+    origin: dict[int, torch.Tensor] = {}
+    for idx in present:
+        d = directions[idx].to(torch.float32).reshape(-1)
+        norm = float(d.norm())
+        if norm <= 1e-12:
+            continue
+        basis = (d / norm).reshape(1, -1)          # (1, D) unit d̂
+        if neutral_means is not None and idx in neutral_means:
+            mean = neutral_means[idx].to(torch.float32).reshape(-1)
+        else:
+            mean = torch.zeros_like(d)
+        layers[idx] = LayerSubspace.affine(mean, basis)
+        mahalanobis_share[idx] = (
+            float(maha_w.mahalanobis_norm(idx, d))
+            if maha_w is not None else norm
+        )
+        # Neutral-anchored ⇒ the foot of neutral on the line is the origin.
+        origin[idx] = torch.zeros(1, dtype=torch.float32)
+        if maha_w is not None and neutral_means is not None and idx in neutral_means:
+            X_c, _K, _lam = maha_w.woodbury_factors(
+                idx, device=torch.device("cpu"), dtype=torch.float32,
+            )
+            lever[idx] = layer_lever(X_c + mean, mean, basis)
+
+    node_coords = torch.tensor([[1.0]], dtype=torch.float32)
+    manifold = Manifold(
+        name=name,
+        domain=CustomDomain(1),
+        node_labels=[label],
+        node_coords=node_coords,
+        layers=layers,
+        feature_space=feature_space,
+        mahalanobis_share=mahalanobis_share,
+        lever=lever,
+        origin=origin,
+    )
+    manifold.metadata["share_metric"] = (
+        "mahalanobis" if maha_w is not None else "euclidean"
+    )
+    return manifold
+
+
 def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
     """Baked-direction view of a folded (affine ``R = 1``) vector manifold.
 
