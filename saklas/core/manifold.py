@@ -1291,6 +1291,186 @@ def layer_lever(
     return float((num / den).mean().item())
 
 
+def _ortho_basis(
+    dirs: Sequence[torch.Tensor], *, eps: float = 1e-6,
+) -> tuple[torch.Tensor, list[int]]:
+    """Ordered Gram-Schmidt orthonormalization of a list of ``(D,)`` directions.
+
+    Processes ``dirs`` in order; each is unit-normalized first (a basis of the
+    *span* — input magnitudes are irrelevant), then a direction whose residual
+    norm after removing its projection onto the already-accepted rows falls
+    below ``eps`` is dropped — collinear / duplicate directions add no axis.
+    Working in unit space makes ``eps`` a scale-free relative tolerance (fp32
+    leaves a ~1e-7 residual on a truly-parallel direction, so the ``1e-6``
+    default catches it).  Returns ``(B, kept)`` where ``B`` is the ``(R, D)``
+    orthonormal basis (``R`` = retained rank) and ``kept`` the indices of
+    ``dirs`` that became rows, in order.  fp32 throughout; ``R = 0``
+    (all-degenerate) yields an empty basis.
+
+    Ordering is load-bearing for :func:`synthesize_subspace`: feeding *push*
+    directions before *ablation* ones keeps the push displacement inside the
+    earlier rows, so the ablation-only axes (the orthogonal complement) carry a
+    target coordinate of ~0 automatically.
+    """
+    rows: list[torch.Tensor] = []
+    kept: list[int] = []
+    for i, d in enumerate(dirs):
+        d = d.to(torch.float32)
+        dn = float(torch.linalg.vector_norm(d))
+        if dn < 1e-12:                 # exact-zero input — no direction
+            continue
+        v = d / dn                     # work in unit space (scale-free residual)
+        for b in rows:
+            v = v - (v @ b) * b
+        nv = float(torch.linalg.vector_norm(v))
+        if nv < eps:                   # collinear with an accepted row
+            continue
+        rows.append(v / nv)
+        kept.append(i)
+    if not rows:
+        d0 = dirs[0]
+        return d0.new_zeros((0, d0.shape[-1]), dtype=torch.float32), kept
+    return torch.stack(rows), kept
+
+
+@dataclass
+class SynthesizedSubspace:
+    """A per-layer affine subspace synthesized from an active steering term set.
+
+    The dispatch-time analogue of a fitted :class:`Manifold`: instead of loading
+    one artifact, the session composes the whole active steering expression into
+    a single per-layer subspace + ``along`` target.  This is what lets steering
+    keep its superposition semantics under the three-op kernel — one manifold per
+    layer holds, because dispatch builds exactly *one* derived subspace per layer
+    from every active term (rather than one manifold per concept, which would
+    collide at shared layers, ``OverlappingManifoldError``).
+
+    Per layer the subspace spans the union of every active direction (push +
+    ablation); the ``target_coord`` slides the foot toward the signed pole on
+    each *push* axis and toward the origin (``0``) on each *ablation* axis, so
+    one geodesic ``along`` slide both pushes the concept directions and removes
+    the ablated ones.  ``share`` is the un-normalized per-layer budget weight
+    (the composed direction's magnitude — the folded analogue of the angular
+    path's ``‖composed_L‖``); the apply path normalizes it across layers.
+
+    Fields are keyed by layer index; only layers carrying at least one
+    non-degenerate active direction (and present in ``neutral_means``) appear.
+    """
+
+    layers: dict[int, "LayerSubspace"]        # affine: mean = neutral_L, basis = ortho span
+    target_coord: dict[int, torch.Tensor]     # (R_L,) the along target (poles / 0)
+    share: dict[int, float]                   # ‖composed_L‖, un-normalized budget weight
+
+
+def synthesize_subspace(
+    push: Sequence[tuple[dict[int, torch.Tensor], float]],
+    ablate: Sequence[dict[int, torch.Tensor]],
+    neutral_means: dict[int, torch.Tensor],
+    *,
+    eps: float = 1e-9,
+) -> SynthesizedSubspace:
+    """Compose an active steering term set into one affine subspace per layer.
+
+    ``push`` is the list of ``(baked_direction_dict, signed_coeff)`` for every
+    directional term (plain concepts, bare poles, ``~`` / ``|`` projections —
+    each already a per-layer baked-direction dict and a signed coefficient).
+    ``ablate`` is the list of baked-direction dicts to remove (``!`` terms).
+    ``neutral_means`` supplies each layer's anchor (``mean``); a layer absent
+    from it is skipped (no anchor ⇒ no subspace).
+
+    Per layer (over the union of layers any term touches):
+
+    - Unit-normalize each present direction; drop degenerate (≈0) ones.
+    - Orthonormalize push directions first, then ablation directions
+      (:func:`_ortho_basis`) → the ``(R, D)`` basis.
+    - ``Δ = Σ_push cᵢ·ûᵢ`` is the push displacement; ``target = B @ Δ`` its
+      coordinates.  Because ``Δ`` lives in the push span and the ablation-only
+      axes are its orthogonal complement, those axes get ``target ≈ 0`` for
+      free — sliding the foot toward ``target`` pushes the concepts *and*
+      collapses the ablated directions in one op.
+    - ``share = ‖Σ_push cᵢ·baked_iᵢ‖`` (the composed magnitude, matching the
+      angular path's per-layer share); a pure-ablation layer weights by the
+      summed ablation magnitude instead.
+
+    The strengths live in ``target`` (per-axis), not in a single ``along`` — the
+    caller picks ``along`` (the overall slide, the existing manifold-``%``
+    knob) and the per-layer share/lever normalization at apply time.  Pure
+    tensor, fp32, no model/IO coupling — the dispatch synthesizer (which routes
+    the result through ``inject_three_op`` with a ``CustomDomain(R)`` per layer)
+    is the only consumer.
+    """
+    all_layers: set[int] = set()
+    for dirs, _c in push:
+        all_layers |= dirs.keys()
+    for dirs in ablate:
+        all_layers |= dirs.keys()
+
+    layers: dict[int, "LayerSubspace"] = {}
+    target_coord: dict[int, torch.Tensor] = {}
+    share: dict[int, float] = {}
+
+    for L in sorted(all_layers):
+        if L not in neutral_means:
+            continue
+        mean = neutral_means[L].to(torch.float32).reshape(-1)
+
+        push_units: list[torch.Tensor] = []
+        push_coeffs: list[float] = []
+        push_baked: list[torch.Tensor] = []
+        for dirs, coeff in push:
+            d = dirs.get(L)
+            if d is None:
+                continue
+            d = d.to(torch.float32).reshape(-1)
+            norm = float(torch.linalg.vector_norm(d))
+            if norm < eps:
+                continue
+            push_units.append(d / norm)
+            push_coeffs.append(float(coeff))
+            push_baked.append(d * float(coeff))
+
+        ablate_units: list[torch.Tensor] = []
+        ablate_baked: list[torch.Tensor] = []
+        for dirs in ablate:
+            d = dirs.get(L)
+            if d is None:
+                continue
+            d = d.to(torch.float32).reshape(-1)
+            norm = float(torch.linalg.vector_norm(d))
+            if norm < eps:
+                continue
+            ablate_units.append(d / norm)
+            ablate_baked.append(d)
+
+        ordered = push_units + ablate_units
+        if not ordered:
+            continue
+        # ``_ortho_basis`` uses its own scale-free dependency tolerance; ``eps``
+        # here is only the degenerate-direction prefilter (applied above).
+        basis, _kept = _ortho_basis(ordered)
+        if basis.shape[0] == 0:
+            continue
+
+        if push_units:
+            delta = torch.stack(
+                [c * u for c, u in zip(push_coeffs, push_units)]
+            ).sum(0)
+            composed = torch.stack(push_baked).sum(0)
+            share_L = float(torch.linalg.vector_norm(composed))
+        else:
+            delta = torch.zeros_like(mean)
+            ablate_sum = torch.stack(ablate_baked).sum(0)
+            share_L = float(torch.linalg.vector_norm(ablate_sum))
+
+        target_coord[L] = basis @ delta          # (R,) ablation axes ≈ 0
+        layers[L] = LayerSubspace.affine(mean=mean, basis=basis)
+        share[L] = share_L
+
+    return SynthesizedSubspace(
+        layers=layers, target_coord=target_coord, share=share,
+    )
+
+
 _TANGENT_GRAM_RIDGE = 1e-6
 
 
