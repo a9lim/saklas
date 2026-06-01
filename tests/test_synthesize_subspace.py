@@ -1,12 +1,16 @@
 """Dispatch-time subspace synthesis (saklas.core.manifold.synthesize_subspace).
 
 Pure CPU tests for the Stage-1 primitive of the full-unification arc: composing
-an active steering term set (push directions + ablation directions) into one
-affine subspace per layer with an ``along`` target that pushes the concept
-directions toward their poles and collapses the ablated ones toward the origin.
+an active steering term set (any-rank affine push fragments + ablation
+directions) into one affine subspace per layer with an ``along`` target that
+pushes the concept subspaces to their coeff-scaled coords and collapses the
+ablated ones to the origin.
 
-The synthesizer is dormant (nothing routes through it yet); these tests pin its
-geometry and prove its output drives ``inject_three_op`` as intended.
+Each push fragment is ``(basis_rows, coord_target, coeff)``: a rank-1 steering
+vector (``(1, D)`` basis), or a rank-R subspace like ``personas%pirate``
+(``(R, D)`` basis + an R-dim node-coord target).  The synthesizer is dormant
+(nothing routes through it yet); these tests pin its geometry and prove its
+output drives ``inject_three_op`` as intended.
 """
 from __future__ import annotations
 
@@ -25,6 +29,11 @@ from saklas.core.manifold import (
 
 def _unit(v: torch.Tensor) -> torch.Tensor:
     return v / torch.linalg.vector_norm(v)
+
+
+def _row(v: torch.Tensor) -> torch.Tensor:
+    """A unit (1, D) basis row from a (D,) direction."""
+    return _unit(v).reshape(1, -1)
 
 
 # --------------------------------------------------------------- _ortho_basis ---
@@ -60,25 +69,28 @@ def test_ortho_basis_all_degenerate_empty():
 def test_single_push_reduces_to_r1_fold():
     torch.manual_seed(1)
     u = _unit(torch.randn(8))
-    baked = 2.0 * u                       # ‖baked‖ = 2
     neutral = 10.0 + torch.randn(8)
     synth = synthesize_subspace(
-        push=[({3: baked}, 0.5)], ablate=[], neutral_means={3: neutral},
+        push=[({3: _row(u)}, {3: torch.tensor([1.0])}, 0.5)],
+        ablate=[], neutral_means={3: neutral},
     )
     assert isinstance(synth, SynthesizedSubspace)
     sub = synth.layers[3]
     assert sub.is_affine and sub.rank == 1
     assert torch.allclose(sub.basis[0], u, atol=1e-5)
     assert torch.allclose(sub.mean, neutral, atol=1e-5)
-    # target coord is the signed coeff (pole at 1); share is the composed norm
+    # target coord = coeff · coord_target (pole at 1) = 0.5
     assert torch.allclose(synth.target_coord[3], torch.tensor([0.5]), atol=1e-5)
-    assert synth.share[3] == pytest.approx(1.0, abs=1e-4)  # ‖0.5 · 2u‖ = 1.0
+    # share = ‖Δ‖ = ‖0.5 · (1.0·u)‖ = 0.5.  Consolidated: |target| == share now
+    # (the predecessor mixed a unit target with a baked-magnitude share = 1.0).
+    assert synth.share[3] == pytest.approx(0.5, abs=1e-4)
 
 
 def test_negative_coeff_flips_target_sign():
     u = _unit(torch.randn(6))
     synth = synthesize_subspace(
-        push=[({0: u}, -0.7)], ablate=[], neutral_means={0: torch.zeros(6)},
+        push=[({0: _row(u)}, {0: torch.tensor([1.0])}, -0.7)],
+        ablate=[], neutral_means={0: torch.zeros(6)},
     )
     # basis stays +û (unit-normalized); the sign lives in the target coord
     assert torch.allclose(synth.layers[0].basis[0], u, atol=1e-5)
@@ -93,7 +105,10 @@ def test_two_orthogonal_pushes_independent_axes():
     ua = torch.randn(16)
     ua = _unit(ua - (ua @ uh) * uh)       # force orthogonal
     synth = synthesize_subspace(
-        push=[({1: uh}, 0.3), ({1: ua}, 0.2)],
+        push=[
+            ({1: _row(uh)}, {1: torch.tensor([1.0])}, 0.3),
+            ({1: _row(ua)}, {1: torch.tensor([1.0])}, 0.2),
+        ],
         ablate=[], neutral_means={1: torch.zeros(16)},
     )
     sub = synth.layers[1]
@@ -102,19 +117,50 @@ def test_two_orthogonal_pushes_independent_axes():
     assert torch.allclose(synth.target_coord[1], torch.tensor([0.3, 0.2]), atol=1e-5)
 
 
-def test_share_is_composed_magnitude():
+def test_share_is_displacement_magnitude():
     torch.manual_seed(3)
     uh = _unit(torch.randn(16))
     ua = torch.randn(16)
     ua = _unit(ua - (ua @ uh) * uh)
-    bh, ba = 4.0 * uh, 3.0 * ua            # baked magnitudes
+    # coord targets 4.0 / 3.0 with coeff 0.5 ⇒ Δ = 0.5·4·uh + 0.5·3·ua.
     synth = synthesize_subspace(
-        push=[({0: bh}, 0.5), ({0: ba}, 0.5)],
+        push=[
+            ({0: _row(uh)}, {0: torch.tensor([4.0])}, 0.5),
+            ({0: _row(ua)}, {0: torch.tensor([3.0])}, 0.5),
+        ],
         ablate=[], neutral_means={0: torch.zeros(16)},
     )
-    composed = 0.5 * bh + 0.5 * ba
+    delta = 0.5 * 4.0 * uh + 0.5 * 3.0 * ua
     assert synth.share[0] == pytest.approx(
-        float(torch.linalg.vector_norm(composed)), abs=1e-4,
+        float(torch.linalg.vector_norm(delta)), abs=1e-4,
+    )
+
+
+# ------------------------------------------------------------- rank-R fragment ---
+
+def test_rank8_push_fragment():
+    """A single rank-8 affine push (the personas%node shape): an 8-row
+    orthonormal basis + an 8-dim node-coord target.  ``share`` and the
+    reconstructed world target match the fragment's coeff-scaled displacement."""
+    torch.manual_seed(8)
+    D = 32
+    B8, _kept = _ortho_basis(list(torch.randn(8, D)))   # (8, D) orthonormal
+    assert B8.shape == (8, D)
+    coords = torch.randn(8)
+    neutral = 5.0 + torch.randn(D)
+    synth = synthesize_subspace(
+        push=[({0: B8}, {0: coords}, 0.5)],
+        ablate=[], neutral_means={0: neutral},
+    )
+    sub = synth.layers[0]
+    assert sub.rank == 8
+    # Δ = 0.5·(coords @ B8); the merged basis re-rotates within the same span,
+    # so the world target reconstructs from the reduced target_coord.
+    delta = 0.5 * (coords @ B8)
+    world_target = synth.target_coord[0] @ sub.basis     # (R,) @ (R, D) -> (D,)
+    assert torch.allclose(world_target, delta, atol=1e-4)
+    assert synth.share[0] == pytest.approx(
+        float(torch.linalg.vector_norm(delta)), abs=1e-4,
     )
 
 
@@ -126,7 +172,8 @@ def test_ablation_axis_gets_zero_target():
     ua = torch.randn(16)
     ua = _unit(ua - (ua @ uh) * uh)       # ablate dir ⟂ push dir
     synth = synthesize_subspace(
-        push=[({2: uh}, 0.6)], ablate=[{2: ua}], neutral_means={2: torch.zeros(16)},
+        push=[({2: _row(uh)}, {2: torch.tensor([1.0])}, 0.6)],
+        ablate=[{2: ua}], neutral_means={2: torch.zeros(16)},
     )
     sub = synth.layers[2]
     assert sub.rank == 2                   # spans push ∪ ablate
@@ -147,7 +194,7 @@ def test_pure_ablation_zero_target_basis_spans():
     assert sub.rank == 1
     assert torch.allclose(sub.basis[0], ua, atol=1e-5)
     assert torch.allclose(synth.target_coord[4], torch.zeros(1), atol=1e-6)
-    # pure-ablation layer weights by the ablation magnitude
+    # pure-ablation layer weights by the (raw) ablation magnitude
     assert synth.share[4] == pytest.approx(2.5, abs=1e-4)
 
 
@@ -156,7 +203,12 @@ def test_pure_ablation_zero_target_basis_spans():
 def test_skips_layer_without_neutral():
     u = _unit(torch.randn(8))
     synth = synthesize_subspace(
-        push=[({3: u, 7: u}, 0.5)], ablate=[], neutral_means={3: torch.zeros(8)},
+        push=[(
+            {3: _row(u), 7: _row(u)},
+            {3: torch.tensor([1.0]), 7: torch.tensor([1.0])},
+            0.5,
+        )],
+        ablate=[], neutral_means={3: torch.zeros(8)},
     )
     assert sorted(synth.layers) == [3]     # layer 7 has no anchor → dropped
 
@@ -164,7 +216,11 @@ def test_skips_layer_without_neutral():
 def test_drops_degenerate_direction_layer():
     u = _unit(torch.randn(8))
     synth = synthesize_subspace(
-        push=[({0: u, 1: torch.zeros(8)}, 0.5)],
+        push=[(
+            {0: _row(u), 1: torch.zeros(1, 8)},
+            {0: torch.tensor([1.0]), 1: torch.tensor([1.0])},
+            0.5,
+        )],
         ablate=[], neutral_means={0: torch.zeros(8), 1: torch.zeros(8)},
     )
     assert sorted(synth.layers) == [0]     # layer 1's only dir is degenerate
@@ -182,7 +238,8 @@ def test_synthesized_subspace_drives_inject_three_op():
     ua = _unit(ua - (ua @ uh) * uh)
     neutral = torch.zeros(D)
     synth = synthesize_subspace(
-        push=[({0: uh}, 0.5)], ablate=[{0: ua}], neutral_means={0: neutral},
+        push=[({0: _row(uh)}, {0: torch.tensor([1.0])}, 0.5)],
+        ablate=[{0: ua}], neutral_means={0: neutral},
     )
     sub = synth.layers[0]
     domain = CustomDomain(sub.rank)
@@ -205,13 +262,38 @@ def test_synthesized_subspace_drives_inject_three_op():
     assert torch.allclose(perp_out, perp, atol=1e-4)
 
 
+def test_rank8_synthesized_drives_inject_three_op():
+    """A rank-8 fragment routed through inject_three_op lands its reduced
+    coords on the target under a full along slide."""
+    torch.manual_seed(9)
+    D = 24
+    B8, _kept = _ortho_basis(list(torch.randn(8, D)))
+    coords = torch.randn(8)
+    neutral = 3.0 + torch.randn(D)
+    synth = synthesize_subspace(
+        push=[({0: B8}, {0: coords}, 0.4)],
+        ablate=[], neutral_means={0: neutral},
+    )
+    sub = synth.layers[0]
+    domain = CustomDomain(sub.rank)
+    target = synth.target_coord[0]
+    h = neutral + torch.randn(D)
+    seed = (h - sub.mean) @ sub.basis.T
+    out, _foot = inject_three_op(
+        h, sub, domain, target, seed, along=1.0, onto=0.0,
+    )
+    coords_out = (out - sub.mean) @ sub.basis.T
+    assert torch.allclose(coords_out, target, atol=1e-4)
+
+
 def test_synthesized_inject_identity_at_along_zero():
     torch.manual_seed(7)
     D = 12
     u = _unit(torch.randn(D))
     neutral = 5.0 + torch.randn(D)
     synth = synthesize_subspace(
-        push=[({0: u}, 0.8)], ablate=[], neutral_means={0: neutral},
+        push=[({0: _row(u)}, {0: torch.tensor([0.8])}, 0.8)],
+        ablate=[], neutral_means={0: neutral},
     )
     sub = synth.layers[0]
     domain = CustomDomain(sub.rank)

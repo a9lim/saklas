@@ -1345,13 +1345,14 @@ class SynthesizedSubspace:
     from every active term (rather than one manifold per concept, which would
     collide at shared layers, ``OverlappingManifoldError``).
 
-    Per layer the subspace spans the union of every active direction (push +
-    ablation); the ``target_coord`` slides the foot toward the signed pole on
-    each *push* axis and toward the origin (``0``) on each *ablation* axis, so
-    one geodesic ``along`` slide both pushes the concept directions and removes
-    the ablated ones.  ``share`` is the un-normalized per-layer budget weight
-    (the composed direction's magnitude — the folded analogue of the angular
-    path's ``‖composed_L‖``); the apply path normalizes it across layers.
+    Per layer the subspace spans the union of every active term's directions
+    (push + ablation); the ``target_coord`` slides the foot toward each *push*
+    term's (signed, coeff-scaled) target on its own axes and toward the origin
+    (``0``) on each *ablation* axis, so one geodesic ``along`` slide both pushes
+    the concept subspaces and removes the ablated ones.  ``share`` is the
+    un-normalized per-layer budget weight — the world push-displacement
+    magnitude ``‖Δ_L‖`` (a pure-ablation layer weights by the summed ablation
+    magnitude instead); the apply path normalizes it across layers.
 
     Fields are keyed by layer index; only layers carrying at least one
     non-degenerate active direction (and present in ``neutral_means``) appear.
@@ -1359,11 +1360,13 @@ class SynthesizedSubspace:
 
     layers: dict[int, "LayerSubspace"]        # affine: mean = neutral_L, basis = ortho span
     target_coord: dict[int, torch.Tensor]     # (R_L,) the along target (poles / 0)
-    share: dict[int, float]                   # ‖composed_L‖, un-normalized budget weight
+    share: dict[int, float]                   # ‖Δ_L‖, un-normalized budget weight
 
 
 def synthesize_subspace(
-    push: Sequence[tuple[dict[int, torch.Tensor], float]],
+    push: Sequence[
+        tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], float]
+    ],
     ablate: Sequence[dict[int, torch.Tensor]],
     neutral_means: dict[int, torch.Tensor],
     *,
@@ -1371,26 +1374,40 @@ def synthesize_subspace(
 ) -> SynthesizedSubspace:
     """Compose an active steering term set into one affine subspace per layer.
 
-    ``push`` is the list of ``(baked_direction_dict, signed_coeff)`` for every
-    directional term (plain concepts, bare poles, ``~`` / ``|`` projections —
-    each already a per-layer baked-direction dict and a signed coefficient).
-    ``ablate`` is the list of baked-direction dicts to remove (``!`` terms).
-    ``neutral_means`` supplies each layer's anchor (``mean``); a layer absent
-    from it is skipped (no anchor ⇒ no subspace).
+    Each **push** term is an affine subspace fragment
+    ``(basis_rows, coord_target, coeff)``:
+
+    - ``basis_rows`` — per-layer ``(R_i, D)`` orthonormal rows (a steering
+      *vector* is rank-1, ``(1, D)``; ``personas%pirate`` is rank-8, ``(8, D)``).
+    - ``coord_target`` — per-layer ``(R_i,)`` target position *in that fragment's
+      own basis* (a pole / node coordinate, origin-relative).
+    - ``coeff`` — the signed strength (the blend fraction / α).
+
+    Each **ablation** term is a per-layer ``(R_i, D)`` (or ``(D,)``) direction
+    set to remove; its target is the origin (``0``).  ``neutral_means`` supplies
+    each layer's anchor (``mean``); a layer absent from it is skipped (no
+    anchor ⇒ no subspace).
 
     Per layer (over the union of layers any term touches):
 
-    - Unit-normalize each present direction; drop degenerate (≈0) ones.
-    - Orthonormalize push directions first, then ablation directions
-      (:func:`_ortho_basis`) → the ``(R, D)`` basis.
-    - ``Δ = Σ_push cᵢ·ûᵢ`` is the push displacement; ``target = B @ Δ`` its
-      coordinates.  Because ``Δ`` lives in the push span and the ablation-only
-      axes are its orthogonal complement, those axes get ``target ≈ 0`` for
-      free — sliding the foot toward ``target`` pushes the concepts *and*
-      collapses the ablated directions in one op.
-    - ``share = ‖Σ_push cᵢ·baked_iᵢ‖`` (the composed magnitude, matching the
-      angular path's per-layer share); a pure-ablation layer weights by the
-      summed ablation magnitude instead.
+    - Flatten every present push term's basis rows, then every ablation term's
+      rows, into one ordered list (push first); orthonormalize the union
+      (:func:`_ortho_basis`) → the merged ``(R, D)`` basis ``B``.
+    - World push displacement ``Δ = Σ_push coeffᵢ·(coord_targetᵢ @ basis_rowsᵢ)``
+      — each fragment's own ``(R_i,) @ (R_i, D) = (D,)`` world vector, scaled by
+      its coeff.  ``target = B @ Δ`` is its coordinate in the merged basis.
+      Because ``Δ`` lives in the push span and the ablation-only axes are its
+      orthogonal complement, those axes get ``target ≈ 0`` for free — sliding
+      the foot toward ``target`` pushes the concepts *and* collapses the ablated
+      directions in one op.
+    - ``share = ‖Δ‖`` (the world displacement magnitude); a pure-ablation layer
+      weights by the summed ablation-row magnitude instead.
+
+    Because the basis is orthonormal, ``‖target‖ = ‖Δ‖`` for a push, so the
+    per-layer budget weight and the steered coordinate sit on one consistent
+    scale (unlike the rank-1-only predecessor, which mixed a unit target with a
+    baked-magnitude share).  Real per-layer coords (Step 3) restore the
+    ``∝ ‖δ_L‖`` magnitude that the high-signal layers should carry.
 
     The strengths live in ``target`` (per-axis), not in a single ``along`` — the
     caller picks ``along`` (the overall slide, the existing manifold-``%``
@@ -1400,8 +1417,8 @@ def synthesize_subspace(
     is the only consumer.
     """
     all_layers: set[int] = set()
-    for dirs, _c in push:
-        all_layers |= dirs.keys()
+    for basis_dirs, _coords, _c in push:
+        all_layers |= basis_dirs.keys()
     for dirs in ablate:
         all_layers |= dirs.keys()
 
@@ -1414,35 +1431,44 @@ def synthesize_subspace(
             continue
         mean = neutral_means[L].to(torch.float32).reshape(-1)
 
-        push_units: list[torch.Tensor] = []
-        push_coeffs: list[float] = []
-        push_baked: list[torch.Tensor] = []
-        for dirs, coeff in push:
-            d = dirs.get(L)
-            if d is None:
+        # Push fragments present at this layer: their basis rows (for the span)
+        # and their world displacement vector ``coeff · (coords @ basis)``.
+        push_rows: list[torch.Tensor] = []          # individual (D,) basis rows
+        push_world: list[torch.Tensor] = []         # per-fragment (D,) displacement
+        for basis_dirs, coord_dirs, coeff in push:
+            B_i = basis_dirs.get(L)
+            if B_i is None:
                 continue
-            d = d.to(torch.float32).reshape(-1)
-            norm = float(torch.linalg.vector_norm(d))
-            if norm < eps:
+            B_i = B_i.to(torch.float32)
+            if B_i.ndim == 1:
+                B_i = B_i.reshape(1, -1)
+            if float(torch.linalg.matrix_norm(B_i)) < eps:
                 continue
-            push_units.append(d / norm)
-            push_coeffs.append(float(coeff))
-            push_baked.append(d * float(coeff))
+            c_i = coord_dirs.get(L)
+            if c_i is None:
+                # No target coords for this layer ⇒ no displacement, but the
+                # rows still join the span (a degenerate push = ablation).
+                c_i = B_i.new_zeros(B_i.shape[0])
+            c_i = c_i.to(torch.float32).reshape(-1)
+            push_rows.extend(B_i)
+            push_world.append(float(coeff) * (c_i @ B_i))   # (D,)
 
-        ablate_units: list[torch.Tensor] = []
-        ablate_baked: list[torch.Tensor] = []
+        ablate_rows: list[torch.Tensor] = []        # individual (D,) basis rows
+        ablate_raw: list[torch.Tensor] = []         # raw rows (magnitude → share)
         for dirs in ablate:
             d = dirs.get(L)
             if d is None:
                 continue
-            d = d.to(torch.float32).reshape(-1)
-            norm = float(torch.linalg.vector_norm(d))
-            if norm < eps:
-                continue
-            ablate_units.append(d / norm)
-            ablate_baked.append(d)
+            d = d.to(torch.float32)
+            if d.ndim == 1:
+                d = d.reshape(1, -1)
+            for row in d:
+                if float(torch.linalg.vector_norm(row)) < eps:
+                    continue
+                ablate_rows.append(row)
+                ablate_raw.append(row)
 
-        ordered = push_units + ablate_units
+        ordered = push_rows + ablate_rows
         if not ordered:
             continue
         # ``_ortho_basis`` uses its own scale-free dependency tolerance; ``eps``
@@ -1451,15 +1477,12 @@ def synthesize_subspace(
         if basis.shape[0] == 0:
             continue
 
-        if push_units:
-            delta = torch.stack(
-                [c * u for c, u in zip(push_coeffs, push_units)]
-            ).sum(0)
-            composed = torch.stack(push_baked).sum(0)
-            share_L = float(torch.linalg.vector_norm(composed))
+        if push_world:
+            delta = torch.stack(push_world).sum(0)
+            share_L = float(torch.linalg.vector_norm(delta))
         else:
             delta = torch.zeros_like(mean)
-            ablate_sum = torch.stack(ablate_baked).sum(0)
+            ablate_sum = torch.stack(ablate_raw).sum(0)
             share_L = float(torch.linalg.vector_norm(ablate_sum))
 
         target_coord[L] = basis @ delta          # (R,) ablation axes ≈ 0
