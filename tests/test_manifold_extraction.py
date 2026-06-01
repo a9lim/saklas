@@ -627,6 +627,36 @@ def test_discover_pca_two_node_is_steering_vector(tmp_path: Path) -> None:
         assert sub.node_coords[0, 0] * sub.node_coords[1, 0] < 0
 
 
+def test_two_node_pca_reads_as_affine_pole_push(tmp_path: Path) -> None:
+    """A fitted 2-node pca manifold reads through the session's
+    ``_affine_manifold_push`` — the ``name%pole`` steer path — as a rank-1
+    affine push: per-layer basis + the pole node's real coord.  This closes
+    the author→fit→steer loop for "a vector = a 2-node folder": steering
+    toward the ``angry`` pole and toward the ``calm`` pole read
+    opposite-signed coords (the difference-of-means contrast).
+    """
+    from saklas.core.session import _affine_manifold_push
+
+    folder = _discover_folder(
+        tmp_path, name="anger", fit_mode="pca",
+        labels=["angry", "calm"],
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    basis_angry, coord_angry = _affine_manifold_push(manifold, "angry")
+    assert set(basis_angry) == set(manifold.layers)
+    for L, sub in manifold.layers.items():
+        assert sub.node_coords is not None
+        assert torch.equal(basis_angry[L], sub.basis)        # per-layer basis
+        assert torch.equal(coord_angry[L], sub.node_coords[0])  # angry == node 0
+
+    _, coord_calm = _affine_manifold_push(manifold, "calm")
+    for L in manifold.layers:
+        # Opposite poles slide to opposite sides of the neutral-anchored origin.
+        assert coord_angry[L][0] * coord_calm[L][0] < 0
+
+
 def test_discover_pca_flat_fit_skips_rbf_floor(tmp_path: Path) -> None:
     """The flat (``pca``) path is gated by the affine-span floor ``k+1``, not
     the RBF poisedness floor ``2k+1``: a flat subspace has no interpolant to
