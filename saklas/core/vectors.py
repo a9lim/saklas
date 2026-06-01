@@ -1682,6 +1682,202 @@ def extract_difference_of_means(
     )
 
 
+def _fold_centroids_to_affine_manifold(
+    name: str,
+    mean_pos_per_layer: dict[int, torch.Tensor],
+    mean_neg_per_layer: dict[int, torch.Tensor],
+    *,
+    pos_label: str,
+    neg_label: str,
+    whitener: "Any | None" = None,
+    layer_means: dict[int, torch.Tensor] | None = None,
+    dls: bool = True,
+    feature_space: str = "raw",
+) -> "Any":  # -> saklas.core.manifold.Manifold
+    """Fold per-layer pos/neg centroids into an affine ``R = 1`` manifold.
+
+    The folded-vector representation (saklas 4.0 Phase 2 §1): a steering
+    vector *is* the degenerate ``n = R = 1`` manifold — a line through the
+    two pole centroids that fills its 1-D subspace (``H_n ≡ 0``).  Per
+    retained layer ``L``:
+
+    * ``basis`` = unit ``δ̂_L`` where ``δ_L = mean_pos_L − mean_neg_L`` — the
+      **raw** difference-of-means direction.  (Not the whitened ``Σ⁻¹δ``
+      Fisher discriminant; that is the separate δ→Σ⁻¹δ commit, staged after
+      this one so the injection-semantics change and the direction change
+      are independently attributable.)
+    * ``mean`` = the pole midpoint ``½(mean_pos_L + mean_neg_L)``.
+    * ``node_coords`` = the shared unit poles ``[[+1], [−1]]``.  The
+      authoring-coordinate scale is unit; the *per-layer magnitude* lives
+      entirely in the baked share + lever, because a unit ``basis`` discards
+      ``‖δ_L‖`` and the coords are shared across layers (nothing per-layer to
+      put in them).
+
+    **Share — exact ``R = 1`` parity with the DiM bake.**
+    ``mahalanobis_share[L] = ‖δ_L‖_M`` (Mahalanobis norm of the raw diff via
+    the whitener) when the whitener covers every retained layer, else
+    ``‖δ_L‖₂``.  This is the *same* per-layer scalar today's
+    :func:`extract_difference_of_means` bakes: its hook share works out to
+    ``∝ ‖δ_L‖_M`` once ``ref_norm`` cancels through the share-bake, so
+    ``hooks._manifold_layer_shares`` (which renormalizes this dict to
+    ``Σ_L share_L = 1``) reproduces today's vector layer profile *exactly*.
+    The unit ``basis`` carries no magnitude, so the share is the only place
+    the per-layer ``‖δ_L‖`` survives — folded vectors therefore *always*
+    populate the share dict (a curved manifold may leave it empty and let
+    the apply path recompute from coords; a folded vector cannot).
+
+    **Origin** ``O_L`` = the foot of the neutral mean on the line, in
+    authoring coords: ``(μ_L − mean_L)·δ̂_L``.  An affine subspace's surface
+    fills its span, so the foot is the trivial projection — no Gauss-Newton
+    inversion.  It lands near ``0`` for a continuum (midpoint ≈ neutral) and
+    off toward a pole for a categorical pair (``dog.cat``); ``!`` slides the
+    foot here either way.
+
+    **DLS** is consumed at fit time: per-axis DLS at ``R = 1`` keeps a layer
+    iff its single basis row passes the centered opposite-sign test —
+    bit-identical to today's scalar :func:`compute_dls_mask`.  Dropped layers
+    are simply absent from the returned manifold (matching the legacy
+    dropped-layer behavior).
+
+    Returns a :class:`~saklas.core.manifold.Manifold`; the caller persists it
+    (the routing + save wiring is the next commit).  ``share_metric`` is
+    recorded on ``manifold.metadata`` for that save.
+    """
+    from saklas.core.manifold import (
+        CustomDomain, LayerSubspace, Manifold, layer_lever,
+    )
+
+    shared = sorted(set(mean_pos_per_layer) & set(mean_neg_per_layer))
+
+    # Per-layer raw δ, unit direction, midpoint (fp32).  Degenerate pairs
+    # (zero diff — no direction to steer) drop out here.
+    deltas: dict[int, torch.Tensor] = {}
+    units: dict[int, torch.Tensor] = {}
+    mids: dict[int, torch.Tensor] = {}
+    for idx in shared:
+        mp = mean_pos_per_layer[idx].to(torch.float32).reshape(-1)
+        mn = mean_neg_per_layer[idx].to(torch.float32).reshape(-1)
+        delta = mp - mn
+        norm = float(delta.norm())
+        if norm <= 1e-12:
+            continue
+        deltas[idx] = delta
+        units[idx] = delta / norm
+        mids[idx] = 0.5 * (mp + mn)
+
+    # Per-axis DLS at R=1 (collapses to today's scalar DLS).
+    if dls:
+        bases = {idx: units[idx].reshape(1, -1) for idx in units}
+        per_axis = compute_dls_mask_per_axis(
+            mean_pos_per_layer, mean_neg_per_layer, bases, layer_means,
+        )
+        kept = [idx for idx in units if per_axis.get(idx)]
+    else:
+        kept = list(units)
+
+    # All-or-nothing whitener gate (parity with the DiM bake metric): the
+    # whitened share is used only when it covers every retained layer, so the
+    # cross-layer normalization in ``_manifold_layer_shares`` compares like
+    # with like.
+    maha_w = (
+        whitener
+        if whitener is not None and whitener.covers_all(kept)
+        else None
+    )
+
+    layers: dict[int, "LayerSubspace"] = {}
+    mahalanobis_share: dict[int, float] = {}
+    lever: dict[int, float] = {}
+    origin: dict[int, torch.Tensor] = {}
+    for idx in kept:
+        basis = units[idx].reshape(1, -1)          # (1, D) unit δ̂
+        mean = mids[idx]                           # (D,) midpoint
+        layers[idx] = LayerSubspace.affine(mean, basis)
+
+        # Per-layer share = ‖δ_L‖ in the bake metric (exact DiM parity).
+        if maha_w is not None:
+            mahalanobis_share[idx] = float(maha_w.mahalanobis_norm(idx, deltas[idx]))
+        else:
+            mahalanobis_share[idx] = float(deltas[idx].norm())
+
+        if layer_means is not None and idx in layer_means:
+            mu = layer_means[idx].to(torch.float32).reshape(-1)
+            # Origin: foot of neutral on the line (authoring coord, R=1).
+            origin[idx] = torch.tensor(
+                [float((mu - mean) @ units[idx])], dtype=torch.float32,
+            )
+            # Lever from the whitener's neutral activations (uncentered by μ
+            # to recover the raw-activation stand-ins ``layer_lever`` needs).
+            if maha_w is not None:
+                X_c, _K, _lam = maha_w.woodbury_factors(
+                    idx, device=torch.device("cpu"), dtype=torch.float32,
+                )
+                lever[idx] = layer_lever(X_c + mu, mean, basis)
+
+    # Bipolar: pos at +1, neg at −1 on a 1-D CustomDomain.  Shared unit
+    # coords — the per-layer magnitude is in the share, not here.
+    node_coords = torch.tensor([[1.0], [-1.0]], dtype=torch.float32)
+    manifold = Manifold(
+        name=name,
+        domain=CustomDomain(1),
+        node_labels=[pos_label, neg_label],
+        node_coords=node_coords,
+        layers=layers,
+        feature_space=feature_space,
+        mahalanobis_share=mahalanobis_share,
+        lever=lever,
+        origin=origin,
+    )
+    manifold.metadata["share_metric"] = (
+        "mahalanobis" if maha_w is not None else "euclidean"
+    )
+    return manifold
+
+
+def fold_vector_to_subspace(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    pairs: list[dict[str, str]],
+    layers: torch.nn.ModuleList,
+    device: torch.device | None = None,
+    *,
+    concept_label: str,
+    pos_label: str,
+    neg_label: str,
+    whitener: "Any | None" = None,
+    dls: bool = True,
+    layer_means: dict[int, torch.Tensor] | None = None,
+    role: str | None = None,
+    model_type: str | None = None,
+) -> "Any":  # -> saklas.core.manifold.Manifold
+    """Extract a folded steering vector as an affine ``R = 1`` manifold.
+
+    The subspace-native replacement for :func:`extract_difference_of_means`:
+    captures the per-layer pos/neg centroids over the contrastive ``pairs``
+    (the same forward-pass capture the DiM path uses), then folds them into
+    an affine manifold via :func:`_fold_centroids_to_affine_manifold`.  See
+    that function for the geometry, the exact-parity share, and the origin /
+    DLS handling.  Pure extraction — the caller persists and routes the
+    result.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    assert device is not None
+    (
+        _n_layers, _mean_diffs, _norm_sums,
+        mean_pos_per_layer, mean_neg_per_layer, _diag,
+    ) = _capture_dim_stats_for_pairs(
+        model, tokenizer, pairs, layers, device,
+        role=role, model_type=model_type,
+    )
+    return _fold_centroids_to_affine_manifold(
+        concept_label,
+        mean_pos_per_layer, mean_neg_per_layer,
+        pos_label=pos_label, neg_label=neg_label,
+        whitener=whitener, layer_means=layer_means, dls=dls,
+    )
+
+
 def save_profile(
     profile: dict[int, torch.Tensor],
     path: str | Path,
