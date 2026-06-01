@@ -117,7 +117,6 @@ class ModelHandle(Protocol):
         scenarios: list[str] | None = None,
         n_scenarios: int = ...,
         statements_per_cell: int = ...,
-        share_moment: bool = False,
         on_progress: Callable[[str], None] | None = None,
         role: str | None = None,
     ) -> dict[str, list[str]]: ...
@@ -681,13 +680,15 @@ class ExtractionPipeline:
                 f"Generating contrastive pairs for '{concept}'{suffix} "
                 f"across {len(eff_scenarios)} domains..."
             )
-            # Bipolar contrastive extraction wants moment-shared
-            # pairs (the load-bearing within-pair structure that lets
-            # DiM cancel scenario+moment variance).  For a monopolar
-            # concept (no baseline) the "B speaker" is the semantic
-            # opposite — slot a placeholder concept slug that the
-            # share_moment prompt template renders as the opposite of
-            # ``concept``.  ``zip`` then recovers (positive, negative).
+            # A bipolar vector is the 2-concept case of the scenario-shared
+            # generate path: pos/neg corpora share the scenario row but are
+            # not moment-paired.  DiM is centroid-based (mean(pos) − mean(neg)),
+            # so within-pair moment-matching never affected the direction —
+            # only scenario-sharing matters, and that survives.  For a
+            # monopolar concept (no baseline) the negative slot is the
+            # semantic opposite — a placeholder slug humanizing to "the
+            # opposite of <concept>".  ``zip`` then recovers (positive,
+            # negative) pairs over the scenario-aligned corpora.
             if baseline is None:
                 # Humanizes to "the opposite of <concept>" — the model
                 # reads this as a self-defining anti-pole, the same
@@ -698,7 +699,6 @@ class ExtractionPipeline:
             corpora = self._handle.generate_statements(
                 [concept, neg_slot],
                 scenarios=eff_scenarios,
-                share_moment=True,
                 on_progress=_progress,
                 role=role,
             )

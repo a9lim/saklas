@@ -4,11 +4,11 @@ using a capable instruct model as the generator.
 The bundled pack is driven by two manifests:
 
 - BIPOLAR: concepts with a named negative pole. Generated via
-  `SaklasSession.generate_statements([pos, neg], share_moment=True)`, which hits
-  the `Speaker A IS X / Speaker B IS Y` branch of the prompt — sharper
-  contrastive direction than topically-disjoint monopolar pairs.
-- MONOPOLAR: concepts without a clean opposite. Generated with the
-  original "Speaker B is unrelated" prompt.
+  `SaklasSession.generate_statements([pos, neg])` over a shared scenario
+  row; DiM (centroid-based) recovers the contrastive direction from the
+  per-pole means.
+- MONOPOLAR: concepts without a clean opposite. The negative slot is the
+  humanized "opposite of <pos>" anti-pole.
 
 Each concept's folder name is the canonical slug used throughout the
 cache (`happy_sad`, `high_context_low_context`, etc.). Folders and
@@ -142,7 +142,7 @@ def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> boo
     """Run the open-ended pipeline end-to-end for a bundled concept.
 
     Stage 1: ``session.generate_scenarios`` → save ``scenarios.json``.
-    Stage 2: ``session.generate_statements([pos, neg], share_moment=True, scenarios=...)``
+    Stage 2: ``session.generate_statements([pos, neg], scenarios=...)``
     → save ``statements.json``.
     Stage 3: refresh the pack.json file manifest.
 
@@ -184,17 +184,18 @@ def regenerate_concept(session: SaklasSession, name: str, *, force: bool) -> boo
     )
     print(f"    saved {len(scenarios)} scenarios")
 
-    # Stage 2: pairs (moment-shared via share_moment=True).  For a
+    # Stage 2: pairs via the scenario-shared generate path.  For a
     # monopolar concept (neg is None) the second slot encodes "the
     # semantic opposite of <pos>" as a humanized slug — same semantic
-    # the legacy monopolar pair prompt carried.
+    # the legacy monopolar pair prompt carried.  DiM is centroid-based,
+    # so the scenario-aligned (not moment-paired) corpora give the same
+    # mean-difference direction.
     neg_slot = neg if neg is not None else f"the_opposite_of_{pos}"
     statements_per_cell = max(1, -(-N_PAIRS // max(1, len(scenarios))))
     corpora = session.generate_statements(
         [pos, neg_slot],
         scenarios=scenarios,
         statements_per_cell=statements_per_cell,
-        share_moment=True,
         on_progress=lambda msg: print(f"    {msg}", flush=True),
     )
     pos_lines = corpora[pos]

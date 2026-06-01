@@ -1390,11 +1390,10 @@ class TestExtractPreview:
         session.generate_scenarios.return_value = ["a quiet morning", "a storm"]
 
         def _statements(concepts: Any, *args: Any, scenarios: Any = None,
-                        statements_per_cell: Any = None, share_moment: Any = False,
+                        statements_per_cell: Any = None,
                         on_progress: Any = None, **_kw: Any) -> Any:
-            # The route wraps generate_statements with share_moment=True
-            # and two concepts ([positive, negative_slot]).
-            assert share_moment is True
+            # The route wraps generate_statements with two concepts
+            # ([positive, negative_slot]) over a shared scenario row.
             assert concepts[0] == "calm"
             assert concepts[1] == "anxious"
             if on_progress:

@@ -1555,8 +1555,8 @@ def register_saklas_routes(app: FastAPI) -> None:
     ):
         """Generate contrastive pairs for review/edit, without extracting.
 
-        Runs ``generate_scenarios`` + ``generate_statements(share_moment=True)``
-        and recovers ``(positive, negative)`` pairs by zipping the
+        Runs ``generate_scenarios`` + ``generate_statements`` and recovers
+        ``(positive, negative)`` pairs by zipping the scenario-aligned
         per-concept corpora.  The webui shows them in an editable
         table; the user edits, then POSTs the result back to
         ``/extract`` as ``source: {pairs: [...]}`` — which skips
@@ -1595,7 +1595,6 @@ def register_saklas_routes(app: FastAPI) -> None:
                 [concept, neg_slot],
                 scenarios=list(scenarios),
                 statements_per_cell=statements_per_cell,
-                share_moment=True,
                 on_progress=on_progress,
             )
             pos_lines = corpora[concept]

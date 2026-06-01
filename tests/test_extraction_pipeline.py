@@ -100,17 +100,15 @@ class _StubHandle:
         scenarios: list[str] | None = None,
         n_scenarios: int = 9,
         statements_per_cell: int = 5,
-        share_moment: bool = False,
         on_progress: Callable[[str], None] | None = None,
         role: str | None = None,
     ) -> dict[str, list[str]]:
         self.pairs_calls += 1
         self.last_pairs_role = role
         # Reshape the canned ``(positive, negative)`` pairs into the
-        # dict-of-corpora shape the new API returns.  The pipeline
-        # always passes a 2-element concepts list under
-        # ``share_moment=True``, so ``concepts[0]`` is positive and
-        # ``concepts[1]`` is the negative slot (real baseline or the
+        # dict-of-corpora shape the API returns.  The pipeline always
+        # passes a 2-element concepts list, so ``concepts[0]`` is positive
+        # and ``concepts[1]`` is the negative slot (real baseline or the
         # synthesized ``the_opposite_of_<X>`` for monopolar concepts).
         pos_lines = [p for p, _ in self._pairs_response]
         neg_lines = [n for _, n in self._pairs_response]

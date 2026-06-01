@@ -142,7 +142,6 @@ class TestHumanize:
             ["artificial_intelligence", "natural_intelligence"],
             scenarios=["a domain"],
             statements_per_cell=2,
-            share_moment=True,
         )
         # The statement-generation call is the second entry (after scenarios are
         # provided so scenario generation is skipped).

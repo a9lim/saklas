@@ -167,7 +167,6 @@ PROBE_CATEGORIES = [
 ]
 MIN_ELAPSED_FOR_RATE = 0.1
 
-_GROUPED_RE = re.compile(r"^\s*(\d+)\s*([a-z])[.)]\s*(.+)$", re.IGNORECASE)
 _SCENARIO_LINE_RE = re.compile(r"^\s*(\d+)\s*[.\)]\s*(.+?)\s*$")
 
 # System prompt shared by scenario and pair generators.  Stripped to
@@ -1383,7 +1382,6 @@ class SaklasSession:
         scenarios: list[str] | None = None,
         n_scenarios: int = _N_SCENARIOS,
         statements_per_cell: int = _N_PAIRS_PER_SCENARIO,
-        share_moment: bool = False,
         on_progress: Callable[[str], None] | None = None,
         on_scenarios: Callable[[list[str]], None] | None = None,
         on_corpus: Callable[[str, list[str]], None] | None = None,
@@ -1404,31 +1402,21 @@ class SaklasSession:
         average becomes the model's natural-voice baseline across
         diverse everyday domains.  Used to build the probe-centering
         ``mu_neutral`` reference that DLS + Mahalanobis depend on; it
-        takes exactly one concept (and not ``share_moment``) and the
-        returned dict uses that slug as its single key (caller picks the
-        slug as a marker).  Naming is the **default** for every other
-        call — including a single named concept (e.g. a one-node
-        discover resume), which generates that concept's corpus, not a
-        neutral baseline.
+        takes exactly one concept and the returned dict uses that slug
+        as its single key (caller picks the slug as a marker).  Naming is
+        the **default** for every other call — including a single named
+        concept (e.g. a one-node discover resume), which generates that
+        concept's corpus, not a neutral baseline.
 
-        Two cell-fill modes (for N >= 2):
-
-        - ``share_moment=False`` (default): one LLM call per (scenario,
-          concept) cell, producing K independent statements per cell.
-          The discover-mode shape — per-cell statements are unmatched
-          across concepts, but the scenario index aligns the row.
-        - ``share_moment=True``: one LLM call per scenario writes K
-          *moment-shared groups*, each a concrete situation with one
-          first-person statement per concept facing that same moment.
-          The bipolar contrastive shape — within group ``i`` of a
-          scenario, every concept's statement is about the same
-          concrete moment, so per-pair diffs cancel scenario+moment
-          variance and isolate the concept axis. The shape that gives
-          DiM its clean signal. Passing ``len(concepts)==2`` reproduces
-          the legacy ``generate_pairs`` semantics; the caller recovers
-          pairs via ``zip(out[concepts[0]], out[concepts[1]])``. N>2
-          generalizes naturally to moment-shared K-tuples — letter
-          labels ``a..z`` cap the concept budget at 26.
+        Cell fill: one LLM call per (scenario, concept) cell produces K
+        independent statements per cell.  Per-cell statements are unmatched
+        across concepts, but the scenario index aligns the row — statement
+        index ``j`` of every concept came from the *same* scenario, which is
+        the load-bearing structure (within-pair moment-matching never
+        affected the direction, since the fit is centroid-based: a 2-node
+        subspace's direction is the mean-difference regardless of pairing).
+        A steering vector is the ``len(concepts)==2`` case; the caller
+        recovers pairs via ``zip(out[concepts[0]], out[concepts[1]])``.
 
         ``scenarios=None`` auto-generates a fresh scenario list (the
         K-tuple scenario prompt; covers both N=2 and N>2). Pass
@@ -1440,12 +1428,11 @@ class SaklasSession:
         The anti-allegory anchor — the directive that each concept is a
         *literal* concept (so non-human axes like deer/wolf or
         brick/feather stay literal rather than collapsing into
-        human-social metaphor) — is present in all three prompt builders:
-        the scenario prompt, the moment-shared (``share_moment=True``)
-        statement prompt, and the per-cell (``share_moment=False``)
-        statement prompt.  The three phrasings differ in wording but all
-        carry the "literal concept" directive; the tests assert that
-        directive's presence, not byte-identical text.
+        human-social metaphor) — is present in both prompt builders: the
+        scenario prompt and the per-cell statement prompt.  The two
+        phrasings differ in wording but both carry the "literal concept"
+        directive; the tests assert that directive's presence, not
+        byte-identical text.
 
         Returns ``{concept: [statement, ...]}`` where each list has
         exactly ``len(scenarios) * statements_per_cell`` entries,
@@ -1461,10 +1448,8 @@ class SaklasSession:
         retained, so the return dict is empty and peak memory stays at
         one concept's corpus rather than the whole roster — the path big
         manifolds take, and which leaves finished nodes on disk if a run
-        dies mid-way.  In ``share_moment=False`` mode the concept loop
-        runs outer so each node finishes before the next; in
-        ``share_moment=True`` mode the moment-shared nodes all complete
-        together and are emitted after the scenario loop.
+        dies mid-way.  The concept loop runs outer so each node finishes
+        before the next.
 
         Short-cell padding: if a cell LLM call yields fewer than
         ``statements_per_cell`` parseable rows after every retry, the
@@ -1477,14 +1462,7 @@ class SaklasSession:
             raise ValueError(
                 "generate_statements needs >= 1 concept"
             )
-        if share_moment and len(concepts) < 2:
-            # Moment-sharing has nothing to share with one speaker.
-            raise ValueError(
-                "generate_statements: share_moment=True needs >= 2 "
-                "concepts (otherwise there's no shared moment to "
-                "anchor against)"
-            )
-        if neutrals and (len(concepts) != 1 or share_moment):
+        if neutrals and len(concepts) != 1:
             # The neutrals baseline is a single unnamed corpus — the
             # mu_neutral reference.  Naming is the default for every
             # other call, including a single named concept (e.g. a
@@ -1492,7 +1470,7 @@ class SaklasSession:
             raise ValueError(
                 "generate_statements: neutrals=True is the single-concept "
                 "baseline path (no concept naming) — pass exactly one "
-                "concept and not share_moment"
+                "concept"
             )
         if n_scenarios <= 0 or statements_per_cell <= 0:
             raise ValueError(
@@ -1503,13 +1481,6 @@ class SaklasSession:
         if len(set(concepts)) != len(concepts):
             raise ValueError(
                 f"generate_statements: duplicate concept in {concepts!r}"
-            )
-        if share_moment and len(concepts) > 26:
-            # ``_parse_grouped_statements`` uses single-letter labels
-            # (a–z) to align statements within a moment group.
-            raise ValueError(
-                "generate_statements: share_moment supports up to 26 "
-                f"concepts (got {len(concepts)})"
             )
 
         # Slug underscores read as spaces in the LLM-facing prompt; the
@@ -1585,201 +1556,87 @@ class SaklasSession:
             else:
                 corpora[label] = statements
 
-        if share_moment:
-            # ``Speakers: a="pirate", b="caveman", c="robot"`` — one line
-            # binds each letter label to its concept.  The format
-            # example below uses these letters as row labels.
-            speakers_inline = ", ".join(
-                f"{chr(ord('a') + i)}=\"{h}\""
-                for i, h in enumerate(humanized)
-            )
+        for c_idx, (c, h) in enumerate(zip(concepts, humanized), 1):
+            acc: list[str] = []
             for s_idx, scenario in enumerate(scenarios, 1):
                 if on_progress:
                     on_progress(
-                        f"Domain {s_idx}/{len(scenarios)} "
-                        f"({scenario}): {K} moment-shared groups of "
-                        f"{N} statements..."
+                        f"Concept {c_idx}/{N} ('{h}'), domain "
+                        f"{s_idx}/{len(scenarios)} ({scenario}): "
+                        f"generating {K} statements..."
                     )
-                # Build the format example with the right number of
-                # speaker letters so the model sees its actual row
-                # template.
-                example_letters = [chr(ord("a") + i) for i in range(N)]
-                example_block_1 = "\n".join(
-                    f"1{letter}. [set 1, speaker {letter}]"
-                    for letter in example_letters
-                )
-                example_block_2 = f"2{example_letters[0]}. [set 2, speaker {example_letters[0]}]"
-                prompt = (
-                    f"Domain: {scenario}.\n"
-                    f"Speakers: {speakers_inline}.\n\n"
-                    f"Write {K} sets of first-person statements. For "
-                    f"each set, pick one aspect of the domain to "
-                    f"write about, then for each of the literal "
-                    f"concepts, write one statement from their "
-                    f"perspective. Each statement should be a rich "
-                    f"and complete sentence.\n\n"
-                    f"Format:\n"
-                    f"{example_block_1}\n"
-                    f"...\n"
-                    f"{example_block_2}\n"
-                    f"..."
-                )
-                max_new_tokens = max(400, K * N * 100)
-                groups_best: list[tuple[str, ...]] = []
+                if neutrals:
+                    # Neutrals: no concept anchor, no qualifier
+                    # nudging affect-register.  The principled
+                    # definition of ``mu_neutral`` is "where the
+                    # model sits when not pushed by a concept" —
+                    # engineering the prompt toward a theoretical
+                    # affect-zero point ("stated plainly" /
+                    # "neutral") substitutes a different artificial
+                    # baseline (the model's response to *being told*
+                    # to be neutral) for the genuine one (the
+                    # model's natural unmodified output).  Letting
+                    # the model speak naturally across diverse
+                    # domains and accepting that as the baseline is
+                    # the actual operational definition.  On
+                    # symmetric axes (happy.sad) any residual
+                    # default-voice tilt cancels in the contrastive
+                    # direction; on axes where the model's default
+                    # is concept-loaded (e.g. ai.human, where the
+                    # model IS the AI side), DLS is slightly biased
+                    # — but a qualifier wouldn't fix that since the
+                    # model would default-voice the same way anyway.
+                    statement_prompt = (
+                        f"Domain: {scenario}.\n\n"
+                        f"Write {K} first-person statements about "
+                        f"this domain. Each statement should be a "
+                        f"rich and complete sentence.\n\n"
+                        f"Format:\n"
+                        f"1. [statement]\n"
+                        f"2. [statement]\n"
+                        f"...\n"
+                        f"{K}. [statement]"
+                    )
+                else:
+                    statement_prompt = (
+                        f"Concept: \"{h}\".\n"
+                        f"Domain: {scenario}.\n\n"
+                        f"Write {K} first-person statements. For each "
+                        f"statement, pick one aspect of the domain to "
+                        f"write about, then as the literal concept, "
+                        f"write one statement from their perspective. "
+                        f"Each statement should be a rich and "
+                        f"complete sentence.\n\n"
+                        f"Format:\n"
+                        f"1. [statement]\n"
+                        f"2. [statement]\n"
+                        f"...\n"
+                        f"{K}. [statement]"
+                    )
+                cell_best: list[str] = []
                 for _ in range(_MAX_GEN_ATTEMPTS):
                     text = self._run_generator(
-                        _GEN_SYSTEM_MSG, prompt, max_new_tokens, role=role,
+                        _GEN_SYSTEM_MSG, statement_prompt,
+                        max_new_tokens=max(400, K * 80),
+                        role=role,
                     )
-                    parsed = self._parse_grouped_statements(text, N)
+                    parsed = self._parse_numbered_statements(text)
                     if len(parsed) >= K:
-                        groups_best = parsed[:K]
+                        cell_best = parsed[:K]
                         break
-                    if len(parsed) > len(groups_best):
-                        groups_best = parsed
-                # Pad to K groups so the scenario-shared-index invariant
-                # survives.  Placeholder respects the per-concept slot.
-                if not groups_best:
-                    groups_best = [
-                        tuple(
-                            f"({h} statement under '{scenario}' — "
-                            f"generation failed)"
-                            for h in humanized
-                        )
+                    if len(parsed) > len(cell_best):
+                        cell_best = parsed
+                if not cell_best:
+                    cell_best = [
+                        f"({h} statement under '{scenario}' — "
+                        f"generation failed)"
                     ]
-                while len(groups_best) < K:
-                    groups_best.append(groups_best[-1])
-                for group in groups_best:
-                    for c, stmt in zip(concepts, group):
-                        corpora[c].append(stmt)
-            # Moment-shared nodes all complete together (one call per
-            # scenario covers every speaker), so emit after the loop.
-            for c in concepts:
-                _emit(c, corpora[c])
-        else:
-            for c_idx, (c, h) in enumerate(zip(concepts, humanized), 1):
-                acc: list[str] = []
-                for s_idx, scenario in enumerate(scenarios, 1):
-                    if on_progress:
-                        on_progress(
-                            f"Concept {c_idx}/{N} ('{h}'), domain "
-                            f"{s_idx}/{len(scenarios)} ({scenario}): "
-                            f"generating {K} statements..."
-                        )
-                    if neutrals:
-                        # Neutrals: no concept anchor, no qualifier
-                        # nudging affect-register.  The principled
-                        # definition of ``mu_neutral`` is "where the
-                        # model sits when not pushed by a concept" —
-                        # engineering the prompt toward a theoretical
-                        # affect-zero point ("stated plainly" /
-                        # "neutral") substitutes a different artificial
-                        # baseline (the model's response to *being told*
-                        # to be neutral) for the genuine one (the
-                        # model's natural unmodified output).  Letting
-                        # the model speak naturally across diverse
-                        # domains and accepting that as the baseline is
-                        # the actual operational definition.  On
-                        # symmetric axes (happy.sad) any residual
-                        # default-voice tilt cancels in the contrastive
-                        # direction; on axes where the model's default
-                        # is concept-loaded (e.g. ai.human, where the
-                        # model IS the AI side), DLS is slightly biased
-                        # — but a qualifier wouldn't fix that since the
-                        # model would default-voice the same way anyway.
-                        statement_prompt = (
-                            f"Domain: {scenario}.\n\n"
-                            f"Write {K} first-person statements about "
-                            f"this domain. Each statement should be a "
-                            f"rich and complete sentence.\n\n"
-                            f"Format:\n"
-                            f"1. [statement]\n"
-                            f"2. [statement]\n"
-                            f"...\n"
-                            f"{K}. [statement]"
-                        )
-                    else:
-                        statement_prompt = (
-                            f"Concept: \"{h}\".\n"
-                            f"Domain: {scenario}.\n\n"
-                            f"Write {K} first-person statements. For each "
-                            f"statement, pick one aspect of the domain to "
-                            f"write about, then as the literal concept, "
-                            f"write one statement from their perspective. "
-                            f"Each statement should be a rich and "
-                            f"complete sentence.\n\n"
-                            f"Format:\n"
-                            f"1. [statement]\n"
-                            f"2. [statement]\n"
-                            f"...\n"
-                            f"{K}. [statement]"
-                        )
-                    cell_best: list[str] = []
-                    for _ in range(_MAX_GEN_ATTEMPTS):
-                        text = self._run_generator(
-                            _GEN_SYSTEM_MSG, statement_prompt,
-                            max_new_tokens=max(400, K * 80),
-                            role=role,
-                        )
-                        parsed = self._parse_numbered_statements(text)
-                        if len(parsed) >= K:
-                            cell_best = parsed[:K]
-                            break
-                        if len(parsed) > len(cell_best):
-                            cell_best = parsed
-                    if not cell_best:
-                        cell_best = [
-                            f"({h} statement under '{scenario}' — "
-                            f"generation failed)"
-                        ]
-                    while len(cell_best) < K:
-                        cell_best.append(cell_best[-1])
-                    acc.extend(cell_best)
-                _emit(c, acc)
+                while len(cell_best) < K:
+                    cell_best.append(cell_best[-1])
+                acc.extend(cell_best)
+            _emit(c, acc)
 
         return {} if on_corpus is not None else corpora
-
-    @staticmethod
-    def _parse_grouped_statements(
-        text: str, group_size: int,
-    ) -> list[tuple[str, ...]]:
-        """Parse ``N<letter>`` grouped statements from generated text.
-
-        Accepts ``1a. stmt`` / ``2b) stmt`` etc.  Lines are grouped by
-        their numeric prefix; within a group, lines are bucketed by
-        their letter (a..z, case-insensitive) and the first
-        ``group_size`` letters must all be present for the group to
-        emerge.  Out-of-order letters within a group are fine (sorts
-        on letter); incomplete groups are dropped (caller retries).
-
-        For ``group_size == 2`` this is a stricter form of the legacy
-        ``_parse_pairs`` — both produce ``(a, b)`` tuples and tolerate
-        reversed ``b/a`` ordering within a group, but this parser
-        additionally rejects pairs missing their numeric prefix.
-        """
-        import collections
-        groups: dict[int, dict[str, str]] = collections.defaultdict(dict)
-        for line in text.split("\n"):
-            m = _GROUPED_RE.match(line.strip())
-            if not m:
-                continue
-            idx = int(m.group(1))
-            letter = m.group(2).lower()
-            content = m.group(3).strip()
-            if len(content) < 10:
-                continue
-            letter_idx = ord(letter) - ord("a")
-            if not 0 <= letter_idx < group_size:
-                continue
-            # First occurrence of (idx, letter) wins; later duplicates
-            # are dropped rather than confusing the row.
-            groups[idx].setdefault(letter, content)
-        out: list[tuple[str, ...]] = []
-        for idx in sorted(groups.keys()):
-            bag = groups[idx]
-            wanted = [chr(ord("a") + i) for i in range(group_size)]
-            if all(letter in bag for letter in wanted):
-                out.append(tuple(bag[letter] for letter in wanted))
-        return out
 
     @staticmethod
     def _parse_numbered_statements(text: str) -> list[str]:

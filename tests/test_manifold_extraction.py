@@ -83,7 +83,6 @@ class _Handle:
         scenarios: list[str] | None = None,
         n_scenarios: int = 9,
         statements_per_cell: int = 5,
-        share_moment: bool = False,
         on_progress: Any = None,
         role: str | None = None,
     ) -> dict[str, list[str]]:
