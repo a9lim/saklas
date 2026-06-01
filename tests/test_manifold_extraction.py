@@ -557,7 +557,7 @@ def test_discover_inject_three_op_moves_toward_target(tmp_path: Path) -> None:
     seed = position.reshape((1,) * 2 + (n,)).expand(1, 3, n)
     out, _foot = inject_three_op(
         hidden, sub, domain, position, seed,
-        along=1.0, onto=1.0, toward=0.0, gn_steps=4,
+        along=1.0, onto=1.0, gn_steps=4,
     )
 
     for pos in range(hidden.shape[1]):

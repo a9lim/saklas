@@ -564,7 +564,7 @@ def test_inject_identity_at_zero():
     h = _on_surface(sub, domain, [0.4, 0.6]) + 0.2 * torch.randn(16)
     out, _ = inject_three_op(
         h, sub, domain, torch.tensor([0.9, 0.1]), torch.tensor([0.4, 0.6]),
-        0.0, 0.0, 0.0, gn_steps=20,
+        0.0, 0.0, gn_steps=20,
     )
     assert torch.allclose(out, h, atol=1e-3)
 
@@ -575,13 +575,13 @@ def test_inject_along_slides_on_surface():
     h = _on_surface(sub, domain, a)  # on the surface, H_n = 0
     out, _ = inject_three_op(
         h, sub, domain, torch.tensor(b), torch.tensor(a),
-        1.0, 0.0, 0.0, gn_steps=20,
+        1.0, 0.0, gn_steps=20,
     )
     assert torch.allclose(out, _on_surface(sub, domain, b), atol=5e-3)
     # half-slide lands on the geodesic midpoint foot
     out_h, _ = inject_three_op(
         h, sub, domain, torch.tensor(b), torch.tensor(a),
-        0.5, 0.0, 0.0, gn_steps=20,
+        0.5, 0.0, gn_steps=20,
     )
     assert torch.allclose(out_h, _on_surface(sub, domain, [0.5, 0.5]), atol=5e-3)
 
@@ -591,7 +591,7 @@ def test_inject_onto_collapses_to_surface():
     h = _on_surface(sub, domain, [0.5, 0.5]) + 0.3 * torch.randn(16)
     out, foot = inject_three_op(
         h, sub, domain, torch.tensor([0.5, 0.5]), torch.tensor([0.5, 0.5]),
-        0.0, 1.0, 0.0, gn_steps=20,
+        0.0, 1.0, gn_steps=20,
     )
     # in-subspace part of the output lies on the surface at the found foot
     q_out = (out - sub.mean) @ sub.basis.T
@@ -603,23 +603,27 @@ def test_inject_onto_half_halves_off_manifold_residual():
     sub, domain = _grid_manifold()
     h = _on_surface(sub, domain, [0.4, 0.4]) + 0.3 * torch.randn(16)
     pos, seed = torch.tensor([0.4, 0.4]), torch.tensor([0.4, 0.4])
-    out0, foot = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.0, 0.0, gn_steps=20)
-    out_h, _ = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.5, 0.0, gn_steps=20)
+    out0, foot = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.0, gn_steps=20)
+    out_h, _ = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.5, gn_steps=20)
     surf = sub.eval_at(domain.embed(foot)) - sub.mean
     hn0 = ((out0 - sub.mean) @ sub.basis.T @ sub.basis) - surf
     hnh = ((out_h - sub.mean) @ sub.basis.T @ sub.basis) - surf
     assert torch.allclose(hnh, 0.5 * hn0, atol=5e-3)
 
 
-def test_inject_toward_collapses_off_subspace():
+def test_inject_keeps_off_subspace_verbatim():
+    # The off-subspace residual ``H_o`` is always kept verbatim — the old
+    # ``toward`` op that scaled it is removed.  Even a strong along+onto slide
+    # leaves the orthogonal complement untouched.
     sub, domain = _grid_manifold()
     h = _on_surface(sub, domain, [0.3, 0.7]) + 0.4 * torch.randn(16)
+    _, perp_in = decompose(h, sub.mean, sub.basis)
     out, _ = inject_three_op(
-        h, sub, domain, torch.tensor([0.3, 0.7]), torch.tensor([0.3, 0.7]),
-        0.0, 0.0, 1.0, gn_steps=20,
+        h, sub, domain, torch.tensor([0.9, 0.2]), torch.tensor([0.3, 0.7]),
+        1.0, 1.0, gn_steps=20,
     )
-    _, perp = decompose(out, sub.mean, sub.basis)
-    assert torch.allclose(perp, torch.zeros_like(perp), atol=1e-4)
+    _, perp_out = decompose(out, sub.mean, sub.basis)
+    assert torch.allclose(perp_out, perp_in, atol=1e-4)
 
 
 def test_inject_along_onto_preserve_off_subspace():
@@ -628,7 +632,7 @@ def test_inject_along_onto_preserve_off_subspace():
     _, perp_in = decompose(h, sub.mean, sub.basis)
     out, _ = inject_three_op(
         h, sub, domain, torch.tensor([0.9, 0.2]), torch.tensor([0.2, 0.8]),
-        0.7, 0.5, 0.0, gn_steps=20,
+        0.7, 0.5, gn_steps=20,
     )
     _, perp_out = decompose(out, sub.mean, sub.basis)
     assert torch.allclose(perp_out, perp_in, atol=1e-4)
@@ -639,14 +643,13 @@ def test_inject_norm_cap_bounds_output():
     h = _on_surface(sub, domain, [0.5, 0.5]) + 0.3 * torch.randn(16)
     for a in (0.0, 0.5, 1.0):
         for o in (0.0, 1.0):
-            for t in (0.0, 1.0):
-                out, _ = inject_three_op(
-                    h, sub, domain, torch.tensor([0.9, 0.1]),
-                    torch.tensor([0.5, 0.5]), a, o, t, gn_steps=20, norm_cap=3.0,
-                )
-                assert torch.isfinite(out).all()
-                ratio = out.norm() / h.norm()
-                assert ratio <= 3.0 + 1e-4
+            out, _ = inject_three_op(
+                h, sub, domain, torch.tensor([0.9, 0.1]),
+                torch.tensor([0.5, 0.5]), a, o, gn_steps=20, norm_cap=3.0,
+            )
+            assert torch.isfinite(out).all()
+            ratio = out.norm() / h.norm()
+            assert ratio <= 3.0 + 1e-4
 
 
 # ------------------------------------------------- affine (flat) subspace ---
@@ -709,7 +712,7 @@ def test_affine_inject_identity_at_zero():
     h = sub.eval_at(torch.tensor([0.6])) + 0.2 * torch.randn(16)
     out, foot = inject_three_op(
         h, sub, domain, torch.tensor([0.9]), torch.tensor([0.6]),
-        0.0, 0.0, 0.0,
+        0.0, 0.0,
     )
     assert torch.allclose(out, h, atol=1e-4)
     # the returned foot is q exactly (the in-subspace reduced coord of h)
@@ -721,14 +724,14 @@ def test_affine_inject_along_lands_coord_at_target():
     h = sub.eval_at(torch.tensor([-0.4])) + 0.3 * torch.randn(16)
     target = torch.tensor([1.5])
     out, _ = inject_three_op(
-        h, sub, domain, target, torch.tensor([-0.4]), 1.0, 0.0, 0.0,
+        h, sub, domain, target, torch.tensor([-0.4]), 1.0, 0.0,
     )
     q_out = (out - sub.mean) @ sub.basis.T          # reduced coord of the output
     assert torch.allclose(q_out, target, atol=1e-4)
     # half-slide lands at the linear midpoint between q and target
     q_in = (h - sub.mean) @ sub.basis.T
     out_h, _ = inject_three_op(
-        h, sub, domain, target, torch.tensor([-0.4]), 0.5, 0.0, 0.0,
+        h, sub, domain, target, torch.tensor([-0.4]), 0.5, 0.0,
     )
     q_half = (out_h - sub.mean) @ sub.basis.T
     assert torch.allclose(q_half, 0.5 * (q_in + target), atol=1e-4)
@@ -739,27 +742,22 @@ def test_affine_inject_onto_is_vacuous():
     sub, domain = _folded_vector()
     h = sub.eval_at(torch.tensor([0.2])) + 0.3 * torch.randn(16)
     pos, seed = torch.tensor([0.2]), torch.tensor([0.2])
-    out0, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 0.0, 0.0)
-    out1, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 1.0, 0.0)
+    out0, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 0.0)
+    out1, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 1.0)
     assert torch.allclose(out0, out1, atol=1e-5)
 
 
-def test_affine_inject_toward_collapses_off_subspace():
+def test_affine_inject_keeps_off_subspace_verbatim():
+    # On a flat subspace the off-subspace residual ``H_o`` is kept verbatim —
+    # the old ``toward`` op that scaled it is removed — even under a full slide.
     sub, domain = _folded_vector()
     h = sub.eval_at(torch.tensor([0.3])) + 0.4 * torch.randn(16)
     _, perp_in = decompose(h, sub.mean, sub.basis)
-    # toward=1 zeroes H_o
     out, _ = inject_three_op(
-        h, sub, domain, torch.tensor([0.3]), torch.tensor([0.3]), 0.0, 0.0, 1.0,
+        h, sub, domain, torch.tensor([1.2]), torch.tensor([0.3]), 1.0, 1.0,
     )
     _, perp_out = decompose(out, sub.mean, sub.basis)
-    assert torch.allclose(perp_out, torch.zeros_like(perp_out), atol=1e-4)
-    # toward=0.5 halves it
-    out_h, _ = inject_three_op(
-        h, sub, domain, torch.tensor([0.3]), torch.tensor([0.3]), 0.0, 0.0, 0.5,
-    )
-    _, perp_h = decompose(out_h, sub.mean, sub.basis)
-    assert torch.allclose(perp_h, 0.5 * perp_in, atol=1e-4)
+    assert torch.allclose(perp_out, perp_in, atol=1e-4)
 
 
 def test_affine_manifold_point_round_trip():

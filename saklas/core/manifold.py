@@ -34,7 +34,7 @@ pulled in. ``eval_rbf``, :func:`eval_rbf_jacobian`, :func:`rotate_toward`,
 :func:`_gn_step` and :func:`inject_three_op` are the functions reachable
 from the generation hot path (``rotate_toward`` is the Givens kernel the
 vector angular path in :mod:`saklas.core.hooks` shares; ``inject_three_op``
-is the unified along/onto/toward manifold injection); all are
+is the unified along/onto manifold injection); all are
 allocation-light and free of host syncs.
 """
 from __future__ import annotations
@@ -1482,16 +1482,15 @@ def inject_three_op(
     foot_seed: torch.Tensor,
     along: "float | torch.Tensor",
     onto: "float | torch.Tensor",
-    toward: "float | torch.Tensor",
     *,
     gn_steps: int = 1,
     norm_cap: float = 3.0,
     damping: float = DEFAULT_INVERSION_DAMPING,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The unified three-operation manifold injection (replaces angular/additive).
+    """The unified two-operation manifold injection (replaces angular/additive).
 
     Decomposes ``h = mean + H_m + H_n + H_o`` against the layer's affine
-    subspace and its RBF surface ``M``, then applies three near-orthogonal
+    subspace and its RBF surface ``M``, then applies two near-orthogonal
     operations, each a coefficient in ``[0, 1]``:
 
     - **along** (``a``): slide the projected foot from its current position
@@ -1504,8 +1503,13 @@ def inject_three_op(
     - **onto** (``o``): scale ``H_n`` by ``(1 − o)`` — collapse onto the surface
       within the subspace.  Vacuous when the surface fills its subspace
       (``H_n ≈ 0``).
-    - **toward** (``t``): scale ``H_o`` by ``(1 − t)`` — collapse onto the
-      affine subspace.  The R-dim generalization of the ``~``/``|`` operators.
+
+    The off-*subspace* residual ``H_o`` is **always kept verbatim** — the old
+    third op (``toward``, which scaled ``H_o``) is removed.  It scaled the
+    orthogonal complement of *this* subspace, i.e. every composing neighbor's
+    span, so it broke orthogonal composition and never cohered as a knob; the
+    R-dim ``~``/``|`` semantics are recovered by routing those operators into the
+    merged affine subspace as push/ablation axes instead.
 
     All subspace arithmetic runs in **reduced (R-dim) coordinates**; because
     ``basis`` is orthonormal, ``‖H_n_reduced‖ = ‖H_n‖`` exactly, so the
@@ -1518,10 +1522,10 @@ def inject_three_op(
     ``(h_new, foot)`` where ``foot`` ``(.., n)`` is *this* token's refined
     pre-slide foot, to seed the next token.
 
-    Order is fixed **along → onto → toward**: the transport (along) must run
-    before ``onto`` scales the transported residual.  No global norm
-    preservation — ``onto``/``toward`` are *meant* to shrink ``‖h − mean‖``, and
-    the apply-time lever normalization controls the per-α magnitude; a soft cap
+    Order is fixed **along → onto**: the transport (along) must run before
+    ``onto`` scales the transported residual.  No global norm preservation —
+    ``onto`` is *meant* to shrink ``‖h − mean‖``, and the apply-time lever
+    normalization controls the per-α magnitude; a soft cap
     ``‖h_new‖ ≤ norm_cap·‖h‖`` guards only against off-domain RBF extrapolation
     blowup.
     """
@@ -1542,10 +1546,10 @@ def inject_three_op(
         # ``onto`` is vacuous (ignored).  No GN solve, no RBF eval, no
         # tangent Gram-solve — the cost the common steering case can't pay.
         # ALONG slides ``q`` toward ``target`` geodesically (CustomDomain ⇒
-        # linear); TOWARD scales the off-subspace residual ``H_o``.
+        # linear); the off-subspace residual ``H_o`` is kept verbatim.
         p_new = domain.geodesic(q, target, along)      # (.., n==R)
         new_par = p_new @ basis                        # (.., D)
-        new_perp = (1.0 - toward) * h_perp             # (.., D)
+        new_perp = h_perp                              # (.., D) kept verbatim
         h_new = mean + new_par + new_perp
         norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
         norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
@@ -1607,14 +1611,16 @@ def inject_three_op(
 
     new_par = (foot_new_red + Hn_final) @ basis          # (.., D) back to world
 
-    # --- TOWARD: scale the off-subspace residual ---
-    new_perp = (1.0 - toward) * h_perp                   # (.., D)
+    # The off-subspace residual ``H_o`` is kept verbatim (the old ``toward`` op
+    # that scaled it is removed — it scaled the orthogonal complement of this
+    # subspace, breaking orthogonal composition with neighboring terms).
+    new_perp = h_perp                                    # (.., D) kept verbatim
 
     h_new = mean + new_par + new_perp                    # (.., D)
 
     # Soft safety cap: only fires on pathological off-domain RBF extrapolation
     # (clamp_position keeps p_new in-box for open axes, so this is belt-and-
-    # suspenders, not the norm semantic — onto/toward are allowed to shrink ‖h‖).
+    # suspenders, not the norm semantic — onto is allowed to shrink ‖h‖).
     norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
     norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
     cap = norm_cap * norm_pre

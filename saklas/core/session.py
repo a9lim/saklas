@@ -2821,7 +2821,7 @@ class SaklasSession:
                 self._steering.add_manifold(
                     entry.manifold, manifold,
                     position=entry.position,
-                    along=entry.along, onto=entry.onto, toward=entry.toward,
+                    along=entry.along, onto=entry.onto,
                     trigger=entry.trigger,
                 )
                 continue

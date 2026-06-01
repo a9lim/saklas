@@ -249,18 +249,18 @@ class SteeringHook:
             tuple[Trigger, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
         # Manifold groups: (Trigger, subspace, domain, target_coord [n],
-        # origin_coord [n], along, onto, toward).  ``target_coord`` /
-        # ``origin_coord`` are **authoring coordinates** (the three-op kernel
-        # slides the foot in coord space, not toward a fixed world point), so
-        # there is no per-layer world-target precompute — the RBF eval lives
-        # in :func:`inject_three_op` warm-started from the per-token foot.
-        # ``along`` / ``onto`` / ``toward`` are the per-layer effective
-        # coefficients (share-weighted + lever-normalized at apply time).  Any
-        # manifold group forces the slow path.
+        # origin_coord [n], along, onto).  ``target_coord`` /
+        # ``origin_coord`` are **authoring coordinates** (the kernel slides the
+        # foot in coord space, not toward a fixed world point), so there is no
+        # per-layer world-target precompute — the RBF eval lives in
+        # :func:`inject_three_op` warm-started from the per-token foot.
+        # ``along`` / ``onto`` are the per-layer effective coefficients
+        # (share-weighted + lever-normalized at apply time).  Any manifold
+        # group forces the slow path.
         self.manifold_groups: list[
             tuple[
                 Trigger, LayerSubspace, ManifoldDomain,
-                torch.Tensor, torch.Tensor, float, float, float,
+                torch.Tensor, torch.Tensor, float, float,
             ]
         ] = []
         # Per-token nearest-point foot state, parallel to ``manifold_groups``
@@ -305,7 +305,7 @@ class SteeringHook:
         dtype: torch.dtype,
         ctx: TriggerContext,
         *,
-        manifold_entries: "list[tuple[LayerSubspace, ManifoldDomain, torch.Tensor, torch.Tensor, float, float, float, Trigger]] | None" = None,
+        manifold_entries: "list[tuple[LayerSubspace, ManifoldDomain, torch.Tensor, torch.Tensor, float, float, Trigger]] | None" = None,
         injection_mode: InjectionMode | None = None,
         theta_max: float | None = None,
     ) -> None:
@@ -428,18 +428,18 @@ class SteeringHook:
         # regardless of the model dtype, and quantizing ``node_params`` /
         # ``rbf_weights`` to bf16 would wreck the interpolant precision).
         # ``inject_three_op`` re-casts internally, so fp32 here is the precise
-        # carrier, not an extra cost.  An entry with all three coefficients
+        # carrier, not an extra cost.  An entry with both coefficients
         # zero is a no-op and drops here.
         manifold_groups: list[
             tuple[
                 Trigger, LayerSubspace, ManifoldDomain,
-                torch.Tensor, torch.Tensor, float, float, float,
+                torch.Tensor, torch.Tensor, float, float,
             ]
         ] = []
-        for sub, domain, target, origin, along, onto, toward, trig in (
+        for sub, domain, target, origin, along, onto, trig in (
             manifold_entries or []
         ):
-            if along == 0.0 and onto == 0.0 and toward == 0.0:
+            if along == 0.0 and onto == 0.0:
                 continue
             manifold_groups.append((
                 trig,
@@ -449,7 +449,6 @@ class SteeringHook:
                 origin.to(device=device, dtype=torch.float32),
                 float(along),
                 float(onto),
-                float(toward),
             ))
         self.manifold_groups = manifold_groups
         # New group set ⇒ cold-start every foot-follower (seed at origin).
@@ -682,10 +681,10 @@ class SteeringHook:
     def _apply_manifold_groups(
         self, hidden: torch.Tensor, ctx: TriggerContext,
     ) -> None:
-        """Apply every active manifold group via the unified three-op kernel.
+        """Apply every active manifold group via the unified kernel.
 
-        Each group runs :func:`inject_three_op` — the single along/onto/toward
-        injection that replaced the angular/additive mode split.  The three
+        Each group runs :func:`inject_three_op` — the single along/onto
+        injection that replaced the angular/additive mode split.  The two
         per-layer coefficients are already share-weighted + lever-normalized at
         :meth:`SteeringManager.apply_to_model` time, so the hot path just routes
         them through the kernel and threads the per-token foot.
@@ -708,7 +707,7 @@ class SteeringHook:
         if not self.manifold_groups:
             return
         for i, (
-            trig, sub, domain, target, origin, along, onto, toward,
+            trig, sub, domain, target, origin, along, onto,
         ) in enumerate(self.manifold_groups):
             if not trig.active(ctx):
                 continue
@@ -730,7 +729,7 @@ class SteeringHook:
                 gn_steps = _MANIFOLD_COLD_GN_STEPS
             h_new, foot = inject_three_op(
                 hidden, sub, domain, target, foot_seed,
-                along, onto, toward, gn_steps=gn_steps,
+                along, onto, gn_steps=gn_steps,
             )
             hidden.copy_(h_new)
             # Carry the last position's foot forward (decode keeps its single
@@ -799,10 +798,10 @@ class SteeringHook:
 _STEER_GAIN = 2.0
 
 
-# *Base* gain for three-op manifold steering, analogous to
+# *Base* gain for manifold steering, analogous to
 # :data:`_STEER_GAIN` for vector steering.  One gain now, not a per-mode
-# pair — the along/onto/toward decomposition replaced the angular/additive
-# mode split, so the three coefficients share a single base.  Each op moves
+# pair — the along/onto decomposition replaced the angular/additive
+# mode split, so the two coefficients share a single base.  Each op moves
 # a piece of ``h`` whose size is a fraction of ``||h||`` that varies with
 # subspace dimension ``R`` and with whether the subspace is rogue-heavy
 # (Euclidean PCA) or de-rogued (whitened/Fisher PCA); the per-α magnitude
@@ -818,7 +817,7 @@ _STEER_GAIN = 2.0
 # dimension and selection metric.  Because ``f_L`` ≈ the in-subspace norm
 # fraction (≈ ``1/n_layers`` scale) and the shares sum to 1, ``base / N`` ≈
 # ``n_layers``, so the per-layer ``coeff · share_L · (base/N)`` lands ≈
-# ``coeff`` on average — i.e. ``along/onto/toward`` read as ≈ [0, 1]
+# ``coeff`` on average — i.e. ``along/onto`` read as ≈ [0, 1]
 # fractions per layer, concentrated at the high-share layers.  ``N``
 # subsumes the former additive-only ``1/√EV`` quality factor (EV was only a
 # proxy for the lever; now recorded as a fit-quality diagnostic only).
@@ -832,10 +831,10 @@ _STEER_GAIN = 2.0
 # Per-persona strength variance persists (``happy`` collapses near α≈1 where
 # ``elated`` still holds — tune down per target).  Recalibrated 2.0 → 1.0 from
 # the old rotation-kernel value: the geodesic-lerp ``along`` over-steers at the
-# old gain.  NOTE (phase-1 sweep item): the three ops share this base; the
-# collapse ops (``onto`` / ``toward``) may want their own (smaller) base if the
-# share-weighted concentration proves too aggressive — splitting it is a
-# one-constant change here.  The gemma-4-31b sweep (#8) refines the number.
+# old gain.  NOTE (phase-1 sweep item): the two ops share this base; the
+# collapse op (``onto``) may want its own (smaller) base if the share-weighted
+# concentration proves too aggressive — splitting it is a one-constant change
+# here.  The gemma-4-31b sweep (#8) refines the number.
 _MANIFOLD_GAIN = 1.0
 
 # Floor on the share-weighted lever ``N`` so a near-degenerate (tiny-
@@ -1057,16 +1056,15 @@ class SteeringManager:
         position: tuple[float, ...] | str,
         along: float,
         onto: float,
-        toward: float,
         trigger: Trigger = Trigger.BOTH,
     ) -> None:
-        """Register a three-op manifold-steering term.
+        """Register a manifold-steering term.
 
         At ``apply_to_model`` time, for every layer the manifold covers, the
         per-layer subspace + domain + authoring ``target`` / ``origin`` coords
         are attached to the corresponding :class:`SteeringHook` along with the
-        share-weighted + lever-normalized per-layer ``along`` / ``onto`` /
-        ``toward`` coefficients; the hot path runs :func:`inject_three_op`.
+        share-weighted + lever-normalized per-layer ``along`` / ``onto``
+        coefficients; the hot path runs :func:`inject_three_op`.
 
         ``position`` is either a tuple of authoring coordinates (coord form)
         or a node-label string (label form, sugar for that node's coords).
@@ -1078,10 +1076,11 @@ class SteeringManager:
         coord-form input) raise
         :class:`saklas.core.steering_expr.SteeringExprError`.
 
-        ``along`` / ``onto`` / ``toward`` are the user coefficients (each
-        clamped to ``[0, 1]`` at apply time): ``along`` slides the foot toward
+        ``along`` / ``onto`` are the user coefficients (each clamped to
+        ``[0, 1]`` at apply time): ``along`` slides the foot toward
         ``position`` geodesically, ``onto`` collapses the off-manifold
-        in-subspace residual, ``toward`` collapses the off-subspace residual.
+        in-subspace residual.  The off-subspace residual is always kept
+        verbatim (the old ``toward`` op is removed).
         """
         resolve = getattr(manifold, "resolve_position", None)
         if resolve is not None:
@@ -1109,7 +1108,6 @@ class SteeringManager:
             "position": tuple(float(c) for c in resolved),
             "along": float(along),
             "onto": float(onto),
-            "toward": float(toward),
             "trigger": trigger,
             "shares": _manifold_layer_shares(manifold),
         }
@@ -1209,35 +1207,35 @@ class SteeringManager:
                 )
 
         # Manifold entries: stamp the per-layer subspace + domain + authoring
-        # ``target`` / ``origin`` coords and the three share-weighted,
-        # lever-normalized op coefficients.  The three-op kernel slides the
-        # foot in *coordinate* space, so there is no fixed world-target
-        # precompute — only the (layer-independent) authoring coords.  One
-        # manifold per layer (two would each overwrite the in-subspace
-        # component; their composition is ill-defined).
+        # ``target`` / ``origin`` coords and the two share-weighted,
+        # lever-normalized op coefficients.  The kernel slides the foot in
+        # *coordinate* space, so there is no fixed world-target precompute —
+        # only the (layer-independent) authoring coords.  One manifold per
+        # layer (two would each overwrite the in-subspace component; their
+        # composition is ill-defined).
         #
-        # **Gain (share-weight every op).**  Each of ``along`` / ``onto`` /
-        # ``toward`` gets the same per-layer factor ``share_L · (base/N)``:
+        # **Gain (share-weight every op).**  Each of ``along`` / ``onto``
+        # gets the same per-layer factor ``share_L · (base/N)``:
         # ``share_L`` (whitened Mahalanobis share, else Euclidean
         # centroid-spread) is how discriminative the manifold is at that layer;
         # ``N = Σ_L share_L·f_L`` is the share-weighted lever that makes the
         # per-α effect invariant to subspace dimension and selection metric
         # (see the gain constants' docstring).  Because ``base/N ≈ n_layers``,
         # the per-layer ``coeff · share_L · (base/N)`` lands ≈ ``coeff`` on
-        # average — so the three coefficients read as ≈ [0, 1] per-layer
+        # average — so the two coefficients read as ≈ [0, 1] per-layer
         # fractions, concentrated at the high-share layers.
         #
         # ``along`` is a displacement budget → **water-filled** (cap 1.0/layer,
         # excess redistributed) so a peaked-share layer never slides past the
-        # target and the cumulative budget is conserved.  ``onto`` / ``toward``
-        # are bounded collapse fractions → **clamped** to ``[0, 1]`` per layer
-        # (saturation at a layer just means "fully collapsed there"; there is
-        # nothing to redistribute).
+        # target and the cumulative budget is conserved.  ``onto`` is a bounded
+        # collapse fraction → **clamped** to ``[0, 1]`` per layer (saturation at
+        # a layer just means "fully collapsed there"; there is nothing to
+        # redistribute).
         manifold_by_layer: dict[
             int,
             list[tuple[
                 LayerSubspace, ManifoldDomain,
-                torch.Tensor, torch.Tensor, float, float, float, Trigger,
+                torch.Tensor, torch.Tensor, float, float, Trigger,
             ]],
         ] = {}
         manifold_owner: dict[int, str] = {}
@@ -1247,15 +1245,13 @@ class SteeringManager:
             trigger = m["trigger"]
             along = max(0.0, min(1.0, float(m["along"])))
             onto = max(0.0, min(1.0, float(m["onto"])))
-            toward = max(0.0, min(1.0, float(m["toward"])))
 
             shares: dict[int, float] = m.get("shares", {})
 
-            # Lever-normalized base gain (one base now — the along/onto/toward
-            # split replaced the per-mode angular/additive pair).  ``N`` is
-            # baked all-or-nothing alongside the whitened share; a fit without
-            # it uses ``N = 1`` (the un-normalized base) for that degenerate
-            # path.
+            # Lever-normalized base gain (one base now — the along/onto split
+            # replaced the per-mode angular/additive pair).  ``N`` is baked
+            # all-or-nothing alongside the whitened share; a fit without it
+            # uses ``N = 1`` (the un-normalized base) for that degenerate path.
             lever = getattr(manifold, "lever", None)
             if lever and all(L in lever for L in manifold.layers):
                 N = sum(shares[L] * lever[L] for L in manifold.layers)
@@ -1264,17 +1260,13 @@ class SteeringManager:
                 gain = _MANIFOLD_GAIN
 
             # ``along`` water-fills (rotation/displacement budget, cap 1.0);
-            # ``onto`` / ``toward`` clamp per layer (collapse fractions).
+            # ``onto`` clamps per layer (collapse fraction).
             raw_along: dict[int, float] = {
                 L: along * shares[L] * gain for L in manifold.layers
             }
             eff_along = _redistribute_budget(raw_along)
             eff_onto = {
                 L: max(0.0, min(1.0, onto * shares[L] * gain))
-                for L in manifold.layers
-            }
-            eff_toward = {
-                L: max(0.0, min(1.0, toward * shares[L] * gain))
                 for L in manifold.layers
             }
 
@@ -1332,8 +1324,7 @@ class SteeringManager:
                     )
                 manifold_by_layer.setdefault(layer_idx, []).append((
                     sub, domain, target_coord, origin_coord,
-                    eff_along[layer_idx], eff_onto[layer_idx],
-                    eff_toward[layer_idx], trigger,
+                    eff_along[layer_idx], eff_onto[layer_idx], trigger,
                 ))
 
         active_layers = (

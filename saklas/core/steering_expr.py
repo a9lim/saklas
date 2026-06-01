@@ -20,12 +20,11 @@ Grammar::
                  | NAME ":" "fraction"                 # manifold subspace fraction
                  | NAME "@" NAME                       # manifold label similarity
     op          := ">" | ">=" | "<" | "<="
-    coeff       := signed_float ("," signed_float){0,2}  # comma-run of ≤3;
+    coeff       := signed_float ("," signed_float)?  # comma-run of ≤2;
                                                        # >1 value is valid
                                                        # ONLY on a "%" term.
-                                                       # 1→along (onto/toward
-                                                       # off), 2→along,onto,
-                                                       # 3→along,onto,toward.
+                                                       # 1→along (onto off),
+                                                       # 2→along,onto.
                                                        # Optional; defaults
                                                        # to DEFAULT_COEFF = 0.5
     variant     := "raw" | "pca" | "sae" | "sae-" ID
@@ -185,30 +184,33 @@ class AblationTerm:
 
 @dataclass(frozen=True)
 class ManifoldTerm:
-    """Three-op manifold-steering entry in ``Steering.alphas``.
+    """Manifold-steering entry in ``Steering.alphas``.
 
     Produced by a ``manifold % position`` term.  The session loads the
     named :class:`~saklas.core.manifold.Manifold` artifact on scope entry
     and hands the hook a per-layer subspace + domain + the authoring
-    ``position`` coords; the hook runs the unified along/onto/toward
-    injection (:func:`~saklas.core.manifold.inject_three_op`).  Stored as a
-    value inside ``Steering.alphas`` under the key ``"<manifold>%<position>"``
-    so two positions on the same manifold compose as distinct entries and
+    ``position`` coords; the hook runs the unified along/onto injection
+    (:func:`~saklas.core.manifold.inject_three_op`).  Stored as a value
+    inside ``Steering.alphas`` under the key ``"<manifold>%<position>"`` so
+    two positions on the same manifold compose as distinct entries and
     never collide with plain / projected / ablation keys.
 
-    The three coefficients (each clamped to ``[0, 1]`` at apply time):
+    The two coefficients (each clamped to ``[0, 1]`` at apply time):
 
     - ``along`` — slide the projected foot toward ``position`` geodesically
       in coordinate space (the principled "directional" op).
     - ``onto`` — collapse the off-manifold, in-subspace residual onto the
       surface (vacuous when the surface fills its subspace).
-    - ``toward`` — collapse the off-subspace residual onto the subspace (the
-      R-dim generalization of the ``~`` / ``|`` projection operators).
 
-    The grammar's coefficient slot expands to a comma-run of ≤ 3: one coeff
-    ⇒ ``along = onto = toward``; two ⇒ ``along, onto = toward``; three ⇒
-    explicit.  ``manifold`` is the registry key — namespace-qualified when
-    the user typed a namespace, variant-suffixed when not ``raw``.
+    The off-*subspace* residual is always kept verbatim; the old third op
+    (``toward``) is removed — its ``~`` / ``|`` semantics are recovered by
+    routing those operators into the merged affine subspace as push/ablation
+    axes instead.
+
+    The grammar's coefficient slot expands to a comma-run of ≤ 2: one coeff
+    ⇒ ``along`` (``onto`` off); two ⇒ ``along, onto``.  ``manifold`` is the
+    registry key — namespace-qualified when the user typed a namespace,
+    variant-suffixed when not ``raw``.
 
     ``position`` is either:
 
@@ -225,7 +227,6 @@ class ManifoldTerm:
     """
     along: float
     onto: float
-    toward: float
     trigger: Trigger
     manifold: str
     position: tuple[float, ...] | str
@@ -384,8 +385,8 @@ class _Term:
     explicit_coeff: bool
     ablation: bool = False  # True iff term was prefixed with `!`
     # The full comma-run of coefficients the user typed.  A plain term
-    # carries a 1-tuple; a manifold ``%`` term may carry up to 3 mapping
-    # to (along, onto, toward) via :func:`_expand_three_op_coeffs`.
+    # carries a 1-tuple; a manifold ``%`` term may carry up to 2 mapping
+    # to (along, onto) via :func:`_expand_three_op_coeffs`.
     # ``coeff`` always equals ``coeffs[0]`` (the representative scalar all
     # non-manifold code paths read), so existing single-coeff behavior is
     # bit-identical; ``> 1`` on a non-manifold term is a parse-fold error.
@@ -451,23 +452,22 @@ class _Parser:
             coeff = float(sign) * float(self._consume().value)
             explicit = True
             # Comma-run of coefficients: the TERM-level coeff slot may carry
-            # up to 3 values mapping to (along, onto, toward) on a manifold
-            # ``%`` term.  This run is lexically unambiguous from the
-            # post-``%`` position commas — those follow the manifold IDENT
-            # and ``%``, this precedes the selector.  Each subsequent value
-            # carries the term's leading sign (so ``-0.6,0.3`` is
-            # ``(-0.6, -0.3)``, the natural read of a signed term).  A 4th
-            # value is a parse error; whether a comma-run is even legal for
-            # the selector kind (manifold-only) is enforced in ``_fold``.
+            # up to 2 values mapping to (along, onto) on a manifold ``%``
+            # term.  This run is lexically unambiguous from the post-``%``
+            # position commas — those follow the manifold IDENT and ``%``,
+            # this precedes the selector.  Each subsequent value carries the
+            # term's leading sign (so ``-0.6,0.3`` is ``(-0.6, -0.3)``, the
+            # natural read of a signed term).  A 3rd value is a parse error;
+            # whether a comma-run is even legal for the selector kind
+            # (manifold-only) is enforced in ``_fold``.
             run = [coeff]
             while self._peek().kind == "COMMA":
                 self._consume()
                 run.append(float(sign) * self._signed_num())
-                if len(run) > 3:
+                if len(run) > 2:
                     raise SteeringExprError(
-                        "a manifold coefficient slot takes at most 3 "
-                        "comma-separated values (along, onto, toward); "
-                        "got more",
+                        "a manifold coefficient slot takes at most 2 "
+                        "comma-separated values (along, onto); got more",
                         col=self._peek(-1).col,
                     )
             coeffs = tuple(run)
@@ -849,56 +849,49 @@ def _fmt_position(position: tuple[float, ...] | str) -> str:
 
 def _expand_three_op_coeffs(
     coeffs: tuple[float, ...],
-) -> tuple[float, float, float]:
-    """Map a 1/2/3-length coefficient run to ``(along, onto, toward)``.
+) -> tuple[float, float]:
+    """Map a 1/2-length coefficient run to ``(along, onto)``.
 
     The manifold ``%`` coefficient slot expands a comma-run with the
-    collapse ops defaulting **off** — they are progressively opted into:
+    collapse op (``onto``) defaulting **off** — it is opted into:
 
-    - ``c`` → ``along = c, onto = 0, toward = 0``  (pure directional slide)
-    - ``a, o`` → ``along = a, onto = o, toward = 0``
-    - ``a, o, t`` → explicit
+    - ``c`` → ``along = c, onto = 0``  (pure directional slide)
+    - ``a, o`` → ``along = a, onto = o``
 
     ``along`` is *the* steering knob: it slides the projected foot toward
     the target on the manifold and keeps everything else.  ``onto`` (flatten
-    the off-manifold in-subspace residual) and ``toward`` (collapse the
-    off-*subspace* residual) are aggressive and so off by default — crucially
-    ``toward`` scales ``H_o``, which is the bulk of the activation (the lever
-    ``‖h_par_c‖/‖h‖`` is ~0.1, so ``H_o`` is ~90% of it), so a nonzero
-    ``toward`` guts the activation and is reachable only via the explicit
-    3-coeff form.  This is why the single-coeff form maps to along-only, not
-    to ``(c, c, c)``.
+    the off-manifold in-subspace residual) is aggressive and so off by
+    default.  The off-*subspace* residual is always kept verbatim — the old
+    third op (``toward``) that scaled it is removed.
 
-    A run of length 0 or > 3 is a programming error here — the parser
-    rejects the 4-coeff case at parse time and a term always carries at
+    A run of length 0 or > 2 is a programming error here — the parser
+    rejects the 3-coeff case at parse time and a term always carries at
     least one coeff — but raise rather than index blindly.
     """
     n = len(coeffs)
     if n == 1:
-        return (coeffs[0], 0.0, 0.0)
+        return (coeffs[0], 0.0)
     if n == 2:
         a, o = coeffs
-        return (a, o, 0.0)
-    if n == 3:
-        return (coeffs[0], coeffs[1], coeffs[2])
+        return (a, o)
     raise SteeringExprError(
-        "a manifold coefficient slot takes 1, 2, or 3 comma-separated "
-        f"values (along, onto, toward); got {n}"
+        "a manifold coefficient slot takes 1 or 2 comma-separated "
+        f"values (along, onto); got {n}"
     )
 
 
 def _merge_manifold(
     alphas: "dict[str, AlphaEntry]",
     manifold: str,
-    coeffs: tuple[float, float, float],
+    coeffs: tuple[float, float],
     position: tuple[float, ...] | str,
     trig: Trigger,
 ) -> None:
-    along, onto, toward = coeffs
+    along, onto = coeffs
     key = f"{manifold}%{_fmt_position(position)}"
     if key not in alphas:
         alphas[key] = ManifoldTerm(
-            along=along, onto=onto, toward=toward,
+            along=along, onto=onto,
             trigger=trig, manifold=manifold, position=position,
         )
         return
@@ -916,7 +909,6 @@ def _merge_manifold(
     alphas[key] = ManifoldTerm(
         along=existing.along + along,
         onto=existing.onto + onto,
-        toward=existing.toward + toward,
         trigger=trig, manifold=manifold, position=position,
     )
 
@@ -1108,17 +1100,23 @@ def _fmt_ablation(a: AblationTerm) -> str:
 
 
 def _fmt_manifold(m: ManifoldTerm) -> str:
-    # Render the shortest coefficient form the (along, onto, toward) triple
-    # collapses to — the inverse of ``_expand_three_op_coeffs`` — so the
-    # round-trip is byte-for-byte.  The collapse ops default off, so: both
-    # zero → one coeff (along); toward zero → two (along, onto); else three.
+    # Render the shortest coefficient form the (along, onto) pair collapses
+    # to — the inverse of ``_expand_three_op_coeffs`` — so the round-trip is
+    # byte-for-byte.  The collapse op defaults off, so: onto zero → one coeff
+    # (along); else two (along, onto).
+    #
+    # The parser applies the term's *leading* sign (carried by ``along``) to
+    # every value in the comma-run (``-0.6,0.3`` parses as ``(-0.6, -0.3)``),
+    # so to make a programmatically-built mixed-sign term round-trip we render
+    # ``onto`` *relative to* ``along``'s sign: literal = onto·sign(along), which
+    # the parser then re-multiplies by sign(along) back to ``onto``.  For the
+    # parser's own output (where the whole run shares one sign) this is a no-op.
     pos = _fmt_position(m.position)
-    if m.onto == 0.0 and m.toward == 0.0:
+    if m.onto == 0.0:
         coeff_str = f"{m.along:g}"
-    elif m.toward == 0.0:
-        coeff_str = f"{m.along:g},{m.onto:g}"
     else:
-        coeff_str = f"{m.along:g},{m.onto:g},{m.toward:g}"
+        onto_lit = -m.onto if m.along < 0 else m.onto
+        coeff_str = f"{m.along:g},{onto_lit:g}"
     body = f"{coeff_str} {m.manifold}%{pos}"
     if m.trigger != Trigger.BOTH:
         body += "@" + _trigger_name(m.trigger)

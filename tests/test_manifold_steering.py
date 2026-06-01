@@ -1,10 +1,10 @@
-"""Hook + manager level tests for three-op manifold steering — CPU only.
+"""Hook + manager level tests for manifold steering — CPU only.
 
 These cover the *integration* layer — ``SteeringManager.apply_to_model``'s
-gain assembly (share-weight + lever-normalize + along water-fill + onto/toward
+gain assembly (share-weight + lever-normalize + along water-fill + onto
 clamp), ``add_manifold``'s plumbing, the hook's foot-following state, and the
-slow-path forcing.  The kernel math itself (geodesic slide, onto/toward
-collapse, norm cap) lives in ``test_manifold_math.py``.
+slow-path forcing.  The kernel math itself (geodesic slide, onto collapse,
+norm cap) lives in ``test_manifold_math.py``.
 """
 from __future__ import annotations
 
@@ -139,10 +139,9 @@ def _recompose_manifold(
     *,
     along: float = 0.5,
     onto: float = 0.0,
-    toward: float = 0.0,
     position: Sequence[float] = (0.5,),
 ) -> None:
-    """Stamp one three-op manifold group onto ``hook`` directly.
+    """Stamp one manifold group onto ``hook`` directly.
 
     Mirrors what ``apply_to_model`` hands ``recompose``: the per-layer
     subspace + domain + authoring target/origin coords + the (already
@@ -162,7 +161,7 @@ def _recompose_manifold(
         ablation_entries=[],
         manifold_entries=[(
             sub, domain, target_coord, origin_coord,
-            along, onto, toward, Trigger.BOTH,
+            along, onto, Trigger.BOTH,
         )],
         device=torch.device("cpu"),
         dtype=torch.float32,
@@ -170,12 +169,12 @@ def _recompose_manifold(
     )
 
 
-def _coeffs(hook: SteeringHook, gi: int = 0) -> tuple[float, float, float]:
-    """The per-layer (along, onto, toward) on group ``gi``."""
-    _trig, _sub, _domain, _target, _origin, along, onto, toward = (
+def _coeffs(hook: SteeringHook, gi: int = 0) -> tuple[float, float]:
+    """The per-layer (along, onto) on group ``gi``."""
+    _trig, _sub, _domain, _target, _origin, along, onto = (
         hook.manifold_groups[gi]
     )
-    return along, onto, toward
+    return along, onto
 
 
 # ------------------------------------------------------------- hook level ---
@@ -183,7 +182,7 @@ def _coeffs(hook: SteeringHook, gi: int = 0) -> tuple[float, float, float]:
 def test_hook_all_zero_is_noop():
     manifold = _manifold()
     hook = SteeringHook()
-    _recompose_manifold(hook, manifold, 0, along=0.0, onto=0.0, toward=0.0)
+    _recompose_manifold(hook, manifold, 0, along=0.0, onto=0.0)
     # A fully-zero term drops at recompose — no group, nothing fires.
     assert hook.manifold_groups == []
     hidden = torch.randn(1, 4, _DIM)
@@ -214,7 +213,7 @@ def test_hook_onto_collapses_onto_surface():
     domain = manifold.domain
     hook = SteeringHook()
     # Pure onto: no slide, no off-subspace collapse — isolate the H_n scale.
-    _recompose_manifold(hook, manifold, 0, along=0.0, onto=1.0, toward=0.0)
+    _recompose_manifold(hook, manifold, 0, along=0.0, onto=1.0)
     hidden = torch.randn(1, 4, _DIM) + sub.mean
     q_before = (hidden[0] - sub.mean) @ sub.basis.T
     _, dist_before = invert_parameterization(
@@ -231,19 +230,20 @@ def test_hook_onto_collapses_onto_surface():
     assert dist_after.max().item() < 0.1
 
 
-def test_hook_toward_collapses_off_subspace_residual():
-    """``toward=1`` drives the off-subspace residual ``H_o`` to zero — the
-    orthogonal complement of the subspace shrinks toward 0."""
+def test_hook_keeps_off_subspace_residual_verbatim():
+    """The off-subspace residual ``H_o`` is always kept verbatim — the old
+    ``toward`` op that scaled it is removed.  Even a strong along+onto slide
+    leaves the orthogonal complement of the subspace untouched."""
     manifold = _manifold()
     sub = manifold.layers[0]
     hook = SteeringHook()
-    _recompose_manifold(hook, manifold, 0, along=0.0, onto=0.0, toward=1.0)
+    _recompose_manifold(hook, manifold, 0, along=1.0, onto=1.0)
     hidden = torch.randn(1, 4, _DIM) + sub.mean
-    _, h_perp_before = decompose(hidden - sub.mean + sub.mean, sub.mean, sub.basis)
-    perp_before = h_perp_before.norm(dim=-1).clone()
+    _, h_perp_before = decompose(hidden, sub.mean, sub.basis)
+    perp_before = h_perp_before.clone()
     hook.hook_fn(None, None, hidden)
     _, h_perp_after = decompose(hidden, sub.mean, sub.basis)
-    assert (h_perp_after.norm(dim=-1) < perp_before).all()
+    assert torch.allclose(h_perp_after, perp_before, atol=1e-4)
 
 
 def test_hook_forces_slow_path():
@@ -291,7 +291,7 @@ def test_hook_trigger_gating_skips_inactive():
         additive_entries=[],
         ablation_entries=[],
         manifold_entries=[(
-            sub, domain, target, origin, 0.6, 0.0, 0.0, Trigger.GENERATED_ONLY,
+            sub, domain, target, origin, 0.6, 0.0, Trigger.GENERATED_ONLY,
         )],
         device=torch.device("cpu"), dtype=torch.float32, ctx=ctx,
     )
@@ -308,7 +308,7 @@ def test_hook_trigger_gating_skips_inactive():
 def test_manager_attaches_manifold_hooks():
     manifold = _manifold(layers=(0, 1))
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.5, onto=0.5, toward=0.5)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.5, onto=0.5)
     layers = _model_layers(4)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     assert sorted(mgr.hooks) == [0, 1]
@@ -320,7 +320,7 @@ def test_manager_steer_n2_manifold():
     mgr = SteeringManager()
     # along=0.3 keeps the single-layer budget (0.3·gain=0.6) under the
     # water-fill cap, so no saturation warning pollutes the run.
-    mgr.add_manifold("disk", manifold, position=(0.3, 0.8), along=0.3, onto=0.0, toward=0.0)
+    mgr.add_manifold("disk", manifold, position=(0.3, 0.8), along=0.3, onto=0.0)
     layers = _model_layers(2)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     hidden = torch.randn(1, 3, _DIM) + 20.0
@@ -335,24 +335,23 @@ def test_manager_position_length_mismatch_raises():
     # A 2-D manifold steered with a single coordinate.  ``ManifoldArityError``
     # still subclasses ``SteeringExprError`` so the family catch keeps working.
     with pytest.raises(ManifoldArityError) as exc:
-        mgr.add_manifold("disk", manifold, position=(0.5,), along=0.5, onto=0.5, toward=0.5)
+        mgr.add_manifold("disk", manifold, position=(0.5,), along=0.5, onto=0.5)
     assert isinstance(exc.value, SteeringExprError)
 
 
 def test_manager_coeffs_clamped_to_unit():
     """User coefficients clamp to [0, 1].  With a single covered layer
     share_L == 1, so along's raw budget would be ``1.0 · _MANIFOLD_GAIN``;
-    the water-fill caps it at 1.0.  onto/toward clamp per layer."""
+    the water-fill caps it at 1.0.  onto clamps per layer."""
     manifold = _manifold(layers=(0,))
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=5.0, onto=5.0, toward=5.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=5.0, onto=5.0)
     layers = _model_layers(1)
     with pytest.warns(UserWarning, match="saturates the 'along' displacement"):
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
-    along, onto, toward = _coeffs(mgr.hooks[0])
+    along, onto = _coeffs(mgr.hooks[0])
     assert along == pytest.approx(1.0, abs=1e-6)
     assert onto == pytest.approx(1.0, abs=1e-6)
-    assert toward == pytest.approx(1.0, abs=1e-6)
 
 
 def test_manager_along_share_weighting_sums():
@@ -366,7 +365,7 @@ def test_manager_along_share_weighting_sums():
         mgr = SteeringManager()
         mgr.add_manifold(
             "mood", manifold, position=(0.5,),
-            along=user_along, onto=0.0, toward=0.0,
+            along=user_along, onto=0.0,
         )
         mgr.apply_to_model(
             _model_layers(n_layers), torch.device("cpu"), torch.float32,
@@ -391,7 +390,7 @@ def test_manager_along_waterfill_caps_per_layer():
     manifold = _manifold(layers=tuple(range(n_layers)), lever=lever)
     eff_gain = _MANIFOLD_GAIN / lever  # = 10
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=1.0, onto=0.0, toward=0.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=1.0, onto=0.0)
     hooks_mod._warned_manifold_saturated.discard("mood")
     with pytest.warns(UserWarning, match="saturates the 'along' displacement"):
         mgr.apply_to_model(
@@ -404,36 +403,34 @@ def test_manager_along_waterfill_caps_per_layer():
     assert sum(budgets) == pytest.approx(min(1.0 * eff_gain, n_layers), abs=1e-4)
 
 
-def test_manager_onto_toward_clamped_not_waterfilled():
-    """onto/toward are bounded collapse fractions: clamped to [0, 1] per
-    layer, NOT water-filled (saturation at a layer just means fully
-    collapsed there — there is nothing to redistribute)."""
+def test_manager_onto_clamped_not_waterfilled():
+    """onto is a bounded collapse fraction: clamped to [0, 1] per layer, NOT
+    water-filled (saturation at a layer just means fully collapsed there —
+    there is nothing to redistribute)."""
     n_layers = 3
     lever = 0.2  # eff_gain = 10 ⇒ per-layer raw blows past 1.0 → clamps
     manifold = _manifold(layers=tuple(range(n_layers)), lever=lever)
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.0, onto=1.0, toward=1.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.0, onto=1.0)
     mgr.apply_to_model(_model_layers(n_layers), torch.device("cpu"), torch.float32)
     for hook in mgr.hooks.values():
-        _along, onto, toward = _coeffs(hook)
+        _along, onto = _coeffs(hook)
         assert 0.0 <= onto <= 1.0 + 1e-6
-        assert 0.0 <= toward <= 1.0 + 1e-6
     # At least one layer should be fully saturated (eff_gain ≫ 1).
     ontos = [_coeffs(h)[1] for h in mgr.hooks.values()]
     assert max(ontos) == pytest.approx(1.0, abs=1e-6)
 
 
-def test_manager_three_coeffs_independent():
-    """along / onto / toward flow through independently — a term with only
-    one nonzero coefficient leaves the other two at zero per layer."""
+def test_manager_two_coeffs_independent():
+    """along / onto flow through independently — a term with only one nonzero
+    coefficient leaves the other at zero per layer."""
     manifold = _manifold(layers=(0,))
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.1, onto=0.0, toward=0.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.1, onto=0.0)
     mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
-    along, onto, toward = _coeffs(mgr.hooks[0])
+    along, onto = _coeffs(mgr.hooks[0])
     assert along > 0.0
     assert onto == 0.0
-    assert toward == 0.0
 
 
 def test_manager_lever_normalization():
@@ -446,7 +443,7 @@ def test_manager_lever_normalization():
 
     def _eff(mf: Manifold) -> float:
         mgr = SteeringManager()
-        mgr.add_manifold("m", mf, position=(0.5,), along=user_along, onto=0.0, toward=0.0)
+        mgr.add_manifold("m", mf, position=(0.5,), along=user_along, onto=0.0)
         mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
         return _coeffs(mgr.hooks[0])[0]
 
@@ -479,7 +476,7 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     )
     user_along = 0.15
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=user_along, onto=0.0, toward=0.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=user_along, onto=0.0)
     mgr.apply_to_model(_model_layers(2), torch.device("cpu"), torch.float32)
     along_0 = _coeffs(mgr.hooks[0])[0]
     along_1 = _coeffs(mgr.hooks[1])[0]
@@ -528,8 +525,8 @@ def test_manager_rejects_overlapping_manifolds():
     m1 = _manifold(layers=(0, 1))
     m2 = _manifold(layers=(1, 2))
     mgr = SteeringManager()
-    mgr.add_manifold("a", m1, position=(0.3,), along=0.5, onto=0.0, toward=0.0)
-    mgr.add_manifold("b", m2, position=(0.7,), along=0.5, onto=0.0, toward=0.0)
+    mgr.add_manifold("a", m1, position=(0.3,), along=0.5, onto=0.0)
+    mgr.add_manifold("b", m2, position=(0.7,), along=0.5, onto=0.0)
     layers = _model_layers(4)
     with pytest.raises(OverlappingManifoldError) as exc:
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
@@ -539,7 +536,7 @@ def test_manager_rejects_overlapping_manifolds():
 def test_manager_clear_all_drops_manifolds():
     manifold = _manifold(layers=(0,))
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.5, onto=0.0, toward=0.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.5, onto=0.0)
     mgr.apply_to_model(_model_layers(2), torch.device("cpu"), torch.float32)
     mgr.clear_all()
     assert mgr.manifolds == {}
@@ -550,7 +547,7 @@ def test_manager_reset_manifold_feet_cold_starts():
     """``reset_manifold_feet`` re-seeds every hook's foot to cold (None)."""
     manifold = _manifold(layers=(0, 1))
     mgr = SteeringManager()
-    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.6, onto=0.0, toward=0.0)
+    mgr.add_manifold("mood", manifold, position=(0.5,), along=0.6, onto=0.0)
     layers = _model_layers(2)
     mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     # Fire once to warm the feet.

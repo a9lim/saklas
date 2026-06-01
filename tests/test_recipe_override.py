@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from saklas import Recipe, SamplingConfig
+from saklas.core.steering_expr import ManifoldTerm, parse_expr
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,20 @@ def test_invert_empty_steering():
     r = Recipe(steering=None)
     inv = r.invert_steering()
     assert inv.steering == ""
+
+
+def test_invert_manifold_term():
+    # Regression: a recipe whose steering carries a manifold ``%`` term must
+    # invert without error — the directional ``along`` flips sign, ``onto``
+    # (a collapse fraction) carries through unchanged.
+    r = Recipe(steering="0.6,0.3 circumplex%happy")
+    inv = r.invert_steering()
+    assert inv.steering is not None
+    reparsed = parse_expr(inv.steering)
+    (term,) = reparsed.alphas.values()
+    assert isinstance(term, ManifoldTerm)
+    assert term.along == pytest.approx(-0.6)
+    assert term.onto == pytest.approx(0.3)
 
 
 # ---------------------------------------------------------------------------

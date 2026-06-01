@@ -231,7 +231,7 @@ class TestManifoldAlongBudget:
         m = _peaked_manifold()
         # along=1.0 with the dominant layer's share ≈ 1.0 and base gain 2.0
         # would ask for a 2× full-slide on layer 0 absent the water-fill.
-        mgr.add_manifold("peaked", m, (0.0,), along=1.0, onto=0.0, toward=0.0)
+        mgr.add_manifold("peaked", m, (0.0,), along=1.0, onto=0.0)
         n_layers = max(m.layers) + 2
         layers = nn.ModuleList([_Passthrough() for _ in range(n_layers)])
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
@@ -250,7 +250,7 @@ class TestManifoldAlongBudget:
     def test_manifold_along_budget_conserved(self) -> None:
         mgr = SteeringManager()
         m = _peaked_manifold()
-        mgr.add_manifold("peaked", m, (0.0,), along=1.0, onto=0.0, toward=0.0)
+        mgr.add_manifold("peaked", m, (0.0,), along=1.0, onto=0.0)
         n_layers = max(m.layers) + 2
         layers = nn.ModuleList([_Passthrough() for _ in range(n_layers)])
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)

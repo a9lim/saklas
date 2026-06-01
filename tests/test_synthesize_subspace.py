@@ -195,12 +195,12 @@ def test_synthesized_subspace_drives_inject_three_op():
     seed = (h - sub.mean) @ sub.basis.T
 
     out, _foot = inject_three_op(
-        h, sub, domain, target, seed, along=1.0, onto=0.0, toward=0.0,
+        h, sub, domain, target, seed, along=1.0, onto=0.0,
     )
     # in-subspace coords land exactly on the target (push→0.5, ablate→0)
     coords_out = (out - sub.mean) @ sub.basis.T
     assert torch.allclose(coords_out, target, atol=1e-4)
-    # off-subspace residual preserved (toward=0)
+    # off-subspace residual preserved (kept verbatim)
     _, perp_out = decompose(out, sub.mean, sub.basis)
     assert torch.allclose(perp_out, perp, atol=1e-4)
 
@@ -219,6 +219,6 @@ def test_synthesized_inject_identity_at_along_zero():
     seed = (h - sub.mean) @ sub.basis.T
     out, _foot = inject_three_op(
         h, sub, domain, synth.target_coord[0], seed,
-        along=0.0, onto=0.0, toward=0.0,
+        along=0.0, onto=0.0,
     )
     assert torch.allclose(out, h, atol=1e-5)

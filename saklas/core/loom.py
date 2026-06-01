@@ -251,8 +251,12 @@ class Recipe:
                 )
                 continue
             if isinstance(val, ManifoldTerm):
+                # Flip the directional ``along`` (the representative coeff);
+                # ``onto`` is a collapse fraction in [0, 1], not a signed
+                # push, so it carries through unchanged.
                 flipped[name] = ManifoldTerm(
-                    coeff=-val.coeff,
+                    along=-val.along,
+                    onto=val.onto,
                     trigger=val.trigger,
                     manifold=val.manifold,
                     position=val.position,
