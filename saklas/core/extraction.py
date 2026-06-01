@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import pathlib
 import hashlib
-from typing import Any, Callable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 import torch
 
@@ -31,12 +31,7 @@ from saklas.io.datasource import DataSource
 from saklas.io.packs import hash_file
 from saklas.io.paths import tensor_filename
 from saklas.core.vectors import (
-    # Imported for ``_extractor_for``'s ``globals()`` lookup, which is
-    # the deliberate dispatch pattern that lets test monkeypatches at
-    # module scope reach the dispatcher.  Direct name references would
-    # bypass the indirection.
-    extract_contrastive,  # noqa: F401
-    extract_difference_of_means,  # noqa: F401
+    extract_difference_of_means,
     save_profile as _save_profile,
     load_profile as _load_profile,
     load_contrastive_pairs,
@@ -44,48 +39,14 @@ from saklas.core.vectors import (
 from saklas.io.atomic import write_json_atomic
 
 
-# Default extraction method for fresh extractions.  v2.1 flips the
-# default from contrastive PCA to difference-of-means (Im & Li 2025);
-# ``--method pca`` and the matching API kwarg keep the legacy path
-# accessible for direct A/B comparisons and reproducing v1.x results.
-DEFAULT_EXTRACTION_METHOD: Literal["dim", "pca"] = "dim"
-
-
-def _method_label(
-    method: Literal["dim", "pca"], sae_backend: SaeBackend | None,
-) -> str:
+def _method_label(sae_backend: SaeBackend | None) -> str:
     """Sidecar ``method`` label for an extraction.
 
-    DiM extractions write ``"difference_of_means"`` (raw) or
-    ``"dim_sae"`` (SAE feature space).  PCA extractions preserve the
-    pre-v2.1 labels ``"contrastive_pca"`` / ``"pca_center_sae"`` so
-    older readers and on-disk tensors round-trip unchanged.
+    Difference-of-means is the only extraction method (4.0): raw extraction
+    writes ``"difference_of_means"``, the SAE feature-space path
+    ``"dim_sae"``.
     """
-    if method == "dim":
-        return "dim_sae" if sae_backend is not None else "difference_of_means"
-    if method == "pca":
-        return "pca_center_sae" if sae_backend is not None else "contrastive_pca"
-    raise ValueError(
-        f"unknown extraction method {method!r} (expected 'dim' | 'pca')"
-    )
-
-
-def _extractor_for(
-    method: Literal["dim", "pca"],
-):
-    """Return the per-method low-level extractor function.
-
-    Resolves through the module namespace (``globals()``) rather than the
-    closed-over import binding so test monkeypatches at module scope reach
-    the dispatcher.
-    """
-    if method == "dim":
-        return globals()["extract_difference_of_means"]
-    if method == "pca":
-        return globals()["extract_contrastive"]
-    raise ValueError(
-        f"unknown extraction method {method!r} (expected 'dim' | 'pca')"
-    )
+    return "dim_sae" if sae_backend is not None else "difference_of_means"
 
 
 def _pairs_payload_sha256(pairs: list[dict[str, str]]) -> str:
@@ -228,7 +189,6 @@ class ExtractionPipeline:
         sae: str | SaeBackend | None = None,
         sae_revision: str | None = None,
         namespace: str | None = None,
-        method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
         dls: bool = True,
         role: str | None = None,
     ) -> tuple[str, Profile]:
@@ -238,18 +198,12 @@ class ExtractionPipeline:
         accepts a release-name string (resolved via :func:`load_sae_backend`)
         or an already-resolved :class:`SaeBackend` for direct injection.
 
-        ``method`` selects the per-layer direction algorithm:
-
-        - ``"dim"`` (default, v2.1+) — difference-of-means; provably
-          optimal for the linear-steering objective (Im & Li 2025).
-        - ``"pca"`` — legacy contrastive PCA; first principal component
-          of the diffs.  Retained for backward compatibility and
-          side-by-side comparison via the ``:pca`` selector variant.
+        The per-layer direction is difference-of-means (Im & Li 2025) — the
+        only extraction method as of 4.0.
 
         Cache-hit semantics:
 
-        - Tensor cache hits short-circuit and emit ``VectorExtracted``
-          with ``method`` set to the prior extraction method.
+        - Tensor cache hits short-circuit and emit ``VectorExtracted``.
         - On tensor miss, ``statements.json`` is reused when present
           unless ``force_statements=True`` or explicit ``scenarios=[...]``
           were supplied.
@@ -264,7 +218,6 @@ class ExtractionPipeline:
             sae=sae,
             sae_revision=sae_revision,
             namespace=namespace,
-            method=method,
             dls=dls,
             role=role,
         )
@@ -291,7 +244,6 @@ class ExtractionPipeline:
         sae: str | SaeBackend | None = None,
         sae_revision: str | None = None,
         namespace: str | None = None,
-        method: Literal["dim", "pca"] = DEFAULT_EXTRACTION_METHOD,
         dls: bool = True,
         role: str | None = None,
     ) -> tuple[str, Profile]:
@@ -388,17 +340,15 @@ class ExtractionPipeline:
                 model_type_for_role = getattr(model_cfg, "model_type", None)
             role_metadata = {"role": role}
 
-        method_label = _method_label(method, sae_backend)
-        extractor = _extractor_for(method)
+        method_label = _method_label(sae_backend)
+        extractor = extract_difference_of_means
 
-        # Mahalanobis bake (v2.1+): DiM extraction uses the per-model
-        # whitener for share allocation when available.  We pull off the
-        # handle via getattr — keeps the ModelHandle protocol minimal
-        # and lets test stubs that don't implement ``.whitener`` fall
-        # back to Euclidean.  PCA branch ignores the whitener (it scores
-        # via EVR, not magnitude).  v2.1+: layer_means + dls are
-        # threaded uniformly into both extractors; the centered DLS
-        # check fires when both are present.  Tests / mock stubs that
+        # Mahalanobis bake: DiM extraction uses the per-model whitener for
+        # share allocation when available.  We pull off the handle via
+        # getattr — keeps the ModelHandle protocol minimal and lets test
+        # stubs that don't implement ``.whitener`` fall back to Euclidean.
+        # ``layer_means`` + ``dls`` thread into the extractor; the centered
+        # DLS check fires when both are present.  Tests / mock stubs that
         # don't carry layer_means just keep all layers.
         bake_label = "euclidean"
         # Eager kwargs — cheap, always known.  The expensive fields
@@ -432,32 +382,27 @@ class ExtractionPipeline:
             nonlocal bake_label
             out = dict(eager_kwargs)
             out["layer_means"] = getattr(self._handle, "layer_means", None)
-            # DiM consumes the whitener on both the raw and SAE paths (it
-            # bakes the Mahalanobis norm of the decoded direction either
-            # way).  PCA consumes it only on the **raw** path — whitened /
-            # Fisher PCA needs the residual-stream Σ, which doesn't apply in
-            # SAE feature space, and a unit principal component carries no
-            # signal magnitude to whiten — so SAE-PCA stays on EVR.
-            if method == "dim" or (method == "pca" and sae_backend is None):
-                handle_whitener = getattr(self._handle, "whitener", None)
-                if handle_whitener is not None:
-                    # All-or-nothing metric gate, matching the extractor's
-                    # internal ``covers_all`` decision so ``bake_label``
-                    # reflects the metric actually used.  Withhold the
-                    # whitener on partial coverage → the extractor sees
-                    # ``None`` and runs all-Euclidean, and the label stays
-                    # "euclidean".  Scored layers are the SAE-covered model
-                    # layers (SAE path) or every model layer (raw path).
-                    n_layers = len(self._handle.layers)
-                    if sae_backend is not None:
-                        scored = sorted(
-                            set(sae_backend.layers) & set(range(n_layers))
-                        )
-                    else:
-                        scored = list(range(n_layers))
-                    if handle_whitener.covers_all(scored):
-                        out["whitener"] = handle_whitener
-                        bake_label = "mahalanobis"
+            # DiM consumes the whitener on both the raw and SAE paths — it
+            # bakes the Mahalanobis norm of the decoded direction either way.
+            handle_whitener = getattr(self._handle, "whitener", None)
+            if handle_whitener is not None:
+                # All-or-nothing metric gate, matching the extractor's
+                # internal ``covers_all`` decision so ``bake_label``
+                # reflects the metric actually used.  Withhold the
+                # whitener on partial coverage → the extractor sees
+                # ``None`` and runs all-Euclidean, and the label stays
+                # "euclidean".  Scored layers are the SAE-covered model
+                # layers (SAE path) or every model layer (raw path).
+                n_layers = len(self._handle.layers)
+                if sae_backend is not None:
+                    scored = sorted(
+                        set(sae_backend.layers) & set(range(n_layers))
+                    )
+                else:
+                    scored = list(range(n_layers))
+                if handle_whitener.covers_all(scored):
+                    out["whitener"] = handle_whitener
+                    bake_label = "mahalanobis"
             return out
 
         def _build_return(
@@ -498,7 +443,7 @@ class ExtractionPipeline:
 
         def _path_for(folder: pathlib.Path) -> str:
             return str(folder / tensor_filename(
-                model_id, release=sae_release, method=method, role=role,
+                model_id, release=sae_release, role=role,
             ))
 
         def _out_name_for_cache() -> str:

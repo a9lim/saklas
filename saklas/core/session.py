@@ -493,7 +493,6 @@ class SaklasSession:
         max_tokens: int = 1024,
         injection_mode: str = "angular",
         theta_max: float | None = None,
-        extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
         dls: bool = True,
         compile: bool = False,
@@ -628,7 +627,6 @@ class SaklasSession:
             max_tokens=max_tokens,
             injection_mode=injection_mode,
             theta_max=theta_max,
-            extraction_method=extraction_method,
             projection_metric=projection_metric,
             dls=dls,
             cuda_graphs=cuda_graphs,
@@ -645,7 +643,6 @@ class SaklasSession:
         max_tokens: int = 1024,
         injection_mode: str = "angular",
         theta_max: float | None = None,
-        extraction_method: str = "dim",
         projection_metric: str = "mahalanobis",
         dls: bool = True,
         cuda_graphs: bool = False,
@@ -910,17 +907,8 @@ class SaklasSession:
             )
             self._whitener = self._build_whitener_from_cache_or_compute()
 
-        # Stash for later session.extract calls — same default applies
-        # to ad-hoc extraction unless the caller overrides per-call.
-        if extraction_method not in ("dim", "pca"):
-            raise ValueError(
-                f"extraction_method must be 'dim' or 'pca', "
-                f"got {extraction_method!r}"
-            )
-        self._extraction_method: str = extraction_method
-        # v2.1+: DLS toggle stored on the session so ad-hoc
-        # ``session.extract`` calls (via ``ExtractionPipeline``) inherit
-        # it without re-passing.  ``--legacy`` sets this to False.
+        # DLS toggle stored on the session so ad-hoc ``session.extract``
+        # calls (via ``ExtractionPipeline``) inherit it without re-passing.
         self._dls: bool = bool(dls)
 
         probe_profiles: dict[str, dict[int, torch.Tensor]] = {}
@@ -928,11 +916,8 @@ class SaklasSession:
             probe_profiles = bootstrap_probes(
                 self._model, self._tokenizer, self._layers, self._model_info,
                 probe_categories,
-                method=extraction_method,
-                # Both DiM and PCA now consume the whitener (DiM bakes a
-                # Mahalanobis share; PCA selects a whitened/Fisher direction
-                # on the raw path).  ``bootstrap_probes`` gates it
-                # all-or-nothing internally.
+                # DiM consumes the whitener to bake a Mahalanobis share;
+                # ``bootstrap_probes`` gates it all-or-nothing internally.
                 whitener=self._whitener,
                 layer_means=self._layer_means,
                 dls=self._dls,
@@ -1000,7 +985,7 @@ class SaklasSession:
 
         Returns whatever ``get_layers`` produced — typically an
         ``nn.ModuleList``, list-like enough for the downstream
-        consumers (``extract_contrastive``, hooks).
+        consumers (``extract_difference_of_means``, hooks).
         """
         return self._layers
 
@@ -1829,7 +1814,6 @@ class SaklasSession:
         sae: str | None = None,
         sae_revision: str | None = None,
         namespace: str | None = None,
-        method: str | None = None,
         dls: bool | None = None,
         role: str | None = None,
     ) -> tuple[str, Profile]:
@@ -1837,7 +1821,7 @@ class SaklasSession:
 
         Thin delegate to :class:`saklas.core.extraction.ExtractionPipeline` —
         the pipeline owns folder probing, statement caching, scenario /
-        pair generation, contrastive PCA invocation, and pack updates.
+        pair generation, difference-of-means extraction, and pack updates.
         Re-entry is gated against generation: extraction runs forward
         passes through the model and would race an active gen.
 
@@ -1862,19 +1846,12 @@ class SaklasSession:
         - ``force_statements=True``: regenerate ``statements.json``
           from scratch.  **Also bypasses the tensor cache** — same
           reasoning as ``scenarios=[...]``.
-        - ``method=None`` (default) inherits ``self._extraction_method``
-          (set at session construction; ``"dim"`` unless ``--legacy``
-          flipped it to ``"pca"``).  Explicit ``"dim"`` / ``"pca"``
-          overrides per-call.
         - ``dls=None`` (default) inherits ``self._dls`` (set at session
-          construction; ``True`` unless ``--legacy`` flipped it).
-          Explicit ``True`` / ``False`` overrides per-call.
+          construction; ``True`` by default).  Explicit ``True`` /
+          ``False`` overrides per-call.
 
-        Pre-v2.1 these defaults were hardcoded to ``method="dim"`` and
-        ``dls=True`` regardless of session config — so ``--legacy``
-        sessions calling bare ``session.extract(...)`` got the modern
-        stack instead of the v2.0 one.  The ``None``-inherits-session
-        shape closes that hole.
+        The per-layer direction is always difference-of-means (Im & Li
+        2025) as of 4.0.
         """
         # Must hold ``_gen_lock`` to read ``_gen_phase`` race-free against
         # ``_generate_core``, which acquires the lock first then flips
@@ -1891,9 +1868,6 @@ class SaklasSession:
                 raise ConcurrentExtractionError(
                     "session.extract called while a generation is in flight"
                 )
-            effective_method = (
-                method if method is not None else self._extraction_method
-            )
             effective_dls = dls if dls is not None else self._dls
             return self._extraction.extract(
                 source, baseline,
@@ -1904,7 +1878,6 @@ class SaklasSession:
                 sae=sae,
                 sae_revision=sae_revision,
                 namespace=namespace,
-                method=effective_method,  # pyright: ignore[reportArgumentType]  # str is narrowed to Literal['dim','pca'] by earlier validation
                 dls=effective_dls,
                 role=role,
             )

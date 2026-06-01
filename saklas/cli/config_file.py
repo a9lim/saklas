@@ -19,14 +19,12 @@ log = logging.getLogger(__name__)
 _KNOWN_KEYS = {
     "model", "vectors", "thinking",
     "temperature", "top_p", "max_tokens", "system_prompt",
-    "extraction_method",
     "injection_mode", "theta_max",
     "projection_metric",
     "compile", "cuda_graphs",
     "return_top_k",
 }
 
-_VALID_EXTRACTION_METHODS = ("dim", "pca")
 _VALID_INJECTION_MODES = ("angular", "additive")
 _VALID_PROJECTION_METRICS = ("mahalanobis", "euclidean")
 
@@ -45,7 +43,6 @@ class ConfigFile:
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     system_prompt: Optional[str] = None
-    extraction_method: Optional[str] = None  # "dim" | "pca"; None = use default
     injection_mode: Optional[str] = None     # "angular" | "additive"; None = default
     theta_max: Optional[float] = None        # radians; None = default π/2
     projection_metric: Optional[str] = None  # "mahalanobis" | "euclidean"; None = default
@@ -144,18 +141,6 @@ class ConfigFile:
                     ) from e
                 vectors = text
 
-        extraction_method = data.get("extraction_method")
-        if extraction_method is not None:
-            if (
-                not isinstance(extraction_method, str)
-                or extraction_method not in _VALID_EXTRACTION_METHODS
-            ):
-                raise ConfigFileError(
-                    f"{path}: extraction_method must be one of "
-                    f"{list(_VALID_EXTRACTION_METHODS)} "
-                    f"(got {extraction_method!r})"
-                )
-
         injection_mode = data.get("injection_mode")
         if injection_mode is not None:
             if (
@@ -236,7 +221,6 @@ class ConfigFile:
             top_p=data.get("top_p"),
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
-            extraction_method=extraction_method,
             injection_mode=injection_mode,
             theta_max=theta_max,
             projection_metric=projection_metric,
@@ -258,7 +242,7 @@ def compose(configs: list[ConfigFile]) -> ConfigFile:
         for f in (
             "model", "thinking", "temperature",
             "top_p", "max_tokens", "system_prompt", "vectors",
-            "extraction_method", "injection_mode", "theta_max",
+            "injection_mode", "theta_max",
             "projection_metric", "compile", "cuda_graphs",
             "return_top_k",
         ):

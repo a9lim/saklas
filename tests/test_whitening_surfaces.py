@@ -6,20 +6,14 @@ checked against the *definitional* formula (not just "runs"):
 * ``ManifoldMonitor`` whitened readout — the M-orthogonal subspace
   projection fraction + Mahalanobis nearest-node distance, vs a reference
   implementation built from ``LayerWhitener.apply_inv`` / ``subspace_gram``.
-* ``extract_contrastive`` whitened/Fisher PCA — reduces to ordinary PCA
-  under an isotropic Σ, de-rogues under an anisotropic one, falls back to
-  Euclidean on partial coverage.
 * ``transfer_profile`` target-metric re-bake — per-layer magnitude becomes
   the target Mahalanobis norm; all-or-nothing gate; ``bake`` provenance.
 """
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 import torch
 
-from saklas.core import vectors as V
 from saklas.core.mahalanobis import LayerWhitener
 from saklas.core.manifold import (
     BoxAxis,
@@ -179,121 +173,8 @@ class TestManifoldMonitorWhitened:
         assert mon.attached_probes()["toy"].whitened == {}
 
 
-# --------------------------------------------------------------------------- #
-# Whitened / Fisher PCA extraction                                            #
-# --------------------------------------------------------------------------- #
-
-
-class _FakeModel(torch.nn.Module):
-    def parameters(self, recurse: bool = True):  # type: ignore[override]
-        yield torch.zeros(1)
-
-
-class _FakeTok:
-    pass
-
-
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a / a.norm(), b / b.norm()).item())
-
-
-def _rogue_encoder(d: int, sig_axis: int, rogue_axis: int, rogue_sigma: float):
-    """Encoder stub: per-pair diff = e[sig] + s·e[rogue], s ~ N(0, σ²).
-
-    The *consistent* class signal is on ``sig_axis``; ``rogue_axis`` carries
-    large per-pair variance but no consistent signal — exactly the regime
-    where ordinary PCA of the diffs chases the rogue axis and whitened PCA
-    (with Σ large on the rogue axis) recovers the signal axis.
-    """
-    def _enc(model: Any, tok: Any, text: str, layers: Any, device: Any,
-             **_kw: Any) -> dict[int, torch.Tensor]:
-        n = len(layers)
-        idx = int(text.split("_")[-1])
-        g = torch.Generator().manual_seed(1000 + idx)
-        s = float(torch.randn(1, generator=g).item()) * rogue_sigma
-        sign = 1.0 if text.startswith("pos") else -1.0
-        out: dict[int, torch.Tensor] = {}
-        for L in range(n):
-            v = torch.zeros(d)
-            v[sig_axis] = 0.5 * sign
-            v[rogue_axis] = 0.5 * sign * s
-            out[L] = v
-        return out
-    return _enc
-
-
-class TestWhitenedPCAExtraction:
-    def test_isotropic_matches_ordinary_pca(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # Clean separable signal along axis 0; isotropic Σ ⇒ whitened PCA
-        # ≈ ordinary PCA direction.
-        monkeypatch.setattr(
-            V, "_encode_and_capture_all",
-            _rogue_encoder(d=4, sig_axis=0, rogue_axis=1, rogue_sigma=0.0),
-        )
-        pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(12)]
-        layers = [object()] * 3
-        plain, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=layers,  # type: ignore[arg-type]
-            device=torch.device("cpu"), dls=False,
-        )
-        iso = _make_whitener(layers=(0, 1, 2), d=4, n=4000)
-        whit, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=layers,  # type: ignore[arg-type]
-            device=torch.device("cpu"), dls=False, whitener=iso,
-        )
-        for L in range(3):
-            assert abs(_cos(plain[L], whit[L])) > 0.99
-
-    def test_anisotropic_derogues_direction(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # Signal on axis 0, large per-pair rogue variance on axis 1.
-        monkeypatch.setattr(
-            V, "_encode_and_capture_all",
-            _rogue_encoder(d=4, sig_axis=0, rogue_axis=1, rogue_sigma=3.0),
-        )
-        pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(24)]
-        layers = [object()] * 2
-        plain, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=layers,  # type: ignore[arg-type]
-            device=torch.device("cpu"), dls=False,
-        )
-        # Σ huge on the rogue axis (axis 1) so whitened PCA divides it out.
-        cov = torch.tensor([1.0, 6.0, 1.0, 1.0])
-        w = _make_whitener(layers=(0, 1), d=4, cov_scale=cov, n=2000)
-        whit, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=layers,  # type: ignore[arg-type]
-            device=torch.device("cpu"), dls=False, whitener=w,
-        )
-        e0 = torch.tensor([1.0, 0.0, 0.0, 0.0])
-        for L in range(2):
-            # Whitened direction sits closer to the true signal axis than
-            # the rogue-chasing ordinary PCA direction.
-            assert abs(_cos(whit[L], e0)) > abs(_cos(plain[L], e0))
-
-    def test_partial_coverage_falls_back_to_euclidean(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr(
-            V, "_encode_and_capture_all",
-            _rogue_encoder(d=4, sig_axis=0, rogue_axis=1, rogue_sigma=1.0),
-        )
-        pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(12)]
-        layers = [object()] * 3
-        plain, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=layers,  # type: ignore[arg-type]
-            device=torch.device("cpu"), dls=False,
-        )
-        # Whitener covers only layers {0, 1} — not all 3 → Euclidean for all.
-        w_partial = _make_whitener(layers=(0, 1), d=4)
-        gated, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs, layers=layers,  # type: ignore[arg-type]
-            device=torch.device("cpu"), dls=False, whitener=w_partial,
-        )
-        for L in range(3):
-            assert torch.allclose(plain[L], gated[L], atol=1e-5)
 
 
 # --------------------------------------------------------------------------- #

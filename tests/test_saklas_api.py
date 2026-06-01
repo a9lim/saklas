@@ -1214,7 +1214,7 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path: Any, monkeypatch: Any
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    # Stub extract_contrastive at the source (used by both session and the
+    # Stub the extractor at the source (used by both session and the
     # ExtractionPipeline) so we don't need a real model.
     from saklas.core import vectors as V
     from saklas.core import extraction as E
@@ -1227,8 +1227,6 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path: Any, monkeypatch: Any
         return ({0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}, {})
     # Stub both extractors — pipeline dispatches to DiM by default in v2.1+,
     # PCA via ``method="pca"``.  Test is method-agnostic; intercept both.
-    monkeypatch.setattr(V, "extract_contrastive", fake_extract)
-    monkeypatch.setattr(E, "extract_contrastive", fake_extract)
     monkeypatch.setattr(V, "extract_difference_of_means", fake_extract)
     monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
 
@@ -1323,8 +1321,6 @@ def test_session_extract_raw_path_unchanged(tmp_path: Any, monkeypatch: Any) -> 
                      device: Any = None, *, sae: Any = None,
                      concept_label: Any = None, **_kwargs: Any) -> Any:
         return ({0: torch.ones(4), 2: torch.ones(4)}, {})
-    monkeypatch.setattr(V, "extract_contrastive", fake_extract)
-    monkeypatch.setattr(E, "extract_contrastive", fake_extract)
     monkeypatch.setattr(V, "extract_difference_of_means", fake_extract)
     monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
 

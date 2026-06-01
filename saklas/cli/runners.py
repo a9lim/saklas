@@ -58,10 +58,8 @@ def _make_session(args: argparse.Namespace):
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes)
     # ``--legacy`` is a v2.0-backcompat shorthand: additive injection +
-    # PCA extraction.  Mutually exclusive with ``--steer-mode`` (the
-    # canonical injection-mode flag).  Probe-bootstrap method is forced
-    # to ``"pca"`` so first-run extractions match the v2.0 stack;
-    # ``--method`` on ``vector extract`` is independent (per-call).
+    # Euclidean projection + DLS off.  Mutually exclusive with
+    # ``--steer-mode`` / ``--projection-metric`` / ``--no-dls``.
     legacy = bool(getattr(args, "legacy", False))
     injection_explicit = getattr(args, "injection_mode", None)
     metric_explicit = getattr(args, "projection_metric", None)
@@ -96,7 +94,6 @@ def _make_session(args: argparse.Namespace):
     # than re-implement the removed edge-drop just for backcompat).
     if legacy:
         injection_mode = "additive"
-        extraction_method = "pca"
         projection_metric = "euclidean"
         dls = False
     else:
@@ -104,7 +101,6 @@ def _make_session(args: argparse.Namespace):
         # session defaults (angular + π/2).  CLI flag and YAML are both
         # already merged onto ``args`` by ``_load_effective_config``.
         injection_mode = injection_explicit or "angular"
-        extraction_method = "dim"
         projection_metric = getattr(args, "projection_metric", None) or "mahalanobis"
         # ``--no-dls`` opts out of the discriminative-layer mask without
         # toggling the rest of the v2.1 stack.
@@ -132,7 +128,6 @@ def _make_session(args: argparse.Namespace):
         max_tokens=getattr(args, "max_tokens", 1024),
         injection_mode=injection_mode,
         theta_max=theta_max,
-        extraction_method=extraction_method,
         projection_metric=projection_metric,
         dls=dls,
         compile=compile_enabled,
@@ -177,13 +172,6 @@ def _load_effective_config(args: argparse.Namespace):
     args.system_prompt = composed.system_prompt
     args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
     args.config_vectors = composed.vectors
-    # Honor YAML ``extraction_method:`` only when the user hasn't already
-    # set --method on the CLI (argparse defaults the attr to "dim").
-    if (
-        composed.extraction_method is not None
-        and getattr(args, "method", None) is None
-    ):
-        args.method = composed.extraction_method
     # Steering-injection options on tui/serve: YAML wins when CLI is unset.
     if (
         composed.injection_mode is not None
@@ -644,35 +632,9 @@ def _run_clone(args: argparse.Namespace) -> None:
     print(f"Cloned persona -> local/{canonical}")
 
 
-def _resolve_legacy_method(args: argparse.Namespace) -> str:
-    """Resolve ``vector extract --legacy`` / ``--method`` into a method string.
-
-    ``--legacy`` is a v2.0-backcompat shorthand for ``--method pca``.
-    Mutually exclusive with ``--method``: passing both is a hard error
-    (we'd otherwise silently pick one and the user wouldn't know which).
-    """
-    legacy = bool(getattr(args, "legacy", False))
-    method = getattr(args, "method", None)
-    if legacy and method is not None:
-        print(
-            "extract: --legacy and --method are mutually exclusive "
-            "(--legacy implies --method pca)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if legacy:
-        return "pca"
-    return method or "dim"
-
-
 def _run_extract(args: argparse.Namespace) -> None:
     _require_model(args)
     from saklas.core.session import canonical_concept_name
-
-    # Validate flag combinations before kicking off the model load —
-    # otherwise the user pays a multi-GB download just to learn their
-    # CLI invocation had conflicting options.
-    method = _resolve_legacy_method(args)
 
     if len(args.concept) == 1:
         raw = args.concept[0]
@@ -697,8 +659,6 @@ def _run_extract(args: argparse.Namespace) -> None:
     import pathlib
     from saklas.io.paths import tensor_filename
     from saklas.io.selectors import _all_concepts
-    # ``method`` was resolved at the top of the function (pre-flight
-    # validation; see ``_resolve_legacy_method``).
     requested_namespace = getattr(args, "namespace", None)
     if requested_namespace is not None:
         # User pinned a destination — restrict the existence check to
@@ -718,15 +678,14 @@ def _run_extract(args: argparse.Namespace) -> None:
     if requested_release and requested_role:
         print(
             "extract: --sae and --role are mutually exclusive "
-            "(role substitution composes with method=pca via tensor "
-            "filename but not with SAE feature space)",
+            "(role substitution composes via the tensor filename but not "
+            "with SAE feature space)",
             file=sys.stderr,
         )
         sys.exit(2)
     candidate_tensor_name = tensor_filename(
         session.model_id,
         release=requested_release,
-        method=method,
         role=requested_role,
     )
     candidate_paths = [
@@ -743,7 +702,7 @@ def _run_extract(args: argparse.Namespace) -> None:
             if p.exists():
                 p.unlink()
 
-    extract_kwargs: dict[str, Any] = {"method": method}
+    extract_kwargs: dict[str, Any] = {}
     if getattr(args, "sae", None):
         extract_kwargs["sae"] = args.sae
     if getattr(args, "sae_revision", None):
@@ -776,19 +735,13 @@ def _run_extract(args: argparse.Namespace) -> None:
     # exclusive at the flag layer above, so we never see both.
     if ":sae-" in canonical:
         core_name, _, rel = canonical.partition(":sae-")
-        tensor_name = tensor_filename(
-            session.model_id, release=rel, method=method,
-        )
+        tensor_name = tensor_filename(session.model_id, release=rel)
     elif ":role-" in canonical:
         core_name, _, role_slug = canonical.partition(":role-")
-        tensor_name = tensor_filename(
-            session.model_id, role=role_slug, method=method,
-        )
+        tensor_name = tensor_filename(session.model_id, role=role_slug)
     else:
         core_name = canonical
-        tensor_name = tensor_filename(
-            session.model_id, release=None, method=method,
-        )
+        tensor_name = tensor_filename(session.model_id, release=None)
     final_paths = [pathlib.Path(f) / tensor_name for f in candidate_folders]
     final_path = next((p for p in final_paths if p.exists()), None)
     if final_path is None:
@@ -797,7 +750,7 @@ def _run_extract(args: argparse.Namespace) -> None:
                 core_name, namespace=requested_namespace or "local",
             )) / tensor_name
         )
-    print(f"extracted {canonical} ({method}) -> {final_path}")
+    print(f"extracted {canonical} -> {final_path}")
 
 
 _PACK_RUNNERS = {

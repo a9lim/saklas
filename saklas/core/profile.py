@@ -7,7 +7,7 @@ This class is purely the Python-level surface the rest of saklas uses so
 that callers stop passing bare ``dict[int, Tensor]`` around.
 
 The underlying tensors are "baked": share and reference norm are folded
-into the magnitude at extraction time (see ``vectors.extract_contrastive``),
+into the magnitude at extraction time (see ``vectors.extract_difference_of_means``),
 so the steering hook collapses to ``alpha * _STEER_GAIN * sum(baked)``.
 A ``Profile`` is just a thin wrapper; the dict stays the canonical shape
 at rest.

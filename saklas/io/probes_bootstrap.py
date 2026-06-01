@@ -24,7 +24,6 @@ from saklas.io.paths import (
 )
 from saklas.core.vectors import (
     compute_layer_means,
-    extract_contrastive,
     extract_difference_of_means,
     load_contrastive_pairs,
     load_profile, save_profile,
@@ -103,50 +102,42 @@ def bootstrap_probes(
     model_info: dict[str, Any],
     categories: list[str],
     *,
-    method: str = "dim",
     whitener: Any = None,
     layer_means: dict[int, torch.Tensor] | None = None,
     dls: bool = True,
 ) -> dict[str, dict[int, torch.Tensor]]:
     """Load or extract probe vector profiles for the given categories.
 
-    ``method`` selects the extraction algorithm for any probes that need
-    re-extraction.  Defaults to ``"dim"`` (difference-of-means, v2.1+);
-    pass ``"pca"`` to recover the legacy contrastive-PCA path.  Cached
-    tensors are loaded as-is regardless of method — the sidecar carries
-    the method that produced them.
+    The extraction algorithm is difference-of-means (Im & Li 2025) — the
+    only method as of 4.0.  Cached tensors are loaded as-is; the sidecar
+    carries the method that produced them.
 
     ``whitener`` is a :class:`saklas.core.mahalanobis.LayerWhitener` (or
     ``None``).  When provided, DiM extraction uses Mahalanobis-flavored
     scores for share allocation (see :func:`saklas.core.vectors.extract_difference_of_means`);
     written sidecars carry ``bake: "mahalanobis"``.  ``None`` falls back
-    to Euclidean scoring (sidecar ``bake: "euclidean"``).  Whitener has
-    no effect on PCA extraction (legacy method, kept on EVR scoring).
+    to Euclidean scoring (sidecar ``bake: "euclidean"``).
 
     ``layer_means`` is the per-model neutral-baseline mean cache (built
     by :func:`bootstrap_layer_means` before this call).  Threaded into
-    the extractors for the centered-DLS check.  ``None`` disables DLS
+    the extractor for the centered-DLS check.  ``None`` disables DLS
     centering — the helper falls back to "keep all layers."
 
-    ``dls`` (default ``True``, v2.1+) enables the discriminative-layer
-    selection mask.  Pass ``False`` to extract every layer (the path
-    used by ``--legacy`` and by tests on small mock models).
+    ``dls`` (default ``True``) enables the discriminative-layer selection
+    mask.  Pass ``False`` to extract every layer (tests on small mock
+    models).
     """
     from saklas import __version__ as _saklas_version
 
     defaults = load_defaults()
     model_id = model_info.get("model_id", "unknown")
-    if method not in ("dim", "pca"):
-        raise ValueError(
-            f"unknown extraction method {method!r} (expected 'dim' | 'pca')"
-        )
 
     probes: dict[str, dict[int, torch.Tensor]] = {}
     to_extract: list[tuple[str, Path, Path]] = []
 
     allow_stale = os.environ.get("SAKLAS_ALLOW_STALE") == "1"
-    ts_name = tensor_filename(model_id, method=method)
-    sc_name = sidecar_filename(model_id, method=method)
+    ts_name = tensor_filename(model_id)
+    sc_name = sidecar_filename(model_id)
 
     for cat in categories:
         for probe_name in defaults.get(cat, []):
@@ -206,15 +197,10 @@ def bootstrap_probes(
         datasets_to_extract.append((name, cdir, ts, pairs_data, stmts_path))
 
     model_device = next(model.parameters()).device
-    extractor = (
-        extract_difference_of_means if method == "dim" else extract_contrastive
-    )
-    method_label = (
-        "difference_of_means" if method == "dim" else "contrastive_pca"
-    )
-    # Both extractors consume the whitener now: DiM bakes a Mahalanobis
-    # share, PCA selects a whitened/Fisher direction.  DLS + layer_means
-    # flow into both uniformly.
+    extractor = extract_difference_of_means
+    method_label = "difference_of_means"
+    # DiM consumes the whitener (bakes a Mahalanobis share).  DLS +
+    # layer_means flow into the extractor.
     extract_kwargs: dict[str, Any] = {"dls": dls, "layer_means": layer_means}
     bake_label = "euclidean"
     # All-or-nothing metric gate: only pass the whitener (and label the

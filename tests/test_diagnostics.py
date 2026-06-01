@@ -81,7 +81,7 @@ class TestComputeLayerDiagnostics:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end through ``extract_contrastive`` with a stubbed forward pass.
+# End-to-end through ``extract_difference_of_means`` with a stubbed forward pass.
 # ---------------------------------------------------------------------------
 
 
@@ -110,15 +110,15 @@ class _FakeTok:
     pass
 
 
-class TestExtractContrastiveReturnsTuple:
-    """``extract_contrastive`` returns ``(profile, diagnostics)``."""
+class TestExtractReturnsTuple:
+    """``extract_difference_of_means`` returns ``(profile, diagnostics)``."""
 
     def test_multi_pair_diagnostics_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode)
 
         pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(8)]
-        profile, diagnostics = V.extract_contrastive(
+        profile, diagnostics = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs, layers=[object()] * 6,  # pyright: ignore[reportArgumentType]
             device=torch.device("cpu"),
             dls=False,
@@ -156,7 +156,7 @@ class TestExtractContrastiveReturnsTuple:
         # layers); explicit dls=False keeps every layer regardless.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
-            profile, diagnostics = V.extract_contrastive(
+            profile, diagnostics = V.extract_difference_of_means(
                 _FakeModel(), _FakeTok(), pairs, layers=[object()] * 8,  # pyright: ignore[reportArgumentType]
                 device=torch.device("cpu"),
                 dls=False,
@@ -180,7 +180,7 @@ class TestSoftWarning:
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            V.extract_contrastive(
+            V.extract_difference_of_means(
                 _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,  # pyright: ignore[reportArgumentType]
                 device=torch.device("cpu"),
                 dls=False,
@@ -198,7 +198,7 @@ class TestSoftWarning:
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            V.extract_contrastive(
+            V.extract_difference_of_means(
                 _FakeModel(), _FakeTok(), pairs, layers=[object()] * 4,  # pyright: ignore[reportArgumentType]
                 device=torch.device("cpu"),
                 dls=False,

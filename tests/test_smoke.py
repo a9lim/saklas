@@ -53,8 +53,8 @@ def num_layers(layers: Any) -> int:
 
 def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> Any:
     """Extract a profile for a single concept with one pair."""
-    from saklas.core.vectors import extract_contrastive
-    profile, _ = extract_contrastive(
+    from saklas.core.vectors import extract_difference_of_means
+    profile, _ = extract_difference_of_means(
         model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers,
     )
     return profile
@@ -170,10 +170,10 @@ class TestSaveLoad:
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_profile.safetensors")
-            save_profile(happy_profile, path, {"method": "contrastive_pca"})
+            save_profile(happy_profile, path, {"method": "difference_of_means"})
             loaded_profile, loaded_meta = load_profile(path)
 
-            assert loaded_meta["method"] == "contrastive_pca"
+            assert loaded_meta["method"] == "difference_of_means"
             assert "scores" not in loaded_meta
             assert set(loaded_profile.keys()) == set(happy_profile.keys())
             for idx in happy_profile:
@@ -283,9 +283,9 @@ class TestTraitMonitor:
         )
 
 
-class TestExtractContrastive:
+class TestExtractDifferenceOfMeans:
     def test_returns_valid_profile(self, model_and_tokenizer: Any, layers: Any, num_layers: int) -> None:
-        from saklas.core.vectors import extract_contrastive
+        from saklas.core.vectors import extract_difference_of_means
         model, tokenizer = model_and_tokenizer
         cfg = getattr(model.config, "text_config", None) or model.config
         hidden_dim = cfg.hidden_size
@@ -294,7 +294,7 @@ class TestExtractContrastive:
             {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
             {"positive": "I love this", "negative": "I hate this"},
         ]
-        profile, diagnostics = extract_contrastive(model, tokenizer, pairs, layers=layers)
+        profile, diagnostics = extract_difference_of_means(model, tokenizer, pairs, layers=layers)
         assert isinstance(profile, dict)
         assert len(profile) > 0
         for idx, vec in profile.items():
@@ -354,7 +354,7 @@ class TestProbesBootstrap:
             folder = concept_dir("default", "happy.sad")
             ts_path = folder / f"{safe_model_id(model_info['model_id'])}.safetensors"
             save_profile(happy_profile, str(ts_path), {
-                "method": "contrastive_pca",
+                "method": "difference_of_means",
                 "statements_sha256": hash_file(folder / "statements.json"),
             })
             # Refresh the pack.json files map to include the new tensor

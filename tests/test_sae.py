@@ -118,7 +118,7 @@ def test_mock_sae_backend_passes_layer_idx_to_overrides():
     assert seen == [2, -5]
 
 
-def test_extract_contrastive_sae_subset_layers(monkeypatch: pytest.MonkeyPatch):
+def test_extract_sae_subset_layers(monkeypatch: pytest.MonkeyPatch):
     """With sae=MockSaeBackend(layers={1,3}), profile covers only those layers."""
     import torch
     from saklas.core import vectors as V
@@ -146,7 +146,7 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch: pytest.MonkeyPatch):
     layers_list = [object()] * 4
     sae = MockSaeBackend(layers=frozenset({1, 3}), d_model=8)
 
-    profile, _ = V.extract_contrastive(
+    profile, _ = V.extract_difference_of_means(
         FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         sae=sae,
@@ -157,8 +157,8 @@ def test_extract_contrastive_sae_subset_layers(monkeypatch: pytest.MonkeyPatch):
     assert all(m > 0 for m in mags)
 
 
-def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch: pytest.MonkeyPatch):
-    """pos > neg on the resulting direction, majority-vote orientation."""
+def test_extract_sae_pca_center_orients_correctly(monkeypatch: pytest.MonkeyPatch):
+    """pos > neg on the resulting direction (mean-diff orientation)."""
     import torch
     from saklas.core import vectors as V
     from saklas.core.sae import MockSaeBackend
@@ -185,7 +185,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch: pytes
     layers_list = [object()] * 2
     sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
 
-    profile, _ = V.extract_contrastive(
+    profile, _ = V.extract_difference_of_means(
         FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         sae=sae,
@@ -195,7 +195,7 @@ def test_extract_contrastive_sae_pca_center_orients_correctly(monkeypatch: pytes
         assert vec[0].item() > 0
 
 
-def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch: pytest.MonkeyPatch):
+def test_extract_sae_zero_coverage_raises(monkeypatch: pytest.MonkeyPatch):
     """An SAE covering no model layers raises SaeCoverageError."""
     import torch
     from saklas.core import vectors as V
@@ -218,7 +218,7 @@ def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch: pytest.Monkey
     sae = MockSaeBackend(layers=frozenset({5, 7}), d_model=4)
 
     with pytest.raises(SaeCoverageError):
-        V.extract_contrastive(
+        V.extract_difference_of_means(
             FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
             device=torch.device("cpu"),
             sae=sae,
@@ -226,8 +226,8 @@ def test_extract_contrastive_sae_zero_coverage_raises(monkeypatch: pytest.Monkey
         )
 
 
-def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch: pytest.MonkeyPatch):
-    """Per-layer baked magnitudes should scale with the layer's share (evr/sum)."""
+def test_extract_sae_bakes_shares_proportional_to_signal(monkeypatch: pytest.MonkeyPatch):
+    """Per-layer baked magnitudes scale with the layer's signal strength (share)."""
     import torch
     from saklas.core import vectors as V
     from saklas.core.sae import MockSaeBackend
@@ -236,8 +236,8 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch: p
     torch.manual_seed(0)
 
     def fake_encode_and_capture(model: Any, tokenizer: Any, text: Any, layers: Any, device: Any, **_kwargs: Any):
-        # Layer 0: high-SNR separation (evr near 1.0)
-        # Layer 1: low-SNR separation (evr lower — noise dominates)
+        # Layer 0: high-SNR separation (strong mean-diff)
+        # Layer 1: low-SNR separation (noise dominates the mean-diff)
         out = {}
         sign = 1.0 if "pos" in text else -1.0
         out[0] = torch.tensor([sign * 5.0, 0.0, 0.0, 0.0]) + 0.01 * torch.randn(4)
@@ -256,7 +256,7 @@ def test_extract_contrastive_sae_bakes_shares_proportional_to_evr(monkeypatch: p
     layers_list = [object()] * 2
     sae = MockSaeBackend(layers=frozenset({0, 1}), d_model=4)
 
-    profile, _ = V.extract_contrastive(
+    profile, _ = V.extract_difference_of_means(
         FakeModel(), FakeTok(), pairs, layers=layers_list,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         sae=sae,
@@ -432,7 +432,7 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch: pyt
 # v2.1, layer selection is now data-driven via :func:`compute_dls_mask`.
 
 
-def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypatch: pytest.MonkeyPatch):
+def test_extract_dls_default_keeps_all_when_no_layer_means(monkeypatch: pytest.MonkeyPatch):
     """Without ``layer_means``, DLS centering is undefined and the helper
     falls back to "keep all layers" silently — every layer in the
     profile when ``layer_means=None``."""
@@ -456,7 +456,7 @@ def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypat
         pass
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
-    profile, _ = V.extract_contrastive(
+    profile, _ = V.extract_difference_of_means(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
     )
@@ -464,7 +464,7 @@ def test_extract_contrastive_dls_default_keeps_all_when_no_layer_means(monkeypat
     assert set(profile.keys()) == set(range(N))
 
 
-def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch: pytest.MonkeyPatch):
+def test_extract_dls_off_preserves_all_layers(monkeypatch: pytest.MonkeyPatch):
     """``dls=False`` skips the discriminative check entirely."""
     import torch
     from saklas.core import vectors as V
@@ -486,7 +486,7 @@ def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch: pytest.Mo
         pass
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(5)]
-    profile, _ = V.extract_contrastive(
+    profile, _ = V.extract_difference_of_means(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         dls=False,
@@ -494,7 +494,7 @@ def test_extract_contrastive_dls_off_preserves_all_layers(monkeypatch: pytest.Mo
     assert set(profile.keys()) == set(range(N))
 
 
-def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch: pytest.MonkeyPatch):
+def test_extract_dls_drops_non_discriminative_layers(monkeypatch: pytest.MonkeyPatch):
     """With ``layer_means`` and centered separation, layers where pos
     and neg both project the same side of the baseline are dropped."""
     import torch
@@ -529,7 +529,7 @@ def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch: py
 
     pairs = [{"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(10)]
     layer_means = {i: torch.zeros(4) for i in range(N)}
-    profile, _ = V.extract_contrastive(
+    profile, _ = V.extract_difference_of_means(
         FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
         device=torch.device("cpu"),
         layer_means=layer_means,
@@ -538,7 +538,7 @@ def test_extract_contrastive_dls_drops_non_discriminative_layers(monkeypatch: py
     assert set(profile.keys()) == set(range(4))
 
 
-def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch: pytest.MonkeyPatch):
+def test_extract_dls_all_failed_falls_back_to_keep_all(monkeypatch: pytest.MonkeyPatch):
     """When every layer fails the discriminative check, the helper
     warns and falls back to keep-all rather than emptying the profile."""
     import warnings as _warnings
@@ -568,7 +568,7 @@ def test_extract_contrastive_dls_all_failed_falls_back_to_keep_all(monkeypatch: 
 
     with _warnings.catch_warnings(record=True) as caught:
         _warnings.simplefilter("always")
-        profile, _ = V.extract_contrastive(
+        profile, _ = V.extract_difference_of_means(
             FakeModel(), FakeTok(), pairs, layers=[object()] * N,  # pyright: ignore[reportArgumentType]  # list[object] stubs; ModuleList accepts iteration
             device=torch.device("cpu"),
             layer_means=layer_means,

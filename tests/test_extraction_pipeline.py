@@ -142,36 +142,31 @@ class _StubHandle:
 
 
 def _fake_extract(monkeypatch: Any, *, response: Any = None) -> dict[str, Any]:
-    """Replace both ``extract_contrastive`` and ``extract_difference_of_means``
-    inside the extraction module.
+    """Replace ``extract_difference_of_means`` inside the extraction module.
 
-    The pipeline dispatches to one or the other based on ``method=``; tests
-    that don't care which method ran (the dispatch architecture itself, not
-    the per-method math) get one shared stub via this helper.  Tests that
-    do care about per-method dispatch hit ``captured["method"]`` to read
-    back which extractor fired.
+    Difference-of-means is the only extractor as of 4.0; tests that exercise
+    the dispatch architecture (cache short-circuit, staleness, force, role
+    variants) get this shared stub and read back ``captured`` to assert the
+    pipeline's behavior around it.
     """
     from saklas.core import extraction as E
 
     captured: dict[str, Any] = {}
 
-    def _make(label: str) -> Callable[..., Any]:
-        def _fake(model: Any, tokenizer: Any, pairs: Any, layers: Any, device: Any = None, *,
-                  sae: Any = None, concept_label: Any = None, **_kwargs: Any) -> Any:
-            # ``**_kwargs`` swallows ``dls`` / ``layer_means`` /
-            # ``whitener`` (added in v2.1) — the fake doesn't model
-            # any of them, just records what the pipeline asked for.
-            captured["pairs"] = pairs
-            captured["sae"] = sae
-            captured["concept_label"] = concept_label
-            captured["method"] = label
-            captured["call_count"] = captured.get("call_count", 0) + 1
-            profile = response if response is not None else {0: torch.ones(4), 2: torch.ones(4)}
-            return profile, {}
-        return _fake
+    def _fake(model: Any, tokenizer: Any, pairs: Any, layers: Any, device: Any = None, *,
+              sae: Any = None, concept_label: Any = None, **_kwargs: Any) -> Any:
+        # ``**_kwargs`` swallows ``dls`` / ``layer_means`` / ``whitener``
+        # — the fake doesn't model any of them, just records what the
+        # pipeline asked for.
+        captured["pairs"] = pairs
+        captured["sae"] = sae
+        captured["concept_label"] = concept_label
+        captured["method"] = "dim"
+        captured["call_count"] = captured.get("call_count", 0) + 1
+        profile = response if response is not None else {0: torch.ones(4), 2: torch.ones(4)}
+        return profile, {}
 
-    monkeypatch.setattr(E, "extract_contrastive", _make("pca"))
-    monkeypatch.setattr(E, "extract_difference_of_means", _make("dim"))
+    monkeypatch.setattr(E, "extract_difference_of_means", _fake)
     return captured
 
 
@@ -201,7 +196,7 @@ class TestProtocolShape:
 class TestTensorCacheShortCircuit:
     """Cache-hit semantics: pre-populated tensor → no model forward fires."""
 
-    def test_tensor_cache_hit_skips_extract_contrastive(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_tensor_cache_hit_skips_extract(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
         captured = _fake_extract(monkeypatch)
@@ -232,7 +227,7 @@ class TestTensorCacheShortCircuit:
         name, profile = pipeline.extract("honest.deceptive")
 
         assert name == "honest.deceptive"
-        assert "call_count" not in captured  # extract_contrastive never fired
+        assert "call_count" not in captured  # the extractor never fired
         assert handle.scenarios_calls == 0
         assert handle.pairs_calls == 0
         assert handle.promote_calls == 1  # cache load promoted to device
@@ -373,7 +368,7 @@ class TestForceStatementsRegenerates:
         # Generators fire — the stale statements.json was bypassed.
         assert handle.scenarios_calls == 1
         assert handle.pairs_calls == 1
-        # extract_contrastive fired once on the freshly-generated pairs.
+        # the extractor fired once on the freshly-generated pairs.
         assert captured.get("call_count") == 1
         # Pairs must come from the stub responses, not the stale file.
         new_pairs = captured["pairs"]
@@ -467,7 +462,7 @@ class TestExplicitScenariosBypass:
         assert handle.scenarios_calls == 0
         # Pair generator still fired against the supplied scenarios.
         assert handle.pairs_calls == 1
-        # extract_contrastive fired exactly once on the new pairs.
+        # the extractor fired exactly once on the new pairs.
         assert captured.get("call_count") == 1
 
         # scenarios.json on disk reflects the caller's input, not the stub default.

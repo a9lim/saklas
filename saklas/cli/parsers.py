@@ -339,23 +339,6 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
     p.add_argument("-f", "--force", action="store_true")
     p.add_argument(
-        "--method", choices=["dim", "pca"], default=None,
-        help="Extraction algorithm: 'dim' (difference-of-means, default) or "
-             "'pca' (legacy contrastive PCA).  DiM is the v2.1+ default per "
-             "Im & Li 2025; --method pca recovers the v1.x path and writes "
-             "to the legacy ``_pca`` filename suffix for side-by-side "
-             "comparison.  Unset = defer to YAML ``extraction_method:`` if "
-             "configured, else 'dim'.",
-    )
-    p.add_argument(
-        "--legacy", action="store_true",
-        help="v2.0 backcompat preset.  On ``vector extract`` this is "
-             "equivalent to ``--method pca``; combined with ``--legacy`` "
-             "on ``tui``/``serve`` (additive injection) and ``vector "
-             "compare`` (Euclidean cosine), it round-trips the entire "
-             "pre-v2.1 stack.  Mutually exclusive with ``--method``.",
-    )
-    p.add_argument(
         "--sae", default=None, metavar="RELEASE",
         help="Extract via a SAELens SAE release (requires `pip install .[sae]`). "
              "No implicit default — you must name a release.",

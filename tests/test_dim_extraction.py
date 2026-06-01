@@ -76,7 +76,7 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 class TestDimReturnShape:
-    """``extract_difference_of_means`` matches ``extract_contrastive`` shape."""
+    """``extract_difference_of_means`` returns ``(profile, diagnostics)``."""
 
     def test_returns_profile_and_diagnostics(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(0)
@@ -122,10 +122,10 @@ class TestDimReturnShape:
 # ---------------------------------------------------------------------------
 
 
-class TestDimAgreesWithPca:
-    """On well-separated synthetic data DiM and PCA pick the same axis."""
+class TestDimCleanSignal:
+    """On well-separated synthetic data DiM picks the class-separation axis."""
 
-    def test_clean_signal_high_cosine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_clean_signal_axis_recovered(self, monkeypatch: pytest.MonkeyPatch) -> None:
         torch.manual_seed(0)
         monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode_separable)
         pairs = [
@@ -135,59 +135,19 @@ class TestDimAgreesWithPca:
         _device = torch.device("cpu")
 
         torch.manual_seed(0)
-        pca, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs,
-            layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
-            device=_device, dls=False,
-        )
-        torch.manual_seed(0)
         dim, _ = V.extract_difference_of_means(
             _FakeModel(), _FakeTok(), pairs,
             layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
             device=_device, dls=False,
         )
 
-        for layer in pca:
-            assert _cos(pca[layer], dim[layer]) > 0.95, (
-                f"DiM and PCA disagreed on layer {layer} for clean signal"
+        # The stub plants the class separation along axis 0; DiM should
+        # recover it (each baked layer aligns with [1, 0, 0, 0]).
+        axis0 = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        for layer in dim:
+            assert _cos(dim[layer], axis0) > 0.95, (
+                f"DiM missed the separation axis on layer {layer}"
             )
-
-    def test_share_bake_magnitudes_in_band(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Per-layer baked magnitudes from DiM live in the same band as
-        PCA's — share-baking math is method-agnostic, so the total
-        ``Σ_L ||baked_L||`` budget should match within an order of
-        magnitude.  Anchors the v2.1 invariant that swapping methods
-        doesn't require recalibrating ``_STEER_GAIN``.
-        """
-        torch.manual_seed(0)
-        monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encode_separable)
-        pairs = [
-            {"positive": f"pos_{i}", "negative": f"neg_{i}"} for i in range(12)
-        ]
-
-        _layers = [object()] * 6
-        _device = torch.device("cpu")
-        torch.manual_seed(0)
-        pca, _ = V.extract_contrastive(
-            _FakeModel(), _FakeTok(), pairs,
-            layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
-            device=_device, dls=False,
-        )
-        torch.manual_seed(0)
-        dim, _ = V.extract_difference_of_means(
-            _FakeModel(), _FakeTok(), pairs,
-            layers=_layers,  # pyright: ignore[reportArgumentType]  # stub uses len(); ModuleList not needed
-            device=_device, dls=False,
-        )
-
-        pca_total = sum(t.norm().item() for t in pca.values())
-        dim_total = sum(t.norm().item() for t in dim.values())
-        # Within 0.5×–2× of each other for the synthetic regime.  A
-        # tighter bound would over-fit to the seed; a looser one would
-        # let a regression slip through.
-        assert 0.5 * pca_total <= dim_total <= 2.0 * pca_total, (
-            f"DiM total {dim_total} drifted vs PCA total {pca_total}"
-        )
 
 
 class TestDimOnNoisyPairs:

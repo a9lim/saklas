@@ -75,7 +75,6 @@ class ExtractRequest(BaseModel):
     name: str
     source: Any = None
     baseline: str | None = None
-    method: str | None = None
     dls: bool | None = None
     sae: str | None = None
     sae_revision: str | None = None
@@ -1438,7 +1437,6 @@ def register_saklas_routes(app: FastAPI) -> None:
                                 on_progress=_on_progress,
                                 sae=req.sae,
                                 sae_revision=req.sae_revision,
-                                method=req.method,
                                 dls=req.dls,
                                 role=req.role,
                                 namespace=req.namespace,
@@ -1537,7 +1535,6 @@ def register_saklas_routes(app: FastAPI) -> None:
                 on_progress=progress_msgs.append,
                 sae=req.sae,
                 sae_revision=req.sae_revision,
-                method=req.method,
                 dls=req.dls,
                 role=req.role,
                 namespace=req.namespace,
