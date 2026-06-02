@@ -1,75 +1,140 @@
 # cli/
 
-Six-verb root parser (`tui`/`serve`/`pack`/`vector`/`experiment`/`config`) split across:
+Six-verb root parser (`tui`/`serve`/`pack`/`vector`/`experiment`/`config`) split
+across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
-- `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`
+- `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
 - `cli/runners.py` — every `_run_X` plus the shared helpers below
-- `cli/config_file.py` — `ConfigFile` dataclass + `compose` / `apply_flag_overrides` / `ensure_vectors_installed`
+- `cli/config_file.py` — `ConfigFile` dataclass + `compose` / `apply_flag_overrides`
+  / `ensure_vectors_installed`
 - `cli/output.py` — text/JSON formatters for `pack ls` / `pack search`
 
-`main()` dispatches via `_COMMAND_RUNNERS[cmd]`. Bare `saklas` (or a bare verb with no subverb) prints help and exits 0, not argparse's exit 2.
+`main()` dispatches via `_COMMAND_RUNNERS[cmd]`. Bare `saklas` (or a bare verb
+with no subverb) prints help and exits 0, not argparse's exit 2. `manifold` is
+nested under `vector` — there is no top-level `subspace`/`manifold` verb.
 
 ## Verb nesting
 
-- `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via `_PACK_VERBS` / `_PACK_BUILDERS` / `_PACK_RUNNERS`
-- `vector` = computation (extract/merge/clone/compare/why/transfer/manifold) via `_VECTOR_VERBS` / `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`; `manifold` is itself nested (`fit`/`discover`/`generate`/`merge`/`install`/`search`/`push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`), hand-dispatched by `_run_vector_manifold`. The fit/discover/generate/transfer trio load a model (or two, for transfer); the lifecycle verbs (`merge`/`install`/`search`/`push`/`rm`/`clear`/`refresh`) and `ls`/`show` are pure-IO over `~/.saklas/manifolds/`. Lifecycle selectors are `(namespace, name)` pairs, *not* the concept `Selector`/`resolve` machinery the vector verbs use. Bare-name resolution splits by intent: verbs addressing an *existing* manifold (`clear`/`refresh`/`rm`/`transfer`, plus `discover`/`show`) resolve a bare name cross-namespace via `_resolve_manifold_ns_name` (reaching bundled `default/`, raising on collision/miss); verbs authoring a *fresh* folder (`generate`, `merge` target) and `push` default a bare name to `local/` via `_split_manifold_ns_name`.
-- `experiment` = repeatable research runs (`fan`, `transcript run`, `naturalness`) via `_EXPERIMENT_VERBS` / `_EXPERIMENT_BUILDERS`; `_run_experiment` hand-dispatches the verbs
-- `config` = show / validate
+- `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via
+  `_PACK_VERBS` / `_PACK_BUILDERS` / `_PACK_RUNNERS`
+- `vector` = computation (extract/merge/clone/compare/why/transfer/manifold) via
+  `_VECTOR_VERBS` / `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`. `manifold` is itself
+  nested (`fit`/`discover`/`generate`/`merge`/`install`/`search`/`push`/`rm`/
+  `clear`/`refresh`/`transfer`/`ls`/`show`), hand-dispatched by `_run_vector_manifold`.
+  The fit/discover/generate/transfer verbs load a model; the lifecycle verbs and
+  `ls`/`show` are pure-IO over `~/.saklas/manifolds/`, addressed by
+  `(namespace, name)` pairs (not the concept `Selector`/`resolve` machinery).
+  Bare-name resolution splits by intent: verbs addressing an *existing* manifold
+  (`clear`/`refresh`/`rm`/`transfer`, `discover`/`show`) resolve cross-namespace
+  via `_resolve_manifold_ns_name` (reaching bundled `default/`, raising on
+  collision/miss); verbs authoring a *fresh* folder (`generate`, `merge` target,
+  `push`) default a bare name to `local/` via `_split_manifold_ns_name`.
+- `experiment` = repeatable research runs (`fan`, `transcript run`, `naturalness`)
+  via `_EXPERIMENT_VERBS` / `_EXPERIMENT_BUILDERS`; `_run_experiment` hand-dispatches.
+- `config` = show / validate.
 
 ## Config loading
 
-`_load_effective_config(args)` (in `runners.py`) is the shared entry point every subcommand that takes `-c` calls. It composes `~/.saklas/config.yaml` + explicit `-c` files via `ConfigFile.effective(extras, include_default=True)`, runs `apply_flag_overrides` for CLI-supplied values, then stamps in place: `args.model` (if YAML supplied it), `args.temperature`, `args.top_p`, `args.thinking`, `args.system_prompt`, `args.max_tokens`, `args.config_vectors`, plus YAML-only knobs `args.method` / `args.injection_mode` / `args.theta_max` / `args.projection_metric` / `args.compile` / `args.cuda_graphs` / `args.top_k_alts` — each only when the matching CLI flag is unset (CLI wins). Finally calls `ensure_vectors_installed`.
+`_load_effective_config(args)` (in `runners.py`) is the shared entry point every
+`-c`-taking subcommand calls. It composes `~/.saklas/config.yaml` + explicit `-c`
+files via `ConfigFile.effective(extras, include_default=True)`, runs
+`apply_flag_overrides` for CLI-supplied values, then stamps in place: `args.model`
+(if YAML supplied it), `args.temperature`, `args.top_p`, `args.thinking`,
+`args.system_prompt`, `args.max_tokens`, `args.config_vectors`, plus the YAML-only
+knobs `args.projection_metric` / `args.compile` / `args.cuda_graphs` /
+`args.top_k_alts` (from YAML `return_top_k`) — each only when the matching CLI flag
+is unset (CLI wins). Finally calls `ensure_vectors_installed`. There is **no**
+`method`/`injection_mode`/`theta_max` threading — those config keys were removed
+with the unified injection kernel.
 
-`ConfigFile.load` parses the YAML, warns on unknown keys, and validates the `vectors:` value (a single steering expression string) through `saklas.core.steering_expr.parse_expr` at load time, storing the raw text. Re-parsing into a `Steering` happens on consumption. `compose` overrides field-by-field, later configs winning; `vectors` overrides wholesale (no concatenation). Known keys: `model`, `vectors`, `thinking`, `temperature`, `top_p`, `max_tokens`, `system_prompt`, `extraction_method`, `injection_mode`, `theta_max`, `projection_metric`, `compile`, `cuda_graphs`, `return_top_k`.
-
-`ensure_vectors_installed` walks the raw expression via `referenced_selectors`, auto-installing HF-namespaced concepts and materializing `default/` ones; `strict=True` raises on any unresolvable reference instead of warning.
+`ConfigFile.load` parses the YAML, warns on unknown keys, and validates the
+`vectors:` value (a single steering expression) through `parse_expr` at load time.
+`compose` overrides field-by-field (later wins; `vectors` wholesale). Known keys
+(`_KNOWN_KEYS`): `model`, `vectors`, `thinking`, `temperature`, `top_p`,
+`max_tokens`, `system_prompt`, `projection_metric`, `compile`, `cuda_graphs`,
+`return_top_k`. `ensure_vectors_installed` walks the raw expression via
+`referenced_selectors`, auto-installing HF concepts and materializing `default/`
+ones; `strict=True` raises on any unresolvable reference.
 
 ## Session construction + warmup
 
-`_make_session(args)` builds the `SaklasSession` via `from_pretrained`, resolving probe categories, injection mode, projection metric, DLS, compile, and CUDA-graph settings off `args`. It enforces the `--legacy` conflict checks (mutually exclusive with `--steer-mode`, `--projection-metric`, `--no-dls`). `_warmup_session` runs a 32-token stateless `session.generate("Please respond briefly.", ...)` so dynamo's automatic-shape promotion fires on a realistic prefill length before the user's first request; called from both `tui` and `serve` after `_setup_steering_vectors`. The model loader's `_compile_with_probe` already specializes a minimal 2-token shape during `from_pretrained` to catch compile crashes; the warmup is the layer above that, sized so the user's first interactive prompt skips the per-prefill-shape recompile.
-
-`_attach_default_manifold_probes(session)` runs in `_run_serve` after `create_app`, gated on the dashboard being mounted (`web_enabled`). It attaches the bundled manifolds (`default/personas`, `default/circumplex`) as read-side probes so the dashboard's probe rack opens with them watching — the manifold analogue of `bootstrap_probes` pre-loading default vector probes. Fitted-for-model only (it checks `ManifoldFolder.tensor_models()`); an unfitted bundled manifold is skipped with a one-line hint rather than triggering an expensive startup fit.
+`_make_session(args)` builds the `SaklasSession` via `from_pretrained`, threading
+`device`, `quantize`, `probes`, `system_prompt`, `max_tokens`, `projection_metric`
+(default `"mahalanobis"`), `dls`, `compile`, `cuda_graphs`, `return_top_k`. There
+is no injection-mode resolution and no `--legacy` conflict check. `_warmup_session`
+runs a 32-token stateless `session.generate(...)` so dynamo's shape promotion fires
+on a realistic prefill before the user's first request; called from `tui` and
+`serve` after `_setup_steering_vectors`. `_attach_default_manifold_probes(session)`
+runs in `_run_serve` after `create_app`, gated on the dashboard being mounted
+(`web_enabled`) — it attaches the bundled `default/personas` + `default/circumplex`
+as read-side probes (fitted-for-model only; an unfitted one is skipped with a hint).
 
 ## Flags
 
-`tui` and `serve` share model-loading args (`model`, `-q/--quantize`, `-d/--device`, `-p/--probes`), the injection block (`_add_injection_args`), the logit block (`_add_logit_args`), and config args (`_add_config_args`: `-c/--config` repeatable, `-s/--strict`).
+`tui`/`serve` share model-loading args (`model`, `-q/--quantize`, `-d/--device`,
+`-p/--probes`), the injection block (`_add_injection_args`), the logit block
+(`_add_logit_args`), and config args (`_add_config_args`: `-c/--config` repeatable,
+`-s/--strict`).
 
-- Injection block (`tui`/`serve`/`experiment fan`/`transcript run`): `--steer-mode {angular,additive}`, `--theta-max RAD`, `--projection-metric {mahalanobis,euclidean}`, `--no-dls`, `--legacy`, `--compile`, `--cuda-graphs`. All argparse-default to `None`/`False`; YAML fills unset values, session defaults (angular / π/2 / mahalanobis / DLS on / compile + cuda-graphs **off** — torch 2.12 inductor bugs on newer architectures and limited per-token benefit on interactive workloads make compile opt-in) win otherwise.
-- Logit block: `--top-k-alts N` (0–256, default unset → session default 0). Sets the session-level `SamplingConfig.return_top_k`.
-- `tui`: `model` is optional (a `-c` config with `model:` can supply it); `--max-tokens` default 1024.
-- `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (default 8000), `-S/--steer EXPR`, `-C/--cors ORIGIN` (repeatable), `-k/--api-key` (falls back to `$SAKLAS_API_KEY`), `--no-web` (skip the dashboard mount at `/`).
-- `vector extract`: positional `concept` (one concept or two poles), `-m/--model`, `-f/--force` (pre-deletes the existing tensor + threads `force_statements=True` so the statements cache is also bypassed — full webui `force` parity), `--namespace NS` (destination folder; unset → `local/`, the historical landing site; any other value lands at `vectors/<NS>/<canonical>/`; webui parity with `ExtractRequest.namespace`), `--method {dim,pca}` (default `dim`; `pca` writes the legacy `_pca` filename suffix), `--legacy` (≡ `--method pca`, mutually exclusive with `--method`), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG` (role-augmented extraction; writes a `_role-<slug>` tensor and returns a `:role-<slug>` canonical tail; mutually exclusive with `--sae`; slug must match `[a-z0-9._-]+`). `--method`/`--legacy` resolve through `_resolve_legacy_method`.
-- `vector merge`: positional `name` + `expression` (a steering expression, e.g. `"0.3 ns/a + 0.5 ns/a~ns/b"`), `-f/--force`, `-s/--strict`, `-m/--model`.
-- `vector clone`: positional `corpus_path`, required `-N/--name`, `-m/--model`, `-n/--n-pairs` (default 90), `--seed`, `-f/--force`.
-- `vector compare`: positional `concepts` (1+ selectors), required `-m/--model`, `-v/--verbose`, `-j/--json`, `--metric {euclidean,mahalanobis}` (default `mahalanobis`), `--ridge-scale FLOAT` (default 1.0, mahalanobis only), `--legacy` (≡ `--metric euclidean`). 1-arg mode ranks all installed against the target, 2-arg is pairwise, 3+ prints an N×N matrix. The mahalanobis path loads `LayerWhitener.from_cache(model_id)` up front; a missing whitener cache is fatal (no silent Euclidean fallback).
-- `vector why`: positional `concept`, required `-m/--model`, `-j/--json`. Prints a per-layer `||baked||` histogram (16 buckets) plus diagnostics when the sidecar carries them.
-- `vector transfer`: positional `concept`, required `--from SRC_MODEL` / `--to TGT_MODEL`, `-f/--force`, `-j/--json`. Fits/loads a Procrustes alignment and writes a transferred tensor at the target's `from-<safe_src>` variant.
-- `vector manifold`: nested `fit` / `discover` / `generate` / `merge` / `install` / `search` / `push` / `rm` / `clear` / `refresh` / `transfer` / `ls` / `show`. `fit <folder> [-m MODEL] [--sae RELEASE] [--sae-revision REV]` loads a model and runs `ManifoldExtractionPipeline` via `session.extract_manifold` on an authored folder. `discover <name> [-m MODEL] [--method pca|spectral] [--max-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--sae REL]` does the same for a discover-mode folder, writing any CLI override into `manifold.json` (atomically, via `write_json_atomic`) *before* the fit so the cache key reflects the actual inputs; `_sanitize_hyperparams` drops cross-method keys at the IO boundary. `--max-subspace-dim R` (argparse default `None` → engine default 64; `core/manifold.fit_layer_subspace`'s `DEFAULT_N_COMPONENTS`) caps the per-layer PCA subspace `fit_layer_subspace` uses — smaller R = finer-grained steering at large K (each axis the RBF moves along is one `subspace_replace` displaces), so for steering use set near the manifold's intrinsic `picked_k` (the bundled `personas` ships fitted at `R=8`); keep at 64 for representational analysis. `generate <name> --concepts C... [--n-scenarios N] [--statements-per-concept K] [--seed INT] [--role-per-node] [-m MODEL] [-f]` LLM-authors a discover folder by wrapping `session.generate_statements` (one scenario call + N×K cell calls, `share_moment=False` since discover-mode wants per-cell independent statements) and writing the corpora + a `scenarios.json` provenance file; `--role-per-node` doubles each concept slug as that node's assistant-role substitution at fit time, producing a persona manifold (engine validates the slug; family-unsupported raises at the matching `discover` call). `--seed` (parity with `vector clone --seed`) seeds the corpora for reproducibility — `generate_statements` carries no `seed` kwarg, so the runner sets the global `torch.manual_seed` (+ `cuda.manual_seed_all`) before the call, which the underlying `model.generate(do_sample=True)` draws from. Output folder is `~/.saklas/manifolds/<ns>/<name>/` ready for `discover` to fit. No `discover --generate` sugar — two-step is deliberate so a flaky generation leaves inspectable corpora.
-  - Lifecycle / distribution verbs mirror their `pack` / `vector` precedents flag-for-flag. Two bare-name resolution paths: the lifecycle verbs that *address an existing* manifold — `clear` / `refresh` / `rm` / `transfer` — route a bare name through `_resolve_manifold_ns_name`, which resolves cross-namespace over `_iter_manifold_folders` (reaching bundled `default/` when that's the only match), raises a clear ambiguity error on a cross-namespace collision and not-found on a miss — matching the pack lifecycle verbs and the `discover` / `show` folder lookups (`_resolve_manifold_folder` is now a thin wrapper over it). The verbs that *author fresh* (`generate`, `merge`'s target) keep the historical `_split_manifold_ns_name` bare → `local/` default (you don't cross-namespace-resolve a thing you're creating); `push`'s selector also still uses `_split_manifold_ns_name`. An explicit `ns/name` always pins.
-    - `merge <name> <src...> [--description TEXT] [--method pca|spectral] [-f]` (mirrors `vector merge` shape) → `io.manifolds.merge_discover_manifolds` — unions ≥2 discover-mode sources' node corpora into a fresh *unfitted* discover folder (the runner enforces the ≥2 floor; backend rejects authored sources, label collisions, and mixed fit-modes without `--method`). `--method` now uses the default `dest="method"` (unified with `discover`'s `--method`; the runner maps `args.method` → the backend's `fit_mode=` param at the call site). Prints a `→ run vector manifold discover <merged>` hint.
-    - `install <target> [-a NS/NAME] [-f]` (mirrors `pack install`) → `io.hf_manifolds.install_manifold` — HF coord (`<ns>/<name>[@rev]`) or local folder path; `-a/--as` relocates (must be fully qualified).
-    - `search <query> [-j|-v]` (mirrors `pack search`) → `io.hf_manifolds.search_manifolds` (empty CLI query → `None` for list-by-recency). Renders `[hf]` rows with `domain_label` + node count + fitted tensors (or descriptions under `-v`); JSON emits the backend row dicts verbatim.
-    - `push <selector> [-a OWNER/NAME] [-m MODEL] [--variant raw|sae|all] [-p] [-d]` (mirrors `pack push`; `--variant` default `raw` — aligned with `pack push`, since SAE variants carry stronger provenance and sharing them is opt-in) → `io.hf_manifolds.push_manifold`. The runner resolves the coord via `hf.resolve_target_coord(name, --as)` (the same `<whoami>/<name>` fallback packs use; `push_manifold` takes the resolved coord directly) and maps `-m`→`model_scope`, `--variant`→`variant`. The corpus always uploads (a manifold can't re-fit without it); per-model tensors are filtered by `-m`/`--variant`.
-    - `rm <selector> [-y]` (mirrors `pack rm`) → `io.manifolds.remove_manifold_folder`. The runner guards a `default/`-namespace target behind `-y` (it re-materializes on next session start — the manifold analogue of `pack rm`'s broad-selector confirmation); the success message flags `rematerializes_on_restart`.
-    - `clear <selector> [-m MODEL] [--variant raw|sae|all]` (mirrors `pack clear`; `--variant` default `all`) → `io.manifolds.clear_manifold_tensors`. `-m` is passed through as `model_scope` (a raw model id; the `safe_model_id` conversion happens at the io boundary, same as the pack runner), narrowing the delete to one model's fitted tensors; omitted → all models. Keeps `manifold.json` + the `nodes/` corpus.
-    - `refresh <selector> [-m MODEL]` (mirrors `pack refresh`) → `io.manifolds.refresh_manifold`. With `-m` it does a scoped refresh — drops just that model's fit pair so it re-fits on next use (returns `"scoped"`); without `-m` it dispatches on source tier: `local` → "nothing to refresh", `bundled`/`default/` → re-materialize, `hf://` → re-pull.
-    - `transfer <name> --from SRC --to TGT [-f] [-j]` (mirrors `vector transfer`) → `io.manifolds.transfer_manifold`. The runner owns the alignment build/load exactly as `_run_transfer` does — `load_alignment_map` cache hit, else serialize the two model loads + `load_or_compute_neutral_activations` + `fit_alignment` + `save_alignment_map` — then hands the prebuilt `{layer: M_L}` dict to the pure-io `transfer_manifold` (the manifold analogue maps the fitted subspace's `mean`/`basis` through the alignment, leaving the RBF + `node_coords` untouched). Writes the target's `_from-<safe_src>` variant tensor.
-  - `ls [--namespace NS] [-j] [-v]` and `show <name> [-j]` are pure-IO walks of `manifolds_dir()`. `ls -v` appends each manifold's description under its row (mirroring `pack ls -v`). `show` text mode surfaces `fit_mode` + `hyperparams` + a per-fit one-line diagnostics summary (PCA: `picked_k=k, cumvar@k=…`; spectral: `picked_k=k, gap=…, bandwidth=…, k_nn=…`), the derived per-model coords when a discover fit exists, and per-node `[role=<slug>]` tags when set; `show -j` now emits `io.manifolds.manifold_summary(folder)` so its JSON shares keys with the server's `GET /saklas/v1/manifolds/{ns}/{name}` route (for a discover folder the summary reports the on-disk empty geometry — `node_coords == []` — the derived per-model layout still shows in the text path).
-- `experiment fan`: positional `model` + `prompt`, required repeatable `-g/--grid CONCEPT=ALPHAS`, `-S/--base-steering EXPR`, `--max-tokens` (default 256), `-j/--json`. Runs the alpha grid through `session.generate_sweep`; JSON mode emits `RunSet.to_dict()`.
-- `experiment transcript run`: positional `path` + optional `model` (falls back to the transcript's embedded `model_id`), `--max-tokens` (default 256). Replays each user turn and reports per-turn readings drift. `transcript` is not a top-level verb.
-- `experiment naturalness`: positional `model` + `prompt`, required `--manifold FOLDER` / `-S/--steer EXPR`, `--compare-linear`, `--max-tokens` (default 128), `-j/--json`. Fits a behavior-space manifold from the manifold's node corpus, generates, and reports the trajectory's Bhattacharyya distance to it; `--compare-linear` scores a straight-chord additive baseline alongside (the steer expression must then be a single `%` term).
-- `pack install`: `target`, `-s/--statements-only`, `-a/--as NS/NAME`, `-f/--force`.
-- `pack refresh`: `selector` (or the literal `neutrals`), `-m/--model`.
-- `pack clear`: `selector`, `-m/--model`, `-y/--yes` (required for broad selectors), `--variant {raw,sae,all}` (default `all`).
-- `pack rm`: `selector`, `-y/--yes` (required for broad selectors).
-- `pack ls`: optional `selector`, `-j/--json`, `-v/--verbose` — local-only, no HF query.
-- `pack search`: optional `query`, `-j/--json`, `-v/--verbose` — the HF-remote verb.
-- `pack push`: `selector`, `-a/--as OWNER/NAME`, `-p/--private`, `-m/--model`, `-s/--statements-only`, `-n/--no-statements`, `-t/--tag-version`, `-d/--dry-run`, `-f/--force`, `--variant {raw,sae,all}` (default `raw` — SAE variants carry stronger provenance, so sharing them is opt-in).
-- `pack export gguf`: `selector`, `-m/--model`, `-o/--output`, `--model-hint`.
-- `config show`: `-c/--config` (extra YAML), `-m/--model` (override), `--no-default` (skip `~/.saklas/config.yaml`). `config validate`: positional `file` — exit 0 valid, 2 invalid.
-
-`--legacy` is a single-flag preset: on `tui`/`serve` it forces `injection_mode="additive"`, `extraction_method="pca"`, `projection_metric="euclidean"`, `dls=False`; on `vector extract` it forces `--method pca`; on `vector compare` it forces `--metric euclidean`. Conflicting per-flag controls on the same verb error at parse/runner time before model load.
+- **Injection block** (`_add_injection_args`, on `tui`/`serve`/`experiment fan`/
+  `transcript run`/`naturalness`): `--projection-metric {mahalanobis,euclidean}`,
+  `--no-dls`, `--compile`, `--cuda-graphs`. All argparse-default to `None`/`False`;
+  YAML fills unset values, session defaults (mahalanobis / DLS on / compile +
+  cuda-graphs **off**) win otherwise. There is **no** `--steer-mode`/`--theta-max`/
+  `--legacy`.
+- **Logit block** (`_add_logit_args`): `--top-k-alts N` (0–256, → session
+  `SamplingConfig.return_top_k`).
+- `tui`: `model` optional (a `-c` config with `model:` can supply it); `--max-tokens`
+  default 1024.
+- `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (8000), `-S/--steer EXPR`,
+  `-C/--cors ORIGIN` (repeatable), `-k/--api-key` (falls back to `$SAKLAS_API_KEY`),
+  `--no-web`.
+- `vector extract`: positional `concept` (one concept or two poles, `nargs="+"`),
+  `-m/--model`, `-f/--force` (pre-deletes the existing tensor + threads
+  `force_statements=True`), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG`
+  (mutually exclusive with `--sae`; writes a `_role-<slug>` tensor + returns a
+  `:role-<slug>` tail; slug `[a-z0-9._-]+`), `--namespace NS` (destination; unset →
+  `local/`). There is **no `--method`/`--legacy`** — difference-of-means is the only
+  method.
+- `vector merge`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`.
+- `vector clone`: `corpus_path`, `-N/--name` (required), `-m/--model`,
+  `-n/--n-pairs` (90), `--seed`, `-f`.
+- `vector compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,
+  `--metric {euclidean,mahalanobis}` (default `None` → resolves to `mahalanobis`),
+  `--ridge-scale` (1.0, mahalanobis only). No `--legacy`. 1-arg ranks all installed
+  against the target, 2-arg pairwise, 3+ an N×N matrix; the mahalanobis path loads
+  `LayerWhitener.from_cache` up front (a miss is fatal — no silent Euclidean
+  fallback).
+- `vector why`: `concept`, `-m/--model` (required), `-j`. Per-layer `‖baked‖`
+  histogram (16 buckets) + sidecar diagnostics.
+- `vector transfer`: `concept`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
+  Fits/loads a Procrustes alignment, writes the target's `from-<safe_src>` tensor.
+- `vector manifold`: nested `fit`/`discover`/`generate`/`merge`/`install`/`search`/
+  `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`. `fit <folder>` runs
+  `ManifoldExtractionPipeline` on an authored folder; `discover <name>
+  [--method pca|spectral] [--max-dim N] [--var-threshold T] [--k-nn K]
+  [--bandwidth SIGMA] [--max-subspace-dim R] [--sae REL]` fits a discover-mode
+  folder (writes any CLI hyperparam override into `manifold.json` atomically
+  *before* the fit; `--max-subspace-dim` caps the per-layer PCA dim,
+  argparse-default `None` → engine 64). `generate <name> --concepts C...
+  [--n-scenarios N] [--statements-per-concept K] [--seed INT] [--role-per-node]
+  [-m] [-f]` LLM-authors a discover folder via `session.generate_statements`
+  (`--role-per-node` doubles each concept slug as that node's assistant-role
+  substitution → a persona manifold). Lifecycle/distribution verbs mirror their
+  `pack`/`vector` precedents flag-for-flag. The only surviving `--method` flag is
+  the manifold `pca`/`spectral` one (on `discover`/`merge`).
+- `experiment fan`: `model` + `prompt`, `-g/--grid CONCEPT=ALPHAS` (required,
+  repeatable), `-S/--base-steering`, `--max-tokens` (256), `-j`. Runs the grid
+  through `generate_sweep`.
+- `experiment transcript run`: `path` + optional `model`, `--max-tokens` (256).
+  `transcript` is not a top-level verb.
+- `experiment naturalness`: `model` + `prompt`, `--manifold FOLDER` / `-S/--steer
+  EXPR` (required), `--compare-linear`, `--max-tokens` (128), `-j`.
+- `pack install`/`refresh`/`clear`/`rm`/`ls`/`search`/`push`/`export gguf`,
+  `config show`/`validate` — flags as in their `cache_ops`/`hf` backends.
 
 ## Error handling
 
-`@_saklas_error_exit` wraps the top-level runners (not `tui`): any escaping `SaklasError` prints `user_message()` to stderr and exits with `min(2, status // 100)`.
+`@_saklas_error_exit` wraps the top-level runners (including `_run_tui`): any
+escaping `SaklasError` prints `user_message()` to stderr and exits with
+`min(2, status // 100)`.

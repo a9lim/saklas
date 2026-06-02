@@ -11,7 +11,7 @@ Textual frontend over `SaklasSession`. Three panels — left (vectors), center (
 - `pairs_modal.py` — `CustomPairsModal` (`ModalScreen`) for `/pairs`; `parse_pair_lines` splits the `positive | negative` buffer.
 - `trait_panel.py` — `TraitPanel`; probe list + WHY/LAYERS histogram.
 - `loom_screen.py` / `loom_helpers.py` — full-screen loom navigator + formatting helpers.
-- `utils.py` — `build_bar`, `BAR_WIDTH = 24` (every bar in the UI; `vector_panel.RIGHT_W` derives from it).
+- `utils.py` — `build_bar`, `BAR_WIDTH = 24` (every bar in the UI; the left panel's right-edge alignment `RIGHT_W = 11 + BAR_WIDTH + 4` is a function-local of `LeftPanel._render_gen_config`).
 
 ## app.py
 
@@ -38,7 +38,7 @@ A bare slug typed into `/steer` (`/steer 0.7 pirate`) resolves through `io.selec
 - Analysis: `/compare <a> [b]` — 1-arg ranks cosine vs all loaded profiles; 2-arg is a pairwise score.
 - Loom: `/tree`, `/nav <prefix>`, `/edit <text>`, `/branch [text]`, `/del [yes]`, `/star`, `/note <text>`, `/path`, `/fan <vector> <alphas>`, `/prune <filter-expr>`, `/auto-regen [mode]`, `/diff <id1> <id2> [--full]` / `/diff --siblings`.
 
-`/steer` and friends take a full steering expression parsed by `saklas.core.steering_expr.parse_expr` — bare poles resolve through `resolve_pole` (canonical name + sign flip for installed bipolars); variant suffixes (`:sae`, `:sae-<release>`) are grammar-native; projections (`a|b`, `a~b`) and triggers (`@after`, `@when:…`) are accepted. A bare term with no coefficient uses `DEFAULT_COEFF` (0.5). `/probe <name>` also seeds the highlight probe and turns highlighting on.
+`/steer` and friends take a full steering expression parsed by `saklas.core.steering_expr.parse_expr` — bare poles resolve through `resolve_pole` (canonical name + sign flip for installed bipolars); variant suffixes (`:sae`, `:sae-<release>`, `:role-<slug>`), triggers (`@after`, `@when:…`), and manifold `%` terms are accepted. Projection (`a~b`, `a|b`) and ablation (`!x`) terms are **rejected** from `/steer` with an "express them in the YAML config" system message — they need session-level materialization the live `/steer` path doesn't run (`_handle_steer` rejects `ProjectedTerm`/`AblationTerm`). A bare term with no coefficient uses `DEFAULT_COEFF` (0.5). `/probe <name>` also seeds the highlight probe and turns highlighting on.
 
 Namespace bulk forms (`/steer ns/`, `/probe ns/`, `/unsteer ns/`, `/unprobe ns/`): the trailing-slash form is caught by `_detect_namespace_selector` before the parser runs. Add-side enumerates `_all_concepts()` for the namespace and routes through `session._try_autoload_vector` (cache-hit only — no extraction). `/steer ns/` registers loaded concepts at `DEFAULT_ALPHA = 0.5` with `enabled=False`. Concepts with no tensor on disk get a one-line summary with a `pack refresh` hint.
 
