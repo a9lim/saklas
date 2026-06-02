@@ -1236,12 +1236,12 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     assert out.name in mf.files
 
 
-def test_transfer_manifold_rebakes_share_and_lever_in_target_space(
+def test_transfer_manifold_rebakes_share_in_target_space(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     """A target whitener covering the transferred layers re-bakes the
-    Mahalanobis share + steering lever in target space (instead of
-    dropping them) and records ``share_metric == "mahalanobis"``."""
+    Mahalanobis share in target space (instead of dropping it) and records
+    ``share_metric == "mahalanobis"``."""
     import torch
     from saklas.core.mahalanobis import LayerWhitener
     from saklas.core.manifold import load_manifold
@@ -1258,7 +1258,7 @@ def test_transfer_manifold_rebakes_share_and_lever_in_target_space(
     src_man = load_manifold(src_tensor)
     align = {L: torch.eye(6) for L in src_man.layers}
 
-    # Target whitener + layer means over the fitted layers {4, 5, 6}.
+    # Target whitener over the fitted layers {4, 5, 6}.
     g = torch.Generator().manual_seed(99)
     acts = {L: torch.randn(120, 6, generator=g) for L in src_man.layers}
     means = {L: torch.zeros(6) for L in src_man.layers}
@@ -1266,16 +1266,14 @@ def test_transfer_manifold_rebakes_share_and_lever_in_target_space(
 
     out = transfer_manifold(
         folder, from_model=src_model, to_model=tgt_model,
-        alignment=align, whitener=w, layer_means=means,
+        alignment=align, whitener=w,
     )
     tgt_man = load_manifold(out)
 
-    # Share + lever recomputed (not dropped), one per transferred layer.
+    # Share recomputed (not dropped), one per transferred layer.
     assert set(tgt_man.mahalanobis_share.keys()) == set(src_man.layers)
-    assert set(tgt_man.lever.keys()) == set(src_man.layers)
     for L in src_man.layers:
         assert tgt_man.mahalanobis_share[L] > 0.0
-        assert 0.0 < tgt_man.lever[L] <= 1.0 + 1e-6
     # They are *target*-metric values, not the source's hand-set share.
     assert tgt_man.mahalanobis_share != src_man.mahalanobis_share
     with open(out.with_suffix(".json")) as f:

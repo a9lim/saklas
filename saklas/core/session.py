@@ -2702,51 +2702,9 @@ class SaklasSession:
             )
             if not synth.layers:
                 continue
-            lever = self._dispatch_lever(synth)
             self._steering.add_subspace(
-                f"__affine__{i}", synth, lever=lever, trigger=trigger,
+                f"__affine__{i}", synth, trigger=trigger,
             )
-
-    def _dispatch_lever(
-        self, synth: "SynthesizedSubspace",
-    ) -> "dict[int, float] | None":
-        """Per-layer steering lever for a synthesized subspace, from neutrals.
-
-        ``layer_lever`` over the cached neutral activations (raw = the
-        whitener's centered ``X_L`` + the layer mean) gives the fraction of a
-        running activation's norm that lives in the merged subspace, which
-        :meth:`SteeringManager.apply_to_model` divides into the gain for R-/
-        metric-invariance.  Returns ``None`` (⇒ ``N = 1``) when no whitener
-        covers the subspace's layers — the CPU-stub / no-neutral path, where
-        steering strength is uncalibrated anyway (the GPU gate owns that).
-        """
-        from saklas.core.manifold import layer_lever
-
-        layers = list(synth.layers)
-        try:
-            whitener = self.whitener
-        except Exception:
-            whitener = None
-        if whitener is None or not whitener.covers_all(layers):
-            return None
-        means = self._layer_means
-        if not all(L in means for L in layers):
-            return None
-        lever: dict[int, float] = {}
-        for L in layers:
-            mean_L = means[L].to(torch.float32).reshape(-1)
-            raw_L = whitener._X[L].to(torch.float32) + mean_L  # (N, D) raw neutrals
-            # The lever is fit-time math over the cached (CPU) neutral set; the
-            # synth basis may live on the model device (the manifold it came
-            # from was promoted by ``_ensure_manifold_loaded``).  Align the
-            # small ``(R, D)`` basis onto the neutrals' device rather than
-            # hauling the whole neutral stack to the GPU — otherwise the
-            # ``centered @ basis.T`` decompose mismatches CPU vs MPS/CUDA.
-            basis_L = synth.layers[L].basis.to(
-                device=raw_L.device, dtype=torch.float32,
-            )
-            lever[L] = layer_lever(raw_L, mean_L, basis_L)
-        return lever
 
     def _install_composed_steering(self) -> None:
         """Attach the currently-composed steering entries to model layers."""

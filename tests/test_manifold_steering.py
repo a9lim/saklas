@@ -1,8 +1,8 @@
 """Hook + manager level tests for manifold steering — CPU only.
 
 These cover the *integration* layer — ``SteeringManager.apply_to_model``'s
-gain assembly (share-weight + lever-normalize + along water-fill + onto
-clamp), ``add_manifold``'s plumbing, the hook's foot-following state, and the
+gain assembly (mean-1 share-weight + onto clamp; no lever / along clamp —
+Step 8), ``add_manifold``'s plumbing, the hook's foot-following state, and the
 slow-path forcing.  The kernel math itself (geodesic slide, onto collapse,
 norm cap) lives in ``test_manifold_math.py``.
 """
@@ -68,21 +68,12 @@ def _circle(k: int, dim: int, scale: float = 1.0) -> torch.Tensor:
     return out
 
 
-def _manifold(
-    layers: Sequence[int] = (0, 1),
-    *,
-    lever: float | dict[int, float] | None = None,
-) -> Manifold:
-    """A 1-D periodic (loop) manifold over 6 nodes.
-
-    ``lever`` stamps a per-layer steering lever ``f_L`` (a float applies to
-    every layer, a dict gives per-layer values).  ``None`` leaves the lever
-    empty, so ``apply_to_model`` falls back to ``N = 1`` (no normalization).
-    """
+def _manifold(layers: Sequence[int] = (0, 1)) -> Manifold:
+    """A 1-D periodic (loop) manifold over 6 nodes."""
     domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
-    mf = Manifold(
+    return Manifold(
         name="mood",
         domain=domain,
         node_labels=[f"n{i}" for i in range(6)],
@@ -93,13 +84,6 @@ def _manifold(
         },
         feature_space="raw",
     )
-    if lever is not None:
-        mf.lever = (
-            {L: float(lever) for L in layers}
-            if isinstance(lever, (int, float))
-            else dict(lever)
-        )
-    return mf
 
 
 def _manifold2d(layers: Sequence[int] = (0,)) -> Manifold:
@@ -335,26 +319,25 @@ def test_manager_position_length_mismatch_raises():
     assert isinstance(exc.value, SteeringExprError)
 
 
-def test_manager_coeffs_clamped_to_unit():
-    """User coefficients clamp to [0, 1].  With a single covered layer
-    share_L == 1, so along's raw budget would be ``1.0 · _MANIFOLD_GAIN``;
-    the water-fill caps it at 1.0.  onto clamps per layer."""
+def test_manager_user_coeffs_clamped_to_unit():
+    """User along/onto clamp to [0, 1].  With a single covered layer the
+    mean-1 share == 1, so eff_along = base and eff_onto = min(1, base) — onto
+    stays clamped per layer; along does not (Step 8)."""
     manifold = _manifold(layers=(0,))
     mgr = SteeringManager()
     mgr.add_manifold("mood", manifold, position=(0.5,), along=5.0, onto=5.0)
     layers = _model_layers(1)
-    with pytest.warns(UserWarning, match="saturates the 'along' displacement"):
-        mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
+    mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
     along, onto = _coeffs(mgr.hooks[0])
-    assert along == pytest.approx(1.0, abs=1e-6)
-    assert onto == pytest.approx(1.0, abs=1e-6)
+    assert along == pytest.approx(_MANIFOLD_GAIN, abs=1e-6)
+    assert onto == pytest.approx(min(1.0, _MANIFOLD_GAIN), abs=1e-6)
 
 
-def test_manager_along_share_weighting_sums():
-    """Per-layer along is share-weighted so the cumulative budget
-    ``Σ_L along_L = along · base`` regardless of layer count — the
-    layer-count-invariance property (tested in the unsaturated regime
-    where the water-fill cap never bites; no lever ⇒ N=1)."""
+def test_manager_along_share_weighting_mean_one():
+    """Per-layer along is mean-1 share-weighted, so the cumulative budget
+    ``Σ_L along_L = along · base · n_layers`` — the *per-layer* slide averages
+    ``along · base`` regardless of layer count (n_layers-invariance, no
+    lever)."""
     user_along = 0.1
     for n_layers in (1, 2, 4):
         manifold = _manifold(layers=tuple(range(n_layers)))
@@ -366,53 +349,43 @@ def test_manager_along_share_weighting_sums():
         mgr.apply_to_model(
             _model_layers(n_layers), torch.device("cpu"), torch.float32,
         )
-        total = sum(
-            _coeffs(hook)[0]
-            for hook in mgr.hooks.values()
-        )
-        expected = user_along * _MANIFOLD_GAIN
+        total = sum(_coeffs(hook)[0] for hook in mgr.hooks.values())
+        expected = user_along * _MANIFOLD_GAIN * n_layers
         assert total == pytest.approx(expected, abs=1e-4), (
-            f"share-weighted along at n={n_layers}: {total} ≠ {expected}"
+            f"mean-1 share-weighted along at n={n_layers}: {total} ≠ {expected}"
         )
 
 
-def test_manager_along_waterfill_caps_per_layer():
-    """along never slides a layer past the target.  With a small lever the
-    effective gain blows the raw per-layer budget past 1.0; the water-fill
-    caps each layer at 1.0 and the cumulative pins at the ceiling."""
-    import saklas.core.hooks as hooks_mod
+def test_manager_along_unclamped_overshoots():
+    """along is NOT clamped per layer (Step 8).  The per-layer centroid spread
+    differs (scale ∝ 1 + 0.2·L), so the top layer's mean-1 share > 1 slides it
+    strictly past base — no [0, 1] cap.  ``norm_cap`` (kernel) is the only
+    bound."""
     n_layers = 3
-    lever = 0.2
-    manifold = _manifold(layers=tuple(range(n_layers)), lever=lever)
-    eff_gain = _MANIFOLD_GAIN / lever  # = 10
+    manifold = _manifold(layers=tuple(range(n_layers)))
     mgr = SteeringManager()
     mgr.add_manifold("mood", manifold, position=(0.5,), along=1.0, onto=0.0)
-    hooks_mod._warned_manifold_saturated.discard("mood")
-    with pytest.warns(UserWarning, match="saturates the 'along' displacement"):
-        mgr.apply_to_model(
-            _model_layers(n_layers), torch.device("cpu"), torch.float32,
-        )
+    mgr.apply_to_model(_model_layers(n_layers), torch.device("cpu"), torch.float32)
     budgets = [_coeffs(hook)[0] for hook in mgr.hooks.values()]
     assert budgets, "expected manifold groups to be attached"
-    for b in budgets:
-        assert b <= 1.0 + 1e-6, f"layer slides past target: {b}"
-    assert sum(budgets) == pytest.approx(min(1.0 * eff_gain, n_layers), abs=1e-4)
+    # mean-1 ⇒ Σ = along·base·n_layers; the spread pushes the top layer past base.
+    assert sum(budgets) == pytest.approx(1.0 * _MANIFOLD_GAIN * n_layers, abs=1e-4)
+    assert max(budgets) > _MANIFOLD_GAIN
 
 
-def test_manager_onto_clamped_not_waterfilled():
-    """onto is a bounded collapse fraction: clamped to [0, 1] per layer, NOT
-    water-filled (saturation at a layer just means fully collapsed there —
-    there is nothing to redistribute)."""
+def test_manager_onto_clamped_per_layer():
+    """onto is a bounded collapse fraction: clamped to [0, 1] per layer (a
+    fraction > 1 would invert the residual).  A high-spread layer (mean-1
+    share > 1) saturates its onto at 1.0."""
     n_layers = 3
-    lever = 0.2  # eff_gain = 10 ⇒ per-layer raw blows past 1.0 → clamps
-    manifold = _manifold(layers=tuple(range(n_layers)), lever=lever)
+    manifold = _manifold(layers=tuple(range(n_layers)))
     mgr = SteeringManager()
     mgr.add_manifold("mood", manifold, position=(0.5,), along=0.0, onto=1.0)
     mgr.apply_to_model(_model_layers(n_layers), torch.device("cpu"), torch.float32)
     for hook in mgr.hooks.values():
         _along, onto = _coeffs(hook)
         assert 0.0 <= onto <= 1.0 + 1e-6
-    # At least one layer should be fully saturated (eff_gain ≫ 1).
+    # The top-spread layer's mean-1 share > 1 ⇒ its onto saturates at 1.0.
     ontos = [_coeffs(h)[1] for h in mgr.hooks.values()]
     assert max(ontos) == pytest.approx(1.0, abs=1e-6)
 
@@ -429,33 +402,11 @@ def test_manager_two_coeffs_independent():
     assert onto == 0.0
 
 
-def test_manager_lever_normalization():
-    """The gain divides by the share-weighted lever ``N`` (one base now —
-    the angular/additive split is gone).  Smaller lever ⇒ larger effective
-    along; no lever ⇒ ``N = 1`` (un-normalized base)."""
-    user_along = 0.15
-    big_lever = 0.8
-    small_lever = 0.4
-
-    def _eff(mf: Manifold) -> float:
-        mgr = SteeringManager()
-        mgr.add_manifold("m", mf, position=(0.5,), along=user_along, onto=0.0)
-        mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
-        return _coeffs(mgr.hooks[0])[0]
-
-    a_big = _eff(_manifold(layers=(0,), lever=big_lever))
-    a_small = _eff(_manifold(layers=(0,), lever=small_lever))
-    a_none = _eff(_manifold(layers=(0,)))  # no lever -> N = 1
-    assert a_small > a_big
-    assert a_small / a_big == pytest.approx(big_lever / small_lever, rel=1e-4)
-    assert a_none == pytest.approx(user_along * _MANIFOLD_GAIN, abs=1e-6)
-    assert a_big == pytest.approx(user_along * _MANIFOLD_GAIN / big_lever, abs=1e-4)
-
-
 def test_manager_share_weighting_weights_by_centroid_spread():
     """The per-layer share is proportional to centroid spread — the
-    wider-spread (more discriminative) layer absorbs a larger slice of
-    along, and the total still sums to ``along · _MANIFOLD_GAIN``."""
+    wider-spread (more discriminative) layer absorbs a larger slice of along,
+    the ratio is preserved by the mean-1 normalization, and the total sums to
+    ``along · base · n_layers``."""
     domain = BoxDomain([BoxAxis("t", periodic=True, period=1.0)])
     node_coords = torch.tensor([[i / 6] for i in range(6)])
     node_params = domain.embed(node_coords)
@@ -478,26 +429,31 @@ def test_manager_share_weighting_weights_by_centroid_spread():
     along_1 = _coeffs(mgr.hooks[1])[0]
     assert along_1 > along_0
     assert along_1 / along_0 == pytest.approx(2.0, rel=0.05)
-    assert (along_0 + along_1) == pytest.approx(user_along * _MANIFOLD_GAIN, abs=1e-4)
+    assert (along_0 + along_1) == pytest.approx(
+        user_along * _MANIFOLD_GAIN * 2, abs=1e-4
+    )
 
 
 def _euclidean_shares(manifold: Manifold) -> dict[int, float]:
-    """Reference Euclidean ``‖coords‖_F`` share, normalized across layers."""
+    """Reference Euclidean ``‖coords‖_F`` share, **mean-1** normalized
+    (``Σ = n_layers``) to match ``_manifold_layer_shares``."""
     raw = {}
     for L, sub in manifold.layers.items():
         _np, _rw, _pc = sub.rbf_params()
         c = eval_rbf(_np, _rw, _pc, _np)
         raw[L] = float(torch.linalg.vector_norm(c).item())
     tot = sum(raw.values())
-    return {L: v / tot for L, v in raw.items()}
+    n = len(raw)
+    return {L: v / tot * n for L, v in raw.items()}
 
 
 def test_manifold_shares_use_baked_when_full_coverage():
     manifold = _manifold(layers=(0, 1))
     manifold.mahalanobis_share = {0: 1.0, 1: 3.0}
     shares = _manifold_layer_shares(manifold)
-    assert shares[0] == pytest.approx(0.25)
-    assert shares[1] == pytest.approx(0.75)
+    # Mean-1: raw {1, 3} → ×(2/4) → {0.5, 1.5} (Σ = n_layers = 2).
+    assert shares[0] == pytest.approx(0.5)
+    assert shares[1] == pytest.approx(1.5)
     assert shares != pytest.approx(_euclidean_shares(manifold))
 
 

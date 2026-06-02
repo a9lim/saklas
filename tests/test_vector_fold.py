@@ -141,7 +141,7 @@ def test_fold_euclidean_share_is_mu_centered_spread():
 
 def test_fold_whitened_share_proportional_to_mahalanobis_norm():
     """With a covering whitener, share = ‖δ_L‖_M/√2 (the μ-centered whitened
-    spread) + lever populated, no stored origin (affine)."""
+    spread), no stored origin (affine)."""
     d = 10
     layers = (0, 1)
     g = torch.Generator().manual_seed(7)
@@ -166,7 +166,6 @@ def test_fold_whitened_share_proportional_to_mahalanobis_norm():
         assert mfld.mahalanobis_share[L] == pytest.approx(
             whitener.mahalanobis_norm(L, delta[L]) / _SQRT2, abs=1e-4,
         )
-        assert 0.0 < mfld.lever[L] <= 1.0
 
 
 def test_fold_per_axis_dls_drops_non_discriminative_layer():
@@ -292,7 +291,6 @@ def test_fold_directions_drops_zero_and_anchors_at_origin_without_neutral():
     mfld = fold_directions_to_subspace("m", directions, None)  # no neutral
     assert sorted(mfld.layers) == [0]
     assert torch.allclose(mfld.layers[0].mean, torch.zeros(d))    # P_basis(∅) = 0
-    assert mfld.lever == {}                                        # no whitener/neutral
 
 
 def test_fold_share_matches_dim_bake_exactly(monkeypatch: pytest.MonkeyPatch):

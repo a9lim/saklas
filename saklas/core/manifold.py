@@ -1135,17 +1135,6 @@ class Manifold:
     # These are raw per-layer scalars — the apply-time normalization to
     # ``Σ_L share_L = 1`` lives in ``_manifold_layer_shares``.
     mahalanobis_share: dict[int, float] = field(default_factory=dict)
-    # Per-layer steering *lever* ``f_L = E_neutral[‖h_par_c‖/‖h‖]`` recorded
-    # at fit time (see :func:`layer_lever`).  ``SteeringManager.apply_to_model``
-    # divides the manifold gain by the share-weighted lever
-    # ``N = Σ_L share_L·f_L`` so the per-α behavioral magnitude is invariant
-    # to subspace dimension ``R`` and to subspace-selection metric (Euclidean
-    # vs whitened) — without it, a bigger ``R`` or a rogue-heavy fit steers
-    # disproportionately harder at the same user α.  Empty dict on a fit with
-    # no neutral activations at fit time (e.g. CPU test stubs); the apply path
-    # then falls back to no lever normalization (``N = 1``), preserving the
-    # pre-lever gain scale for that degenerate case.
-    lever: dict[int, float] = field(default_factory=dict)
     # Origin ``O_L`` — the **per-layer** foot of the neutral mean on ``M``, in
     # authoring coordinates ``(n,)``, keyed by layer.  Always a point *on* the
     # manifold (each is an ``invert_parameterization`` result), so always affine;
@@ -1182,7 +1171,6 @@ class Manifold:
             node_roles=list(self.node_roles),
             explained_variance=dict(self.explained_variance),
             mahalanobis_share=dict(self.mahalanobis_share),
-            lever=dict(self.lever),
             origin={
                 L: o.to(device=device, dtype=dtype)
                 for L, o in self.origin.items()
@@ -1392,43 +1380,6 @@ def decompose(
     return h_par_c, h_perp
 
 
-def layer_lever(
-    neutral: torch.Tensor,
-    mean: torch.Tensor,
-    basis: torch.Tensor,
-) -> float:
-    """Per-layer steering *lever* — ``E_neutral[‖h_par_c‖ / ‖h‖]``.
-
-    ``neutral`` is ``(N, D)`` *raw* (un-centered) activations — the cached
-    neutral-prompt stack, a stand-in for the running activations the hook
-    sees at decode.  ``mean`` / ``basis`` define the manifold's per-layer
-    affine subspace.  Returns the mean fraction of a running activation's
-    norm that lives inside the subspace.
-
-    This is the quantity manifold steering must normalize the gain by to
-    behave consistently across subspace dimension and selection metric.
-    The angular hook rotates ``h_par_c`` (the in-subspace component) by a
-    fixed angle ``α·θ_max``; the resulting fractional displacement of the
-    full activation is ``(‖h_par_c‖/‖h‖)·2sin(θ/2)`` — i.e. proportional
-    to this lever.  A larger subspace (bigger ``R``) captures more of
-    ``‖h‖`` ⇒ bigger lever ⇒ harder steering at the same α; a de-rogued
-    (whitened) subspace excludes the high-norm rogue channels ⇒ smaller
-    lever ⇒ gentler.  ``SteeringManager.apply_to_model`` divides the gain
-    by the share-weighted lever ``N = Σ_L share_L·lever_L`` so the per-α
-    behavioral magnitude is invariant to both — a 4-dim and a 16-dim fit,
-    or a Euclidean and a whitened fit, reach comparable effect at the same
-    user α (up to the angular operator's per-layer ``θ_max`` ceiling,
-    which a small lever can saturate).
-
-    fp32 throughout; called once per layer at fit time (off the hot path).
-    """
-    h = neutral.to(torch.float32)
-    h_par_c, _ = decompose(h, mean.to(torch.float32), basis.to(torch.float32))
-    num = torch.linalg.vector_norm(h_par_c, dim=-1)
-    den = torch.linalg.vector_norm(h, dim=-1).clamp_min(1e-9)
-    return float((num / den).mean().item())
-
-
 def _ortho_basis(
     dirs: Sequence[torch.Tensor], *, eps: float = 1e-6,
 ) -> tuple[torch.Tensor, list[int]]:
@@ -1549,7 +1500,7 @@ def synthesize_subspace(
 
     The strengths live in ``target`` (per-axis), not in a single ``along`` — the
     caller picks ``along`` (the overall slide, the existing manifold-``%``
-    knob) and the per-layer share/lever normalization at apply time.  Pure
+    knob) and the per-layer (mean-1) share normalization at apply time.  Pure
     tensor, fp32, no model/IO coupling — the dispatch synthesizer (which routes
     the result through ``inject_three_op`` with a ``CustomDomain(R)`` per layer)
     is the only consumer.
@@ -1685,8 +1636,8 @@ def inject_three_op(
 
     Order is fixed **along → onto**: the transport (along) must run before
     ``onto`` scales the transported residual.  No global norm preservation —
-    ``onto`` is *meant* to shrink ``‖h − mean‖``, and the apply-time lever
-    normalization controls the per-α magnitude; a soft cap
+    ``onto`` is *meant* to shrink ``‖h − mean‖``, and the apply-time (mean-1)
+    share normalization controls the per-α magnitude; a soft cap
     ``‖h_new‖ ≤ norm_cap·‖h‖`` guards only against off-domain RBF extrapolation
     blowup.
     """
@@ -2266,15 +2217,6 @@ def save_manifold(
             str(idx): float(v)
             for idx, v in manifold.mahalanobis_share.items()
         }
-    # Per-layer steering lever ``f_L = E_neutral[‖h_par_c‖/‖h‖]`` — drives
-    # the apply-time gain normalization (``effective_gain = base/N``,
-    # ``N = Σ_L share_L·f_L``) that makes the per-α effect invariant to
-    # subspace dim and selection metric.  Absent on a fit with no neutral
-    # activations available; the apply path then uses ``N = 1``.
-    if manifold.lever:
-        sidecar["lever_per_layer"] = {
-            str(idx): float(v) for idx, v in manifold.lever.items()
-        }
     # Per-layer origin ``O_L`` (the authoring-coordinate foot of the neutral
     # mean) — the cold-start foot seed.  Stored ``{str(L): [coord, ...]}`` like
     # the other per-layer bakes; absent on a fit with no neutral means.
@@ -2372,9 +2314,6 @@ def load_manifold(path: str | Path) -> Manifold:
         int(k): float(v) for k, v in maha_raw.items()
     }
 
-    lever_raw = sidecar.get("lever_per_layer") or {}
-    lever: dict[int, float] = {int(k): float(v) for k, v in lever_raw.items()}
-
     # Per-layer origin ``O_L`` (authoring-coordinate foot of neutral).  Absent
     # on a pre-origin fit → empty dict; the apply path seeds at ``zeros(n)``.
     origin_raw = sidecar.get("origin_per_layer") or {}
@@ -2396,7 +2335,6 @@ def load_manifold(path: str | Path) -> Manifold:
         node_roles=list(sidecar.get("node_roles", [])),
         explained_variance=explained_variance,
         mahalanobis_share=mahalanobis_share,
-        lever=lever,
         origin=origin,
     )
 

@@ -421,8 +421,9 @@ def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
     """PCA discover fits a **flat affine** subspace per layer (no RBF surface)
     — the 4.0 reclassification (ARCHITECTURE §1/§5): a personas-shaped artifact
     is a rank-k flat subspace, not a curved manifold.  Each layer carries the
-    real per-layer node coords ``(K, R)``; the basis is Euclidean (δ-raw
-    invariant — the whitened gate flips at Step 8)."""
+    real per-layer node coords ``(K, R)``; the basis is Euclidean here because
+    the CPU stub handle has no whitener (the whitened/Fisher basis is the
+    default whenever a covering whitener is present — Step 8)."""
     folder = _discover_folder(
         tmp_path, fit_mode="pca",
         hyperparams={"max_dim": 4, "var_threshold": 0.70},
@@ -436,8 +437,8 @@ def test_discover_pca_produces_affine_subspaces(tmp_path: Path) -> None:
         assert sub.node_coords is not None            # real per-layer coords
         assert sub.node_coords.shape[0] == 5          # one row per node
         assert sub.node_coords.shape[1] == sub.rank   # (K, R)
-    # subspace_metric records Euclidean (δ-raw invariant) even if a whitener
-    # covered — the share may still be whitened; the two need not agree here.
+    # subspace_metric records Euclidean here because the CPU stub handle has
+    # no whitener; with a covering whitener it would record "mahalanobis".
     sidecar = json.loads((folder / "stub-model.json").read_text())
     assert sidecar["subspace_metric"] == "euclidean"
 

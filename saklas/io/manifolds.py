@@ -1853,7 +1853,6 @@ def transfer_manifold(
     alignment: dict[int, torch.Tensor],
     transfer_quality_estimate: Optional[float] = None,
     whitener: "Any | None" = None,
-    layer_means: "dict[int, torch.Tensor] | None" = None,
     force: bool = False,
 ) -> Path:
     """Apply a per-layer alignment map to a fitted manifold, target-side.
@@ -1881,21 +1880,17 @@ def transfer_manifold(
     pure-io.  ``transfer_quality_estimate`` (median per-layer R², if the
     caller computed it) rides into the sidecar provenance.
 
-    **Target-metric re-bake (``whitener`` + ``layer_means`` given).**  The
-    fitted manifold's per-layer Mahalanobis share and steering lever are
-    per-model quantities (``Σ`` and the neutral activations both belong to
-    ``from_model``), so a bare transfer can't carry them.  When a
-    ``whitener`` for the **target** model is supplied and covers every
-    transferred layer (all-or-nothing, mirroring the fit gate), both are
-    recomputed in target space: the share via
-    ``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)`` (the RBF reduced
-    node values × the target subspace-restricted inverse covariance) and
-    the lever via :func:`~saklas.core.manifold.layer_lever` over the target
-    neutral activations (the whitener's centered observations uncentered by
-    ``layer_means``).  The sidecar then records ``share_metric:
-    "mahalanobis"``.  Without coverage (or no whitener), both are left
-    empty — the apply path falls back to the Euclidean centroid-spread
-    share + ``N = 1`` lever (``share_metric: "euclidean"``).
+    **Target-metric re-bake (``whitener`` given).**  The fitted manifold's
+    per-layer Mahalanobis share is a per-model quantity (``Σ`` belongs to
+    ``from_model``), so a bare transfer can't carry it.  When a ``whitener``
+    for the **target** model is supplied and covers every transferred layer
+    (all-or-nothing, mirroring the fit gate), the share is recomputed in
+    target space via ``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)`` (the
+    RBF reduced node values × the target subspace-restricted inverse
+    covariance — the same formula the fit pipeline bakes).  The sidecar then
+    records ``share_metric: "mahalanobis"``.  Without coverage (or no
+    whitener) the share is left empty — the apply path falls back to the
+    Euclidean centroid-spread share (``share_metric: "euclidean"``).
     ``subspace_metric`` always carries the source value: the basis was
     *selected* on the source model and only rotated here.
 
@@ -1910,7 +1905,6 @@ def transfer_manifold(
     from saklas.core.manifold import (
         LayerSubspace,
         eval_rbf,
-        layer_lever,
         load_manifold,
         save_manifold,
     )
@@ -1957,18 +1951,16 @@ def transfer_manifold(
             f"({sorted(src.layers)})"
         )
 
-    # The source model's Mahalanobis share + steering lever are per-model
-    # (Σ and the neutral activations are both ``from_model`` quantities),
-    # so they're invalid in ``to_model`` space.  When a **target** whitener
-    # is supplied and covers every transferred layer (all-or-nothing,
-    # mirroring the fit gate), recompute both in target space; otherwise
-    # clear both — the apply path then falls back to the Euclidean
-    # centroid-spread share + ``N = 1`` lever, which is metric-valid for
-    # the target.  (EV is a fit-quality ratio, not a per-model metric, so
+    # The source model's Mahalanobis share is per-model (Σ and the neutral
+    # activations are both ``from_model`` quantities), so it's invalid in
+    # ``to_model`` space.  When a **target** whitener is supplied and covers
+    # every transferred layer (all-or-nothing, mirroring the fit gate),
+    # recompute it in target space; otherwise clear it — the apply path then
+    # falls back to the Euclidean centroid-spread share, which is metric-valid
+    # for the target.  (EV is a fit-quality ratio, not a per-model metric, so
     # it carries either way.)
     rebake = whitener is not None and whitener.covers_all(new_layers.keys())
     new_share: dict[int, float] = {}
-    new_lever: dict[int, float] = {}
     if rebake:
         assert whitener is not None  # narrowed by ``rebake``
         for layer, sub_tgt in new_layers.items():
@@ -1986,28 +1978,14 @@ def transfer_manifold(
                 (coords @ gram * coords).sum().clamp_min(0.0).item()
             )
             new_share[layer] = quad ** 0.5
-            # Lever needs the raw target neutral activations — uncenter the
-            # whitener's centered observations by the target layer mean.
-            # Skipped (left absent → that layer contributes ``N`` via the
-            # share-weighted mean) when the layer mean isn't resolvable.
-            if layer_means is not None and layer in layer_means:
-                X_c, _K, _lam = whitener.woodbury_factors(
-                    layer, device=torch.device("cpu"), dtype=torch.float32,
-                )
-                mu = layer_means[layer].to(
-                    device="cpu", dtype=torch.float32,
-                ).reshape(-1)
-                new_lever[layer] = layer_lever(
-                    X_c + mu, sub_f.mean, sub_f.basis,
-                )
 
     transferred = _dc_replace(
         src, layers=new_layers, explained_variance=new_ev,
-        mahalanobis_share=new_share, lever=new_lever,
+        mahalanobis_share=new_share,
         # ``origin`` is the per-layer foot of the *source* model's neutral
-        # mean — a per-model quantity invalid in target space (same reason
-        # share + lever are cleared); the apply path falls back to a
-        # zero-coord seed per layer.
+        # mean — a per-model quantity invalid in target space (same reason the
+        # share is cleared); the apply path falls back to a zero-coord seed
+        # per layer.
         origin={},
     )
 

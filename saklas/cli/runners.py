@@ -2265,15 +2265,12 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
 
     median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
 
-    # Target whitener + layer means for the share/lever re-bake (mirrors
-    # ``_run_transfer``).  Read the target neutral cache directly and
-    # center by its own per-layer mean — the neutral mean *is* the
-    # probe-centering baseline, so no layer_means cache is needed and
-    # ``layer_lever`` gets the same means the whitener centers by.  Soft
-    # ``None`` → ``transfer_manifold`` clears share + lever (Euclidean
-    # fallback at apply).
+    # Target whitener for the Mahalanobis-share re-bake (mirrors
+    # ``_run_transfer``).  Read the target neutral cache directly and center by
+    # its own per-layer mean — the neutral mean *is* the probe-centering
+    # baseline, so no separate layer_means cache is needed.  Soft ``None`` →
+    # ``transfer_manifold`` clears the share (Euclidean fallback at apply).
     target_whitener = None
-    target_layer_means = None
     try:
         import torch as _torch
         from safetensors.torch import load_file as _load_file
@@ -2288,13 +2285,12 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
                 int(k.split("_", 1)[1]): v.to(_torch.float32)
                 for k, v in _raw.items()
             }
-            target_layer_means = {L: t.mean(dim=0) for L, t in _acts.items()}
+            _target_means = {L: t.mean(dim=0) for L, t in _acts.items()}
             target_whitener = LayerWhitener.from_neutral_activations(
-                _acts, target_layer_means,
+                _acts, _target_means,
             )
     except Exception:
         target_whitener = None
-        target_layer_means = None
 
     try:
         out_path = transfer_manifold(
@@ -2304,7 +2300,6 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
             alignment=M,
             transfer_quality_estimate=median_quality,
             whitener=target_whitener,
-            layer_means=target_layer_means,
             force=args.force,
         )
     except (FileNotFoundError, FileExistsError, ManifoldFormatError) as e:

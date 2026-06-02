@@ -1353,10 +1353,10 @@ def _fold_centroids_to_affine_manifold(
     so the basis orients ``+δ̂``) gives:
 
     * ``basis`` = unit ``δ̂_L`` where ``δ_L = mean_pos_L − mean_neg_L`` — the
-      **raw** difference-of-means direction (PCA@2 ≡ DiM exactly; not the
-      whitened ``Σ⁻¹δ`` Fisher discriminant — that is the δ→Σ⁻¹δ gate flip,
-      staged at Step 8 so the injection-semantics change and the direction
-      change are independently attributable).
+      **raw** difference-of-means direction (PCA@2 ≡ DiM exactly).  This is the
+      legacy fold path (test-only, retiring in 6b); the live 2-node-vector read
+      whitens the basis via extraction's ``fit_affine_subspace``.  Only the
+      share is whitened here (the ``covers_all`` gate below).
     * ``mean`` = ``P_basis(ν_L)`` — the neutral mean projected into the span
       (neutral-anchored frame, §5); falls back to the pole midpoint ``μ`` when
       no neutral baseline is supplied.
@@ -1387,16 +1387,26 @@ def _fold_centroids_to_affine_manifold(
     """
     from saklas.core.manifold import (
         CustomDomain, LayerSubspace, Manifold, fit_affine_subspace,
-        layer_lever, subspace_share,
+        subspace_share,
     )
 
     shared = sorted(set(mean_pos_per_layer) & set(mean_neg_per_layer))
 
+    # All-or-nothing whitener gate (parity with the DiM bake): Mahalanobis
+    # share only when the whitener covers every candidate layer, else
+    # Euclidean for all.
+    maha_w = (
+        whitener
+        if whitener is not None and whitener.covers_all(shared)
+        else None
+    )
+
     # Per-layer affine fit over [pos, neg] (pos = node 0 ⇒ +δ̂ orientation).
     # Degenerate pairs (zero diff — no direction to steer) drop out first so
-    # the K=2 fit never sees a zero scatter.  δ stays *raw* (no whitener into
-    # the fit) until the Step 8 gate flip — the whitener only weights the
-    # share / lever below.
+    # the K=2 fit never sees a zero scatter.  This is the legacy fold path
+    # (test-only, retiring in 6b) and keeps the **raw** δ̂ basis (PCA@2 ≡ DiM)
+    # — the live 2-node-vector read goes through extraction's whitened
+    # ``fit_affine_subspace``; only the share is whitened here.
     fits: dict[int, tuple["LayerSubspace", torch.Tensor, torch.Tensor]] = {}
     for idx in shared:
         mp = mean_pos_per_layer[idx].to(torch.float32).reshape(-1)
@@ -1409,7 +1419,9 @@ def _fold_centroids_to_affine_manifold(
             if layer_means is not None and idx in layer_means
             else None
         )
-        sub, mu_coords, _ev = fit_affine_subspace(cent, neutral_mean=nu, orient_to=0)
+        sub, mu_coords, _ev = fit_affine_subspace(
+            cent, neutral_mean=nu, orient_to=0,
+        )
         fits[idx] = (sub, mu_coords, cent)
 
     # Per-axis DLS at R=1 (collapses to the scalar keep-or-drop).
@@ -1421,33 +1433,16 @@ def _fold_centroids_to_affine_manifold(
     else:
         kept = list(fits)
 
-    # All-or-nothing whitener gate for the share/lever metric (parity with
-    # the DiM bake): whitened only when it covers every retained layer.
-    maha_w = (
-        whitener
-        if whitener is not None and whitener.covers_all(kept)
-        else None
-    )
-
     layers: dict[int, "LayerSubspace"] = {}
     mahalanobis_share: dict[int, float] = {}
-    lever: dict[int, float] = {}
     for idx in kept:
         sub, mu_coords, _cent = fits[idx]
         layers[idx] = sub
-        # Per-layer budget = μ-centered whitened/Euclidean spread.
+        # Per-layer budget = μ-centered whitened/Euclidean spread.  No origin
+        # store — affine origin is coord 0 (§2).
         mahalanobis_share[idx] = subspace_share(
             mu_coords, sub.basis, whitener=maha_w, layer=idx,
         )
-        # Lever from the whitener's neutral activations (uncentered by the
-        # layer mean to recover the raw-activation stand-ins ``layer_lever``
-        # needs).  No origin store — affine origin is coord 0 (§2).
-        if maha_w is not None and layer_means is not None and idx in layer_means:
-            mu = layer_means[idx].to(torch.float32).reshape(-1)
-            X_c, _K, _lam = maha_w.woodbury_factors(
-                idx, device=torch.device("cpu"), dtype=torch.float32,
-            )
-            lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
 
     # Shared display layout: pos at +1, neg at −1 on a 1-D CustomDomain (the
     # label/display frame; the real per-layer steer coords live on each
@@ -1461,7 +1456,6 @@ def _fold_centroids_to_affine_manifold(
         layers=layers,
         feature_space=feature_space,
         mahalanobis_share=mahalanobis_share,
-        lever=lever,
     )
     manifold.metadata["share_metric"] = (
         "mahalanobis" if maha_w is not None else "euclidean"
@@ -1541,14 +1535,13 @@ def fold_directions_to_subspace(
     (Euclidean) — the direction magnitude itself is the budget (a single
     direction has no node cloud to take a μ-centered spread over, so this is
     *not* :func:`~saklas.core.manifold.subspace_share`'s √2-scaled form; the
-    apply-time normalization handles the cross-layer scale either way).
-    ``lever`` from the neutral activations when the whitener is present.  No
+    apply-time normalization handles the cross-layer scale either way).  No
     DLS — a derived direction has no polarity for the straddle test; the
     caller's layer set folds verbatim.  No origin store (coord 0, §2).
-    ``neutral_means=None`` (CPU stubs) anchors at coord 0 with no lever.
+    ``neutral_means=None`` (CPU stubs) anchors at coord 0.
     """
     from saklas.core.manifold import (
-        CustomDomain, LayerSubspace, Manifold, layer_lever,
+        CustomDomain, LayerSubspace, Manifold,
     )
 
     present = sorted(directions)
@@ -1560,7 +1553,6 @@ def fold_directions_to_subspace(
 
     layers: dict[int, "LayerSubspace"] = {}
     mahalanobis_share: dict[int, float] = {}
-    lever: dict[int, float] = {}
     for idx in present:
         d = directions[idx].to(torch.float32).reshape(-1)
         norm = float(d.norm())
@@ -1581,14 +1573,6 @@ def fold_directions_to_subspace(
             float(maha_w.mahalanobis_norm(idx, d))
             if maha_w is not None else norm
         )
-        # Lever from the whitener's neutral activations (uncentered by the
-        # actual ν, not the projected mean, to recover the raw-activation
-        # stand-ins).
-        if maha_w is not None and nu is not None:
-            X_c, _K, _lam = maha_w.woodbury_factors(
-                idx, device=torch.device("cpu"), dtype=torch.float32,
-            )
-            lever[idx] = layer_lever(X_c + nu, mean, basis)
 
     # Shared display layout: a single ``+`` pole at coord 1 (the real per-layer
     # pole distance ‖d_L‖ lives on each ``LayerSubspace.node_coords``).
@@ -1601,7 +1585,6 @@ def fold_directions_to_subspace(
         layers=layers,
         feature_space=feature_space,
         mahalanobis_share=mahalanobis_share,
-        lever=lever,
     )
     manifold.metadata["share_metric"] = (
         "mahalanobis" if maha_w is not None else "euclidean"

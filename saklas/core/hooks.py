@@ -172,8 +172,8 @@ class SteeringHook:
         # both groups here; ``inject_three_op``'s ``is_affine`` branch picks the
         # analytic-vs-foot-following path.  ``target_coord`` / ``origin_coord``
         # are authoring coordinates; ``along`` / ``onto`` are the per-layer
-        # effective coefficients (share-weighted + lever-normalized at apply
-        # time).  See :meth:`_apply_manifold_groups`.
+        # effective coefficients (share-weighted at apply time).  See
+        # :meth:`_apply_manifold_groups`.
         self.manifold_groups: list[
             tuple[
                 Trigger, LayerSubspace, ManifoldDomain,
@@ -270,7 +270,7 @@ class SteeringHook:
 
         Each group runs :func:`inject_three_op` — the single along/onto
         injection that replaced the angular/additive mode split.  The two
-        per-layer coefficients are already share-weighted + lever-normalized at
+        per-layer coefficients are already share-weighted at
         :meth:`SteeringManager.apply_to_model` time, so the hot path just routes
         them through the kernel and threads the per-token foot.
 
@@ -334,45 +334,35 @@ class SteeringHook:
 
 # *Base* gain for the unified subspace/manifold steering backend — one gain
 # for every term (vectors, poles, projections, ablations, affine and curved
-# ``%``), since 4.0 lowers them all to the one along/onto kernel.  Each op moves
-# a piece of ``h`` whose size is a fraction of ``||h||`` that varies with
-# subspace dimension ``R`` and with whether the subspace is rogue-heavy
-# (Euclidean PCA) or de-rogued (whitened/Fisher PCA); the per-α magnitude
-# would otherwise scale with that fraction (a 16-dim fit steering harder
-# than a 4-dim fit, a Euclidean fit harder than a whitened one).
+# ``%``), since 4.0 lowers them all to the one along/onto kernel.
 #
-# ``apply_to_model`` removes that dependence by dividing the base gain by
-# the manifold's share-weighted *lever* ``N = Σ_L share_L · f_L`` where
-# ``f_L = E_neutral[||h_par_c||/||h||]`` is baked at fit time (see
-# :func:`saklas.core.manifold.layer_lever`).  So the *effective* gain is
-# ``base / N``: a small-lever fit (de-rogued, or small R) gets a
-# proportionally larger gain, equalizing the per-α effect across subspace
-# dimension and selection metric.  Because ``f_L`` ≈ the in-subspace norm
-# fraction (≈ ``1/n_layers`` scale) and the shares sum to 1, ``base / N`` ≈
-# ``n_layers``, so the per-layer ``coeff · share_L · (base/N)`` lands ≈
-# ``coeff`` on average — i.e. ``along/onto`` read as ≈ [0, 1]
-# fractions per layer, concentrated at the high-share layers.  ``N``
-# subsumes the former additive-only ``1/√EV`` quality factor (EV was only a
-# proxy for the lever; now recorded as a fit-quality diagnostic only).
+# Each op moves a piece of ``h`` whose *magnitude* is carried by the target's
+# **neutral-anchored real coords** (Step 3): a high-signal layer's pole sits
+# farther from the origin, so sliding ``along`` toward it displaces more there.
+# The per-layer share (``_manifold_layer_shares`` / ``synth.share``) is
+# normalized to **mean 1** (``Σ_L share_L = n_layers``), so
+# ``eff_along_L = share_L · base_gain`` reads as a clean per-layer *slide
+# fraction* ≈ ``base_gain`` on a typical layer — above ``base`` on the
+# high-spread layers, below it on the flat ones — and is **n_layers-invariant**:
+# one covered layer and a 30-layer fit both put ≈ ``base`` of slide on each
+# contributing layer (a 4-dim and a 16-dim fit reach comparable behavior at the
+# same α; an ``A ⊂ B`` nested subspace steers its shared axis identically).
 #
-# Calibrated on the gemma-3-4b whitened-``circumplex`` MPS sweep (the three-op
-# Phase-1 validation): the coherent ``along`` band runs to effective ~0.4 with
-# collapse beyond, and the lever normalization makes effective ≈ 0.4·user_α, so
-# ``base = 1.0`` lands ``α ≈ 0.5`` at the mild-coherent point and ``α ≈ 1.0`` at
-# the strong/coherence-edge (the vector-comparable "``α ≈ 0.5``, tune per
-# target" idiom; α is clamped to [0, 1] so the base is the strength ceiling).
-# Per-persona strength variance persists (``happy`` collapses near α≈1 where
-# ``elated`` still holds — tune down per target).  Recalibrated 2.0 → 1.0 from
-# the old rotation-kernel value: the geodesic-lerp ``along`` over-steers at the
-# old gain.  NOTE (phase-1 sweep item): the two ops share this base; the
-# collapse op (``onto``) may want its own (smaller) base if the share-weighted
-# concentration proves too aggressive — splitting it is a one-constant change
-# here.  The gemma-4-31b sweep (#8) refines the number.
+# There is **no lever / ``N`` correction** (torn out in Step 8): it
+# double-counted the magnitude the de-rogued real coords already carry, broke
+# the A⊂B consistency above, and blew the gain up on whitened low-rank fits
+# (``N ≈ 1e-4`` → ``base/N`` saturating every layer).  And **no ``[0, 1]`` clamp
+# / water-fill** on ``along``: a high-signal layer is *meant* to overshoot past
+# the pole; the affine/RBF ``norm_cap = 3·‖h‖`` inside ``inject_three_op`` is
+# the only bound.  ``onto`` stays clamped ``[0, 1]`` (a collapse fraction > 1
+# inverts the residual).
+#
+# Calibrated on the gemma-3-4b whitened MPS smoke (rank-1 ``happysad`` + rank-8
+# ``personas``, lever dropped): ``base = 1.0`` is coherent + directional across
+# both regimes but *gentle* — the gemma-4-31b sweep (#8.5) refines the number
+# upward (α clamps to [0, 1] so ``base`` is the strength ceiling).  Per-persona
+# strength variance persists — tune α down per target.
 _MANIFOLD_GAIN = 1.0
-
-# Floor on the share-weighted lever ``N`` so a near-degenerate (tiny-
-# lever) fit can't send the effective gain ``base / N`` to infinity.
-_MIN_MANIFOLD_LEVER = 0.01
 
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before
 # they are deemed overlapping (``OverlappingManifoldError``).  Curved manifolds
@@ -419,73 +409,6 @@ def _orthogonalize_affine_against(
 # Cheap: O(R) per position, off the model-forward critical path.
 _MANIFOLD_COLD_GN_STEPS = 4
 
-# One-time saturation warnings, keyed by manifold name.
-_warned_manifold_saturated: set[str] = set()
-
-
-def _redistribute_budget(
-    per_layer_raw: dict[int, float],
-) -> dict[int, float]:
-    """Water-fill a per-layer angular budget so no layer exceeds θ_max.
-
-    Both angular steering paths express a per-layer rotation budget in
-    ``θ_max`` units (1.0 ⇒ a full ``θ_max`` rotation at that layer).  A
-    peaked per-layer share can push a single layer's budget above 1.0;
-    the historical code clamped that layer at 1.0 and silently *dropped*
-    the excess, which loses cumulative steering budget on a saturated
-    layer.  This helper instead conserves the budget: cap each layer at
-    1.0 and redistribute the trimmed excess across the still-uncapped
-    layers proportional to their current value, iterating until no new
-    layer caps (or every layer is capped).
-
-    The cumulative budget is preserved up to the hard ceiling: the
-    returned values sum to ``min(Σ raw, n_layers)`` — when the requested
-    total fits under ``n_layers · θ_max`` every bit of budget lands on
-    some layer; when it overflows (more total than the layers can hold)
-    every layer saturates at 1.0.
-
-    Apply-time only (one host-side pass over the layer set per
-    ``apply_to_model``), never the per-token hot path; pure Python floats
-    so there is no device sync.  Negative raw budgets (an inverted /
-    sign-flipped term) are passed through by magnitude: the cap and the
-    redistribution operate on ``|raw|`` and the original sign is
-    re-attached, so a negative term rotates the other way without
-    breaking the water-fill bookkeeping.
-    """
-    if not per_layer_raw:
-        return {}
-    signs: dict[int, float] = {
-        L: (-1.0 if v < 0.0 else 1.0) for L, v in per_layer_raw.items()
-    }
-    # Work on magnitudes; re-attach sign at the end.
-    capped: dict[int, float] = {L: abs(v) for L, v in per_layer_raw.items()}
-    uncapped: set[int] = set(capped)
-    # Iterate: pull every over-budget layer down to 1.0, pool the trimmed
-    # excess, and spread it over the layers still below 1.0 in proportion
-    # to their current (sub-cap) value.  Each pass can only push more
-    # layers to the cap, so it terminates in ≤ n_layers iterations.
-    while True:
-        excess = 0.0
-        newly_capped: list[int] = []
-        for L in list(uncapped):
-            if capped[L] > 1.0:
-                excess += capped[L] - 1.0
-                capped[L] = 1.0
-                newly_capped.append(L)
-        for L in newly_capped:
-            uncapped.discard(L)
-        if excess <= 1e-12 or not uncapped:
-            break
-        pool = sum(capped[L] for L in uncapped)
-        if pool <= 1e-12:
-            # All remaining layers are at zero budget — nothing to soak
-            # up the excess; it is dropped (cumulative budget already
-            # equals n_capped, the hard ceiling for this configuration).
-            break
-        for L in uncapped:
-            capped[L] += excess * (capped[L] / pool)
-    return {L: signs[L] * capped[L] for L in per_layer_raw}
-
 
 def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     # Prefer the whitened (Mahalanobis) per-layer share baked at fit time —
@@ -496,7 +419,10 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     # Euclidean scalars across layers would compare incommensurable
     # metrics.  When the baked share is absent (no whitener at fit time —
     # CPU test stubs) or partial, fall back to the Euclidean centroid-
-    # spread ``‖coords‖_F``.
+    # spread ``‖coords‖_F``.  Normalized to **mean 1** (``Σ_L share_L =
+    # n_layers``, not 1) so ``eff_along_L = share_L · base_gain`` is a clean
+    # per-layer slide fraction ≈ ``base`` on a typical layer and
+    # n_layers-invariant — see ``_MANIFOLD_GAIN``.
     baked = getattr(manifold, "mahalanobis_share", None)
     if baked and all(layer_idx in baked for layer_idx in manifold.layers):
         layer_scores: dict[int, float] = {
@@ -512,11 +438,11 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
             layer_scores[layer_idx] = float(
                 torch.linalg.vector_norm(node_coords).item()
             )
+    n_layers = max(1, len(manifold.layers))
     total_score = sum(layer_scores.values())
     if total_score <= 1e-12:
-        n_layers = max(1, len(manifold.layers))
-        return {L: 1.0 / n_layers for L in manifold.layers}
-    return {L: s / total_score for L, s in layer_scores.items()}
+        return {L: 1.0 for L in manifold.layers}
+    return {L: s / total_score * n_layers for L, s in layer_scores.items()}
 
 
 class SteeringManager:
@@ -534,7 +460,7 @@ class SteeringManager:
         self.manifolds: dict[str, dict[str, Any]] = {}
         # Dispatch-synthesized merged affine subspaces (one per active trigger
         # group), the 4.0 unified vector/pole/projection/ablation/affine-``%``
-        # backend.  Each value is ``{synth, lever, trigger}``; ``apply_to_model``
+        # backend.  Each value is ``{synth, trigger}``; ``apply_to_model``
         # lowers them to per-layer ``inject_three_op`` entries alongside curved
         # manifolds.
         self.subspaces: dict[str, dict[str, Any]] = {}
@@ -567,8 +493,8 @@ class SteeringManager:
         At ``apply_to_model`` time, for every layer the manifold covers, the
         per-layer subspace + domain + authoring ``target`` / ``origin`` coords
         are attached to the corresponding :class:`SteeringHook` along with the
-        share-weighted + lever-normalized per-layer ``along`` / ``onto``
-        coefficients; the hot path runs :func:`inject_three_op`.
+        share-weighted per-layer ``along`` / ``onto`` coefficients; the hot path
+        runs :func:`inject_three_op`.
 
         ``position`` is either a tuple of authoring coordinates (coord form)
         or a node-label string (label form, sugar for that node's coords).
@@ -621,7 +547,6 @@ class SteeringManager:
         name: str,
         synth: SynthesizedSubspace,
         *,
-        lever: dict[int, float] | None = None,
         trigger: Trigger = Trigger.BOTH,
     ) -> None:
         """Register a dispatch-synthesized merged affine subspace (4.0).
@@ -629,26 +554,21 @@ class SteeringManager:
         ``synth`` (one per active trigger group) carries the per-layer affine
         :class:`LayerSubspace`, the ``along`` ``target_coord`` (every active
         push term's coeff-scaled pole already composed in), and the
-        un-normalized per-layer budget ``share`` (``‖Δ_L‖``).  ``lever`` is the
-        per-layer steering lever ``f_L = E_neutral[‖h_par_c‖/‖h‖]`` the
-        *session* computes at dispatch over the cached neutral activations
-        (:func:`saklas.core.manifold.layer_lever`); ``None`` ⇒ ``N = 1`` (no
-        lever normalization — the degenerate / CPU-stub path).
+        un-normalized per-layer budget ``share`` (``‖Δ_L‖``).
 
         At :meth:`apply_to_model` each layer becomes a per-layer
         ``(subspace, CustomDomain(R_L), target_coord, origin=0, eff_along,
         onto=0)`` entry routed through the same :func:`inject_three_op` hot
         path as a curved manifold — the affine analytic shortcut slides the
         in-subspace component toward ``target_coord`` with
-        ``eff_along_L = clamp(share_L · base_gain / N, 0, 1)``.  No ``onto``
-        (the surface fills its span) and no θ_max water-fill (the slide to a
-        neutral-anchored real-coord target is intrinsically bounded — the foot
-        lands at most on the composed pole at ``eff_along = 1``); the budget is
-        a plain per-layer clamp.
+        ``eff_along_L = share_L · base_gain`` (``share_L`` mean-1 normalized; no
+        lever / ``N``, no ``[0, 1]`` clamp — the de-rogued real-coord target
+        carries the magnitude and the ``norm_cap`` inside ``inject_three_op``
+        bounds an over-share layer's overshoot).  ``onto = 0`` (the surface
+        fills its span).
         """
         self.subspaces[name] = {
             "synth": synth,
-            "lever": lever,
             "trigger": trigger,
         }
 
@@ -669,8 +589,8 @@ class SteeringManager:
         """
 
         # Manifold entries: stamp the per-layer subspace + domain + authoring
-        # ``target`` / ``origin`` coords and the two share-weighted,
-        # lever-normalized op coefficients.  The kernel slides the foot in
+        # ``target`` / ``origin`` coords and the two share-weighted op
+        # coefficients.  The kernel slides the foot in
         # *coordinate* space, so there is no fixed world-target precompute —
         # only the (layer-independent) authoring coords.  Two *curved* manifolds
         # may share a layer only if their subspaces are (near-)orthogonal
@@ -680,23 +600,16 @@ class SteeringManager:
         # curved spans so the merged affine subspace can be orthogonalized
         # against them below.
         #
-        # **Gain (share-weight every op).**  Each of ``along`` / ``onto``
-        # gets the same per-layer factor ``share_L · (base/N)``:
-        # ``share_L`` (whitened Mahalanobis share, else Euclidean
-        # centroid-spread) is how discriminative the manifold is at that layer;
-        # ``N = Σ_L share_L·f_L`` is the share-weighted lever that makes the
-        # per-α effect invariant to subspace dimension and selection metric
-        # (see the gain constants' docstring).  Because ``base/N ≈ n_layers``,
-        # the per-layer ``coeff · share_L · (base/N)`` lands ≈ ``coeff`` on
-        # average — so the two coefficients read as ≈ [0, 1] per-layer
-        # fractions, concentrated at the high-share layers.
-        #
-        # ``along`` is a displacement budget → **water-filled** (cap 1.0/layer,
-        # excess redistributed) so a peaked-share layer never slides past the
-        # target and the cumulative budget is conserved.  ``onto`` is a bounded
-        # collapse fraction → **clamped** to ``[0, 1]`` per layer (saturation at
-        # a layer just means "fully collapsed there"; there is nothing to
-        # redistribute).
+        # **Gain (share-weight every op).**  Each of ``along`` / ``onto`` gets
+        # the same per-layer factor ``share_L · base``: ``share_L`` (whitened
+        # Mahalanobis share, else Euclidean centroid-spread) is how
+        # discriminative the manifold is at that layer, normalized to mean 1
+        # (``Σ_L share_L = n_layers``); ``base`` is the one gain constant.  No
+        # lever / ``N`` and no water-fill (both torn out in Step 8 — see the
+        # ``_MANIFOLD_GAIN`` docstring): ``along`` is left un-clamped so a
+        # high-share layer overshoots past the target (the ``norm_cap`` inside
+        # ``inject_three_op`` is the only bound), while ``onto`` stays clamped
+        # ``[0, 1]`` per layer (a collapse fraction > 1 inverts the residual).
         manifold_by_layer: dict[
             int,
             list[tuple[
@@ -715,51 +628,16 @@ class SteeringManager:
 
             shares: dict[int, float] = m.get("shares", {})
 
-            # Lever-normalized base gain (one base now — the along/onto split
-            # replaced the per-mode angular/additive pair).  ``N`` is baked
-            # all-or-nothing alongside the whitened share; a fit without it
-            # uses ``N = 1`` (the un-normalized base) for that degenerate path.
-            lever = getattr(manifold, "lever", None)
-            if lever and all(L in lever for L in manifold.layers):
-                N = sum(shares[L] * lever[L] for L in manifold.layers)
-                gain = _MANIFOLD_GAIN / max(N, _MIN_MANIFOLD_LEVER)
-            else:
-                gain = _MANIFOLD_GAIN
-
-            # ``along`` water-fills (rotation/displacement budget, cap 1.0);
-            # ``onto`` clamps per layer (collapse fraction).
-            raw_along: dict[int, float] = {
-                L: along * shares[L] * gain for L in manifold.layers
+            # One gain constant, no lever (Step 8).  ``along`` is left
+            # un-clamped — a high-share layer is meant to overshoot past the
+            # target (``norm_cap`` bounds it); ``onto`` clamps per layer.
+            eff_along = {
+                L: along * shares[L] * _MANIFOLD_GAIN for L in manifold.layers
             }
-            eff_along = _redistribute_budget(raw_along)
             eff_onto = {
-                L: max(0.0, min(1.0, onto * shares[L] * gain))
+                L: max(0.0, min(1.0, onto * shares[L] * _MANIFOLD_GAIN))
                 for L in manifold.layers
             }
-
-            # Saturation tell for ``along``: water-fill caps each layer at 1.0,
-            # so the cumulative budget maxes at ``n_layers``.  Pinned near that
-            # ceiling ⇒ every layer slides fully onto the target — the slide
-            # operator is maxed (small in-subspace lever and/or high α·gain),
-            # so ``along`` can't push harder.  Warn once so a flat-at-high-α
-            # sweep isn't mistaken for a calibration bug.
-            n_lay = len(eff_along)
-            if (
-                along > 0.0
-                and n_lay > 0
-                and sum(eff_along.values()) >= 0.98 * n_lay
-                and mname not in _warned_manifold_saturated
-            ):
-                _warned_manifold_saturated.add(mname)
-                import warnings
-                warnings.warn(
-                    f"manifold {mname!r} saturates the 'along' displacement "
-                    f"budget at along={along:.2f} (every layer fully on the "
-                    f"target): the slide operator is maxed (small in-subspace "
-                    f"lever and/or high coeff·gain), so it can't push the "
-                    f"position harder past this point.",
-                    stacklevel=2,
-                )
 
             # Target is layer-independent (one authoring position); clamp it
             # into the domain once.  The cold-start origin seed ``O_L`` is
@@ -808,41 +686,33 @@ class SteeringManager:
         # Dispatch-synthesized merged affine subspaces (4.0 unified backend).
         # Each ``synth`` is already neutral-anchored with its ``along`` target
         # composed from every active push term's coeff-scaled pole; here we only
-        # set the per-layer slide budget ``eff_along_L = clamp(share_L·base/N)``
-        # and lower each layer to a ``CustomDomain(R_L)`` ``inject_three_op``
-        # entry (the affine analytic shortcut — no GN / RBF / foot solve).  The
-        # target carries the strength, so there is no separate user-α multiply
-        # here and no θ_max water-fill (the slide is intrinsically bounded — it
-        # lands at most on the composed pole); ``onto = 0`` (the surface fills
-        # its span).  Curved-vs-affine orthogonalization + the relaxed overlap
-        # check land with the session dispatch flip (Step 5b); here a subspace
-        # simply joins ``manifold_by_layer``.
+        # set the per-layer slide budget ``eff_along_L = share_L · base`` (mean-1
+        # share, no lever / clamp — Step 8) and lower each layer to a
+        # ``CustomDomain(R_L)`` ``inject_three_op`` entry (the affine analytic
+        # shortcut — no GN / RBF / foot solve).  The target carries the
+        # strength, so there is no separate user-α multiply here; ``onto = 0``
+        # (the surface fills its span).  Curved-vs-affine orthogonalization +
+        # the relaxed overlap check land with the session dispatch flip (Step
+        # 5b); here a subspace simply joins ``manifold_by_layer``.
         for s in self.subspaces.values():
             synth: SynthesizedSubspace = s["synth"]
             sub_trigger: Trigger = s["trigger"]
-            lever: dict[int, float] | None = s["lever"]
             layer_set = list(synth.layers)
             if not layer_set:
                 continue
 
-            # Normalize the per-layer budget share across the subspace's layers
-            # (Σ_L share_L = 1) so the slide is layer-count-invariant.
+            # Normalize the per-layer budget share to **mean 1**
+            # (``Σ_L share_L = n_layers``) so ``eff_along_L = share_L · base``
+            # is a clean per-layer slide fraction and n_layers-invariant (one
+            # covered layer and a 30-layer fit both put ≈ ``base`` of slide on
+            # each contributing layer; A⊂B steers its shared axis identically).
+            n_lay = len(layer_set)
             raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
             total_share = sum(raw_share.values())
             if total_share <= 1e-12:
-                shares = {L: 1.0 / len(layer_set) for L in layer_set}
+                shares = {L: 1.0 for L in layer_set}
             else:
-                shares = {L: raw_share[L] / total_share for L in layer_set}
-
-            # Lever-normalized base gain (``N = Σ_L share_L·f_L``; ``N = 1``
-            # without a lever — the degenerate / CPU-stub path).  Mirrors the
-            # curved-manifold gain so the per-α effect is R-/metric-invariant
-            # across a rank-1 vector and a rank-8 ``personas%`` term.
-            if lever and all(L in lever for L in layer_set):
-                N = sum(shares[L] * lever[L] for L in layer_set)
-                gain = _MANIFOLD_GAIN / max(N, _MIN_MANIFOLD_LEVER)
-            else:
-                gain = _MANIFOLD_GAIN
+                shares = {L: raw_share[L] / total_share * n_lay for L in layer_set}
 
             for L in layer_set:
                 sub_L = synth.layers[L]
@@ -862,7 +732,11 @@ class SteeringManager:
                 # Affine origin is span-coord 0 (neutral → coord 0, §5); the
                 # foot seed / cold-start is unused on the affine shortcut.
                 sub_origin = torch.zeros(r_l, dtype=torch.float32)
-                eff_along_L = max(0.0, min(1.0, shares[L] * gain))
+                # No lever / ``N`` and no ``[0, 1]`` clamp (Step 8): the
+                # de-rogued real-coord target carries the magnitude; a
+                # high-share layer overshoots past the pole (``norm_cap`` bounds
+                # it in ``inject_three_op``).
+                eff_along_L = shares[L] * _MANIFOLD_GAIN
                 manifold_by_layer.setdefault(L, []).append((
                     sub_L, sub_domain, sub_target, sub_origin,
                     eff_along_L, 0.0, sub_trigger,

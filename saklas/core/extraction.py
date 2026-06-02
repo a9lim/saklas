@@ -828,7 +828,6 @@ class ManifoldExtractionPipeline:
             fit_affine_subspace,
             fit_layer_subspace,
             invert_parameterization,
-            layer_lever,
             load_manifold,
             save_manifold,
             subspace_share,
@@ -1156,17 +1155,10 @@ class ManifoldExtractionPipeline:
         layer_subs = {}
         explained_variance: dict[int, float] = {}
         mahalanobis_share: dict[int, float] = {}
-        # Per-layer steering lever (drives apply-time gain normalization).
-        # Baked when the whitener is present — it carries the centered
-        # neutral activations, which (re-centered by the layer means) are
-        # the raw-activation stand-ins ``layer_lever`` needs.  Same gate as
-        # Fisher PCA + the Mahalanobis share, so all three agree.
-        lever: dict[int, float] = {}
         # Neutral baseline (probe-centering means), **ungated** by the
         # whitener: the curved fit's neutral-anchor (``mean = P_basis(ν)``,
-        # §5) and the lever both consume it.  ``None`` on a CPU-stub handle ⇒
-        # the fit falls back to the centroid-mean anchor and the lever is
-        # skipped.  (Also drives the origin foot below.)
+        # §5) consumes it.  ``None`` on a CPU-stub handle ⇒ the fit falls back
+        # to the centroid-mean anchor.  (Also drives the origin foot below.)
         _handle_means = getattr(self._handle, "layer_means", None)
         fit_kwargs: dict[str, Any] = {}
         if max_subspace_dim_override is not None:
@@ -1188,42 +1180,31 @@ class ManifoldExtractionPipeline:
                 else None
             )
 
-        def _bake_share_lever(
+        def _bake_share(
             idx: int, sub: Any, mu_coords: torch.Tensor,
         ) -> None:
             # Per-layer budget = the **μ-centered** (anchor-independent)
             # whitened spread (§5 / ``subspace_share``): the share measures
-            # signal spread, not where neutral sits.  ``mahalanobis_share`` is
-            # *kept* (the budget weight) even while the basis stays Euclidean
-            # (δ-raw invariant) — coords carry the position, share the budget.
-            # The lever (typical in-subspace norm fraction) divides the
-            # apply-time gain for R-/metric-invariance.  Both gated on the
-            # covers-all whitener; absent ⇒ Euclidean spread + ``N = 1``.
+            # signal spread, not where neutral sits.  Gated on the covers-all
+            # whitener; absent ⇒ Euclidean spread fallback at apply.
             if maha_whitener is None:
                 return
             mahalanobis_share[idx] = subspace_share(
                 mu_coords, sub.basis, whitener=maha_whitener, layer=idx,
             )
-            if _handle_means is not None and idx in _handle_means:
-                X_c, _K, _lam = maha_whitener.woodbury_factors(
-                    idx, device=torch.device("cpu"), dtype=torch.float32,
-                )
-                mu = _handle_means[idx].to(
-                    device="cpu", dtype=torch.float32,
-                ).reshape(-1)
-                lever[idx] = layer_lever(X_c + mu, sub.mean, sub.basis)
 
         if mf.fit_mode == "pca":
             # FLAT affine fit — the discover-``pca`` path is a flat rank-``k``
             # subspace, not an RBF surface (ARCHITECTURE §1/§5).  Per layer:
             # ``fit_affine_subspace`` (μ-centered PCA basis at the derived
             # intrinsic dim ``k``, neutral-anchored frame, real per-layer node
-            # coords).  **Euclidean basis for now** (no whitener into the fit)
-            # per the δ-raw invariant — the whitened-PCA gate flips at the
-            # Step 8 GPU spot-check; the whitener still weights the share/lever.
-            # The shared ``node_coords`` stays the derived PCA layout
-            # (display/labels); the real per-layer steer coords live on each
-            # ``LayerSubspace.node_coords``.
+            # coords).  **Whitened/Fisher basis** when the whitener covers every
+            # fit layer (Step 8 made this unconditional — the de-rogued basis is
+            # what makes the no-lever gain coherent; same ``covers_all`` gate as
+            # the curved path + the Mahalanobis share), Euclidean on the
+            # no-coverage fallback.  The shared ``node_coords`` stays the derived
+            # PCA layout (display/labels); the real per-layer steer coords live
+            # on each ``LayerSubspace.node_coords``.
             affine_kwargs = dict(fit_kwargs)
             # rank = the derived intrinsic dim (the shared layout's width — set
             # for every fit_mode, so always bound here unlike the discover-only
@@ -1236,6 +1217,7 @@ class ManifoldExtractionPipeline:
                 stacks[idx] = stacked
                 sub, mu_coords, ev_ratio = fit_affine_subspace(
                     stacked, neutral_mean=_neutral_for(idx),
+                    whitener=maha_whitener, layer=idx,
                     orient_to=0, **affine_kwargs,
                 )
                 raw_fits[idx] = (sub, mu_coords)
@@ -1255,7 +1237,7 @@ class ManifoldExtractionPipeline:
                     sub = sub.select_axes(kept)
                     mu_coords = mu_coords[:, kept]
                 layer_subs[idx] = sub
-                _bake_share_lever(idx, sub, mu_coords)
+                _bake_share(idx, sub, mu_coords)
         else:
             # CURVED (authored / spectral): RBF surface fit, neutral-anchored.
             for idx in fit_layers:
@@ -1276,7 +1258,7 @@ class ManifoldExtractionPipeline:
                 mu_centered = stacked.to(torch.float32)
                 mu_centered = mu_centered - mu_centered.mean(dim=0)
                 mu_coords = mu_centered @ sub.basis.to(torch.float32).T  # (K, R)
-                _bake_share_lever(idx, sub, mu_coords)
+                _bake_share(idx, sub, mu_coords)
 
         # Origin ``O_L`` — the per-layer foot of the neutral mean on ``M``, in
         # authoring coords ``(n,)``.  **Curved only** — a flat affine subspace's
@@ -1311,7 +1293,6 @@ class ManifoldExtractionPipeline:
             node_roles=list(node_roles),
             explained_variance=explained_variance,
             mahalanobis_share=mahalanobis_share,
-            lever=lever,
             origin=origin,
         )
 
@@ -1326,16 +1307,14 @@ class ManifoldExtractionPipeline:
             "share_metric": (
                 "mahalanobis" if maha_whitener is not None else "euclidean"
             ),
-            # Which metric the per-layer PCA *subspace selection* used.  The
-            # flat (``pca``) path is **Euclidean for now** (δ-raw invariant —
-            # the whitened-PCA gate flips at Step 8), so it records "euclidean"
-            # even when the whitener covers (the share is still whitened — the
-            # two need NOT agree here).  The curved path keeps its whitened/
-            # Fisher selection when the whitener covers ("mahalanobis" =>
-            # de-rogued directions), else Euclidean.
+            # Which metric the per-layer PCA *subspace selection* used —
+            # "mahalanobis" => whitened/Fisher (de-rogued directions) when the
+            # whitener covers every fit layer, else "euclidean".  Both the flat
+            # (``pca``) and curved paths whiten under the same ``covers_all``
+            # gate as the share (Step 8 made the flat path unconditional), so
+            # subspace_metric and share_metric agree.
             "subspace_metric": (
-                "euclidean" if mf.fit_mode == "pca"
-                else ("mahalanobis" if maha_whitener is not None else "euclidean")
+                "mahalanobis" if maha_whitener is not None else "euclidean"
             ),
         }
         if sae_backend is not None:
