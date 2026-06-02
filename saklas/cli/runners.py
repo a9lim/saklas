@@ -1467,145 +1467,22 @@ def _print_why_histogram(
 
 
 def _run_transfer(args: argparse.Namespace) -> None:
-    """Cross-model probe transfer via Procrustes (v1.6).
+    """Cross-model transfer via Procrustes — routes to the manifold path.
 
-    Resolves the concept folder, loads the source-model tensor, fits
-    (or loads) the per-layer alignment between source and target's
-    cached neutral activations, applies the transfer, and writes the
-    result at the target's ``_from-<safe_src>`` variant path with a
-    sidecar carrying transfer provenance.
+    A steering vector is the K=2 case of a flat ``pca`` manifold, so
+    ``subspace transfer <concept>`` transfers the 2-node manifold named
+    ``<concept>``: it delegates to :func:`_run_manifold_transfer`, which
+    resolves the manifold folder, fits/loads the per-layer Procrustes
+    alignment, and writes the target's ``_from-<safe_src>`` fitted tensor via
+    :func:`saklas.io.manifolds.transfer_manifold`.  The pre-4.0
+    ``Profile``-Procrustes path that wrote a ``vectors/`` tensor is gone.
     """
-    import json as _json
-
-    from saklas.core.profile import Profile, ProfileError
-    from saklas.io.alignment import transfer_profile
-    from saklas.io.packs import hash_file
-    from saklas.io.paths import safe_model_id, sidecar_filename, tensor_filename
-    from saklas.io.selectors import parse as sel_parse, resolve
-
-    sel = sel_parse(args.concept)
-    matches = resolve(sel)
-    if not matches:
-        print(f"transfer: '{args.concept}' not found", file=sys.stderr)
-        sys.exit(1)
-    if len(matches) > 1:
-        qualified = ", ".join(f"{c.namespace}/{c.name}" for c in matches)
-        print(
-            f"transfer: '{args.concept}' is ambiguous (matches {qualified}); "
-            f"specify ns/name",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    folder = matches[0].folder
-    src_tensor = folder / tensor_filename(args.src_model)
-    if not src_tensor.is_file():
-        print(
-            f"transfer: source tensor not found at {src_tensor} — extract "
-            f"the concept on {args.src_model} first",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    tgt_tensor = folder / tensor_filename(
-        args.tgt_model, transferred_from=args.src_model,
-    )
-    tgt_sidecar = folder / sidecar_filename(
-        args.tgt_model, transferred_from=args.src_model,
-    )
-    if tgt_tensor.exists() and not args.force:
-        print(
-            f"transfer: target already exists at {tgt_tensor}; pass -f to recompute",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    try:
-        src_profile = Profile.load(src_tensor)
-    except ProfileError as e:
-        print(f"transfer: failed to load source profile: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    M, quality_per_layer, map_path = _load_or_fit_transfer_alignment(
-        args.src_model, args.tgt_model, force=args.force, label="transfer",
-    )
-
-    median_quality: float | None = None
-    if quality_per_layer:
-        ordered = sorted(quality_per_layer.values())
-        mid = len(ordered) // 2
-        median_quality = (
-            ordered[mid]
-            if len(ordered) % 2
-            else 0.5 * (ordered[mid - 1] + ordered[mid])
-        )
-
-    # Build the target-model whitener so the transferred share is re-baked
-    # in the *target* metric (else it inherits the source model's
-    # anisotropy).  Both the fit and cached-alignment paths leave the
-    # target neutral-activation cache on disk (the alignment was computed
-    # from it), so read it directly and center by its own per-layer mean —
-    # the neutral mean *is* the probe-centering baseline, so this needs no
-    # layer_means cache.  Soft ``None`` on any miss → ``transfer_profile``
-    # leaves the Euclidean (source-share) bake untouched.
-    target_whitener = _target_whitener_from_neutral_cache(args.tgt_model)
-
-    transferred = transfer_profile(
-        src_profile, M,
-        source_model_id=args.src_model,
-        transfer_quality_estimate=median_quality,
-        whitener=target_whitener,
-    )
-
-    # Persist the alignment-map hash on the transferred sidecar so
-    # callers can detect when an old transfer is stale against a newer
-    # alignment cache.
-    map_hash = hash_file(map_path) if map_path.exists() else None
-    save_meta: dict[str, Any] = dict(transferred.metadata)
-    if map_hash is not None:
-        save_meta["alignment_map_hash"] = map_hash
-
-    transferred.save(tgt_tensor, metadata=save_meta)
-
-    # Refresh the pack.json files map so the new variant lands in the
-    # integrity check on next load.
-    from saklas.io.packs import PackMetadata, hash_folder_files
-    try:
-        meta = PackMetadata.load(folder)
-        meta.files = hash_folder_files(folder)
-        meta.write(folder)
-    except Exception:
-        # Pack metadata refresh is best-effort — the tensor itself is
-        # written, and the next ``pack ls`` will notice the discrepancy.
-        pass
-
-    payload = {
-        "concept": matches[0].name,
-        "namespace": matches[0].namespace,
-        "source_model": args.src_model,
-        "target_model": args.tgt_model,
-        "tensor": str(tgt_tensor),
-        "sidecar": str(tgt_sidecar),
-        "transferred_layers": sorted(M.keys()),
-        "median_transfer_quality": (
-            round(median_quality, 4) if median_quality is not None else None
-        ),
-    }
-    if args.json_output:
-        print(_json.dumps(payload, indent=2))
-        return
-
-    quality_str = (
-        f"{median_quality:.3f}" if median_quality is not None else "n/a"
-    )
-    print(
-        f"Transferred {matches[0].namespace}/{matches[0].name} "
-        f"from {args.src_model} -> {args.tgt_model}\n"
-        f"  layers:           {len(M)} shared\n"
-        f"  median quality:   {quality_str} (R^2 across shared layers)\n"
-        f"  tensor:           {tgt_tensor}\n"
-        f"  variant suffix:   :from-{safe_model_id(args.src_model)}"
-    )
+    # The subspace parser names the positional ``concept``; the manifold
+    # transfer runner reads ``name``.  Bridge the one differing attr and
+    # delegate — every other arg (src_model / tgt_model / force / json_output)
+    # is identical across the two parsers.
+    args.name = args.concept
+    _run_manifold_transfer(args)
 
 
 def _run_manifold_fit(args: argparse.Namespace) -> None:

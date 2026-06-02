@@ -117,12 +117,14 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
 - `subspace why`: `concept`, `-m/--model` (required), `-j`. Per-layer `‖baked‖`
   histogram (16 buckets) + sidecar diagnostics.
 - `subspace transfer`: `concept`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
-  Fits/loads a Procrustes alignment, writes the target's `from-<safe_src>` tensor.
-  On both vector and manifold transfers, the runner best-effort calls
-  `LayerWhitener.from_neutral_cache` on the target model's cached
-  `neutral_activations.safetensors` (no model load on a cache hit) so transferred
-  shares can be re-baked in the target Mahalanobis metric; cache miss or
-  degenerate cache leaves the Euclidean fallback path.
+  A vector is a 2-node `pca` manifold, so `_run_transfer` now delegates to
+  `_run_manifold_transfer` (the `concept` positional is bridged onto `name`) —
+  one transfer path. It fits/loads a Procrustes alignment and writes the target's
+  `from-<safe_src>` **manifold** tensor via `transfer_manifold`. The runner
+  best-effort calls `LayerWhitener.from_neutral_cache` on the target model's
+  cached `neutral_activations.safetensors` (no model load on a cache hit) so
+  transferred shares can be re-baked in the target Mahalanobis metric; cache miss
+  or degenerate cache leaves the Euclidean fallback path.
 - `manifold`: top-level `fit`/`discover`/`generate`/`merge`/`install`/`search`/
   `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`. `fit <folder>` runs
   `ManifoldExtractionPipeline` on an authored folder; `discover <name>
