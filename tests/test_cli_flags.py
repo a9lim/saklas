@@ -393,19 +393,16 @@ def test_run_rm_specific(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
 
-    from saklas.io.paths import vectors_dir, safe_model_id
+    from saklas.io.paths import manifold_dir, tensor_filename
     model_id = "fake/model"
-    folder = vectors_dir() / "default" / "happy.sad"
+    # A steering vector is a 2-node pca manifold (4.0); extract lands it under
+    # ``manifolds/<ns>/<canonical>/``.  A present per-model tensor is the
+    # cache-hit marker the runner checks (no manifold load needed).
+    folder = manifold_dir("local", "happy.sad")
     folder.mkdir(parents=True, exist_ok=True)
-    tensor = folder / f"{safe_model_id(model_id)}.safetensors"
+    tensor = folder / tensor_filename(model_id)
     tensor.write_bytes(b"")
-    # 4.0 step 6b: materialize_bundled no longer ships a pack.json for this
-    # name (bundled concepts are manifolds now), so the synthetic vector
-    # folder must carry its own for ``_all_concepts()`` to surface it.
-    _install_concept_pack(folder, "happy.sad")
 
     class FakeSession:
         def __init__(self, **kw: Any) -> None:
@@ -413,9 +410,6 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
             self.model_info = {"model_type": "fake", "num_layers": 1,
                                "hidden_dim": 8, "vram_used_gb": 0.0}
             self.probes = {}
-
-        def _local_concept_folder(self, canonical: str, *, namespace: str = "local") -> Path:
-            return vectors_dir() / namespace / canonical
 
         def extract(self, *a: Any, **kw: Any) -> Any:
             raise AssertionError("extract() must not be called on cache hit")
@@ -425,7 +419,7 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
     monkeypatch.setattr(cli_runners, "_print_startup", lambda args: None)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["vector", "extract", "happy.sad", "-m", model_id])
+        cli.main(["subspace", "extract", "happy.sad", "-m", model_id])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
     assert "already extracted at" in out

@@ -1,31 +1,26 @@
-"""Bootstrap default probe vectors from the ~/.saklas/ concept-folder layout."""
+"""Bootstrap the per-model probe-centering baseline and the bundled probe roster.
+
+A steering vector lives as a 2-node ``pca`` manifold (4.0), so the bundled
+probe set is sourced by folding fitted manifolds (see
+``SaklasSession._bootstrap_manifold_probes``); this module owns the two pieces
+that feed it: the per-model layer-mean cache (:func:`bootstrap_layer_means`) and
+the tag→manifold roster (:func:`load_default_manifolds`).
+"""
 
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
 from typing import Any
 
 import torch
 
-from saklas.core.errors import StaleSidecarError
-from saklas.io.packs import (
-    ConceptFolder, PackFormatError, Sidecar,
-    hash_file, materialize_bundled,
-)
+from saklas.io.packs import Sidecar, hash_file
 from saklas.io.paths import (
-    concept_dir,
     model_dir,
     neutral_statements_path,
-    sidecar_filename,
-    tensor_filename,
-    vectors_dir,
 )
 from saklas.core.vectors import (
     compute_layer_means,
-    extract_difference_of_means,
-    load_contrastive_pairs,
     load_profile, save_profile,
 )
 
@@ -34,36 +29,12 @@ log = logging.getLogger(__name__)
 _LAYER_MEANS_NAME = "layer_means"
 
 
-def load_defaults() -> dict[str, list[str]]:
-    """Return {tag: [concept_name, ...]} for the default/ namespace.
-
-    Triggers first-run materialization of bundled data into ~/.saklas/.
-    """
-    materialize_bundled()
-    root = vectors_dir() / "default"
-    if not root.is_dir():
-        return {}
-    by_tag: dict[str, list[str]] = {}
-    for cdir in sorted(root.iterdir()):
-        if not cdir.is_dir() or not (cdir / "pack.json").is_file():
-            continue
-        try:
-            cf = ConceptFolder.load(cdir)
-        except PackFormatError as e:
-            log.warning("skipping %s: %s", cdir.name, e)
-            continue
-        for tag in cf.metadata.tags or ["uncategorized"]:
-            by_tag.setdefault(tag, []).append(cf.metadata.name)
-    return by_tag
-
-
 def load_default_manifolds() -> dict[str, list[str]]:
-    """Return {tag: [manifold_name, ...]} for bundled default/ manifolds (4.0).
+    """Return {tag: [manifold_name, ...]} for bundled default/ manifolds.
 
-    The manifold counterpart of :func:`load_defaults`: a steering vector now
-    lives as a 2-node ``pca`` manifold, tagged (``manifold.json::tags``,
-    carried from the source pack) for the same category-grouped probe
-    bootstrap.  Triggers first-run materialization of bundled manifolds.
+    A steering vector lives as a 2-node ``pca`` manifold, tagged
+    (``manifold.json::tags``) for category-grouped probe bootstrap.  Triggers
+    first-run materialization of bundled manifolds.
     """
     from saklas.io.manifolds import (
         iter_manifold_folders, materialize_bundled_manifolds,
@@ -113,145 +84,3 @@ def bootstrap_layer_means(
         "statements_sha256": current_ns_hash or "",
     })
     return means
-
-
-def bootstrap_probes(
-    model: Any,
-    tokenizer: Any,
-    layers: torch.nn.ModuleList,
-    model_info: dict[str, Any],
-    categories: list[str],
-    *,
-    whitener: Any = None,
-    layer_means: dict[int, torch.Tensor] | None = None,
-    dls: bool = True,
-) -> dict[str, dict[int, torch.Tensor]]:
-    """Load or extract probe vector profiles for the given categories.
-
-    The extraction algorithm is difference-of-means (Im & Li 2025) — the
-    only method as of 4.0.  Cached tensors are loaded as-is; the sidecar
-    carries the method that produced them.
-
-    ``whitener`` is a :class:`saklas.core.mahalanobis.LayerWhitener` (or
-    ``None``).  When provided, DiM extraction uses Mahalanobis-flavored
-    scores for share allocation (see :func:`saklas.core.vectors.extract_difference_of_means`);
-    written sidecars carry ``bake: "mahalanobis"``.  ``None`` falls back
-    to Euclidean scoring (sidecar ``bake: "euclidean"``).
-
-    ``layer_means`` is the per-model neutral-baseline mean cache (built
-    by :func:`bootstrap_layer_means` before this call).  Threaded into
-    the extractor for the centered-DLS check.  ``None`` disables DLS
-    centering — the helper falls back to "keep all layers."
-
-    ``dls`` (default ``True``) enables the discriminative-layer selection
-    mask.  Pass ``False`` to extract every layer (tests on small mock
-    models).
-    """
-    from saklas import __version__ as _saklas_version
-
-    defaults = load_defaults()
-    model_id = model_info.get("model_id", "unknown")
-
-    probes: dict[str, dict[int, torch.Tensor]] = {}
-    to_extract: list[tuple[str, Path, Path]] = []
-
-    allow_stale = os.environ.get("SAKLAS_ALLOW_STALE") == "1"
-    ts_name = tensor_filename(model_id)
-    sc_name = sidecar_filename(model_id)
-
-    for cat in categories:
-        for probe_name in defaults.get(cat, []):
-            cdir = concept_dir("default", probe_name)
-            ts = cdir / ts_name
-            sc_path = cdir / sc_name
-            if ts.exists() and sc_path.exists():
-                try:
-                    profile, meta = load_profile(str(ts))
-                    stmts = cdir / "statements.json"
-                    recorded_sha = meta.get("statements_sha256")
-                    if stmts.exists() and recorded_sha:
-                        current = hash_file(stmts)
-                        if current != recorded_sha and not allow_stale:
-                            raise StaleSidecarError(
-                                f"default/{probe_name}: statements.json has changed "
-                                f"since this tensor was extracted (model={model_id}). "
-                                f"The baked PCA no longer matches the on-disk pairs. "
-                                f"Re-extract: `saklas pack refresh default/{probe_name} -m {model_id}` "
-                                f"— or set SAKLAS_ALLOW_STALE=1 to load the stale tensor anyway."
-                            )
-                    probes[probe_name] = profile
-                    sidecar_version = meta.get("saklas_version", "")
-                    try:
-                        sv = tuple(int(p) for p in sidecar_version.split(".")[:2])
-                        cv = tuple(int(p) for p in _saklas_version.split(".")[:2])
-                        if sv != cv:
-                            log.warning("%s: extracted with older saklas version", probe_name)
-                    except (ValueError, IndexError):
-                        log.warning("%s: extracted with older saklas version", probe_name)
-                    continue
-                except StaleSidecarError:
-                    raise
-                except Exception as e:
-                    log.warning("Corrupt cache for %s, re-extracting: %s", probe_name, e)
-            to_extract.append((probe_name, cdir, ts))
-
-    if not to_extract:
-        return probes
-
-    log.info("Extracting %d probes...", len(to_extract))
-    try:
-        from tqdm import tqdm as _tqdm
-        progress: Any = _tqdm
-    except ImportError:
-        def _no_tqdm(x: Any, **kw: Any) -> Any:
-            return x
-        progress = _no_tqdm
-
-    datasets_to_extract = []
-    for name, cdir, ts in to_extract:
-        stmts_path = cdir / "statements.json"
-        if not stmts_path.exists():
-            log.warning("statements.json missing for %s; skipping", name)
-            continue
-        pairs_data = load_contrastive_pairs(str(stmts_path))
-        datasets_to_extract.append((name, cdir, ts, pairs_data, stmts_path))
-
-    model_device = next(model.parameters()).device
-    extractor = extract_difference_of_means
-    method_label = "difference_of_means"
-    # DiM consumes the whitener (bakes a Mahalanobis share).  DLS +
-    # layer_means flow into the extractor.
-    extract_kwargs: dict[str, Any] = {"dls": dls, "layer_means": layer_means}
-    bake_label = "euclidean"
-    # All-or-nothing metric gate: only pass the whitener (and label the
-    # bake "mahalanobis") when it covers every scored layer — matches the
-    # extractor's internal ``covers_all`` decision so the label reflects the
-    # metric actually used.  The bundled-probe path is residual-stream only
-    # (no SAE), so the scored set is every model layer.
-    if (
-        whitener is not None
-        and whitener.covers_all(range(len(layers)))
-    ):
-        extract_kwargs["whitener"] = whitener
-        bake_label = "mahalanobis"
-    for name, cdir, ts, ds, stmts_path in progress(datasets_to_extract, desc="Extracting probes", unit="probe"):
-        try:
-            profile, diagnostics = extractor(
-                model, tokenizer, ds["pairs"], layers=layers,
-                concept_label=f"default/{name}",
-                **extract_kwargs,
-            )
-            probes[name] = profile
-            save_meta: dict[str, Any] = {
-                "method": method_label,
-                "bake": bake_label,
-                "statements_sha256": hash_file(stmts_path),
-            }
-            if diagnostics:
-                save_meta["diagnostics"] = diagnostics
-            save_profile(profile, str(ts), save_meta)
-        except Exception as e:
-            log.warning("Contrastive extraction failed for %s: %s", name, e)
-        if model_device.type == "mps":
-            torch.mps.empty_cache()
-    return probes

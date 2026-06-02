@@ -243,13 +243,15 @@ def test_clone_clears_and_restores_active_steering_hooks(
                 "Model", (), {"config": type("Config", (), {"max_position_embeddings": 4096})()}
             )()
             self.rebuild_calls = 0
-            self.extract_sources: list[Any] = []
+            self.extract_calls: list[Any] = []
 
         def _rebuild_steering_hooks(self) -> None:
             self.rebuild_calls += 1
 
-        def extract(self, source: Any) -> tuple[str, Profile]:
-            self.extract_sources.append(source)
+        def extract_vector_from_corpora(
+            self, name: str, positive: Any, negative: Any, **kwargs: Any,
+        ) -> tuple[str, Profile]:
+            self.extract_calls.append((name, positive, negative, kwargs))
             return "persona", Profile({0: torch.ones(2)})
 
     session = _Session()
@@ -269,4 +271,7 @@ def test_clone_clears_and_restores_active_steering_hooks(
     assert profile.layers == [0]
     assert session._steering.clear_calls == 1
     assert session.rebuild_calls == 1
-    assert len(session.extract_sources) == 1
+    assert len(session.extract_calls) == 1
+    # Two pole corpora: persona lines (positive) vs neutral rewrites (negative).
+    _name, positive, negative, _kw = session.extract_calls[0]
+    assert positive and negative and len(positive) == len(negative)

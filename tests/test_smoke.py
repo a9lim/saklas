@@ -52,12 +52,26 @@ def num_layers(layers: Any) -> int:
 
 
 def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> Any:
-    """Extract a profile for a single concept with one pair."""
-    from saklas.core.vectors import extract_difference_of_means
-    profile, _ = extract_difference_of_means(
-        model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers,
+    """A per-layer direction profile for a single concept vs the empty pole.
+
+    The 4.0 equivalent of a difference-of-means vector: capture the two pole
+    centroids and fold them into a 2-node affine subspace, then take its
+    baked-direction view (``folded_vector_directions``).  Same centroid-
+    difference direction the old DiM extractor produced, no pipeline needed.
+    """
+    from saklas.core.vectors import (
+        _encode_and_capture_all,
+        _fold_centroids_to_affine_manifold,
+        folded_vector_directions,
     )
-    return profile
+
+    device = next(model.parameters()).device
+    pos = _encode_and_capture_all(model, tokenizer, concept, layers, device)
+    neg = _encode_and_capture_all(model, tokenizer, "", layers, device)
+    mfld = _fold_centroids_to_affine_manifold(
+        concept, pos, neg, pos_label="p", neg_label="n", dls=False,
+    )
+    return folded_vector_directions(mfld)
 
 
 @pytest.fixture(scope="module")
@@ -311,39 +325,6 @@ class TestTraitMonitor:
             f"Steered throughput ({steered_tps:.1f} tok/s) is only "
             f"{ratio:.0%} of vanilla ({vanilla_tps:.1f} tok/s), expected >= 85%"
         )
-
-
-class TestExtractDifferenceOfMeans:
-    def test_returns_valid_profile(self, model_and_tokenizer: Any, layers: Any, num_layers: int) -> None:
-        from saklas.core.vectors import extract_difference_of_means
-        model, tokenizer = model_and_tokenizer
-        cfg = getattr(model.config, "text_config", None) or model.config
-        hidden_dim = cfg.hidden_size
-        pairs = [
-            {"positive": "I feel happy today", "negative": "I feel sad today"},
-            {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
-            {"positive": "I love this", "negative": "I hate this"},
-        ]
-        profile, diagnostics = extract_difference_of_means(model, tokenizer, pairs, layers=layers)
-        assert isinstance(profile, dict)
-        assert len(profile) > 0
-        for idx, vec in profile.items():
-            assert 0 <= idx < num_layers
-            assert vec.shape == (hidden_dim,)
-            norm = vec.norm().item()
-            assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
-        # Diagnostics surface for multi-pair extractions; layer set must
-        # match the profile so downstream consumers can index either dict
-        # by layer index without branching.
-        assert set(diagnostics.keys()) == set(profile.keys())
-        for metrics in diagnostics.values():
-            assert {
-                "evr",
-                "intra_pair_variance_mean",
-                "intra_pair_variance_std",
-                "inter_pair_alignment",
-                "diff_principal_projection",
-            } <= set(metrics.keys())
 
 
 class TestBuildChatInput:

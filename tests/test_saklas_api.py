@@ -410,20 +410,17 @@ class TestExtract:
         session, client = session_and_client
         profile = Profile({0: torch.ones(4)})
 
-        def _extract(source: Any, baseline: Any = None, *, on_progress: Any = None, **_kwargs: Any) -> Any:
-            # A {pairs:[...]} payload coerces to a DataSource carrying the
-            # request's name — not a bare list, which the pipeline would
-            # name "custom" and collide on disk.
-            from saklas.io.datasource import DataSource
-            assert isinstance(source, DataSource)
-            assert source.pairs == [("positive text", "negative text")]
-            assert source.name == "custom"
-            assert baseline is None
+        def _extract(name: Any, positive: Any, negative: Any, *, on_progress: Any = None, **_kwargs: Any) -> Any:
+            # A {pairs:[...]} payload unzips into two pole corpora fed to the
+            # 2-node pca fit — no {positive,negative} pairs, no DataSource.
+            assert name == "custom"
+            assert positive == ["positive text"]
+            assert negative == ["negative text"]
             assert on_progress is not None
             on_progress("progress")
             return "custom", profile
 
-        session.extract.side_effect = _extract
+        session.extract_vector_from_corpora.side_effect = _extract
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
             json={
@@ -446,20 +443,19 @@ class TestExtract:
 
     def test_extract_json_coerces_single_pair_dict(self, session_and_client: Any) -> None:
         # A bare {positive, negative} object — not wrapped in {"pairs": ...}
-        # — coerces to a one-pair DataSource carrying the request name.
+        # — coerces to two one-element pole corpora carrying the request name.
         import torch
         from saklas.core.profile import Profile
         session, client = session_and_client
         profile = Profile({0: torch.ones(4)})
 
-        def _extract(source: Any, baseline: Any = None, *, on_progress: Any = None, **_kwargs: Any) -> Any:
-            from saklas.io.datasource import DataSource
-            assert isinstance(source, DataSource)
-            assert source.pairs == [("pos one", "neg one")]
-            assert source.name == "mood"
+        def _extract(name: Any, positive: Any, negative: Any, **_kwargs: Any) -> Any:
+            assert name == "mood"
+            assert positive == ["pos one"]
+            assert negative == ["neg one"]
             return "mood", profile
 
-        session.extract.side_effect = _extract
+        session.extract_vector_from_corpora.side_effect = _extract
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
             json={
@@ -1205,180 +1201,6 @@ def test_steering_variant_and_raw_coexist(tmp_path: Any, monkeypatch: Any) -> No
     assert "honest.deceptive:sae" in out
     assert out["honest.deceptive"][0] == pytest.approx(0.3)
     assert out["honest.deceptive:sae"][0] == pytest.approx(0.2)
-
-
-def test_session_extract_sae_saves_suffixed_file(tmp_path: Any, monkeypatch: Any) -> None:
-    """session.extract(..., sae=release) writes to <model>_sae-<release>.safetensors
-    and returns a canonical:sae-<release> name."""
-    import torch
-    from saklas.core.sae import MockSaeBackend
-
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    # Stub the extractor at the source (used by both session and the
-    # ExtractionPipeline) so we don't need a real model.
-    from saklas.core import vectors as V
-    from saklas.core import extraction as E
-
-    captured: dict[str, Any] = {}
-    def fake_extract(model: Any, tokenizer: Any, pairs: Any, layers: Any,
-                     device: Any = None, *, sae: Any = None,
-                     concept_label: Any = None, **_kwargs: Any) -> Any:
-        captured["sae"] = sae
-        return ({0: torch.ones(4) * 0.5, 2: torch.ones(4) * 0.5}, {})
-    # Stub the extractor at both the source module and the pipeline's
-    # import binding so the dispatch reaches the fake.
-    monkeypatch.setattr(V, "extract_difference_of_means", fake_extract)
-    monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
-
-    # Stub SAE backend loader.
-    def fake_loader(release: Any, **kw: Any) -> Any:
-        return MockSaeBackend(
-            layers=frozenset({0, 2}), d_model=4, release=release,
-        )
-    monkeypatch.setattr("saklas.core.sae.load_sae_backend", fake_loader, raising=False)
-
-    # Pre-write bundled statements so the curated-statements fast path kicks in.
-    import json
-    concept_folder = tmp_path / "vectors" / "default" / "honest.deceptive"
-    concept_folder.mkdir(parents=True)
-    (concept_folder / "pack.json").write_text(json.dumps({
-        "name": "honest.deceptive", "description": "test", "version": "0.0.0",
-        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
-    }))
-    (concept_folder / "statements.json").write_text(json.dumps([
-        {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
-    ]))
-
-    # Build a minimal handle stub with only what ExtractionPipeline needs.
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    from saklas.core.events import EventBus
-
-    class StubHandle:
-        model_id = "m"
-        device = torch.device("cpu")
-        dtype = torch.float32
-        model = None
-        tokenizer = None
-        layers = [object()] * 4
-
-        def _run_generator(self, system_msg: Any, prompt: Any, max_new_tokens: Any) -> Any:  # pragma: no cover
-            raise AssertionError("scenario gen path should not be reached")
-
-        def generate_scenarios(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
-            raise AssertionError("scenario gen path should not be reached")
-
-        def generate_statements(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
-            raise AssertionError("statement gen path should not be reached")
-
-        def _local_concept_folder(self, canonical: Any) -> Any:
-            import pathlib
-            folder = pathlib.Path(tmp_path) / "vectors" / "local" / canonical
-            folder.mkdir(parents=True, exist_ok=True)
-            return folder
-
-        def _promote_profile(self, p: Any) -> Any:
-            return p
-
-        def _update_local_pack_files(self, folder: Any) -> None:
-            pass
-
-    handle = StubHandle()
-    pipeline = E.ExtractionPipeline(handle, handle, EventBus())  # pyright: ignore[reportArgumentType]
-    name, profile = pipeline.extract("honest.deceptive", sae="mock-release")
-
-    # Return key carries the :sae-<release> suffix
-    assert name == "honest.deceptive:sae-mock-release"
-
-    # File written with the suffix
-    expected_tensor = concept_folder / "m_sae-mock-release.safetensors"
-    assert expected_tensor.exists()
-
-    # Sidecar carries sae metadata.  The SAE-DiM branch records the
-    # ``"dim_sae"`` method label.
-    with open(expected_tensor.with_suffix(".json")) as f:
-        sidecar = json.load(f)
-    assert sidecar["method"] == "dim_sae"
-    assert sidecar["sae_release"] == "mock-release"
-
-    # The selected extractor received the backend instance.
-    assert captured["sae"] is not None
-
-
-def test_session_extract_raw_path_unchanged(tmp_path: Any, monkeypatch: Any) -> None:
-    """Without sae=..., extract returns the bare canonical name and writes the raw tensor."""
-    import torch
-
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.core import vectors as V
-    from saklas.core import extraction as E
-
-    def fake_extract(model: Any, tokenizer: Any, pairs: Any, layers: Any,
-                     device: Any = None, *, sae: Any = None,
-                     concept_label: Any = None, **_kwargs: Any) -> Any:
-        return ({0: torch.ones(4), 2: torch.ones(4)}, {})
-    monkeypatch.setattr(V, "extract_difference_of_means", fake_extract)
-    monkeypatch.setattr(E, "extract_difference_of_means", fake_extract)
-
-    import json
-    concept_folder = tmp_path / "vectors" / "default" / "honest.deceptive"
-    concept_folder.mkdir(parents=True)
-    (concept_folder / "pack.json").write_text(json.dumps({
-        "name": "honest.deceptive", "description": "t", "version": "0",
-        "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
-    }))
-    (concept_folder / "statements.json").write_text(json.dumps([
-        {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
-    ]))
-
-    from saklas.io.selectors import invalidate
-    invalidate()
-    from saklas.core.events import EventBus
-
-    class StubHandle:
-        model_id = "m"
-        device = torch.device("cpu")
-        dtype = torch.float32
-        model = None
-        tokenizer = None
-        layers = [object()] * 4
-
-        def _run_generator(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
-            raise AssertionError("not used in raw-statements path")
-
-        def generate_scenarios(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
-            raise AssertionError("not used in raw-statements path")
-
-        def generate_pairs(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
-            raise AssertionError("not used in raw-statements path")
-
-        def _local_concept_folder(self, canonical: Any) -> Any:
-            import pathlib
-            folder = pathlib.Path(tmp_path) / "vectors" / "local" / canonical
-            folder.mkdir(parents=True, exist_ok=True)
-            return folder
-
-        def _promote_profile(self, p: Any) -> Any:
-            return p
-
-        def _update_local_pack_files(self, folder: Any) -> None:
-            pass
-
-    handle = StubHandle()
-    pipeline = E.ExtractionPipeline(handle, handle, EventBus())  # pyright: ignore[reportArgumentType]
-    name, profile = pipeline.extract("honest.deceptive")
-
-    # No :sae suffix
-    assert name == "honest.deceptive"
-    # Raw filename
-    assert (concept_folder / "m.safetensors").exists()
-    # No _sae-* files
-    assert not list(concept_folder.glob("*_sae-*.safetensors"))
 
 
 # ---- extract preview + manifold routes ----------------------------------

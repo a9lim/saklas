@@ -22,7 +22,7 @@ from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.io.paths import saklas_home
-from saklas.io.probes_bootstrap import load_defaults
+from saklas.io.probes_bootstrap import load_default_manifolds as load_defaults
 from saklas.core.results import ResultCollector
 from saklas.core.session import MIN_ELAPSED_FOR_RATE
 from saklas.tui.chat_panel import (
@@ -1551,19 +1551,18 @@ class SaklasApp(App[None]):
             def _progress(msg: str) -> None:
                 self.call_from_thread(self._steer_status, msg)
             try:
-                # Wrap the hand-authored pairs in a ``DataSource`` so the
-                # user-supplied name rides through — a bare list source
-                # would extract as the literal concept ``"custom"``.
-                from saklas.io.datasource import DataSource
-
-                source = DataSource(pairs=pairs, name=name)
+                # Hand-authored contrastive examples become the two pole
+                # corpora of a 2-node ``pca`` manifold — positive pole vs its
+                # opposite — fit directly (no scenario / pair generation).
+                positive = [pos for pos, _ in pairs]
+                negative = [neg for _, neg in pairs]
                 extract_kwargs: dict[str, Any] = {
                     "on_progress": _progress, "namespace": "local",
                 }
                 if role is not None:
                     extract_kwargs["role"] = role
-                canonical, profile = self._session.extract(
-                    source, **extract_kwargs,
+                canonical, profile = self._session.extract_vector_from_corpora(
+                    name, positive, negative, **extract_kwargs,
                 )
                 _on_success(canonical, profile, DEFAULT_ALPHA)
             except SaklasError as e:

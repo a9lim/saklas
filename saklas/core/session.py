@@ -24,6 +24,7 @@ from saklas.core.events import (
     ProbeScored,
     SteeringApplied,
     SteeringCleared,
+    VectorExtracted,
 )
 from saklas.core.generation import GenerationConfig, GenerationState, build_chat_input, detect_base_model, generate_steered, supports_thinking
 from saklas.core.hooks import HiddenCapture, SteeringManager
@@ -39,7 +40,7 @@ from saklas.core.model import load_model, get_layers, get_model_info
 from saklas.core.monitor import ManifoldMonitor, TraitMonitor
 from saklas.io.packs import PackFormatError, PackMetadata, hash_folder_files
 from saklas.io.paths import concept_dir
-from saklas.io.probes_bootstrap import bootstrap_probes, bootstrap_layer_means
+from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import (
     GenerationResult,
@@ -922,21 +923,11 @@ class SaklasSession:
 
         probe_profiles: dict[str, dict[int, torch.Tensor]] = {}
         if probe_categories:
-            # User-installed vector packs (still baked DiM under vectors/).
-            probe_profiles = bootstrap_probes(
-                self._model, self._tokenizer, self._layers, self._model_info,
-                probe_categories,
-                # DiM consumes the whitener to bake a Mahalanobis share;
-                # ``bootstrap_probes`` gates it all-or-nothing internally.
-                whitener=self._whitener,
-                layer_means=self._layer_means,
-                dls=self._dls,
-            )
-            # Bundled concepts now live as 2-node ``pca`` manifolds — fit-or-
-            # load + fold them into the same TraitMonitor probe set (4.0 6b).
-            probe_profiles.update(
-                self._bootstrap_manifold_probes(probe_categories)
-            )
+            # Every concept lives as a 2-node ``pca`` manifold (4.0): fit-or-
+            # load each tagged manifold and fold it to a per-layer direction
+            # for the TraitMonitor probe set.  There is no separate baked-DiM
+            # ``vectors/`` probe path anymore.
+            probe_profiles = self._bootstrap_manifold_probes(probe_categories)
 
         self._monitor = TraitMonitor(
             probe_profiles, self._layer_means, whitener=self._whitener,
@@ -964,15 +955,7 @@ class SaklasSession:
         # push/pop/steer/unsteer, probe install/remove, profile mutation.
         self._prefix_cache: tuple[torch.Tensor, object, int] | None = None
 
-        # Concept-extraction pipeline.  Constructed once so the session
-        # holds a single live instance; the pipeline takes the structural
-        # dependencies it needs (model handle / pack writer / event bus)
-        # instead of a back-reference.  ``self`` satisfies those protocols
-        # implicitly — see :mod:`saklas.core.extraction`.
-        from saklas.core.extraction import ExtractionPipeline as _Pipeline
-        self._extraction = _Pipeline(self, self, self.events)
-
-    # -- ModelHandle protocol surface (consumed by ExtractionPipeline) --
+    # -- ModelHandle protocol surface (consumed by ManifoldExtractionPipeline) --
 
     @property
     def model(self) -> torch.nn.Module:
@@ -1676,61 +1659,48 @@ class SaklasSession:
 
     def extract(
         self,
-        source: Any,
+        concept: str,
         baseline: str | None = None,
         *,
         scenarios: list[str] | None = None,
-        reuse_scenarios: bool = False,
-        force_statements: bool = False,
+        force: bool = False,
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
         sae_revision: str | None = None,
         namespace: str | None = None,
-        dls: bool | None = None,
         role: str | None = None,
     ) -> tuple[str, Profile]:
-        """Extract a steering vector profile and emit ``VectorExtracted``.
+        """Author + fit a steering vector as a 2-node ``pca`` manifold.
 
-        Thin delegate to :class:`saklas.core.extraction.ExtractionPipeline` —
-        the pipeline owns folder probing, statement caching, scenario /
-        pair generation, difference-of-means extraction, and pack updates.
-        Re-entry is gated against generation: extraction runs forward
-        passes through the model and would race an active gen.
+        A steering vector is the K=2 case of a flat affine subspace (4.0), so
+        "extracting" a concept now authors a 2-node discover-``pca`` manifold
+        under ``manifolds/<namespace>/<name>/`` — node 0 the positive pole,
+        node 1 the negative — and fits it via
+        :class:`~saklas.core.extraction.ManifoldExtractionPipeline`.  There is
+        no separate ``{positive, negative}`` / ``statements.json`` / baked-DiM
+        artifact anymore; the corpus lives as the manifold's two node groups.
 
-        **Default behavior**: tensor cache hits short-circuit.  On
-        tensor miss, if ``statements.json`` exists (curated bundled
-        pack or local cache), extract directly from it — statements
-        are the expensive part and reuse is the sane default.  On
-        statements miss, run the full pipeline: generate scenarios →
-        generate pairs → save both → extract tensor.
+        Returns ``(canonical_name, Profile)`` where the ``Profile`` is the
+        folded per-layer direction view of the fitted 2-node manifold
+        (:func:`~saklas.core.vectors.folded_vector_directions`) — the
+        in-memory steering-vector shape callers expect, with the manifold the
+        single on-disk artifact.  Emits ``VectorExtracted``.
 
         Flags:
 
-        - ``scenarios=[...]``: explicit scenarios input; bypasses
-          scenario generation and ``scenarios.json`` cache.  Written
-          to disk after use.  **Also bypasses the tensor cache** —
-          supplying fresh scenarios means the caller wants fresh
-          pairs, so any cached tensor is stale by definition.
-        - ``reuse_scenarios=True``: when regenerating pairs, load
-          ``scenarios.json`` from disk if present instead of
-          regenerating.  Default False — scenarios are cheap, so the
-          full pipeline regenerates them fresh each pair-gen pass.
-        - ``force_statements=True``: regenerate ``statements.json``
-          from scratch.  **Also bypasses the tensor cache** — same
-          reasoning as ``scenarios=[...]``.
-        - ``dls=None`` (default) inherits ``self._dls`` (set at session
-          construction; ``True`` by default).  Explicit ``True`` /
-          ``False`` overrides per-call.
+        - ``scenarios=[...]``: explicit scenarios; skips scenario generation.
+        - ``force=True``: regenerate the pole corpora + re-author the folder
+          (otherwise an existing manifold's corpus is reused and the fit
+          cache-hits when a tensor for this model is already present).
+        - ``role=<slug>``: role-augmented extraction — both poles are pooled
+          under the substituted assistant-role label (stored as the manifold's
+          per-node ``role``).
+        - ``sae=<release>``: fit in SAE feature space (a ``_sae-<release>``
+          tensor variant beside the raw one).
 
-        The per-layer direction is always difference-of-means (Im & Li
-        2025) as of 4.0.
+        Gated against generation: fitting runs forward passes through the
+        model and would race an active gen.
         """
-        # Must hold ``_gen_lock`` to read ``_gen_phase`` race-free against
-        # ``_generate_core``, which acquires the lock first then flips
-        # ``_gen_phase = PREAMBLE``.  Without the lock, a concurrent
-        # ``generate()`` could pass ``extract()``'s gate and then race
-        # extraction over model forward passes.  The lock generalizes from
-        # "serialize generations" to "serialize all model uses".
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentExtractionError(
                 "session.extract called while another model use is in flight"
@@ -1740,21 +1710,167 @@ class SaklasSession:
                 raise ConcurrentExtractionError(
                     "session.extract called while a generation is in flight"
                 )
-            effective_dls = dls if dls is not None else self._dls
-            return self._extraction.extract(
-                source, baseline,
-                scenarios=scenarios,
-                reuse_scenarios=reuse_scenarios,
-                force_statements=force_statements,
-                on_progress=on_progress,
-                sae=sae,
-                sae_revision=sae_revision,
-                namespace=namespace,
-                dls=effective_dls,
-                role=role,
+            from saklas.io.manifolds import create_discover_manifold_folder
+            from saklas.io.paths import manifold_dir
+
+            ns = namespace or "local"
+            pos_raw, neg_raw = _split_composite_source(concept, baseline)
+            name = canonical_concept_name(concept, baseline)
+            pos_label = _slug(pos_raw)
+            if neg_raw is not None:
+                neg_label = _slug(neg_raw)
+                neg_gen = neg_raw
+                desc = f"Bipolar axis: {pos_raw} (+) vs {neg_raw} (-)."
+            else:
+                neg_label = f"{pos_label}_neg"
+                neg_gen = f"the_opposite_of_{pos_raw}"
+                desc = f"Monopolar probe: {pos_raw}."
+
+            folder = manifold_dir(ns, name)
+            manifest = folder / "manifold.json"
+            if force or not manifest.exists():
+                eff_scen = scenarios or self.generate_scenarios(
+                    pos_raw, neg_raw, on_progress=on_progress, role=role,
+                )
+                corpora = self.generate_statements(
+                    [pos_raw, neg_gen], scenarios=eff_scen,
+                    on_progress=on_progress, role=role,
+                )
+                node_corpora = {
+                    pos_label: corpora[pos_raw],
+                    neg_label: corpora[neg_gen],
+                }
+                node_roles: dict[str, str | None] | None = (
+                    {pos_label: role, neg_label: role} if role else None
+                )
+                if manifest.exists():
+                    import shutil
+                    shutil.rmtree(folder)
+                create_discover_manifold_folder(
+                    ns, name, desc, fit_mode="pca",
+                    node_corpora=node_corpora,
+                    hyperparams={"max_dim": 1, "var_threshold": 0.7},
+                    node_roles=node_roles, scenarios=eff_scen,
+                )
+            return self._fit_vector_manifold(
+                name, folder, sae=sae, sae_revision=sae_revision,
+                role=role, on_progress=on_progress,
             )
         finally:
             self._gen_lock.release()
+
+    def extract_vector_from_corpora(
+        self,
+        name: str,
+        positive: list[str],
+        negative: list[str],
+        *,
+        namespace: str | None = None,
+        role: str | None = None,
+        sae: str | None = None,
+        sae_revision: str | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        force: bool = False,
+        description: str = "",
+    ) -> tuple[str, Profile]:
+        """Author + fit a steering vector from two ready-made pole corpora.
+
+        The corpus-in sibling of :meth:`extract` — used by persona cloning and
+        the hand-authored TUI/HTTP paths, which already hold the positive and
+        negative statement lists and so skip generation.  Authors a 2-node
+        ``pca`` manifold (``positive`` → pole node, ``negative`` → its
+        opposite) and fits it; returns ``(canonical_name, Profile)`` like
+        :meth:`extract`.
+        """
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentExtractionError(
+                "session.extract_vector_from_corpora called while another "
+                "model use is in flight"
+            )
+        try:
+            if self._gen_phase is not GenState.IDLE:
+                raise ConcurrentExtractionError(
+                    "session.extract_vector_from_corpora called while a "
+                    "generation is in flight"
+                )
+            from saklas.io.manifolds import create_discover_manifold_folder
+            from saklas.io.paths import manifold_dir
+
+            ns = namespace or "local"
+            pos_raw, neg_raw = _split_composite_source(name, None)
+            canonical = canonical_concept_name(name)
+            pos_label = _slug(pos_raw)
+            neg_label = _slug(neg_raw) if neg_raw is not None else f"{pos_label}_neg"
+
+            folder = manifold_dir(ns, canonical)
+            manifest = folder / "manifold.json"
+            if force or not manifest.exists():
+                node_roles: dict[str, str | None] | None = (
+                    {pos_label: role, neg_label: role} if role else None
+                )
+                if manifest.exists():
+                    import shutil
+                    shutil.rmtree(folder)
+                create_discover_manifold_folder(
+                    ns, canonical, description, fit_mode="pca",
+                    node_corpora={pos_label: positive, neg_label: negative},
+                    hyperparams={"max_dim": 1, "var_threshold": 0.7},
+                    node_roles=node_roles,
+                )
+            return self._fit_vector_manifold(
+                canonical, folder, sae=sae, sae_revision=sae_revision,
+                role=role, on_progress=on_progress,
+            )
+        finally:
+            self._gen_lock.release()
+
+    def _fit_vector_manifold(
+        self,
+        name: str,
+        folder: Any,
+        *,
+        sae: str | None,
+        sae_revision: str | None,
+        role: str | None,
+        on_progress: Callable[[str], None] | None,
+    ) -> tuple[str, Profile]:
+        """Fit a 2-node pca manifold (lock held) and return its folded Profile.
+
+        Shared tail of :meth:`extract` / :meth:`extract_vector_from_corpora`:
+        runs :class:`ManifoldExtractionPipeline` directly (the public
+        :meth:`extract_manifold` re-acquires ``_gen_lock``, which the callers
+        already hold), folds the fitted manifold to a per-layer direction
+        :class:`Profile`, and emits ``VectorExtracted``.
+
+        The returned name carries the variant tail (``:sae-<release>`` /
+        ``:role-<slug>``) so the caller steers the right per-model tensor; the
+        on-disk manifold folder stays the bare canonical name.
+        """
+        from saklas.core.extraction import ManifoldExtractionPipeline
+        from saklas.core.vectors import folded_vector_directions
+
+        pipe = ManifoldExtractionPipeline(self, self.events)
+        manifold = pipe.fit(
+            folder, sae=sae, sae_revision=sae_revision, on_progress=on_progress,
+        )
+        if sae:
+            ret_name = f"{name}:sae-{sae}"
+        elif role:
+            ret_name = f"{name}:role-{role}"
+        else:
+            ret_name = name
+        profile = Profile(
+            folded_vector_directions(manifold),
+            metadata={
+                "method": "manifold_pca",
+                "name": ret_name,
+                "share_metric": manifold.metadata.get("share_metric"),
+            },
+        )
+        self.events.emit(VectorExtracted(
+            name=ret_name, profile=profile, metadata=dict(profile.metadata),
+        ))
+        return ret_name, profile
 
     def extract_manifold(
         self,

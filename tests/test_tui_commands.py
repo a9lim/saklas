@@ -2350,21 +2350,22 @@ def test_help_lists_manifold_probe_commands():
 
 
 def test_pairs_extract_routes_through_session_extract():
-    """A submitted pair list extracts via ``session.extract`` wrapped in
-    a ``DataSource`` carrying the user-supplied name."""
+    """A submitted pair list extracts via ``session.extract_vector_from_corpora``
+    as two pole corpora (positive vs negative), carrying the user name."""
     import torch
     from saklas.core.profile import Profile
-    from saklas.io.datasource import DataSource
 
     app = _make_app()
     app._refresh_left_panel = MagicMock()
     captured: dict[str, Any] = {}
 
-    def _fake_extract(source: Any, **kwargs: Any) -> Any:
-        captured["source"] = source
+    def _fake_extract(name: str, positive: Any, negative: Any, **kwargs: Any) -> Any:
+        captured["name"] = name
+        captured["positive"] = positive
+        captured["negative"] = negative
         captured["kwargs"] = kwargs
         return "mood", Profile({0: torch.zeros(4)})
-    app._session.extract = _fake_extract
+    app._session.extract_vector_from_corpora = _fake_extract
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
@@ -2372,8 +2373,7 @@ def test_pairs_extract_routes_through_session_extract():
         "mood", [("happy", "sad"), ("calm", "angry")],
     )
 
-    src = captured["source"]
-    assert isinstance(src, DataSource)
-    assert src.name == "mood"
-    assert src.pairs == [("happy", "sad"), ("calm", "angry")]
+    assert captured["name"] == "mood"
+    assert captured["positive"] == ["happy", "calm"]
+    assert captured["negative"] == ["sad", "angry"]
     assert "mood" in app._alphas

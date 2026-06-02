@@ -25,7 +25,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "ProbeScored": ("saklas.core.events", "ProbeScored"),
     "GenerationStarted": ("saklas.core.events", "GenerationStarted"),
     "GenerationFinished": ("saklas.core.events", "GenerationFinished"),
-    "DataSource": ("saklas.io.datasource", "DataSource"),
     "GenerationResult": ("saklas.core.results", "GenerationResult"),
     "RunSet": ("saklas.core.results", "RunSet"),
     "TokenAlt": ("saklas.core.results", "TokenAlt"),
@@ -82,7 +81,6 @@ __all__ = [
     "ProbeScored",
     "GenerationStarted",
     "GenerationFinished",
-    "DataSource",
     "GenerationResult",
     "RunSet",
     "TokenAlt",
@@ -199,4 +197,3 @@ if TYPE_CHECKING:
         parse_filter as parse_filter,
     )
     from saklas.core.triggers import Trigger as Trigger
-    from saklas.io.datasource import DataSource as DataSource
