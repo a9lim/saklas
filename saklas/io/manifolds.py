@@ -442,11 +442,12 @@ class ManifoldFolder:
         domain_spec: dict[str, Any]
 
         if fit_mode == "authored":
-            domain_spec = data.get("domain") or {}
-            if not isinstance(domain_spec, dict) or not domain_spec:
+            domain_spec_in: Any = data.get("domain") or {}
+            if not isinstance(domain_spec_in, dict) or not domain_spec_in:
                 raise ManifoldFormatError(
                     f"authored manifold {name!r} needs a 'domain' object"
                 )
+            domain_spec = domain_spec_in
             try:
                 domain = domain_from_spec(domain_spec)
             except (ValueError, KeyError) as e:
@@ -975,9 +976,7 @@ def create_manifold_folder(
     return folder, advisories
 
 
-def _validate_discover_corpora(
-    name: str, node_corpora: dict[str, list[str]],
-) -> None:
+def _validate_discover_corpora(name: str, node_corpora: object) -> None:
     """Validate a discover-mode node corpus dict.
 
     ``node_corpora`` is ``{label: [statement, ...]}`` — the authoring
@@ -1008,6 +1007,31 @@ def _validate_discover_corpora(
                 f"discover manifold {name!r} node {label!r} needs a "
                 f"non-empty list of non-blank statement strings"
             )
+
+
+def _validate_discover_labels(name: str, labels: object) -> list[str]:
+    """Return validated discover labels, preserving order."""
+    if not isinstance(labels, list) or not labels:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} needs at least one node label"
+        )
+    out: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        if not isinstance(label, str) or not _LABEL_REGEX.match(label):
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} label {label!r} invalid; "
+                f"a node label is a grammar-addressable identifier "
+                f"(no '.', reserved as the bipolar separator) — "
+                f"must match {_LABEL_REGEX.pattern}"
+            )
+        if label in seen:
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} duplicate node label {label!r}"
+            )
+        seen.add(label)
+        out.append(label)
+    return out
 
 
 def create_discover_manifold_folder(
@@ -1265,24 +1289,7 @@ def init_discover_manifold_folder(
             f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
             f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
         )
-    if not labels:
-        raise ManifoldFormatError(
-            f"discover manifold {name!r} needs at least one node label"
-        )
-    seen: set[str] = set()
-    for label in labels:
-        if not isinstance(label, str) or not _LABEL_REGEX.match(label):
-            raise ManifoldFormatError(
-                f"discover manifold {name!r} label {label!r} invalid; "
-                f"a node label is a grammar-addressable identifier "
-                f"(no '.', reserved as the bipolar separator) — "
-                f"must match {_LABEL_REGEX.pattern}"
-            )
-        if label in seen:
-            raise ManifoldFormatError(
-                f"discover manifold {name!r} duplicate node label {label!r}"
-            )
-        seen.add(label)
+    labels = _validate_discover_labels(name, labels)
 
     roles_resolved: dict[str, str | None] = {label: None for label in labels}
     if node_roles is not None:
@@ -1329,15 +1336,17 @@ def append_discover_manifold_node(
     whole-corpus staging swap — that is the point, so a run that dies
     part-way keeps the nodes it already finished.
     """
-    if not isinstance(label, str) or not _LABEL_REGEX.match(label):
+    label_in: Any = label
+    if not isinstance(label_in, str) or not _LABEL_REGEX.match(label_in):
         raise ManifoldFormatError(
             f"discover manifold node label {label!r} invalid; "
             f"must match {_LABEL_REGEX.pattern}"
         )
+    statements_in: Any = statements
     if (
-        not isinstance(statements, list)
-        or not statements
-        or not all(isinstance(s, str) and s.strip() for s in statements)
+        not isinstance(statements_in, list)
+        or not statements_in
+        or not all(isinstance(s, str) and s.strip() for s in statements_in)
     ):
         raise ManifoldFormatError(
             f"discover manifold node {label!r} needs a non-empty list "
@@ -1463,22 +1472,7 @@ def plan_discover_generation(
             f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
             f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
         )
-    if not labels:
-        raise ManifoldFormatError(
-            f"discover manifold {name!r} needs at least one node label"
-        )
-    seen: set[str] = set()
-    for label in labels:
-        if not isinstance(label, str) or not _LABEL_REGEX.match(label):
-            raise ManifoldFormatError(
-                f"discover manifold {name!r} label {label!r} invalid; "
-                f"must match {_LABEL_REGEX.pattern}"
-            )
-        if label in seen:
-            raise ManifoldFormatError(
-                f"discover manifold {name!r} duplicate node label {label!r}"
-            )
-        seen.add(label)
+    labels = _validate_discover_labels(name, labels)
     roles_in = node_roles or {}
     unknown = set(roles_in) - set(labels)
     if unknown:

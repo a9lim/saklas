@@ -1363,14 +1363,8 @@ def register_saklas_routes(app: FastAPI) -> None:
                     matrix[a][b] = 1.0
                     continue
                 try:
-                    # ``cosine_similarity`` without ``per_layer=`` returns
-                    # the magnitude-weighted aggregate ``float`` — narrow
-                    # explicitly because the method's union return type
-                    # is ``float | dict[int, float]``.
                     cos = pool[a].cosine_similarity(pool[b])
-                    matrix[a][b] = (
-                        round(float(cos), 6) if isinstance(cos, (int, float)) else None
-                    )
+                    matrix[a][b] = round(float(cos), 6)
                 except Exception:
                     matrix[a][b] = None
                 shared = sorted(

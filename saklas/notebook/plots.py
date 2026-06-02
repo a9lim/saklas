@@ -208,12 +208,8 @@ def plot_probe_correlation(
                 matrix[i][j] = 1.0
                 continue
             try:
-                # ``cosine_similarity`` without ``per_layer=`` returns
-                # the magnitude-weighted aggregate ``float`` — narrow
-                # explicitly because the method's union return type is
-                # ``float | dict[int, float]``.
                 agg = profiles[a_name].cosine_similarity(profiles[b_name])
-                cos = float(agg) if isinstance(agg, (int, float)) else float("nan")
+                cos = float(agg)
             except Exception:
                 cos = float("nan")
             matrix[i][j] = cos
@@ -335,5 +331,4 @@ def plot_trait_history(
         legend={"orientation": "h", "y": -0.2},
     )
     return fig
-
 

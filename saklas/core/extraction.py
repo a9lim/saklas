@@ -266,16 +266,17 @@ class ExtractionPipeline:
                 on_progress(msg)
 
         # Normalize source.
-        if isinstance(source, str):
-            concept, baseline = _split_composite_source(source, baseline)
-        elif isinstance(source, DataSource):
-            concept = source.name
+        source_in: Any = source
+        if isinstance(source_in, str):
+            concept, baseline = _split_composite_source(source_in, baseline)
+        elif isinstance(source_in, DataSource):
+            concept = source_in.name
             baseline = None
-        elif isinstance(source, list):
+        elif isinstance(source_in, list):
             concept = "custom"
             baseline = None
         else:
-            raise TypeError(f"Unsupported source type: {type(source)}")
+            raise TypeError(f"Unsupported source type: {type(source_in)}")
 
         canonical = canonical_concept_name(concept, baseline)
 

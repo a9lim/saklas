@@ -286,11 +286,8 @@ def _load_text_from_multimodal(
     import gc
     import json
     import os
-    from transformers.utils import (
-        cached_file,
-        SAFE_WEIGHTS_INDEX_NAME,
-        SAFE_WEIGHTS_NAME,
-    )
+    from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME
+    from transformers.utils.hub import cached_file
 
     # Create directly on target device — avoids a CPU copy that would
     # spike RSS and eat into MPS's unified memory budget.
@@ -626,7 +623,7 @@ def load_model(
             # Availability check only — presence of the package flips
             # transformers onto the flash-attention-2 kernel. We never
             # call into flash_attn ourselves.
-            import flash_attn  # noqa: F401
+            import flash_attn  # pyright: ignore[reportMissingImports]  # noqa: F401
             attn_impl = "flash_attention_2"
         except ImportError:
             pass

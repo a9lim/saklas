@@ -447,7 +447,7 @@ def _write_synthetic_vlm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, lay
         # Single-file path: no index, weights resolve to our temp file.
         return str(weights_path) if filename == SAFE_WEIGHTS_NAME else None
 
-    monkeypatch.setattr("transformers.utils.cached_file", _fake_cached_file)
+    monkeypatch.setattr("transformers.utils.hub.cached_file", _fake_cached_file)
     return text_cfg, ref
 
 
@@ -501,7 +501,7 @@ def test_load_text_from_multimodal_raises_when_no_text_weights(tmp_path: Path, m
     def _fake_cached_file(model_id: str, filename: str, **kw: Any):
         return str(weights_path) if filename == SAFE_WEIGHTS_NAME else None
 
-    monkeypatch.setattr("transformers.utils.cached_file", _fake_cached_file)
+    monkeypatch.setattr("transformers.utils.hub.cached_file", _fake_cached_file)
 
     with pytest.raises(model_mod._NoTextWeightsExtracted):
         model_mod._load_text_from_multimodal(

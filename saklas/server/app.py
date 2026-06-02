@@ -161,7 +161,7 @@ class _SamplingBase(BaseModel):
         # response_format: accept None or {"type": "text"}; reject json modes.
         rf = self.response_format
         if rf is not None:
-            rf_type = rf.get("type") if isinstance(rf, dict) else None
+            rf_type = rf.get("type")
             if rf_type not in (None, "text"):
                 raise UnsupportedContentError(
                     "response_format types other than 'text' are not supported"

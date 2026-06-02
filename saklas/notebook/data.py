@@ -76,18 +76,20 @@ def to_dataframe(
         first = source[0]
         if isinstance(first, dict):
             return pd.DataFrame(source)
-        if isinstance(first, GenerationResult):
+        first_in: Any = first
+        if isinstance(first_in, GenerationResult):
             # Route through a transient collector so column names match
             # manual collection. RunSet takes the richer path above.
             rc = ResultCollector()
             for r in source:
-                if not isinstance(r, GenerationResult):
+                r_in: Any = r
+                if not isinstance(r_in, GenerationResult):
                     raise TypeError(
                         f"to_dataframe: list contains mixed types "
                         f"({type(r).__name__}); expected uniform "
                         f"GenerationResult or dict"
                     )
-                rc.add(r)
+                rc.add(r_in)
             return rc.to_dataframe()
 
     raise TypeError(

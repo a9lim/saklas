@@ -48,7 +48,8 @@ class Profile:
         *,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if not isinstance(tensors, Mapping):
+        tensors_in: Any = tensors
+        if not isinstance(tensors_in, Mapping):
             raise ProfileError(
                 f"Profile(tensors) must be a mapping, got {type(tensors).__name__}"
             )
@@ -57,11 +58,13 @@ class Profile:
         out: dict[int, torch.Tensor] = {}
         ref_dtype: torch.dtype | None = None
         for layer, t in tensors.items():
-            if not isinstance(layer, int):
+            layer_in: Any = layer
+            tensor_in: Any = t
+            if not isinstance(layer_in, int):
                 raise ProfileError(
                     f"Profile layer key must be int, got {type(layer).__name__}"
                 )
-            if not isinstance(t, torch.Tensor):
+            if not isinstance(tensor_in, torch.Tensor):
                 raise ProfileError(
                     f"Profile value at layer {layer} must be torch.Tensor, "
                     f"got {type(t).__name__}"

@@ -87,7 +87,7 @@ class Steering:
 
     @classmethod
     def from_value(
-        cls, value: "str | Steering | None",
+        cls, value: object,
     ) -> "Steering | None":
         """Coerce a string / Steering / None into a Steering or None.
 
@@ -106,7 +106,7 @@ class Steering:
             return parse_expr(value)
         raise TypeError(
             f"Steering.from_value expects str | Steering | None, "
-            f"got {type(value).__name__}"  # pyright: ignore[reportUnreachable]
+            f"got {type(value).__name__}"
         )
 
     def normalized_entries(self) -> "dict[str, tuple[float, Trigger]]":

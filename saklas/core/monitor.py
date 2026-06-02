@@ -135,7 +135,8 @@ class TraitMonitor:
 
     @layer_means.setter
     def layer_means(self, value: dict[int, torch.Tensor]) -> None:
-        if value is not None and not isinstance(value, dict):
+        value_in: Any = value
+        if value_in is not None and not isinstance(value_in, dict):
             raise TypeError(f"layer_means must be a dict, got {type(value).__name__}")
         self._layer_means = dict(value) if value else {}
         # Invalidate mean cache; v_unit cache is independent of means.
@@ -1041,7 +1042,8 @@ class ManifoldMonitor:
 
     @layer_means.setter
     def layer_means(self, value: dict[int, torch.Tensor] | None) -> None:
-        if value is not None and not isinstance(value, dict):
+        value_in: Any = value
+        if value_in is not None and not isinstance(value_in, dict):
             raise TypeError(
                 f"layer_means must be a dict, got {type(value).__name__}"
             )

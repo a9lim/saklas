@@ -1468,7 +1468,8 @@ class SaklasSession:
         survives a flaky LM.  A ragged corpus would silently miscount
         scenario positions downstream.
         """
-        if not isinstance(concepts, list) or len(concepts) < 1:
+        concepts_in: Any = concepts
+        if not isinstance(concepts_in, list) or len(concepts_in) < 1:
             raise ValueError(
                 "generate_statements needs >= 1 concept"
             )
@@ -5129,7 +5130,8 @@ class SaklasSession:
             ``RunSet`` aligned with ``prompts``.  ``runset.grid`` records
             ``{"prompt_index": i}`` for each row.
         """
-        if not isinstance(prompts, list) or not prompts:
+        prompts_in: Any = prompts
+        if not isinstance(prompts_in, list) or not prompts_in:
             raise ValueError("generate_batch: prompts must be a non-empty list")
 
         results: list[GenerationResult] = []
@@ -5192,10 +5194,12 @@ class SaklasSession:
             alpha dict for row ``i``; ``runset.node_ids[i]`` is the
             assistant node id when ``stateless=False``.
         """
-        if not isinstance(sweep, dict) or not sweep:
+        sweep_in: Any = sweep
+        if not isinstance(sweep_in, dict) or not sweep_in:
             raise ValueError("generate_sweep: sweep dict must be non-empty")
         for name, alphas in sweep.items():
-            if not isinstance(alphas, (list, tuple)) or not alphas:
+            alphas_in: Any = alphas
+            if not isinstance(alphas_in, (list, tuple)) or not alphas_in:
                 raise ValueError(
                     f"generate_sweep: sweep['{name}'] must be a non-empty "
                     f"list of alpha values"
