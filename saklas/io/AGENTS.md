@@ -160,13 +160,16 @@ Pure data layer behind `pack install/refresh/clear/rm/ls/search/push` +
 
 HF distribution as **model** repos (`repo_type="model"`; safetensors is hub-native,
 `base_model` frontmatter gives reverse-link discoverability). `split_revision`
-parses `owner/name@rev`. `pull_pack` uses stage-verify-swap (build under
-`.staging/`, verify, atomic swap with `.bak`); native if a `pack.json` is present,
-else `_install_synthesized_pack` (scans tensors, writes `method="imported"`
-sidecars — repeng-style GGUF-only repos install with zero prep). `push_pack(...,
-variant="all")` stages a filtered copy + one `upload_folder`; the model card
-carries `library_name: saklas`, `saklas-pack` tags, deduped `base_model:`, and
-`base_model_relation: adapter`. `resolve_target_coord` picks `<whoami>/<name>`.
+parses `owner/name@rev`. `stage_verify_swap` (`staging.py`) owns the shared
+stage-verify-swap choreography for HF installs: build under `.staging/`, recover
+`.bak` on interrupted swaps, then promote atomically with best-effort restore.
+`pull_pack` supplies pack-specific staging/validation; native if a `pack.json` is
+present, else `_install_synthesized_pack` (scans tensors, writes
+`method="imported"` sidecars — repeng-style GGUF-only repos install with zero
+prep). `push_pack(..., variant="all")` stages a filtered copy + one
+`upload_folder`; the model card carries `library_name: saklas`, `saklas-pack`
+tags, deduped `base_model:`, and `base_model_relation: adapter`.
+`resolve_target_coord` picks `<whoami>/<name>`.
 
 `hf_manifolds.py` is the manifold counterpart (`saklas-manifold` tag). `pull_manifold`
 uses the same stage-verify-swap but **rejects** a repo with no `manifold.json` (the

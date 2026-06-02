@@ -22,6 +22,7 @@ from saklas.io.packs import (
     synthesize_pack_metadata,
     verify_integrity,
 )
+from saklas.io.staging import stage_verify_swap
 
 
 class HFError(RuntimeError, SaklasError):
@@ -147,37 +148,7 @@ def pull_pack(
     tmp_dir = Path(_download(coord, revision=revision))
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
-    if target_folder.exists() and not force:
-        raise HFError(f"{target_folder} exists; pass force=True to overwrite")
-
-    # Sibling staging dir on the same volume — required so the final
-    # rename into place is atomic.
-    staging = target_folder.with_name(target_folder.name + ".staging")
-    backup = target_folder.with_name(target_folder.name + ".bak")
-
-    # Crash-recovery: if a previous pull died after ``target → .bak`` but
-    # before ``staging → target``, the only valid prior install lives in
-    # ``.bak``.  Restore it before starting a new pull — wiping ``.bak``
-    # first would lose the prior install if the new staging itself fails.
-    if not target_folder.exists() and backup.exists():
-        try:
-            backup.rename(target_folder)
-        except OSError:
-            # If the rename fails, leave ``.bak`` in place; the user can
-            # recover manually rather than losing it to a wipe.
-            pass
-
-    # Stale ``.staging`` from a previous interrupted pull is safe to wipe
-    # (it was never promoted).  Stale ``.bak`` past the recovery branch
-    # above came from a completed swap that got interrupted mid-cleanup;
-    # the target is the source of truth and the ``.bak`` is redundant.
-    if staging.exists():
-        shutil.rmtree(staging)
-    if backup.exists():
-        shutil.rmtree(backup)
-
-    staging.mkdir(parents=True, exist_ok=True)
-    try:
+    def _build(staging: Path) -> None:
         if (tmp_dir / "pack.json").is_file():
             _install_native_pack(tmp_dir, staging, coord, source)
         else:
@@ -191,42 +162,14 @@ def pull_pack(
             raise HFError(
                 f"{coord}: staging integrity check failed ({bad})"
             )
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
 
-    # Atomic-ish swap: target -> .bak (if exists), staging -> target,
-    # then rmtree .bak. A crash between the two renames leaves a recoverable
-    # state — the .bak is restored below if we fail before the second rename
-    # completes.
-    had_existing = target_folder.exists()
-    if had_existing:
-        try:
-            target_folder.rename(backup)
-        except OSError as e:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise HFError(
-                f"{coord}: could not move existing install aside ({e})"
-            ) from e
-
-    try:
-        staging.rename(target_folder)
-    except OSError as e:
-        # Restore the prior install from .bak if we moved it aside.
-        if had_existing and backup.exists() and not target_folder.exists():
-            try:
-                backup.rename(target_folder)
-            except OSError:
-                pass  # nothing better we can do; .bak still on disk
-        shutil.rmtree(staging, ignore_errors=True)
-        raise HFError(
-            f"{coord}: could not promote staging into place ({e})"
-        ) from e
-
-    if had_existing:
-        shutil.rmtree(backup, ignore_errors=True)
-
-    return target_folder
+    return stage_verify_swap(
+        target_folder,
+        force=force,
+        label=coord,
+        build=_build,
+        make_error=HFError,
+    )
 
 
 def _install_native_pack(

@@ -566,6 +566,21 @@ def _author_fake_manifold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, na
     return folder
 
 
+def test_pull_manifold_records_revision_in_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from saklas.io import hf_manifolds as hfm
+    from saklas.io.manifolds import ManifoldFolder
+
+    fake = _author_fake_manifold(tmp_path, monkeypatch)
+    monkeypatch.setattr(hfm, "_hf_snapshot_download", lambda **kw: str(fake))
+    target = tmp_path / "installed" / "mood"
+
+    hfm.pull_manifold(
+        "alice/mood", target_folder=target, force=False, revision="v1.2.0",
+    )
+
+    assert ManifoldFolder.load(target).source == "hf://alice/mood@v1.2.0"
+
+
 def _capture_push_staging(monkeypatch: pytest.MonkeyPatch):
     """Hook tempfile.mkdtemp + shutil.rmtree to snapshot the push staging dir."""
     from saklas.io import hf_manifolds as hfm

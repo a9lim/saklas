@@ -35,6 +35,7 @@ from saklas.io.manifolds import (
     ManifoldFormatError,
 )
 from saklas.io.packs import NAME_REGEX
+from saklas.io.staging import stage_verify_swap
 
 # Mirror :data:`saklas.io.hf._HF_SEARCH_CAP`.  Kept independent so the
 # manifold side can diverge later (e.g. larger cap once a few canonical
@@ -103,29 +104,7 @@ def pull_manifold(
 
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
-    if target_folder.exists() and not force:
-        raise HFError(f"{target_folder} exists; pass force=True to overwrite")
-
-    staging = target_folder.with_name(target_folder.name + ".staging")
-    backup = target_folder.with_name(target_folder.name + ".bak")
-
-    # Crash-recovery: a previous pull that died after target → .bak but
-    # before staging → target left a valid prior install in .bak only.
-    # Restore it before starting a new pull so a failed new staging
-    # doesn't lose the prior good install.
-    if not target_folder.exists() and backup.exists():
-        try:
-            backup.rename(target_folder)
-        except OSError:
-            pass
-
-    if staging.exists():
-        shutil.rmtree(staging)
-    if backup.exists():
-        shutil.rmtree(backup)
-
-    staging.mkdir(parents=True, exist_ok=True)
-    try:
+    def _build(staging: Path) -> None:
         _install_manifold(tmp_dir, staging, coord)
         # Validate the staged folder against the same loader the
         # session will see — catches format-version mismatches and a
@@ -150,37 +129,14 @@ def pull_manifold(
                 f"{coord}: staged manifold failed re-validation after "
                 f"source stamp ({e})"
             ) from e
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
 
-    had_existing = target_folder.exists()
-    if had_existing:
-        try:
-            target_folder.rename(backup)
-        except OSError as e:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise HFError(
-                f"{coord}: could not move existing install aside ({e})"
-            ) from e
-
-    try:
-        staging.rename(target_folder)
-    except OSError as e:
-        if had_existing and backup.exists() and not target_folder.exists():
-            try:
-                backup.rename(target_folder)
-            except OSError:
-                pass
-        shutil.rmtree(staging, ignore_errors=True)
-        raise HFError(
-            f"{coord}: could not promote staging into place ({e})"
-        ) from e
-
-    if had_existing:
-        shutil.rmtree(backup, ignore_errors=True)
-
-    return target_folder
+    return stage_verify_swap(
+        target_folder,
+        force=force,
+        label=coord,
+        build=_build,
+        make_error=HFError,
+    )
 
 
 def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
