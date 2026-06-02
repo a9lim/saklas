@@ -230,3 +230,44 @@ def test_push_manifold_corpus_only_when_unfitted(tmp_path: Path, monkeypatch: py
     assert "manifold.json" in staged
     assert "nodes/00_a.json" in staged
     assert not any(k.endswith(".safetensors") for k in staged)
+
+
+# ========================================================== legacy-pack port ===
+#
+# 4.0 back-compat: `manifold install` ports a published/local legacy
+# saklas-pack (statements-bearing, no manifold.json) to a 2-node `pca`
+# manifold. A bare control-vector repo (no statements, no manifest) is refused.
+
+
+def test_install_manifold_ports_local_legacy_pack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
+    from saklas.io.hf_manifolds import install_manifold
+    from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import manifold_dir
+
+    # A legacy v2 vector folder: statements.json of {positive, negative} pairs.
+    legacy = tmp_path / "legacy" / "happy.sad"
+    legacy.mkdir(parents=True)
+    (legacy / "statements.json").write_text(json.dumps([
+        {"positive": "what a wonderful day", "negative": "everything is bleak"},
+        {"positive": "i feel great", "negative": "i feel hopeless"},
+    ]))
+
+    dst = install_manifold(str(legacy))
+    assert dst == manifold_dir("local", "happy.sad")
+    mf = ManifoldFolder.load(dst)
+    assert mf.fit_mode == "pca"
+    assert sorted(mf.node_labels) == ["happy", "sad"]
+
+
+def test_install_manifold_refuses_bare_control_vector_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
+    from saklas.io.hf_manifolds import install_manifold
+
+    # Only a safetensors dump — no manifold.json, no statements.json. The
+    # geometry/authoring can't be recovered, so it's refused (re-author it).
+    bare = tmp_path / "bare" / "control"
+    bare.mkdir(parents=True)
+    (bare / "model.safetensors").write_bytes(b"not a real tensor")
+    with pytest.raises(ValueError, match="statements.json"):
+        install_manifold(str(bare))

@@ -87,19 +87,27 @@ def pull_manifold(
     target``, ``rmtree .bak``.  A crash mid-swap is recoverable from
     ``.bak``.
 
-    Unlike packs, manifold folders carry no synthesis path — if the
-    repo doesn't have a ``manifold.json`` at root we refuse rather
-    than fabricate one (a manifold's geometry can't be inferred from
-    a bare safetensors dump).  Repos pre-dating the manifold format
-    should be re-authored, not auto-installed.
+    Back-compat (4.0): a published **legacy saklas-pack** repo (no
+    ``manifold.json`` but a ``statements.json`` of ``{positive, negative}``
+    pairs) is *ported* to a 2-node ``pca`` manifold on install via
+    :func:`~saklas.io.manifolds.port_legacy_vector_folder` (file-only — the
+    per-model subspace re-fits lazily).  A **bare control-vector** repo
+    (safetensors with no manifest and no statements) carries no recoverable
+    geometry/authoring, so it's refused — re-author it as a manifold.
     """
     tmp_dir = Path(_download(coord, revision=revision))
 
     if not (tmp_dir / "manifold.json").is_file():
+        if (tmp_dir / "statements.json").is_file():
+            return _port_legacy_pack_dir(
+                tmp_dir, target_folder, coord, revision, force=force,
+            )
         raise HFError(
             f"{coord}: HF repo has no manifold.json at root — saklas "
             f"manifolds must be published with the manifest in place "
-            f"(see `saklas manifold push`)."
+            f"(see `saklas manifold push`).  A legacy vector pack must carry "
+            f"statements.json to port; a bare control-vector repo must be "
+            f"re-authored as a manifold."
         )
 
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
@@ -173,6 +181,36 @@ def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
                         target_folder / "nodes" / child.name,
                         child.read_bytes(),
                     )
+
+
+def _port_legacy_pack_dir(
+    tmp_dir: Path,
+    target_folder: Path,
+    coord: str,
+    revision: Optional[str],
+    *,
+    force: bool,
+) -> Path:
+    """Port a downloaded legacy saklas-pack repo to a 2-node ``pca`` manifold.
+
+    The 4.0 back-compat install path for a published v2 vector pack: its
+    ``statements.json`` reconstructs the equivalent 2-node manifold authoring
+    (file-only — the per-model subspace re-fits lazily on first steer).
+    ``target_folder`` is the resolved ``manifolds/<dst_ns>/<dst_name>/``
+    destination; the ``hf://`` source is stamped so ``refresh`` can re-pull.
+    Not stage-verify-swapped — porting is an idempotent file-only transform.
+    """
+    from saklas.io.manifolds import port_legacy_vector_folder
+
+    dst_ns = target_folder.parent.name
+    dst_name = target_folder.name
+    dst, mf = port_legacy_vector_folder(
+        tmp_dir, namespace=dst_ns, name=dst_name, force=force,
+    )
+    source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
+    mf.source = source
+    mf.write_metadata(files=mf.files)
+    return dst
 
 
 # ---------------------------------------------------------------------- push --
@@ -622,18 +660,26 @@ def install_manifold(
 def _install_local_manifold(
     src: Path, *, as_: Optional[str] = None, force: bool = False,
 ) -> Path:
-    """Copy a local manifold folder into the cache.
+    """Copy a local manifold folder into the cache (or port a legacy vector pack).
 
-    Validates the source through ``ManifoldFolder.load`` first so a
-    malformed folder fails fast at the source rather than after the
-    copy.  ``as_`` defaults to ``local/<src.name>``.
+    Validates the source through ``ManifoldFolder.load`` first so a malformed
+    folder fails fast at the source.  A folder that isn't a manifold but carries
+    a ``statements.json`` is a legacy v2 vector pack — ported to a 2-node ``pca``
+    manifold via :func:`~saklas.io.manifolds.port_legacy_vector_folder` (the
+    back-compat bridge).  ``as_`` defaults to ``local/<src.name>``.
     """
     from saklas.io.paths import manifold_dir
 
+    is_manifold = True
     try:
         ManifoldFolder.load(src)
     except ManifoldFormatError as e:
-        raise ValueError(f"{src}: source folder is not a manifold ({e})") from e
+        if not (src / "statements.json").is_file():
+            raise ValueError(
+                f"{src}: source folder is not a manifold ({e}) and has no "
+                f"statements.json to port as a legacy vector pack"
+            ) from e
+        is_manifold = False
 
     if as_:
         if "/" not in as_:
@@ -656,5 +702,9 @@ def _install_local_manifold(
         shutil.rmtree(dst)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst)
+    if is_manifold:
+        shutil.copytree(src, dst)
+    else:
+        from saklas.io.manifolds import port_legacy_vector_folder
+        port_legacy_vector_folder(src, namespace=dst_ns, name=dst_name, force=force)
     return dst

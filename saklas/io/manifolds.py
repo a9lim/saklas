@@ -1361,6 +1361,7 @@ def port_legacy_vector_folder(
     vector_folder: Path,
     *,
     namespace: str = "local",
+    name: Optional[str] = None,
     force: bool = False,
 ) -> tuple[Path, "ManifoldFolder"]:
     """Port a legacy ``vectors/<ns>/<c>/`` folder to a 2-node ``pca`` manifold.
@@ -1378,13 +1379,18 @@ def port_legacy_vector_folder(
     ``(pos, neg)``; a monopolar name ``c`` becomes ``(c, c_neg)``.  ``tags``
     and ``description`` are carried from the legacy ``pack.json`` when present.
 
+    ``name`` defaults to ``vector_folder.name`` (the in-cache layout) but can be
+    overridden when the source folder isn't named for the concept — e.g. an HF
+    snapshot dir (a commit-SHA path) being imported via ``manifold install``.
+
     Returns ``(manifold_folder_path, ManifoldFolder)``.  Raises
     :class:`FileNotFoundError` when the source has no ``statements.json`` and
     :class:`FileExistsError` when the target manifold already exists and
     ``force`` is ``False``.
     """
     vector_folder = Path(vector_folder)
-    name = vector_folder.name
+    if name is None:
+        name = vector_folder.name
     stmts_path = vector_folder / "statements.json"
     if not stmts_path.exists():
         raise FileNotFoundError(
