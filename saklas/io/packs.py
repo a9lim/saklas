@@ -1,278 +1,49 @@
-"""Pack format: load, validate, and write concept folders under ~/.saklas/vectors/.
+"""Shared pack-format primitives: name validation, integrity, and the
+legacy-format version sentinel.
 
-A concept folder contains:
-    pack.json          # human-editable metadata (required)
-    statements.json    # contrastive pair list (optional)
-    <model>.safetensors + <model>.json   # extracted tensor + slim sidecar (optional, 0..N)
+The 4.0 collapse retired the pack *format/distribution* surface
+(``PackMetadata`` / ``ConceptFolder`` / ``Sidecar`` / ``enumerate_variants`` /
+``materialize_bundled`` / HF pack distribution) — concepts are manifolds now
+(:mod:`saklas.io.manifolds`).  What remains here is the cross-cutting
+infrastructure several layers still share:
 
-At least one of statements.json or a tensor must be present.
+- ``NAME_REGEX`` — the artifact-name grammar (manifolds reuse it);
+- ``hash_file`` / ``hash_folder_files`` / ``verify_integrity`` — the sha256
+  integrity helpers (the neutral/layer-means/alignment caches + the manifold
+  format's own integrity manifest build on these);
+- ``PACK_FORMAT_VERSION`` — the legacy-vector-folder migration sentinel: a v2
+  ``vectors/`` pack (``format_version`` below this) is *legacy*, ported to a
+  2-node ``pca`` manifold on first touch
+  (:meth:`saklas.core.session.SaklasSession._port_stale_legacy_vector` /
+  ``scripts/upgrade_packs.py``).  Also stamped onto the profile-cache sidecars
+  written by :func:`saklas.core.vectors.save_profile`.
 """
 from __future__ import annotations
 
 import hashlib
-import json
-import logging
 import re
-from dataclasses import dataclass, field
-from importlib import resources as _resources
 from pathlib import Path
-from typing import Any, Optional, Sequence
 
 from saklas.core.errors import SaklasError
 from saklas.io.paths import ensure_within
 
-_log = logging.getLogger("saklas.io.packs")
-
 
 NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
-_REQUIRED_PACK_FIELDS = (
-    "name", "description", "version", "license",
-    "tags", "recommended_alpha", "source", "files",
-)
 
-# Current on-disk pack format version. Readers refuse anything lower; the
-# number bumps any time the sidecar/pack.json shape changes in a way that
-# old readers cannot safely ignore. See scripts/upgrade_packs.py.
-#
-# v3 (4.0): a steering vector *is* the K=2 case of a flat affine subspace, so
-# the canonical artifact for a concept is now a 2-node ``pca`` manifold under
-# ``manifolds/``, not a baked DiM tensor under ``vectors/``.  v2 vector packs
-# are legacy: ``scripts/upgrade_packs.py`` ports statements-bearing folders to
-# manifolds (and re-stamps tensor-only folders that can't re-fit).  Bumping
-# here makes ``_all_concepts`` skip un-migrated v2 folders (PackFormatError),
-# which is the forcing function for the migration.
+# Current on-disk pack format version.  v3 (4.0): a steering vector *is* the
+# K=2 case of a flat affine subspace, so the canonical artifact for a concept
+# is now a 2-node ``pca`` manifold under ``manifolds/``, not a baked DiM tensor
+# under ``vectors/``.  v2 vector packs are legacy: ``scripts/upgrade_packs.py``
+# (and ``_port_stale_legacy_vector``) port statements-bearing folders to
+# manifolds on touch.
 PACK_FORMAT_VERSION = 3
 
 
 class PackFormatError(ValueError, SaklasError):
-    """Raised when a pack folder or pack.json is malformed."""
+    """Raised when a (legacy) pack folder or pack.json is malformed."""
 
     def user_message(self) -> tuple[int, str]:
         return (400, str(self) or self.__class__.__name__)
-
-
-@dataclass
-class PackMetadata:
-    name: str
-    description: str
-    version: str
-    license: str
-    tags: list[str]
-    recommended_alpha: float
-    source: str
-    files: dict[str, str]
-    long_description: str = ""
-    format_version: int = PACK_FORMAT_VERSION
-
-    @classmethod
-    def load(cls, folder: Path) -> "PackMetadata":
-        pj = folder / "pack.json"
-        if not pj.exists():
-            raise PackFormatError(f"pack.json missing in {folder}")
-        try:
-            with open(pj) as f:
-                data = json.load(f)
-        except json.JSONDecodeError as e:
-            raise PackFormatError(f"pack.json parse error in {folder}: {e}") from e
-
-        for k in _REQUIRED_PACK_FIELDS:
-            if k not in data:
-                raise PackFormatError(f"pack.json missing required field '{k}' in {folder}")
-
-        fmt_ver = data.get("format_version", 1)
-        if not isinstance(fmt_ver, int) or fmt_ver < PACK_FORMAT_VERSION:
-            raise PackFormatError(
-                f"pack at {folder} has format_version={fmt_ver!r}, "
-                f"need >= {PACK_FORMAT_VERSION}. "
-                f"Run: python scripts/upgrade_packs.py {folder}"
-            )
-        if fmt_ver > PACK_FORMAT_VERSION:
-            raise PackFormatError(
-                f"pack at {folder} was created by a newer saklas "
-                f"(format v{fmt_ver} > local v{PACK_FORMAT_VERSION}); "
-                f"upgrade saklas, or pass `--force-legacy` to attempt to "
-                f"load anyway."
-            )
-
-        name = data["name"]
-        if not isinstance(name, str) or not NAME_REGEX.match(name):
-            raise PackFormatError(
-                f"pack.json name '{name}' invalid; must match {NAME_REGEX.pattern}"
-            )
-
-        return cls(
-            name=name,
-            description=data["description"],
-            long_description=data.get("long_description", ""),
-            version=data["version"],
-            license=data["license"],
-            tags=list(data["tags"]),
-            recommended_alpha=float(data["recommended_alpha"]),
-            source=data["source"],
-            files=dict(data["files"]),
-            format_version=fmt_ver,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "name": self.name,
-            "description": self.description,
-            "format_version": self.format_version,
-        }
-        if self.long_description:
-            out["long_description"] = self.long_description
-        out.update({
-            "version": self.version,
-            "license": self.license,
-            "tags": self.tags,
-            "recommended_alpha": self.recommended_alpha,
-            "source": self.source,
-            "files": self.files,
-        })
-        return out
-
-    def write(self, folder: Path) -> None:
-        from saklas.io.atomic import write_json_atomic
-
-        folder.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(folder / "pack.json", self.to_dict())
-
-
-@dataclass
-class Sidecar:
-    method: str
-    saklas_version: str
-    statements_sha256: Optional[str] = None
-    components: Optional[dict[str, dict[str, Any]]] = None
-    # Per-layer probe-quality metrics computed at extraction time.  Keys are
-    # the same layer indices the profile carries (stringified on disk for
-    # JSON-key compatibility, ``int``-keyed in memory).  Old saklas readers
-    # ignore this field; readers that know about it surface it through
-    # ``Profile.diagnostics`` and the CLI ``vector why`` output.  See
-    # ``saklas.core.vectors._compute_layer_diagnostics`` for the metric set.
-    diagnostics_by_layer: Optional[dict[int, dict[str, float]]] = None
-    # Transfer provenance — set on transferred profiles only (v1.6).
-    # ``source_model_id`` is the HF coord of the model the probe was
-    # extracted on; ``alignment_map_hash`` pins the specific Procrustes
-    # fit used; ``transfer_quality_estimate`` is the median per-layer R²
-    # from :func:`saklas.io.alignment.alignment_quality`.
-    source_model_id: Optional[str] = None
-    alignment_map_hash: Optional[str] = None
-    transfer_quality_estimate: Optional[float] = None
-    # Role/persona provenance — set on role-variant tensors. The filename
-    # ``_role-<name>`` suffix is the source of truth; this field is a
-    # convenience for dashboard display so the UI doesn't need to re-parse
-    # the filename.
-    role: Optional[str] = None
-
-    @classmethod
-    def load(cls, path: Path) -> "Sidecar":
-        with open(path) as f:
-            data = json.load(f)
-        raw_diag = data.get("diagnostics_by_layer")
-        diagnostics: Optional[dict[int, dict[str, float]]]
-        if isinstance(raw_diag, dict) and raw_diag:
-            try:
-                diagnostics = {
-                    int(layer): {k: float(v) for k, v in metrics.items()}
-                    for layer, metrics in raw_diag.items()
-                }
-            except (TypeError, ValueError):
-                # Malformed sidecar diagnostics — drop the field.  Tensors
-                # themselves are still valid; integrity is enforced by
-                # ``ConceptFolder.load`` over the file hash, not the
-                # diagnostics shape.
-                diagnostics = None
-        else:
-            diagnostics = None
-        tqe = data.get("transfer_quality_estimate")
-        return cls(
-            method=data["method"],
-            saklas_version=data["saklas_version"],
-            statements_sha256=data.get("statements_sha256"),
-            components=data.get("components"),
-            diagnostics_by_layer=diagnostics,
-            source_model_id=data.get("source_model_id"),
-            alignment_map_hash=data.get("alignment_map_hash"),
-            transfer_quality_estimate=float(tqe) if tqe is not None else None,
-            role=data.get("role"),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "method": self.method,
-            "saklas_version": self.saklas_version,
-        }
-        if self.statements_sha256 is not None:
-            out["statements_sha256"] = self.statements_sha256
-        if self.components is not None:
-            out["components"] = self.components
-        if self.diagnostics_by_layer:
-            out["diagnostics_by_layer"] = {
-                str(layer): {k: float(v) for k, v in metrics.items()}
-                for layer, metrics in self.diagnostics_by_layer.items()
-            }
-        if self.source_model_id is not None:
-            out["source_model_id"] = self.source_model_id
-        if self.alignment_map_hash is not None:
-            out["alignment_map_hash"] = self.alignment_map_hash
-        if self.transfer_quality_estimate is not None:
-            out["transfer_quality_estimate"] = float(self.transfer_quality_estimate)
-        if self.role is not None:
-            out["role"] = self.role
-        return out
-
-    def write(self, path: Path) -> None:
-        from saklas.io.atomic import write_json_atomic
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(path, self.to_dict())
-
-
-def hash_folder_files(folder: Path) -> dict[str, str]:
-    """Return ``{filename: sha256}`` for every file in ``folder`` except ``pack.json``.
-
-    Shared by any code path that needs to (re)populate ``PackMetadata.files``
-    after writing new files on disk. Non-recursive — concept folders are flat.
-    """
-    out: dict[str, str] = {}
-    for entry in sorted(folder.iterdir()):
-        if entry.is_file() and entry.name != "pack.json":
-            out[entry.name] = hash_file(entry)
-    return out
-
-
-def synthesize_pack_metadata(
-    *,
-    name: str,
-    source: str,
-    pack_dir: Path,
-    description: str = "",
-    tags: Sequence[str] = (),
-    version: str = "1.0.0",
-    license: str = "unknown",
-    recommended_alpha: float = 0.5,
-    long_description: str = "",
-) -> "PackMetadata":
-    """Build a :class:`PackMetadata` with ``files`` hashed from on-disk contents.
-
-    Both pack-less HF install synthesis and user-concept extraction converge
-    on the same operation: once all real files live under ``pack_dir``, build
-    a manifest from them. Callers still own any format-specific file
-    fabrication (e.g. hf.py's ``method="imported"`` sidecar stubs) — this
-    helper only does the hashing + construction.
-    """
-    return PackMetadata(
-        name=name,
-        description=description,
-        long_description=long_description,
-        version=version,
-        license=license,
-        tags=list(tags),
-        recommended_alpha=recommended_alpha,
-        source=source,
-        files=hash_folder_files(pack_dir),
-    )
 
 
 def hash_file(path: Path) -> str:
@@ -287,6 +58,18 @@ def hash_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def hash_folder_files(folder: Path) -> dict[str, str]:
+    """Return ``{filename: sha256}`` for every file in ``folder`` except ``pack.json``.
+
+    Non-recursive — concept folders are flat.
+    """
+    out: dict[str, str] = {}
+    for entry in sorted(folder.iterdir()):
+        if entry.is_file() and entry.name != "pack.json":
+            out[entry.name] = hash_file(entry)
+    return out
 
 
 # In-process fingerprint cache keyed by absolute file path.
@@ -309,9 +92,9 @@ def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[st
     bad: list[str] = []
     for rel, expected in files.items():
         # A manifest entry that resolves outside ``folder`` (a ``..`` or
-        # absolute ``rel`` in a downloaded pack.json) is treated as a failed
-        # file rather than read off-tree — the pack fails integrity and won't
-        # load. ``ensure_within`` is the path-traversal barrier.
+        # absolute ``rel`` in a downloaded manifest) is treated as a failed
+        # file rather than read off-tree. ``ensure_within`` is the path-
+        # traversal barrier.
         try:
             fp = ensure_within(folder, rel)
         except ValueError:
@@ -336,319 +119,3 @@ def verify_integrity(folder: Path, files: dict[str, str]) -> tuple[bool, list[st
             continue
         _FINGERPRINT_CACHE[key] = fp_key
     return (not bad, bad)
-
-
-@dataclass
-class ConceptFolder:
-    folder: Path
-    metadata: PackMetadata
-    has_statements: bool
-    # safe_model_id -> Sidecar. GGUF-only entries have no sidecar (metadata
-    # is embedded in the gguf file), so this dict is only populated for
-    # safetensors tensors.
-    _sidecars: dict[str, Sidecar] = field(default_factory=dict)
-    # safe_model_id -> "safetensors" | "gguf". A safetensors file takes
-    # precedence over a gguf file with the same stem (native format wins).
-    _tensor_formats: dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def load(cls, folder: Path) -> "ConceptFolder":
-        meta = PackMetadata.load(folder)
-
-        ok, bad = verify_integrity(folder, meta.files)
-        if not ok:
-            raise PackFormatError(
-                f"pack integrity check failed in {folder}: tampered/missing {bad}"
-            )
-
-        has_stmts = (folder / "statements.json").exists()
-        safetensors = sorted(folder.glob("*.safetensors"))
-        ggufs = sorted(folder.glob("*.gguf"))
-        if not has_stmts and not safetensors and not ggufs:
-            raise PackFormatError(
-                f"concept folder must contain at least one of statements.json, "
-                f"a .safetensors file, or a .gguf file: {folder}"
-            )
-
-        sidecars: dict[str, Sidecar] = {}
-        formats: dict[str, str] = {}
-        for t in safetensors:
-            sc_path = t.with_suffix(".json")
-            if not sc_path.exists():
-                raise PackFormatError(
-                    f"tensor {t.name} has no sidecar {sc_path.name}"
-                )
-            sidecars[t.stem] = Sidecar.load(sc_path)
-            formats[t.stem] = "safetensors"
-        for g in ggufs:
-            # safetensors wins on conflict — it's the native format and
-            # carries more metadata (statements hash, merge components).
-            if g.stem not in formats:
-                formats[g.stem] = "gguf"
-
-        return cls(
-            folder=folder,
-            metadata=meta,
-            has_statements=has_stmts,
-            _sidecars=sidecars,
-            _tensor_formats=formats,
-        )
-
-    def tensor_models(self) -> list[str]:
-        return sorted(self._tensor_formats.keys())
-
-    def tensor_format(self, safe_model_id: str) -> str:
-        """Return "safetensors" or "gguf" for the tensor backing this model."""
-        return self._tensor_formats[safe_model_id]
-
-    def sidecar(self, safe_model_id: str) -> Sidecar:
-        """Return the JSON sidecar for a safetensors tensor.
-
-        Raises KeyError for GGUF-backed tensors, which carry metadata inside
-        the .gguf file rather than a sibling sidecar.
-        """
-        return self._sidecars[safe_model_id]
-
-    def tensor_path(self, safe_model_id: str) -> Path:
-        """Return the on-disk path to the tensor file, with extension."""
-        fmt = self._tensor_formats.get(safe_model_id)
-        if fmt == "gguf":
-            return self.folder / f"{safe_model_id}.gguf"
-        # Default to safetensors (preserves pre-existing callers that
-        # construct paths directly when the tensor hasn't been extracted yet).
-        return self.folder / f"{safe_model_id}.safetensors"
-
-    def statements_path(self) -> Path:
-        return self.folder / "statements.json"
-
-
-def is_stale(current_statements_sha: Optional[str], sidecar: Sidecar) -> bool:
-    """Tensor is stale if its recorded statements hash disagrees with the current one."""
-    if sidecar.statements_sha256 is None or current_statements_sha is None:
-        return False
-    return sidecar.statements_sha256 != current_statements_sha
-
-
-def version_mismatch(sidecar: Sidecar, current: str) -> bool:
-    """Major/minor mismatch between sidecar version and current saklas version."""
-    def _parse(v: str) -> tuple[int, int]:
-        parts = v.split(".")
-        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
-    try:
-        return _parse(sidecar.saklas_version)[:2] != _parse(current)[:2]
-    except (ValueError, IndexError):
-        return True
-
-
-def bundled_concept_names() -> list[str]:
-    """List every concept shipped under saklas/data/vectors/."""
-    try:
-        root = _resources.files("saklas.data.vectors")
-    except (ModuleNotFoundError, FileNotFoundError):
-        return []
-    return sorted(
-        p.name for p in root.iterdir()
-        if p.is_dir() and (p / "pack.json").is_file()
-    )
-
-
-def _canonical_json_sha256(data: bytes) -> str:
-    """Return a content-stable sha256 of a JSON byte payload.
-
-    The hash is computed over canonical JSON form (sorted keys, no
-    surrounding whitespace) so cosmetic-only differences (key order,
-    trailing newline, indent width) compare equal. Used by
-    :func:`materialize_bundled` to detect whether a user has actually edited
-    statements vs. the file just being byte-different from the shipped form.
-
-    Falls back to a raw sha256 if the bytes don't parse as JSON — better to
-    treat unparseable on-disk content as "different from bundled" than to
-    silently replace it.
-
-    Twin: :func:`saklas.io.manifolds._canonical_json_sha256` is the
-    byte-equivalent helper for the decoupled manifold format; mirror any
-    change to one in the other.
-    """
-    try:
-        parsed = json.loads(data)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return hashlib.sha256(data).hexdigest()
-    canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
-
-
-def materialize_bundled() -> None:
-    """Copy bundled package data into ~/.saklas/, leaving user files untouched.
-
-    - neutral_statements.json -> ~/.saklas/neutral_statements.json
-    - saklas/data/vectors/<concept>/ -> ~/.saklas/vectors/default/<concept>/
-
-    On format-version drift (user's cached default/<concept>/pack.json is
-    older than the shipped format), re-copy the shipped pack.json in place
-    and write a ``pack.json.bak`` next to it. ``statements.json`` is only
-    overwritten if its canonical-JSON hash matches the bundled copy — a
-    user-edited statements file is preserved and skipped with an INFO log.
-    Extracted tensor files (<sid>.safetensors / .json sidecar) stay put —
-    they're per-model and expensive to recompute. This keeps the upgrade
-    path painless for existing installs without silently discarding
-    customization.
-    """
-    from saklas.io.atomic import write_bytes_atomic
-    from saklas.io.paths import saklas_home, vectors_dir, neutral_statements_path
-
-    home = saklas_home()
-    home.mkdir(parents=True, exist_ok=True)
-
-    user_ns = neutral_statements_path()
-    if not user_ns.exists():
-        src = _resources.files("saklas.data").joinpath("neutral_statements.json")
-        write_bytes_atomic(user_ns, src.read_bytes())
-
-    default_dir = vectors_dir() / "default"
-    default_dir.mkdir(parents=True, exist_ok=True)
-    for concept in bundled_concept_names():
-        target = default_dir / concept
-        pkg_root = _resources.files("saklas.data.vectors").joinpath(concept)
-
-        if not target.exists():
-            # Fresh install — copy every shipped file atomically.
-            target.mkdir(parents=True, exist_ok=True)
-            for entry in pkg_root.iterdir():
-                if entry.is_file():
-                    write_bytes_atomic(target / entry.name, entry.read_bytes())
-            continue
-
-        pack_json = target / "pack.json"
-        if not pack_json.exists():
-            # Folder exists without a pack.json — refuse to fabricate one.
-            continue
-
-        # Read the on-disk pack.json to decide whether to upgrade.
-        try:
-            with open(pack_json) as f:
-                on_disk_pack = json.load(f)
-        except Exception:
-            # Corrupt; don't stomp user state.
-            continue
-
-        fmt = on_disk_pack.get("format_version")
-        if not (isinstance(fmt, int) and fmt < PACK_FORMAT_VERSION):
-            # No explicit stale version — leave alone.
-            continue
-
-        # Stale format_version → upgrade pack.json (always with .bak), and
-        # only overwrite statements.json if the user hasn't touched it.
-        bundled_pack_bytes = (pkg_root / "pack.json").read_bytes()
-        on_disk_pack_bytes = pack_json.read_bytes()
-
-        # Always preserve the previous pack.json before replacing it.
-        write_bytes_atomic(pack_json.with_suffix(".json.bak"), on_disk_pack_bytes)
-        write_bytes_atomic(pack_json, bundled_pack_bytes)
-
-        on_disk_stmts = target / "statements.json"
-        bundled_stmts = pkg_root / "statements.json"
-        if bundled_stmts.is_file():
-            bundled_stmts_bytes = bundled_stmts.read_bytes()
-            if on_disk_stmts.exists():
-                on_disk_hash = _canonical_json_sha256(on_disk_stmts.read_bytes())
-                bundled_hash = _canonical_json_sha256(bundled_stmts_bytes)
-                if on_disk_hash == bundled_hash:
-                    # Bytewise / canonical-equivalent — safe to refresh.
-                    write_bytes_atomic(on_disk_stmts, bundled_stmts_bytes)
-                else:
-                    _log.info(
-                        "materialize_bundled: preserving user-edited "
-                        "statements.json for default/%s "
-                        "(canonical hash differs from bundled)",
-                        concept,
-                    )
-            else:
-                # No statements on disk — write the shipped copy.
-                write_bytes_atomic(on_disk_stmts, bundled_stmts_bytes)
-
-        # Copy any other shipped files that aren't pack.json or statements.json.
-        for entry in pkg_root.iterdir():
-            if not entry.is_file():
-                continue
-            if entry.name in {"pack.json", "statements.json"}:
-                continue
-            write_bytes_atomic(target / entry.name, entry.read_bytes())
-
-        # One INFO log line per upgrade, after writes succeed.
-        _log.info(
-            "materialize_bundled: upgraded default/%s v%d -> v%d (format_version)",
-            concept, fmt, PACK_FORMAT_VERSION,
-        )
-
-
-def merge_components_status(
-    recorded: dict[str, dict[str, Any]],
-    current_hashes: dict[str, str],
-) -> dict[str, str]:
-    """Return {coord: status} where status is 'ok', 'mismatch', or 'missing'.
-
-    'missing' = component was recorded at merge time but is no longer
-    present in current_hashes (deleted from installed packs).
-    'mismatch' = component's tensor_sha256 has changed since merge.
-    'ok' = component still matches.
-    """
-    out: dict[str, str] = {}
-    for coord, info in recorded.items():
-        want = info.get("tensor_sha256")
-        have = current_hashes.get(coord)
-        if have is None:
-            out[coord] = "missing"
-        elif want is not None and want != have:
-            out[coord] = "mismatch"
-        else:
-            out[coord] = "ok"
-    return out
-
-
-def merge_components_stale(
-    recorded: dict[str, dict[str, Any]],
-    current_hashes: dict[str, str],
-) -> list[str]:
-    """Return components that are 'mismatch' or 'missing' vs current hashes.
-
-    Thin wrapper over :func:`merge_components_status` for callers that only
-    need the non-ok coords.
-    """
-    status = merge_components_status(recorded, current_hashes)
-    return [coord for coord, s in status.items() if s != "ok"]
-
-
-def enumerate_variants(folder: Path, model_id: str) -> dict[str, Path]:
-    """List all on-disk tensor variants for ``(folder, model_id)``.
-
-    Returns ``{variant_key: path}`` where ``variant_key`` is one of:
-      * ``"raw"`` — DiM raw tensor (canonical default).
-      * ``"sae-<release>"`` — SAE-DiM variant (one per release).
-      * ``"from-<safe_src>"`` — transferred-from variant.
-      * ``"role-<name>"`` — role/persona variant.
-
-    Paths point at the ``.safetensors`` files; callers derive the sidecar
-    path by swapping the extension.
-    """
-    from saklas.io.paths import safe_model_id, parse_tensor_filename
-
-    target_model = safe_model_id(model_id)
-    if not folder.is_dir():
-        return {}
-
-    out: dict[str, Path] = {}
-    for p in folder.iterdir():
-        if not p.is_file():
-            continue
-        parsed = parse_tensor_filename(p.name)
-        if parsed is None:
-            continue
-        model, variant = parsed
-        if model != target_model:
-            continue
-        # ``variant`` is already prefixed with its kind tag
-        # ("sae-...", "from-...", "role-...") or ``None`` for the
-        # canonical DiM raw tensor — see ``parse_tensor_filename``.
-        key = "raw" if variant is None else variant
-        out[key] = p
-    return out

@@ -694,87 +694,6 @@ def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
     return raw, None
 
 
-def _resolve_variant_tensor(
-    folder: Path,
-    model_id: str,
-    variant: str | None,
-) -> "Path | None":
-    """Locate the on-disk tensor for ``(folder, model, variant)``.
-
-    ``variant`` semantics:
-      - ``None`` (no suffix passed): prefer raw safetensors, fall back
-        to GGUF.
-      - ``"raw"``: require the raw safetensors tensor.
-      - ``"sae"``: require the unique SAE variant; raise
-        :class:`AmbiguousVariantError` when >1, :class:`UnknownVariantError`
-        when 0.
-      - ``"role"`` / ``"from"``: require the unique role / transferred
-        variant, with the same ambiguity behavior.
-      - ``"<kind>-<id>"``: require that specific variant.
-    """
-    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-    from saklas.io.packs import enumerate_variants
-
-    variants = enumerate_variants(folder, model_id)
-
-    if variant is None:
-        # Raw preferred, GGUF fallback.
-        if "raw" in variants:
-            return variants["raw"]
-        from saklas.io.paths import safe_model_id as _safe
-        gguf = folder / f"{_safe(model_id)}.gguf"
-        return gguf if gguf.is_file() else None
-
-    if variant == "raw":
-        return variants.get("raw")
-
-    if variant in {"sae", "role", "from"}:
-        prefix = f"{variant}-"
-        display = "SAE" if variant == "sae" else variant
-        id_hint = "release" if variant == "sae" else "id"
-        kind_paths = {k: v for k, v in variants.items() if k.startswith(prefix)}
-        if len(kind_paths) == 0:
-            raise UnknownVariantError(
-                f"no {display} variants found in {folder.name} for model {model_id} "
-                f"(available: {sorted(variants) or 'none'})"
-            )
-        if len(kind_paths) > 1:
-            raise AmbiguousVariantError(
-                f"{folder.name}: multiple {display} variants for model {model_id}: "
-                f"{sorted(kind_paths)}. Specify with :{variant}-<{id_hint}>."
-            )
-        return next(iter(kind_paths.values()))
-
-    # Specific variant key (``sae-<release>``, ``role-<slug>``,
-    # ``from-<safe_src>``).
-    path = variants.get(variant)
-    if path is None:
-        raise UnknownVariantError(
-            f"variant '{variant}' not found in {folder.name} for model "
-            f"{model_id} (available: {sorted(variants) or 'none'})"
-        )
-    return path
-
-
-def _fold_manifold_to_profile(
-    name: str, model_id: str, variant: str | None,
-) -> "Profile | None":
-    """Fold a fitted 2-node ``pca`` manifold for ``name`` into a vector Profile.
-
-    The 4.0 fallback for the disk-side inspection verbs (``compare`` / ``why``):
-    bundled and user concepts ship as 2-node manifolds, so when no ``vectors/``
-    tensor resolves, a **fitted** manifold tensor is loaded and folded
-    (:func:`~saklas.core.vectors.folded_vector_directions`).  Returns ``None``
-    when no fitted manifold tensor exists for ``model_id`` (caller surfaces a
-    "fit it first" miss) or the manifold isn't a foldable 2-node affine.  Only
-    the ``raw`` / ``sae-<release>`` variants fold; role / transfer variants are
-    vector-only.  Raises :class:`AmbiguousSelectorError` on a cross-namespace
-    bare-name collision (mirroring vector resolution).
-    """
-    folded = _fold_manifold_to_profile_with_identity(name, model_id, variant)
-    return folded[0] if folded is not None else None
-
-
 def _fold_manifold_to_profile_with_identity(
     name: str, model_id: str, variant: str | None,
 ) -> "tuple[Profile, str, str] | None":
@@ -874,9 +793,7 @@ def _fold_all_fitted_manifolds(
 def _run_compare(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.selectors import parse as sel_parse, resolve
-    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-    from saklas.io.paths import vectors_dir
-    from saklas.core.profile import Profile, ProfileError
+    from saklas.core.profile import Profile
 
     # Default metric is ``"mahalanobis"`` (since v2.1); ``--metric euclidean``
     # selects plain weighted cosine.
@@ -918,59 +835,29 @@ def _run_compare(args: argparse.Namespace) -> None:
             resolved = resolve(sel)
             names.extend((f"{c.namespace}/{c.name}", variant) for c in resolved)
 
-    # Load profiles from disk.
+    # Load profiles by folding each concept's fitted 2-node ``pca`` manifold.
     profiles: dict[str, Profile] = {}
     profile_identities: dict[str, tuple[str, str]] = {}
     for name, variant in names:
-        sel = sel_parse(name)
-        matches = resolve(sel)
-        # Vector tensor first; fall back to folding a fitted manifold (bundled
-        # & user concepts ship as 2-node manifolds).
-        loaded: Profile | None = None
-        identity: tuple[str, str] | None = None
-        display = name if variant is None else f"{name}:{variant}"
-        if matches:
-            match = matches[0]
-            folder = match.folder
-            identity = (match.namespace, match.name)
-            display_base = (
-                f"{match.namespace}/{match.name}" if "/" in name else match.name
+        try:
+            folded = _fold_manifold_to_profile_with_identity(
+                name, args.model, variant,
             )
-            display = display_base if variant is None else f"{display_base}:{variant}"
-            try:
-                tensor_path = _resolve_variant_tensor(folder, args.model, variant)
-            except (AmbiguousVariantError, UnknownVariantError) as e:
-                print(f"warning: {e}, skipping", file=sys.stderr)
-                continue
-            if tensor_path is not None and tensor_path.is_file():
-                try:
-                    loaded = Profile.load(tensor_path)
-                except (ProfileError, Exception) as e:
-                    print(f"warning: failed to load '{name}': {e}", file=sys.stderr)
-                    continue
-        if loaded is None:
-            try:
-                folded = _fold_manifold_to_profile_with_identity(
-                    name, args.model, variant,
-                )
-            except Exception as e:
-                print(f"warning: {e}, skipping", file=sys.stderr)
-                continue
-            if folded is not None:
-                loaded, ns, bare = folded
-                identity = (ns, bare)
-                display_base = f"{ns}/{bare}" if "/" in name else bare
-                display = display_base if variant is None else f"{display_base}:{variant}"
-        if loaded is None:
+        except Exception as e:
+            print(f"warning: {e}, skipping", file=sys.stderr)
+            continue
+        if folded is None:
             print(
-                f"warning: no vector tensor or fitted manifold for '{name}' "
-                f"with model {args.model}, skipping",
+                f"warning: no fitted manifold for '{name}' with model "
+                f"{args.model}, skipping",
                 file=sys.stderr,
             )
             continue
+        loaded, ns, bare = folded
+        display_base = f"{ns}/{bare}" if "/" in name else bare
+        display = display_base if variant is None else f"{display_base}:{variant}"
         profiles[display] = loaded
-        if identity is not None:
-            profile_identities[display] = identity
+        profile_identities[display] = (ns, bare)
 
     if len(profiles) < 1:
         print("compare: no loadable profiles found", file=sys.stderr)
@@ -984,42 +871,17 @@ def _run_compare(args: argparse.Namespace) -> None:
         target = profiles[target_name]
         target_identity = profile_identities.get(target_name)
 
-        # Load all other installed profiles for this model. Keep the exact
-        # namespace identity internally, then choose display names after the
-        # full pool is known: bare for unique names, qualified for collisions.
+        # Every concept ships as a fitted 2-node ``pca`` manifold — fold
+        # every fitted one for this model into the ranking pool.  Keep the
+        # exact namespace identity internally, then choose display names after
+        # the full pool is known: bare for unique names, qualified for
+        # collisions.
         other_entries: dict[tuple[str, str], Profile] = {}
-        vdir = vectors_dir()
-        if vdir.is_dir():
-            for ns_dir in sorted(vdir.iterdir()):
-                if not ns_dir.is_dir():
-                    continue
-                for cdir in sorted(ns_dir.iterdir()):
-                    if not cdir.is_dir():
-                        continue
-                    identity = (ns_dir.name, cdir.name)
-                    if identity == target_identity:
-                        continue
-                    # Auto-scan: raw preferred, GGUF fallback. SAE-vs-all
-                    # ranking requires the caller to pass the SAE selector
-                    # explicitly.
-                    try:
-                        tp = _resolve_variant_tensor(cdir, args.model, None)
-                    except (AmbiguousVariantError, UnknownVariantError):
-                        continue
-                    if tp is None or not tp.is_file():
-                        continue
-                    try:
-                        other_entries[identity] = Profile.load(tp)
-                    except Exception:
-                        continue
-
-        # Bundled & user concepts ship as manifolds — fold every fitted one
-        # into the ranking pool (vector tensors above win a name collision).
         for mname, mprof in _fold_all_fitted_manifolds(
             args.model, exclude_identity=target_identity,
         ).items():
             ns, bare = mname.split("/", 1)
-            other_entries.setdefault((ns, bare), mprof)
+            other_entries[(ns, bare)] = mprof
 
         from collections import Counter
 
@@ -1137,49 +999,30 @@ def _run_compare(args: argparse.Namespace) -> None:
 
 def _run_why(args: argparse.Namespace) -> None:
     import json as _json
-    from saklas.io.selectors import parse as sel_parse, resolve
-    from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-    from saklas.core.profile import Profile, ProfileError
+    from saklas.io.selectors import AmbiguousSelectorError
+    from saklas.core.profile import Profile
 
-    # Peel off a ``:<variant>`` suffix before parsing as a selector.
+    # Peel off a ``:<variant>`` suffix before resolving the manifold.
     name_part, variant = _split_variant_suffix(args.concept)
-    sel = sel_parse(name_part)
-    matches = resolve(sel)
 
-    # Vector tensor first; fall back to folding a fitted 2-node manifold
-    # (bundled & user concepts ship as manifolds).
+    # Every concept is a fitted 2-node ``pca`` manifold — fold it to a vector.
     profile: "Profile | None" = None
     concept_name = name_part if variant is None else f"{name_part}:{variant}"
-    if matches:
-        match = matches[0]
-        folder = match.folder
-        concept_base = (
-            f"{match.namespace}/{match.name}" if "/" in name_part else match.name
-        )
-        concept_name = concept_base if variant is None else f"{concept_base}:{variant}"
-        try:
-            tensor_path = _resolve_variant_tensor(folder, args.model, variant)
-        except (AmbiguousVariantError, UnknownVariantError) as e:
-            print(f"why: {e}", file=sys.stderr)
-            sys.exit(1)
-        if tensor_path is not None and tensor_path.is_file():
-            try:
-                profile = Profile.load(tensor_path)
-            except (ProfileError, Exception) as e:
-                print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
-                sys.exit(1)
-    if profile is None:
+    try:
         folded = _fold_manifold_to_profile_with_identity(
             name_part, args.model, variant,
         )
-        if folded is not None:
-            profile, ns, bare = folded
-            concept_base = f"{ns}/{bare}" if "/" in name_part else bare
-            concept_name = concept_base if variant is None else f"{concept_base}:{variant}"
+    except AmbiguousSelectorError as e:
+        print(f"why: {e}", file=sys.stderr)
+        sys.exit(1)
+    if folded is not None:
+        profile, ns, bare = folded
+        concept_base = f"{ns}/{bare}" if "/" in name_part else bare
+        concept_name = concept_base if variant is None else f"{concept_base}:{variant}"
     if profile is None:
         print(
-            f"why: no vector tensor or fitted manifold for '{args.concept}' "
-            f"with model {args.model}. If it's a manifold, fit it first: "
+            f"why: no fitted manifold for '{args.concept}' with model "
+            f"{args.model}. If it's authored but unfit, fit it first: "
             f"`saklas manifold fit {name_part} -m {args.model}`.",
             file=sys.stderr,
         )

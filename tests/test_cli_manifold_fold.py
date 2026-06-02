@@ -68,28 +68,37 @@ def _write_fitted_manifold(
 
 class TestFoldHelper:
     def test_fold_returns_profile_for_fitted_manifold(self) -> None:
-        from saklas.cli.runners import _fold_manifold_to_profile
+        from saklas.cli.runners import _fold_manifold_to_profile_with_identity
 
         _write_fitted_manifold("default", "happy.sad")
-        prof = _fold_manifold_to_profile("happy.sad", _MODEL, None)
-        assert prof is not None
+        folded = _fold_manifold_to_profile_with_identity("happy.sad", _MODEL, None)
+        assert folded is not None
+        prof, ns, bare = folded
         assert sorted(prof.layers) == [2, 5]
+        assert (ns, bare) == ("default", "happy.sad")
 
     def test_fold_returns_none_when_unfitted(self) -> None:
-        from saklas.cli.runners import _fold_manifold_to_profile
+        from saklas.cli.runners import _fold_manifold_to_profile_with_identity
         # No tensor on disk for this model → miss (caller nudges to fit).
-        assert _fold_manifold_to_profile("happy.sad", _MODEL, None) is None
+        assert (
+            _fold_manifold_to_profile_with_identity("happy.sad", _MODEL, None)
+            is None
+        )
 
     def test_fold_bare_name_collision_raises(self) -> None:
-        from saklas.cli.runners import _fold_manifold_to_profile
+        from saklas.cli.runners import _fold_manifold_to_profile_with_identity
         from saklas.io.selectors import AmbiguousSelectorError
 
         _write_fitted_manifold("default", "happy.sad")
         _write_fitted_manifold("alice", "happy.sad")
         with pytest.raises(AmbiguousSelectorError):
-            _fold_manifold_to_profile("happy.sad", _MODEL, None)
+            _fold_manifold_to_profile_with_identity("happy.sad", _MODEL, None)
         # Namespace-qualified resolves cleanly.
-        assert _fold_manifold_to_profile("alice/happy.sad", _MODEL, None) is not None
+        folded = _fold_manifold_to_profile_with_identity(
+            "alice/happy.sad", _MODEL, None,
+        )
+        assert folded is not None
+        assert folded[1:] == ("alice", "happy.sad")
 
     def test_fold_all_fitted_excludes_target(self) -> None:
         from saklas.cli.runners import _fold_all_fitted_manifolds

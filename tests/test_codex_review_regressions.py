@@ -19,11 +19,9 @@ from typing import Any
 import pytest
 import torch
 
-from saklas.core.errors import StaleSidecarError
 from saklas.core.session import (
     ConcurrentExtractionError, GenState, SaklasSession,
 )
-from saklas.io import packs
 
 
 def _stub_session_with_lock() -> SaklasSession:
@@ -79,117 +77,15 @@ def test_extract_releases_lock_on_path_through_phase_gate():
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 fix — _try_autoload_vector enforces statements_sha256 too
+# Phase 2 — _try_autoload_vector stale-statements contract
 # ---------------------------------------------------------------------------
-
-def test_autoload_raises_on_stale_statements(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-):
-    """The session-level autoload path must apply the same
-    ``statements_sha256`` contract as ``bootstrap_probes``.  Otherwise
-    ``/steer happy.sad`` silently loads a stale tensor that
-    ``bootstrap_probes`` would have rejected."""
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.delenv("SAKLAS_ALLOW_STALE", raising=False)
-
-    # Build a concept folder with a stale tensor (recorded sha doesn't
-    # match the live statements.json).
-    cdir = tmp_path / "vectors" / "default" / "zz-stale"
-    cdir.mkdir(parents=True)
-    stmts_path = cdir / "statements.json"
-    stmts_path.write_text("[]")
-    extraction_time_sha = packs.hash_file(stmts_path)
-
-    from saklas.core.vectors import save_profile
-    save_profile(
-        {0: torch.zeros(8, dtype=torch.float32)},
-        str(cdir / "google__gemma-2-2b-it.safetensors"),
-        {"method": "contrastive_pca", "statements_sha256": extraction_time_sha},
-    )
-
-    # User edits statements; refresh pack.json so integrity passes.
-    stmts_path.write_text('[["my edit", "after extraction"]]')
-    files: dict[str, str] = {
-        "statements.json": packs.hash_file(stmts_path),
-        "google__gemma-2-2b-it.safetensors": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.safetensors"),
-        "google__gemma-2-2b-it.json": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.json"),
-    }
-    packs.PackMetadata(
-        name="zz-stale", description="x", version="1.0.0", license="MIT",
-        tags=["custom"], recommended_alpha=0.5, source="bundled",
-        files=files,
-    ).write(cdir)
-
-    # Stub a session that exposes just the autoload entry point.
-    s = _stub_session_with_lock()
-    s._model_info = {"model_id": "google/gemma-2-2b-it"}
-    from torch import device
-    s._device = device("cpu")
-    s._dtype = torch.float32
-    s._profiles = {}
-    # Tickle the selectors cache so _all_concepts sees our planted folder.
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    with pytest.raises(StaleSidecarError) as excinfo:
-        s._try_autoload_vector("zz-stale")
-
-    msg = str(excinfo.value)
-    assert "default/zz-stale" in msg
-    assert "google/gemma-2-2b-it" in msg
-    assert "saklas pack refresh" in msg
-    assert "SAKLAS_ALLOW_STALE" in msg
-
-
-def test_autoload_allow_stale_env_var_escape_hatch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-):
-    """``SAKLAS_ALLOW_STALE=1`` bypasses the autoload staleness check —
-    matching ``bootstrap_probes`` semantics."""
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.setenv("SAKLAS_ALLOW_STALE", "1")
-
-    cdir = tmp_path / "vectors" / "default" / "zz-stale"
-    cdir.mkdir(parents=True)
-    stmts_path = cdir / "statements.json"
-    stmts_path.write_text("[]")
-    extraction_time_sha = packs.hash_file(stmts_path)
-
-    from saklas.core.vectors import save_profile
-    save_profile(
-        {0: torch.zeros(8, dtype=torch.float32)},
-        str(cdir / "google__gemma-2-2b-it.safetensors"),
-        {"method": "contrastive_pca", "statements_sha256": extraction_time_sha},
-    )
-    stmts_path.write_text('[["my edit", "after extraction"]]')
-    files: dict[str, str] = {
-        "statements.json": packs.hash_file(stmts_path),
-        "google__gemma-2-2b-it.safetensors": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.safetensors"),
-        "google__gemma-2-2b-it.json": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.json"),
-    }
-    packs.PackMetadata(
-        name="zz-stale", description="x", version="1.0.0", license="MIT",
-        tags=["custom"], recommended_alpha=0.5, source="bundled",
-        files=files,
-    ).write(cdir)
-
-    s = _stub_session_with_lock()
-    s._model_info = {"model_id": "google/gemma-2-2b-it"}
-    from torch import device
-    s._device = device("cpu")
-    s._dtype = torch.float32
-    s._profiles = {}
-
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    # No raise — allow-stale lets it through and the tensor lands.
-    s._try_autoload_vector("zz-stale")
-    assert "zz-stale" in s._profiles
+# NOTE: ``test_autoload_raises_on_stale_statements`` and
+# ``test_autoload_allow_stale_env_var_escape_hatch`` were deleted in 4.0.
+# ``SaklasSession._try_autoload_vector`` (the ``vectors/``-pack safetensors
+# scan that re-checked ``statements_sha256``) was removed; profile resolution
+# now folds a fitted manifold via ``_ensure_profile_registered`` (the legacy
+# ``vectors/`` folder is only *ported* to a manifold on first touch, then
+# re-fit — there is no stale-tensor autoload path left to guard).
 
 
 # ---------------------------------------------------------------------------

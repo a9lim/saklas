@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from saklas.io.packs import Sidecar, hash_file
+from saklas.io.packs import hash_file
 from saklas.io.paths import (
     model_dir,
     neutral_statements_path,
@@ -68,9 +68,9 @@ def bootstrap_layer_means(
 
     if ts_path.exists() and sc_path.exists():
         try:
-            sc = Sidecar.load(sc_path)
-            if current_ns_hash is None or sc.statements_sha256 == current_ns_hash:
-                profile, _ = load_profile(str(ts_path))
+            profile, meta = load_profile(str(ts_path))
+            recorded_sha = meta.get("statements_sha256")
+            if current_ns_hash is None or recorded_sha == current_ns_hash:
                 log.debug("Loaded cached layer means")
                 return profile
             log.info("Layer means stale (neutral_statements changed); recomputing")

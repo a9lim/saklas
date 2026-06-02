@@ -776,8 +776,12 @@ def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch: pytest.Monke
 
 
 def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Option C ``--sae <concept>``: no fresh extract — session autoload
-    picks the unique SAE tensor already on disk.
+    """Option C ``--sae <concept>``: no fresh extract — the unified profile
+    resolver (``_ensure_profile_registered``, fold a fitted manifold) picks
+    the unique SAE variant already on disk.
+
+    (4.0: the TUI calls ``_ensure_profile_registered`` rather than the removed
+    ``_try_autoload_vector``.)
     """
     import torch
     from saklas.io import selectors as _sel
@@ -791,12 +795,12 @@ def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, 
         raise AssertionError("session.extract must not run for bare --sae")
     app._session.extract = _fail_extract
 
-    # _try_autoload_vector populates _profiles[<concept>:sae].
-    def _autoload(canonical: Any, *, variant: Any) -> None:
-        assert canonical == "honest"
-        assert variant == "sae"
+    # _ensure_profile_registered populates _profiles[<concept>:sae].
+    def _ensure(key: Any, **kw: Any) -> Any:
+        assert key == "honest:sae"
         app._session._profiles["honest:sae"] = {0: torch.zeros(4)}
-    app._session._try_autoload_vector = _autoload
+        return app._session._profiles["honest:sae"]
+    app._session._ensure_profile_registered = _ensure
 
     def _run_worker(fn: Any, thread: bool = True) -> None:
         fn()
@@ -931,14 +935,18 @@ def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch:
     cached_keys = {"alice/honest.deceptive", "alice/warm.clinical"}
 
     import torch
+    from saklas.core.session import VectorNotRegisteredError
 
-    def _autoload(canonical: Any, *, variant: Any = "raw") -> None:
-        # Simulate cache hit for the two pre-baked tensors; miss for the third.
-        # A real tensor (not object()) so the bulk handler's Profile(...) wrap
-        # — which re-validates the cached dict before re-registering — passes.
-        if canonical in cached_keys:
-            app._session._profiles[canonical] = {0: torch.zeros(2)}
-    app._session._try_autoload_vector = _autoload
+    def _ensure(key: Any, **kw: Any) -> Any:
+        # Simulate cache hit (fitted manifold folds) for the two pre-baked
+        # tensors; miss for the third.  A real tensor (not object()) so the
+        # bulk handler's Profile(...) wrap — which re-validates the cached
+        # dict before re-registering — passes.
+        if key in cached_keys:
+            app._session._profiles[key] = {0: torch.zeros(2)}
+            return app._session._profiles[key]
+        raise VectorNotRegisteredError(f"no manifold for '{key}'")
+    app._session._ensure_profile_registered = _ensure
     app.run_worker = MagicMock()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
     app._refresh_left_panel = MagicMock()

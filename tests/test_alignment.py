@@ -252,32 +252,10 @@ class TestAlignmentCache:
 
 
 # ---------------------------------------------------------------------------
-# Sidecar transfer fields round-trip through packs.Sidecar.
+# NOTE: ``TestSidecarTransferFields::test_round_trip`` was deleted in 4.0 —
+# ``saklas.io.packs.Sidecar`` (the ``vectors/`` per-tensor sidecar carrying the
+# ``source_model_id`` / ``alignment_map_hash`` / ``transfer_quality_estimate``
+# transfer fields) was removed.  Cross-model transfer is a manifold operation
+# now (``transfer_manifold`` writes a ``_from-<safe_src>`` ``ManifoldSidecar``);
+# its round-trip is covered by the manifold transfer tests.
 # ---------------------------------------------------------------------------
-
-
-class TestSidecarTransferFields:
-    def test_round_trip(self, tmp_path: Path) -> None:
-        from saklas.io.packs import Sidecar
-
-        sc = Sidecar(
-            method="procrustes_transfer",
-            saklas_version="1.6.0",
-            source_model_id="google/gemma-3-4b-it",
-            alignment_map_hash="deadbeef",
-            transfer_quality_estimate=0.78,
-        )
-        path = tmp_path / "sidecar.json"
-        sc.write(path)
-
-        with open(path) as f:
-            raw = json.load(f)
-        assert raw["source_model_id"] == "google/gemma-3-4b-it"
-        assert raw["alignment_map_hash"] == "deadbeef"
-        assert raw["transfer_quality_estimate"] == pytest.approx(0.78)
-
-        loaded = Sidecar.load(path)
-        assert loaded.method == "procrustes_transfer"
-        assert loaded.source_model_id == "google/gemma-3-4b-it"
-        assert loaded.alignment_map_hash == "deadbeef"
-        assert loaded.transfer_quality_estimate == pytest.approx(0.78)

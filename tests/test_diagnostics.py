@@ -16,7 +16,6 @@ import torch
 
 from saklas.core import vectors as V
 from saklas.core.profile import Profile
-from saklas.io.packs import Sidecar
 
 
 # ---------------------------------------------------------------------------
@@ -75,22 +74,6 @@ class TestSidecarRoundTrip:
 
         _, meta = V.load_profile(str(path))
         assert "diagnostics" not in meta
-
-    def test_sidecar_dataclass_roundtrip(self, tmp_path: Path) -> None:
-        # Mirror the same shape through io.packs.Sidecar so packs.py
-        # readers see the same field consistently.
-        sc = Sidecar(
-            method="contrastive_pca",
-            saklas_version="1.6.0",
-            diagnostics_by_layer={0: {"evr": 0.5, "inter_pair_alignment": 0.8}},
-        )
-        path = tmp_path / "sidecar.json"
-        sc.write(path)
-
-        loaded = Sidecar.load(path)
-        assert loaded.diagnostics_by_layer is not None
-        assert loaded.diagnostics_by_layer[0]["evr"] == pytest.approx(0.5)
-        assert loaded.diagnostics_by_layer[0]["inter_pair_alignment"] == pytest.approx(0.8)
 
 
 class TestProfileSurface:

@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Optional
 
 from saklas.core.errors import SaklasError
-from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata
-from saklas.io.paths import manifolds_dir, vectors_dir
+from saklas.io.packs import NAME_REGEX
+from saklas.io.paths import manifold_dir, manifolds_dir
 
 _VARIANT_REGEX = _re.compile(
     r"^(raw|sae(?:-[a-z0-9._-]+)?|role(?:-[a-z0-9._-]+)?|from(?:-[a-z0-9._-]+)?)$"
@@ -59,10 +59,15 @@ class Selector:
 
 @dataclass
 class ResolvedConcept:
+    """An installed concept — a fitted/authored manifold (4.0).
+
+    ``folder`` is the manifold folder (``~/.saklas/manifolds/<ns>/<name>/``);
+    ``tags`` carries the manifold's category tags for ``tag:`` selectors.
+    """
     namespace: str
     name: str
     folder: Path
-    metadata: PackMetadata
+    tags: list[str]
 
 
 _VALID_PREFIXES = {"tag", "namespace", "model"}
@@ -129,27 +134,30 @@ def invalidate() -> None:
 
 
 def _all_concepts() -> list[ResolvedConcept]:
-    root = vectors_dir()
+    """Every installed concept — i.e. every installed manifold (4.0).
+
+    Concepts and steering manifolds are the same artifact now, so this walks
+    ``manifolds_dir()`` via :func:`~saklas.io.manifolds.iter_manifold_folders`
+    (which already skips malformed folders).  Memoized on the manifolds root and
+    cleared by :func:`invalidate`, exactly as the manifold-label index is.
+    """
+    root = manifolds_dir()
     cached = _concepts_cache.get(root)
     if cached is not None:
         return cached
-    if not root.is_dir():
-        _concepts_cache[root] = []
-        return _concepts_cache[root]
+    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
+
     out: list[ResolvedConcept] = []
-    for ns_dir in sorted(root.iterdir()):
-        if not ns_dir.is_dir():
-            continue
-        for cdir in sorted(ns_dir.iterdir()):
-            if not cdir.is_dir() or not (cdir / "pack.json").is_file():
-                continue
-            try:
-                meta = PackMetadata.load(cdir)
-            except PackFormatError:
-                continue
-            out.append(ResolvedConcept(
-                namespace=ns_dir.name, name=cdir.name, folder=cdir, metadata=meta,
-            ))
+    try:
+        folders = list(iter_manifold_folders())
+    except ManifoldFormatError:
+        _concepts_cache[root] = out
+        return out
+    for ns, mf in folders:
+        out.append(ResolvedConcept(
+            namespace=ns, name=mf.name, folder=manifold_dir(ns, mf.name),
+            tags=list(mf.tags or []),
+        ))
     _concepts_cache[root] = out
     return out
 
@@ -164,18 +172,24 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
         return [c for c in concepts if c.namespace == selector.value]
 
     if selector.kind == "tag":
-        return [c for c in concepts if selector.value in c.metadata.tags]
+        return [c for c in concepts if selector.value in c.tags]
 
     if selector.kind == "model":
-        # ``model:X`` matches any concept with an installed tensor for X,
+        # ``model:X`` matches any concept (manifold) with a fitted tensor for X,
         # regardless of variant — raw or SAE.
         # parse() guarantees selector.value is non-None for kind="model".
         assert selector.value is not None
-        from saklas.io.packs import enumerate_variants
-        return [
-            c for c in concepts
-            if enumerate_variants(c.folder, selector.value)
-        ]
+        from saklas.io.paths import parse_tensor_filename, safe_model_id
+        sid = safe_model_id(selector.value)
+
+        def _has_tensor(folder: Path) -> bool:
+            for p in folder.glob("*.safetensors"):
+                parsed = parse_tensor_filename(p.name)
+                if parsed is not None and parsed[0] == sid:
+                    return True
+            return False
+
+        return [c for c in concepts if _has_tensor(c.folder)]
 
     if selector.kind == "name":
         matches = [
@@ -197,43 +211,27 @@ def resolve(selector: Selector) -> list[ResolvedConcept]:
 def resolve_pole(
     raw: str, namespace: Optional[str] = None,
 ) -> tuple[str, int, Optional["ResolvedConcept"], str]:
-    """Resolve a user-typed concept reference to ``(canonical, sign, match, variant)``.
+    """Peel a ``:variant`` suffix and canonicalize a concept reference.
 
     Grammar: ``<name_part>[":"<variant>]`` where ``<variant>`` is ``raw``
     (the default when no suffix is present), ``sae`` (unique SAE variant),
-    ``sae-<release>``, ``role``, or ``role-<id>``. The name part feeds the
-    existing pole-alias pipeline; variant is passed through unchanged for
-    callers to propagate to autoload / registry-key selection.
+    ``sae-<release>``, ``role``, ``role-<id>``, or ``from``/``from-<src>``.
+    Returns ``(canonical, +1, None, variant)`` — the canonicalized slug, a
+    positive sign, no resolved match, and the parsed variant.
 
-    Alias resolution for bipolar packs: if the user types a single-pole
-    name that appears on either side of an installed bipolar concept,
-    return the full composite with a sign of +1 (positive pole) or -1
-    (negative pole). Callers multiply the user-supplied alpha by ``sign``
-    before storing it.
-
-    Examples (assuming ``default/angry.calm`` is installed):
-      ``resolve_pole("angry")`` -> ``("angry.calm", +1, <resolved>, "raw")``
-      ``resolve_pole("calm")``  -> ``("angry.calm", -1, <resolved>, "raw")``
-      ``resolve_pole("angry.calm")`` -> ``("angry.calm", +1, <resolved>, "raw")``
-      ``resolve_pole("angry:sae")``  -> ``("angry.calm", +1, <resolved>, "sae")``
-
-    Not-installed names fall through as fresh monopolar concepts with
-    sign +1 and ``match=None`` so the caller can still feed them into
-    the extraction pipeline.
+    4.0 note: bipolar-pole alias resolution (``wolf`` → ``deer.wolf @ -0.5``)
+    moved entirely to the **manifold** tier — a bipolar concept is a 2-node
+    ``pca`` manifold, so a bare pole resolves through
+    :func:`resolve_manifold_label` (the node) / :func:`resolve_manifold_name`
+    (the composite name) in :func:`resolve_bare_name`, which the steering
+    grammar consults *before* the plain-vector fall-through.  This function no
+    longer scans installed concepts (doing so would only collide with the
+    manifold node), so ``match`` is always ``None`` and ``sign`` always ``+1``.
 
     Raises:
         SelectorError: when the ``:variant`` suffix doesn't match
-            ``_VARIANT_REGEX`` (``raw`` | ``pca`` | ``sae`` |
-            ``sae-<release>`` | ``role`` | ``role-<id>`` | ``from`` |
-            ``from-<src>``).
-        AmbiguousSelectorError: when multiple installed concepts match
-            the input under different canonical names (e.g. both
-            ``alice/angry`` and ``default/angry.calm`` exist and the
-            caller didn't supply a namespace). Also raised for
-            intra-namespace collisions like ``default/happy.sad`` +
-            ``default/happy.calm``.
+            ``_VARIANT_REGEX``.
     """
-    # Variant suffix strips first — pole alias logic is variant-agnostic.
     variant = "raw"
     if ":" in raw:
         name_part, maybe_variant = raw.rsplit(":", 1)
@@ -243,46 +241,11 @@ def resolve_pole(
         else:
             raise SelectorError(f"unknown variant '{maybe_variant}' in '{raw}'")
 
-    # Lazy import to avoid a cycle: session.py imports this module for
-    # the broadened extract() lookup.
-    from saklas.core.session import BIPOLAR_SEP, canonical_concept_name
+    # Lazy import to avoid a cycle: session.py imports this module.
+    from saklas.core.session import canonical_concept_name
 
     slug = canonical_concept_name(raw)
-    scope = [c for c in _all_concepts()
-             if namespace is None or c.namespace == namespace]
-
-    matches: list[tuple[str, int, ResolvedConcept]] = []
-    for c in scope:
-        if c.name == slug:
-            matches.append((c.name, +1, c))
-            continue
-        if BIPOLAR_SEP in c.name:
-            pos, neg = c.name.split(BIPOLAR_SEP, 1)
-            if pos == slug:
-                matches.append((c.name, +1, c))
-            elif neg == slug:
-                matches.append((c.name, -1, c))
-
-    if not matches:
-        return slug, +1, None, variant
-
-    # Ambiguous if the matches don't collapse to a single (canonical, sign)
-    # or span multiple namespaces when none was specified — both raise the
-    # same error class as resolve() does for plain selectors.
-    canonicals = {(m[0], m[1]) for m in matches}
-    namespaces = {m[2].namespace for m in matches}
-    if len(canonicals) > 1 or (namespace is None and len(namespaces) > 1):
-        qualified = ", ".join(
-            f"{m[2].namespace}/{m[0]}{' (negated)' if m[1] < 0 else ''}"
-            for m in matches
-        )
-        raise AmbiguousSelectorError(
-            f"ambiguous pole '{raw}': matches {qualified}. "
-            f"Specify the full composite or a namespace."
-        )
-
-    c_name, c_sign, c_resolved = matches[0]
-    return c_name, c_sign, c_resolved, variant
+    return slug, +1, None, variant
 
 
 @dataclass(frozen=True)

@@ -7,52 +7,7 @@ from pathlib import Path
 import json
 
 from saklas.io import selectors as sel
-from saklas.io import packs
-
-
-# Synthetic bundled-vectors fixture — see the matching helpers in
-# ``tests/test_packs.py`` / ``tests/test_atomic.py``.  4.0 step 6b emptied
-# ``saklas/data/vectors/`` (bundled concepts ship as manifolds now), so
-# ``bundled_concept_names()`` is empty and ``materialize_bundled()`` copies
-# nothing real.  This test pins the materialize+invalidate visibility contract,
-# so we stand up synthetic bundled concepts and redirect the
-# ``saklas.data.vectors`` resource lookup at them.
-
-# Names NOT in ``bundled_manifold_names()`` so nothing routes elsewhere.
-_SYNTH_CONCEPTS = ["synthvec.alpha", "synthvec.beta"]
-
-
-def _install_synthetic_bundle(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    bundle_root = tmp_path / "_synth_data_vectors"
-    bundle_root.mkdir()
-    for concept in _SYNTH_CONCEPTS:
-        cdir = bundle_root / concept
-        cdir.mkdir()
-        (cdir / "pack.json").write_text(json.dumps({
-            "name": concept,
-            "description": f"synthetic bundled {concept}",
-            "format_version": packs.PACK_FORMAT_VERSION,
-            "version": "1.0.0",
-            "license": "MIT",
-            "tags": ["synthetic"],
-            "recommended_alpha": 0.5,
-            "source": "bundled",
-            "files": {},
-        }))
-        (cdir / "statements.json").write_text(
-            json.dumps([[f"{concept} pos", f"{concept} neg"]])
-        )
-
-    real_files = packs._resources.files
-
-    def _patched_files(anchor: str):
-        if anchor == "saklas.data.vectors":
-            return bundle_root
-        return real_files(anchor)
-
-    monkeypatch.setattr(packs._resources, "files", _patched_files)
+from saklas.io.manifolds import create_discover_manifold_folder
 
 
 def test_parse_bare_name():
@@ -110,16 +65,23 @@ def test_parse_invalid_prefix_raises():
 
 
 def _mk(tmp_path: Path, ns: str, name: str, tags: list[str] | None = None) -> Path:
-    d = tmp_path / "vectors" / ns / name
-    d.mkdir(parents=True)
-    (d / "statements.json").write_text("[]")
-    meta = packs.PackMetadata(
-        name=name, description="x", version="1.0.0", license="MIT",
-        tags=tags or [], recommended_alpha=0.5, source="local",
-        files={"statements.json": packs.hash_file(d / "statements.json")},
+    """Author an installed concept as a 2-node ``pca`` manifold (4.0).
+
+    Concepts and steering manifolds are the same artifact now, so an
+    installed concept is a manifold folder under ``manifolds/<ns>/<name>/``.
+    ``tags`` are patched into ``manifold.json`` so ``tag:`` selectors resolve.
+    """
+    folder = create_discover_manifold_folder(
+        ns, name, "x", fit_mode="pca",
+        node_corpora={"pos": ["a statement."], "neg": ["b statement."]},
+        hyperparams={"max_dim": 1},
     )
-    meta.write(d)
-    return d
+    if tags:
+        mpath = folder / "manifold.json"
+        data = json.loads(mpath.read_text())
+        data["tags"] = list(tags)
+        mpath.write_text(json.dumps(data))
+    return folder
 
 
 def test_resolve_bare_unique(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -175,6 +137,27 @@ def test_resolve_all(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert len(results) == 2
 
 
+def _fake_fitted_tensor(folder: Path, filename: str) -> None:
+    """Write a placeholder tensor + minimal sidecar so the manifold loads.
+
+    ``model:`` resolution only checks tensor *filenames*, never tensor
+    contents, so the bytes can be junk — but ``ManifoldFolder.load`` demands
+    a ``.json`` sidecar beside every ``.safetensors``, so we write a lean
+    one (a ``domain`` object is the only hard requirement of
+    ``ManifoldSidecar.load``).
+    """
+    (folder / filename).write_bytes(b"x")
+    sidecar = Path(folder) / (Path(filename).stem + ".json")
+    sidecar.write_text(json.dumps({
+        "method": "manifold_pca",
+        "saklas_version": "0",
+        "domain": {"kind": "custom", "dim": 1},
+        "node_count": 2,
+        "node_labels": ["pos", "neg"],
+        "fit_mode": "pca",
+    }))
+
+
 def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``model:X`` matches any concept with a tensor for X — raw or SAE.
 
@@ -190,15 +173,15 @@ def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch: pytest.MonkeyPat
 
     # Concept A: has raw tensor only.
     a = _mk(tmp_path, "default", "a_raw_only")
-    (a / f"{sid}.safetensors").write_bytes(b"x")
+    _fake_fitted_tensor(a, f"{sid}.safetensors")
 
     # Concept B: has only an SAE tensor for this model.
     b = _mk(tmp_path, "default", "b_sae_only")
-    (b / tensor_filename(model_id, release="my-release")).write_bytes(b"x")
+    _fake_fitted_tensor(b, tensor_filename(model_id, release="my-release"))
 
     # Concept C: has a tensor for a different model — should not match.
     c = _mk(tmp_path, "default", "c_other_model")
-    (c / f"{safe_model_id('meta/llama-3-8b')}.safetensors").write_bytes(b"x")
+    _fake_fitted_tensor(c, f"{safe_model_id('meta/llama-3-8b')}.safetensors")
 
     sel.invalidate()
     results = sel.resolve(sel.parse(f"model:{model_id}"))
@@ -233,175 +216,90 @@ def test_parse_args_two_models_raises():
 # --- resolve_pole alias resolution -----------------------------------------
 
 class TestResolvePole:
-    def test_monopolar_exact_match(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "default", "agentic")
-        sel.invalidate()
+    """4.0: ``resolve_pole`` no longer scans disk or resolves bipolar aliases.
+
+    It always returns ``(canonical_slug, +1, None, variant)`` — peeling a
+    ``:variant`` suffix and canonicalizing the name.  Bipolar-pole STEERING
+    (``wolf`` → ``deer.wolf``) moved to the manifold tier
+    (:func:`resolve_manifold_label` / ``resolve_bare_name`` in the steering
+    grammar), so the old positive/negative-alias, collision, sign-flip, and
+    namespaced-scoped tests are obsolete and were deleted.
+    """
+
+    def test_monopolar_exact_match(self) -> None:
         name, sign, m, _v = sel.resolve_pole("agentic")
         assert name == "agentic"
         assert sign == 1
-        assert m is not None
+        assert m is None
 
-    def test_positive_pole_alias(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "default", "angry.calm")
-        sel.invalidate()
-        name, sign, m, _v = sel.resolve_pole("angry")
-        assert name == "angry.calm"
-        assert sign == 1
-
-    def test_negative_pole_alias(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "default", "angry.calm")
-        sel.invalidate()
-        name, sign, m, _v = sel.resolve_pole("calm")
-        assert name == "angry.calm"
-        assert sign == -1
-
-    def test_composite_literal(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "default", "angry.calm")
-        sel.invalidate()
+    def test_composite_literal(self) -> None:
         name, sign, m, _v = sel.resolve_pole("angry.calm")
         assert name == "angry.calm"
         assert sign == 1
+        assert m is None
 
-    def test_slug_normalization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "default", "high_context.low_context")
-        sel.invalidate()
+    def test_slug_normalization(self) -> None:
         name, sign, _m, _v = sel.resolve_pole("High-Context")
-        assert name == "high_context.low_context"
+        assert name == "high_context"
         assert sign == 1
 
-    def test_unknown_falls_through(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        sel.invalidate()
+    def test_unknown_falls_through(self) -> None:
         name, sign, m, _v = sel.resolve_pole("xyzzy")
         assert name == "xyzzy"
         assert sign == 1
         assert m is None
 
-    def test_collision_monopolar_vs_bipolar(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "alice", "angry")
-        _mk(tmp_path, "default", "angry.calm")
-        sel.invalidate()
-        with pytest.raises(sel.AmbiguousSelectorError):
-            sel.resolve_pole("angry")
 
-    def test_collision_two_bipolars(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "default", "angry.calm")
-        _mk(tmp_path, "default", "angry.fearful")
-        sel.invalidate()
-        with pytest.raises(sel.AmbiguousSelectorError):
-            sel.resolve_pole("angry")
-
-    def test_namespaced_scoped_resolve(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        _mk(tmp_path, "bob", "deer.wolf")
-        _mk(tmp_path, "alice", "wolf")
-        sel.invalidate()
-        # Scoped to bob/: wolf -> deer.wolf with sign -1
-        name, sign, m, _variant = sel.resolve_pole("wolf", namespace="bob")
-        assert name == "deer.wolf"
-        assert sign == -1
-        assert m is not None  # scoped resolve with installed concept always matches
-        assert m.namespace == "bob"
-        # Scoped to alice/: wolf is a monopolar exact match
-        name, sign, m, _variant = sel.resolve_pole("wolf", namespace="alice")
-        assert name == "wolf"
-        assert sign == 1
-        assert m is not None  # scoped resolve with installed concept always matches
-        assert m.namespace == "alice"
-
-
-def _install_minimal_pack(saklas_home: Path, name: str) -> None:
-    """Lay down a minimal pack.json tree so _all_concepts finds the name."""
-    import json
-    folder = saklas_home / "vectors" / "default" / name
-    folder.mkdir(parents=True)
-    (folder / "pack.json").write_text(json.dumps({
-        "name": name,
-        "description": "test",
-        "version": "0.0.0",
-        "license": "MIT",
-        "tags": [],
-        "recommended_alpha": 0.3,
-        "source": "local",
-        "files": {},
-        "format_version": packs.PACK_FORMAT_VERSION,
-    }))
-
-
-def test_resolve_pole_strips_raw_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "honest.deceptive")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.io.selectors import resolve_pole, invalidate
-    invalidate()
+def test_resolve_pole_strips_raw_variant() -> None:
+    from saklas.io.selectors import resolve_pole
 
     canonical, sign, match, variant = resolve_pole("honest:raw")
-    assert canonical == "honest.deceptive"
+    assert canonical == "honest"
     assert sign == 1
-    assert match is not None
+    assert match is None
     assert variant == "raw"
 
 
-def test_resolve_pole_sae_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "honest.deceptive")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.io.selectors import resolve_pole, invalidate
-    invalidate()
+def test_resolve_pole_sae_variant() -> None:
+    from saklas.io.selectors import resolve_pole
 
     canonical, sign, match, variant = resolve_pole("honest:sae")
-    assert canonical == "honest.deceptive"
+    assert canonical == "honest"
+    assert match is None
     assert variant == "sae"
 
 
-def test_resolve_pole_sae_with_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "honest.deceptive")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.io.selectors import resolve_pole, invalidate
-    invalidate()
+def test_resolve_pole_sae_with_release() -> None:
+    from saklas.io.selectors import resolve_pole
 
     canonical, sign, match, variant = resolve_pole("honest:sae-gemma-scope-2b-pt-res-canonical")
     assert variant == "sae-gemma-scope-2b-pt-res-canonical"
 
 
-def test_resolve_pole_no_variant_defaults_to_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "honest.deceptive")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.io.selectors import resolve_pole, invalidate
-    invalidate()
+def test_resolve_pole_no_variant_defaults_to_raw() -> None:
+    from saklas.io.selectors import resolve_pole
 
     canonical, sign, match, variant = resolve_pole("honest")
     assert variant == "raw"
 
 
-def test_resolve_pole_variant_preserves_pole_sign(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "deer.wolf")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+def test_resolve_pole_variant_strips_suffix() -> None:
+    """A ``:variant`` suffix peels off; the name canonicalizes, sign stays +1.
 
-    from saklas.io.selectors import resolve_pole, invalidate
-    invalidate()
+    (Pre-4.0 this asserted a bipolar sign flip for ``wolf:sae`` →
+    ``deer.wolf @ -1``; that resolution moved to the manifold tier.)
+    """
+    from saklas.io.selectors import resolve_pole
 
     canonical, sign, match, variant = resolve_pole("wolf:sae")
-    assert canonical == "deer.wolf"
-    assert sign == -1
+    assert canonical == "wolf"
+    assert sign == 1
+    assert match is None
     assert variant == "sae"
 
 
-def test_resolve_pole_rejects_invalid_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "honest.deceptive")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.io.selectors import resolve_pole, invalidate, SelectorError
-    invalidate()
+def test_resolve_pole_rejects_invalid_variant() -> None:
+    from saklas.io.selectors import resolve_pole, SelectorError
 
     with pytest.raises(SelectorError):
         resolve_pole("honest:weird-variant")
@@ -431,31 +329,23 @@ def test_parse_role_variant():
     assert s.namespace is None
 
 
-def test_resolve_pole_role_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "angry.calm")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.io.selectors import resolve_pole, invalidate
-    invalidate()
+def test_resolve_pole_role_variant() -> None:
+    from saklas.io.selectors import resolve_pole
 
     canonical, sign, match, variant = resolve_pole("angry:role-pirate")
-    assert canonical == "angry.calm"
+    assert canonical == "angry"
     assert sign == 1
-    assert match is not None
+    assert match is None
     assert variant == "role-pirate"
 
 
-def test_resolve_pole_role_with_dotted_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_minimal_pack(tmp_path, "happy.sad")
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    from saklas.io.selectors import resolve_pole, invalidate
-    invalidate()
+def test_resolve_pole_role_with_dotted_id() -> None:
+    from saklas.io.selectors import resolve_pole
 
     canonical, sign, match, variant = resolve_pole("happy.sad:role-mad-scientist")
     assert canonical == "happy.sad"
     assert sign == 1
-    assert match is not None
+    assert match is None
     assert variant == "role-mad-scientist"
 
 
@@ -475,42 +365,8 @@ def test_parse_role_with_namespace():
     assert s.namespace == "default"
 
 
-def test_materialize_then_invalidate_makes_bundled_visible(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The contract `SaklasSession.__init__` relies on for bundled visibility.
-
-    Regression: when bundled concepts are added (e.g. via
-    `regenerate_bundled_statements.py`) but the user-cache hasn't been
-    refreshed since, `_all_concepts()` doesn't see them — and
-    `session.extract(name)` silently falls through to the local namespace
-    and re-runs scenario+pair generation instead of using the bundled
-    statements. `SaklasSession.__init__` calls `materialize_bundled()` +
-    `selectors.invalidate()` to guarantee bundled visibility per session
-    boot. This test pins that invariant at the helper level so the
-    contract holds even when probes=[] skips probes_bootstrap entirely.
-    """
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    _install_synthetic_bundle(monkeypatch, tmp_path)
-    sel.invalidate()
-
-    # Prime the cache with an empty walk — bundled not visible yet.
-    user_default = tmp_path / "vectors" / "default"
-    assert not user_default.exists()
-    initial = sel._all_concepts()
-    assert all(c.namespace != "default" for c in initial)
-
-    bundled = set(packs.bundled_concept_names())
-    assert bundled, "test prereq: shipped saklas.data.vectors must be non-empty"
-
-    # The session-init contract: materialize, then invalidate the cache.
-    packs.materialize_bundled()
-    sel.invalidate()
-
-    # Bundled concepts are now in user cache and visible to the selector.
-    assert user_default.is_dir()
-    concepts = sel._all_concepts()
-    names = {c.name for c in concepts if c.namespace == "default"}
-    missing = bundled - names
-    assert not missing, (
-        f"_all_concepts() did not surface bundled concepts after "
-        f"materialize+invalidate: {sorted(missing)}"
-    )
+# NOTE: ``test_materialize_then_invalidate_makes_bundled_visible`` was deleted
+# in 4.0 — it pinned the now-removed ``packs.bundled_concept_names()`` /
+# ``packs.materialize_bundled()`` ``vectors/``-pack visibility contract.
+# Bundled concepts ship as manifolds now
+# (``saklas.io.manifolds.materialize_bundled_manifolds``).

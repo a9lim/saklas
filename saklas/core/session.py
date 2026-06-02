@@ -2,8 +2,6 @@
 from __future__ import annotations
 import asyncio
 import logging
-import os
-import pathlib
 import queue
 import re
 import threading
@@ -16,7 +14,7 @@ from typing import Any, Callable, Iterator, Literal, overload
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from saklas.core.errors import SaklasError, StaleSidecarError
+from saklas.core.errors import SaklasError
 from saklas.core.events import (
     EventBus,
     GenerationFinished,
@@ -38,8 +36,6 @@ from saklas.core.loom import (
 )
 from saklas.core.model import load_model, get_layers, get_model_info
 from saklas.core.monitor import ManifoldMonitor, TraitMonitor
-from saklas.io.packs import PackFormatError, PackMetadata, hash_folder_files
-from saklas.io.paths import concept_dir
 from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import (
@@ -884,16 +880,14 @@ class SaklasSession:
         # ``regenerate_bundled_statements.py``) invisible to the selector
         # layer for the rest of the session.  Calling explicitly here keeps
         # the invariant intact regardless of probe-loading config; the call
-        # is cheap when up-to-date (pack.json format-version short-circuit).
-        # Bundled manifolds (e.g. ``personas``) materialize in the same
-        # pre-invalidate window so the bare-name resolver picks up bundled
-        # manifold node labels alongside bundled bipolar poles.
-        from saklas.io.packs import materialize_bundled as _materialize_bundled
+        # is cheap when up-to-date (format-version short-circuit).  Bundled
+        # concepts and manifolds (e.g. ``happy.sad``, ``personas``) all
+        # materialize in the same pre-invalidate window so the bare-name
+        # resolver picks up every bundled node label.
         from saklas.io.manifolds import (
             materialize_bundled_manifolds as _materialize_bundled_manifolds,
         )
         from saklas.io import selectors as _selectors
-        _materialize_bundled()
         _materialize_bundled_manifolds()
         _selectors.invalidate()
 
@@ -1183,48 +1177,6 @@ class SaklasSession:
             return None
 
     # -- Extraction --
-
-    def _local_concept_folder(
-        self, canonical: str, *, namespace: str = "local",
-    ) -> pathlib.Path:
-        """Return the ``<namespace>/<canonical>/`` folder, creating pack.json if needed.
-
-        User-extracted vectors and generated statements default to
-        ``~/.saklas/vectors/local/<canonical>/``.  Passing ``namespace=``
-        relocates the destination — the webui's vector-extract drawer
-        uses this for the namespace-of-the-vector field (parity with
-        the manifold builder's namespace control).  A minimal pack.json
-        with ``source=local`` is written on first access regardless of
-        namespace — the source field tracks provenance (user-extracted),
-        not folder location.
-        """
-        folder = concept_dir(namespace, canonical)
-        folder.mkdir(parents=True, exist_ok=True)
-        if not (folder / "pack.json").exists():
-            PackMetadata(
-                name=canonical,
-                description=f"User-extracted: {canonical}",
-                version="1.0.0",
-                license="AGPL-3.0-or-later",
-                tags=[],
-                recommended_alpha=0.5,
-                source="local",
-                files={},
-            ).write(folder)
-        return folder
-
-    def _statements_cache_path(self, canonical: str) -> str:
-        folder = self._local_concept_folder(canonical)
-        return str(folder / "statements.json")
-
-    def _update_local_pack_files(self, folder: pathlib.Path) -> None:
-        """Recompute pack.json `files` map after writing new tensors/statements."""
-        try:
-            meta = PackMetadata.load(folder)
-        except PackFormatError:
-            return
-        meta.files = hash_folder_files(folder)
-        meta.write(folder)
 
     def _run_generator(
         self,
@@ -2056,15 +2008,12 @@ class SaklasSession:
                 continue
             target = val.target
             if target not in self._profiles:
-                if ":" in target:
-                    canonical, variant = target.rsplit(":", 1)
-                else:
-                    canonical, variant = target, "raw"
-                # Non-raw variant miss raises AmbiguousVariantError or
-                # UnknownVariantError; let it surface at hook-install with
-                # the shared VectorNotRegisteredError shape.
+                # Resolve via the unified path (fold a fitted manifold, or
+                # port a legacy vectors/ folder on first touch).  A miss /
+                # non-raw variant error surfaces at hook-install with the
+                # shared VectorNotRegisteredError shape.
                 with suppress(Exception):
-                    self._try_autoload_vector(canonical, variant=variant)
+                    self._ensure_profile_registered(target, role="ablation")
             resolved[key] = val
         # Fold in manifold terms.  Like ablation, ``normalized_entries``
         # strips ``ManifoldTerm`` values, so walk ``alphas`` directly.
@@ -2363,13 +2312,13 @@ class SaklasSession:
             )
             if registry_key not in self._profiles:
                 try:
-                    self._try_autoload_vector(
-                        canonical_qualified, variant=variant,
-                    )
+                    # Unified resolution: fold a fitted manifold, or port a
+                    # legacy vectors/ folder on first touch.  May raise
+                    # Ambiguous/UnknownVariantError — keep the user's original
+                    # name in ``out`` so the error surfaces at hook-install
+                    # with a clear message.
+                    self._ensure_profile_registered(registry_key)
                 except Exception:
-                    # Autoload may raise AmbiguousVariantError / UnknownVariantError.
-                    # Keep the user's original name in `out` so the error surfaces
-                    # at hook-install time with a clear message.
                     out[name] = (float(alpha), trig)
                     continue
             effective = float(alpha) * (1 if sign >= 0 else -1)
@@ -2379,105 +2328,6 @@ class SaklasSession:
             else:
                 out[name] = (float(alpha), trig)
         return out
-
-    def _try_autoload_vector(self, canonical: str, *, variant: str = "raw") -> None:
-        """Cache-hit fast path: load an installed concept's tensor into _profiles.
-
-        Walks installed concept packs, finds the first matching ``canonical``,
-        and loads its per-model tensor. ``variant`` is the resolver's output:
-
-        - ``"raw"`` — loads the unsuffixed tensor. Silent on miss (caller
-          falls through to the normal raise path). Matches pre-Task-7 behavior.
-        - ``"sae"`` — loads the unique SAE variant. Raises
-          :class:`AmbiguousVariantError` when more than one is on disk,
-          :class:`UnknownVariantError` when zero exist.
-        - ``"sae-<release>"`` — loads that specific release.
-          :class:`UnknownVariantError` when absent.
-
-        ``canonical`` may be namespace-qualified (``alice/foo``), in which
-        case discovery is scoped to that namespace.  Registered key in
-        ``_profiles`` matches the input form: ``canonical`` for raw, and
-        ``f"{canonical}:{variant}"`` otherwise — so namespace-qualified
-        callers get a namespace-qualified registry key back.
-        """
-        from saklas.io.selectors import _all_concepts
-        from saklas.io.packs import enumerate_variants
-        from saklas.core.errors import AmbiguousVariantError, UnknownVariantError
-        from saklas.core.vectors import load_profile
-
-        # Split namespace prefix so concept discovery scopes to the
-        # namespace the caller specified.  Bare canonicals leave
-        # ``namespace=None`` and pick up the first matching concept
-        # across every namespace (the historical behavior).
-        ns: str | None = None
-        bare_canonical = canonical
-        if "/" in canonical:
-            ns, bare_canonical = canonical.split("/", 1)
-
-        registry_key = canonical if variant == "raw" else f"{canonical}:{variant}"
-        available: list[str] = []
-        for concept in _all_concepts():
-            if ns is not None and concept.namespace != ns:
-                continue
-            if concept.name != bare_canonical:
-                continue
-            variants = enumerate_variants(concept.folder, self.model_id)
-            available.extend(variants.keys())
-
-            if variant == "raw":
-                path = variants.get("raw")
-            elif variant == "sae":
-                sae_paths = {k: v for k, v in variants.items() if k.startswith("sae-")}
-                if len(sae_paths) == 0:
-                    continue
-                if len(sae_paths) > 1:
-                    raise AmbiguousVariantError(
-                        f"concept '{canonical}' has multiple SAE variants for "
-                        f"model '{self.model_id}': {sorted(sae_paths.keys())}. "
-                        f"Specify explicitly with :sae-<release>."
-                    )
-                path = next(iter(sae_paths.values()))
-            else:
-                # "sae-<release>"
-                path = variants.get(variant)
-
-            if path is None:
-                continue
-
-            try:
-                profile_dict, _meta = load_profile(str(path))
-            except Exception:
-                continue
-            # Phase 2 contract: tensor must not be stale relative to the
-            # concept's on-disk statements.json.  bootstrap_probes raises
-            # StaleSidecarError on the same condition; autoload would
-            # otherwise be a silent escape hatch for the same mismatch.
-            recorded_sha = _meta.get("statements_sha256") if _meta else None
-            stmts_path = concept.folder / "statements.json"
-            if recorded_sha and stmts_path.exists():
-                from saklas.io.packs import hash_file as _hash_file
-                if (
-                    _hash_file(stmts_path) != recorded_sha
-                    and os.environ.get("SAKLAS_ALLOW_STALE") != "1"
-                ):
-                    raise StaleSidecarError(
-                        f"{concept.namespace}/{bare_canonical}: statements.json has "
-                        f"changed since this tensor was extracted "
-                        f"(model={self.model_id}). The baked PCA no longer "
-                        f"matches the on-disk pairs. Re-extract: "
-                        f"`saklas pack refresh {concept.namespace}/{bare_canonical} "
-                        f"-m {self.model_id}` — or set SAKLAS_ALLOW_STALE=1 "
-                        f"to load the stale tensor anyway."
-                    )
-            self._profiles[registry_key] = self._promote_profile(profile_dict)
-            return
-
-        # Explicit non-raw variant request that didn't resolve → surface the miss.
-        if variant != "raw":
-            raise UnknownVariantError(
-                f"variant '{variant}' not found for '{canonical}' on model "
-                f"'{self.model_id}' (available: {sorted(set(available)) or 'none'})"
-            )
 
     def _ensure_profile_registered(
         self, name: str, *, role: str = "vector",
@@ -2500,11 +2350,7 @@ class SaklasSession:
            file-only; fitting runs forward passes through the model and can't
            re-enter the generation lock from dispatch, so a freshly-ported
            manifold has no tensor yet and the call raises with the exact
-           ``manifold fit`` command to run (or the bulk migration with ``-m``);
-        4. a current-version or tensor-only ``vectors/`` pack — the residual
-           autoload-fold path (tensor-only HF/GGUF packs have no statements to
-           re-fit, and ``vector extract`` still writes ``vectors/`` until the
-           CLI restructure routes it to manifold authoring).
+           ``manifold fit`` command to run (or the bulk migration with ``-m``).
 
         Raises :class:`VectorNotRegisteredError` when nothing resolves.
         """
@@ -2540,13 +2386,6 @@ class SaklasSession:
                     f"(or `python scripts/upgrade_packs.py --all -m {self.model_id}` "
                     f"to migrate + fit every legacy vector at once)."
                 )
-
-        # (4) Residual autoload-fold: current-version / tensor-only packs.
-        with suppress(Exception):
-            self._try_autoload_vector(canonical, variant=variant)
-        loaded = self._profiles.get(name)
-        if loaded is not None:
-            return loaded
 
         raise VectorNotRegisteredError(
             f"No vector registered for {role} '{name}'"

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from saklas.io import merge, packs
+from saklas.io import merge
 from saklas.io.manifolds import (
     ManifoldFolder, ManifoldSidecar,
     create_baked_manifold_folder, save_baked_manifold_tensor,
@@ -274,30 +274,3 @@ def test_project_away_layer_in_a_not_b():
     assert torch.allclose(result[0], a[0])
     dot = torch.dot(result[1].float(), b[1].float()).item()
     assert abs(dot) < 1e-6
-
-
-# -------------------------------------------------- packs helpers ---
-
-def test_merge_components_stale():
-    comp = {"default/happy": {"alpha": 0.5, "tensor_sha256": "old"}}
-    stale = packs.merge_components_stale(comp, {"default/happy": "new"})
-    assert stale == ["default/happy"]
-    stale = packs.merge_components_stale(comp, {"default/happy": "old"})
-    assert stale == []
-    stale = packs.merge_components_stale(comp, {})
-    assert stale == ["default/happy"]
-
-
-def test_merge_components_status():
-    comp = {
-        "default/happy": {"alpha": 0.5, "tensor_sha256": "old"},
-        "default/sad": {"alpha": 0.5, "tensor_sha256": "old"},
-        "default/angry": {"alpha": 0.5, "tensor_sha256": "old"},
-    }
-    current = {"default/happy": "old", "default/sad": "new"}
-    status = packs.merge_components_status(comp, current)
-    assert status == {
-        "default/happy": "ok",
-        "default/sad": "mismatch",
-        "default/angry": "missing",
-    }

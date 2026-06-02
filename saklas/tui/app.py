@@ -1010,21 +1010,24 @@ class SaklasApp(App[None]):
             def _progress(msg: str) -> None:
                 self.call_from_thread(self._steer_status, msg)
             # Bare ``--sae`` (variant == "sae") routes the load through
-            # session autoload rather than a fresh PCA extract — it
-            # means "use the unique SAE variant that's already on disk".
-            # Ambiguous / missing cases surface via the session errors.
+            # the unified profile resolver (manifold-fold) rather than a
+            # fresh extract — it means "use the SAE variant that's already
+            # on disk". Ambiguous / missing cases surface via the session
+            # errors / the None-check below.
             if variant == "sae" and sae_release is None:
+                from contextlib import suppress as _suppress
                 autoload_key = (
                     concept if namespace is None
                     else f"{namespace}/{concept}"
                 )
-                self._session._try_autoload_vector(autoload_key, variant="sae")
                 key = f"{autoload_key}:sae"
+                with _suppress(Exception):
+                    self._session._ensure_profile_registered(key)
                 profile_dict = self._session._profiles.get(key)
                 if profile_dict is None:
                     raise ValueError(
                         f"no SAE variant loaded for '{autoload_key}' — "
-                        f"run `saklas vector extract {autoload_key} --sae <RELEASE>` "
+                        f"run `saklas subspace extract {autoload_key} --sae <RELEASE>` "
                         f"first, or pick a release with "
                         f"`:sae-<release>` in the concept name."
                     )
@@ -3016,9 +3019,9 @@ class SaklasApp(App[None]):
                 loaded.append(key)
                 continue
             try:
-                self._session._try_autoload_vector(key, variant="raw")
+                self._session._ensure_profile_registered(key)
             except SaklasError:
-                # Stale sidecar / variant errors surface to the user
+                # Unresolved / not-yet-fit concepts surface to the user
                 # below by leaving the concept in ``skipped``; the
                 # detailed message would drown out the bulk summary.
                 pass
