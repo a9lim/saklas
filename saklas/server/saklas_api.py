@@ -29,6 +29,7 @@ import asyncio
 import time
 import uuid
 from collections import deque
+from contextlib import suppress
 from operator import itemgetter
 from typing import Any, Awaitable, Callable, Literal
 
@@ -1778,6 +1779,10 @@ def register_saklas_routes(app: FastAPI) -> None:
             async with ws_send_lock:
                 await websocket.send_json(payload)
 
+        def _queue_tree_event(payload: dict[str, Any]) -> None:
+            with suppress(Exception):
+                loop.call_soon_threadsafe(tree_event_queue.put_nowait, payload)
+
         def _on_loom_event(event: object) -> None:
             if not isinstance(event, LoomMutated):
                 return
@@ -1803,12 +1808,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                 ],
                 "active_node_id": event.active_node_id,
             }
-            try:
-                loop.call_soon_threadsafe(
-                    tree_event_queue.put_nowait, mutated_payload,
-                )
-            except Exception:
-                pass
+            _queue_tree_event(mutated_payload)
             # ``begin_assistant`` and ``branch`` both materialize a new
             # node — surface a separate ``node_created`` event with the
             # parent + role so the client can allocate a render slot
@@ -1826,12 +1826,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                         "role": node.role,
                         "rev": event.rev,
                     }
-                    try:
-                        loop.call_soon_threadsafe(
-                            tree_event_queue.put_nowait, node_payload,
-                        )
-                    except Exception:
-                        pass
+                    _queue_tree_event(node_payload)
 
         loom_unsub = session.events.subscribe(_on_loom_event)
 
@@ -1857,6 +1852,15 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         deferred_incoming: deque[Any] = deque()
 
+        async def _cancel_and_wait(task: asyncio.Task[Any]) -> None:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+
+        def _stop_session_safely() -> None:
+            with suppress(Exception):
+                session.stop()
+
         try:
             while True:
                 msg = (
@@ -1881,8 +1885,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                         })
                         continue
                     await _ws_handle_generate(
-                        websocket, session, parsed,
-                        app.state.default_steering, incoming,
+                        session, parsed, app.state.default_steering, incoming,
                         deferred_incoming, _send_json,
                     )
                 elif mtype == "stop":
@@ -1896,10 +1899,7 @@ def register_saklas_routes(app: FastAPI) -> None:
                     })
         except WebSocketDisconnect:
             # Ensure any stray generation is signaled.
-            try:
-                session.stop()
-            except Exception:
-                pass
+            _stop_session_safely()
             return
         except Exception as e:
             try:
@@ -1909,35 +1909,22 @@ def register_saklas_routes(app: FastAPI) -> None:
                     "code": type(e).__name__,
                 })
             finally:
-                try:
+                with suppress(Exception):
                     await websocket.close(code=1011)
-                except Exception:
-                    pass
         finally:
             # Drop the loom subscription before tearing down the reader
             # so the EventBus stops dispatching into a queue nobody
             # reads.
-            try:
+            with suppress(Exception):
                 loom_unsub()
-            except Exception:
-                pass
-            forwarder_task.cancel()
-            try:
-                await forwarder_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await _cancel_and_wait(forwarder_task)
             # Reader holds the only ``receive_json()`` call on the WS.
             # Cancel + await so the cancellation propagates fully before
             # the connection tears down.
-            reader_task.cancel()
-            try:
-                await reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await _cancel_and_wait(reader_task)
 
 
 async def _ws_handle_generate(
-    websocket: WebSocket,
     session: SaklasSession,
     msg: WSGenerateMessage,
     default_steering: "Steering | None",
@@ -2179,6 +2166,10 @@ async def _ws_handle_generate(
     else:
         seeds = list(derive_seed_schedule(base_seed, n))
 
+    def _stop_session_safely() -> None:
+        with suppress(Exception):
+            session.stop()
+
     # Acquire the session lock for the full N-way batch lifetime so
     # concurrent WS clients serialize FIFO instead of overlapping.
     # ``session.generate_stream`` itself uses the threading ``_gen_lock``
@@ -2327,16 +2318,10 @@ async def _ws_handle_generate(
                         # iteration.
                         if isinstance(incoming_msg, dict):
                             if incoming_msg.get("type") == "stop":
-                                try:
-                                    session.stop()
-                                except Exception:
-                                    pass
+                                _stop_session_safely()
                                 stop_signaled = True
                             elif "_reader_error" in incoming_msg:
-                                try:
-                                    session.stop()
-                                except Exception:
-                                    pass
+                                _stop_session_safely()
                                 stop_signaled = True
                                 # Defer so the outer dispatch loop
                                 # surfaces the error after we wind down.
@@ -2356,10 +2341,7 @@ async def _ws_handle_generate(
                                 deferred_incoming.append(incoming_msg)
                         else:
                             # Disconnect sentinel from the reader.
-                            try:
-                                session.stop()
-                            except Exception:
-                                pass
+                            _stop_session_safely()
                             stop_signaled = True
                             deferred_incoming.append(incoming_msg)
                     if token_get in finished:
