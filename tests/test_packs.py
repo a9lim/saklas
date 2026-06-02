@@ -89,7 +89,7 @@ def test_pack_metadata_parse_minimal(tmp_path: Path):
     folder = _write_pack(tmp_path, {
         "name": "happy",
         "description": "Upbeat.",
-        "format_version": 2,
+        "format_version": packs.PACK_FORMAT_VERSION,
         "version": "1.0.0",
         "license": "MIT",
         "tags": ["emotion"],
@@ -115,7 +115,7 @@ def test_pack_metadata_missing_required_field_errors(tmp_path: Path):
 def test_pack_metadata_invalid_name_rejected(tmp_path: Path):
     folder = _write_pack(tmp_path, {
         "name": "Has_Caps",
-        "description": "x", "format_version": 2, "version": "1", "license": "x",
+        "description": "x", "format_version": packs.PACK_FORMAT_VERSION, "version": "1", "license": "x",
         "tags": [], "recommended_alpha": 0.5,
         "source": "local", "files": {},
     })
@@ -128,7 +128,7 @@ def test_pack_metadata_long_description_optional(tmp_path: Path):
         "name": "happy",
         "description": "short",
         "long_description": "longer form",
-        "format_version": 2,
+        "format_version": packs.PACK_FORMAT_VERSION,
         "version": "1.0.0", "license": "MIT",
         "tags": [], "recommended_alpha": 0.5,
         "source": "bundled", "files": {},
@@ -444,9 +444,9 @@ def test_materialize_upgrades_stale_bundled(monkeypatch: pytest.MonkeyPatch,  tm
     fake_tensor = concept_dir / "stale_model.safetensors"
     fake_tensor.write_bytes(b"\x00" * 8)
     packs.materialize_bundled()
-    # pack.json is now the shipped v2.
+    # pack.json is now the shipped current format.
     upgraded = json.loads(stale_pack.read_text())
-    assert upgraded.get("format_version") == 2
+    assert upgraded.get("format_version") == packs.PACK_FORMAT_VERSION
     assert upgraded.get("description") != "stale v1"
     # statements.json got copied across.
     assert (concept_dir / "statements.json").is_file()
@@ -583,7 +583,7 @@ def test_save_profile_writes_sae_sidecar_fields(tmp_path: Path):
     assert sidecar["sae_release"] == "mock-release"
     assert sidecar["sae_revision"] is None
     assert sidecar["sae_ids_by_layer"] == {"3": "layer_3/mock", "7": "layer_7/mock"}
-    assert sidecar["format_version"] == 2
+    assert sidecar["format_version"] == packs.PACK_FORMAT_VERSION
 
 
 def test_save_profile_omits_sae_fields_when_absent(tmp_path: Path):

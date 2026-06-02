@@ -331,7 +331,7 @@ def _install_minimal_pack(saklas_home: Path, name: str) -> None:
         "recommended_alpha": 0.3,
         "source": "local",
         "files": {},
-        "format_version": 2,
+        "format_version": packs.PACK_FORMAT_VERSION,
     }))
 
 

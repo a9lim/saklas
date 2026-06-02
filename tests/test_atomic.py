@@ -251,9 +251,9 @@ def test_materialize_preserves_user_edited_statements(monkeypatch: pytest.Monkey
     with caplog.at_level(logging.INFO, logger="saklas.io.packs"):
         packs.materialize_bundled()
 
-    # pack.json upgraded to v2.
+    # pack.json upgraded to the current format.
     upgraded = json.loads(stale_pack.read_text())
-    assert upgraded.get("format_version") == 2
+    assert upgraded.get("format_version") == packs.PACK_FORMAT_VERSION
     # User-edited statements left alone.
     assert user_stmts.read_text() == user_stmts_payload
     # .bak preserves the prior pack.json bytes.

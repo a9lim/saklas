@@ -249,6 +249,7 @@ def test_autoload_cache_hit_registers_bundled_vector(monkeypatch: pytest.MonkeyP
     against a synthetic fake concept folder."""
     import torch
     from saklas.core.session import SaklasSession
+    from saklas.io import packs
     from saklas.io import paths as io_paths
     from saklas.io import selectors as _sel_local
     _sel_local.invalidate()
@@ -257,7 +258,7 @@ def test_autoload_cache_hit_registers_bundled_vector(monkeypatch: pytest.MonkeyP
     (ns_dir / "pack.json").write_text(
         '{"name":"myprobe","description":"test",'
         '"method":"contrastive_pca","tags":[],"files":{},'
-        '"format_version":2,"version":"1.0.0","license":"unknown",'
+        f'"format_version":{packs.PACK_FORMAT_VERSION},"version":"1.0.0","license":"unknown",'
         '"recommended_alpha":0.5,"long_description":"","source":"local"}'
     )
     from saklas.core.vectors import save_profile
@@ -265,7 +266,7 @@ def test_autoload_cache_hit_registers_bundled_vector(monkeypatch: pytest.MonkeyP
     save_profile(
         {0: torch.randn(8), 1: torch.randn(8)},
         str(ns_dir / f"{sid}.safetensors"),
-        metadata={"method": "test", "format_version": 2},
+        metadata={"method": "test", "format_version": packs.PACK_FORMAT_VERSION},
     )
 
     class _AutoloadStub(SaklasSession):

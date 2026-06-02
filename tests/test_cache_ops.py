@@ -300,7 +300,7 @@ def test_delete_tensors_variant_raw_only(tmp_path: Path, monkeypatch: pytest.Mon
     (ns_folder / "pack.json").write_text(json.dumps({
         "name": "test-concept", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": packs.PACK_FORMAT_VERSION,
     }))
     (ns_folder / "m.safetensors").write_bytes(b"raw")
     (ns_folder / "m.json").write_text("{}")
@@ -329,7 +329,7 @@ def test_delete_tensors_variant_sae_only(tmp_path: Path, monkeypatch: pytest.Mon
     (ns_folder / "pack.json").write_text(json.dumps({
         "name": "test-concept", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": packs.PACK_FORMAT_VERSION,
     }))
     (ns_folder / "m.safetensors").write_bytes(b"raw")
     (ns_folder / "m.json").write_text("{}")
@@ -360,7 +360,7 @@ def test_delete_tensors_variant_all_default(tmp_path: Path, monkeypatch: pytest.
     (ns_folder / "pack.json").write_text(json.dumps({
         "name": "test-concept", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": packs.PACK_FORMAT_VERSION,
     }))
     (ns_folder / "m.safetensors").write_bytes(b"raw")
     (ns_folder / "m.json").write_text("{}")

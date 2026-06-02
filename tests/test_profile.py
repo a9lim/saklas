@@ -9,6 +9,7 @@ import torch
 
 from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile, ProfileError
+from saklas.io.packs import PACK_FORMAT_VERSION
 
 
 def _mk(layers: Any = (0, 5, 10), dim: int = 8, dtype: Any = torch.float32) -> dict[int, torch.Tensor]:
@@ -78,7 +79,7 @@ def test_save_load_roundtrip(tmp_path: Path):
     for idx in loaded.layers:
         assert torch.allclose(loaded[idx], p[idx])
     assert loaded.metadata["method"] == "contrastive_pca"
-    assert loaded.metadata["format_version"] == 2
+    assert loaded.metadata["format_version"] == PACK_FORMAT_VERSION
 
 
 def test_merged_intersection_semantics():

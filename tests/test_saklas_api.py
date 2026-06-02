@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult
+from saklas.io.packs import PACK_FORMAT_VERSION
 
 
 def _mock_session():
@@ -903,17 +904,17 @@ def test_autoload_picks_sae_variant(tmp_path: Any, monkeypatch: Any) -> None:
         "name": "honest.deceptive", "description": "test",
         "version": "0.0.0", "license": "MIT", "tags": [],
         "recommended_alpha": 0.3, "source": "local", "files": {},
-        "format_version": 2,
+        "format_version": PACK_FORMAT_VERSION,
     }))
     # Raw tensor — layer 0 marker 1.0
     save_file({"layer_0": torch.full((4,), 1.0)}, str(folder / "m.safetensors"))
     (folder / "m.json").write_text(json.dumps({
-        "format_version": 2, "method": "contrastive_pca", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "contrastive_pca", "saklas_version": "t",
     }))
     # SAE tensor — layer 0 marker 2.0
     save_file({"layer_0": torch.full((4,), 2.0)}, str(folder / "m_sae-mock.safetensors"))
     (folder / "m_sae-mock.json").write_text(json.dumps({
-        "format_version": 2, "method": "pca_center_sae",
+        "format_version": PACK_FORMAT_VERSION, "method": "pca_center_sae",
         "saklas_version": "t", "sae_release": "mock",
     }))
 
@@ -951,16 +952,16 @@ def test_autoload_picks_sae_with_explicit_release(tmp_path: Any, monkeypatch: An
     (folder / "pack.json").write_text(json.dumps({
         "name": "honest.deceptive", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     # Two SAE variants at different markers
     save_file({"layer_0": torch.full((4,), 3.0)}, str(folder / "m_sae-release-a.safetensors"))
     (folder / "m_sae-release-a.json").write_text(json.dumps({
-        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "pca_center_sae", "saklas_version": "t",
     }))
     save_file({"layer_0": torch.full((4,), 4.0)}, str(folder / "m_sae-release-b.safetensors"))
     (folder / "m_sae-release-b.json").write_text(json.dumps({
-        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
     from saklas.core import session as S
@@ -993,12 +994,12 @@ def test_autoload_raises_ambiguous_when_multiple_sae_variants(tmp_path: Any, mon
     (folder / "pack.json").write_text(json.dumps({
         "name": "honest.deceptive", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     for rel in ("mock-a", "mock-b"):
         save_file({"layer_0": torch.zeros(4)}, str(folder / f"m_sae-{rel}.safetensors"))
         (folder / f"m_sae-{rel}.json").write_text(json.dumps({
-            "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+            "format_version": PACK_FORMAT_VERSION, "method": "pca_center_sae", "saklas_version": "t",
         }))
 
     from saklas.core import session as S
@@ -1029,12 +1030,12 @@ def test_autoload_raises_unknown_when_variant_missing(tmp_path: Any, monkeypatch
     (folder / "pack.json").write_text(json.dumps({
         "name": "honest.deceptive", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     # Only a raw tensor exists — no SAE variants.
     save_file({"layer_0": torch.zeros(4)}, str(folder / "m.safetensors"))
     (folder / "m.json").write_text(json.dumps({
-        "format_version": 2, "method": "contrastive_pca", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "contrastive_pca", "saklas_version": "t",
     }))
 
     from saklas.core import session as S
@@ -1085,11 +1086,11 @@ def test_steering_resolves_sae_variant_key(tmp_path: Any, monkeypatch: Any) -> N
     (folder / "pack.json").write_text(json.dumps({
         "name": "honest.deceptive", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     save_file({"layer_0": torch.zeros(4)}, str(folder / "m_sae-mock.safetensors"))
     (folder / "m_sae-mock.json").write_text(json.dumps({
-        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
     from saklas.io.selectors import invalidate
@@ -1128,11 +1129,11 @@ def test_steering_variant_with_pole_sign_flip(tmp_path: Any, monkeypatch: Any) -
     (folder / "pack.json").write_text(json.dumps({
         "name": "deer.wolf", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     save_file({"layer_0": torch.zeros(4)}, str(folder / "m_sae-mock.safetensors"))
     (folder / "m_sae-mock.json").write_text(json.dumps({
-        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
     from saklas.io.selectors import invalidate
@@ -1170,15 +1171,15 @@ def test_steering_variant_and_raw_coexist(tmp_path: Any, monkeypatch: Any) -> No
     (folder / "pack.json").write_text(json.dumps({
         "name": "honest.deceptive", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     save_file({"layer_0": torch.zeros(4)}, str(folder / "m.safetensors"))
     (folder / "m.json").write_text(json.dumps({
-        "format_version": 2, "method": "contrastive_pca", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "contrastive_pca", "saklas_version": "t",
     }))
     save_file({"layer_0": torch.zeros(4)}, str(folder / "m_sae-mock.safetensors"))
     (folder / "m_sae-mock.json").write_text(json.dumps({
-        "format_version": 2, "method": "pca_center_sae", "saklas_version": "t",
+        "format_version": PACK_FORMAT_VERSION, "method": "pca_center_sae", "saklas_version": "t",
     }))
 
     from saklas.io.selectors import invalidate
@@ -1244,7 +1245,7 @@ def test_session_extract_sae_saves_suffixed_file(tmp_path: Any, monkeypatch: Any
     (concept_folder / "pack.json").write_text(json.dumps({
         "name": "honest.deceptive", "description": "test", "version": "0.0.0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     (concept_folder / "statements.json").write_text(json.dumps([
         {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},
@@ -1329,7 +1330,7 @@ def test_session_extract_raw_path_unchanged(tmp_path: Any, monkeypatch: Any) -> 
     (concept_folder / "pack.json").write_text(json.dumps({
         "name": "honest.deceptive", "description": "t", "version": "0",
         "license": "MIT", "tags": [], "recommended_alpha": 0.3,
-        "source": "local", "files": {}, "format_version": 2,
+        "source": "local", "files": {}, "format_version": PACK_FORMAT_VERSION,
     }))
     (concept_folder / "statements.json").write_text(json.dumps([
         {"positive": "p", "negative": "n"}, {"positive": "p2", "negative": "n2"},

@@ -29,7 +29,10 @@ suffix** — difference-of-means is the only vector extraction method.
 
 ## packs.py
 
-`PackMetadata` + `Sidecar` + `ConceptFolder`. `PACK_FORMAT_VERSION = 2`;
+`PackMetadata` + `Sidecar` + `ConceptFolder`. `PACK_FORMAT_VERSION = 3` (4.0: a
+vector *is* a 2-node `pca` manifold, so v2 `vectors/` packs are legacy —
+`scripts/upgrade_packs.py` ports statements-bearing folders to `manifolds/` and
+re-stamps tensor-only ones; `_all_concepts` silently skips un-migrated v2);
 `PackMetadata.load` raises `PackFormatError` on a stale *or* newer `format_version`
 (symmetric ceiling). `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$`. Required pack.json
 fields: `name`, `description`, `version`, `license`, `tags`, `recommended_alpha`,

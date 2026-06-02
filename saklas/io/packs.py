@@ -33,7 +33,15 @@ _REQUIRED_PACK_FIELDS = (
 # Current on-disk pack format version. Readers refuse anything lower; the
 # number bumps any time the sidecar/pack.json shape changes in a way that
 # old readers cannot safely ignore. See scripts/upgrade_packs.py.
-PACK_FORMAT_VERSION = 2
+#
+# v3 (4.0): a steering vector *is* the K=2 case of a flat affine subspace, so
+# the canonical artifact for a concept is now a 2-node ``pca`` manifold under
+# ``manifolds/``, not a baked DiM tensor under ``vectors/``.  v2 vector packs
+# are legacy: ``scripts/upgrade_packs.py`` ports statements-bearing folders to
+# manifolds (and re-stamps tensor-only folders that can't re-fit).  Bumping
+# here makes ``_all_concepts`` skip un-migrated v2 folders (PackFormatError),
+# which is the forcing function for the migration.
+PACK_FORMAT_VERSION = 3
 
 
 class PackFormatError(ValueError, SaklasError):

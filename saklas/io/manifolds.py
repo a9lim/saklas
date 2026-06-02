@@ -1176,6 +1176,10 @@ def port_legacy_vector_folder(
     if scn_path.exists():
         try:
             raw_scn = json.loads(scn_path.read_text())
+            # Vector extraction writes the dict form ``{"scenarios": [...]}``
+            # (``core/extraction.py``); a bare list is tolerated too.
+            if isinstance(raw_scn, dict):
+                raw_scn = raw_scn.get("scenarios")
             if isinstance(raw_scn, list):
                 scenarios = [str(s) for s in raw_scn]
         except (json.JSONDecodeError, OSError):

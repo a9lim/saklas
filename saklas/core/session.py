@@ -2365,29 +2365,64 @@ class SaklasSession:
     ) -> dict[int, torch.Tensor]:
         """Direction profile for ``name`` — registered tensor or folded manifold.
 
-        4.0 step 6b unifies the two sources a steering direction can come from:
+        4.0 unifies the sources a steering direction can come from, **manifold
+        first** (the 6e "prefer-manifold" stance):
 
-        - an in-memory baked direction already in ``_profiles`` (ad-hoc
-          ``extract``/``clone``/``merge`` results, ``~``/``|`` projection
-          derivations) — returned verbatim;
-        - a fitted 2-node ``pca`` manifold on disk — loaded via
-          :meth:`_ensure_manifold_loaded` and folded to a per-layer direction
-          dict by :func:`~saklas.core.vectors.folded_vector_directions`, then
-          memoized in ``_profiles`` so a probe / repeat steer reuses it.
+        1. an in-memory baked direction already in ``_profiles`` (ad-hoc
+           ``extract``/``clone``/``merge`` results, ``~``/``|`` projection
+           derivations) — returned verbatim;
+        2. a fitted 2-node ``pca`` manifold on disk (native, or one a prior
+           steer already ported) — loaded via :meth:`_ensure_manifold_loaded`
+           and folded by :func:`~saklas.core.vectors.folded_vector_directions`,
+           then memoized in ``_profiles``;
+        3. a **stale** (`< PACK_FORMAT_VERSION`) statements-bearing legacy
+           ``vectors/<ns>/<name>/`` folder — ported to a 2-node manifold on
+           first touch (:meth:`_port_stale_legacy_vector`).  The port is
+           file-only; fitting runs forward passes through the model and can't
+           re-enter the generation lock from dispatch, so a freshly-ported
+           manifold has no tensor yet and the call raises with the exact
+           ``manifold fit`` command to run (or the bulk migration with ``-m``);
+        4. a current-version or tensor-only ``vectors/`` pack — the residual
+           autoload-fold path (tensor-only HF/GGUF packs have no statements to
+           re-fit, and ``vector extract`` still writes ``vectors/`` until the
+           CLI restructure routes it to manifold authoring).
 
-        Both lower to one direction dict; the dispatch then folds it to a
-        one-pole-ray push fragment.  Raises :class:`VectorNotRegisteredError`
-        when neither source resolves.
+        Raises :class:`VectorNotRegisteredError` when nothing resolves.
         """
         existing = self._profiles.get(name)
         if existing is not None:
             return existing
-        # Installed vector pack (possibly variant-qualified) not yet loaded —
-        # the historical autoload path for user packs / non-bundled poles.
         if ":" in name:
             canonical, variant = name.rsplit(":", 1)
         else:
             canonical, variant = name, "raw"
+
+        # (2) Manifold first — native or previously ported.
+        folded = self._try_fold_manifold(name)
+        if folded is not None:
+            self._profiles[name] = folded
+            return folded
+
+        # (3) Stale legacy vectors/ folder → port (file-only) and nudge to fit.
+        if variant == "raw":
+            ported = self._port_stale_legacy_vector(canonical)
+            if ported is not None:
+                folded = self._try_fold_manifold(name)
+                if folded is not None:
+                    self._profiles[name] = folded
+                    return folded
+                ns, bare = ported
+                raise VectorNotRegisteredError(
+                    f"ported legacy vector '{canonical}' to manifold "
+                    f"'{ns}/{bare}' (a 2-node pca subspace), but it has no "
+                    f"fitted tensor for {self.model_id} yet — porting is "
+                    f"file-only. Fit it: "
+                    f"`saklas vector manifold fit {ns}/{bare} -m {self.model_id}` "
+                    f"(or `python scripts/upgrade_packs.py --all -m {self.model_id}` "
+                    f"to migrate + fit every legacy vector at once)."
+                )
+
+        # (4) Residual autoload-fold: current-version / tensor-only packs.
         try:
             self._try_autoload_vector(canonical, variant=variant)
         except Exception:
@@ -2395,22 +2430,91 @@ class SaklasSession:
         loaded = self._profiles.get(name)
         if loaded is not None:
             return loaded
+
+        raise VectorNotRegisteredError(
+            f"No vector registered for {role} '{name}'"
+        )
+
+    def _try_fold_manifold(
+        self, name: str,
+    ) -> dict[int, torch.Tensor] | None:
+        """Load a 2-node ``pca`` manifold for ``name`` and fold it to a vector.
+
+        Returns the per-layer direction dict, or ``None`` when no fitted
+        manifold resolves (so the caller falls through to porting / autoload).
+        Re-raises only when a manifold *does* load but isn't a foldable 2-node
+        affine subspace — that's a usage error, not a miss.
+        """
         try:
             self._ensure_manifold_loaded(name)
         except Exception:
-            raise VectorNotRegisteredError(
-                f"No vector registered for {role} '{name}'"
-            )
+            return None
         from saklas.core.vectors import folded_vector_directions
         try:
-            prof = folded_vector_directions(self._manifolds[name])
+            return folded_vector_directions(self._manifolds[name])
         except Exception as e:
             raise VectorNotRegisteredError(
-                f"{role} '{name}' is a manifold that does not fold to a single "
+                f"'{name}' is a manifold that does not fold to a single "
                 f"steering direction (not a 2-node affine subspace): {e}"
             )
-        self._profiles[name] = prof
-        return prof
+
+    def _port_stale_legacy_vector(
+        self, canonical: str,
+    ) -> tuple[str, str] | None:
+        """Port a stale legacy ``vectors/`` folder to a 2-node ``pca`` manifold.
+
+        4.0 6e port-on-detect.  ``canonical`` is a concept name, optionally
+        ``ns/``-qualified.  Scans ``vectors/`` *directly* (not through the
+        resolver, which after the v3 bump skips stale v2 folders) for a
+        statements-bearing folder whose ``pack.json`` is below
+        :data:`~saklas.io.packs.PACK_FORMAT_VERSION`, and ports it via
+        :func:`~saklas.io.manifolds.port_legacy_vector_folder` (file-only — no
+        tensors carried; they re-fit lazily).  Current-version packs are left
+        for the autoload path; tensor-only packs (no ``statements.json``) can't
+        re-fit and are skipped.
+
+        Returns ``(namespace, name)`` when a folder was ported or a matching
+        manifold already exists (so the caller nudges to fit), else ``None``.
+        """
+        import json as _json
+        from saklas.io.packs import PACK_FORMAT_VERSION
+        from saklas.io.paths import vectors_dir, concept_dir, manifold_dir
+        from saklas.io.manifolds import port_legacy_vector_folder
+        from saklas.io.selectors import invalidate as _invalidate_selectors
+
+        if "/" in canonical:
+            ns, bare = canonical.split("/", 1)
+            candidates = [(ns, concept_dir(ns, bare))]
+        else:
+            bare = canonical
+            root = vectors_dir()
+            candidates = (
+                [(nsd.name, nsd / bare) for nsd in sorted(root.iterdir())
+                 if nsd.is_dir() and (nsd / bare).is_dir()]
+                if root.exists() else []
+            )
+
+        for namespace, vfolder in candidates:
+            pack_path = vfolder / "pack.json"
+            if not pack_path.exists():
+                continue
+            if not (vfolder / "statements.json").exists():
+                continue  # tensor-only — can't re-fit, leave to autoload
+            try:
+                fmt = _json.loads(pack_path.read_text()).get("format_version", 1)
+            except (OSError, ValueError):
+                fmt = 1
+            if isinstance(fmt, int) and fmt >= PACK_FORMAT_VERSION:
+                continue  # current — keep its tensor via autoload-fold
+            if (manifold_dir(namespace, bare) / "manifold.json").exists():
+                return (namespace, bare)  # already ported; nudge to fit
+            try:
+                port_legacy_vector_folder(vfolder, namespace=namespace, force=False)
+            except Exception:
+                continue
+            _invalidate_selectors()
+            return (namespace, bare)
+        return None
 
     def _bootstrap_manifold_probes(
         self, categories: list[str],
