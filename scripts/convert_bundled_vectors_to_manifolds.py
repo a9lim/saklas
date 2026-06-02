@@ -173,10 +173,11 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"unknown bundled concept(s): {', '.join(unknown)}")
 
-    written = []
-    for concept in targets:
-        if convert(concept, force=args.force, dry_run=args.dry_run):
-            written.append(concept)
+    written = [
+        concept
+        for concept in targets
+        if convert(concept, force=args.force, dry_run=args.dry_run)
+    ]
 
     if not args.dry_run and not args.no_validate:
         print("\nvalidating folder integrity...")

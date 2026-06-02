@@ -330,10 +330,10 @@ def _all_manifold_labels() -> list[ResolvedManifoldLabel]:
         _manifold_labels_cache[root] = out
         return out
     for ns, mf in manifolds:
-        for label in mf.node_labels:
-            out.append(ResolvedManifoldLabel(
-                namespace=ns, manifold_name=mf.name, label=label,
-            ))
+        out.extend(
+            ResolvedManifoldLabel(namespace=ns, manifold_name=mf.name, label=label)
+            for label in mf.node_labels
+        )
     _manifold_labels_cache[root] = out
     return out
 

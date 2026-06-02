@@ -1323,7 +1323,7 @@ class ManifoldMonitor:
                     fraction_mean=0.0,
                     fraction_per_layer={},
                     nearest=[],
-                    coords=tuple(),
+                    coords=(),
                     coords_per_layer={},
                     residual_mean=0.0,
                     residual_per_layer={},
@@ -1405,7 +1405,7 @@ class ManifoldMonitor:
                 (manifold.node_labels[k], dist_acc[k]) for k in top
             ]
             coords_tuple = (
-                tuple(coords_mean) if coords_mean is not None else tuple()
+                tuple(coords_mean) if coords_mean is not None else ()
             )
             out[name] = ManifoldAggregate(
                 fraction_mean=frac_mean,

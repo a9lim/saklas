@@ -8,6 +8,7 @@ import queue
 import re
 import threading
 import time
+from contextlib import suppress
 from enum import IntEnum
 from types import TracebackType
 from typing import Any, Callable, Iterator, Literal, overload
@@ -1074,10 +1075,8 @@ class SaklasSession:
     def unregister_trait_queue(self, loop: Any, q: Any) -> None:
         """Remove a previously registered trait queue."""
         with self._trait_lock:
-            try:
+            with suppress(ValueError):
                 self._trait_queues.remove((loop, q))
-            except ValueError:
-                pass
 
     # -- Neutral baseline (v2.1) --
 
@@ -1945,13 +1944,11 @@ class SaklasSession:
                     canonical, variant = target.rsplit(":", 1)
                 else:
                     canonical, variant = target, "raw"
-                try:
+                # Non-raw variant miss raises AmbiguousVariantError or
+                # UnknownVariantError; let it surface at hook-install with
+                # the shared VectorNotRegisteredError shape.
+                with suppress(Exception):
                     self._try_autoload_vector(canonical, variant=variant)
-                except Exception:
-                    # Non-raw variant miss raises AmbiguousVariantError or
-                    # UnknownVariantError; let it surface at hook-install
-                    # with the shared VectorNotRegisteredError shape.
-                    pass
             resolved[key] = val
         # Fold in manifold terms.  Like ablation, ``normalized_entries``
         # strips ``ManifoldTerm`` values, so walk ``alphas`` directly.
@@ -2429,10 +2426,8 @@ class SaklasSession:
                 )
 
         # (4) Residual autoload-fold: current-version / tensor-only packs.
-        try:
+        with suppress(Exception):
             self._try_autoload_vector(canonical, variant=variant)
-        except Exception:
-            pass
         loaded = self._profiles.get(name)
         if loaded is not None:
             return loaded
@@ -4670,10 +4665,8 @@ class SaklasSession:
                 trait_token_counter[0] += 1
                 with self._trait_lock:
                     for lp_ref, q in list(self._trait_queues):
-                        try:
+                        with suppress(Exception):
                             lp_ref.call_soon_threadsafe(q.put_nowait, event)
-                        except Exception:
-                            pass
 
         # Pass _token_tap into generate_steered only when at least one of its
         # branches is live: caller-supplied on_token, logprobs collection, or

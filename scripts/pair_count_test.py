@@ -266,7 +266,7 @@ def stage_extract(model_id: str) -> int:
     out_path.write_text(json.dumps({
         "model_id": model_id,
         "n_pool": len(pool),
-        "subsamples": {k: v for k, v in subsamples.items()},
+        "subsamples": dict(subsamples),
         "aggregate_cosines": {f"{a}__vs__{b}": c for (a, b), c in agg.items()},
         "noise_floor": {
             "boot_pairwise": boot_pairs,

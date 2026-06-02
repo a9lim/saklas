@@ -7,7 +7,7 @@ import json
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
 
 if TYPE_CHECKING:
@@ -307,10 +307,8 @@ def _manifold_reading_aggregate(session: SaklasSession) -> dict[str, Any]:
     for name, agg in readings.items():
         if name not in attached:
             continue
-        try:
+        with suppress(Exception):
             out[name] = agg.to_dict()
-        except Exception:
-            continue
     return out
 
 
@@ -328,10 +326,8 @@ def _manifold_token_readings(event: Any) -> dict[str, Any] | None:
         return None
     out: dict[str, Any] = {}
     for name, reading in readings.items():
-        try:
+        with suppress(Exception):
             out[name] = reading.to_dict()
-        except Exception:
-            continue
     return out or None
 
 
@@ -375,8 +371,7 @@ def _merge_steering(
     if default_steering is not None and not explicit_clear:
         merged_alphas.update(default_steering.alphas)
     if req_steering is not None:
-        for k, v in req_steering.alphas.items():
-            merged_alphas[k] = v
+        merged_alphas.update(req_steering.alphas)
     if not merged_alphas and thinking is None:
         return None
     return Steering(alphas=merged_alphas, thinking=thinking)

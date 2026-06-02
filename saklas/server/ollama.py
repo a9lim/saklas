@@ -435,14 +435,16 @@ def register_ollama_routes(app: FastAPI) -> None:
 
     @app.get("/api/ps")
     def api_ps():
-        entries = []
-        for entry in _tag_entries(session):
-            entries.append({
-                **entry,
-                "expires_at": "9999-12-31T23:59:59Z",
-                "size_vram": int((session.model_info.get("vram_used_gb") or 0) * 1024**3),
-            })
-        return {"models": entries}
+        return {
+            "models": [
+                {
+                    **entry,
+                    "expires_at": "9999-12-31T23:59:59Z",
+                    "size_vram": int((session.model_info.get("vram_used_gb") or 0) * 1024**3),
+                }
+                for entry in _tag_entries(session)
+            ]
+        }
 
     @app.post("/api/show")
     async def api_show(request: Request):

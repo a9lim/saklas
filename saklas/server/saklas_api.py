@@ -543,8 +543,7 @@ def _build_steering(
     if default_steering is not None and not explicit_clear:
         merged.update(default_steering.alphas)
     if req is not None:
-        for k, v in req.alphas.items():
-            merged[k] = v
+        merged.update(req.alphas)
 
     if not merged and thinking is None:
         return None
@@ -673,14 +672,14 @@ def _per_token_probes(session: SaklasSession, n_tokens: int) -> list[dict[str, A
     scores = session.last_per_token_scores
     if not scores:
         return []
-    out: list[dict[str, Any]] = []
     n = min(n_tokens, *(len(v) for v in scores.values())) if scores else 0
-    for i in range(n):
-        out.append({
+    return [
+        {
             "token_idx": i,
             "probes": {name: float(vals[i]) for name, vals in scores.items() if i < len(vals)},
-        })
-    return out
+        }
+        for i in range(n)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1010,8 +1009,8 @@ def register_saklas_routes(app: FastAPI) -> None:
         per_token_spans: list[dict[str, Any]] = []
         if a_tok_strs and b_tok_strs:
             spans = per_token_diff(a_tok_strs, b_tok_strs)
-            for sp in spans:
-                per_token_spans.append({
+            per_token_spans.extend(
+                {
                     "a_index": sp.a_index,
                     "b_index": sp.b_index,
                     "a_text": sp.a_text,
@@ -1026,7 +1025,9 @@ def register_saklas_routes(app: FastAPI) -> None:
                         }
                         for rd in sp.reading_deltas
                     ],
-                })
+                }
+                for sp in spans
+            )
 
         return {
             "a_id": diff.a_id,
@@ -2263,15 +2264,15 @@ async def _ws_handle_generate(
                             on_token=_on_token,
                         )
                     else:
-                        gen_kwargs: dict[str, Any] = dict(
-                            steering=steering,
-                            sampling=_sampling,
-                            stateless=msg.stateless,
-                            raw=msg.raw,
-                            thinking=msg.thinking,
-                            on_token=_on_token,
-                            parent_node_id=parent_node_id,
-                        )
+                        gen_kwargs: dict[str, Any] = {
+                            "steering": steering,
+                            "sampling": _sampling,
+                            "stateless": msg.stateless,
+                            "raw": msg.raw,
+                            "thinking": msg.thinking,
+                            "on_token": _on_token,
+                            "parent_node_id": parent_node_id,
+                        }
                         if _recipe_override is not None:
                             gen_kwargs["recipe_override"] = _recipe_override
                         result = session.generate(msg.input, **gen_kwargs)

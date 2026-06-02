@@ -620,7 +620,7 @@ def push(
     c = matches[0]
 
     src = c.metadata.source or ""
-    if not force and as_ is None and (src.startswith("bundled") or src.startswith("hf://")):
+    if not force and as_ is None and src.startswith(("bundled", "hf://")):
         raise RuntimeError(
             f"refusing to push pack with source={src!r}; "
             f"pass --as owner/name to retarget, or --force to republish in place"

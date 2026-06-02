@@ -2,6 +2,7 @@
 
 import logging
 import warnings
+from contextlib import suppress
 from typing import Any, cast
 
 import torch
@@ -196,10 +197,8 @@ def _open_uncached(path: str) -> int:
     fd = os.open(path, os.O_RDONLY)
     if sys.platform == "darwin":
         import fcntl
-        try:
+        with suppress(OSError):
             fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
-        except OSError:
-            pass
     return fd
 
 
@@ -337,7 +336,7 @@ def _load_text_from_multimodal(
                     #   language_model.model.layers… -> model.layers…
                     #   model.language_model.layers… -> model.layers…
                     key = name.replace("language_model.", "", 1)
-                    if key.endswith(".weight_scale_inv") or key.endswith(".activation_scale"):
+                    if key.endswith((".weight_scale_inv", ".activation_scale")):
                         continue
                     target = targets.get(key)
                     if target is None:
@@ -676,11 +675,11 @@ def load_model(
     # model_type isn't registered with AutoModelForCausalLM (e.g.
     # Ministral tagged as Mistral3).  If the config has a text_config
     # that IS a known causal-LM type, use that instead.
-    load_kwargs: dict[str, Any] = dict(
-        attn_implementation=attn_impl,
-        trust_remote_code=trust,
-        device_map=device_map,
-    )
+    load_kwargs: dict[str, Any] = {
+        "attn_implementation": attn_impl,
+        "trust_remote_code": trust,
+        "device_map": device_map,
+    }
     if quantize == "4bit":
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,

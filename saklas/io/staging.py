@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import suppress
 from pathlib import Path
 from typing import Callable
 
@@ -35,10 +36,8 @@ def stage_verify_swap(
     backup = target_folder.with_name(target_folder.name + ".bak")
 
     if not target_folder.exists() and backup.exists():
-        try:
+        with suppress(OSError):
             backup.rename(target_folder)
-        except OSError:
-            pass
 
     if staging.exists():
         shutil.rmtree(staging)
@@ -66,10 +65,8 @@ def stage_verify_swap(
         staging.rename(target_folder)
     except OSError as e:
         if had_existing and backup.exists() and not target_folder.exists():
-            try:
+            with suppress(OSError):
                 backup.rename(target_folder)
-            except OSError:
-                pass
         shutil.rmtree(staging, ignore_errors=True)
         raise make_error(
             f"{label}: could not promote staging into place ({e})"

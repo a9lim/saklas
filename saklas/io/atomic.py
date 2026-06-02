@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -47,10 +48,8 @@ def write_bytes_atomic(path: Path, data: bytes) -> None:
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
-        try:
+        with suppress(FileNotFoundError):
             tmp.unlink()
-        except FileNotFoundError:
-            pass
         raise
     os.replace(tmp, path)
 

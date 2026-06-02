@@ -426,7 +426,7 @@ def search_manifolds(query: Optional[str]) -> list[dict[str, Any]]:
     """
     api = _hf_api()
     required_tags: list[str] = ["saklas-manifold"]
-    kwargs: dict[str, Any] = dict(filter=required_tags, limit=_HF_SEARCH_CAP)
+    kwargs: dict[str, Any] = {"filter": required_tags, "limit": _HF_SEARCH_CAP}
     if query:
         kwargs["search"] = query
 

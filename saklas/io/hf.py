@@ -585,7 +585,7 @@ def search_packs(selector: Any) -> list[dict[str, Any]]:
     elif selector.kind == "model":
         pass  # applied post-search
 
-    kwargs: dict[str, Any] = dict(filter=required_tags, limit=_HF_SEARCH_CAP)
+    kwargs: dict[str, Any] = {"filter": required_tags, "limit": _HF_SEARCH_CAP}
     if search_text:
         kwargs["search"] = search_text
 

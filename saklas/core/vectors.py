@@ -7,6 +7,7 @@ import json
 import logging
 import warnings
 from collections.abc import Sequence
+from contextlib import suppress
 from importlib import resources as _resources
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -787,7 +788,7 @@ def _capture_diffs_for_pairs(
                 f"SAE release '{sae.release}' covers no layers for a "
                 f"{n_layers}-layer model"
             )
-        sae_layer_set = set(sorted(covered))
+        sae_layer_set = set(covered)
     else:
         sae_layer_set = None
 
@@ -1748,16 +1749,13 @@ def load_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict[str, A
     # are addressable by ``int`` consistently with the profile dict.
     raw_diag = metadata.get("diagnostics_by_layer")
     if isinstance(raw_diag, dict) and raw_diag:
-        try:
+        # Malformed diagnostics leave the raw dict in place; downstream readers
+        # can decide whether to fall back. The tensors themselves are still valid.
+        with suppress(TypeError, ValueError):
             metadata["diagnostics"] = {
                 int(layer): dict(metrics)
                 for layer, metrics in raw_diag.items()
             }
-        except (TypeError, ValueError):
-            # Leave the raw dict in place; downstream readers can decide
-            # whether to fall back.  Don't fail the load over malformed
-            # diagnostics — the tensors themselves are still valid.
-            pass
 
     return profile, metadata
 

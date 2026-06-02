@@ -34,6 +34,7 @@ import json
 import os
 import secrets
 import tempfile
+from contextlib import suppress
 import threading
 import time
 from dataclasses import dataclass, field, fields
@@ -735,13 +736,11 @@ class LoomTree:
 
     def _emit(self, event: LoomMutated) -> None:
         if self._events is not None:
-            try:
+            # Event delivery must not break a mutation. ``EventBus`` itself
+            # swallows subscriber errors; this guard catches anything from a
+            # non-EventBus shim.
+            with suppress(Exception):
                 self._events.emit(event)
-            except Exception:
-                # Event delivery must not break a mutation.  ``EventBus``
-                # itself swallows subscriber errors; this guard catches
-                # anything from a non-EventBus shim.
-                pass
 
     def _add_child(self, parent_id: str, node: LoomNode) -> None:
         self.nodes[node.id] = node
@@ -1254,10 +1253,8 @@ class LoomTree:
 
         if token_payload is None:
             write_json_atomic(out_path, data)
-            try:
+            with suppress(FileNotFoundError):
                 sidecar.unlink()
-            except FileNotFoundError:
-                pass
             return
 
         sidecar.parent.mkdir(parents=True, exist_ok=True)
@@ -1273,10 +1270,8 @@ class LoomTree:
                 json.dump(token_payload, f, ensure_ascii=False, separators=(",", ":"))
             os.replace(tmp, sidecar)
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 tmp.unlink()
-            except FileNotFoundError:
-                pass
         write_json_atomic(out_path, data)
 
     @classmethod

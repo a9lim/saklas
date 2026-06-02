@@ -540,7 +540,7 @@ def _emit_node(data: Any, indent: int, lines: list[str]) -> None:
     pad = "  " * indent
     if isinstance(data, dict):
         for k, v in data.items():
-            if isinstance(v, dict) or isinstance(v, list):
+            if isinstance(v, (dict, list)):
                 lines.append(f"{pad}{k}:")
                 _emit_node(v, indent + 1, lines)
             else:

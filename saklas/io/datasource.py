@@ -112,8 +112,7 @@ class DataSource:
         pairs = []
         with open(path, newline="") as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                pairs.append((row[positive_col], row[negative_col]))
+            pairs.extend((row[positive_col], row[negative_col]) for row in reader)
         return cls(pairs=pairs, name=name or Path(path).stem)
 
     @classmethod
