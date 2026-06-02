@@ -286,8 +286,8 @@ def transfer_profile(
     **Target-metric re-bake (``whitener`` given).**  The source tensor is
     share-baked in the *source* model's metric — its per-layer Euclidean
     magnitude is the source Mahalanobis norm of the raw mean-diff (the
-    angular hook reads ``‖baked_L‖₂ / Σ‖baked‖₂`` back out as the layer
-    share).  The orthogonal Procrustes map preserves Euclidean norm, so a
+    unified subspace hook reads ``‖baked_L‖₂ / Σ‖baked‖₂`` back out as
+    the layer share).  The orthogonal Procrustes map preserves Euclidean norm, so a
     bare transfer carries the *source* cross-layer share into target space
     — where it no longer matches the target's anisotropy.  When a
     ``whitener`` for the **target** model is supplied and covers every
@@ -298,7 +298,7 @@ def transfer_profile(
         v_tgt'_L = v_tgt_L · (‖v_tgt_L‖_M(target) / ‖v_tgt_L‖₂)
 
     The direction is untouched; only the per-layer magnitude — and hence
-    the share the angular hook recovers — changes.  ``‖v_tgt_L‖₂`` carries
+    the hook-recovered share — changes.  ``‖v_tgt_L‖₂`` carries
     the transported source-signal strength (the best target-signal proxy
     available without target contrastive pairs) and ``‖v̂_tgt_L‖_M(target)``
     applies the target anisotropy correction, so the composite is the

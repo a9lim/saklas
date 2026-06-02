@@ -359,7 +359,7 @@ def main() -> None:
         f"({len(PERSONAS)} personas + 1 anchor node ({ANCHOR_LABEL!r}))"
     )
     print(
-        f"  -> run `saklas vector manifold discover default/{MANIFOLD_NAME}` "
+        f"  -> run `saklas manifold discover default/{MANIFOLD_NAME}` "
         f"to fit against a model "
         f"(origin anchors to {ANCHOR_LABEL!r} automatically)"
     )

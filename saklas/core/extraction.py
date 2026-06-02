@@ -1322,7 +1322,7 @@ class ManifoldExtractionPipeline:
             metadata["sae_release"] = sae_backend.release
             metadata["sae_revision"] = sae_backend.revision
         if any_role:
-            # Per-node roles ride into the sidecar so `vector manifold
+            # Per-node roles ride into the sidecar so `manifold
             # show` and the inspector surfaces can report "this node was
             # pooled as <role>" without re-reading manifold.json.  The
             # order matches ``node_labels``; a missing entry means

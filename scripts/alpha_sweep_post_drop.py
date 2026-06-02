@@ -1,4 +1,4 @@
-"""Alpha sweep after drop_edges=(2,2) fix to recalibrate _STEER_GAIN.
+"""Alpha sweep after drop_edges=(2,2) fix to recalibrate vector alpha.
 
 Runs `angry.calm` extraction (using new default edge-drop) on two reference
 models sequentially, sweeps α ∈ {0.3, 0.45, 0.6, 0.75}, and prints output

@@ -997,9 +997,7 @@ def fit_layer_subspace(
     channels* — they carry the most raw variance regardless of whether
     they carry node signal — so the fitted subspace, its ``mean``, and the
     resulting steering direction all end up dominated by a handful of rogue
-    dims, and the angular hook's per-step norm swings wildly (the rogue-
-    aligned ``mean`` makes ``‖h‖`` uncontrolled even when ``‖h - mean‖`` is
-    preserved).
+    dims, producing unstable per-step norms under steering.
 
     Passing a ``whitener`` (covering ``layer``) switches to **whitened /
     Fisher PCA**: it maximizes the *ratio* ``vᵀ S_b v / vᵀ Σ v`` where
@@ -1035,10 +1033,8 @@ def fit_layer_subspace(
     the fraction of raw inter-node variance retained.  Under whitened PCA
     it is the fraction of *whitened* between-variance retained
     (``Σ μ (retained) / Σ μ (all)`` over the generalized eigenvalues) —
-    the metric-appropriate fit-quality signal there.  Either feeds
-    manifold-steering's additive-mode ``1/√mean_EV`` α normalization
-    (poorly-fitted layers under-blend at a given α; the ratio
-    compensates); angular mode ignores it.  Computed from the
+    the metric-appropriate fit-quality signal there.  The same diagnostic
+    is persisted for fit inspection and share baking; computed from the
     decomposition that already runs, so this is free.
     """
     centroids = centroids.to(torch.float32)

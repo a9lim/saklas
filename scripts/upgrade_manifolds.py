@@ -20,7 +20,7 @@ explicit per-node authoring ``coords``.  This converter rewrites
   4. Every fitted ``*.safetensors`` tensor + ``.json`` sidecar is
      **deleted** — the old tensors carry the cubic-spline representation
      (``t_knots`` / ``coords`` / ``spline_M``) and cannot be loaded by the
-     v3 ``load_manifold``.  Re-fit with ``saklas vector manifold fit``.
+     v3 ``load_manifold``.  Re-fit with ``saklas manifold fit``.
   5. ``files`` is recomputed (empty after the tensor deletion).
 
 Idempotent — a folder already on v3 is left untouched.  Prints one line

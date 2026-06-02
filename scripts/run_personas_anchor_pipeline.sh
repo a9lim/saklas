@@ -84,7 +84,7 @@ echo "--- stage 3 finished at $(date) (worst rc=$s3) ---"
 echo ""
 echo "=== STAGE 4/4: personas manifold discover-fit (anchored) ==="
 date
-saklas vector manifold discover default/personas -m "$MODEL"
+saklas manifold discover default/personas -m "$MODEL"
 s4=$?
 echo "--- stage 4 exit=$s4 at $(date) ---"
 

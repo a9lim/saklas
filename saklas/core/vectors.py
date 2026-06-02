@@ -1015,8 +1015,8 @@ def _share_bake_and_warn(
     # layers, so sum(||baked_i||) ≈ sum(ref_norm_i * share_i): the collective
     # magnitude budget is fixed by the reference activation norms and
     # distributed in proportion to per-layer signal quality.  At apply time
-    # the additive hook does ``alpha * _STEER_GAIN * sum(baked)``; the
-    # angular hook reads the same baked magnitudes as per-layer weights.
+    # the unified subspace kernel reads these baked magnitudes as per-layer
+    # weights.
     total_score = sum(score for _, score in raw.values())
     if total_score <= 0:
         # Pathological extraction (all-zero diffs).  Fall back to uniform

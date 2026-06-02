@@ -2177,7 +2177,7 @@ class SaklasSession:
         if not matches:
             raise ManifoldNotRegisteredError(
                 f"manifold '{key}' has no fitted tensor for {self.model_id}; "
-                f"run `saklas vector manifold fit` first"
+                f"run `saklas manifold fit` first"
             )
         if len(matches) > 1:
             # A bare name collided across namespaces — refuse rather than
@@ -2418,7 +2418,7 @@ class SaklasSession:
                     f"'{ns}/{bare}' (a 2-node pca subspace), but it has no "
                     f"fitted tensor for {self.model_id} yet — porting is "
                     f"file-only. Fit it: "
-                    f"`saklas vector manifold fit {ns}/{bare} -m {self.model_id}` "
+                    f"`saklas manifold fit {ns}/{bare} -m {self.model_id}` "
                     f"(or `python scripts/upgrade_packs.py --all -m {self.model_id}` "
                     f"to migrate + fit every legacy vector at once)."
                 )

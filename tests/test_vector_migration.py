@@ -218,7 +218,7 @@ class TestPortOnDetect:
         # The artifact was ported (file-only) ...
         assert (manifold_dir("local", "happy.sad") / "manifold.json").exists()
         # ... and the raise carries the exact fit command + model id.
-        assert "saklas vector manifold fit local/happy.sad" in msg
+        assert "saklas manifold fit local/happy.sad" in msg
         assert "test/model" in msg
 
 

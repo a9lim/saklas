@@ -255,7 +255,7 @@ def main() -> None:
         if plan.pending:
             print(
                 f"[{name}] wrote {folder.relative_to(REPO)} -> fit with "
-                f"`saklas vector manifold discover default/{name} -m <model>`"
+                f"`saklas manifold discover default/{name} -m <model>`"
             )
 
 
