@@ -192,7 +192,7 @@ def test_steering_vector_changes_logits(model_type: str):
     direction = direction / direction.norm()
 
     # 4.0: a vector lowers to a rank-1 push fragment synthesized into one
-    # merged affine subspace, then ``add_subspace`` → ``inject_three_op``.
+    # merged affine subspace, then ``add_subspace`` → ``subspace_inject``.
     L = len(layers) // 2
     synth = synthesize_subspace(
         push=[({L: direction.reshape(1, -1)}, {L: torch.tensor([1.0])}, 1.0)],

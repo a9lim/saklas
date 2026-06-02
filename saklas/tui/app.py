@@ -1380,7 +1380,7 @@ class SaklasApp(App[None]):
         """``/manifold-probe <selector>`` — attach a manifold probe.
 
         Routes through ``session.add_manifold_probe`` (Phase 1 engine
-        wiring) — the selector can be a bundled name (``circumplex``,
+        wiring) — the selector can be a bundled name (``pad``,
         ``personas``), an ``ns/name`` form, or an already-loaded
         manifold's registered name; the session's lazy-load path
         (``_ensure_manifold_loaded``) handles resolution.  Refused

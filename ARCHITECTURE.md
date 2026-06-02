@@ -38,24 +38,23 @@ The three bundled defaults map cleanly onto the taxonomy:
 |-----------------|-------|------|-----------|-----------------|
 | a DiM vector    | 2     | 1    | flat      | PCA (= DiM)     |
 | `personas`      | 101   | ~8   | flat      | discover PCA    |
-| `circumplex`    | 9     | 2    | curved    | authored coords |
+| `pad`           | 15    | 3    | curved    | authored coords |
 
 Every steering term — vectors, bare poles, `~`/`|` projections, `!` ablations,
 and `%` manifold positions — lowers at generation time to a single per-layer
-injection: `inject_three_op` (`core/manifold.py`). There is no angular/additive
+injection: `subspace_inject` (`core/manifold.py`). There is no angular/additive
 mode split, no separate vector hook, and no per-fit gain knob. The flat case
 takes an analytic shortcut inside that kernel; the curved case runs a per-token
 nearest-point foot-follower.
 
-> **Live state vs. convergence.** The bundled *vector* concepts are still stored
-> and steered as baked `Profile`s (per-layer directions), folded into rank-1
-> subspace fragments at dispatch. `personas` (flat) and `circumplex` (curved)
-> are stored as `Manifold` artifacts. The subspace-native vector-fold functions
-> (`fold_vector_to_subspace`, `fold_directions_to_subspace`,
-> `folded_vector_directions` in `core/vectors.py`) implement the final
-> convergence — a vector *as* a 2-node affine `Manifold` — and the author→fit→
-> steer loop is tested, but production extraction/steering of vector concepts
-> still rides the baked-`Profile` path. Both lower to the same kernel.
+> **Live state.** The 26 bundled *vector* concepts are stored and steered as
+> 2-node `pca` `Manifold` artifacts under `manifolds/` (4.0 6b/6d) — the
+> "a vector *is* the K=2 affine subspace" convergence, shipped. `personas` (flat)
+> and `pad` (curved) are `Manifold` artifacts too. User-authored / ad-hoc vector
+> directions (`extract`/`clone`/`merge`, `~`/`|` projections) are still baked
+> `Profile`s, folded into rank-1 subspace fragments at dispatch by
+> `fold_directions_to_subspace` (`core/vectors.py`); legacy `vectors/` packs
+> migrate to manifolds via port-on-detect (6e). All paths lower to the same kernel.
 
 ---
 
@@ -366,11 +365,12 @@ composes the unified backend:
 | `c a~b` / `a\|b`             | push fragment: the derived projected direction (materialized via `project_profile`), folded like a vector |
 | `!x`                         | ablation fragment: x's per-layer directions, target → origin (0) |
 | `c M%label` (affine M)       | push fragment: M's per-layer basis rows, target = node's `LayerSubspace.node_coords[idx]`, coeff `c` |
-| `c[,o] M%pos` (curved M)     | a separate three-op term via `add_manifold` (along=c, onto=o)  |
+| `c[,o] M%pos` (curved M)     | a separate two-op term via `add_manifold` (along=c, onto=o)  |
 
-`_vector_push_fragment` splits a baked `Profile` into per-layer
-`(unit_dir, [‖d_L‖])`, so the synthesizer's `Δ = coeff · (coord @ basis) = coeff
-· d_L` reproduces the baked direction exactly. `_affine_manifold_push` reads the
+`fold_directions_to_subspace` (4.0 6b, replacing the old `_vector_push_fragment`
+shim) splits a resolved direction `Profile` into per-layer `(unit_dir, [‖d_L‖])`,
+so the synthesizer's `Δ = coeff · (coord @ basis) = coeff · d_L` reproduces the
+baked direction exactly. `_affine_manifold_push` reads the
 fitted manifold's per-layer `node_coords` (label-form only — coord-form on an
 affine manifold has no interpolant). Projection terms are materialized to derived
 `Profile`s first (`_materialize_projections` → `project_profile`, LEACE under a
@@ -422,7 +422,7 @@ operates only inside its own span.
 
 ### 5.1 The kernel
 
-`inject_three_op(h, subspace, domain, target_coord, foot_seed, along, onto)`
+`subspace_inject(h, subspace, domain, target_coord, foot_seed, along, onto)`
 (`core/manifold.py`) is the single injection. It decomposes
 `h = mean + h_par + h_perp` against the layer's affine subspace (`decompose`),
 where `h_par` is the in-subspace component and `h_perp = H_o` the off-subspace
@@ -475,7 +475,7 @@ projection — never the per-token hot path.
 
 `core/hooks.py` — **`SteeringHook`** carries the per-layer groups
 `(trigger, subspace, domain, target_coord, origin_coord, along, onto)` and runs
-each active one through `inject_three_op` in `_apply_manifold_groups`. A
+each active one through `subspace_inject` in `_apply_manifold_groups`. A
 cheap pre-check skips the work when no group is active this step (e.g. an
 `AFTER_THINKING` group during prefill). There is no composed-tensor fast path:
 every steered layer runs the (ctx-consulting) slow hook, so per-step triggers and
@@ -486,7 +486,7 @@ signal (`core/cuda_graphs.py`).
 **`SteeringManager`** owns the hooks + the per-generation `TriggerContext`. It
 holds `subspaces` (the dispatch-synthesized merged affine subspaces, one per
 trigger group) and `manifolds` (curved terms). `apply_to_model` lowers both to
-per-layer `inject_three_op` entries, orthogonalizes affine against curved
+per-layer `subspace_inject` entries, orthogonalizes affine against curved
 (§4), and recomposes the hooks. `reset_manifold_feet` cold-starts every
 follower at each generation start.
 
@@ -593,7 +593,7 @@ as extraction), runs the channels, and additionally calls
 `ProbeGate`. `Trigger.active(ctx)` consults the phase flags and, when gated,
 `ctx.probe_scores[gate.probe]` against `score <op> threshold`. The gate key is
 the canonical scalar key from whichever monitor supplied it (`"angry.calm"` from
-TraitMonitor, `"circumplex:fraction"` / `"circumplex@elated"` from
+TraitMonitor, `"pad:fraction"` / `"pad@elated"` from
 ManifoldMonitor) — the runtime lookup is identical; only the parser knows the
 difference. Gated triggers report inactive during prefill (no reading yet) and
 for missing probes (no raise).

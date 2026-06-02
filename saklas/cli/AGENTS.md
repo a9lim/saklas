@@ -75,7 +75,7 @@ runs a 32-token stateless `session.generate(...)` so dynamo's shape promotion fi
 on a realistic prefill before the user's first request; called from `tui` and
 `serve` after `_setup_steering_vectors`. `_attach_default_manifold_probes(session)`
 runs in `_run_serve` after `create_app`, gated on the dashboard being mounted
-(`web_enabled`) — it attaches the bundled `default/personas` + `default/circumplex`
+(`web_enabled`) — it attaches the bundled `default/personas` + `default/pad`
 as read-side probes (fitted-for-model only; an unfitted one is skipped with a hint).
 
 ## Flags

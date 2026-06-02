@@ -10,7 +10,7 @@ Each push fragment is ``(basis_rows, coord_target, coeff)``: a rank-1 steering
 vector (``(1, D)`` basis), or a rank-R subspace like ``personas%pirate``
 (``(R, D)`` basis + an R-dim node-coord target).  The synthesizer is dormant
 (nothing routes through it yet); these tests pin its geometry and prove its
-output drives ``inject_three_op`` as intended.
+output drives ``subspace_inject`` as intended.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from saklas.core.manifold import (
     SynthesizedSubspace,
     _ortho_basis,
     decompose,
-    inject_three_op,
+    subspace_inject,
     synthesize_subspace,
 )
 
@@ -226,9 +226,9 @@ def test_drops_degenerate_direction_layer():
     assert sorted(synth.layers) == [0]     # layer 1's only dir is degenerate
 
 
-# ----------------------------------------------- integration with inject_three_op ---
+# ----------------------------------------------- integration with subspace_inject ---
 
-def test_synthesized_subspace_drives_inject_three_op():
+def test_synthesized_subspace_drives_subspace_inject():
     """along=1 lands the in-subspace coords on the target: push axis set to its
     coeff, ablation axis removed; the off-subspace residual is preserved."""
     torch.manual_seed(6)
@@ -251,7 +251,7 @@ def test_synthesized_subspace_drives_inject_three_op():
     h = neutral + 0.7 * uh + 0.9 * ua + perp
     seed = (h - sub.mean) @ sub.basis.T
 
-    out, _foot = inject_three_op(
+    out, _foot = subspace_inject(
         h, sub, domain, target, seed, along=1.0, onto=0.0,
     )
     # in-subspace coords land exactly on the target (push→0.5, ablate→0)
@@ -262,8 +262,8 @@ def test_synthesized_subspace_drives_inject_three_op():
     assert torch.allclose(perp_out, perp, atol=1e-4)
 
 
-def test_rank8_synthesized_drives_inject_three_op():
-    """A rank-8 fragment routed through inject_three_op lands its reduced
+def test_rank8_synthesized_drives_subspace_inject():
+    """A rank-8 fragment routed through subspace_inject lands its reduced
     coords on the target under a full along slide."""
     torch.manual_seed(9)
     D = 24
@@ -279,7 +279,7 @@ def test_rank8_synthesized_drives_inject_three_op():
     target = synth.target_coord[0]
     h = neutral + torch.randn(D)
     seed = (h - sub.mean) @ sub.basis.T
-    out, _foot = inject_three_op(
+    out, _foot = subspace_inject(
         h, sub, domain, target, seed, along=1.0, onto=0.0,
     )
     coords_out = (out - sub.mean) @ sub.basis.T
@@ -299,7 +299,7 @@ def test_synthesized_inject_identity_at_along_zero():
     domain = CustomDomain(sub.rank)
     h = neutral + 0.3 * u + 0.4 * torch.randn(D)
     seed = (h - sub.mean) @ sub.basis.T
-    out, _foot = inject_three_op(
+    out, _foot = subspace_inject(
         h, sub, domain, synth.target_coord[0], seed,
         along=0.0, onto=0.0,
     )

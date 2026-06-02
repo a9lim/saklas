@@ -356,7 +356,7 @@ def _manifold_is_affine(manifold: "Manifold") -> bool:
     """True iff every layer subspace is flat — an affine ``%`` joins the merge.
 
     A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
-    a curved ``%`` gets its own three-op instead.
+    a curved ``%`` gets its own two-op instead.
     """
     layers = getattr(manifold, "layers", None)
     if not layers:
@@ -2785,7 +2785,7 @@ class SaklasSession:
           each group is synthesized into one merged affine subspace via
           :func:`~saklas.core.manifold.synthesize_subspace` and registered with
           :meth:`SteeringManager.add_subspace`;
-        - **curved-``%``** manifold terms each get their own three-op via
+        - **curved-``%``** manifold terms each get their own two-op via
           :meth:`SteeringManager.add_manifold`.
 
         A push fragment is ``(unit-dir rows, ‖d_L‖ coord, coeff)`` so the
@@ -2890,7 +2890,7 @@ class SaklasSession:
         nesting depth — ``_compose_steering_entries`` synthesizes the merged
         affine subspace(s) + registers curved manifolds, and
         ``SteeringManager.apply_to_model`` lowers them to per-layer
-        ``inject_three_op`` groups.
+        ``subspace_inject`` groups.
         """
         flat = self._flatten_steering_stack()
         if not flat:

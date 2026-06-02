@@ -9,7 +9,7 @@ and a Svelte dashboard at `/`. Steering signal comes from representation
 engineering: difference-of-means vectors, multi-node affine subspaces, and curved
 RBF manifolds. Every steering term — vectors, poles, `~`/`|` projections, `!`
 ablations, and `%` manifold positions — lowers at generation time to one unified
-per-layer injection (the along/onto subspace kernel, `core/manifold.py::inject_three_op`).
+per-layer injection (the along/onto subspace kernel, `core/manifold.py::subspace_inject`).
 Per-call coefficients, no model mutation. Three frontends over one engine:
 `SaklasSession` (programmatic), `saklas serve` (HTTP), `saklas tui` (TUI).
 
@@ -154,9 +154,9 @@ Probe gates accept three identifier shapes against the merged scalars the sessio
 writes into `TriggerContext.probe_scores`. Vector probes are bare concept names
 (`@when:angry.calm > 0.4`), matching `TraitMonitor.score_single_token` keys.
 Manifold subspace-fraction gates write the `:fraction` channel suffix
-(`@when:circumplex:fraction > 0.5`) — the share of the centered activation living
+(`@when:pad:fraction > 0.5`) — the share of the centered activation living
 in that manifold's subspace, in `[0, 1]`. Manifold label-similarity gates write
-the `@<label>` suffix (`@when:circumplex@elated > -0.1`) — the negated distance to
+the `@<label>` suffix (`@when:pad@elated > -0.1`) — the negated distance to
 a named node (larger = closer), so the natural threshold range is negative. All
 three flow through one `ProbeGate` (full namespaced string stored verbatim,
 matching the keys `ManifoldMonitor.flat_scalars` emits) and round-trip
@@ -165,12 +165,12 @@ byte-for-byte.
 `%` is the manifold operator: `<manifold> % <position>` places a generation at a
 point of a fitted manifold. `<position>` is `<coord_list>` (a comma-separated list
 of authoring coordinates, one per intrinsic dimension, e.g.
-`0.7 circumplex%0.3,0.8@response`) or `<label>` (sugar for "the coords of the node
+`0.7 pad%0.3,0.8,0.0@response`) or `<label>` (sugar for "the coords of the node
 labeled `pirate`", e.g. `0.5 persona%pirate`). The coefficient slot is
 `along[,onto]` — `along` is the slide fraction toward the position, `onto` (curved
 manifolds only) collapses the off-surface in-subspace residual. The former third
 `toward` slot is removed. An affine `%` term (e.g. `personas%pirate`) joins the
-merged subspace as a push fragment; a curved `%` term (e.g. `circumplex%…`) gets
+merged subspace as a push fragment; a curved `%` term (e.g. `pad%…`) gets
 its own injection term. A `%` term doesn't compose with `~`/`|`/`!`. Arity (coord
 form) and label existence (label form) are validated at manifold-load time. Two
 *curved* manifolds at one layer must be (near-)orthogonal or `OverlappingManifoldError`
@@ -213,13 +213,13 @@ the whitened/Fisher subspace fit, the whitened monitor reads, and
 
 ## Injection
 
-One injection kernel — `core/manifold.py::inject_three_op` — for every steering
+One injection kernel — `core/manifold.py::subspace_inject` — for every steering
 term. There is no angular/additive mode, no `injection_mode`/`theta_max`, no
 `_STEER_GAIN`. At dispatch (`session._compose_steering_entries`) each term is
 classified and lowered: vectors / poles / `~`/`|` projections / `!` ablations /
 affine `%` are composed into **one merged affine subspace per trigger group** via
 `synthesize_subspace`; each curved `%` gets its own term. `apply_to_model` then
-attaches per-layer `inject_three_op` groups.
+attaches per-layer `subspace_inject` groups.
 
 The kernel decomposes `h = mean + h_par + h_perp` against the layer's affine
 subspace and applies two ops: **along** slides the in-subspace foot toward the
@@ -330,16 +330,19 @@ Two bundled manifolds ship under `saklas/data/manifolds/`, materializing into
   101 persona nodes (100 archetypes `assistant`…`vandal` + a `default` anchor) in
   assistant-baselined activation space; from Anthropic's Assistant Axis paper
   (arXiv 2601.10387). Per-model coords derived at fit time.
-- **`circumplex`** — *authored*, curved 2-D box on Russell's valence × arousal
-  plane. Nine first-person mood corpora at canonical coordinates (cardinal moods on
-  the axes, diagonal moods at the unit-circle diagonals, neutral at the origin), 27
-  statements/node across nine scenarios. Steer by coord (`circumplex%0.6,0.4`) or
-  label (`circumplex%elated`).
+- **`pad`** — *authored*, curved 3-D box on the PAD (pleasure × arousal ×
+  dominance) space, each axis `[−1, 1]`. 15 first-person mood corpora: the nine
+  valence × arousal moods at dominance 0 (cardinal moods on the axes, diagonal
+  moods at the unit-circle diagonals, `neutral` at the origin), the
+  `dominant`/`submissive` dominance poles, and four dominance-differentiated
+  affects (`furious`/`fearful`/`triumphant`/`humiliated`); 27 statements/node.
+  Steer by coord (`pad%0.6,0.4,0.0` — three coords) or label (`pad%elated`).
+  Supersedes the old 2-D `circumplex`.
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression (α clamps to `[0,1]`, so `_MANIFOLD_GAIN = 1.0` is the
 strength ceiling). Because the share is normalized to mean 1 and the lever is
-gone, a low-dim and a high-dim fit — and `personas` vs `circumplex` — land in the
+gone, a low-dim and a high-dim fit — and `personas` vs `pad` — land in the
 same α-band without per-fit retuning. Architecture-level behavioral notes (hold
 across model families; α values are qualitative, MPS is not bitwise deterministic
 so compare qualitatively):
@@ -453,8 +456,8 @@ tok/s):
   only. The whole generation loop is wrapped in `torch.inference_mode()`.
 - **Norms use fp32** — fp16 sum-of-squares overflows at hidden_dim ≥ 2048. Applies
   to extraction-time direction norms and the per-position norms inside
-  `inject_three_op`. Contrastive diffs are differenced in fp32 too.
-- **One injection kernel.** Every steered layer runs `inject_three_op` (the slow,
+  `subspace_inject`. Contrastive diffs are differenced in fp32 too.
+- **One injection kernel.** Every steered layer runs `subspace_inject` (the slow,
   ctx-consulting hook path), so per-step triggers and probe gates work uniformly;
   there is no composed-tensor fast path. `torch.compile`/StaticCache graph capture
   is eligible only for unsteered generation. The affine analytic shortcut keeps the

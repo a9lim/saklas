@@ -81,7 +81,7 @@ def test_session_steering_dispatches_ablation_to_manager():
     with session.steering(steering):
         # 4.0: ``!`` lowers to an ablation axis (target 0) inside the merged
         # affine subspace — one ``add_subspace`` entry per trigger group, an
-        # ``inject_three_op`` group on the covered layer.
+        # ``subspace_inject`` group on the covered layer.
         assert session._steering.subspaces
         synth = next(iter(session._steering.subspaces.values()))["synth"]
         assert 1 in synth.layers

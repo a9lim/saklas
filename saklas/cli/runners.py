@@ -252,7 +252,7 @@ def _warmup_session(session: SaklasSession) -> None:
 def _attach_default_manifold_probes(session: SaklasSession) -> None:
     """Auto-attach the bundled manifold probes on dashboard startup.
 
-    The two bundled manifolds (``personas``, ``circumplex``) ship as the
+    The two bundled manifolds (``personas``, ``pad``) ship as the
     default read-side counterparts to the bundled vector probes, so the
     dashboard's probe rack opens with them already watching — the
     manifold analogue of how ``bootstrap_probes`` pre-loads the default

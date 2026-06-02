@@ -55,7 +55,7 @@ def _circle(k: int, dim: int, scale: float = 1.0) -> torch.Tensor:
 
     The 20.0 common-mode component mimics a real LM activation's large,
     persona-agnostic norm — without it the per-node centroids vary wildly
-    in magnitude and the soft norm-cap inside ``inject_three_op`` fires on
+    in magnitude and the soft norm-cap inside ``subspace_inject`` fires on
     synthetic fits, masking the geometry under test.
     """
     out = torch.zeros(k, dim)
@@ -513,7 +513,7 @@ def test_manager_reset_manifold_feet_cold_starts():
 
 def test_any_steering_forces_slow_path():
     # 4.0: there is no composed-tensor fast path — any attached hook forces the
-    # slow (ctx-consulting) ``inject_three_op`` path, so ``all_fast_path`` is
+    # slow (ctx-consulting) ``subspace_inject`` path, so ``all_fast_path`` is
     # True only for the unsteered manager (no hooks).
     mgr = SteeringManager()
     assert mgr.all_fast_path() is True

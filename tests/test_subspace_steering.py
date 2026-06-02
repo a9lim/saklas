@@ -2,7 +2,7 @@
 
 The 4.0 unification routes vectors / poles / ``~``/``|`` / ``!`` / affine-``%``
 through one ``synthesize_subspace`` → ``SteeringManager.add_subspace`` →
-``inject_three_op`` backend (Step 5a — the manager half; the session dispatch
+``subspace_inject`` backend (Step 5a — the manager half; the session dispatch
 that builds the ``SynthesizedSubspace`` from active terms is Step 5b).  These
 tests pin ``add_subspace``'s ``apply_to_model`` lowering: each layer becomes a
 ``CustomDomain(R_L)`` manifold-group entry with ``eff_along_L =

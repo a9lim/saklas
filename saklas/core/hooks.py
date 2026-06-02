@@ -14,7 +14,7 @@ from saklas.core.manifold import (
     SynthesizedSubspace,
     _ortho_basis,
     eval_rbf,
-    inject_three_op,
+    subspace_inject,
 )
 from saklas.core.triggers import Trigger, TriggerContext
 
@@ -157,7 +157,7 @@ class SteeringHook:
 
     The 4.0 unified backend.  Every steering term — vectors, poles,
     ``~``/``|`` projections, ``!`` ablations, affine and curved ``%`` — lowers
-    to a per-layer :func:`inject_three_op` group: the dispatch-synthesized
+    to a per-layer :func:`subspace_inject` group: the dispatch-synthesized
     merged affine subspace, plus zero or more mutually-orthogonal curved
     manifolds.  There is no additive/angular vector fast path any more, so a
     steered layer always runs the (ctx-consulting) slow hook — per-step
@@ -169,7 +169,7 @@ class SteeringHook:
         # Subspace / manifold groups: (Trigger, subspace, domain,
         # target_coord [n], origin_coord [n], along, onto).  The merged affine
         # subspace (from the dispatch synthesizer) and each curved manifold are
-        # both groups here; ``inject_three_op``'s ``is_affine`` branch picks the
+        # both groups here; ``subspace_inject``'s ``is_affine`` branch picks the
         # analytic-vs-foot-following path.  ``target_coord`` / ``origin_coord``
         # are authoring coordinates; ``along`` / ``onto`` are the per-layer
         # effective coefficients (share-weighted at apply time).  See
@@ -183,7 +183,7 @@ class SteeringHook:
         # Per-token nearest-point foot state, parallel to ``manifold_groups``
         # (``None`` = cold, seed at the origin).  Affine groups ignore it (the
         # foot is ``q`` exactly); curved groups warm-start the Gauss-Newton
-        # follower from it.  ``inject_three_op`` returns the refined foot each
+        # follower from it.  ``subspace_inject`` returns the refined foot each
         # fire; we stash the *last position* of it as the next token's warm
         # start.  Reset at recompose and by
         # :meth:`SteeringManager.reset_manifold_feet` at each generation start.
@@ -209,7 +209,7 @@ class SteeringHook:
         generation loop mutates and the hook reads at fire time.
 
         Subspace tensors are cast to **fp32** (the RBF / Gauss-Newton math is
-        fp32 regardless of the model dtype; ``inject_three_op`` casts the
+        fp32 regardless of the model dtype; ``subspace_inject`` casts the
         result back to ``hidden.dtype`` per fire).  An entry with both
         coefficients zero is a no-op and drops here.  A new group set
         cold-starts every foot-follower.
@@ -221,7 +221,7 @@ class SteeringHook:
         # subspace tensors stay **fp32** (the RBF / Gauss-Newton math is fp32
         # regardless of the model dtype, and quantizing ``node_params`` /
         # ``rbf_weights`` to bf16 would wreck the interpolant precision).
-        # ``inject_three_op`` re-casts internally, so fp32 here is the precise
+        # ``subspace_inject`` re-casts internally, so fp32 here is the precise
         # carrier, not an extra cost.  An entry with both coefficients
         # zero is a no-op and drops here.
         manifold_groups: list[
@@ -268,7 +268,7 @@ class SteeringHook:
     ) -> None:
         """Apply every active manifold group via the unified kernel.
 
-        Each group runs :func:`inject_three_op` — the single along/onto
+        Each group runs :func:`subspace_inject` — the single along/onto
         injection that replaced the angular/additive mode split.  The two
         per-layer coefficients are already share-weighted at
         :meth:`SteeringManager.apply_to_model` time, so the hot path just routes
@@ -312,7 +312,7 @@ class SteeringHook:
                     (1,) * len(lead) + (n,)
                 ).expand(*lead, n)
                 gn_steps = _MANIFOLD_COLD_GN_STEPS
-            h_new, foot = inject_three_op(
+            h_new, foot = subspace_inject(
                 hidden, sub, domain, target, foot_seed,
                 along, onto, gn_steps=gn_steps,
             )
@@ -353,7 +353,7 @@ class SteeringHook:
 # the A⊂B consistency above, and blew the gain up on whitened low-rank fits
 # (``N ≈ 1e-4`` → ``base/N`` saturating every layer).  And **no ``[0, 1]`` clamp
 # / water-fill** on ``along``: a high-signal layer is *meant* to overshoot past
-# the pole; the affine/RBF ``norm_cap = 3·‖h‖`` inside ``inject_three_op`` is
+# the pole; the affine/RBF ``norm_cap = 3·‖h‖`` inside ``subspace_inject`` is
 # the only bound.  ``onto`` stays clamped ``[0, 1]`` (a collapse fraction > 1
 # inverts the residual).
 #
@@ -461,7 +461,7 @@ class SteeringManager:
         # Dispatch-synthesized merged affine subspaces (one per active trigger
         # group), the 4.0 unified vector/pole/projection/ablation/affine-``%``
         # backend.  Each value is ``{synth, trigger}``; ``apply_to_model``
-        # lowers them to per-layer ``inject_three_op`` entries alongside curved
+        # lowers them to per-layer ``subspace_inject`` entries alongside curved
         # manifolds.
         self.subspaces: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
@@ -470,7 +470,7 @@ class SteeringManager:
         """True iff no steering hook is attached (the unsteered path).
 
         The 4.0 backend lowers every steering term to a slow (ctx-consulting)
-        :func:`inject_three_op` group, so there is no longer a composed-tensor
+        :func:`subspace_inject` group, so there is no longer a composed-tensor
         fast path.  An attached hook therefore always forces the slow path,
         which is the StaticCache / ``torch.compile`` graph-capture
         ineligibility signal :mod:`saklas.core.cuda_graphs` reads — graph
@@ -494,7 +494,7 @@ class SteeringManager:
         per-layer subspace + domain + authoring ``target`` / ``origin`` coords
         are attached to the corresponding :class:`SteeringHook` along with the
         share-weighted per-layer ``along`` / ``onto`` coefficients; the hot path
-        runs :func:`inject_three_op`.
+        runs :func:`subspace_inject`.
 
         ``position`` is either a tuple of authoring coordinates (coord form)
         or a node-label string (label form, sugar for that node's coords).
@@ -558,12 +558,12 @@ class SteeringManager:
 
         At :meth:`apply_to_model` each layer becomes a per-layer
         ``(subspace, CustomDomain(R_L), target_coord, origin=0, eff_along,
-        onto=0)`` entry routed through the same :func:`inject_three_op` hot
+        onto=0)`` entry routed through the same :func:`subspace_inject` hot
         path as a curved manifold — the affine analytic shortcut slides the
         in-subspace component toward ``target_coord`` with
         ``eff_along_L = share_L · base_gain`` (``share_L`` mean-1 normalized; no
         lever / ``N``, no ``[0, 1]`` clamp — the de-rogued real-coord target
-        carries the magnitude and the ``norm_cap`` inside ``inject_three_op``
+        carries the magnitude and the ``norm_cap`` inside ``subspace_inject``
         bounds an over-share layer's overshoot).  ``onto = 0`` (the surface
         fills its span).
         """
@@ -582,7 +582,7 @@ class SteeringManager:
 
         Lowers every registered term — the dispatch-synthesized merged affine
         subspace(s) and each curved manifold — to per-layer
-        :func:`inject_three_op` groups, orthogonalizing the affine subspace
+        :func:`subspace_inject` groups, orthogonalizing the affine subspace
         against the curved manifolds so they compose with zero cross-talk,
         then recomposing the per-layer hooks.  ``dtype`` is the model dtype the
         hook casts the fp32 subspace result back to.
@@ -608,7 +608,7 @@ class SteeringManager:
         # lever / ``N`` and no water-fill (both torn out in Step 8 — see the
         # ``_MANIFOLD_GAIN`` docstring): ``along`` is left un-clamped so a
         # high-share layer overshoots past the target (the ``norm_cap`` inside
-        # ``inject_three_op`` is the only bound), while ``onto`` stays clamped
+        # ``subspace_inject`` is the only bound), while ``onto`` stays clamped
         # ``[0, 1]`` per layer (a collapse fraction > 1 inverts the residual).
         manifold_by_layer: dict[
             int,
@@ -688,7 +688,7 @@ class SteeringManager:
         # composed from every active push term's coeff-scaled pole; here we only
         # set the per-layer slide budget ``eff_along_L = share_L · base`` (mean-1
         # share, no lever / clamp — Step 8) and lower each layer to a
-        # ``CustomDomain(R_L)`` ``inject_three_op`` entry (the affine analytic
+        # ``CustomDomain(R_L)`` ``subspace_inject`` entry (the affine analytic
         # shortcut — no GN / RBF / foot solve).  The target carries the
         # strength, so there is no separate user-α multiply here; ``onto = 0``
         # (the surface fills its span).  Curved-vs-affine orthogonalization +
@@ -735,7 +735,7 @@ class SteeringManager:
                 # No lever / ``N`` and no ``[0, 1]`` clamp (Step 8): the
                 # de-rogued real-coord target carries the magnitude; a
                 # high-share layer overshoots past the pole (``norm_cap`` bounds
-                # it in ``inject_three_op``).
+                # it in ``subspace_inject``).
                 eff_along_L = shares[L] * _MANIFOLD_GAIN
                 manifold_by_layer.setdefault(L, []).append((
                     sub_L, sub_domain, sub_target, sub_origin,

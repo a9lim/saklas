@@ -51,7 +51,7 @@ activation living in the manifold's PCA subspace), and
 ``@when:<manifold>@<label> <op> N`` fires on the negated distance to a
 named node (larger = closer; label-similarity gates routinely use
 negative thresholds).  The gate's probe string is stored verbatim
-(``"circumplex:fraction"``, ``"circumplex@elated"``) so it matches the
+(``"pad:fraction"``, ``"pad@elated"``) so it matches the
 key ``ManifoldMonitor.flat_scalars`` already merges into
 ``TriggerContext.probe_scores``; no runtime gate machinery changes.
 
@@ -71,7 +71,7 @@ entry.
 
 Manifold steering: the ``%`` infix operator places a generation at a
 point of a fitted manifold — ``manifold % coord_list``, e.g.
-``0.7 circumplex%0.3,0.8@response``.  The left operand is a manifold name
+``0.7 pad%0.3,0.8,0.0@response``.  The left operand is a manifold name
 (not a concept; no pole resolution), the right is a comma-separated list
 of authoring coordinates — one per intrinsic dimension of the manifold's
 domain.  The parser only collects the coordinate tuple; arity and range
@@ -190,7 +190,7 @@ class ManifoldTerm:
     named :class:`~saklas.core.manifold.Manifold` artifact on scope entry
     and hands the hook a per-layer subspace + domain + the authoring
     ``position`` coords; the hook runs the unified along/onto injection
-    (:func:`~saklas.core.manifold.inject_three_op`).  Stored as a value
+    (:func:`~saklas.core.manifold.subspace_inject`).  Stored as a value
     inside ``Steering.alphas`` under the key ``"<manifold>%<position>"`` so
     two positions on the same manifold compose as distinct entries and
     never collide with plain / projected / ablation keys.
@@ -386,7 +386,7 @@ class _Term:
     ablation: bool = False  # True iff term was prefixed with `!`
     # The full comma-run of coefficients the user typed.  A plain term
     # carries a 1-tuple; a manifold ``%`` term may carry up to 2 mapping
-    # to (along, onto) via :func:`_expand_three_op_coeffs`.
+    # to (along, onto) via :func:`_expand_along_onto_coeffs`.
     # ``coeff`` always equals ``coeffs[0]`` (the representative scalar all
     # non-manifold code paths read), so existing single-coeff behavior is
     # bit-identical; ``> 1`` on a non-manifold term is a parse-fold error.
@@ -536,14 +536,14 @@ class _Parser:
           ``<manifold>:fraction`` — fires on the fraction of the
           centered activation that lives in the manifold's PCA
           subspace.  Stored verbatim as the gate's probe string
-          (e.g. ``"circumplex:fraction"``); the session's
+          (e.g. ``"pad:fraction"``); the session's
           :class:`ManifoldMonitor.flat_scalars` already emits a
           matching namespaced key, so ``Trigger.active`` looks it up
           unchanged.
         - Manifold label-similarity probe:
           ``<manifold>@<label>`` — fires on the negated distance to
           the named node (larger = closer).  Stored verbatim as the
-          gate's probe string (e.g. ``"circumplex@elated"``); same
+          gate's probe string (e.g. ``"pad@elated"``); same
           ``flat_scalars`` correspondence.
 
         The discriminator on the trailing IDENT: a ``COLON`` after the
@@ -847,7 +847,7 @@ def _fmt_position(position: tuple[float, ...] | str) -> str:
     return ",".join(f"{c:g}" for c in position)
 
 
-def _expand_three_op_coeffs(
+def _expand_along_onto_coeffs(
     coeffs: tuple[float, ...],
 ) -> tuple[float, float]:
     """Map a 1/2-length coefficient run to ``(along, onto)``.
@@ -930,7 +930,7 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
             )
             _merge_manifold(
                 alphas, mfld_key,
-                _expand_three_op_coeffs(term.coeffs),
+                _expand_along_onto_coeffs(term.coeffs),
                 sel.manifold_position, mfld_trig,
             )
             continue
@@ -971,7 +971,7 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 )
                 _merge_manifold(
                     alphas, manifold_hit.manifold_key,
-                    _expand_three_op_coeffs(term.coeffs),
+                    _expand_along_onto_coeffs(term.coeffs),
                     manifold_hit.label, mfld_trig,
                 )
                 continue
@@ -1005,7 +1005,7 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                 )
                 _merge_manifold(
                     alphas, name_hit.manifold_key,
-                    _expand_three_op_coeffs(term.coeffs),
+                    _expand_along_onto_coeffs(term.coeffs),
                     name_hit.pole_label, mfld_trig,
                 )
                 continue
@@ -1135,7 +1135,7 @@ def _fmt_ablation(a: AblationTerm) -> str:
 
 def _fmt_manifold(m: ManifoldTerm) -> str:
     # Render the shortest coefficient form the (along, onto) pair collapses
-    # to — the inverse of ``_expand_three_op_coeffs`` — so the round-trip is
+    # to — the inverse of ``_expand_along_onto_coeffs`` — so the round-trip is
     # byte-for-byte.  The collapse op defaults off, so: onto zero → one coeff
     # (along); else two (along, onto).
     #

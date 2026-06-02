@@ -221,7 +221,7 @@ def test_format_round_trip(expr: str) -> None:
     assert a == b
 
 
-# ------------------------------------------------ three-op coeff grammar ---
+# ------------------------------------------------ two-op coeff grammar ---
 
 def test_single_coeff_is_along_only():
     # Collapse op defaults off: one coeff is a pure directional slide.

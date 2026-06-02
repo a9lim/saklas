@@ -7,7 +7,7 @@ in the repo-root `ARCHITECTURE.md`; this file is the per-module map.
 
 The 4.0 backend lowers **every** steering term — vectors, poles, `~`/`|`
 projections, `!` ablations, and affine/curved `%` — to one per-layer
-`inject_three_op` (along/onto) call. There is no angular/additive mode, no
+`subspace_inject` (along/onto) call. There is no angular/additive mode, no
 `injection_mode`/`theta_max`, no `_STEER_GAIN`, and no per-fit lever.
 
 ## model.py
@@ -65,13 +65,16 @@ baseline + the whitener's neutral cache. `project_profile(base, onto, operator,
 *, whitener=None)` is the per-layer `~`/`|` projection (LEACE under a whitener,
 Gram-Schmidt otherwise; metric all-or-nothing via `covers_all`).
 
-**Subspace-native fold (built, tested, not yet the production vector path).**
+**Subspace-native fold (the production vector path).**
 `fold_vector_to_subspace` / `_fold_centroids_to_affine_manifold` capture pos/neg
 centroids and fold them into an affine `R=1` `Manifold`; `fold_directions_to_subspace`
 is the monopolar sibling (a merge/projection direction → a one-pole ray);
 `folded_vector_directions` is the reverse view. These implement "a vector *is* a
-2-node affine manifold". The live extraction/steering path for vector concepts
-still uses baked `Profile`s folded at dispatch (`session._vector_push_fragment`).
+2-node affine manifold". 4.0 dispatch lowers every plain vector term this way:
+`session._ensure_profile_registered` resolves the direction (a registered tensor,
+or a fitted 2-node manifold loaded + folded), then `fold_directions_to_subspace`
+→ `_affine_manifold_push` joins it to the merged affine subspace. The old
+baked-`Profile` `_vector_push_fragment` shim is gone (4.0 6b).
 
 ## extraction.py
 
@@ -165,7 +168,7 @@ decomposition behind injection + the read monitor. `synthesize_subspace(push,
 ablate, neutral_means)` composes the active steering term set into one
 `SynthesizedSubspace` per layer (orthonormal merged basis via `_ortho_basis`,
 push-before-ablation ordering; `target_coord = B @ Σ coeffᵢ·poleᵢ`; `share =
-‖Δ‖`). `inject_three_op(h, subspace, domain, target_coord, foot_seed, along,
+‖Δ‖`). `subspace_inject(h, subspace, domain, target_coord, foot_seed, along,
 onto)` is **the** injection: affine analytic shortcut (foot = q, geodesic slide,
 `H_o` kept) vs curved per-token GN foot-follow (along transports `H_n` normal at
 the new foot, onto scales it `(1−o)`, `H_o` kept). `norm_cap = 3·‖h‖` is the only
@@ -187,7 +190,7 @@ Naturalness eval: `to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifo
 ## hooks.py
 
 `SteeringHook` carries per-layer groups `(trigger, subspace, domain, target_coord,
-origin_coord, along, onto)` and runs each active one through `inject_three_op`
+origin_coord, along, onto)` and runs each active one through `subspace_inject`
 (`_apply_manifold_groups`). A cheap pre-check skips inactive steps. Per-token foot
 state `_manifold_feet` (cold → seed at `origin`, `_MANIFOLD_COLD_GN_STEPS = 4` GN
 steps; warm → one step). No composed-tensor fast path: a steered layer always
@@ -303,8 +306,9 @@ HTTP clients steer bundled probes without pre-registration.
 `_compose_steering_entries` is the 4.0 dispatch (`ARCHITECTURE.md` §4): classify
 each entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins
 the merge (`_affine_manifold_push`, label-form) or curved `%` → `add_manifold`;
-plain `(alpha, trigger)` → rank-1 push (`_vector_push_fragment`, unit dir +
-`‖d_L‖` coord) — group push+ablate by trigger, `synthesize_subspace` per group,
+plain `(alpha, trigger)` → rank-1 push (`_ensure_profile_registered` →
+`fold_directions_to_subspace` → `_affine_manifold_push`, unit dir + `‖d_L‖`
+coord) — group push+ablate by trigger, `synthesize_subspace` per group,
 `add_subspace`. `_install_composed_steering` → `apply_to_model`. There are **no**
 persistent hooks. Manifold-implied roles aggregate under soft-warn +
 highest-`|coeff|`-wins (`RoleBaselineMismatchWarning`).
@@ -420,9 +424,9 @@ checks). Term markers: `ProjectedTerm(coeff, trigger, operator, base, onto)`
 (materialized into derived profiles before the hook layer), `AblationTerm` (`!atom`,
 default coeff 1.0, doesn't compose with `~`/`|` — lowered through
 `synthesize_subspace`'s ablation path at dispatch), `ManifoldTerm` (`along`,
-`onto`, position; the third `toward` slot is removed — `_expand_three_op_coeffs`
+`onto`, position; the third `toward` slot is removed — `_expand_along_onto_coeffs`
 yields a 1- or 2-tuple). Probe gates (`@when:<probe><op><threshold>`) accept three
-identifier shapes — vector (`angry.calm`), manifold fraction (`circumplex:fraction`),
-manifold label (`circumplex@elated`) — all stored verbatim in `ProbeGate.probe` so
+identifier shapes — vector (`angry.calm`), manifold fraction (`pad:fraction`),
+manifold label (`pad@elated`) — all stored verbatim in `ProbeGate.probe` so
 the runtime gate is identical; the parser is the only place the discrimination
 lives.

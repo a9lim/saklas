@@ -31,8 +31,8 @@ The RBF fit solves a small dense symmetric-indefinite saddle system with
 ``torch.linalg.solve`` -- node counts are tiny (on the order of ten to
 thirty) and fitting is a one-shot operation, not a hot path. scipy is not
 pulled in. ``eval_rbf``, :func:`eval_rbf_jacobian`, :func:`_gn_step` and
-:func:`inject_three_op` are the functions reachable from the generation
-hot path (``inject_three_op`` is the unified along/onto subspace/manifold
+:func:`subspace_inject` are the functions reachable from the generation
+hot path (``subspace_inject`` is the unified along/onto subspace/manifold
 injection — the single steering backend); all are allocation-light and
 free of host syncs.
 """
@@ -164,7 +164,7 @@ class ManifoldDomain(ABC):
         non-wrapping domain (``CustomDomain``, and the open-axis part of a
         ``BoxDomain``). :class:`BoxDomain` overrides it for periodic axes
         (wrap-aware shortest arc) and :class:`SphereDomain` for great-circle
-        slerp. This is the operator the three-op ``along`` step slides the
+        slerp. This is the operator the two-op ``along`` step slides the
         projected foot through, so the path stays *on the surface* rather than
         cutting the ambient chord the old additive injection took.
         """
@@ -636,7 +636,7 @@ class LayerSubspace:
     ``n = R``), so the reduced coordinates equal the authoring coordinates
     by an identity map and ``manifold_point(c) = mean + c @ basis``.  The
     affine case has ``H_n ≡ 0`` (the surface fills its subspace), so
-    ``inject_three_op`` takes an analytic shortcut that skips the
+    ``subspace_inject`` takes an analytic shortcut that skips the
     Gauss-Newton foot solve, the RBF eval, and the tangent Gram-solve —
     load-bearing for throughput, since a folded vector is the common
     steering case and the curved per-token solve would blow the
@@ -669,7 +669,7 @@ class LayerSubspace:
     def is_affine(self) -> bool:
         """True for a flat (no-RBF) subspace — the surface fills its span.
 
-        The analytic-shortcut marker: ``inject_three_op`` and ``eval_at``
+        The analytic-shortcut marker: ``subspace_inject`` and ``eval_at``
         branch on this to skip all RBF / Gauss-Newton machinery.  A folded
         steering vector (``n = R``, the chord) is built affine; every
         RBF-fitted manifold (curved, or merely space-filling like a discover
@@ -1138,9 +1138,9 @@ class Manifold:
     # Origin ``O_L`` — the **per-layer** foot of the neutral mean on ``M``, in
     # authoring coordinates ``(n,)``, keyed by layer.  Always a point *on* the
     # manifold (each is an ``invert_parameterization`` result), so always affine;
-    # there is no linear/affine field.  Two roles in three-op steering: the
+    # there is no linear/affine field.  Two roles in two-op steering: the
     # cold-start seed for that layer's per-token nearest-point foot-follower
-    # (``inject_three_op``), and the slide-to target of the ``!`` operator
+    # (``subspace_inject``), and the slide-to target of the ``!`` operator
     # (Phase 2).  Per-layer rather than a single shared coord because each layer
     # embeds the shared authoring coords into activation space differently (its
     # own PCA + RBF), so neutral's foot genuinely differs by depth — and the
@@ -1349,7 +1349,7 @@ class Manifold:
 
 
 # Per-position guard against a degenerate normal-transport renorm in
-# :func:`inject_three_op` (the off-manifold residual collapsing onto the
+# :func:`subspace_inject` (the off-manifold residual collapsing onto the
 # tangent at a new foot near a fold): below this the transported residual
 # is dropped rather than fabricated from a near-zero direction.
 _ROTATE_EPSILON: float = 1e-6
@@ -1368,7 +1368,7 @@ def decompose(
     ``h_perp`` is the orthogonal residual; together they sum to
     ``h - mean`` exactly.
 
-    The shared decomposition step that backs :func:`inject_three_op` and
+    The shared decomposition step that backs :func:`subspace_inject` and
     the read-side ``ManifoldMonitor``.  All
     three intermediates are kept in the input's dtype — callers that need
     fp32 (the injection functions, the monitor) cast their inputs first.
@@ -1429,7 +1429,7 @@ class SynthesizedSubspace:
     The dispatch-time analogue of a fitted :class:`Manifold`: instead of loading
     one artifact, the session composes the whole active steering expression into
     a single per-layer subspace + ``along`` target.  This is what lets steering
-    keep its superposition semantics under the three-op kernel — one manifold per
+    keep its superposition semantics under the two-op kernel — one manifold per
     layer holds, because dispatch builds exactly *one* derived subspace per layer
     from every active term (rather than one manifold per concept, which would
     collide at shared layers, ``OverlappingManifoldError``).
@@ -1502,7 +1502,7 @@ def synthesize_subspace(
     caller picks ``along`` (the overall slide, the existing manifold-``%``
     knob) and the per-layer (mean-1) share normalization at apply time.  Pure
     tensor, fp32, no model/IO coupling — the dispatch synthesizer (which routes
-    the result through ``inject_three_op`` with a ``CustomDomain(R)`` per layer)
+    the result through ``subspace_inject`` with a ``CustomDomain(R)`` per layer)
     is the only consumer.
     """
     all_layers: set[int] = set()
@@ -1586,7 +1586,7 @@ def synthesize_subspace(
 _TANGENT_GRAM_RIDGE = 1e-6
 
 
-def inject_three_op(
+def subspace_inject(
     h: torch.Tensor,
     subspace: LayerSubspace,
     domain: ManifoldDomain,
@@ -2363,7 +2363,7 @@ def _gn_step(
     foot-follower) gate on whether a single step actually reduced the residual.
 
     Shared by :func:`invert_parameterization` (looped ``max_iter`` times over
-    ``S`` warm starts) and the three-op steering kernel (one step per token,
+    ``S`` warm starts) and the two-op steering kernel (one step per token,
     warm-started from the previous foot), so the LM math lives in exactly one
     place.
     """
@@ -2642,7 +2642,7 @@ __all__ = [
     "eval_rbf_jacobian",
     "fit_layer_subspace",
     "decompose",
-    "inject_three_op",
+    "subspace_inject",
     "PcaDiagnostics",
     "SpectralDiagnostics",
     "derive_pca_coords",

@@ -544,18 +544,18 @@ def test_discover_round_trip_through_load_manifold(tmp_path: Path) -> None:
         assert m2.layers[L].basis.shape == m1.layers[L].basis.shape
 
 
-def test_discover_inject_three_op_moves_toward_target(tmp_path: Path) -> None:
-    """End-to-end behavior check: ``inject_three_op`` with along=onto=1 snaps
+def test_discover_subspace_inject_moves_toward_target(tmp_path: Path) -> None:
+    """End-to-end behavior check: ``subspace_inject`` with along=onto=1 snaps
     the in-subspace component onto the manifold target.
 
-    This is the three-op analogue of the old ``subspace_replace`` α=1 snap:
+    This is the two-op analogue of the old ``subspace_replace`` α=1 snap:
     ``along=1`` slides the projected foot all the way onto the target coord,
     ``onto=1`` collapses the off-manifold in-subspace residual ``H_n``, so the
     output's reduced coords land on ``target_coords``.  We assert
     direction-reducing (the in-subspace distance to target at least halves),
     robust to the soft norm cap firing on a synthetic fit.
     """
-    from saklas.core.manifold import inject_three_op
+    from saklas.core.manifold import subspace_inject
     # Seed the global RNG before the fit: the stub encoder perturbs each
     # layer's centroid with a generator-less ``torch.randn``, so without
     # this the fitted subspace jitters with test order and the borderline
@@ -580,7 +580,7 @@ def test_discover_inject_three_op_moves_toward_target(tmp_path: Path) -> None:
     g = torch.Generator().manual_seed(0)
     hidden = 3.0 * torch.randn(1, 3, _DIM, generator=g)
     seed = position.reshape((1,) * 2 + (n,)).expand(1, 3, n)
-    out, _foot = inject_three_op(
+    out, _foot = subspace_inject(
         hidden, sub, domain, position, seed,
         along=1.0, onto=1.0, gn_steps=4,
     )
@@ -593,7 +593,7 @@ def test_discover_inject_three_op_moves_toward_target(tmp_path: Path) -> None:
         # along=onto=1 should close most of the gap toward target — at least
         # halve the in-subspace coordinate distance.
         assert dist_after < 0.5 * dist_before, (
-            f"position {pos}: inject_three_op barely moved h_in "
+            f"position {pos}: subspace_inject barely moved h_in "
             f"({dist_before:.3f}) toward target (now {dist_after:.3f})"
         )
 

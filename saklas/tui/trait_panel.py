@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 # Mini-map dimensions for 2-D BoxDomain manifolds (the canonical case
-# is the bundled ``circumplex``).  Fits comfortably within the trait
+# is the bundled ``pad``).  Fits comfortably within the trait
 # panel's column width — `MINIMAP_W = 17` matches BAR_WIDTH's visual
 # weight without overflowing on narrow terminals; `MINIMAP_H = 7` gives
 # enough vertical room to discriminate the four quadrants and the origin.

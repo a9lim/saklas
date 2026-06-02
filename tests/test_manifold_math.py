@@ -24,7 +24,7 @@ from saklas.core.manifold import (
     eval_rbf_jacobian,
     fit_layer_subspace as _fit_layer_subspace_with_ev,  # returns (LayerSubspace, ev_ratio)
     fit_rbf_interpolant,
-    inject_three_op,
+    subspace_inject,
     LayerSubspace,
     invert_parameterization,
     load_manifold,
@@ -560,7 +560,7 @@ def test_geodesic_custom_linear():
     assert torch.allclose(cd.geodesic(a, b, 0.5), torch.tensor([1.0, 2.0, 3.0]))
 
 
-# ------------------------------------------------------------- inject_three_op ---
+# ------------------------------------------------------------- subspace_inject ---
 
 def _grid_manifold(dim: int = 16, seed: int = 0):
     """A curved 3x3-grid manifold with a realistic large common-mode norm.
@@ -589,7 +589,7 @@ def _on_surface(sub: Any, domain: Any, coord: Any) -> torch.Tensor:
 def test_inject_identity_at_zero():
     sub, domain = _grid_manifold()
     h = _on_surface(sub, domain, [0.4, 0.6]) + 0.2 * torch.randn(16)
-    out, _ = inject_three_op(
+    out, _ = subspace_inject(
         h, sub, domain, torch.tensor([0.9, 0.1]), torch.tensor([0.4, 0.6]),
         0.0, 0.0, gn_steps=20,
     )
@@ -600,13 +600,13 @@ def test_inject_along_slides_on_surface():
     sub, domain = _grid_manifold()
     a, b = [0.0, 0.0], [1.0, 1.0]
     h = _on_surface(sub, domain, a)  # on the surface, H_n = 0
-    out, _ = inject_three_op(
+    out, _ = subspace_inject(
         h, sub, domain, torch.tensor(b), torch.tensor(a),
         1.0, 0.0, gn_steps=20,
     )
     assert torch.allclose(out, _on_surface(sub, domain, b), atol=5e-3)
     # half-slide lands on the geodesic midpoint foot
-    out_h, _ = inject_three_op(
+    out_h, _ = subspace_inject(
         h, sub, domain, torch.tensor(b), torch.tensor(a),
         0.5, 0.0, gn_steps=20,
     )
@@ -616,7 +616,7 @@ def test_inject_along_slides_on_surface():
 def test_inject_onto_collapses_to_surface():
     sub, domain = _grid_manifold()
     h = _on_surface(sub, domain, [0.5, 0.5]) + 0.3 * torch.randn(16)
-    out, foot = inject_three_op(
+    out, foot = subspace_inject(
         h, sub, domain, torch.tensor([0.5, 0.5]), torch.tensor([0.5, 0.5]),
         0.0, 1.0, gn_steps=20,
     )
@@ -630,8 +630,8 @@ def test_inject_onto_half_halves_off_manifold_residual():
     sub, domain = _grid_manifold()
     h = _on_surface(sub, domain, [0.4, 0.4]) + 0.3 * torch.randn(16)
     pos, seed = torch.tensor([0.4, 0.4]), torch.tensor([0.4, 0.4])
-    out0, foot = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.0, gn_steps=20)
-    out_h, _ = inject_three_op(h, sub, domain, pos, seed, 0.0, 0.5, gn_steps=20)
+    out0, foot = subspace_inject(h, sub, domain, pos, seed, 0.0, 0.0, gn_steps=20)
+    out_h, _ = subspace_inject(h, sub, domain, pos, seed, 0.0, 0.5, gn_steps=20)
     surf = sub.eval_at(domain.embed(foot)) - sub.mean
     hn0 = ((out0 - sub.mean) @ sub.basis.T @ sub.basis) - surf
     hnh = ((out_h - sub.mean) @ sub.basis.T @ sub.basis) - surf
@@ -645,7 +645,7 @@ def test_inject_keeps_off_subspace_verbatim():
     sub, domain = _grid_manifold()
     h = _on_surface(sub, domain, [0.3, 0.7]) + 0.4 * torch.randn(16)
     _, perp_in = decompose(h, sub.mean, sub.basis)
-    out, _ = inject_three_op(
+    out, _ = subspace_inject(
         h, sub, domain, torch.tensor([0.9, 0.2]), torch.tensor([0.3, 0.7]),
         1.0, 1.0, gn_steps=20,
     )
@@ -657,7 +657,7 @@ def test_inject_along_onto_preserve_off_subspace():
     sub, domain = _grid_manifold()
     h = _on_surface(sub, domain, [0.2, 0.8]) + 0.3 * torch.randn(16)
     _, perp_in = decompose(h, sub.mean, sub.basis)
-    out, _ = inject_three_op(
+    out, _ = subspace_inject(
         h, sub, domain, torch.tensor([0.9, 0.2]), torch.tensor([0.2, 0.8]),
         0.7, 0.5, gn_steps=20,
     )
@@ -670,7 +670,7 @@ def test_inject_norm_cap_bounds_output():
     h = _on_surface(sub, domain, [0.5, 0.5]) + 0.3 * torch.randn(16)
     for a in (0.0, 0.5, 1.0):
         for o in (0.0, 1.0):
-            out, _ = inject_three_op(
+            out, _ = subspace_inject(
                 h, sub, domain, torch.tensor([0.9, 0.1]),
                 torch.tensor([0.5, 0.5]), a, o, gn_steps=20, norm_cap=3.0,
             )
@@ -682,7 +682,7 @@ def test_inject_norm_cap_bounds_output():
 # ------------------------------------------------- affine (flat) subspace ---
 #
 # A folded steering vector is the degenerate n = R = 1 case: an affine
-# subspace whose "surface" fills its span, so H_n ≡ 0 and inject_three_op
+# subspace whose "surface" fills its span, so H_n ≡ 0 and subspace_inject
 # takes the analytic shortcut (no GN solve / RBF eval / tangent solve).
 
 def _folded_vector(dim: int = 16, seed: int = 0):
@@ -737,7 +737,7 @@ def test_affine_jacobian_is_basis_T():
 def test_affine_inject_identity_at_zero():
     sub, domain = _folded_vector()
     h = sub.eval_at(torch.tensor([0.6])) + 0.2 * torch.randn(16)
-    out, foot = inject_three_op(
+    out, foot = subspace_inject(
         h, sub, domain, torch.tensor([0.9]), torch.tensor([0.6]),
         0.0, 0.0,
     )
@@ -750,14 +750,14 @@ def test_affine_inject_along_lands_coord_at_target():
     sub, domain = _folded_vector()
     h = sub.eval_at(torch.tensor([-0.4])) + 0.3 * torch.randn(16)
     target = torch.tensor([1.5])
-    out, _ = inject_three_op(
+    out, _ = subspace_inject(
         h, sub, domain, target, torch.tensor([-0.4]), 1.0, 0.0,
     )
     q_out = (out - sub.mean) @ sub.basis.T          # reduced coord of the output
     assert torch.allclose(q_out, target, atol=1e-4)
     # half-slide lands at the linear midpoint between q and target
     q_in = (h - sub.mean) @ sub.basis.T
-    out_h, _ = inject_three_op(
+    out_h, _ = subspace_inject(
         h, sub, domain, target, torch.tensor([-0.4]), 0.5, 0.0,
     )
     q_half = (out_h - sub.mean) @ sub.basis.T
@@ -769,8 +769,8 @@ def test_affine_inject_onto_is_vacuous():
     sub, domain = _folded_vector()
     h = sub.eval_at(torch.tensor([0.2])) + 0.3 * torch.randn(16)
     pos, seed = torch.tensor([0.2]), torch.tensor([0.2])
-    out0, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 0.0)
-    out1, _ = inject_three_op(h, sub, domain, pos, seed, 0.3, 1.0)
+    out0, _ = subspace_inject(h, sub, domain, pos, seed, 0.3, 0.0)
+    out1, _ = subspace_inject(h, sub, domain, pos, seed, 0.3, 1.0)
     assert torch.allclose(out0, out1, atol=1e-5)
 
 
@@ -780,7 +780,7 @@ def test_affine_inject_keeps_off_subspace_verbatim():
     sub, domain = _folded_vector()
     h = sub.eval_at(torch.tensor([0.3])) + 0.4 * torch.randn(16)
     _, perp_in = decompose(h, sub.mean, sub.basis)
-    out, _ = inject_three_op(
+    out, _ = subspace_inject(
         h, sub, domain, torch.tensor([1.2]), torch.tensor([0.3]), 1.0, 1.0,
     )
     _, perp_out = decompose(out, sub.mean, sub.basis)

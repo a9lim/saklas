@@ -1,7 +1,7 @@
 """SteeringHook per-trigger conditional apply on the 4.0 subspace backend.
 
 The hook no longer has an additive fast path — every steering term lowers to a
-``inject_three_op`` group (the merged affine subspace + curved manifolds).  This
+``subspace_inject`` group (the merged affine subspace + curved manifolds).  This
 exercises the surviving behavior: a group fires only on the decode steps where
 its :class:`Trigger` is active, and ``ctx`` mutation between forwards gates the
 apply.  A ``nn.Identity``-equivalent module is enough to drive the hook.
