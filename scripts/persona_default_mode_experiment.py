@@ -31,7 +31,7 @@ import torch
 from typing import Any
 
 from saklas import SamplingConfig, SaklasSession
-from saklas.core.manifold import LayerSubspace, Manifold, eval_rbf, load_manifold
+from saklas.core.manifold import LayerSubspace, Manifold, load_manifold
 
 
 MODEL_ID = "google/gemma-4-31b-it"
@@ -64,11 +64,7 @@ def persona_pca_coords(manifold: Manifold, sub: LayerSubspace) -> torch.Tensor:
     for k in range(K):
         authoring = manifold.node_coords[k].to(sub.mean.device, sub.mean.dtype)
         embedded = manifold.domain.embed(manifold.domain.clamp_position(authoring))
-        normalized = (embedded - sub.coord_offset) / sub.coord_scale
-        c = eval_rbf(
-            sub.node_params, sub.rbf_weights, sub.poly_coeffs,
-            normalized.unsqueeze(0),
-        ).squeeze(0)
+        c = ((sub.eval_at(embedded) - sub.mean) @ sub.basis.T).squeeze(0)
         coords_list.append(c)
     return torch.stack(coords_list, dim=0)  # (K, R)
 

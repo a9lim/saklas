@@ -1,7 +1,7 @@
 """Prototype harness for the open-ended scenario + pair generator.
 
 Thin wrapper over the library-side ``SaklasSession.generate_scenarios``
-and ``SaklasSession.generate_statements(share_moment=True)`` methods.
+and scenario-aligned ``SaklasSession.generate_statements`` methods.
 Does not own any prompt logic — the script is purely a test harness
 that prints what the library produces.
 
@@ -140,7 +140,6 @@ def main() -> int:
             [pos, neg_slot],
             scenarios=scenarios,
             statements_per_cell=pairs_per_scenario,
-            share_moment=True,
             on_progress=_progress,
         )
         pairs = list(zip(corpora[pos], corpora[neg_slot]))

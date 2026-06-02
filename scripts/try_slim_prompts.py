@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Sanity-check the slim statement-generator prompts against a target model.
 
-Runs :meth:`SaklasSession.generate_statements` with ``share_moment=True``
-on four diverse bipolar axes and prints the scenarios + every moment-
-shared pair the model produces.  No extraction, no disk side effects —
+Runs :meth:`SaklasSession.generate_statements` on four diverse bipolar axes
+and prints the scenarios + every scenario-aligned pair the model produces.
+No extraction, no disk side effects —
 just exercises the slim prompts and shows what comes out, so a human
 can sanity-check whether the slimmer phrasing holds quality at the
 chosen model scale.
@@ -130,7 +130,6 @@ def main() -> int:
             [pos, neg],
             n_scenarios=args.n_scenarios,
             statements_per_cell=args.statements_per_cell,
-            share_moment=True,
             on_progress=lambda m: print(f"  {m}", flush=True),
         )
         dt = time.time() - t0

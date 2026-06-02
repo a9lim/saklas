@@ -4,7 +4,7 @@ import asyncio
 import json
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1565,7 +1565,7 @@ class TestRoleSampling:
 class TestPairwiseMetric:
     """``GET /vectors/pairwise`` Euclidean default + Mahalanobis toggle."""
 
-    def _setup(self, session_and_client):
+    def _setup(self, session_and_client: Any) -> tuple[Any, TestClient]:
         import torch
         from saklas import Profile
         session, client = session_and_client
@@ -1575,9 +1575,9 @@ class TestPairwiseMetric:
             "x": Profile({0: torch.randn(4), 1: torch.randn(4)}),
             "y": Profile({0: torch.randn(4), 1: torch.randn(4)}),
         }
-        return session, client
+        return session, cast(TestClient, client)
 
-    def test_default_euclidean(self, session_and_client):
+    def test_default_euclidean(self, session_and_client: Any) -> None:
         import torch
         session, client = self._setup(session_and_client)
         r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
@@ -1589,7 +1589,7 @@ class TestPairwiseMetric:
         cos = float(torch.dot(vx, vy) / (vx.norm() * vy.norm()))
         assert body["matrix"][0][0] == pytest.approx(cos, abs=1e-5)
 
-    def test_mahalanobis_toggle(self, session_and_client):
+    def test_mahalanobis_toggle(self, session_and_client: Any) -> None:
         import torch
         from saklas.core.mahalanobis import LayerWhitener
         session, client = self._setup(session_and_client)
@@ -1609,7 +1609,7 @@ class TestPairwiseMetric:
         ref = w.mahalanobis_cosine(0, vx, vy)
         assert body["matrix"][0][0] == pytest.approx(ref, abs=1e-5)
 
-    def test_invalid_metric_400(self, session_and_client):
+    def test_invalid_metric_400(self, session_and_client: Any) -> None:
         _session, client = self._setup(session_and_client)
         r = client.get(
             "/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y&metric=bogus"

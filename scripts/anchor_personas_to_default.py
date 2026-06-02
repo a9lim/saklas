@@ -35,7 +35,6 @@ from saklas.core.manifold import (
     LayerSubspace,
     Manifold,
     compute_node_centroid,
-    eval_rbf,
     fit_rbf_interpolant,
     load_manifold,
     save_manifold,
@@ -235,11 +234,7 @@ def augment_manifold(
                     existing_coords[k].to(device=sub.mean.device, dtype=sub.mean.dtype),
                 ),
             )
-            normalized = (embedded - sub.coord_offset) / sub.coord_scale
-            val = eval_rbf(
-                sub.node_params, sub.rbf_weights, sub.poly_coeffs,
-                normalized.unsqueeze(0),
-            ).squeeze(0)
+            val = ((sub.eval_at(embedded) - sub.mean) @ sub.basis.T).squeeze(0)
             old_pca_values_list.append(val)
         old_pca_values = torch.stack(old_pca_values_list, dim=0)  # (100, R)
 
@@ -310,11 +305,7 @@ def persona_pca_coords_per_layer(manifold: Manifold) -> dict[int, torch.Tensor]:
         for k in range(K):
             authoring = manifold.node_coords[k].to(device=sub.mean.device, dtype=sub.mean.dtype)
             embedded = manifold.domain.embed(manifold.domain.clamp_position(authoring))
-            normalized = (embedded - sub.coord_offset) / sub.coord_scale
-            c = eval_rbf(
-                sub.node_params, sub.rbf_weights, sub.poly_coeffs,
-                normalized.unsqueeze(0),
-            ).squeeze(0)
+            c = ((sub.eval_at(embedded) - sub.mean) @ sub.basis.T).squeeze(0)
             rows.append(c)
         out[layer_idx] = torch.stack(rows, dim=0)
     return out
@@ -417,11 +408,7 @@ def main() -> None:
     source_manifold = source_manifold.to(
         device=session._device, dtype=torch.float32,
     )
-    _ref_layer_raw = (
-        source_manifold.metadata.get("reference_layer", 30)
-        if isinstance(source_manifold.metadata, dict)
-        else 30
-    )
+    _ref_layer_raw = source_manifold.metadata.get("reference_layer", 30)
     # metadata values are typed as `object`; cast to int (the stored value is
     # always an int or falls back to the literal 30 above).
     _ref_layer: int = int(_ref_layer_raw)  # pyright: ignore[reportArgumentType]  # metadata values typed as object

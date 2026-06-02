@@ -8,8 +8,7 @@ Three stages:
    Run once.
 
 2. ``extract <model_id>`` — load the chosen extraction model, read the scratch
-   pool, extract 7 profiles directly via ``extract_contrastive`` (bypassing the
-   namespace cache):
+   pool, extract 7 profiles directly via DiM (bypassing the namespace cache):
 
        P45_bundled   — first 45 (= the bundled pool, deterministic)
        P120          — all 120
@@ -48,7 +47,7 @@ import torch
 from saklas.core.session import SaklasSession
 from saklas.core.profile import Profile
 from saklas.core.sampling import SamplingConfig
-from saklas.core.vectors import extract_contrastive
+from saklas.core.vectors import extract_difference_of_means
 from saklas.io.paths import saklas_home
 
 
@@ -99,7 +98,6 @@ def stage_gen() -> int:
         ["angry", "calm"],
         scenarios=scenarios,
         statements_per_cell=statements_per_cell,
-        share_moment=True,
         on_progress=lambda m: print(f"  {m}", flush=True),
     )
     new_pairs = list(zip(corpora["angry"], corpora["calm"]))[:n_new]
@@ -164,7 +162,7 @@ def stage_extract(model_id: str) -> int:
     for name, indices in subsamples.items():
         sub = [pool[i] for i in indices]
         t0 = time.time()
-        prof_dict, _ = extract_contrastive(
+        prof_dict, _ = extract_difference_of_means(
             session._model, session._tokenizer, sub,
             layers=session._layers, concept_label=name,
         )
@@ -315,13 +313,13 @@ def stage_sweep(
           f"in {time.time()-t0:.1f}s", flush=True)
 
     t0 = time.time()
-    p45_dict, _ = extract_contrastive(
+    p45_dict, _ = extract_difference_of_means(
         session._model, session._tokenizer, bundled_45,
         layers=session._layers, concept_label="angry.calm__n45",
     )
     print(f"[sweep] n=45 extracted in {time.time()-t0:.1f}s", flush=True)
     t0 = time.time()
-    p120_dict, _ = extract_contrastive(
+    p120_dict, _ = extract_difference_of_means(
         session._model, session._tokenizer, pool_120,
         layers=session._layers, concept_label="angry.calm__n120",
     )

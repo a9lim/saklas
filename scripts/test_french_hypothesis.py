@@ -2,7 +2,7 @@
 """Test whether ministral's elevated L0 perturbation is English-specific.
 
 Loads ministral-3-8b, translates angry.calm contrastive pairs to French via
-the same model, re-extracts contrastive PCA on the French pairs, and compares
+the same model, re-extracts the DiM vector on the French pairs, and compares
 L0/L1/L2 perturbation ratios against the existing English extraction.
 
 If the French ratios drop to qwen/gemma levels (~0.04) → language-bias confirmed.
@@ -21,7 +21,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from saklas.core.model import load_model, get_layers
-from saklas.core.vectors import extract_contrastive
+from saklas.core.vectors import extract_difference_of_means
 from saklas.io.paths import saklas_home, safe_model_id
 
 TRANSLATE_SYSTEM = (
@@ -165,10 +165,12 @@ def main():
         )
         print(f"[save] translations → {dst_statements_path}", file=sys.stderr)
 
-    # Extract contrastive PCA on French pairs, using the same ministral model
-    print(f"[extract] contrastive PCA on {len(translated)} French pairs …", file=sys.stderr)
+    # Extract the DiM vector on French pairs, using the same ministral model.
+    print(f"[extract] DiM on {len(translated)} French pairs …", file=sys.stderr)
     layers = get_layers(model)
-    profile, _ = extract_contrastive(model, tokenizer, translated, layers, device=device)
+    profile, _ = extract_difference_of_means(
+        model, tokenizer, translated, layers, device=device,
+    )
 
     safe_mid = safe_model_id(args.model)
     baked_out = dst_dir / f"{safe_mid}.safetensors"

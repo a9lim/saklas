@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from saklas.core.hooks import SteeringHook, SteeringManager
-from saklas.core.manifold import CustomDomain, synthesize_subspace
+from saklas.core.manifold import CustomDomain, LayerSubspace, synthesize_subspace
 from saklas.core.triggers import Trigger, TriggerContext
 
 
@@ -26,7 +26,18 @@ def _unit(dim: int, seed: int = 0) -> torch.Tensor:
     return v / v.norm()
 
 
-def _affine_group(layer: int, trigger: Trigger):
+_AffineEntry = tuple[
+    LayerSubspace,
+    CustomDomain,
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    float,
+    Trigger,
+]
+
+
+def _affine_group(layer: int, trigger: Trigger) -> _AffineEntry:
     """One ``(sub, domain, target, origin, along, onto, trigger)`` entry.
 
     A rank-1 affine subspace from a single push term — the merged-subspace shape
@@ -45,7 +56,7 @@ def _affine_group(layer: int, trigger: Trigger):
     )
 
 
-def _recompose(hook: SteeringHook, entry, ctx: TriggerContext) -> None:
+def _recompose(hook: SteeringHook, entry: _AffineEntry, ctx: TriggerContext) -> None:
     hook.recompose([entry], ctx, device=torch.device("cpu"))
 
 

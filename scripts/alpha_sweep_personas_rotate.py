@@ -1,19 +1,10 @@
-"""Alpha sweep on a persona manifold node under the new angular-in-subspace
-(``subspace_rotate``) operator.
+"""Alpha sweep on a persona manifold node under the unified subspace kernel.
 
-The bundled ``personas`` manifold was previously characterized under
-``subspace_replace`` (the ``injection_mode="additive"`` path for manifold
-terms) with a sweet-spot around α ≈ 0.20 and collapse beyond α ≥ 0.30.
-Under angular mode the manifold hook now dispatches to
-``subspace_rotate``: rotate ``h_par`` toward the target by ``α · θ_max``
-inside the affine subspace plane, leaving ``h_perp`` untouched. ``||h
-- mean||`` is preserved by construction; no destructive in-subspace
-overwrite. The α-regime is expected to differ.
-
-This script runs the same persona under both operators on
-``gemma-4-31b-it`` (the reference model the existing α-regime was
-characterized against, manifold already fit) with a deterministic seed
-across alphas, so the contrast is clean.
+The bundled ``personas`` manifold now steers through the same
+``subspace_inject`` path as folded vectors and authored manifolds. This script
+runs one persona on ``gemma-4-31b-it`` (assuming the manifold is already fit,
+or refitting it if absent) with a deterministic seed across alpha values, so
+the current coefficient regime is easy to inspect.
 """
 
 from __future__ import annotations
@@ -44,14 +35,11 @@ def run_sweep(
     max_tokens: int,
     seed: int,
     alphas: tuple[float, ...],
-    mode: str,
     out_path: Path,
 ) -> None:
-    print(f"loading {MODEL_ID}  (injection_mode={mode})")
+    print(f"loading {MODEL_ID}")
     t0 = time.time()
-    session = SaklasSession.from_pretrained(
-        MODEL_ID, device="auto", injection_mode=mode,
-    )
+    session = SaklasSession.from_pretrained(MODEL_ID, device="auto")
     print(f"  loaded in {time.time() - t0:.1f}s")
     print(f"  device={session._device}  dtype={session._dtype}")
 
@@ -114,18 +102,17 @@ def run_sweep(
         "n_tokens": len(base.tokens),
     })
 
-    # Main sweep at the session's injection mode.
-    label = "angular (rotate)" if mode == "angular" else "additive (replace)"
+    # Main sweep under the unified subspace kernel.
     for alpha in alphas:
         expr = f"{alpha:g} personas%{persona}"
-        print(f"\n== {label}  {expr} ==")
+        print(f"\n== {expr} ==")
         t0 = time.time()
         out = session.generate(
             prompt, steering=expr, **common_kwargs,  # pyright: ignore[reportArgumentType]  # dict[str, object] spreads as object-typed kwargs
         ).first
         print(f"  [{time.time() - t0:.1f}s]  {out.text!r}")
         runs.append({
-            "mode": mode,
+            "mode": "subspace_inject",
             "alpha": alpha,
             "expression": out.applied_steering,
             "text": out.text,
@@ -148,14 +135,9 @@ def main() -> None:
         default=DEFAULT_ALPHAS,
     )
     parser.add_argument(
-        "--mode", choices=("angular", "additive"), default="angular",
-        help="Manifold injection mode (angular → subspace_rotate, "
-             "additive → subspace_replace).",
-    )
-    parser.add_argument(
         "--out",
         type=Path,
-        default=Path("/tmp/alpha_sweep_personas_rotate.json"),
+        default=Path("/tmp/alpha_sweep_personas.json"),
     )
     args = parser.parse_args()
 
@@ -165,7 +147,6 @@ def main() -> None:
         max_tokens=args.max_tokens,
         seed=args.seed,
         alphas=args.alphas,
-        mode=args.mode,
         out_path=args.out,
     )
 
