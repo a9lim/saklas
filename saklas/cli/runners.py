@@ -19,6 +19,7 @@ from saklas.core.stats import median_or_zero
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
     from saklas.core.steering import Steering
+    from saklas.core.profile import Profile
 
 
 _R = TypeVar("_R")
@@ -533,14 +534,21 @@ def _run_push(args: argparse.Namespace) -> None:
 
 def _require_model(args: argparse.Namespace) -> None:
     if not args.model:
-        cmd = getattr(args, "vector_cmd", None) or getattr(args, "pack_cmd", None) or "?"
-        # The manifold leaves (fit / discover / generate / transfer) all carry
-        # ``vector_cmd == "manifold"``, so the leaf verb lives on
-        # ``manifold_cmd`` — surface it so the error reads e.g. "manifold fit"
-        # rather than the bare "manifold".
+        # The manifold leaves (fit / discover / generate / transfer) carry the
+        # leaf on ``manifold_cmd`` — surface it so the error reads "manifold
+        # fit" under both the top-level ``manifold`` verb and the deprecated
+        # ``vector manifold`` alias.  Otherwise the leaf is the subspace verb
+        # (``subspace_cmd``), the deprecated ``vector_cmd``, or a ``pack_cmd``.
         manifold_cmd = getattr(args, "manifold_cmd", None)
         if manifold_cmd:
-            cmd = f"{cmd} {manifold_cmd}"
+            cmd = f"manifold {manifold_cmd}"
+        else:
+            cmd = (
+                getattr(args, "subspace_cmd", None)
+                or getattr(args, "vector_cmd", None)
+                or getattr(args, "pack_cmd", None)
+                or "?"
+            )
         print(f"{cmd}: -m/--model is required", file=sys.stderr)
         sys.exit(2)
 
@@ -880,6 +888,103 @@ def _resolve_variant_tensor(
     return path
 
 
+def _fold_manifold_to_profile(
+    name: str, model_id: str, variant: str | None,
+) -> "Profile | None":
+    """Fold a fitted 2-node ``pca`` manifold for ``name`` into a vector Profile.
+
+    The 4.0 fallback for the disk-side inspection verbs (``compare`` / ``why``):
+    bundled and user concepts ship as 2-node manifolds, so when no ``vectors/``
+    tensor resolves, a **fitted** manifold tensor is loaded and folded
+    (:func:`~saklas.core.vectors.folded_vector_directions`).  Returns ``None``
+    when no fitted manifold tensor exists for ``model_id`` (caller surfaces a
+    "fit it first" miss) or the manifold isn't a foldable 2-node affine.  Only
+    the ``raw`` / ``sae-<release>`` variants fold; role / transfer variants are
+    vector-only.  Raises :class:`AmbiguousSelectorError` on a cross-namespace
+    bare-name collision (mirroring vector resolution).
+    """
+    from saklas.core.profile import Profile
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+    from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
+    from saklas.io.selectors import AmbiguousSelectorError
+
+    if variant in (None, "raw"):
+        release: str | None = None
+    elif variant.startswith("sae-"):
+        release = variant[len("sae-"):]
+    else:
+        return None
+
+    if "/" in name:
+        ns, bare = name.split("/", 1)
+        search_ns = [ns]
+    else:
+        bare = name
+        root = manifolds_dir()
+        search_ns = (
+            sorted(d.name for d in root.iterdir() if d.is_dir())
+            if root.exists() else []
+        )
+    fname = tensor_filename(model_id, release=release)
+    hits = [
+        manifold_dir(ns, bare) / fname
+        for ns in search_ns
+        if (manifold_dir(ns, bare) / fname).exists()
+    ]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        qualified = ", ".join(f"{p.parent.parent.name}/{bare}" for p in hits)
+        raise AmbiguousSelectorError(
+            f"ambiguous manifold '{bare}': matches {qualified}. "
+            f"Qualify it with a namespace."
+        )
+    try:
+        manifold = load_manifold(hits[0])
+        dirs = folded_vector_directions(manifold)
+    except Exception:
+        return None
+    return Profile(dirs)
+
+
+def _fold_all_fitted_manifolds(
+    model_id: str, *, exclude: str = "",
+) -> "dict[str, Profile]":
+    """Fold every fitted 2-node ``pca`` manifold into ``{name: Profile}``.
+
+    Backs ``compare``'s 1-arg "rank against all installed" mode now that
+    bundled concepts are manifolds.  Only manifolds with a fitted raw tensor
+    for ``model_id`` that fold to a 2-node affine are included; ``exclude``
+    drops the target by bare name.
+    """
+    from saklas.core.profile import Profile
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+    from saklas.io.paths import manifolds_dir, tensor_filename
+
+    out: dict[str, Profile] = {}
+    root = manifolds_dir()
+    if not root.is_dir():
+        return out
+    fname = tensor_filename(model_id, release=None)
+    for ns_dir in sorted(root.iterdir()):
+        if not ns_dir.is_dir():
+            continue
+        for mdir in sorted(ns_dir.iterdir()):
+            if not mdir.is_dir() or mdir.name == exclude:
+                continue
+            tensor = mdir / fname
+            if not tensor.is_file():
+                continue
+            try:
+                dirs = folded_vector_directions(load_manifold(tensor))
+            except Exception:
+                continue  # not a foldable 2-node affine (curved / rank > 1)
+            out[mdir.name] = Profile(dirs)
+    return out
+
+
 def _run_compare(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.selectors import parse as sel_parse, resolve
@@ -933,26 +1038,38 @@ def _run_compare(args: argparse.Namespace) -> None:
     for name, variant in names:
         sel = sel_parse(name)
         matches = resolve(sel)
-        if not matches:
-            print(f"warning: '{name}' not found, skipping", file=sys.stderr)
+        # Vector tensor first; fall back to folding a fitted manifold (bundled
+        # & user concepts ship as 2-node manifolds).
+        loaded: Profile | None = None
+        display = name if variant is None else f"{name}:{variant}"
+        if matches:
+            folder = matches[0].folder
+            display = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
+            try:
+                tensor_path = _resolve_variant_tensor(folder, args.model, variant)
+            except (AmbiguousVariantError, UnknownVariantError) as e:
+                print(f"warning: {e}, skipping", file=sys.stderr)
+                continue
+            if tensor_path is not None and tensor_path.is_file():
+                try:
+                    loaded = Profile.load(tensor_path)
+                except (ProfileError, Exception) as e:
+                    print(f"warning: failed to load '{name}': {e}", file=sys.stderr)
+                    continue
+        if loaded is None:
+            try:
+                loaded = _fold_manifold_to_profile(name, args.model, variant)
+            except Exception as e:
+                print(f"warning: {e}, skipping", file=sys.stderr)
+                continue
+        if loaded is None:
+            print(
+                f"warning: no vector tensor or fitted manifold for '{name}' "
+                f"with model {args.model}, skipping",
+                file=sys.stderr,
+            )
             continue
-        folder = matches[0].folder
-        try:
-            tensor_path = _resolve_variant_tensor(folder, args.model, variant)
-        except (AmbiguousVariantError, UnknownVariantError) as e:
-            print(f"warning: {e}, skipping", file=sys.stderr)
-            continue
-        if tensor_path is None or not tensor_path.is_file():
-            print(f"warning: no tensor for '{name}' with model {args.model}, skipping",
-                  file=sys.stderr)
-            continue
-        # Display keys carry the variant when present so compare output
-        # distinguishes raw vs SAE rows.
-        display = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
-        try:
-            profiles[display] = Profile.load(tensor_path)
-        except (ProfileError, Exception) as e:
-            print(f"warning: failed to load '{name}': {e}", file=sys.stderr)
+        profiles[display] = loaded
 
     if len(profiles) < 1:
         print("compare: no loadable profiles found", file=sys.stderr)
@@ -990,6 +1107,13 @@ def _run_compare(args: argparse.Namespace) -> None:
                         others[cdir.name] = Profile.load(tp)
                     except Exception:
                         continue
+
+        # Bundled & user concepts ship as manifolds — fold every fitted one
+        # into the ranking pool (vector tensors above win a name collision).
+        for mname, mprof in _fold_all_fitted_manifolds(
+            args.model, exclude=target_name.rsplit("/", 1)[-1],
+        ).items():
+            others.setdefault(mname, mprof)
 
         if not others:
             print(f"compare: no other profiles found for model {args.model}", file=sys.stderr)
@@ -1099,29 +1223,34 @@ def _run_why(args: argparse.Namespace) -> None:
     name_part, variant = _split_variant_suffix(args.concept)
     sel = sel_parse(name_part)
     matches = resolve(sel)
-    if not matches:
-        print(f"why: '{args.concept}' not found", file=sys.stderr)
-        sys.exit(1)
 
-    folder = matches[0].folder
-    concept_name = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
-
-    try:
-        tensor_path = _resolve_variant_tensor(folder, args.model, variant)
-    except (AmbiguousVariantError, UnknownVariantError) as e:
-        print(f"why: {e}", file=sys.stderr)
-        sys.exit(1)
-    if tensor_path is None or not tensor_path.is_file():
+    # Vector tensor first; fall back to folding a fitted 2-node manifold
+    # (bundled & user concepts ship as manifolds).
+    profile: "Profile | None" = None
+    concept_name = name_part if variant is None else f"{name_part}:{variant}"
+    if matches:
+        folder = matches[0].folder
+        concept_name = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
+        try:
+            tensor_path = _resolve_variant_tensor(folder, args.model, variant)
+        except (AmbiguousVariantError, UnknownVariantError) as e:
+            print(f"why: {e}", file=sys.stderr)
+            sys.exit(1)
+        if tensor_path is not None and tensor_path.is_file():
+            try:
+                profile = Profile.load(tensor_path)
+            except (ProfileError, Exception) as e:
+                print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
+                sys.exit(1)
+    if profile is None:
+        profile = _fold_manifold_to_profile(name_part, args.model, variant)
+    if profile is None:
         print(
-            f"why: no tensor for '{args.concept}' with model {args.model}",
+            f"why: no vector tensor or fitted manifold for '{args.concept}' "
+            f"with model {args.model}. If it's a manifold, fit it first: "
+            f"`saklas manifold fit {name_part} -m {args.model}`.",
             file=sys.stderr,
         )
-        sys.exit(1)
-
-    try:
-        profile = Profile.load(tensor_path)
-    except (ProfileError, Exception) as e:
-        print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
         sys.exit(1)
 
     layer_mags: list[tuple[int, float]] = sorted(
