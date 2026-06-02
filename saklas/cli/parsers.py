@@ -98,9 +98,9 @@ _VECTOR_VERBS: list[tuple[str, str]] = [
     ("manifold",  "Fit and inspect spline-based steering manifolds"),
 ]
 
-# Verb table for ``saklas vector manifold <verb>`` — the source of truth for
-# both parser registration order and the bare-verb help block (``_run_vector_
-# manifold``), mirroring how ``_VECTOR_VERBS`` / ``_PACK_VERBS`` drive theirs.
+# Verb table for ``saklas manifold <verb>`` — the source of truth for both
+# parser registration order and the bare-verb help block, mirroring how
+# ``_SUBSPACE_VERBS`` / ``_PACK_VERBS`` drive theirs.
 _MANIFOLD_VERBS: list[tuple[str, str]] = [
     ("fit",       "Fit an authored manifold (user-supplied coords)"),
     ("discover",  "Fit a discover-mode manifold (coords derived from activations)"),
@@ -348,7 +348,7 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "landing site.  Any other value relocates to "
              "``vectors/<namespace>/<canonical>/``.  Parity with the "
              "webui ExtractDrawer's namespace control and with "
-             "``vector manifold`` / `discover``'s NS slot.",
+             "``manifold`` / ``discover``'s NS slot.",
     )
     p.set_defaults(quantize=None, device="auto", probes=None)
 
@@ -418,7 +418,7 @@ def _build_vector_why(p: argparse.ArgumentParser) -> None:
 
 
 def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
-    """``saklas vector transfer`` — cross-model probe alignment.
+    """``saklas subspace transfer`` — cross-model probe alignment.
 
     Required:
         ``concept`` — selector resolving to a single concept folder.
@@ -432,7 +432,7 @@ def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
     provenance (``method=procrustes_transfer``, ``source_model_id``,
     ``alignment_map_hash``, ``transfer_quality_estimate``).  Reuses the
     same tensor-filename machinery as SAE variants, so subsequent
-    ``saklas pack ls`` / ``saklas vector why`` see the transferred
+    ``saklas pack ls`` / ``saklas subspace why`` see the transferred
     profile alongside any native or SAE variants.
 
     Cached alignment maps live at
@@ -451,7 +451,7 @@ def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
 
 
 def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
-    """``saklas vector manifold`` — fit, discover, generate, and inspect.
+    """Shared builder for ``saklas manifold`` and the deprecated alias.
 
     Nested subparser:
       ``fit`` — fit an authored manifold (user-supplied coords).
@@ -495,7 +495,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
             "Pool per-node centroids, derive node coordinates via PCA or "
             "spectral embedding, fit a per-layer RBF, and write the per-model "
             "manifold tensor.  Operates on an existing discover-mode manifold "
-            "folder (usually authored by `saklas vector manifold generate`).  "
+            "folder (usually authored by `saklas manifold generate`).  "
             "PCA is the safe default for current bundled-heap sizes (~20–48 "
             "nodes); spectral is the right choice once heaps cross ~50 nodes "
             "and start to hint at curved structure — below that the spectral "
@@ -533,7 +533,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         metavar="R",
         help="Per-layer PCA subspace dim cap (default 64). Smaller values "
              "give finer-grained steering control at large K — each axis the "
-             "RBF can move along is an axis subspace_replace can displace, "
+             "RBF can move along is an axis subspace_inject can displace, "
              "so fewer axes = smaller per-α effect = wider coherence regime. "
              "Recommended: set near the manifold's intrinsic dim (=picked_k) "
              "for steering use; keep at 64 for representational analysis.",
@@ -557,7 +557,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
             "concept) cell write K first-person statements as a literal "
             "instance of that concept under that scenario.  Writes a fresh "
             "discover-mode manifold folder under "
-            "~/.saklas/manifolds/<ns>/<name>/ ready for `vector manifold "
+            "~/.saklas/manifolds/<ns>/<name>/ ready for `saklas manifold "
             "discover` to fit.  Scenario sharing across the row is "
             "load-bearing — statement j of every concept came from the same "
             "scenario, so the per-concept centroids stay comparable."
@@ -675,8 +675,8 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         description=(
             "Union the *nodes* of two or more discover-mode source "
             "manifolds into a fresh, unfitted discover folder, then run "
-            "`saklas vector manifold discover <merged>` to fit it.  The "
-            "manifold analogue of `saklas vector merge` — but on node "
+            "`saklas manifold discover <merged>` to fit it.  The "
+            "manifold analogue of `saklas subspace merge` — but on node "
             "corpora rather than steering directions.  Restricted to "
             "discover-mode sources (authored manifolds carry user-declared "
             "geometry that isn't mergeable without a shared coordinate "
@@ -793,7 +793,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
             "model by fitting a per-layer Procrustes alignment between "
             "their cached neutral activations and mapping the fitted "
             "subspace into target space.  The manifold analogue of "
-            "`saklas vector transfer`.  Writes the transferred tensor at "
+            "`saklas subspace transfer`.  Writes the transferred tensor at "
             "the target's `_from-<safe_src>` variant path."
         ),
     )

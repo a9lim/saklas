@@ -969,7 +969,7 @@ class ManifoldExtractionPipeline:
         discover_metadata: dict[str, Any] = {}
         # ``max_subspace_dim`` caps the per-layer PCA subspace in
         # ``fit_layer_subspace`` (default :data:`DEFAULT_N_COMPONENTS` = 64).
-        # Smaller values constrain the dim count that ``subspace_replace``
+        # Smaller values constrain the dim count that ``subspace_inject``
         # displaces at steer time — finer-grained steering control at the
         # cost of representing less per-layer activation variance.  At K
         # large (e.g. 100), the default 64 makes the per-layer subspace

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
+from typing import Any, cast
 
 import pytest
+import torch
 
 from saklas.io.cloning import (
     _BATCH_SIZE,
@@ -19,7 +21,9 @@ from saklas.io.cloning import (
     _filter_corpus,
     _parse_numbered,
     _sample_lines,
+    clone_from_corpus,
 )
+from saklas.core.profile import Profile
 
 
 # -- _filter_corpus ---------------------------------------------------------
@@ -199,3 +203,70 @@ def test_batch_size_is_five():
     assert _BATCH_SIZE == 5
 
 
+def test_clone_clears_and_restores_active_steering_hooks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Neutral rewrite generation should suspend, then restore, active hooks.
+
+    Regression for the 4.0 steering-manager refactor: clone used to reach for
+    ``session._steering.vectors`` / ``add_vector()``, which no longer exist.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    corpus = tmp_path / "persona.txt"
+    corpus.write_text(
+        "\n".join(
+            f"persona line {i} has enough words for cloning"
+            for i in range(10)
+        ),
+        encoding="utf-8",
+    )
+
+    class _Tokenizer:
+        def __call__(self, _text: str, *, add_special_tokens: bool = False) -> dict[str, list[int]]:
+            return {"input_ids": [1, 2, 3]}
+
+    class _Steering:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear_all(self) -> None:
+            self.clear_calls += 1
+
+    class _Session:
+        model_id = "fake/model"
+
+        def __init__(self) -> None:
+            self._steering = _Steering()
+            self._tokenizer = _Tokenizer()
+            self._model = type(
+                "Model", (), {"config": type("Config", (), {"max_position_embeddings": 4096})()}
+            )()
+            self.rebuild_calls = 0
+            self.extract_sources: list[Any] = []
+
+        def _rebuild_steering_hooks(self) -> None:
+            self.rebuild_calls += 1
+
+        def extract(self, source: Any) -> tuple[str, Profile]:
+            self.extract_sources.append(source)
+            return "persona", Profile({0: torch.ones(2)})
+
+    session = _Session()
+
+    def _fake_neutralize(sess: Any, batch: list[str], seed: int | None) -> list[str]:
+        assert sess is session
+        assert session._steering.clear_calls == 1
+        return [f"neutral rewrite {i} with enough words" for i, _ in enumerate(batch)]
+
+    monkeypatch.setattr("saklas.io.cloning._neutralize_batch", _fake_neutralize)
+
+    canonical, profile = clone_from_corpus(
+        cast(Any, session), corpus, "persona", n_pairs=10, batch_size=5, seed=7,
+    )
+
+    assert canonical == "persona"
+    assert profile.layers == [0]
+    assert session._steering.clear_calls == 1
+    assert session.rebuild_calls == 1
+    assert len(session.extract_sources) == 1

@@ -50,7 +50,7 @@ from saklas.core.results import (
 from saklas.core.sampling import SamplingConfig
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
-from saklas.core.manifold import Manifold, SynthesizedSubspace
+from saklas.core.manifold import Manifold
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import last_content_index
 from saklas.core.vectors import load_profile as _load_profile

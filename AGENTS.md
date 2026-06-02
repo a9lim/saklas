@@ -35,7 +35,7 @@ when you work in that directory. Consult them only when editing that layer.
   injection, monitor, session, generation loop, loom tree
 - `saklas/io/AGENTS.md` — packs, manifolds, HF distribution, GGUF, cloning,
   alignment, paths/selectors
-- `saklas/cli/AGENTS.md` — six-verb dispatch, config loading, flags
+- `saklas/cli/AGENTS.md` — eight-verb dispatch, config loading, flags
 - `saklas/server/AGENTS.md` — OpenAI / Ollama / native routes
 - `saklas/tui/AGENTS.md` — slash commands, panels, loom screen
 - `saklas/web/AGENTS.md` — dashboard mount, wire protocol, Svelte source layout
@@ -58,24 +58,24 @@ saklas pack ls [selector] [-j|-v]               # LOCAL installed packs only
 saklas pack search <query> [-j|-v]              # search HF hub for saklas-pack repos
 saklas pack push <selector> [-a OWNER/NAME] [-m MODEL] [--variant raw|sae|all] ...
 saklas pack export gguf <selector> [-m MODEL] [-o PATH] [--model-hint HINT]
-saklas vector extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
-saklas vector merge <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b~ns/c"
-saklas vector clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S]
-saklas vector compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]
-saklas vector why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
-saklas vector transfer <concept> --from SRC --to TGT [-f]   # cross-model Procrustes transfer
-saklas vector manifold fit <folder> [-m MODEL] [--sae REL]  # fit an authored manifold
-saklas vector manifold discover <name> [-m MODEL] [--method pca|spectral] [--max-dim N] ...
-saklas vector manifold generate <name> --concepts C... [--n-scenarios N] [--statements-per-concept K] [--seed S]
-saklas vector manifold install <target> [-a NS/N] [-f]      # HF coord or local folder
-saklas vector manifold search <query> [-j|-v]               # search HF hub for saklas-manifold repos
-saklas vector manifold merge <name> <src...> [-f]           # union discover-mode node corpora
-saklas vector manifold push <name> [-a OWNER/N] [-m MODEL] [--variant raw|sae|all]
-saklas vector manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes (discover coords)
-saklas vector manifold clear <name> [-m MODEL] [--variant raw|sae|all]   # delete per-model fitted tensors
-saklas vector manifold rm <name> [-y]                       # remove folder (bundled respawns)
-saklas vector manifold refresh <name> [-m MODEL]            # re-pull (hf) / re-fit (-m scoped)
-saklas vector manifold ls [-v|-j] | show <name> [-j]        # list / inspect manifolds
+saklas subspace extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
+saklas subspace merge <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b~ns/c"
+saklas subspace clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S]
+saklas subspace compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]
+saklas subspace why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
+saklas subspace transfer <concept> --from SRC --to TGT [-f]   # cross-model Procrustes transfer
+saklas manifold fit <folder> [-m MODEL] [--sae REL]  # fit an authored manifold
+saklas manifold discover <name> [-m MODEL] [--method pca|spectral] [--max-dim N] ...
+saklas manifold generate <name> --concepts C... [--n-scenarios N] [--statements-per-concept K] [--seed S]
+saklas manifold install <target> [-a NS/N] [-f]      # HF coord or local folder
+saklas manifold search <query> [-j|-v]               # search HF hub for saklas-manifold repos
+saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
+saklas manifold push <name> [-a OWNER/N] [-m MODEL] [--variant raw|sae|all]
+saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes (discover coords)
+saklas manifold clear <name> [-m MODEL] [--variant raw|sae|all]   # delete per-model fitted tensors
+saklas manifold rm <name> [-y]                       # remove folder (bundled respawns)
+saklas manifold refresh <name> [-m MODEL]            # re-pull (hf) / re-fit (-m scoped)
+saklas manifold ls [-v|-j] | show <name> [-j]        # list / inspect manifolds
 saklas experiment fan <model> "<prompt>" -g concept=0,0.5,1 # alpha grid as loom siblings
 saklas experiment transcript run <path.yaml> [model]        # replay a saved transcript
 saklas experiment naturalness <model> "<prompt>" --manifold F -S EXPR  # behavior-manifold eval
@@ -84,11 +84,13 @@ saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly six verbs: `tui`, `serve`, `pack`, `vector`,
-`experiment`, `config` (`manifold` is nested under `vector`, not a top-level
-verb). No `argv[0]` peeking, no verb aliases, no bare-TUI fallback — `saklas
-google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas pack` /
-`saklas vector` / `saklas experiment` / `saklas config` print help and exit 0.
+The root parser has exactly eight verbs: `tui`, `serve`, `pack`, `subspace`,
+`manifold`, `vector`, `experiment`, `config`. `vector` is a deprecated 3.x alias
+for `subspace` plus the old nested `vector manifold` tree; new commands should
+use top-level `subspace` / `manifold`. No `argv[0]` peeking, no bare-TUI fallback
+— `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
+pack` / `saklas subspace` / `saklas manifold` / `saklas vector` / `saklas
+experiment` / `saklas config` print help and exit 0.
 
 Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
@@ -264,7 +266,7 @@ A manifold is its own artifact type — labeled nodes at authoring coordinates o
 domain, each a small statement corpus, under `~/.saklas/manifolds/<ns>/<name>/`
 (not a `ConceptFolder`). Authored as `manifold.json` (domain spec + per-node
 `{label, coords}`) + `nodes/*.json` — by hand or via the webui builder
-(`io.manifolds.create_manifold_folder`). `vector manifold fit`, the webui fit
+(`io.manifolds.create_manifold_folder`). `manifold fit`, the webui fit
 action, and `POST .../fit` all run `ManifoldExtractionPipeline`: pool each node's
 centroid, embed coords through the domain, fit a per-layer subspace (flat
 `fit_affine_subspace` for `fit_mode=pca`, curved `fit_layer_subspace` for
@@ -308,11 +310,11 @@ eigenvalue-ratio cliff. `fit_mode=pca` produces a flat affine subspace (no RBF);
 are the architectural shift: a Gemma fit and a Qwen fit produce different node
 layouts for the same heap (stored as `node_coords` in the per-model safetensors).
 
-`vector manifold generate <name> --concepts ...` LLM-authors a discover folder via
+`manifold generate <name> --concepts ...` LLM-authors a discover folder via
 `session.generate_statements` — one call for shared scenarios, then per-(scenario,
 concept) cells. Scenario-sharing across the row is load-bearing (else per-concept
 centroids mix concept and scenario signal); the anti-allegory (literal-concept)
-directive keeps non-human axes literal. `vector manifold discover <name>` then
+directive keeps non-human axes literal. `manifold discover <name>` then
 fits — the two steps are deliberate (a flaky generation leaves inspectable
 corpora). Cross-model Procrustes alignment for discover coords is deferred (TODO
 in `io/manifolds.py`). The naturalness eval (`experiment naturalness`) fits a

@@ -98,27 +98,27 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
 - `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (8000), `-S/--steer EXPR`,
   `-C/--cors ORIGIN` (repeatable), `-k/--api-key` (falls back to `$SAKLAS_API_KEY`),
   `--no-web`.
-- `vector extract`: positional `concept` (one concept or two poles, `nargs="+"`),
+- `subspace extract`: positional `concept` (one concept or two poles, `nargs="+"`),
   `-m/--model`, `-f/--force` (pre-deletes the existing tensor + threads
   `force_statements=True`), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG`
   (mutually exclusive with `--sae`; writes a `_role-<slug>` tensor + returns a
   `:role-<slug>` tail; slug `[a-z0-9._-]+`), `--namespace NS` (destination; unset →
   `local/`). There is **no `--method`/`--legacy`** — difference-of-means is the only
   method.
-- `vector merge`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`.
-- `vector clone`: `corpus_path`, `-N/--name` (required), `-m/--model`,
+- `subspace merge`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`.
+- `subspace clone`: `corpus_path`, `-N/--name` (required), `-m/--model`,
   `-n/--n-pairs` (90), `--seed`, `-f`.
-- `vector compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,
+- `subspace compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,
   `--metric {euclidean,mahalanobis}` (default `None` → resolves to `mahalanobis`),
   `--ridge-scale` (1.0, mahalanobis only). No `--legacy`. 1-arg ranks all installed
   against the target, 2-arg pairwise, 3+ an N×N matrix; the mahalanobis path loads
   `LayerWhitener.from_cache` up front (a miss is fatal — no silent Euclidean
   fallback).
-- `vector why`: `concept`, `-m/--model` (required), `-j`. Per-layer `‖baked‖`
+- `subspace why`: `concept`, `-m/--model` (required), `-j`. Per-layer `‖baked‖`
   histogram (16 buckets) + sidecar diagnostics.
-- `vector transfer`: `concept`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
+- `subspace transfer`: `concept`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
   Fits/loads a Procrustes alignment, writes the target's `from-<safe_src>` tensor.
-- `vector manifold`: nested `fit`/`discover`/`generate`/`merge`/`install`/`search`/
+- `manifold`: top-level `fit`/`discover`/`generate`/`merge`/`install`/`search`/
   `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`. `fit <folder>` runs
   `ManifoldExtractionPipeline` on an authored folder; `discover <name>
   [--method pca|spectral] [--max-dim N] [--var-threshold T] [--k-nn K]

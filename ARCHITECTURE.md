@@ -347,7 +347,7 @@ present in every prompt builder, keeping non-human axes (deer/wolf, brick/
 feather) literal rather than collapsing into human-social metaphor (tests assert
 its presence, not byte-identity). Returns `{concept: [statements]}`. The DiM
 extractor calls it with `[pos, neg]` and zips the two corpora into pairs;
-discover authoring (`vector manifold generate`, the HTTP route) wraps it into a
+discover authoring (`manifold generate`, the HTTP route) wraps it into a
 freshly written discover folder. `on_scenarios`/`on_corpus` are streaming sinks
 the resumable discover writers (`io/manifolds.py`) use for big rosters.
 

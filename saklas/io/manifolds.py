@@ -21,7 +21,7 @@ manifold is not a single bipolar concept, so it is not a
 
 The user authors ``manifold.json`` (each node carries a ``label`` and its
 authoring ``coords``) and the ``nodes/*.json`` corpus files by hand;
-``saklas vector manifold fit`` produces the per-model tensors and
+``saklas manifold fit`` produces the per-model tensors and
 back-fills the ``files`` integrity manifest.  Tensor save/load itself
 lives in :mod:`saklas.core.manifold` (``save_manifold`` / ``load_manifold``);
 this module owns folder discovery, the node corpus, and integrity.
@@ -148,8 +148,8 @@ def _sanitize_hyperparams(
 # v4 fine *except* that we want users to refit so the EV value is
 # populated and the normalizer can kick in.  Bumping the version forces
 # materialize_bundled_manifolds to refresh the bundled fit on next
-# session start; user-fit v3 manifolds will need ``saklas vector
-# manifold fit`` to pick up the new field.
+# session start; user-fit v3 manifolds will need ``saklas manifold fit``
+# to pick up the new field.
 # v5 adds the per-layer ``origin_per_layer`` sidecar field (the per-layer
 # authoring-coordinate foot of the neutral mean, ``{str(L): [coord, ...]}``,
 # the cold-start foot seed).  Loading stays back-compatible — an absent
@@ -275,7 +275,7 @@ class ManifoldSidecar:
     # default, byte-identical to today's non-role manifolds.  The same
     # information rides ``ManifoldFolder.node_roles`` but the sidecar
     # carries an independent copy so a downstream consumer
-    # (``vector manifold show``, the webui inspector) doesn't have to
+    # (``manifold show``, the webui inspector) doesn't have to
     # round-trip through the folder to know which role each node was
     # pooled under.
     node_roles: list[str | None] = field(default_factory=list)
@@ -794,7 +794,7 @@ def _warn_authoring_quality(
 
 # ===================================================== discovery + authoring ===
 #
-# The functions below are the shared backend for `saklas vector manifold`
+# The functions below are the shared backend for `saklas manifold`
 # (CLI) and the `/saklas/v1/manifolds` HTTP routes — folder discovery and
 # the create/update authoring path live here in `io` so neither `cli` nor
 # `server` re-implements the on-disk format, and `server` need not import
@@ -1430,7 +1430,7 @@ def plan_discover_generation(
     label in ``labels``, and report which node corpora still need writing.
 
     Resume + add-nodes in one — the single planner every discover-generate
-    surface (the bundled regen scripts, ``vector manifold generate``, the
+    surface (the bundled regen scripts, ``manifold generate``, the
     HTTP generate route) calls:
 
     - A fresh ``folder`` gets a label-only skeleton (`manifold.json` +
@@ -1610,7 +1610,7 @@ def merge_discover_manifolds(
     drops cross-method keys at the IO boundary.
 
     The merged folder is written *unfitted* — no per-model tensor is
-    materialized.  Run ``saklas vector manifold discover`` or
+    materialized.  Run ``saklas manifold discover`` or
     ``POST .../fit`` against the merged folder to derive coords + fit.
     """
     if len(sources) < 2:
@@ -1950,7 +1950,7 @@ def refresh_manifold(
 
 # ============================================================ cross-model transfer ===
 #
-# The manifold analogue of ``saklas vector transfer`` (which writes a
+# The manifold analogue of ``saklas subspace transfer`` (which writes a
 # ``_from-<safe_src>`` variant tensor for steering vectors via
 # ``saklas.io.alignment.transfer_profile``).  Pure-io: the caller builds
 # the per-layer Procrustes alignment map — that needs both models loaded,
@@ -2157,7 +2157,7 @@ def transfer_manifold(
 def manifold_summary(folder: Path) -> dict[str, Any]:
     """Session-independent summary of a manifold folder.
 
-    The shared serializer behind ``vector manifold show -j`` (CLI) and
+    The shared serializer behind ``manifold show -j`` (CLI) and
     ``GET /saklas/v1/manifolds/{ns}/{name}`` (server) — the keys both can
     render without a loaded session.  Pure-io: reads the folder off disk
     and reports its identity, geometry, node layout, hyperparameters, and
@@ -2239,7 +2239,7 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
 # ``saklas/data/manifolds/<name>/`` in the wheel and materialize into
 # ``~/.saklas/manifolds/default/<name>/`` on session startup.  JSON-only
 # on the shipped side — per-model ``.safetensors`` fits are produced on
-# the user's machine via ``saklas vector manifold discover``.
+# the user's machine via ``saklas manifold discover``.
 
 
 def bundled_manifold_names() -> list[str]:
@@ -2350,7 +2350,7 @@ def materialize_bundled_manifolds() -> None:
     differs), the edit is stale-against-old-bundle and silently keeping
     it would mix corpora from two versions.  Users who want to override
     a bundled node corpus should fork it under a different namespace
-    (``saklas vector manifold generate ...`` or hand-author under
+    (``saklas manifold generate ...`` or hand-author under
     ``local/<name>/``) rather than edit the default-namespace copy.
 
     Per-model ``.safetensors`` tensor files stay put on bundle update —

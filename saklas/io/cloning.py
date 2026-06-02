@@ -330,11 +330,12 @@ def clone_from_corpus(
                 f"({ctx_len}); try a smaller --n-pairs or shorter corpus lines"
             )
 
-    # Save and clear steering state — extracted pairs must not be
-    # contaminated by whatever's currently active. Shallow dict() is
-    # safe: inner profile dicts are immutable references, we only
-    # clear the outer mapping via clear_all().
-    saved_vectors = dict(session._steering.vectors)
+    # Clear active steering hooks while generating neutral rewrites:
+    # persona pairs must not be contaminated by an enclosing
+    # ``session.steering(...)`` scope. The registered vector profiles live
+    # on ``SaklasSession._profiles`` in 4.0; ``SteeringManager`` only owns
+    # the composed hook state, so restoration means rebuilding hooks from
+    # the still-intact steering stack.
     session._steering.clear_all()
 
     pairs: list[tuple[str, str]] = []
@@ -357,13 +358,8 @@ def clone_from_corpus(
                     continue
                 pairs.append((persona_line, rewrite))
     finally:
-        # Restore prior vector registrations.
-        for vname, vdata in saved_vectors.items():
-            session._steering.add_vector(vname, vdata["profile"], vdata["alpha"])
-        if saved_vectors:
-            session._steering.apply_to_model(
-                session._layers, session._device, session._dtype,
-            )
+        # Restore hooks for any enclosing steering scope.
+        session._rebuild_steering_hooks()
 
     min_pairs = max(n_pairs // 2, 4)
     if len(pairs) < min_pairs:

@@ -260,7 +260,7 @@ def _manifold_json(
 
     The session-independent fields come straight from
     :func:`saklas.io.manifolds.manifold_summary` so this route and the
-    CLI ``vector manifold show -j`` emit byte-identical values for every
+    CLI ``manifold show -j`` emit byte-identical values for every
     key they share (``namespace`` / ``name`` / ``description`` /
     ``source`` / ``fit_mode`` / ``is_discover`` / ``node_count`` /
     ``node_labels`` / ``node_roles`` / ``hyperparams`` / ``fitted_models``
@@ -821,7 +821,7 @@ def register_manifold_routes(app: FastAPI) -> None:
 
         Delegates the actual removal to
         :func:`saklas.io.manifolds.remove_manifold_folder` — the single
-        source of truth shared with the CLI ``vector manifold rm`` — so
+        source of truth shared with the CLI ``manifold rm`` — so
         bundled-respawn semantics stay in one place.  The response
         carries that helper's ``{namespace, name, source, removed,
         rematerializes_on_restart}`` (a superset of the historical

@@ -1012,9 +1012,9 @@ def fit_layer_subspace(
     ``(S_b, Σ)`` via the whitener's low-rank Woodbury ``Σ⁻¹``: eigvecs
     ``a`` of ``G = X Σ⁻¹ Xᵀ`` (``K×K``), directions ``v_r = Σ⁻¹ Xᵀ a_r``.
     The result is re-expressed in a **Euclidean-orthonormal** basis (QR,
-    span-preserving) so :func:`decompose` / :func:`subspace_rotate` /
-    :func:`subspace_replace` — the steering hot path — are untouched; only
-    *which* subspace they operate in moves.  The de-rogued subspace barely
+    span-preserving) so :func:`decompose` / :func:`subspace_inject` — the
+    steering hot path — are untouched; only *which* subspace they operate
+    in moves.  The de-rogued subspace barely
     overlaps the rogue-dominated ``mean``, so the angular norm artifact
     collapses for free (no explicit norm-restore needed).  The caller
     gates this all-or-nothing on ``whitener.covers_all`` over the fit

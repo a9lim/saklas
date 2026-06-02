@@ -537,7 +537,7 @@ def _require_model(args: argparse.Namespace) -> None:
         # The manifold leaves (fit / discover / generate / transfer) carry the
         # leaf on ``manifold_cmd`` — surface it so the error reads "manifold
         # fit" under both the top-level ``manifold`` verb and the deprecated
-        # ``vector manifold`` alias.  Otherwise the leaf is the subspace verb
+        # ``vector manifold`` alias. Otherwise the leaf is the subspace verb
         # (``subspace_cmd``), the deprecated ``vector_cmd``, or a ``pack_cmd``.
         manifold_cmd = getattr(args, "manifold_cmd", None)
         if manifold_cmd:
@@ -903,6 +903,20 @@ def _fold_manifold_to_profile(
     vector-only.  Raises :class:`AmbiguousSelectorError` on a cross-namespace
     bare-name collision (mirroring vector resolution).
     """
+    folded = _fold_manifold_to_profile_with_identity(name, model_id, variant)
+    return folded[0] if folded is not None else None
+
+
+def _fold_manifold_to_profile_with_identity(
+    name: str, model_id: str, variant: str | None,
+) -> "tuple[Profile, str, str] | None":
+    """Fold a fitted 2-node ``pca`` manifold and return its namespace identity.
+
+    The identity is needed by ``compare``'s rank-all mode: bundled and user
+    concepts can share a bare name across namespaces, so callers must key
+    scanned profiles by ``namespace/name`` rather than letting later matches
+    overwrite earlier ones.
+    """
     from saklas.core.profile import Profile
     from saklas.core.manifold import load_manifold
     from saklas.core.vectors import folded_vector_directions
@@ -945,18 +959,19 @@ def _fold_manifold_to_profile(
         dirs = folded_vector_directions(manifold)
     except Exception:
         return None
-    return Profile(dirs)
+    ns = hits[0].parent.parent.name
+    return Profile(dirs), ns, bare
 
 
 def _fold_all_fitted_manifolds(
-    model_id: str, *, exclude: str = "",
+    model_id: str, *, exclude_identity: tuple[str, str] | None = None,
 ) -> "dict[str, Profile]":
-    """Fold every fitted 2-node ``pca`` manifold into ``{name: Profile}``.
+    """Fold every fitted 2-node ``pca`` manifold into ``{ns/name: Profile}``.
 
     Backs ``compare``'s 1-arg "rank against all installed" mode now that
     bundled concepts are manifolds.  Only manifolds with a fitted raw tensor
-    for ``model_id`` that fold to a 2-node affine are included; ``exclude``
-    drops the target by bare name.
+    for ``model_id`` that fold to a 2-node affine are included;
+    ``exclude_identity`` drops the target by exact ``(namespace, name)``.
     """
     from saklas.core.profile import Profile
     from saklas.core.manifold import load_manifold
@@ -972,7 +987,10 @@ def _fold_all_fitted_manifolds(
         if not ns_dir.is_dir():
             continue
         for mdir in sorted(ns_dir.iterdir()):
-            if not mdir.is_dir() or mdir.name == exclude:
+            if not mdir.is_dir():
+                continue
+            identity = (ns_dir.name, mdir.name)
+            if identity == exclude_identity:
                 continue
             tensor = mdir / fname
             if not tensor.is_file():
@@ -981,7 +999,7 @@ def _fold_all_fitted_manifolds(
                 dirs = folded_vector_directions(load_manifold(tensor))
             except Exception:
                 continue  # not a foldable 2-node affine (curved / rank > 1)
-            out[mdir.name] = Profile(dirs)
+            out[f"{ns_dir.name}/{mdir.name}"] = Profile(dirs)
     return out
 
 
@@ -1035,16 +1053,23 @@ def _run_compare(args: argparse.Namespace) -> None:
 
     # Load profiles from disk.
     profiles: dict[str, Profile] = {}
+    profile_identities: dict[str, tuple[str, str]] = {}
     for name, variant in names:
         sel = sel_parse(name)
         matches = resolve(sel)
         # Vector tensor first; fall back to folding a fitted manifold (bundled
         # & user concepts ship as 2-node manifolds).
         loaded: Profile | None = None
+        identity: tuple[str, str] | None = None
         display = name if variant is None else f"{name}:{variant}"
         if matches:
-            folder = matches[0].folder
-            display = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
+            match = matches[0]
+            folder = match.folder
+            identity = (match.namespace, match.name)
+            display_base = (
+                f"{match.namespace}/{match.name}" if "/" in name else match.name
+            )
+            display = display_base if variant is None else f"{display_base}:{variant}"
             try:
                 tensor_path = _resolve_variant_tensor(folder, args.model, variant)
             except (AmbiguousVariantError, UnknownVariantError) as e:
@@ -1058,10 +1083,17 @@ def _run_compare(args: argparse.Namespace) -> None:
                     continue
         if loaded is None:
             try:
-                loaded = _fold_manifold_to_profile(name, args.model, variant)
+                folded = _fold_manifold_to_profile_with_identity(
+                    name, args.model, variant,
+                )
             except Exception as e:
                 print(f"warning: {e}, skipping", file=sys.stderr)
                 continue
+            if folded is not None:
+                loaded, ns, bare = folded
+                identity = (ns, bare)
+                display_base = f"{ns}/{bare}" if "/" in name else bare
+                display = display_base if variant is None else f"{display_base}:{variant}"
         if loaded is None:
             print(
                 f"warning: no vector tensor or fitted manifold for '{name}' "
@@ -1070,6 +1102,8 @@ def _run_compare(args: argparse.Namespace) -> None:
             )
             continue
         profiles[display] = loaded
+        if identity is not None:
+            profile_identities[display] = identity
 
     if len(profiles) < 1:
         print("compare: no loadable profiles found", file=sys.stderr)
@@ -1081,9 +1115,12 @@ def _run_compare(args: argparse.Namespace) -> None:
     if len(args.concepts) == 1 and len(ordered) == 1:
         target_name = ordered[0]
         target = profiles[target_name]
+        target_identity = profile_identities.get(target_name)
 
-        # Load all other installed profiles for this model.
-        others: dict[str, Profile] = {}
+        # Load all other installed profiles for this model. Keep the exact
+        # namespace identity internally, then choose display names after the
+        # full pool is known: bare for unique names, qualified for collisions.
+        other_entries: dict[tuple[str, str], Profile] = {}
         vdir = vectors_dir()
         if vdir.is_dir():
             for ns_dir in sorted(vdir.iterdir()):
@@ -1092,7 +1129,8 @@ def _run_compare(args: argparse.Namespace) -> None:
                 for cdir in sorted(ns_dir.iterdir()):
                     if not cdir.is_dir():
                         continue
-                    if cdir.name == target_name:
+                    identity = (ns_dir.name, cdir.name)
+                    if identity == target_identity:
                         continue
                     # Auto-scan: raw preferred, GGUF fallback. SAE-vs-all
                     # ranking requires the caller to pass the SAE selector
@@ -1104,16 +1142,33 @@ def _run_compare(args: argparse.Namespace) -> None:
                     if tp is None or not tp.is_file():
                         continue
                     try:
-                        others[cdir.name] = Profile.load(tp)
+                        other_entries[identity] = Profile.load(tp)
                     except Exception:
                         continue
 
         # Bundled & user concepts ship as manifolds — fold every fitted one
         # into the ranking pool (vector tensors above win a name collision).
         for mname, mprof in _fold_all_fitted_manifolds(
-            args.model, exclude=target_name.rsplit("/", 1)[-1],
+            args.model, exclude_identity=target_identity,
         ).items():
-            others.setdefault(mname, mprof)
+            ns, bare = mname.split("/", 1)
+            other_entries.setdefault((ns, bare), mprof)
+
+        from collections import Counter
+
+        target_bare = (
+            target_identity[1] if target_identity is not None
+            else target_name.rsplit("/", 1)[-1]
+        )
+        bare_counts = Counter(name for _ns, name in other_entries)
+        others: dict[str, Profile] = {}
+        for (ns, bare), profile in sorted(other_entries.items()):
+            display = (
+                f"{ns}/{bare}"
+                if bare_counts[bare] > 1 or bare == target_bare
+                else bare
+            )
+            others[display] = profile
 
         if not others:
             print(f"compare: no other profiles found for model {args.model}", file=sys.stderr)
@@ -1229,8 +1284,12 @@ def _run_why(args: argparse.Namespace) -> None:
     profile: "Profile | None" = None
     concept_name = name_part if variant is None else f"{name_part}:{variant}"
     if matches:
-        folder = matches[0].folder
-        concept_name = matches[0].name if variant is None else f"{matches[0].name}:{variant}"
+        match = matches[0]
+        folder = match.folder
+        concept_base = (
+            f"{match.namespace}/{match.name}" if "/" in name_part else match.name
+        )
+        concept_name = concept_base if variant is None else f"{concept_base}:{variant}"
         try:
             tensor_path = _resolve_variant_tensor(folder, args.model, variant)
         except (AmbiguousVariantError, UnknownVariantError) as e:
@@ -1243,7 +1302,13 @@ def _run_why(args: argparse.Namespace) -> None:
                 print(f"why: failed to load '{args.concept}': {e}", file=sys.stderr)
                 sys.exit(1)
     if profile is None:
-        profile = _fold_manifold_to_profile(name_part, args.model, variant)
+        folded = _fold_manifold_to_profile_with_identity(
+            name_part, args.model, variant,
+        )
+        if folded is not None:
+            profile, ns, bare = folded
+            concept_base = f"{ns}/{bare}" if "/" in name_part else bare
+            concept_name = concept_base if variant is None else f"{concept_base}:{variant}"
     if profile is None:
         print(
             f"why: no vector tensor or fitted manifold for '{args.concept}' "
@@ -1632,7 +1697,7 @@ def _iter_manifold_folders(namespace: str | None):
     the walk.  CLI verbs like ``manifold discover`` / ``show`` / ``ls``
     resolve folders *before* any session is constructed, so the session-
     startup ``materialize_bundled_manifolds`` call hasn't fired yet —
-    without this hop, a user's first ``saklas vector manifold discover
+    without this hop, a user's first ``saklas manifold discover
     default/personas`` would miss the bundled folder and exit with "not
     found".  The format-version short-circuit inside the materialize
     function makes repeated calls cheap (no-op when up-to-date).  The
@@ -1824,7 +1889,7 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
         hint = (
             "discover" if mf.is_discover else "fit"
         )
-        print(f"  fitted models: (none — run `saklas vector manifold {hint}`)")
+        print(f"  fitted models: (none — run `saklas manifold {hint}`)")
 
 
 def _resolve_manifold_ns_name(name: str) -> tuple[str, str]:
@@ -1886,7 +1951,7 @@ def _resolve_manifold_folder(name: str) -> Path:
 def _run_manifold_discover(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import domain_label
 
-    """``saklas vector manifold discover`` — fit a discover-mode manifold.
+    """``saklas manifold discover`` — fit a discover-mode manifold.
 
     The folder must already exist (usually created by ``generate``) and
     be in discover shape.  Any CLI overrides (``--method``, ``--max-dim``,
@@ -1915,7 +1980,7 @@ def _run_manifold_discover(args: argparse.Namespace) -> None:
     if not mf.is_discover:
         print(
             f"manifold discover: '{args.name}' is authored, not discover; "
-            f"use `saklas vector manifold fit` for authored manifolds",
+            f"use `saklas manifold fit` for authored manifolds",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -1987,13 +2052,13 @@ def _run_manifold_discover(args: argparse.Namespace) -> None:
 
 
 def _run_manifold_generate(args: argparse.Namespace) -> None:
-    """``saklas vector manifold generate`` — author + LLM-fill a discover folder.
+    """``saklas manifold generate`` — author + LLM-fill a discover folder.
 
     Two-step end-to-end: load the model, run
     :meth:`SaklasSession.generate_statements` to fill per-concept
     corpora with the anti-allegory K-tuple generator, then write the
     folder via :func:`create_discover_manifold_folder`.  The folder is
-    ready for ``vector manifold discover`` to fit; the two-step split
+    ready for ``manifold discover`` to fit; the two-step split
     keeps the failure modes legible (a flaky generation run leaves
     inspectable corpora) and lets the user review the statements before
     paying for the discover fit.
@@ -2106,7 +2171,7 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
 
     print(f"wrote {namespace}/{name} ({n_total} nodes)")
     print(
-        f"  → run `saklas vector manifold discover {namespace}/{name}` to fit"
+        f"  -> run `saklas manifold discover {namespace}/{name}` to fit"
     )
 
 
@@ -2139,7 +2204,7 @@ def _run_manifold_search(args: argparse.Namespace) -> None:
     try:
         rows = search_manifolds(args.query or None)
     except ImportError as e:
-        print(f"saklas vector manifold search unavailable: {e}", file=sys.stderr)
+        print(f"saklas manifold search unavailable: {e}", file=sys.stderr)
         return
     except Exception as e:
         print(f"hf search failed: {type(e).__name__}: {e}", file=sys.stderr)
@@ -2190,7 +2255,7 @@ def _run_manifold_merge(args: argparse.Namespace) -> None:
         sys.exit(1)
     print(f"Merged manifold written to {dst}")
     print(
-        f"  → run `saklas vector manifold discover {target_ns}/{target_name}` to fit"
+        f"  -> run `saklas manifold discover {target_ns}/{target_name}` to fit"
     )
 
 

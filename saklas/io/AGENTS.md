@@ -115,7 +115,7 @@ leaves the RBF + `node_coords` untouched, re-bakes the Mahalanobis **share** in
 target space when a target whitener covers the transferred layers (no lever),
 clears `origin` (per-layer source-neutral foot), carries source `subspace_metric`,
 writes the `_from-<safe_src>` variant. `manifold_summary(folder)` is the
-session-independent serializer shared by `vector manifold show -j` + the HTTP
+session-independent serializer shared by `manifold show -j` + the HTTP
 summary route. `iter_manifold_folders`, `bundled_manifold_names`,
 `materialize_bundled_manifolds`. Per-node `role` (slug `[a-z0-9._-]+`) rides
 through the fit to `compute_node_centroid` for role-baselined centroids;

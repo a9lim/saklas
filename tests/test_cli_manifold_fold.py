@@ -96,9 +96,19 @@ class TestFoldHelper:
 
         _write_fitted_manifold("default", "happy.sad", seed=1)
         _write_fitted_manifold("default", "warm.clinical", seed=2)
-        pool = _fold_all_fitted_manifolds(_MODEL, exclude="happy.sad")
-        assert "warm.clinical" in pool
-        assert "happy.sad" not in pool
+        pool = _fold_all_fitted_manifolds(
+            _MODEL, exclude_identity=("default", "happy.sad"),
+        )
+        assert "default/warm.clinical" in pool
+        assert "default/happy.sad" not in pool
+
+    def test_fold_all_fitted_preserves_namespace_collisions(self) -> None:
+        from saklas.cli.runners import _fold_all_fitted_manifolds
+
+        _write_fitted_manifold("default", "happy.sad", seed=1)
+        _write_fitted_manifold("alice", "happy.sad", seed=2)
+        pool = _fold_all_fitted_manifolds(_MODEL)
+        assert set(pool) == {"alice/happy.sad", "default/happy.sad"}
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +147,18 @@ class TestWhyFold:
         assert payload["concept"] == "happy.sad"
         assert {row["layer"] for row in payload["layers"]} == {2, 5}
 
+    def test_why_json_keeps_explicit_namespace(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import json
+        _write_fitted_manifold("alice", "happy.sad")
+        args = cli.parse_args([
+            "subspace", "why", "alice/happy.sad", "-m", _MODEL, "-j",
+        ])
+        _run_why(args)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["concept"] == "alice/happy.sad"
+
 
 # ---------------------------------------------------------------------------
 # subspace compare — folds fitted manifolds (named + 1-arg rank-all)
@@ -172,6 +194,35 @@ class TestCompareFold:
         # 1-arg mode ranks the others (folded manifolds) against the target.
         assert "warm.clinical" in out
         assert "angry.calm" in out
+
+    def test_compare_explicit_namespace_collision_keeps_both(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _write_fitted_manifold("default", "happy.sad", seed=1)
+        _write_fitted_manifold("alice", "happy.sad", seed=2)
+        args = cli.parse_args([
+            "subspace", "compare", "default/happy.sad", "alice/happy.sad",
+            "-m", _MODEL, "--metric", "euclidean",
+        ])
+        _run_compare(args)
+        out = capsys.readouterr().out
+        assert "default/happy.sad" in out
+        assert "alice/happy.sad" in out
+
+    def test_compare_one_arg_rank_all_keeps_namespace_collision(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _write_fitted_manifold("default", "happy.sad", seed=1)
+        _write_fitted_manifold("alice", "warm.clinical", seed=2)
+        _write_fitted_manifold("default", "warm.clinical", seed=3)
+        args = cli.parse_args([
+            "subspace", "compare", "happy.sad",
+            "-m", _MODEL, "--metric", "euclidean",
+        ])
+        _run_compare(args)
+        out = capsys.readouterr().out
+        assert "alice/warm.clinical" in out
+        assert "default/warm.clinical" in out
 
 
 def _make_full_manifold(ns: str, name: str, *, seed: int = 0) -> Path:
