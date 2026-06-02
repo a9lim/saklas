@@ -178,7 +178,9 @@ activations `X_L ∈ ℝ^(N, D)` and the small Woodbury inverse `K_L = (NλI +
 XXᵀ)⁻¹`, so `apply_inv(layer, v) = Σ_reg⁻¹ v = (1/λ)(v − Xᵀ K X v)` in O(ND)
 without ever materializing a D×D matrix. Ridge `λ_L = (‖X_L‖²_F / (N·D)) ·
 ridge_scale`. Built lazily from the cached neutral activations
-(`from_neutral_activations` in-memory, `from_cache(model_id)` from disk).
+(`from_neutral_activations` in-memory, `from_cache(model_id)` from disk with
+cached layer means, `from_neutral_cache(model_id)` from disk with means derived
+from the neutral cache for no-model-load transfer rebakes).
 
 Neutral activations are cached **fp32** — the project-wide invariant. fp16's
 65504 ceiling overflows gemma-3's extreme late-layer channels to ±inf, which

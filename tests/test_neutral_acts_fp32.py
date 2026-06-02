@@ -180,3 +180,49 @@ def test_from_cache_rejects_legacy_bf16(tmp_path: Path, monkeypatch: pytest.Monk
 
     with pytest.raises(WhitenerError, match="non-fp32"):
         LayerWhitener.from_cache(MODEL_ID)
+
+
+def test_from_neutral_cache_builds_without_layer_means(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transfer rebakes can derive centering means from the neutral cache."""
+    _install_home(tmp_path, monkeypatch)
+    acts = _deterministic_acts()
+    md = model_dir(MODEL_ID)
+    md.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {f"layer_{i}": t.contiguous() for i, t in acts.items()},
+        str(md / "neutral_activations.safetensors"),
+    )
+
+    got = LayerWhitener.from_neutral_cache(MODEL_ID)
+    expected = LayerWhitener.from_neutral_activations(
+        acts,
+        {i: t.mean(dim=0) for i, t in acts.items()},
+    )
+
+    assert got.layers == set(acts)
+    v = torch.randn(8, generator=torch.Generator().manual_seed(55))
+    for layer in acts:
+        assert torch.allclose(got.apply_inv(layer, v), expected.apply_inv(layer, v))
+
+
+def test_from_neutral_cache_rejects_legacy_bf16(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_home(tmp_path, monkeypatch)
+    acts = _deterministic_acts()
+    md = model_dir(MODEL_ID)
+    md.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {
+            f"layer_{i}": t.contiguous().to(torch.bfloat16).cpu()
+            for i, t in acts.items()
+        },
+        str(md / "neutral_activations.safetensors"),
+    )
+
+    with pytest.raises(WhitenerError, match="non-fp32"):
+        LayerWhitener.from_neutral_cache(MODEL_ID)

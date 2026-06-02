@@ -60,22 +60,9 @@ def _resolve_probes(raw: list[str] | None) -> list[str]:
 def _target_whitener_from_neutral_cache(model_id: str) -> Any | None:
     """Build a target-model whitener from neutral activations without loading a model."""
     try:
-        import torch as _torch
-        from safetensors.torch import load_file
-
         from saklas.core.mahalanobis import LayerWhitener
-        from saklas.io.paths import model_dir
 
-        acts_path = model_dir(model_id) / "neutral_activations.safetensors"
-        if not acts_path.is_file():
-            return None
-        raw = load_file(str(acts_path))
-        acts = {
-            int(k.split("_", 1)[1]): v.to(_torch.float32)
-            for k, v in raw.items()
-        }
-        means = {layer: tensor.mean(dim=0) for layer, tensor in acts.items()}
-        return LayerWhitener.from_neutral_activations(acts, means)
+        return LayerWhitener.from_neutral_cache(model_id)
     except Exception:
         # Best-effort: a missing, stale, or degenerate target neutral cache
         # leaves transfers on the Euclidean fallback path.

@@ -82,6 +82,41 @@ _NEAR_ZERO_DENOM = 1e-12
 DEFAULT_RIDGE_SCALE = 1.0
 
 
+def _decode_layer_tensor_map(
+    raw: Mapping[str, torch.Tensor],
+    *,
+    label: str,
+) -> dict[int, torch.Tensor]:
+    """Decode ``layer_<idx>`` safetensor maps and promote values to fp32."""
+    out: dict[int, torch.Tensor] = {}
+    for key, value in raw.items():
+        try:
+            prefix, raw_idx = key.split("_", 1)
+            if prefix != "layer":
+                raise ValueError
+            idx = int(raw_idx)
+        except ValueError as e:
+            raise WhitenerError(
+                f"{label}: expected tensor keys like 'layer_0', got {key!r}"
+            ) from e
+        out[idx] = value.to(dtype=torch.float32)
+    return out
+
+
+def _require_fp32_neutral_cache(
+    model_id: str,
+    acts_raw: Mapping[str, torch.Tensor],
+) -> None:
+    if any(v.dtype != torch.float32 for v in acts_raw.values()):
+        raise WhitenerError(
+            f"neutral activations cache for {model_id} is a legacy "
+            f"non-fp32 (bf16/fp16) store; saklas requires fp32 for "
+            f"reproducible whitening. Repopulate by running any "
+            f"session-level extract on this model (it rewrites the cache "
+            f"as fp32), then retry."
+        )
+
+
 class LayerWhitener:
     """Per-layer Mahalanobis primitives over centered neutral activations.
 
@@ -258,14 +293,7 @@ class LayerWhitener:
         # missing-cache path above) rather than silently building a reduced-
         # precision metric.  Checks the RAW on-disk dtype, before the
         # ``.float()`` promotion below would mask it.
-        if any(v.dtype != torch.float32 for v in acts_raw.values()):
-            raise WhitenerError(
-                f"neutral activations cache for {model_id} is a legacy "
-                f"non-fp32 (bf16/fp16) store; saklas requires fp32 for "
-                f"reproducible whitening. Repopulate by running any "
-                f"session-level extract on this model (it rewrites the cache "
-                f"as fp32), then retry."
-            )
+        _require_fp32_neutral_cache(model_id, acts_raw)
         # Both files key tensors by ``layer_<idx>`` (alignment.py and
         # vectors.save_profile shape).  ``layer_means`` and
         # ``neutral_activations`` are both stored fp32; the ``.to(fp32)``
@@ -276,14 +304,45 @@ class LayerWhitener:
         # cache that overflowed on an extreme-activation channel), so a
         # corrupt cache degrades to Euclidean rather than poisoning the
         # inverse.
-        means = {
-            int(k.split("_", 1)[1]): v.to(dtype=torch.float32)
-            for k, v in means_raw.items()
-        }
-        acts = {
-            int(k.split("_", 1)[1]): v.to(dtype=torch.float32)
-            for k, v in acts_raw.items()
-        }
+        means = _decode_layer_tensor_map(means_raw, label=f"{model_id} layer_means")
+        acts = _decode_layer_tensor_map(
+            acts_raw, label=f"{model_id} neutral_activations",
+        )
+        return cls.from_neutral_activations(
+            acts, means, ridge_scale=ridge_scale,
+        )
+
+    @classmethod
+    def from_neutral_cache(
+        cls,
+        model_id: str,
+        *,
+        ridge_scale: float = DEFAULT_RIDGE_SCALE,
+    ) -> "LayerWhitener":
+        """Load a whitener from ``neutral_activations.safetensors`` alone.
+
+        This is for no-model-load transfer paths that only need the target
+        model's covariance.  The per-layer centering mean is derived from the
+        neutral activations themselves, so no ``layer_means.safetensors`` cache
+        is required.
+        """
+        from safetensors.torch import load_file
+        from saklas.io.paths import model_dir
+
+        md = model_dir(model_id)
+        acts_path = md / "neutral_activations.safetensors"
+        if not acts_path.is_file():
+            raise WhitenerError(
+                f"neutral activations cache missing for {model_id} "
+                f"(expected {acts_path}); populate via any flow that loads "
+                f"the model + neutral activations"
+            )
+        acts_raw = load_file(str(acts_path))
+        _require_fp32_neutral_cache(model_id, acts_raw)
+        acts = _decode_layer_tensor_map(
+            acts_raw, label=f"{model_id} neutral_activations",
+        )
+        means = {layer: tensor.mean(dim=0) for layer, tensor in acts.items()}
         return cls.from_neutral_activations(
             acts, means, ridge_scale=ridge_scale,
         )

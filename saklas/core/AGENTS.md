@@ -119,8 +119,10 @@ resolves per-layer sae_ids (`_canonical_layer_map` narrowest-width), gates
 `LayerWhitener` holds per-layer centered neutrals `X_L ∈ ℝ^(N,D)` + the Woodbury
 inverse `K_L = (NλI + XXᵀ)⁻¹`; `apply_inv(layer, v) = (1/λ)(v − Xᵀ K X v)` in
 O(ND), no D×D. Ridge `λ_L = (‖X_L‖²_F / (N·D)) · ridge_scale`. Built lazily via
-`from_neutral_activations` / `from_cache(model_id)`; neutrals cached **fp32** (the
-project-wide invariant — fp16's 65504 ceiling overflows gemma-3's late layers to
+`from_neutral_activations`, `from_cache(model_id)` (requires cached layer means),
+or `from_neutral_cache(model_id)` (derives per-layer means from cached neutrals for
+no-model-load transfer rebakes); neutrals cached **fp32** (the project-wide
+invariant — fp16's 65504 ceiling overflows gemma-3's late layers to
 ±inf, poisoning Σ). Any layer whose centered acts or `K` come back non-finite is
 *excluded*, so `covers_all` is trustworthy as "finite factors everywhere" — the
 all-or-nothing gate shared by extraction, manifold fit, projection, monitor, and
