@@ -11,8 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import (
-    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _SUBSPACE_VERBS,
-    _VECTOR_VERBS,
+    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _SUBSPACE_VERBS,
 )
 from saklas.core.errors import SaklasError
 from saklas.core.stats import median_or_zero
@@ -460,115 +459,6 @@ def _run_serve(args: argparse.Namespace) -> None:
 # --- pack runners --------------------------------------------------------
 
 @_saklas_error_exit
-def _run_pack(args: argparse.Namespace) -> None:
-    pack_cmd = getattr(args, "pack_cmd", None)
-    if pack_cmd is None:
-        print("usage: saklas pack <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _PACK_VERBS)
-        for v, desc in _PACK_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas pack <verb> -h` for verb-specific options.")
-        sys.exit(0)
-    runner = _PACK_RUNNERS[pack_cmd]
-    runner(args)
-
-
-def _run_install(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    cache_ops.install(
-        args.target,
-        as_=args.as_target,
-        force=args.force,
-        statements_only=args.statements_only,
-    )
-    suffix = " (statements only)" if args.statements_only else ""
-    print(f"Installed {args.target}{suffix}")
-
-
-def _run_refresh(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    if args.selector == "neutrals":
-        if args.model is not None:
-            print("warning: --model has no effect with `refresh neutrals`", file=sys.stderr)
-        dst = cache_ops.refresh_neutrals()
-        print(f"Refreshed {dst}")
-        return
-
-    selector = sel_parse(args.selector)
-    n = cache_ops.refresh(selector, model_scope=args.model)
-    print(f"Refreshed {n} concept(s)")
-
-
-def _run_clear(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector)
-    if selector.kind in {"all", "namespace"} and not args.yes:
-        print(
-            f"refusing to clear a broad selector ({selector.kind}); pass --yes to confirm",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    n = cache_ops.delete_tensors(selector, args.model, variant=args.variant)
-    print(f"Deleted {n} files")
-
-
-def _run_rm(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector)
-    try:
-        n = cache_ops.uninstall(selector, yes=args.yes)
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(2)
-    print(f"Uninstalled {n} concept(s)")
-
-
-def _run_ls(args: argparse.Namespace) -> None:
-    from saklas.cli.output import render_local_pack_list
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector) if args.selector else None
-    render_local_pack_list(
-        selector,
-        json_output=args.json_output,
-        verbose=args.verbose,
-    )
-
-
-def _run_search(args: argparse.Namespace) -> None:
-    from saklas.cli.output import render_remote_search
-    render_remote_search(
-        args.query,
-        json_output=args.json_output,
-        verbose=args.verbose,
-    )
-
-
-def _run_export(args: argparse.Namespace) -> None:
-    if args.format != "gguf":
-        print(f"Unknown export format: {args.format}", file=sys.stderr)
-        sys.exit(2)
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-    selector = sel_parse(args.selector)
-    written = cache_ops.export_gguf(
-        selector,
-        model_scope=args.model,
-        output=args.output,
-        model_hint=args.model_hint,
-    )
-    for p in written:
-        print(f"Wrote {p}")
-
-
 def _run_merge(args: argparse.Namespace) -> None:
     from saklas.io import merge as merge_mod
     dst = merge_mod.merge_into_manifold(
@@ -576,36 +466,6 @@ def _run_merge(args: argparse.Namespace) -> None:
         force=args.force, strict=args.strict,
     )
     print(f"Merged manifold written to {dst}")
-
-
-def _run_push(args: argparse.Namespace) -> None:
-    from saklas.io import cache_ops
-    from saklas.io.selectors import parse as sel_parse
-
-    selector = sel_parse(args.selector)
-    try:
-        coord, url, sha = cache_ops.push(
-            selector,
-            as_=args.as_target,
-            private=args.private,
-            model_scope=args.model,
-            statements_only=args.statements_only,
-            no_statements=args.no_statements,
-            tag_version=args.tag_version,
-            dry_run=args.dry_run,
-            force=args.force,
-            variant=args.variant,
-        )
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(2)
-
-    if sha:
-        print(f"Pushed {coord} -> {url} @ {sha[:12]}")
-    elif args.dry_run:
-        print(f"Dry-run: would push {coord} -> {url}")
-    else:
-        print(f"Pushed {coord} -> {url}")
 
 
 def _require_model(args: argparse.Namespace) -> None:
@@ -619,12 +479,7 @@ def _require_model(args: argparse.Namespace) -> None:
         if manifold_cmd:
             cmd = f"manifold {manifold_cmd}"
         else:
-            cmd = (
-                getattr(args, "subspace_cmd", None)
-                or getattr(args, "vector_cmd", None)
-                or getattr(args, "pack_cmd", None)
-                or "?"
-            )
+            cmd = getattr(args, "subspace_cmd", None) or "?"
         print(f"{cmd}: -m/--model is required", file=sys.stderr)
         sys.exit(2)
 
@@ -734,21 +589,6 @@ def _run_extract(args: argparse.Namespace) -> None:
 
     final_path = pathlib.Path(manifold_dir(ns, name)) / tensor_name
     print(f"extracted {name} -> {final_path}")
-
-
-_PACK_RUNNERS = {
-    "install": _run_install,
-    "refresh": _run_refresh,
-    "clear":   _run_clear,
-    "rm":      _run_rm,
-    "ls":      _run_ls,
-    "search":  _run_search,
-    "push":    _run_push,
-    "export":  _run_export,
-}
-
-
-# --- vector runners ------------------------------------------------------
 
 
 # --- config runners ------------------------------------------------------
@@ -2295,9 +2135,38 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     )
 
 
+def _run_manifold_export(args: argparse.Namespace) -> None:
+    """Export a fitted 2-node ``pca`` manifold to an interchange format (gguf).
+
+    Folds the manifold down to a single steering direction
+    (:func:`~saklas.core.vectors.folded_vector_directions`) and writes a
+    llama.cpp control-vector GGUF — the manifold-native successor to the old
+    ``pack export gguf``.
+    """
+    fmt = getattr(args, "format", None)
+    if fmt != "gguf":
+        print(f"Unknown export format: {fmt}", file=sys.stderr)
+        sys.exit(2)
+    from saklas.io.cache_ops import _export_gguf_manifold
+
+    ns, name = _resolve_manifold_ns_name(args.name)
+    try:
+        written = _export_gguf_manifold(
+            ns, name,
+            model_scope=args.model,
+            output=args.output,
+            model_hint=args.model_hint,
+        )
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"manifold export failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    for p in written:
+        print(f"Wrote {p}")
+
+
 @_saklas_error_exit
 def _run_manifold(args: argparse.Namespace) -> None:
-    """Dispatch ``saklas manifold <verb>`` (and the deprecated ``vector manifold``)."""
+    """Dispatch ``saklas manifold <verb>``."""
     cmd = getattr(args, "manifold_cmd", None)
     if cmd is None:
         print("usage: saklas manifold <verb> [...]")
@@ -2345,6 +2214,9 @@ def _run_manifold(args: argparse.Namespace) -> None:
     if cmd == "show":
         _run_manifold_show(args)
         return
+    if cmd == "export":
+        _run_manifold_export(args)
+        return
     print(f"unknown manifold verb {cmd!r}", file=sys.stderr)
     sys.exit(2)
 
@@ -2356,13 +2228,6 @@ _SUBSPACE_RUNNERS = {
     "compare":  _run_compare,
     "why":      _run_why,
     "transfer": _run_transfer,
-}
-
-# The deprecated ``vector`` alias dispatches the subspace verbs plus the
-# nested ``manifold`` (which reads the same ``manifold_cmd`` dest).
-_VECTOR_RUNNERS = {
-    **_SUBSPACE_RUNNERS,
-    "manifold": _run_manifold,
 }
 
 
@@ -2380,28 +2245,6 @@ def _run_subspace(args: argparse.Namespace) -> None:
         print("Run `saklas subspace <verb> -h` for verb-specific options.")
         sys.exit(0)
     _SUBSPACE_RUNNERS[cmd](args)
-
-
-@_saklas_error_exit
-def _run_vector(args: argparse.Namespace) -> None:
-    """[deprecated 4.0] alias for ``subspace`` (+ nested ``manifold``)."""
-    vector_cmd = getattr(args, "vector_cmd", None)
-    if vector_cmd is None:
-        print("usage: saklas vector <verb> [...]   [deprecated: use `subspace`/`manifold`]")
-        print()
-        width = max(len(v) for v, _ in _VECTOR_VERBS)
-        for v, desc in _VECTOR_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas vector <verb> -h` for verb-specific options.")
-        sys.exit(0)
-    target = "manifold" if vector_cmd == "manifold" else f"subspace {vector_cmd}"
-    print(
-        f"warning: `saklas vector {vector_cmd}` is deprecated (4.0) — "
-        f"use `saklas {target}`.",
-        file=sys.stderr,
-    )
-    _VECTOR_RUNNERS[vector_cmd](args)
 
 
 @_saklas_error_exit
@@ -2718,10 +2561,8 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
 _COMMAND_RUNNERS = {
     "tui":        _run_tui,
     "serve":      _run_serve,
-    "pack":       _run_pack,
     "subspace":   _run_subspace,
     "manifold":   _run_manifold,
-    "vector":     _run_vector,
     "config":     _run_config,
     "experiment": _run_experiment,
 }

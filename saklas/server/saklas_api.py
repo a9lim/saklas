@@ -718,11 +718,6 @@ def register_saklas_routes(app: FastAPI) -> None:
     from saklas.server.manifold_probe_routes import register_manifold_probe_routes
     register_manifold_probe_routes(app)
 
-    # ----- packs (top-level, not under a session) ------------------------
-
-    from saklas.server.pack_routes import register_pack_routes
-    register_pack_routes(app)
-
     # ----- sessions collection -------------------------------------------
 
     from saklas.server.session_routes import register_session_routes

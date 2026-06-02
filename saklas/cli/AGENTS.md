@@ -1,35 +1,34 @@
 # cli/
 
-Eight-verb root parser
-(`tui`/`serve`/`pack`/`subspace`/`manifold`/`vector`/`experiment`/`config`). 4.0
-promoted `subspace` (flat — the old `vector` extract/merge/clone/compare/why/
-transfer) and `manifold` (the old `vector manifold *` subtree) to top-level
-verbs; `vector` is now a **deprecated alias** that parses the old tree
-identically and dispatches to the new runners with a one-time stderr notice
-(`_run_vector` → `_SUBSPACE_RUNNERS` / `_run_manifold`). Split across:
+Six-verb root parser
+(`tui`/`serve`/`subspace`/`manifold`/`experiment`/`config`). 4.0 promoted
+`subspace` (flat — the old `vector` extract/merge/clone/compare/why/transfer)
+and `manifold` (the old `vector manifold *` subtree) to top-level verbs; the
+4.0 collapse then **retired** the `pack` verb and the deprecated `vector`
+alias entirely (pack distribution folded into the manifold artifact, so
+`pack install`/`push`/`ls`/`search`/`export` are gone — install via `manifold
+install`, export via `manifold export gguf`). Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
 - `cli/runners.py` — every `_run_X` plus the shared helpers below
 - `cli/config_file.py` — `ConfigFile` dataclass + `compose` / `apply_flag_overrides`
   / `ensure_vectors_installed`
-- `cli/output.py` — text/JSON formatters for `pack ls` / `pack search`
 
 `main()` dispatches via `_COMMAND_RUNNERS[cmd]`. Bare `saklas` (or a bare verb
 with no subverb) prints help and exits 0, not argparse's exit 2. `subspace` and
-`manifold` are top-level verbs; `vector` is the deprecated alias (`_run_vector`
-warns then routes to `_SUBSPACE_RUNNERS` / `_run_manifold`).
+`manifold` are the artifact verbs; there is no `pack` verb and no `vector` alias.
 
 ## Verb nesting
 
-- `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via
-  `_PACK_VERBS` / `_PACK_BUILDERS` / `_PACK_RUNNERS`
 - `subspace` = flat-artifact computation (extract/merge/clone/compare/why/transfer)
   via `_SUBSPACE_VERBS` / `_SUBSPACE_BUILDERS` / `_SUBSPACE_RUNNERS` (`_run_subspace`).
 - `manifold` = the steering-manifold subtree promoted to top-level
   (`fit`/`discover`/`generate`/`merge`/`install`/`search`/`push`/`rm`/
-  `clear`/`refresh`/`transfer`/`ls`/`show`), hand-dispatched by `_run_manifold`
-  (`_build_manifold_parser` reuses `_build_vector_manifold`, so the verb and the
-  `vector manifold` alias parse identically).
+  `clear`/`refresh`/`transfer`/`ls`/`show`/`export`), hand-dispatched by
+  `_run_manifold` (`_build_manifold_parser` reuses `_build_vector_manifold`).
+  `manifold export gguf <name>` folds a fitted 2-node `pca` manifold to a
+  steering vector and writes a llama.cpp control-vector GGUF (the successor to
+  the old `pack export gguf`), via `cache_ops._export_gguf_manifold`.
   The fit/discover/generate/transfer verbs load a model; the lifecycle verbs and
   `ls`/`show` are pure-IO over `~/.saklas/manifolds/`, addressed by
   `(namespace, name)` pairs (not the concept `Selector`/`resolve` machinery).
@@ -126,7 +125,7 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
   transferred shares can be re-baked in the target Mahalanobis metric; cache miss
   or degenerate cache leaves the Euclidean fallback path.
 - `manifold`: top-level `fit`/`discover`/`generate`/`merge`/`install`/`search`/
-  `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`. `fit <folder>` runs
+  `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`/`export`. `fit <folder>` runs
   `ManifoldExtractionPipeline` on an authored folder; `discover <name>
   [--method pca|spectral] [--max-dim N] [--var-threshold T] [--k-nn K]
   [--bandwidth SIGMA] [--max-subspace-dim R] [--sae REL]` fits a discover-mode
@@ -136,8 +135,9 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
   [--n-scenarios N] [--statements-per-concept K] [--seed INT] [--role-per-node]
   [-m] [-f]` LLM-authors a discover folder via `session.generate_statements`
   (`--role-per-node` doubles each concept slug as that node's assistant-role
-  substitution → a persona manifold). Lifecycle/distribution verbs mirror their
-  `pack`/`vector` precedents flag-for-flag. The only surviving `--method` flag is
+  substitution → a persona manifold). `export gguf <name> [-m MODEL] [-o PATH]
+  [--model-hint HINT]` folds a fitted 2-node `pca` manifold to a vector and
+  writes a llama.cpp control-vector GGUF. The only surviving `--method` flag is
   the manifold `pca`/`spectral` one (on `discover`/`merge`).
 - `experiment fan`: `model` + `prompt`, `-g/--grid CONCEPT=ALPHAS` (required,
   repeatable), `-S/--base-steering`, `--max-tokens` (256), `-j`. Runs the grid
@@ -146,8 +146,7 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
   `transcript` is not a top-level verb.
 - `experiment naturalness`: `model` + `prompt`, `--manifold FOLDER` / `-S/--steer
   EXPR` (required), `--compare-linear`, `--max-tokens` (128), `-j`.
-- `pack install`/`refresh`/`clear`/`rm`/`ls`/`search`/`push`/`export gguf`,
-  `config show`/`validate` — flags as in their `cache_ops`/`hf` backends.
+- `config show`/`validate` — flags as in `config_file`.
 
 ## Error handling
 
