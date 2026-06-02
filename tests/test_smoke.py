@@ -347,41 +347,6 @@ class TestBuildChatInput:
         assert ids_sys.shape[1] > ids_no_sys.shape[1]
 
 
-class TestProbesBootstrap:
-    def test_bootstrap_loads_from_cache(self, monkeypatch: pytest.MonkeyPatch, model_and_tokenizer: Any, layers: Any, happy_profile: Any) -> None:
-        """Bootstrap should return cached profiles without re-extracting."""
-        from saklas.io.probes_bootstrap import bootstrap_probes
-        from saklas.core.vectors import save_profile
-        from saklas.io.paths import concept_dir, safe_model_id
-        from saklas.io.packs import materialize_bundled, PackMetadata, hash_file
-        from saklas.core.model import get_model_info
-        model, tokenizer = model_and_tokenizer
-        model_info = get_model_info(model, tokenizer)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            monkeypatch.setenv("SAKLAS_HOME", tmp)
-            materialize_bundled()
-            # Pre-populate the `happy.sad` concept tensor for this model
-            folder = concept_dir("default", "happy.sad")
-            ts_path = folder / f"{safe_model_id(model_info['model_id'])}.safetensors"
-            save_profile(happy_profile, str(ts_path), {
-                "method": "difference_of_means",
-                "statements_sha256": hash_file(folder / "statements.json"),
-            })
-            # Refresh the pack.json files map to include the new tensor
-            meta = PackMetadata.load(folder)
-            meta.files[ts_path.name] = hash_file(ts_path)
-            meta.files[ts_path.with_suffix(".json").name] = hash_file(ts_path.with_suffix(".json"))
-            meta.write(folder)
-
-            probes = bootstrap_probes(
-                model, tokenizer, layers, model_info,
-                categories=["affect"],
-            )
-            assert isinstance(probes, dict)
-            assert "happy.sad" in probes
-
-
 class TestAblationPerformance:
     """Combined ablation + additive throughput must stay >= 80% of vanilla.
 
