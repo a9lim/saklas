@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any
 
 from fastapi.responses import StreamingResponse
@@ -59,19 +60,14 @@ def progress_sse_response(
             try:
                 while True:
                     kind, payload = await queue.get()
-                    if kind == "progress":
-                        data = {"message": payload}
-                    else:
-                        data = payload
+                    data = {"message": payload} if kind == "progress" else payload
                     yield f"event: {kind}\ndata: {json.dumps(data)}\n\n"
                     if kind in {"done", "error"}:
                         break
             finally:
                 if not task.done():
                     task.cancel()
-                    try:
+                    with suppress(BaseException):
                         await task
-                    except BaseException:  # noqa: BLE001 - cancelled generator cleanup
-                        pass
 
     return StreamingResponse(_sse(), media_type="text/event-stream")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from contextlib import suppress
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -26,27 +27,19 @@ def register_traits_routes(app: FastAPI) -> None:
         loop = asyncio.get_running_loop()
         trait_queue: asyncio.Queue[Any] = asyncio.Queue()
 
+        def _enqueue(item: Any) -> None:
+            with suppress(Exception):
+                loop.call_soon_threadsafe(trait_queue.put_nowait, item)
+
         def _on_event(event: object) -> None:
             if isinstance(event, GenerationStarted):
-                try:
-                    loop.call_soon_threadsafe(
-                        trait_queue.put_nowait,
-                        (
-                            "start",
-                            getattr(event, "input", None),
-                            getattr(event, "stateless", False),
-                        ),
-                    )
-                except Exception:
-                    pass
+                _enqueue((
+                    "start",
+                    getattr(event, "input", None),
+                    getattr(event, "stateless", False),
+                ))
             elif isinstance(event, GenerationFinished):
-                try:
-                    loop.call_soon_threadsafe(
-                        trait_queue.put_nowait,
-                        ("done", getattr(event, "result", None)),
-                    )
-                except Exception:
-                    pass
+                _enqueue(("done", getattr(event, "result", None)))
 
         unsub = session.events.subscribe(_on_event)
         session.register_trait_queue(loop, trait_queue)
@@ -61,7 +54,7 @@ def register_traits_routes(app: FastAPI) -> None:
                         item = await asyncio.wait_for(
                             trait_queue.get(), timeout=15.0,
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         yield ": heartbeat\n\n"
                         continue
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Any
 
 
@@ -18,13 +19,11 @@ def build_token_event(
     """Build one native WS ``token`` frame from the current engine state."""
     node_id = node_holder[0]
     if node_id is None:
-        try:
+        with suppress(Exception):
             candidate = session.tree.active_node_id
             if isinstance(candidate, str):
                 node_id = candidate
                 node_holder[0] = candidate
-        except Exception:
-            node_id = None
 
     event: dict[str, Any] = {
         "type": "token",
@@ -41,14 +40,12 @@ def build_token_event(
             for a in top_alts
         ]
 
-    try:
+    with suppress(Exception):
         emap = session._gen_state.emit_map
         if emap:
             event["raw_index"] = int(emap[-1][0])
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         node = session.tree.nodes.get(node_id) if node_id else None
         rows = (
             node.thinking_tokens if is_thinking else node.tokens
@@ -61,10 +58,8 @@ def build_token_event(
             per_layer_blob = last.get("per_layer_scores")
             if per_layer_blob:
                 event["per_layer_scores"] = per_layer_blob
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         payload = getattr(session, "_last_token_probe_payload", None)
         readings = (
             payload.get("manifold_readings")
@@ -95,7 +90,5 @@ def build_token_event(
             event["manifold_readings"] = {
                 name: r.to_dict() for name, r in readings.items()
             }
-    except Exception:
-        pass
 
     return event
