@@ -250,12 +250,12 @@ def _make_full_manifold(ns: str, name: str, *, seed: int = 0) -> Path:
 
 class TestMergeFold:
     def test_merge_folds_manifold_components(self) -> None:
-        from saklas.io.merge import merge_into_pack
+        from saklas.io.merge import merge_into_manifold
         from saklas.io.paths import safe_model_id
 
         _write_fitted_manifold("default", "happy.sad", seed=1)
         _write_fitted_manifold("default", "warm.clinical", seed=2)
-        dst = merge_into_pack(
+        dst = merge_into_manifold(
             "merged",
             "0.5 default/happy.sad + 0.5 default/warm.clinical",
             model=_MODEL,
@@ -263,11 +263,11 @@ class TestMergeFold:
         assert (dst / f"{safe_model_id(_MODEL)}.safetensors").exists()
 
     def test_merge_missing_component_errors(self) -> None:
-        from saklas.io.merge import merge_into_pack, MergeError
+        from saklas.io.merge import merge_into_manifold, MergeError
 
         _write_fitted_manifold("default", "happy.sad", seed=1)
         with pytest.raises(MergeError):
-            merge_into_pack(
+            merge_into_manifold(
                 "merged",
                 "0.5 default/happy.sad + 0.5 default/nonexistent",
                 model=_MODEL,

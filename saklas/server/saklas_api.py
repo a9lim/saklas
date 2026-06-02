@@ -287,7 +287,8 @@ class MergeVectorRequest(BaseModel):
 
     ``expression`` is a merge expression in the shared steering grammar
     (``"0.3 default/honest + 0.4 default/warm"``); ``name`` becomes the
-    new merged pack's local name.  Reuses :func:`saklas.io.merge.merge_into_pack`.
+    new merged manifold's local name.  Reuses
+    :func:`saklas.io.merge.merge_into_manifold`.
     """
     name: str
     expression: str
@@ -1547,15 +1548,18 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
     async def merge_vector(session_id: str, req: MergeVectorRequest):
-        """Merge an expression of installed vectors into a new local pack.
+        """Merge an expression of installed directions into a baked manifold.
 
-        Wraps :func:`saklas.io.merge.merge_into_pack` (model-scoped to
-        the session's loaded model), then loads the merged tensor into
-        ``session._profiles`` so it's immediately steerable. Returns the
-        same profile-JSON shape ``GET /vectors/{name}`` produces.
+        Wraps :func:`saklas.io.merge.merge_into_manifold` (model-scoped to
+        the session's loaded model) — the merge lands a corpus-less
+        ``fit_mode="baked"`` manifold — then folds the fitted tensor back to a
+        steering Profile and registers it so it's immediately steerable.
+        Returns the same profile-JSON shape ``GET /vectors/{name}`` produces.
         """
-        from saklas.io.merge import merge_into_pack, MergeError
+        from saklas.io.merge import merge_into_manifold, MergeError
         from saklas.io.paths import tensor_filename
+        from saklas.core.manifold import load_manifold
+        from saklas.core.vectors import folded_vector_directions
         from saklas.server.manifold_routes import _refuse_if_busy
         _resolve_session_id(session, session_id)
 
@@ -1566,7 +1570,7 @@ def register_saklas_routes(app: FastAPI) -> None:
             _refuse_if_busy(session)
             try:
                 dst_folder = await asyncio.to_thread(
-                    merge_into_pack,
+                    merge_into_manifold,
                     req.name,
                     req.expression,
                     session.model_id,
@@ -1582,7 +1586,12 @@ def register_saklas_routes(app: FastAPI) -> None:
                     500,
                     f"merge produced no tensor for {session.model_id} at {tensor_path}",
                 )
-            profile = await asyncio.to_thread(session.load_profile, str(tensor_path))
+
+            def _load_folded() -> Profile:
+                manifold = load_manifold(str(tensor_path))
+                return Profile(folded_vector_directions(manifold))
+
+            profile = await asyncio.to_thread(_load_folded)
             session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
 

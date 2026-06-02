@@ -290,6 +290,12 @@ class ManifoldSidecar:
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Merge provenance on a ``fit_mode="baked"`` manifold — the
+    # ``{coord: {alpha, project_away, tensor_sha256}}`` map written by
+    # :func:`saklas.io.merge.merge_into_manifold`.  ``None`` on every fit that
+    # isn't a merge (the common case).  Informational only — a baked
+    # manifold never re-fits, so nothing branches on it.
+    components: Optional[dict[str, Any]] = None
     # Per-node assistant-role substitution used at fit time, in
     # ``node_labels`` index order.  ``None`` for a given node (and an
     # empty list as a whole) = "standard assistant baseline" — the
@@ -324,6 +330,7 @@ class ManifoldSidecar:
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
             node_roles=list(data.get("node_roles", [])),
+            components=data.get("components"),
         )
 
 
@@ -1240,6 +1247,7 @@ def create_baked_manifold_folder(
     tags: Optional[list[str]] = None,
     source: str = "local",
     force: bool = False,
+    components: Optional[dict[str, Any]] = None,
 ) -> tuple[Path, "ManifoldFolder"]:
     """Persist a corpus-less pre-baked Manifold as a ``fit_mode="baked"`` folder.
 
@@ -1253,16 +1261,19 @@ def create_baked_manifold_folder(
     Writes ``manifold.json`` (``fit_mode="baked"``, the manifold's display
     ``domain``, label-only nodes) + the per-model tensor + sidecar, then
     back-fills the ``files`` integrity manifest.  ``method`` is the sidecar
-    provenance tag (``"merge"`` / ``"imported"``).  Returns
+    provenance tag (``"merge"`` / ``"imported"``); ``components`` rides the
+    sidecar as merge provenance (``merge`` only).  Returns
     ``(folder, ManifoldFolder)``.
+
+    For a multi-model merge, call this once for the first model and
+    :func:`save_baked_manifold_tensor` for each subsequent model (sharing the
+    one ``manifold.json``), then a final :meth:`ManifoldFolder.write_metadata`
+    to fold every tensor into the ``files`` manifest.
 
     Raises :class:`ManifoldFormatError` on an invalid name/namespace and
     :class:`FileExistsError` when a manifold already lives at the path and
     ``force`` is ``False``.
     """
-    from saklas.core.manifold import save_manifold
-    from saklas.io.paths import tensor_filename
-
     if not NAME_REGEX.match(name):
         raise ManifoldFormatError(
             f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
@@ -1296,10 +1307,40 @@ def create_baked_manifold_folder(
         payload["source"] = source
     write_json_atomic(folder / "manifold.json", payload)
 
+    save_baked_manifold_tensor(
+        folder, manifold, model_id, method=method, components=components,
+    )
+
+    mf = ManifoldFolder.load(folder)
+    mf.write_metadata()  # back-fill the files integrity manifest
+    return folder, mf
+
+
+def save_baked_manifold_tensor(
+    folder: Path,
+    manifold: "Any",
+    model_id: str,
+    *,
+    method: str,
+    components: Optional[dict[str, Any]] = None,
+) -> Path:
+    """Write one per-model tensor + sidecar into a ``fit_mode="baked"`` folder.
+
+    Factored out of :func:`create_baked_manifold_folder` so a multi-model merge
+    can share one ``manifold.json`` across every target model's tensor.  The
+    caller is responsible for the surrounding ``manifold.json`` write (once) and
+    a final :meth:`ManifoldFolder.write_metadata` (to fold every tensor into the
+    ``files`` manifest).  Returns the tensor path.
+    """
+    from saklas.core.manifold import save_manifold
+    from saklas.io.paths import tensor_filename
+
     # ``nodes_sha256`` is provenance-only for baked (never re-fits), computed
     # from the same identity ``ManifoldFolder.nodes_sha256`` hashes.
     nodes_sha = hashlib.sha256(
-        _canonical_json({"fit_mode": "baked", "node_labels": labels})
+        _canonical_json(
+            {"fit_mode": "baked", "node_labels": list(manifold.node_labels)}
+        )
     ).hexdigest()
     save_meta: dict[str, object] = {
         "method": method,
@@ -1309,11 +1350,11 @@ def create_baked_manifold_folder(
     share_metric = manifold.metadata.get("share_metric")
     if share_metric:
         save_meta["share_metric"] = share_metric
-    save_manifold(manifold, folder / tensor_filename(model_id), save_meta)
-
-    mf = ManifoldFolder.load(folder)
-    mf.write_metadata()  # back-fill the files integrity manifest
-    return folder, mf
+    if components:
+        save_meta["components"] = components
+    tensor_path = folder / tensor_filename(model_id)
+    save_manifold(manifold, tensor_path, save_meta)
+    return tensor_path
 
 
 def port_legacy_vector_folder(
@@ -1753,7 +1794,7 @@ def merge_discover_manifolds(
 ) -> Path:
     """Union N discover-mode manifolds' nodes into one fresh discover folder.
 
-    The vector-side counterpart is :func:`saklas.io.merge.merge_into_pack`,
+    The vector-side counterpart is :func:`saklas.io.merge.merge_into_manifold`,
     but the manifold semantics are different: vector merge composes a
     new direction from a steering expression; manifold merge unions
     *node corpora* and lets the next fit derive coords from the
@@ -2651,6 +2692,7 @@ __all__ = [
     "create_manifold_folder",
     "create_discover_manifold_folder",
     "create_baked_manifold_folder",
+    "save_baked_manifold_tensor",
     "init_discover_manifold_folder",
     "append_discover_manifold_node",
     "write_manifold_scenarios",

@@ -2246,6 +2246,13 @@ def save_manifold(
         # Absent on non-role manifolds — the pipeline only stamps it
         # when at least one node opts into role substitution.
         "node_roles",
+        # Merge provenance ({coord: {alpha, project_away, tensor_sha256}}),
+        # carried on a ``fit_mode="baked"`` manifold produced by
+        # :func:`saklas.io.merge.merge_into_manifold`.  Informational only — a
+        # baked manifold never re-fits, so nothing branches on it; surfaced
+        # by the inspector the way the legacy pack sidecar's ``components``
+        # was.  Absent on every non-merge fit.
+        "components",
     ):
         if key in metadata:
             sidecar[key] = metadata[key]

@@ -1,11 +1,12 @@
 <script lang="ts">
   // MergeDrawer — combine vectors via a steering expression and register
-  // the merged result as a new local pack.
+  // the merged result as a new local steerable.
   //
   // Expression is live-validated in the browser using parseExpression
   // (mirrors the server parser).  On submit, POST /vectors/merge wraps
-  // saklas.io.merge.merge_into_pack server-side; the response is the
-  // same VectorInfo shape GET /vectors/{name} returns.
+  // saklas.io.merge.merge_into_manifold server-side (the merge lands a
+  // corpus-less baked manifold, folded back to a steering direction); the
+  // response is the same VectorInfo shape GET /vectors/{name} returns.
   //
   // Variant picker covers the shared tensor variant suffixes.  The merge
   // endpoint body shape is { name, expression } only — no variant field on the

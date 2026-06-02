@@ -571,11 +571,11 @@ def _run_export(args: argparse.Namespace) -> None:
 
 def _run_merge(args: argparse.Namespace) -> None:
     from saklas.io import merge as merge_mod
-    dst = merge_mod.merge_into_pack(
+    dst = merge_mod.merge_into_manifold(
         args.name, args.expression, model=args.model,
         force=args.force, strict=args.strict,
     )
-    print(f"Merged pack written to {dst}")
+    print(f"Merged manifold written to {dst}")
 
 
 def _run_push(args: argparse.Namespace) -> None:
