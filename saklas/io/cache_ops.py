@@ -358,6 +358,122 @@ def _resolve_model_hint(safe_id: str) -> str:
     return str(mt)
 
 
+def _manifold_nsname_from_selector(selector: Selector) -> "tuple[str, str] | None":
+    """Resolve a single-concept ``Selector`` to a ``(ns, name)`` manifold, or None.
+
+    The 4.0 GGUF fold fallback: bundled & user concepts ship as 2-node ``pca``
+    manifolds, so a name that doesn't resolve as a vector pack may be a
+    manifold.  Namespace-qualified resolves directly; a bare name scans every
+    manifold namespace and raises on a cross-namespace collision.
+    """
+    from saklas.io.paths import manifolds_dir, manifold_dir
+    if selector.kind != "name" or selector.value is None:
+        return None
+    name: str = selector.value
+    if selector.namespace:
+        ns = selector.namespace
+        return (ns, name) if (manifold_dir(ns, name) / "manifold.json").exists() else None
+    root = manifolds_dir()
+    hits = (
+        [d.name for d in sorted(root.iterdir())
+         if d.is_dir() and (d / name / "manifold.json").exists()]
+        if root.is_dir() else []
+    )
+    if len(hits) == 1:
+        return (hits[0], name)
+    if len(hits) > 1:
+        raise RuntimeError(
+            f"ambiguous manifold '{name}': matches "
+            f"{', '.join(f'{h}/{name}' for h in hits)}. Qualify with a namespace."
+        )
+    return None
+
+
+def _export_gguf_manifold(
+    ns: str,
+    name: str,
+    *,
+    model_scope: Optional[str],
+    output: Optional[str],
+    model_hint: Optional[str],
+) -> list[Path]:
+    """Export a fitted 2-node ``pca`` manifold to GGUF by folding it to a vector.
+
+    Mirrors :func:`export_gguf`'s vector flow — model targets, output policy,
+    and the in-pack files-map refresh — but sources each per-model profile by
+    folding the manifold (:func:`~saklas.core.vectors.folded_vector_directions`).
+    """
+    from saklas.io.gguf_io import write_gguf_profile
+    from saklas.io.manifolds import ManifoldFolder, hash_manifold_files
+    from saklas.io.paths import (
+        manifold_dir, parse_tensor_filename, tensor_filename,
+    )
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+
+    mdir = manifold_dir(ns, name)
+    mf = ManifoldFolder.load(mdir)
+
+    raw_models: set[str] = set()
+    for tensor in mdir.glob("*.safetensors"):
+        parsed = parse_tensor_filename(tensor.name)
+        if parsed is not None and parsed[1] is None:  # raw fitted → foldable
+            raw_models.add(parsed[0])
+
+    if model_scope is not None:
+        sid = safe_model_id(model_scope)
+        if sid not in raw_models:
+            raise RuntimeError(
+                f"{ns}/{name}: no fitted manifold tensor for {model_scope}"
+            )
+        targets = [sid]
+    else:
+        targets = sorted(raw_models)
+        if not targets:
+            raise RuntimeError(
+                f"{ns}/{name}: no fitted manifold tensors to export"
+            )
+
+    out_path = Path(output) if output else None
+    if out_path is not None and len(targets) > 1 and out_path.suffix == ".gguf":
+        raise RuntimeError(
+            "multi-model export needs a directory or no --output; "
+            f"got file path {out_path}"
+        )
+    if out_path is None and (mf.source or "").startswith("bundled"):
+        raise RuntimeError(
+            f"{ns}/{name}: bundled manifold — in-place GGUF export would be lost "
+            f"on next refresh. Pass --output <path> to write outside the folder."
+        )
+
+    written: list[Path] = []
+    for sid in targets:
+        manifold = load_manifold(mdir / tensor_filename(sid, release=None))
+        try:
+            profile = folded_vector_directions(manifold)
+        except Exception as e:
+            raise RuntimeError(
+                f"{ns}/{name}: manifold does not fold to a single steering "
+                f"direction (not a 2-node affine subspace): {e}"
+            )
+        hint = model_hint or _resolve_model_hint(sid)
+        if out_path is None:
+            dest = mdir / f"{sid}.gguf"
+        elif out_path.suffix == ".gguf":
+            dest = out_path
+        else:
+            out_path.mkdir(parents=True, exist_ok=True)
+            dest = out_path / f"{sid}.gguf"
+        write_gguf_profile(profile, dest, model_hint=hint)
+        written.append(dest)
+
+    if any(p.parent == mdir for p in written):
+        mf.write_metadata(files=hash_manifold_files(mdir))
+        _invalidate_selector_cache()
+
+    return written
+
+
 def export_gguf(
     selector: Selector,
     *,
@@ -390,6 +506,19 @@ def export_gguf(
     from saklas.core.vectors import load_profile
 
     concepts = resolve(selector)
+    if len(concepts) == 0:
+        # No vector pack — fall back to a fitted manifold (bundled & user
+        # concepts ship as 2-node pca manifolds).
+        nsname = _manifold_nsname_from_selector(selector)
+        if nsname is not None:
+            return _export_gguf_manifold(
+                nsname[0], nsname[1],
+                model_scope=model_scope, output=output, model_hint=model_hint,
+            )
+        raise RuntimeError(
+            f"export_gguf: no vector pack or fitted manifold matched "
+            f"{selector.value!r}"
+        )
     if len(concepts) != 1:
         raise RuntimeError(
             f"export_gguf requires a single concept selector; "

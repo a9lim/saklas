@@ -101,16 +101,65 @@ def linear_sum(
     return out
 
 
-def _resolve_coord(ns: Optional[str], name: str) -> ConceptFolder:
-    if ns is None:
-        raise MergeError(
-            f"merge component '{name}' must be namespace-qualified "
-            f"(e.g. 'default/{name}')"
-        )
+def _manifold_tensor_path(ns: str, name: str, sid: str, variant: Optional[str]) -> "Path | None":
+    """Fitted-manifold tensor path for ``(ns, name, sid, variant)``, or ``None``.
+
+    The 4.0 fold fallback: bundled & user concepts ship as 2-node ``pca``
+    manifolds.  Only the ``raw`` / ``sae-<release>`` variants fold (role /
+    transfer variants are vector-only).
+    """
+    from saklas.io.paths import manifold_dir, tensor_filename
+    if variant in (None, "raw"):
+        release: Optional[str] = None
+    elif variant.startswith("sae-"):
+        release = variant[len("sae-"):]
+    else:
+        return None
+    path = manifold_dir(ns, name) / tensor_filename(sid, release=release)
+    return path if path.exists() else None
+
+
+def _component_has_tensor_for(ns: str, name: str, sid: str, variant: Optional[str]) -> bool:
+    """True when ``(ns, name)`` has a usable tensor for ``sid`` — vector or manifold."""
     folder = concept_dir(ns, name)
-    if not folder.exists():
-        raise MergeError(f"component {ns}/{name} not installed")
-    return ConceptFolder.load(folder)
+    if folder.exists() and sid in ConceptFolder.load(folder).tensor_models():
+        return True
+    return _manifold_tensor_path(ns, name, sid, variant) is not None
+
+
+def _resolve_component(
+    ns: str, name: str, sid: str, variant: Optional[str], coord: str,
+) -> "tuple[Profile, Path]":
+    """Load a merge component as ``(profile, source_tensor_path)``.
+
+    Vector pack first; falls back to folding a fitted 2-node ``pca`` manifold
+    (:func:`~saklas.core.vectors.folded_vector_directions`) when no vector
+    folder exists.  The returned path is a real on-disk tensor (the manifold's
+    fitted file for the folded case), so provenance hashing is uniform.
+    """
+    folder = concept_dir(ns, name)
+    if folder.exists():
+        cf = ConceptFolder.load(folder)
+        base_path = _variant_tensor_path(cf, sid, variant, coord)
+        profile, _meta = load_profile(str(base_path))
+        return profile, base_path
+    mpath = _manifold_tensor_path(ns, name, sid, variant)
+    if mpath is None:
+        raise MergeError(
+            f"component {coord} not installed (no vector pack, and no fitted "
+            f"manifold for {sid})"
+        )
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+    manifold = load_manifold(mpath)
+    try:
+        folded = folded_vector_directions(manifold)
+    except Exception as e:
+        raise MergeError(
+            f"component {coord} is a manifold that does not fold to a single "
+            f"steering direction (not a 2-node affine subspace): {e}"
+        )
+    return folded, mpath
 
 
 def _variant_tensor_path(
@@ -251,17 +300,43 @@ class _MergeTerm:
         return f"{self.onto_ns}/{self.onto_name}"
 
 
+def _component_tensor_models(ns: Optional[str], name: str) -> set[str]:
+    """Models with a usable tensor for a component — vector pack or manifold.
+
+    A vector folder's ``tensor_models()``, or the set of ``safe_model_id``s
+    with a fitted ``raw`` manifold tensor on disk (the 4.0 fold source).
+    """
+    if ns is None:
+        raise MergeError(
+            f"merge component '{name}' must be namespace-qualified "
+            f"(e.g. 'default/{name}')"
+        )
+    folder = concept_dir(ns, name)
+    if folder.exists():
+        return set(ConceptFolder.load(folder).tensor_models())
+    from saklas.io.paths import manifold_dir, parse_tensor_filename
+    mdir = manifold_dir(ns, name)
+    models: set[str] = set()
+    if mdir.is_dir():
+        for tensor in mdir.glob("*.safetensors"):
+            parsed = parse_tensor_filename(tensor.name)
+            if parsed is None:
+                continue
+            safe_model, variant = parsed
+            if variant is None:  # raw fitted tensor → foldable
+                models.add(safe_model)
+    return models
+
+
 def shared_models(expression: str) -> list[str]:
     """Return models for which every merge term has a tensor, sorted."""
     terms = _parse_merge_expr(expression)
     per: list[set[str]] = []
     for term in terms:
-        cf = _resolve_coord(term.ns, term.name)
-        per.append(set(cf.tensor_models()))
+        per.append(_component_tensor_models(term.ns, term.name))
         if term.operator is not None:
             assert term.onto_ns is not None and term.onto_name is not None
-            cf_b = _resolve_coord(term.onto_ns, term.onto_name)
-            per.append(set(cf_b.tensor_models()))
+            per.append(_component_tensor_models(term.onto_ns, term.onto_name))
     if not per:
         raise MergeError("no components provided")
     shared = set.intersection(*per)
@@ -295,10 +370,17 @@ def merge_into_pack(
     dst.mkdir(parents=True, exist_ok=True)
 
     if model is not None:
-        target_models = [safe_model_id(model)]
+        sid_check = safe_model_id(model)
+        target_models = [sid_check]
         for term in terms:
-            cf = _resolve_coord(term.ns, term.name)
-            if safe_model_id(model) not in cf.tensor_models():
+            if term.ns is None:
+                raise MergeError(
+                    f"merge component '{term.name}' must be namespace-qualified "
+                    f"(e.g. 'default/{term.name}')"
+                )
+            if not _component_has_tensor_for(
+                term.ns, term.name, sid_check, term.variant,
+            ):
                 raise MergeError(
                     f"component {term.coord} has no tensor for {model}"
                 )
@@ -311,16 +393,20 @@ def merge_into_pack(
     for sid in target_models:
         profiles_and_alphas: list[tuple[Profile, float]] = []
         for term in terms:
-            cf = _resolve_coord(term.ns, term.name)
-            base_path = _variant_tensor_path(cf, sid, term.variant, term.coord)
-            profile, _meta = load_profile(str(base_path))
+            if term.ns is None:
+                raise MergeError(
+                    f"merge component '{term.name}' must be namespace-qualified "
+                    f"(e.g. 'default/{term.name}')"
+                )
+            profile, base_path = _resolve_component(
+                term.ns, term.name, sid, term.variant, term.coord,
+            )
             if term.operator is not None:
                 assert term.onto_ns is not None and term.onto_name is not None
-                cf_b2 = _resolve_coord(term.onto_ns, term.onto_name)
-                onto_path = _variant_tensor_path(
-                    cf_b2, sid, term.onto_variant, term.onto_coord or "",
+                b_profile, _onto_path = _resolve_component(
+                    term.onto_ns, term.onto_name, sid,
+                    term.onto_variant, term.onto_coord or "",
                 )
-                b_profile, _ = load_profile(str(onto_path))
                 profile = project_away(profile, b_profile)
             profiles_and_alphas.append((profile, term.coeff))
             component_info.setdefault(term.coord, {

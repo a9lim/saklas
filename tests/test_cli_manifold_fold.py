@@ -172,3 +172,89 @@ class TestCompareFold:
         # 1-arg mode ranks the others (folded manifolds) against the target.
         assert "warm.clinical" in out
         assert "angry.calm" in out
+
+
+def _make_full_manifold(ns: str, name: str, *, seed: int = 0) -> Path:
+    """A complete manifold folder (manifold.json + nodes) plus a fitted tensor."""
+    from saklas.io.manifolds import (
+        create_discover_manifold_folder, ManifoldFolder, hash_manifold_files,
+    )
+    pos_label, neg_label = (
+        name.split(".", 1) if "." in name else (name, f"{name}_neg")
+    )
+    create_discover_manifold_folder(
+        ns, name, f"test {name}", fit_mode="pca",
+        node_corpora={pos_label: ["a", "b"], neg_label: ["c", "d"]},
+        hyperparams={"max_dim": 1, "var_threshold": 0.70},
+    )
+    folder = _write_fitted_manifold(ns, name, seed=seed).parent
+    # Refresh the manifest so the fitted tensor passes integrity on load.
+    ManifoldFolder.load(folder).write_metadata(files=hash_manifold_files(folder))
+    return folder
+
+
+# ---------------------------------------------------------------------------
+# subspace merge — folds fitted manifold components
+# ---------------------------------------------------------------------------
+
+class TestMergeFold:
+    def test_merge_folds_manifold_components(self) -> None:
+        from saklas.io.merge import merge_into_pack
+        from saklas.io.paths import safe_model_id
+
+        _write_fitted_manifold("default", "happy.sad", seed=1)
+        _write_fitted_manifold("default", "warm.clinical", seed=2)
+        dst = merge_into_pack(
+            "merged",
+            "0.5 default/happy.sad + 0.5 default/warm.clinical",
+            model=_MODEL,
+        )
+        assert (dst / f"{safe_model_id(_MODEL)}.safetensors").exists()
+
+    def test_merge_missing_component_errors(self) -> None:
+        from saklas.io.merge import merge_into_pack, MergeError
+
+        _write_fitted_manifold("default", "happy.sad", seed=1)
+        with pytest.raises(MergeError):
+            merge_into_pack(
+                "merged",
+                "0.5 default/happy.sad + 0.5 default/nonexistent",
+                model=_MODEL,
+            )
+
+
+# ---------------------------------------------------------------------------
+# pack export gguf — folds a fitted manifold
+# ---------------------------------------------------------------------------
+
+class TestGgufFold:
+    def test_export_gguf_folds_manifold(self, tmp_path: Path) -> None:
+        from saklas.io.cache_ops import export_gguf
+        from saklas.io.selectors import parse as sel_parse
+
+        _make_full_manifold("default", "happy.sad")
+        out = tmp_path / "happy.gguf"
+        written = export_gguf(
+            sel_parse("default/happy.sad"),
+            model_scope=_MODEL, output=str(out), model_hint="llama",
+        )
+        assert written == [out]
+        assert out.is_file()
+
+    def test_export_gguf_unfitted_errors(self, tmp_path: Path) -> None:
+        from saklas.io.cache_ops import export_gguf
+        from saklas.io.selectors import parse as sel_parse
+
+        # manifold.json but no fitted tensor for the model.
+        from saklas.io.manifolds import create_discover_manifold_folder
+        create_discover_manifold_folder(
+            "default", "happy.sad", "x", fit_mode="pca",
+            node_corpora={"happy": ["a"], "sad": ["b"]},
+            hyperparams={"max_dim": 1},
+        )
+        with pytest.raises(RuntimeError, match="no fitted manifold"):
+            export_gguf(
+                sel_parse("default/happy.sad"),
+                model_scope=_MODEL, output=str(tmp_path / "x.gguf"),
+                model_hint="llama",
+            )
