@@ -69,6 +69,69 @@ def _target_whitener_from_neutral_cache(model_id: str) -> Any | None:
         return None
 
 
+def _load_or_fit_transfer_alignment(
+    src_model: str,
+    tgt_model: str,
+    *,
+    force: bool,
+    label: str,
+) -> tuple[dict[int, Any], dict[int, float], Path]:
+    """Load or fit a Procrustes alignment for vector/manifold transfer."""
+    from saklas.io.alignment import (
+        AlignmentError,
+        alignment_cache_path,
+        alignment_quality,
+        fit_alignment,
+        load_alignment_map,
+        load_or_compute_neutral_activations,
+        save_alignment_map,
+    )
+
+    cached = None if force else load_alignment_map(src_model, tgt_model)
+    if cached is not None:
+        M, sidecar = cached
+        raw_q = sidecar.get("quality_per_layer") or {}
+        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
+        map_path, _ = alignment_cache_path(src_model, tgt_model)
+        return M, quality_per_layer, map_path
+
+    # Need both models loaded to compute neutrals.  Loading two large models
+    # simultaneously is non-trivial, so serialize: source, then target.
+    print(
+        f"{label}: fitting Procrustes alignment {src_model} -> {tgt_model} "
+        f"(this may load each model briefly)...",
+        file=sys.stderr,
+    )
+    from saklas.core.session import SaklasSession
+
+    with SaklasSession.from_pretrained(
+        src_model, device="auto", probes=[],
+    ) as src_sess:
+        src_acts = load_or_compute_neutral_activations(
+            src_sess._model, src_sess._tokenizer, src_sess._layers,
+            model_id=src_model, force=force,
+        )
+    with SaklasSession.from_pretrained(
+        tgt_model, device="auto", probes=[],
+    ) as tgt_sess:
+        tgt_acts = load_or_compute_neutral_activations(
+            tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
+            model_id=tgt_model, force=force,
+        )
+    try:
+        M = fit_alignment(src_acts, tgt_acts)
+    except AlignmentError as e:
+        print(f"{label}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
+    map_path = save_alignment_map(
+        M, src_model, tgt_model,
+        quality_per_layer=quality_per_layer,
+    )
+    return M, quality_per_layer, map_path
+
+
 def _make_session(args: argparse.Namespace):
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes)
@@ -1463,16 +1526,7 @@ def _run_transfer(args: argparse.Namespace) -> None:
     import json as _json
 
     from saklas.core.profile import Profile, ProfileError
-    from saklas.io.alignment import (
-        AlignmentError,
-        alignment_cache_path,
-        alignment_quality,
-        fit_alignment,
-        load_alignment_map,
-        load_or_compute_neutral_activations,
-        save_alignment_map,
-        transfer_profile,
-    )
+    from saklas.io.alignment import transfer_profile
     from saklas.io.packs import hash_file
     from saklas.io.paths import safe_model_id, sidecar_filename, tensor_filename
     from saklas.io.selectors import parse as sel_parse, resolve
@@ -1514,59 +1568,15 @@ def _run_transfer(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # Load + fit / load alignment.  Heavy work — both forward passes
-    # and the SVD — so we lazy-load saklas.core.session to avoid paying
-    # the model-load cost when the user just runs --help.
-    from saklas.core.session import SaklasSession
-
     try:
         src_profile = Profile.load(src_tensor)
     except ProfileError as e:
         print(f"transfer: failed to load source profile: {e}", file=sys.stderr)
         sys.exit(1)
 
-    cached = None if args.force else load_alignment_map(args.src_model, args.tgt_model)
-
-    if cached is None:
-        # Need both models loaded to compute neutrals.  Loading two
-        # large models simultaneously is non-trivial; we serialize:
-        # load src, compute its neutrals, drop, load tgt, compute, drop.
-        print(
-            f"transfer: fitting Procrustes alignment {args.src_model} -> {args.tgt_model} "
-            f"(this may load each model briefly)...",
-            file=sys.stderr,
-        )
-
-        with SaklasSession.from_pretrained(args.src_model, device="auto", probes=[]) as src_sess:
-            src_acts = load_or_compute_neutral_activations(
-                src_sess._model, src_sess._tokenizer, src_sess._layers,
-                model_id=args.src_model, force=args.force,
-            )
-
-        with SaklasSession.from_pretrained(args.tgt_model, device="auto", probes=[]) as tgt_sess:
-            tgt_acts = load_or_compute_neutral_activations(
-                tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
-                model_id=args.tgt_model, force=args.force,
-            )
-
-        try:
-            M = fit_alignment(src_acts, tgt_acts)
-        except AlignmentError as e:
-            print(f"transfer: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
-        map_path = save_alignment_map(
-            M, args.src_model, args.tgt_model,
-            quality_per_layer=quality_per_layer,
-        )
-    else:
-        M, sidecar = cached
-        # Replay the per-layer quality from the sidecar when present;
-        # otherwise leave it None — transfer still runs.
-        raw_q = sidecar.get("quality_per_layer") or {}
-        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
-        map_path, _ = alignment_cache_path(args.src_model, args.tgt_model)
+    M, quality_per_layer, map_path = _load_or_fit_transfer_alignment(
+        args.src_model, args.tgt_model, force=args.force, label="transfer",
+    )
 
     median_quality: float | None = None
     if quality_per_layer:
@@ -2369,14 +2379,6 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     """
     import json as _json
 
-    from saklas.io.alignment import (
-        AlignmentError,
-        alignment_quality,
-        fit_alignment,
-        load_alignment_map,
-        load_or_compute_neutral_activations,
-        save_alignment_map,
-    )
     from saklas.io.manifolds import (
         ManifoldFormatError, transfer_manifold,
     )
@@ -2411,43 +2413,9 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # Fit / load the per-layer Procrustes alignment.  Mirrors
-    # ``_run_transfer`` exactly — serialize the two model loads so we
-    # never hold both in memory at once.
-    from saklas.core.session import SaklasSession
-
-    cached = None if args.force else load_alignment_map(args.src_model, args.tgt_model)
-    if cached is None:
-        print(
-            f"manifold transfer: fitting Procrustes alignment "
-            f"{args.src_model} -> {args.tgt_model} "
-            f"(this may load each model briefly)...",
-            file=sys.stderr,
-        )
-        with SaklasSession.from_pretrained(args.src_model, device="auto", probes=[]) as src_sess:
-            src_acts = load_or_compute_neutral_activations(
-                src_sess._model, src_sess._tokenizer, src_sess._layers,
-                model_id=args.src_model, force=args.force,
-            )
-        with SaklasSession.from_pretrained(args.tgt_model, device="auto", probes=[]) as tgt_sess:
-            tgt_acts = load_or_compute_neutral_activations(
-                tgt_sess._model, tgt_sess._tokenizer, tgt_sess._layers,
-                model_id=args.tgt_model, force=args.force,
-            )
-        try:
-            M = fit_alignment(src_acts, tgt_acts)
-        except AlignmentError as e:
-            print(f"manifold transfer: {e}", file=sys.stderr)
-            sys.exit(1)
-        quality_per_layer = alignment_quality(M, src_acts, tgt_acts)
-        save_alignment_map(
-            M, args.src_model, args.tgt_model,
-            quality_per_layer=quality_per_layer,
-        )
-    else:
-        M, sidecar = cached
-        raw_q = sidecar.get("quality_per_layer") or {}
-        quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
+    M, quality_per_layer, _ = _load_or_fit_transfer_alignment(
+        args.src_model, args.tgt_model, force=args.force, label="manifold transfer",
+    )
 
     median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
 
