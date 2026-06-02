@@ -298,8 +298,7 @@ class ResultCollector:
 
     def to_jsonl(self, path: str) -> None:
         with open(path, "w") as f:
-            for row in self._rows:
-                f.write(json.dumps(row) + "\n")
+            f.writelines(json.dumps(row) + "\n" for row in self._rows)
 
     def to_csv(self, path: str) -> None:
         if not self._rows:

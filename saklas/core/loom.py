@@ -550,7 +550,7 @@ ConflictChecker = Callable[[str, str], None]
 
 def _noop_conflict_check(node_id: str, op: str) -> None:
     del node_id, op  # signature is the protocol; no work to do here
-    return None
+    return
 
 
 class LoomTree:

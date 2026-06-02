@@ -663,14 +663,13 @@ def load_model(
     _MLA_TYPES = {"deepseek_v2", "deepseek_v3"}
     if device == "mps" and (
         native_type in _MLA_TYPES or native_text_type in _MLA_TYPES
-    ):
-        if attn_impl != "eager":
-            log.info(
-                "forcing eager attention on MPS for MLA model %r "
-                "(PyTorch MPS SDPA mishandles mismatched q/v head_dim)",
-                native_type or native_text_type,
-            )
-            attn_impl = "eager"
+    ) and attn_impl != "eager":
+        log.info(
+            "forcing eager attention on MPS for MLA model %r "
+            "(PyTorch MPS SDPA mishandles mismatched q/v head_dim)",
+            native_type or native_text_type,
+        )
+        attn_impl = "eager"
 
     # --- check for multimodal configs wrapping a text-only model ---
     # Some text-only models ship with a multimodal config whose

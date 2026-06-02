@@ -77,8 +77,7 @@ class ConfigFile:
             default = cls.load_default()
             if default is not None:
                 chain.append(default)
-        for p in extra_paths or []:
-            chain.append(cls.load(Path(p)))
+        chain.extend(cls.load(Path(p)) for p in extra_paths or [])
         return compose(chain) if chain else cls()
 
     def to_dict(self) -> dict[str, object]:
@@ -138,16 +137,15 @@ class ConfigFile:
                 vectors = text
 
         projection_metric = data.get("projection_metric")
-        if projection_metric is not None:
-            if (
-                not isinstance(projection_metric, str)
-                or projection_metric not in _VALID_PROJECTION_METRICS
-            ):
-                raise ConfigFileError(
-                    f"{path}: projection_metric must be one of "
-                    f"{list(_VALID_PROJECTION_METRICS)} "
-                    f"(got {projection_metric!r})"
-                )
+        if projection_metric is not None and (
+            not isinstance(projection_metric, str)
+            or projection_metric not in _VALID_PROJECTION_METRICS
+        ):
+            raise ConfigFileError(
+                f"{path}: projection_metric must be one of "
+                f"{list(_VALID_PROJECTION_METRICS)} "
+                f"(got {projection_metric!r})"
+            )
 
         compile_v = data.get("compile")
         if compile_v is not None and not isinstance(compile_v, bool):

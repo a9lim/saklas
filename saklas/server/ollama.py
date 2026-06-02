@@ -116,8 +116,7 @@ def _normalise_family(model_type: str) -> str:
     """
     mt = (model_type or "").lower()
     for suffix in ("_text", "_moe", "forcausallm"):
-        if mt.endswith(suffix):
-            mt = mt[: -len(suffix)]
+        mt = mt.removesuffix(suffix)
     return mt
 
 

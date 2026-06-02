@@ -227,7 +227,7 @@ def _detect_think_delimiters(
             _detect_channel_delimiters(tokenizer)
             or _detect_bracket_delimiters(tokenizer)
         )
-        _think_delim_cache[tok_key] = result if result else _none_result
+        _think_delim_cache[tok_key] = result or _none_result
         return _think_delim_cache[tok_key]
 
     think_marker = "XTHINKCONTENTX"

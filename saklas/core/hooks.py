@@ -441,7 +441,7 @@ def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
     n_layers = max(1, len(manifold.layers))
     total_score = sum(layer_scores.values())
     if total_score <= 1e-12:
-        return {L: 1.0 for L in manifold.layers}
+        return dict.fromkeys(manifold.layers, 1.0)
     return {L: s / total_score * n_layers for L, s in layer_scores.items()}
 
 
@@ -710,7 +710,7 @@ class SteeringManager:
             raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
             total_share = sum(raw_share.values())
             if total_share <= 1e-12:
-                shares = {L: 1.0 for L in layer_set}
+                shares = dict.fromkeys(layer_set, 1.0)
             else:
                 shares = {L: raw_share[L] / total_share * n_lay for L in layer_set}
 

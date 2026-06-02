@@ -30,6 +30,7 @@ import json
 import time
 import uuid
 from collections import deque
+from operator import itemgetter
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -449,7 +450,7 @@ def _session_info(
 
 def _profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
     layer_norms = [(idx, float(vec.norm().item())) for idx, vec in profile.items()]
-    top = sorted(layer_norms, key=lambda x: x[1], reverse=True)[:5]
+    top = sorted(layer_norms, key=itemgetter(1), reverse=True)[:5]
     # Full per-layer ||baked|| keyed by layer index — stringified for
     # JSON-key compatibility, mirroring how diagnostics_by_layer round-trips.
     # The web UI's LayerNorms panel consumes this directly.
@@ -1833,7 +1834,7 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         layer_mags: list[tuple[int, float]] = sorted(
             ((layer, float(vec.norm().item())) for layer, vec in profile.items()),
-            key=lambda kv: kv[0],
+            key=itemgetter(0),
         )
         buckets = bucketize(layer_mags, HIST_BUCKETS)
         # Buckets: ``(lo_layer, hi_layer, mean_norm)`` triples — same shape the

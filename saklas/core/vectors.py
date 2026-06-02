@@ -812,8 +812,8 @@ def _capture_diffs_for_pairs(
     # at the bundled n=45 is well within fp32 precision for any
     # reasonable D.  None initially; first pair seeds, subsequent pairs
     # accumulate in place.
-    sum_pos: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
-    sum_neg: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
+    sum_pos: dict[int, torch.Tensor | None] = dict.fromkeys(range(n_layers))
+    sum_neg: dict[int, torch.Tensor | None] = dict.fromkeys(range(n_layers))
     norm_sums = torch.zeros(n_layers, device=device, dtype=torch.float32)
 
     # On MPS, keep diffs on CPU — SVD runs there anyway, and the
@@ -910,9 +910,9 @@ def _capture_dim_stats_for_pairs(
     """
     n_layers = len(layers)
     accum_device = torch.device("cpu") if device.type == "mps" else device
-    sum_diffs: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
-    sum_pos: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
-    sum_neg: dict[int, torch.Tensor | None] = {i: None for i in range(n_layers)}
+    sum_diffs: dict[int, torch.Tensor | None] = dict.fromkeys(range(n_layers))
+    sum_pos: dict[int, torch.Tensor | None] = dict.fromkeys(range(n_layers))
+    sum_neg: dict[int, torch.Tensor | None] = dict.fromkeys(range(n_layers))
     diagnostic_samples: dict[int, list[torch.Tensor]] = {
         i: [] for i in range(n_layers)
     }

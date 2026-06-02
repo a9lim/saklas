@@ -94,7 +94,7 @@ class LayerWhitener:
     iterate via ``in`` / :attr:`layers` see only the covered set.
     """
 
-    __slots__ = ("_X", "_K", "_lambda", "_dim")
+    __slots__ = ("_K", "_X", "_dim", "_lambda")
 
     def __init__(
         self,

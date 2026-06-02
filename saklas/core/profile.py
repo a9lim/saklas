@@ -40,7 +40,7 @@ class Profile:
     ``merged``, ``projected_away``, ``cosine_similarity``).
     """
 
-    __slots__ = ("_tensors", "_metadata")
+    __slots__ = ("_metadata", "_tensors")
 
     def __init__(
         self,

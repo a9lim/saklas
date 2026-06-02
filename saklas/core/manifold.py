@@ -538,7 +538,7 @@ def fit_rbf_interpolant(
     values = values.to(torch.float32)
     K, m = node_params.shape
     R = values.shape[1]
-    if K < m + 1:
+    if m + 1 > K:
         raise ValueError(
             f"RBF poisedness failure: {K} nodes cannot determine an affine "
             f"term in {m} embedding dimensions (need >= {m + 1})"
@@ -858,7 +858,7 @@ def _pca_basis(
         # Euclidean PCA — ordinary SVD of the centered centroids (no whitener
         # wired, or partial layer coverage at the call site).
         _, S, Vh = torch.linalg.svd(X, full_matrices=False)
-        rank = int((S > 1e-6 * S[0].clamp(min=1e-12)).sum().item())
+        rank = int((1e-6 * S[0].clamp(min=1e-12) < S).sum().item())
         R = max(1, min(n_components, K - 1, rank))
         basis = Vh[:R].contiguous()                     # (R, D)
         # Per-layer EV ratio.  Falls back to 1.0 on a degenerate (all-zero

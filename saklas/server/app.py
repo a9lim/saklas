@@ -240,20 +240,20 @@ def _require_auth(request: Request = None,  # pyright: ignore[reportArgumentType
     """
     conn = request if request is not None else websocket
     if conn is None:
-        return None
+        return
     expected = getattr(conn.app.state, "api_key", None)
     if not expected:
-        return None
+        return
     if request is None:
         # WS path: handler calls ws_auth_ok() before websocket.accept().
-        return None
+        return
     if not _check_bearer(request.headers, expected):
         raise HTTPException(
             status_code=401,
             detail={"message": "Invalid API key", "type": "invalid_request_error",
                     "param": None, "code": 401},
         )
-    return None
+    return
 
 
 def ws_auth_ok(websocket: WebSocket) -> bool:

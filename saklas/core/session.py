@@ -96,7 +96,7 @@ def _install_la_cache_patch() -> bool:
             snap["conv"] = layer.conv_states.detach().clone()
         if getattr(layer, "is_recurrent_states_initialized", False):
             snap["recurrent"] = layer.recurrent_states.detach().clone()
-        layer._saklas_la_snapshot = snap if snap else None
+        layer._saklas_la_snapshot = snap or None
 
     def _la_crop_with_restore(self: Any, max_length: int) -> None:
         _orig_la_crop(self, max_length)
@@ -418,8 +418,13 @@ class _SteeringContext:
     """
 
     __slots__ = (
-        "_session", "_entries", "_entered", "_projection_metric",
-        "_synthetic_snapshots", "_active_role", "_prev_active_role",
+        "_active_role",
+        "_entered",
+        "_entries",
+        "_prev_active_role",
+        "_projection_metric",
+        "_session",
+        "_synthetic_snapshots",
     )
 
     def __init__(
@@ -4660,16 +4665,15 @@ class SaklasSession:
             if on_token is not None:
                 on_token(text, is_thinking, tid, lp, top_alts, perplexity)
             # Inline per-token scoring for live SSE trait subscribers.
-            if self._trait_queues and self._monitor.probe_names:
-                if scores:
-                    event = ("token", trait_token_counter[0], text, is_thinking, scores)
-                    trait_token_counter[0] += 1
-                    with self._trait_lock:
-                        for lp_ref, q in list(self._trait_queues):
-                            try:
-                                lp_ref.call_soon_threadsafe(q.put_nowait, event)
-                            except Exception:
-                                pass
+            if self._trait_queues and self._monitor.probe_names and scores:
+                event = ("token", trait_token_counter[0], text, is_thinking, scores)
+                trait_token_counter[0] += 1
+                with self._trait_lock:
+                    for lp_ref, q in list(self._trait_queues):
+                        try:
+                            lp_ref.call_soon_threadsafe(q.put_nowait, event)
+                        except Exception:
+                            pass
 
         # Pass _token_tap into generate_steered only when at least one of its
         # branches is live: caller-supplied on_token, logprobs collection, or

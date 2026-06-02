@@ -162,7 +162,7 @@ class ExtractionPipeline:
     See module docstring for the audit reference.
     """
 
-    __slots__ = ("_handle", "_packs", "_events")
+    __slots__ = ("_events", "_handle", "_packs")
 
     def __init__(
         self,
@@ -791,7 +791,7 @@ class ManifoldExtractionPipeline:
     steering hook never touches the SAE.
     """
 
-    __slots__ = ("_handle", "_events")
+    __slots__ = ("_events", "_handle")
 
     def __init__(self, model_handle: ModelHandle, events: EventBus) -> None:
         self._handle = model_handle
@@ -1063,7 +1063,7 @@ class ManifoldExtractionPipeline:
             else:
                 floor = min_nodes(k)
                 floor_reason = "for the RBF fit"
-            if K < floor:
+            if floor > K:
                 raise ValueError(
                     f"discover manifold {mf.name!r}: picked k={k} needs "
                     f">= {floor} nodes {floor_reason}, got K={K}"

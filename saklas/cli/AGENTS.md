@@ -118,6 +118,11 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
   histogram (16 buckets) + sidecar diagnostics.
 - `subspace transfer`: `concept`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
   Fits/loads a Procrustes alignment, writes the target's `from-<safe_src>` tensor.
+  On both vector and manifold transfers, the runner best-effort builds a target
+  `LayerWhitener` from the target model's cached `neutral_activations.safetensors`
+  (no model load on a cache hit) so transferred shares can be re-baked in the
+  target Mahalanobis metric; cache miss or degenerate cache leaves the Euclidean
+  fallback path.
 - `manifold`: top-level `fit`/`discover`/`generate`/`merge`/`install`/`search`/
   `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`. `fit <folder>` runs
   `ManifoldExtractionPipeline` on an authored folder; `discover <name>

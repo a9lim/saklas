@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+from operator import itemgetter
 import re
 import sys
 from pathlib import Path
@@ -51,9 +52,34 @@ def _resolve_probes(raw: list[str] | None) -> list[str]:
     from saklas.core.session import PROBE_CATEGORIES
     if raw is None or raw == ["all"]:
         return list(PROBE_CATEGORIES)
-    if raw == ["none"] or raw == []:
+    if raw in (["none"], []):
         return []
     return raw
+
+
+def _target_whitener_from_neutral_cache(model_id: str) -> Any | None:
+    """Build a target-model whitener from neutral activations without loading a model."""
+    try:
+        import torch as _torch
+        from safetensors.torch import load_file
+
+        from saklas.core.mahalanobis import LayerWhitener
+        from saklas.io.paths import model_dir
+
+        acts_path = model_dir(model_id) / "neutral_activations.safetensors"
+        if not acts_path.is_file():
+            return None
+        raw = load_file(str(acts_path))
+        acts = {
+            int(k.split("_", 1)[1]): v.to(_torch.float32)
+            for k, v in raw.items()
+        }
+        means = {layer: tensor.mean(dim=0) for layer, tensor in acts.items()}
+        return LayerWhitener.from_neutral_activations(acts, means)
+    except Exception:
+        # Best-effort: a missing, stale, or degenerate target neutral cache
+        # leaves transfers on the Euclidean fallback path.
+        return None
 
 
 def _make_session(args: argparse.Namespace):
@@ -1048,8 +1074,7 @@ def _run_compare(args: argparse.Namespace) -> None:
             # names; inherit the variant suffix so `tag:emotion:sae`
             # resolves SAE tensors across the tag.
             resolved = resolve(sel)
-            for c in resolved:
-                names.append((f"{c.namespace}/{c.name}", variant))
+            names.extend((f"{c.namespace}/{c.name}", variant) for c in resolved)
 
     # Load profiles from disk.
     profiles: dict[str, Profile] = {}
@@ -1178,7 +1203,7 @@ def _run_compare(args: argparse.Namespace) -> None:
             name: target.cosine_similarity(p, whitener=whitener)
             for name, p in others.items()
         }
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        ranked = sorted(scores.items(), key=itemgetter(1), reverse=True)
 
         if args.json_output:
             result: dict[str, Any] = {"target": target_name, "model": args.model,
@@ -1320,7 +1345,7 @@ def _run_why(args: argparse.Namespace) -> None:
 
     layer_mags: list[tuple[int, float]] = sorted(
         ((layer, float(tensor.norm().item())) for layer, tensor in profile.items()),
-        key=lambda kv: kv[0],
+        key=itemgetter(0),
     )
     total_layers = len(profile)
     diagnostics = profile.diagnostics  # None when extracted before saklas 1.6
@@ -1377,9 +1402,7 @@ def _summarize_diagnostics(
     med_align = median_or_zero(aligns)
     med_proj = median_or_zero(projs)
 
-    if med_evr > 0.95 and med_intra < 0.01:
-        quality = "poor"
-    elif med_align < 0.2:
+    if (med_evr > 0.95 and med_intra < 0.01) or med_align < 0.2:
         quality = "poor"
     elif med_align < 0.4 or med_evr < 0.2:
         quality = "shaky"
@@ -1562,10 +1585,11 @@ def _run_transfer(args: argparse.Namespace) -> None:
     if quality_per_layer:
         ordered = sorted(quality_per_layer.values())
         mid = len(ordered) // 2
-        if len(ordered) % 2:
-            median_quality = ordered[mid]
-        else:
-            median_quality = 0.5 * (ordered[mid - 1] + ordered[mid])
+        median_quality = (
+            ordered[mid]
+            if len(ordered) % 2
+            else 0.5 * (ordered[mid - 1] + ordered[mid])
+        )
 
     # Build the target-model whitener so the transferred share is re-baked
     # in the *target* metric (else it inherits the source model's
@@ -1575,27 +1599,7 @@ def _run_transfer(args: argparse.Namespace) -> None:
     # the neutral mean *is* the probe-centering baseline, so this needs no
     # layer_means cache.  Soft ``None`` on any miss → ``transfer_profile``
     # leaves the Euclidean (source-share) bake untouched.
-    target_whitener = None
-    try:
-        import torch as _torch
-        from safetensors.torch import load_file as _load_file
-
-        from saklas.core.mahalanobis import LayerWhitener
-        from saklas.io.paths import model_dir as _model_dir
-
-        _acts_path = _model_dir(args.tgt_model) / "neutral_activations.safetensors"
-        if _acts_path.is_file():
-            _raw = _load_file(str(_acts_path))
-            _acts = {
-                int(k.split("_", 1)[1]): v.to(_torch.float32)
-                for k, v in _raw.items()
-            }
-            _means = {L: t.mean(dim=0) for L, t in _acts.items()}
-            target_whitener = LayerWhitener.from_neutral_activations(_acts, _means)
-    except Exception:
-        # Best-effort: a missing/degenerate target neutral cache just
-        # means the transfer stays Euclidean (sidecar records the bake).
-        target_whitener = None
+    target_whitener = _target_whitener_from_neutral_cache(args.tgt_model)
 
     transferred = transfer_profile(
         src_profile, M,
@@ -2465,27 +2469,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     # its own per-layer mean — the neutral mean *is* the probe-centering
     # baseline, so no separate layer_means cache is needed.  Soft ``None`` →
     # ``transfer_manifold`` clears the share (Euclidean fallback at apply).
-    target_whitener = None
-    try:
-        import torch as _torch
-        from safetensors.torch import load_file as _load_file
-
-        from saklas.core.mahalanobis import LayerWhitener
-        from saklas.io.paths import model_dir as _model_dir
-
-        _acts_path = _model_dir(args.tgt_model) / "neutral_activations.safetensors"
-        if _acts_path.is_file():
-            _raw = _load_file(str(_acts_path))
-            _acts = {
-                int(k.split("_", 1)[1]): v.to(_torch.float32)
-                for k, v in _raw.items()
-            }
-            _target_means = {L: t.mean(dim=0) for L, t in _acts.items()}
-            target_whitener = LayerWhitener.from_neutral_activations(
-                _acts, _target_means,
-            )
-    except Exception:
-        target_whitener = None
+    target_whitener = _target_whitener_from_neutral_cache(args.tgt_model)
 
     try:
         out_path = transfer_manifold(

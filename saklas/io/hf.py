@@ -84,13 +84,12 @@ def _download(
             _repo_not_found: type[BaseException] = RepositoryNotFoundError
         except Exception:
             _repo_not_found = type("RepositoryNotFoundError", (Exception,), {})
-        if isinstance(e, _repo_not_found):
-            if _repo_exists_as_dataset(coord, revision):
-                raise HFError(
-                    f"{label}: HF repo is not a model repo. saklas packs must be "
-                    f"published as model repos (see `saklas pack push`). If you uploaded "
-                    f"to a dataset repo, recreate it with repo_type='model'."
-                ) from e
+        if isinstance(e, _repo_not_found) and _repo_exists_as_dataset(coord, revision):
+            raise HFError(
+                f"{label}: HF repo is not a model repo. saklas packs must be "
+                f"published as model repos (see `saklas pack push`). If you uploaded "
+                f"to a dataset repo, recreate it with repo_type='model'."
+            ) from e
         raise HFError(f"{label}: not found ({e})") from e
 
 
@@ -388,7 +387,7 @@ def _render_model_card(meta: PackMetadata, sidecars: dict[str, Sidecar], coord: 
     # ``base_model:`` entry.
     base_models = sorted({
         hf_coord
-        for stem in sidecars.keys()
+        for stem in sidecars
         if (hf_coord := _sidecar_stem_to_hf_coord(stem)) is not None
     })
     tags = sorted({"saklas-pack", "activation-steering", "steering-vector", *meta.tags})

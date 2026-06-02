@@ -496,7 +496,7 @@ class ManifoldFolder:
             # do not even know the intrinsic dimension until after the
             # fit, so the ``min_nodes(k)`` floor is enforced at fit time
             # (once ``k`` is picked) rather than here.
-            if "domain" in data and data["domain"]:
+            if data.get("domain"):
                 raise ManifoldFormatError(
                     f"discover-mode manifold {name!r} must not carry a "
                     f"'domain' field — coords are derived per-model at "
@@ -1092,7 +1092,7 @@ def create_discover_manifold_folder(
     # corpus is written — keeps the failure mode consistent (no
     # half-built folder on a bad role slug).  Extra keys outside the
     # corpus labels raise; missing keys default to ``None``.
-    roles_resolved: dict[str, str | None] = {label: None for label in node_corpora}
+    roles_resolved: dict[str, str | None] = dict.fromkeys(node_corpora)
     if node_roles is not None:
         unknown = set(node_roles) - set(node_corpora)
         if unknown:
@@ -1291,7 +1291,7 @@ def init_discover_manifold_folder(
         )
     labels = _validate_discover_labels(name, labels)
 
-    roles_resolved: dict[str, str | None] = {label: None for label in labels}
+    roles_resolved: dict[str, str | None] = dict.fromkeys(labels)
     if node_roles is not None:
         unknown = set(node_roles) - set(labels)
         if unknown:

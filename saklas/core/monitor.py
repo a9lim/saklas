@@ -342,7 +342,7 @@ class TraitMonitor:
         """
         probe_keys = self._cache_probe_keys if self._cache_device is not None else tuple(self._raw_profiles.keys())
         if not hidden_per_layer:
-            vals = {name: 0.0 for name in self._raw_profiles}
+            vals = dict.fromkeys(self._raw_profiles, 0.0)
             if accumulate:
                 self._apply_accumulate(vals)
             return vals
@@ -543,7 +543,7 @@ class TraitMonitor:
         ``len(generated_ids)`` rows.
         """
         n = len(generated_ids)
-        empty_agg = {name: 0.0 for name in self._raw_profiles}
+        empty_agg = dict.fromkeys(self._raw_profiles, 0.0)
         if n == 0 or not captured:
             return empty_agg, {name: [] for name in self._raw_profiles}
 
@@ -618,7 +618,7 @@ class TraitMonitor:
         because this path is for ad-hoc researcher probing, not the
         in-flight generation loop.
         """
-        empty_agg = {name: 0.0 for name in self._raw_profiles}
+        empty_agg = dict.fromkeys(self._raw_profiles, 0.0)
         if not captured:
             return empty_agg, {name: [] for name in self._raw_profiles}
 
@@ -1119,7 +1119,7 @@ class ManifoldMonitor:
         total = sum(max(_MIN_EV_WEIGHT, w) for w in ev_weights_raw.values())
         if total <= 0.0:
             n_layers = max(1, len(ev_weights_raw))
-            ev_weights = {idx: 1.0 / n_layers for idx in ev_weights_raw}
+            ev_weights = dict.fromkeys(ev_weights_raw, 1.0 / n_layers)
         else:
             ev_weights = {
                 idx: max(_MIN_EV_WEIGHT, w) / total

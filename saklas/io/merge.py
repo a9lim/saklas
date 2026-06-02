@@ -266,8 +266,14 @@ def _parse_merge_expr(expression: str) -> "list[_MergeTerm]":
 
 class _MergeTerm:
     __slots__ = (
-        "ns", "name", "variant", "coeff",
-        "operator", "onto_ns", "onto_name", "onto_variant",
+        "coeff",
+        "name",
+        "ns",
+        "onto_name",
+        "onto_ns",
+        "onto_variant",
+        "operator",
+        "variant",
     )
     def __init__(
         self,
