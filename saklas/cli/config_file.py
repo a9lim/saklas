@@ -224,6 +224,30 @@ def apply_flag_overrides(cfg_in: ConfigFile, **flags: Any) -> ConfigFile:
     return replace(cfg_in, **supplied)
 
 
+def _bare_concept_resolves(concept: str) -> bool:
+    """True when a bare (un-namespaced) concept reference resolves to a manifold.
+
+    Mirrors the steering read path (:mod:`saklas.core.steering_expr`): a bare
+    pole or node label resolves via :func:`resolve_bare_name`, and a composite
+    name (``happy.sad``) resolves to its 2-node ``pca`` manifold via
+    :func:`resolve_manifold_name`.  An ambiguity counts as resolved (the
+    reference matches more than one installed artifact, not zero).
+    """
+    from saklas.io.selectors import (
+        AmbiguousSelectorError,
+        resolve_bare_name,
+        resolve_manifold_name,
+    )
+
+    try:
+        pole_hit, manifold_hit = resolve_bare_name(concept)
+        if pole_hit is not None or manifold_hit is not None:
+            return True
+        return resolve_manifold_name(concept) is not None
+    except AmbiguousSelectorError:
+        return True
+
+
 def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
     """Install any vectors referenced in ``config.vectors`` that are not
     present locally.
@@ -235,27 +259,24 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
     on any failure instead.
     """
     from saklas.core.steering_expr import referenced_selectors
-    from saklas.io.paths import concept_dir
-    from saklas.io.packs import materialize_bundled
-    from saklas.io import cache_ops
+    from saklas.io.paths import manifold_dir
+    from saklas.io.manifolds import materialize_bundled_manifolds
+    from saklas.io import selectors as _selectors
 
     if config.vectors is None:
         return []
 
+    # Every concept is a manifold (4.0): bundled ones live under
+    # ``manifolds/default/<name>/``.  Materialize them up front so a bare or
+    # ``default/`` reference resolves against the just-dropped folders, and
+    # drop any stale resolver cache so the new folders are seen.
+    materialize_bundled_manifolds()
+    _selectors.invalidate()
+
     missing: list[str] = []
     for ns, concept, _variant in referenced_selectors(config.vectors):
         if ns is None:
-            from saklas.io.selectors import _all_concepts
-            slug = concept.split(".")[0] if "." in concept else concept
-            matches = [
-                c for c in _all_concepts()
-                if c.name == concept
-                or (
-                    "." in c.name
-                    and slug in c.name.split(".")
-                )
-            ]
-            if matches:
+            if _bare_concept_resolves(concept):
                 continue
             msg = f"vector {concept!r}: must be '<ns>/<name>' (no installed match)"
             if strict:
@@ -264,8 +285,7 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
             missing.append(concept)
             continue
         coord = f"{ns}/{concept}"
-        cdir = concept_dir(ns, concept)
-        if cdir.exists():
+        if (manifold_dir(ns, concept) / "manifold.json").exists():
             continue
         if ns == "local":
             msg = f"vector {coord!r}: local namespace, cannot auto-install"
@@ -275,17 +295,16 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
             missing.append(coord)
             continue
         if ns == "default":
-            materialize_bundled()
-            if cdir.exists():
-                continue
-            msg = f"vector {coord!r}: bundled concept missing from package data"
+            msg = f"vector {coord!r}: bundled manifold missing from package data"
             if strict:
                 raise ConfigFileError(msg)
             log.warning(msg)
             missing.append(coord)
             continue
         try:
-            cache_ops.install(coord, as_=None, force=False)
+            from saklas.io.hf_manifolds import install_manifold
+            install_manifold(coord, force=False)
+            _selectors.invalidate()
         except Exception as e:
             msg = f"vector {coord!r}: install failed ({e})"
             if strict:

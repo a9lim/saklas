@@ -5,8 +5,8 @@ Merge expressions use the shared steering grammar from
 :mod:`saklas.core.steering_expr` — the same ``+`` / ``-`` / ``~`` /
 ``|`` / coefficient / projection syntax every other saklas surface
 speaks.  Each component resolves to a per-layer ``dict[int, Tensor]``
-direction (a fitted 2-node ``pca`` manifold folded down, or a legacy
-vector pack), the directions are linearly combined, and the result is
+direction by folding a fitted 2-node ``pca`` manifold down to a single
+direction, the directions are linearly combined, and the result is
 folded to a one-pole ray and frozen into a baked manifold under
 ``~/.saklas/manifolds/local/<name>/``.
 """
@@ -19,11 +19,8 @@ from typing import Any, Optional
 import torch
 
 from saklas.core.errors import SaklasError
-from saklas.io.packs import (
-    ConceptFolder, hash_file,
-)
-from saklas.io.paths import concept_dir, safe_model_id
-from saklas.core.vectors import load_profile
+from saklas.io.packs import hash_file
+from saklas.io.paths import safe_model_id
 
 log = logging.getLogger(__name__)
 
@@ -123,10 +120,7 @@ def _manifold_tensor_path(ns: str, name: str, sid: str, variant: Optional[str]) 
 
 
 def _component_has_tensor_for(ns: str, name: str, sid: str, variant: Optional[str]) -> bool:
-    """True when ``(ns, name)`` has a usable tensor for ``sid`` — vector or manifold."""
-    folder = concept_dir(ns, name)
-    if folder.exists() and sid in ConceptFolder.load(folder).tensor_models():
-        return True
+    """True when ``(ns, name)`` has a usable fitted manifold tensor for ``sid``."""
     return _manifold_tensor_path(ns, name, sid, variant) is not None
 
 
@@ -135,22 +129,14 @@ def _resolve_component(
 ) -> "tuple[Profile, Path]":
     """Load a merge component as ``(profile, source_tensor_path)``.
 
-    Vector pack first; falls back to folding a fitted 2-node ``pca`` manifold
-    (:func:`~saklas.core.vectors.folded_vector_directions`) when no vector
-    folder exists.  The returned path is a real on-disk tensor (the manifold's
-    fitted file for the folded case), so provenance hashing is uniform.
+    Folds a fitted 2-node ``pca`` manifold down to a single direction
+    (:func:`~saklas.core.vectors.folded_vector_directions`).  The returned path
+    is the manifold's fitted tensor file, so provenance hashing is uniform.
     """
-    folder = concept_dir(ns, name)
-    if folder.exists():
-        cf = ConceptFolder.load(folder)
-        base_path = _variant_tensor_path(cf, sid, variant, coord)
-        profile, _meta = load_profile(str(base_path))
-        return profile, base_path
     mpath = _manifold_tensor_path(ns, name, sid, variant)
     if mpath is None:
         raise MergeError(
-            f"component {coord} not installed (no vector pack, and no fitted "
-            f"manifold for {sid})"
+            f"component {coord} not installed (no fitted manifold for {sid})"
         )
     from saklas.core.manifold import load_manifold
     from saklas.core.vectors import folded_vector_directions
@@ -163,28 +149,6 @@ def _resolve_component(
             f"steering direction (not a 2-node affine subspace): {e}"
         )
     return folded, mpath
-
-
-def _variant_tensor_path(
-    cf: ConceptFolder, sid: str, variant: Optional[str], coord: str,
-) -> Path:
-    """Resolve a per-model tensor path honoring ``:variant`` suffix.
-
-    ``enumerate_variants`` is the canonical lookup — ``"raw"`` /
-    ``"sae-<release>"`` / ``"role-<name>"`` / ``"from-<safe_src>"``.
-    """
-    from saklas.io.packs import enumerate_variants
-
-    variants = enumerate_variants(cf.folder, sid)
-    key = "raw" if variant in (None, "raw") else variant
-    path = variants.get(key)
-    if path is None:
-        available = sorted(variants) or ["(none)"]
-        raise MergeError(
-            f"component {coord} has no '{key}' tensor for {sid} "
-            f"(available variants: {available})"
-        )
-    return path
 
 
 def _parse_merge_expr(expression: str) -> "list[_MergeTerm]":
@@ -310,19 +274,12 @@ class _MergeTerm:
 
 
 def _component_tensor_models(ns: Optional[str], name: str) -> set[str]:
-    """Models with a usable tensor for a component — vector pack or manifold.
-
-    A vector folder's ``tensor_models()``, or the set of ``safe_model_id``s
-    with a fitted ``raw`` manifold tensor on disk (the 4.0 fold source).
-    """
+    """Models with a fitted ``raw`` manifold tensor for a component (the fold source)."""
     if ns is None:
         raise MergeError(
             f"merge component '{name}' must be namespace-qualified "
             f"(e.g. 'default/{name}')"
         )
-    folder = concept_dir(ns, name)
-    if folder.exists():
-        return set(ConceptFolder.load(folder).tensor_models())
     from saklas.io.paths import manifold_dir, parse_tensor_filename
     mdir = manifold_dir(ns, name)
     models: set[str] = set()

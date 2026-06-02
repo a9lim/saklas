@@ -98,19 +98,13 @@ def test_apply_flag_overrides() -> None:
 
 def test_ensure_vectors_installed_all_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    from saklas.io.selectors import invalidate
-    d = tmp_path / "vectors" / "default" / "happy"
-    d.mkdir(parents=True)
-    (d / "statements.json").write_text("[]")
-    packs.PackMetadata(
-        name="happy", description="x", version="1.0.0", license="MIT",
-        tags=[], recommended_alpha=0.5, source="bundled",
-        files={"statements.json": packs.hash_file(d / "statements.json")},
-    ).write(d)
-    invalidate()
-
-    c = cfg.ConfigFile(vectors="0.5 default/happy")
+    # ``default/happy.sad`` is a bundled manifold — ensure_vectors_installed
+    # materializes the bundled set, so the ``default/`` reference resolves
+    # against the just-dropped folder with nothing to install.  Reset the
+    # process-scope materialize guard so it actually fires under this test's
+    # SAKLAS_HOME (in a real CLI run, config load is the first materialize).
+    monkeypatch.setattr("saklas.io.manifolds._materialized_this_process", False)
+    c = cfg.ConfigFile(vectors="0.5 default/happy.sad")
     missing = cfg.ensure_vectors_installed(c, strict=False)
     assert missing == []
 
@@ -121,11 +115,13 @@ def test_ensure_vectors_installed_missing_hf(monkeypatch: pytest.MonkeyPatch, tm
     invalidate()
     installed: dict[str, Any] = {}
 
-    def fake_install(target: Any, as_: Any = None, force: Any = False) -> Any:
+    def fake_install(target: Any, as_: Any = None, *, force: Any = False) -> Any:
         installed["target"] = target
-        return tmp_path / "vectors" / "user" / "happy"
+        return tmp_path / "manifolds" / "user" / "happy"
 
-    monkeypatch.setattr("saklas.io.cache_ops.install", fake_install)
+    # 4.0: HF auto-install of a referenced concept routes through the manifold
+    # install path, not the retired pack one.
+    monkeypatch.setattr("saklas.io.hf_manifolds.install_manifold", fake_install)
     c = cfg.ConfigFile(vectors="0.5 user/happy")
     missing = cfg.ensure_vectors_installed(c, strict=False)
     assert installed["target"] == "user/happy"

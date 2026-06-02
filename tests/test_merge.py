@@ -8,9 +8,12 @@ import pytest
 import torch
 
 from saklas.io import merge, packs
-from saklas.io.manifolds import ManifoldFolder, ManifoldSidecar
+from saklas.io.manifolds import (
+    ManifoldFolder, ManifoldSidecar,
+    create_baked_manifold_folder, save_baked_manifold_tensor,
+)
 from saklas.core.manifold import load_manifold
-from saklas.core.vectors import folded_vector_directions, save_profile
+from saklas.core.vectors import fold_directions_to_subspace, folded_vector_directions
 
 
 # --------------------------------------------------------- expr parsing ---
@@ -104,21 +107,27 @@ def _make_concept_with_tensors(
     name: str,
     model_tensors: dict[str, Any],
 ) -> Path:
-    d = tmp_path / "vectors" / ns / name
-    d.mkdir(parents=True)
-    (d / "statements.json").write_text("[]")
-    files = {"statements.json": packs.hash_file(d / "statements.json")}
+    """Author a merge component as a fitted manifold (4.0).
+
+    A merge component is resolved by folding a fitted 2-node ``pca`` manifold
+    down to a single direction; the simplest fixture that round-trips a known
+    profile is a corpus-less ``baked`` manifold built straight from the
+    direction via :func:`fold_directions_to_subspace`.  One ``manifold.json``
+    is shared across every model's per-model tensor, mirroring how
+    :func:`merge.merge_into_manifold` writes multi-model output.
+    """
+    folder: Path | None = None
     for model_id, profile in model_tensors.items():
-        ts = d / f"{model_id}.safetensors"
-        save_profile(profile, str(ts), {"method": "contrastive_pca"})
-        files[f"{model_id}.safetensors"] = packs.hash_file(ts)
-        files[f"{model_id}.json"] = packs.hash_file(ts.with_suffix(".json"))
-    packs.PackMetadata(
-        name=name, description="x", version="1.0.0", license="MIT",
-        tags=[], recommended_alpha=0.5, source="local",
-        files=files,
-    ).write(d)
-    return d
+        manifold = fold_directions_to_subspace(name, profile, None, label="test")
+        if folder is None:
+            folder, _mf = create_baked_manifold_folder(
+                ns, name, "x", manifold, model_id, method="test",
+            )
+        else:
+            save_baked_manifold_tensor(folder, manifold, model_id, method="test")
+    assert folder is not None
+    ManifoldFolder.load(folder).write_metadata()
+    return folder
 
 
 def test_shared_models_intersection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

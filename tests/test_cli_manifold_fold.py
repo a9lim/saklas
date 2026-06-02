@@ -280,21 +280,19 @@ class TestMergeFold:
 
 class TestGgufFold:
     def test_export_gguf_folds_manifold(self, tmp_path: Path) -> None:
-        from saklas.io.cache_ops import export_gguf
-        from saklas.io.selectors import parse as sel_parse
+        from saklas.io.cache_ops import _export_gguf_manifold
 
         _make_full_manifold("default", "happy.sad")
         out = tmp_path / "happy.gguf"
-        written = export_gguf(
-            sel_parse("default/happy.sad"),
+        written = _export_gguf_manifold(
+            "default", "happy.sad",
             model_scope=_MODEL, output=str(out), model_hint="llama",
         )
         assert written == [out]
         assert out.is_file()
 
     def test_export_gguf_unfitted_errors(self, tmp_path: Path) -> None:
-        from saklas.io.cache_ops import export_gguf
-        from saklas.io.selectors import parse as sel_parse
+        from saklas.io.cache_ops import _export_gguf_manifold
 
         # manifold.json but no fitted tensor for the model.
         from saklas.io.manifolds import create_discover_manifold_folder
@@ -304,8 +302,8 @@ class TestGgufFold:
             hyperparams={"max_dim": 1},
         )
         with pytest.raises(RuntimeError, match="no fitted manifold"):
-            export_gguf(
-                sel_parse("default/happy.sad"),
+            _export_gguf_manifold(
+                "default", "happy.sad",
                 model_scope=_MODEL, output=str(tmp_path / "x.gguf"),
                 model_hint="llama",
             )

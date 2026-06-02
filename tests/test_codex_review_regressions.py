@@ -23,7 +23,7 @@ from saklas.core.errors import StaleSidecarError
 from saklas.core.session import (
     ConcurrentExtractionError, GenState, SaklasSession,
 )
-from saklas.io import hf, packs
+from saklas.io import packs
 
 
 def _stub_session_with_lock() -> SaklasSession:
@@ -72,83 +72,10 @@ def test_extract_releases_lock_on_path_through_phase_gate():
     s._gen_lock.release()
 
 
-# ---------------------------------------------------------------------------
-# Phase 1 fix — pull_pack recovers from .bak when target is missing
-# ---------------------------------------------------------------------------
-
-def _fake_repo(tmp_path: Path, name: str = "happy") -> Path:
-    repo = tmp_path / "downloaded" / name
-    repo.mkdir(parents=True)
-    (repo / "statements.json").write_text("[]")
-    meta = packs.PackMetadata(
-        name=name, description="x", version="1.0.0", license="MIT",
-        tags=["test"], recommended_alpha=0.5,
-        source="hf://user/happy", files={},
-    )
-    meta.files = {"statements.json": packs.hash_file(repo / "statements.json")}
-    meta.write(repo)
-    return repo
-
-
-def test_pull_pack_recovers_prior_install_from_bak(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-):
-    """Crash window: a prior pull died after ``target → .bak`` but
-    before ``staging → target``.  Target is absent, .bak holds the only
-    valid prior install.  The next pull must restore from .bak before
-    any new download — wiping .bak first would lose the prior install
-    if the new staging itself fails."""
-    _fake_repo(tmp_path)  # baseline 'happy' source — not used by this test
-    target = tmp_path / "installed" / "happy"
-
-    # Simulate the post-crash state: target absent, .bak present with
-    # the prior install.
-    backup = target.with_name(target.name + ".bak")
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    prior = _fake_repo(tmp_path, name="prior")
-    import shutil
-    shutil.copytree(prior, backup)
-    prior_pack_bytes = (backup / "pack.json").read_bytes()
-    assert not target.exists()
-
-    # Force the new pull to fail on staging-side install (broken repo).
-    bad = tmp_path / "downloaded" / "broken"
-    bad.mkdir(parents=True)
-    (bad / "random.txt").write_text("garbage")
-    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(bad))
-
-    with pytest.raises(hf.HFError):
-        hf.pull_pack("user/happy", target_folder=target, force=True)
-
-    # Critical: the prior install was restored from .bak before the
-    # broken-repo attempt blew up — we didn't lose it.
-    assert target.exists()
-    assert (target / "pack.json").is_file()
-    assert (target / "pack.json").read_bytes() == prior_pack_bytes
-
-
-def test_pull_pack_completed_swap_cleanup_drops_bak(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-):
-    """Other crash window: the swap completed but rmtree of .bak got
-    interrupted.  Target is the source of truth; .bak is redundant.
-    Next pull should drop .bak (after the recovery branch sees target
-    is intact)."""
-    fake = _fake_repo(tmp_path)
-    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(fake))
-
-    target = tmp_path / "installed" / "happy"
-    hf.pull_pack("user/happy", target_folder=target, force=False)
-    assert (target / "pack.json").is_file()
-
-    # Plant a stale .bak (simulating a post-swap pre-cleanup crash).
-    backup = target.with_name(target.name + ".bak")
-    backup.mkdir(parents=True)
-    (backup / "leftover.txt").write_text("from a prior crash")
-
-    # Re-pull.  Target is intact, so .bak is just leftover noise.
-    hf.pull_pack("user/happy", target_folder=target, force=True)
-    assert not backup.exists()
+# NOTE: the Phase 1 ``pull_pack`` crash-window regressions (recover-from-.bak
+# before a new build, drop-stale-.bak on a clean swap) moved to the generic
+# ``io/staging.py::stage_verify_swap`` primitive in the 4.0 collapse and are
+# covered directly by ``test_io_staging.py`` (``pull_pack`` itself is gone).
 
 
 # ---------------------------------------------------------------------------
