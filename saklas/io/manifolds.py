@@ -72,7 +72,17 @@ _materialized_this_process: bool = False
 # activations rather than authored by hand.  Authored manifolds carry
 # ``fit_mode == "authored"`` (or omit the field, which means the same).
 _FIT_MODES_DISCOVER: frozenset[str] = frozenset({"pca", "spectral"})
-_FIT_MODES_ALL: frozenset[str] = frozenset({"authored"}) | _FIT_MODES_DISCOVER
+# A baked manifold is a pre-fitted, corpus-less artifact: its geometry is
+# frozen in the per-model tensor and it can never re-fit (no node corpus to
+# pool from).  Merge outputs and imported control vectors land this way — a
+# steering *direction* is the K=1 affine case (see
+# ``core/vectors.fold_directions_to_subspace``).  It is deliberately NOT a
+# discover mode (``is_discover`` stays False — there are no per-model coords
+# to derive).
+_FIT_MODES_BAKED: frozenset[str] = frozenset({"baked"})
+_FIT_MODES_ALL: frozenset[str] = (
+    frozenset({"authored"}) | _FIT_MODES_DISCOVER | _FIT_MODES_BAKED
+)
 
 # Per-method hyperparameter whitelists.  Anything outside the whitelist
 # for a given fit_mode is dropped at folder-create time so a user
@@ -184,6 +194,17 @@ class ManifoldFormatError(ValueError, SaklasError):
     """Raised when a manifold folder is malformed or fails integrity."""
 
 
+class BakedManifoldError(ValueError, SaklasError):
+    """Raised when an operation invalid for a corpus-less baked manifold runs.
+
+    A baked manifold (``fit_mode == "baked"``) has no node corpus and its
+    geometry lives only in the per-model tensor, so a re-fit is impossible.
+    Tensor-deleting lifecycle ops (``clear``, scoped ``refresh``) would
+    therefore destroy the only copy of the geometry irreversibly — they
+    refuse with this error and point the caller at ``manifold rm`` instead.
+    """
+
+
 def min_nodes(n: int) -> int:
     """Minimum node count for an ``n``-dimensional manifold.
 
@@ -269,6 +290,12 @@ class ManifoldSidecar:
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Merge provenance on a ``fit_mode="baked"`` manifold — the
+    # ``{coord: {alpha, project_away, tensor_sha256}}`` map written by
+    # :func:`saklas.io.merge.merge_into_manifold`.  ``None`` on every fit that
+    # isn't a merge (the common case).  Informational only — a baked
+    # manifold never re-fits, so nothing branches on it.
+    components: Optional[dict[str, Any]] = None
     # Per-node assistant-role substitution used at fit time, in
     # ``node_labels`` index order.  ``None`` for a given node (and an
     # empty list as a whole) = "standard assistant baseline" — the
@@ -303,6 +330,7 @@ class ManifoldSidecar:
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
             node_roles=list(data.get("node_roles", [])),
+            components=data.get("components"),
         )
 
 
@@ -489,6 +517,46 @@ class ManifoldFolder:
                 node_coords.append([float(c) for c in coords])
                 node_roles.append(_validate_node_role(name, label, entry.get("role")))
             _warn_authoring_quality(name, domain, node_coords)
+        elif fit_mode == "baked":
+            # Baked mode: a pre-fitted, corpus-less artifact (merge output /
+            # imported control vector).  Like authored it carries a display
+            # ``domain`` (the ``CustomDomain`` the fold produced) so the
+            # inspector/summary have geometry to report; like discover its
+            # nodes are label-only (no ``coords`` — the real per-layer node
+            # coords live baked in the tensor).  There is no corpus and no
+            # re-fit, so ``min_nodes`` and the authoring-quality advisory
+            # are both inapplicable.
+            domain_spec_in = data.get("domain") or {}
+            if not isinstance(domain_spec_in, dict) or not domain_spec_in:
+                raise ManifoldFormatError(
+                    f"baked manifold {name!r} needs a 'domain' object"
+                )
+            domain_spec = domain_spec_in
+            try:
+                domain_from_spec(domain_spec)
+            except (ValueError, KeyError) as e:
+                raise ManifoldFormatError(
+                    f"manifold {name!r} has an invalid domain: {e}"
+                ) from e
+            for entry in nodes:
+                if not isinstance(entry, dict):
+                    raise ManifoldFormatError(
+                        f"baked manifold {name!r} node {entry!r} must be an "
+                        f"object with 'label'"
+                    )
+                label = entry.get("label")
+                if not isinstance(label, str) or not _LABEL_REGEX.match(label):
+                    raise ManifoldFormatError(
+                        f"baked manifold {name!r} node label {label!r} "
+                        f"invalid; must match {_LABEL_REGEX.pattern}"
+                    )
+                if "coords" in entry:
+                    raise ManifoldFormatError(
+                        f"baked manifold {name!r} node {label!r} must not "
+                        f"carry 'coords' — baked geometry lives in the tensor"
+                    )
+                node_labels.append(label)
+                node_roles.append(_validate_node_role(name, label, entry.get("role")))
         else:
             # Discover mode: no ``domain`` field, no per-node ``coords``.
             # The fit pipeline derives coords per-model from the
@@ -571,13 +639,15 @@ class ManifoldFolder:
             tags=[str(t) for t in raw_tags],
         )
 
-        # Every node file must be present.
-        for idx, label in enumerate(node_labels):
-            p = inst.node_path(idx)
-            if not p.exists():
-                raise ManifoldFormatError(
-                    f"manifold {name!r} missing node corpus file {p}"
-                )
+        # Every node file must be present — except for a baked manifold,
+        # which has no ``nodes/`` corpus at all (its geometry is the tensor).
+        if fit_mode != "baked":
+            for idx, label in enumerate(node_labels):
+                p = inst.node_path(idx)
+                if not p.exists():
+                    raise ManifoldFormatError(
+                        f"manifold {name!r} missing node corpus file {p}"
+                    )
 
         for t in sorted(folder.glob("*.safetensors")):
             sc_path = t.with_suffix(".json")
@@ -593,6 +663,15 @@ class ManifoldFolder:
                     f"{sc_path.name}"
                 )
             inst._sidecars[t.stem] = ManifoldSidecar.load(sc_path)
+
+        # A baked manifold's tensor is its entire reason to exist (no corpus
+        # to re-fit from), so a tensor-less baked folder is corrupt, not a
+        # legitimate pre-fit shape the way a fresh authored/discover folder is.
+        if fit_mode == "baked" and not inst._sidecars:
+            raise ManifoldFormatError(
+                f"baked manifold {name!r} has no fitted tensor — a corpus-less "
+                f"manifold carries its geometry only in the per-model tensor"
+            )
         return inst
 
     # -- node corpus -------------------------------------------------------
@@ -604,6 +683,10 @@ class ManifoldFolder:
 
     def node_groups(self) -> list[tuple[str, list[str]]]:
         """Return ``[(label, statements), ...]`` in node order."""
+        if self.fit_mode == "baked":
+            raise ManifoldFormatError(
+                f"baked manifold {self.name!r} has no node corpus to read"
+            )
         groups: list[tuple[str, list[str]]] = []
         for idx, label in enumerate(self.node_labels):
             with open(self.node_path(idx)) as f:
@@ -639,6 +722,15 @@ class ManifoldFolder:
         sidecars; the semantics naturally extends in the discover case.
         """
         h = hashlib.sha256()
+        if self.fit_mode == "baked":
+            # No corpus and no re-fit: the key is provenance-only (the
+            # sidecar records it, and it always matches since baked never
+            # re-fits).  Hash the identity that distinguishes it.
+            h.update(_canonical_json({
+                "fit_mode": "baked",
+                "node_labels": list(self.node_labels),
+            }))
+            return h.hexdigest()
         for idx in range(len(self.node_labels)):
             h.update(self.node_path(idx).read_bytes())
         if self.fit_mode == "authored":
@@ -712,6 +804,13 @@ class ManifoldFolder:
                 for label, coords, role in zip(
                     self.node_labels, self.node_coords, self._roles_padded(),
                 )
+            ]
+        elif self.fit_mode == "baked":
+            # Display domain + label-only nodes (no coords, no hyperparams).
+            payload["domain"] = self.domain
+            payload["nodes"] = [
+                _node_payload_discover(label, role)
+                for label, role in zip(self.node_labels, self._roles_padded())
             ]
         else:
             payload["hyperparams"] = self.hyperparams
@@ -1137,10 +1236,132 @@ def create_discover_manifold_folder(
     return folder
 
 
+def create_baked_manifold_folder(
+    namespace: str,
+    name: str,
+    description: str,
+    manifold: "Any",
+    model_id: str,
+    *,
+    method: str,
+    tags: Optional[list[str]] = None,
+    source: str = "local",
+    force: bool = False,
+    components: Optional[dict[str, Any]] = None,
+) -> tuple[Path, "ManifoldFolder"]:
+    """Persist a corpus-less pre-baked Manifold as a ``fit_mode="baked"`` folder.
+
+    The single producer for corpus-less directions — ``merge`` outputs and
+    imported control vectors.  ``manifold`` is an already-fitted
+    :class:`saklas.core.manifold.Manifold` (typically the affine ``R = 1`` ray
+    from :func:`saklas.core.vectors.fold_directions_to_subspace`); its geometry
+    is frozen into the per-model ``<safe_model>.safetensors`` tensor, the folder
+    carries no ``nodes/`` corpus, and it can never re-fit.
+
+    Writes ``manifold.json`` (``fit_mode="baked"``, the manifold's display
+    ``domain``, label-only nodes) + the per-model tensor + sidecar, then
+    back-fills the ``files`` integrity manifest.  ``method`` is the sidecar
+    provenance tag (``"merge"`` / ``"imported"``); ``components`` rides the
+    sidecar as merge provenance (``merge`` only).  Returns
+    ``(folder, ManifoldFolder)``.
+
+    For a multi-model merge, call this once for the first model and
+    :func:`save_baked_manifold_tensor` for each subsequent model (sharing the
+    one ``manifold.json``), then a final :meth:`ManifoldFolder.write_metadata`
+    to fold every tensor into the ``files`` manifest.
+
+    Raises :class:`ManifoldFormatError` on an invalid name/namespace and
+    :class:`FileExistsError` when a manifold already lives at the path and
+    ``force`` is ``False``.
+    """
+    if not NAME_REGEX.match(name):
+        raise ManifoldFormatError(
+            f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
+        )
+    if not NAME_REGEX.match(namespace):
+        raise ManifoldFormatError(
+            f"manifold namespace {namespace!r} invalid; "
+            f"must match {NAME_REGEX.pattern}"
+        )
+
+    folder = manifold_dir(namespace, name)
+    if (folder / "manifold.json").exists():
+        if not force:
+            raise FileExistsError(f"manifold {namespace}/{name} already exists")
+        shutil.rmtree(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    labels = list(manifold.node_labels)
+    payload: dict[str, Any] = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name,
+        "description": description,
+        "fit_mode": "baked",
+        "domain": manifold.domain.to_spec(),
+        "nodes": [_node_payload_discover(label, None) for label in labels],
+        "files": {},
+    }
+    if tags:
+        payload["tags"] = [str(t) for t in tags]
+    if source and source != "local":
+        payload["source"] = source
+    write_json_atomic(folder / "manifold.json", payload)
+
+    save_baked_manifold_tensor(
+        folder, manifold, model_id, method=method, components=components,
+    )
+
+    mf = ManifoldFolder.load(folder)
+    mf.write_metadata()  # back-fill the files integrity manifest
+    return folder, mf
+
+
+def save_baked_manifold_tensor(
+    folder: Path,
+    manifold: "Any",
+    model_id: str,
+    *,
+    method: str,
+    components: Optional[dict[str, Any]] = None,
+) -> Path:
+    """Write one per-model tensor + sidecar into a ``fit_mode="baked"`` folder.
+
+    Factored out of :func:`create_baked_manifold_folder` so a multi-model merge
+    can share one ``manifold.json`` across every target model's tensor.  The
+    caller is responsible for the surrounding ``manifold.json`` write (once) and
+    a final :meth:`ManifoldFolder.write_metadata` (to fold every tensor into the
+    ``files`` manifest).  Returns the tensor path.
+    """
+    from saklas.core.manifold import save_manifold
+    from saklas.io.paths import tensor_filename
+
+    # ``nodes_sha256`` is provenance-only for baked (never re-fits), computed
+    # from the same identity ``ManifoldFolder.nodes_sha256`` hashes.
+    nodes_sha = hashlib.sha256(
+        _canonical_json(
+            {"fit_mode": "baked", "node_labels": list(manifold.node_labels)}
+        )
+    ).hexdigest()
+    save_meta: dict[str, object] = {
+        "method": method,
+        "fit_mode": "baked",
+        "nodes_sha256": nodes_sha,
+    }
+    share_metric = manifold.metadata.get("share_metric")
+    if share_metric:
+        save_meta["share_metric"] = share_metric
+    if components:
+        save_meta["components"] = components
+    tensor_path = folder / tensor_filename(model_id)
+    save_manifold(manifold, tensor_path, save_meta)
+    return tensor_path
+
+
 def port_legacy_vector_folder(
     vector_folder: Path,
     *,
     namespace: str = "local",
+    name: Optional[str] = None,
     force: bool = False,
 ) -> tuple[Path, "ManifoldFolder"]:
     """Port a legacy ``vectors/<ns>/<c>/`` folder to a 2-node ``pca`` manifold.
@@ -1158,13 +1379,18 @@ def port_legacy_vector_folder(
     ``(pos, neg)``; a monopolar name ``c`` becomes ``(c, c_neg)``.  ``tags``
     and ``description`` are carried from the legacy ``pack.json`` when present.
 
+    ``name`` defaults to ``vector_folder.name`` (the in-cache layout) but can be
+    overridden when the source folder isn't named for the concept — e.g. an HF
+    snapshot dir (a commit-SHA path) being imported via ``manifold install``.
+
     Returns ``(manifold_folder_path, ManifoldFolder)``.  Raises
     :class:`FileNotFoundError` when the source has no ``statements.json`` and
     :class:`FileExistsError` when the target manifold already exists and
     ``force`` is ``False``.
     """
     vector_folder = Path(vector_folder)
-    name = vector_folder.name
+    if name is None:
+        name = vector_folder.name
     stmts_path = vector_folder / "statements.json"
     if not stmts_path.exists():
         raise FileNotFoundError(
@@ -1574,7 +1800,7 @@ def merge_discover_manifolds(
 ) -> Path:
     """Union N discover-mode manifolds' nodes into one fresh discover folder.
 
-    The vector-side counterpart is :func:`saklas.io.merge.merge_into_pack`,
+    The vector-side counterpart is :func:`saklas.io.merge.merge_into_manifold`,
     but the manifold semantics are different: vector merge composes a
     new direction from a steering expression; manifold merge unions
     *node corpora* and lets the next fit derive coords from the
@@ -1841,6 +2067,15 @@ def clear_manifold_tensors(
     # the in-memory folder and re-hash from disk afterward, the same shape
     # ``cache_ops.delete_tensors`` uses (load, mutate, re-hash).
     mf = ManifoldFolder.load(folder)
+    if mf.fit_mode == "baked":
+        # A baked manifold has no corpus to re-fit from — deleting its tensor
+        # would destroy the only copy of its geometry.  Refuse; ``manifold rm``
+        # is the way to remove it wholesale.
+        raise BakedManifoldError(
+            f"manifold {namespace}/{name} is baked (corpus-less, cannot "
+            f"re-fit); clearing its tensors is irreversible — use "
+            f"`manifold rm {namespace}/{name}` to delete it"
+        )
     files = _manifold_tensor_files(folder, variant=variant, model_scope=model_scope)
     for f in files:
         f.unlink()
@@ -2455,12 +2690,15 @@ __all__ = [
     "MANIFOLD_FORMAT_VERSION",
     "min_nodes",
     "ManifoldFormatError",
+    "BakedManifoldError",
     "ManifoldSidecar",
     "ManifoldFolder",
     "hash_manifold_files",
     "iter_manifold_folders",
     "create_manifold_folder",
     "create_discover_manifold_folder",
+    "create_baked_manifold_folder",
+    "save_baked_manifold_tensor",
     "init_discover_manifold_folder",
     "append_discover_manifold_node",
     "write_manifold_scenarios",

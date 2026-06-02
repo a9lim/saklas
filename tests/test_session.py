@@ -60,7 +60,7 @@ class TestConstruction:
 
 class TestSteering:
     def test_extract_and_steer(self, session: SaklasSession) -> None:
-        name, profile = session.extract([("I am happy", "I am sad")])
+        name, profile = session.extract_vector_from_corpora("happy", ["I am happy"], ["I am sad"])
         assert isinstance(profile, Profile)
         assert all(isinstance(k, int) for k in profile)
         session.steer("happy", profile)
@@ -79,14 +79,14 @@ class TestSteering:
         assert len(profile) > 0
 
     def test_extract_datasource(self, session: SaklasSession) -> None:
-        from saklas.io.datasource import DataSource
-        ds = DataSource(pairs=[("formal", "casual")])
-        name, profile = session.extract(ds)
+        name, profile = session.extract_vector_from_corpora(
+            "formal.casual", ["formal"], ["casual"],
+        )
         assert isinstance(profile, Profile)
 
 class TestMonitoring:
     def test_monitor_and_unmonitor(self, session: SaklasSession) -> None:
-        _, profile = session.extract([("I am honest", "I am deceptive")])
+        _, profile = session.extract_vector_from_corpora("honest", ["I am honest"], ["I am deceptive"])
         session.probe("test_probe", profile)  # pyright: ignore[reportArgumentType]  # session.probe annotation says dict, Profile is not a dict subclass
         assert "test_probe" in session.probes
         session.unprobe("test_probe")
@@ -125,7 +125,7 @@ class TestGeneration:
         assert session.history[1]["role"] == "assistant"
 
     def test_generate_with_alphas(self, session: SaklasSession) -> None:
-        name, profile = session.extract([("formal", "casual")])
+        name, profile = session.extract_vector_from_corpora("formal.casual", ["formal"], ["casual"])
         session.steer(name, profile)
         result = session.generate("Hello.", steering=f"0.1 {name}")
         assert result.vectors == {name: 0.1}
@@ -144,7 +144,7 @@ class TestGeneration:
 
     def test_ab_comparison(self, session: SaklasSession) -> None:
         """A/B test: same prompt, with and without steering."""
-        name, profile = session.extract([("I am happy", "I am sad")])
+        name, profile = session.extract_vector_from_corpora("happy", ["I am happy"], ["I am sad"])
         session.steer(name, profile)
         session.clear_history()
         steered = session.generate("Describe a sunset.", steering=f"0.2 {name}")
@@ -306,7 +306,7 @@ class TestStreamingGeneration:
         assert session.last_result.token_count == len(tokens)
 
     def test_stream_with_alphas(self, session: SaklasSession) -> None:
-        name, profile = session.extract([("I am happy", "I am sad")])
+        name, profile = session.extract_vector_from_corpora("happy", ["I am happy"], ["I am sad"])
         session.steer(name, profile)
         session.clear_history()
         tokens = list(session.generate_stream("Hello.", steering=f"0.15 {name}"))
@@ -526,7 +526,7 @@ class TestPrefixCache:
 
         # Make sure there's a steering vector to push.
         if not session.has_vector("happy"):
-            _, prof = session.extract([("I am happy", "I am sad")])
+            _, prof = session.extract_vector_from_corpora("happy", ["I am happy"], ["I am sad"])
             session.steer("happy", prof)
         # steer() itself invalidates; re-warm and verify scope-entry
         # is what we're really testing.

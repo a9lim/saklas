@@ -12,7 +12,6 @@ extraction path is covered by a GPU-gated end-to-end test.
 """
 from __future__ import annotations
 
-import json
 import logging
 import pathlib
 import random
@@ -20,8 +19,6 @@ import re
 from typing import Any, TYPE_CHECKING
 
 
-from saklas.io.atomic import write_json_atomic
-from saklas.io.datasource import DataSource
 from saklas.core.errors import SaklasError
 from saklas.core.generation import (
     GenerationConfig,
@@ -29,12 +26,12 @@ from saklas.core.generation import (
     build_chat_input,
     generate_steered,
 )
-from saklas.io.packs import NAME_REGEX, PackFormatError, PackMetadata, hash_file
-from saklas.io.paths import concept_dir, safe_model_id
-from saklas.core.vectors import load_profile as _load_profile
+from saklas.core.profile import Profile
+from saklas.core.vectors import folded_vector_directions
+from saklas.io.packs import NAME_REGEX
+from saklas.io.paths import manifold_dir
 
 if TYPE_CHECKING:
-    from saklas.core.profile import Profile
     from saklas.core.session import SaklasSession
 
 _log = logging.getLogger(__name__)
@@ -245,51 +242,22 @@ def clone_from_corpus(
             f"invalid concept name after slugging: {canonical!r}"
         )
 
-    folder = concept_dir("local", canonical)
-    folder.mkdir(parents=True, exist_ok=True)
-
-    corpus_sha = hash_file(path)
-    cache_path = folder / f"{safe_model_id(session.model_id)}.safetensors"
-
-    # Cache hit check.
-    #   seed is not None -> must match exactly.
-    #   seed is None     -> ignore seed, reuse any prior run with matching
-    #                       corpus/n_pairs/batch_size.
-    if not force and cache_path.exists() and (folder / "pack.json").exists():
+    # Cache hit: an existing local manifold for this concept.  Fit-or-load it
+    # (cheap when a per-model tensor is already present) and skip the expensive
+    # neutral-rewrite regeneration.  ``force`` re-clones from scratch.
+    mfolder = manifold_dir("local", canonical)
+    if not force and (mfolder / "manifold.json").exists():
         try:
-            raw_pack = json.loads((folder / "pack.json").read_text())
-            cached_sha = raw_pack.get("corpus_sha256")
-            cached_n = raw_pack.get("n_pairs")
-            cached_bs = raw_pack.get("batch_size")
-            cached_seed = raw_pack.get("seed")
-            seed_ok = True if seed is None else cached_seed == seed
-            if (
-                cached_sha == corpus_sha
-                and cached_n == n_pairs
-                and cached_bs == batch_size
-                and seed_ok
-            ):
-                profile, _m = _load_profile(str(cache_path))
-                profile = session._promote_profile(profile)
-                _log.info("cloned %s (cache hit) -> %s", canonical, folder)
-                from saklas.core.profile import Profile
-                return canonical, Profile(profile, metadata=_m)
-        except (PackFormatError, FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
-            pass
-
-    # Placeholder pack.json so downstream helpers (_update_local_pack_files)
-    # have something to operate on. Overwritten in full at the end.
-    if not (folder / "pack.json").exists():
-        PackMetadata(
-            name=canonical,
-            description=f"Cloned from {path.name}",
-            version="1.0.0",
-            license="AGPL-3.0-or-later",
-            tags=["cloned"],
-            recommended_alpha=0.5,
-            source="local",
-            files={},
-        ).write(folder)
+            manifold = session.extract_manifold(mfolder)
+            _log.info("cloned %s (cache hit) -> %s", canonical, mfolder)
+            return canonical, Profile(
+                folded_vector_directions(manifold),
+                metadata={"method": "manifold_pca", "name": canonical},
+            )
+        except Exception as e:  # noqa: BLE001 — fall through and regenerate
+            _log.warning(
+                "clone cache reuse failed for %s (%s); regenerating", canonical, e,
+            )
 
     lines = _filter_corpus(path)
     if len(lines) < _MIN_CORPUS_LINES:
@@ -368,37 +336,19 @@ def clone_from_corpus(
             f"need at least {min_pairs}"
         )
 
-    # Persist statements.json in the same shape as bundled packs.
-    stmts_path = folder / "statements.json"
-    stmt_objs = [{"positive": p, "negative": n} for p, n in pairs]
-    write_json_atomic(stmts_path, stmt_objs)
-
-    # Delegate the contrastive PCA + save + local pack refresh to the
-    # shared session.extract() path via a DataSource. Clear any stale
-    # safetensors first so extract() doesn't short-circuit on a cache
-    # miss we already decided to bypass.
-    if cache_path.exists():
-        cache_path.unlink()
-    ds = DataSource(pairs=pairs, name=canonical)
-    _canonical, profile = session.extract(ds)
-
-    # Single final pack.json overwrite: merge descriptive + clone
-    # metadata on top of whatever session.extract() / _update_local_pack_files
-    # produced, then refresh the files hash map one more time so the
-    # manifest covers the statements.json we just wrote.
-    raw_pack = json.loads((folder / "pack.json").read_text())
-    raw_pack["description"] = f"Cloned from {path.name}"
-    raw_pack["source"] = "local"
-    raw_pack["tags"] = sorted(set((raw_pack.get("tags") or []) + ["cloned"]))
-    raw_pack["corpus_sha256"] = corpus_sha
-    raw_pack["n_pairs"] = n_pairs
-    raw_pack["batch_size"] = batch_size
-    raw_pack["seed"] = effective_seed
-    write_json_atomic(folder / "pack.json", raw_pack)
-
-    _log.info(
-        "cloned %s -> %s (corpus not included in pack; statements.json contains "
-        "model-generated pairs only)",
-        canonical, folder,
+    # The two pole corpora: the persona's own voice (positive pole) vs the
+    # model's neutralized rewrites (negative pole).  Authored + fit as a 2-node
+    # ``pca`` manifold under ``local/`` — the persona direction is the
+    # difference of the two node centroids, exactly as before (the within-pair
+    # alignment never affected the centroid difference).
+    positive = [persona_line for persona_line, _ in pairs]
+    negative = [rewrite for _, rewrite in pairs]
+    _log.info("cloned %s -> %s (%d pairs)", canonical, mfolder, len(pairs))
+    return session.extract_vector_from_corpora(
+        canonical, positive, negative,
+        namespace="local", force=True,
+        description=(
+            f"Cloned from {path.name} "
+            f"(n_pairs={len(pairs)}, seed={effective_seed})."
+        ),
     )
-    return canonical, profile

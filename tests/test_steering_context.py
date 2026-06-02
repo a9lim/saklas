@@ -221,68 +221,41 @@ def test_steering_applied_event_carries_entries():
         assert applied.entries["b"] == (0.5, Trigger.AFTER_THINKING)
 
 
-def test_pole_alias_sign_flip_preserves_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bare-pole alias ``wolf`` resolves to ``deer.wolf`` with sign -1;
-    the trigger survives the sign flip through the grammar path."""
-    from saklas.io import packs
-    wolf_dir = tmp_path / "vectors" / "default" / "deer.wolf"
-    wolf_dir.mkdir(parents=True)
-    (wolf_dir / "statements.json").write_text("[]")
-    meta = packs.PackMetadata(
-        name="deer.wolf", description="x", version="1.0.0", license="MIT",
-        tags=[], recommended_alpha=0.5, source="local",
-        files={"statements.json": packs.hash_file(wolf_dir / "statements.json")},
+def test_pole_alias_resolves_to_manifold_term_with_trigger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4.0: bare-pole alias ``wolf`` resolves through the manifold tier to a
+    label-form ``ManifoldTerm`` at the ``wolf`` node; the term's trigger
+    survives the grammar path.
+
+    (Pre-4.0 this asserted a signed plain-vector entry ``deer.wolf @ -0.4``;
+    bipolar-pole alias resolution moved to the manifold tier, so a bare pole
+    no longer produces a signed vector.)
+    """
+    from saklas.io.manifolds import create_discover_manifold_folder
+    from saklas.core.steering_expr import ManifoldTerm, parse_expr
+    create_discover_manifold_folder(
+        "default", "deer.wolf", "x", fit_mode="pca",
+        node_corpora={"deer": ["a statement."], "wolf": ["b statement."]},
+        hyperparams={"max_dim": 1},
     )
-    meta.write(wolf_dir)
     _sel.invalidate()
 
-    s = _Stub({"deer.wolf": None})
-    with s.steering("0.4 wolf@after"):
-        entries = s._steering_stack[0]
-        assert entries["deer.wolf"] == (-0.4, Trigger.AFTER_THINKING)
+    s = parse_expr("0.4 wolf@after")
+    term = s.alphas["default/deer.wolf%wolf"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.manifold == "default/deer.wolf"
+    assert term.position == "wolf"
+    assert term.along == 0.4
+    assert term.trigger == Trigger.AFTER_THINKING
 
 
-def test_autoload_cache_hit_registers_bundled_vector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """`_try_autoload_vector` is the cache-hit fast path used by the server
-    route to let HTTP clients steer bundled concepts without a prior
-    `POST /vectors`. Exercises the concept-scan + safetensors-load path
-    against a synthetic fake concept folder."""
-    import torch
-    from saklas.core.session import SaklasSession
-    from saklas.io import packs
-    from saklas.io import paths as io_paths
-    from saklas.io import selectors as _sel_local
-    _sel_local.invalidate()
-    ns_dir = tmp_path / "vectors" / "local" / "myprobe"
-    ns_dir.mkdir(parents=True)
-    (ns_dir / "pack.json").write_text(
-        '{"name":"myprobe","description":"test",'
-        '"method":"contrastive_pca","tags":[],"files":{},'
-        f'"format_version":{packs.PACK_FORMAT_VERSION},"version":"1.0.0","license":"unknown",'
-        '"recommended_alpha":0.5,"long_description":"","source":"local"}'
-    )
-    from saklas.core.vectors import save_profile
-    sid = io_paths.safe_model_id("fake/model")
-    save_profile(
-        {0: torch.randn(8), 1: torch.randn(8)},
-        str(ns_dir / f"{sid}.safetensors"),
-        metadata={"method": "test", "format_version": packs.PACK_FORMAT_VERSION},
-    )
-
-    class _AutoloadStub(SaklasSession):
-        def __init__(self):
-            self._profiles = {}
-            self._model_info = {"model_id": "fake/model"}
-            self._device = torch.device("cpu")
-            self._dtype = torch.float32
-
-    s = _AutoloadStub()
-    assert "myprobe" not in s._profiles
-    s._try_autoload_vector("myprobe")
-    assert "myprobe" in s._profiles
-    assert 0 in s._profiles["myprobe"] and 1 in s._profiles["myprobe"]
-    s._try_autoload_vector("no_such_concept")
-    assert "no_such_concept" not in s._profiles
+# NOTE: ``test_autoload_cache_hit_registers_bundled_vector`` was deleted in
+# 4.0 — ``session._try_autoload_vector`` (the ``vectors/``-pack safetensors
+# scan) was removed.  Profile resolution now goes through
+# ``_ensure_profile_registered`` (folds a fitted manifold, or ports a legacy
+# ``vectors/`` folder on first touch); the manifold-fold path is covered by
+# the session GPU smoke suite, not this model-free stub file.
 
 
 # ---------------------------------------------------------------------------

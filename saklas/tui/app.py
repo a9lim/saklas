@@ -22,7 +22,7 @@ from saklas.io.selectors import AmbiguousSelectorError, resolve_pole
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.io.paths import saklas_home
-from saklas.io.probes_bootstrap import load_defaults
+from saklas.io.probes_bootstrap import load_default_manifolds as load_defaults
 from saklas.core.results import ResultCollector
 from saklas.core.session import MIN_ELAPSED_FOR_RATE
 from saklas.tui.chat_panel import (
@@ -1010,21 +1010,24 @@ class SaklasApp(App[None]):
             def _progress(msg: str) -> None:
                 self.call_from_thread(self._steer_status, msg)
             # Bare ``--sae`` (variant == "sae") routes the load through
-            # session autoload rather than a fresh PCA extract — it
-            # means "use the unique SAE variant that's already on disk".
-            # Ambiguous / missing cases surface via the session errors.
+            # the unified profile resolver (manifold-fold) rather than a
+            # fresh extract — it means "use the SAE variant that's already
+            # on disk". Ambiguous / missing cases surface via the session
+            # errors / the None-check below.
             if variant == "sae" and sae_release is None:
+                from contextlib import suppress as _suppress
                 autoload_key = (
                     concept if namespace is None
                     else f"{namespace}/{concept}"
                 )
-                self._session._try_autoload_vector(autoload_key, variant="sae")
                 key = f"{autoload_key}:sae"
+                with _suppress(Exception):
+                    self._session._ensure_profile_registered(key)
                 profile_dict = self._session._profiles.get(key)
                 if profile_dict is None:
                     raise ValueError(
                         f"no SAE variant loaded for '{autoload_key}' — "
-                        f"run `saklas vector extract {autoload_key} --sae <RELEASE>` "
+                        f"run `saklas subspace extract {autoload_key} --sae <RELEASE>` "
                         f"first, or pick a release with "
                         f"`:sae-<release>` in the concept name."
                     )
@@ -1551,19 +1554,18 @@ class SaklasApp(App[None]):
             def _progress(msg: str) -> None:
                 self.call_from_thread(self._steer_status, msg)
             try:
-                # Wrap the hand-authored pairs in a ``DataSource`` so the
-                # user-supplied name rides through — a bare list source
-                # would extract as the literal concept ``"custom"``.
-                from saklas.io.datasource import DataSource
-
-                source = DataSource(pairs=pairs, name=name)
+                # Hand-authored contrastive examples become the two pole
+                # corpora of a 2-node ``pca`` manifold — positive pole vs its
+                # opposite — fit directly (no scenario / pair generation).
+                positive = [pos for pos, _ in pairs]
+                negative = [neg for _, neg in pairs]
                 extract_kwargs: dict[str, Any] = {
                     "on_progress": _progress, "namespace": "local",
                 }
                 if role is not None:
                     extract_kwargs["role"] = role
-                canonical, profile = self._session.extract(
-                    source, **extract_kwargs,
+                canonical, profile = self._session.extract_vector_from_corpora(
+                    name, positive, negative, **extract_kwargs,
                 )
                 _on_success(canonical, profile, DEFAULT_ALPHA)
             except SaklasError as e:
@@ -3017,9 +3019,9 @@ class SaklasApp(App[None]):
                 loaded.append(key)
                 continue
             try:
-                self._session._try_autoload_vector(key, variant="raw")
+                self._session._ensure_profile_registered(key)
             except SaklasError:
-                # Stale sidecar / variant errors surface to the user
+                # Unresolved / not-yet-fit concepts surface to the user
                 # below by leaving the concept in ``skipped``; the
                 # detailed message would drown out the bulk summary.
                 pass

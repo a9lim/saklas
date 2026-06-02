@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from saklas.io import selectors as sel
-from saklas.io import packs
+from saklas.io.manifolds import create_discover_manifold_folder
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import (
     ProjectedTerm,
@@ -33,16 +33,30 @@ def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Generator
 
 
 def _mk(tmp_path: Path, ns: str, name: str, tags: list[str] | None = None) -> Path:
-    d = tmp_path / "vectors" / ns / name
-    d.mkdir(parents=True)
-    (d / "statements.json").write_text("[]")
-    meta = packs.PackMetadata(
-        name=name, description="x", version="1.0.0", license="MIT",
-        tags=tags or [], recommended_alpha=0.5, source="local",
-        files={"statements.json": packs.hash_file(d / "statements.json")},
+    """Author an installed concept as a 2-node ``pca`` manifold (4.0).
+
+    A bipolar composite name (``deer.wolf``) becomes a manifold whose two
+    node labels are the poles (``deer``/``wolf``), so a bare pole resolves
+    through the manifold tier (``resolve_manifold_label`` /
+    ``resolve_manifold_name``); a plain name gets generic ``pos``/``neg``
+    nodes.  ``tags`` are patched into ``manifold.json``.
+    """
+    if "." in name:
+        pos, neg = name.split(".", 1)
+        node_corpora = {pos: ["a statement."], neg: ["b statement."]}
+    else:
+        node_corpora = {"pos": ["a statement."], "neg": ["b statement."]}
+    folder = create_discover_manifold_folder(
+        ns, name, "x", fit_mode="pca",
+        node_corpora=node_corpora, hyperparams={"max_dim": 1},
     )
-    meta.write(d)
-    return d
+    if tags:
+        import json
+        mpath = folder / "manifold.json"
+        data = json.loads(mpath.read_text())
+        data["tags"] = list(tags)
+        mpath.write_text(json.dumps(data))
+    return folder
 
 
 # -------------------------------------------------------------- basic ---
@@ -139,17 +153,23 @@ def test_namespace_with_bipolar():
 
 
 def test_namespace_disambiguates_collision(tmp_path: Path) -> None:
-    # Two packs sharing a concept name across namespaces — the parser
-    # must keep the user's explicit ``alice/`` / ``bob/`` prefix in the
-    # alphas key so each pack ends up at a distinct registry slot.
-    # Pre-fix this case raised ``AmbiguousSelectorError`` from the
-    # session's pole-resolution second pass because the namespace was
-    # dropped at parse time.
+    # Two concepts sharing a name across namespaces — the parser must keep
+    # the user's explicit ``alice/`` / ``bob/`` prefix so each lands at a
+    # distinct registry slot.  4.0: a 2-node ``pca`` manifold name resolves
+    # through the composite-name tier to its node-0 (+) pole, so each term
+    # becomes a ``ManifoldTerm`` keyed ``<ns>/shared%pos`` — still distinct
+    # per namespace, which is the behavior under test.
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "alice", "shared", tags=[])
     _mk(tmp_path, "bob", "shared", tags=[])
     sel.invalidate()
     s = parse_expr("0.3 alice/shared + 0.4 bob/shared")
-    assert s.alphas == {"alice/shared": 0.3, "bob/shared": 0.4}
+    assert set(s.alphas) == {"alice/shared%pos", "bob/shared%pos"}
+    a = s.alphas["alice/shared%pos"]
+    b = s.alphas["bob/shared%pos"]
+    assert isinstance(a, ManifoldTerm) and isinstance(b, ManifoldTerm)
+    assert a.manifold == "alice/shared" and a.along == 0.3
+    assert b.manifold == "bob/shared" and b.along == 0.4
 
 
 def test_namespace_round_trips_through_format():
@@ -396,27 +416,49 @@ def test_dot_without_second_pole():
 
 # ------------------------------------------------------ pole aliasing ---
 
-def test_pole_alias_flips_sign(tmp_path: Path) -> None:
-    # Install ``default/deer.wolf``; bare ``wolf`` should resolve to
-    # ``deer.wolf`` with sign -1, so ``0.5 wolf`` -> ``deer.wolf: -0.5``.
+def test_pole_alias_resolves_through_manifold(tmp_path: Path) -> None:
+    # 4.0: a bipolar concept is a 2-node ``pca`` manifold (``deer.wolf`` with
+    # nodes ``deer``/``wolf``).  A bare pole resolves through the manifold
+    # *label* tier — ``0.5 wolf`` synthesizes a label-form ``ManifoldTerm`` at
+    # the ``wolf`` node (``default/deer.wolf%wolf``) rather than the old
+    # signed-vector ``deer.wolf @ -0.5``.
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 wolf")
-    assert s.alphas == {"deer.wolf": -0.5}
+    assert set(s.alphas) == {"default/deer.wolf%wolf"}
+    term = s.alphas["default/deer.wolf%wolf"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.manifold == "default/deer.wolf"
+    assert term.position == "wolf"
+    assert term.along == 0.5
 
 
-def test_pole_positive_pole_keeps_sign(tmp_path: Path) -> None:
+def test_pole_positive_pole_resolves_through_manifold(tmp_path: Path) -> None:
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 deer")
-    assert s.alphas == {"deer.wolf": 0.5}
+    assert set(s.alphas) == {"default/deer.wolf%deer"}
+    term = s.alphas["default/deer.wolf%deer"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.position == "deer"
+    assert term.along == 0.5
 
 
-def test_pole_composite_literal_bypasses_resolution(tmp_path: Path) -> None:
+def test_pole_composite_name_resolves_to_node0(tmp_path: Path) -> None:
+    # The composite-name tier: a 2-node ``pca`` manifold *name* (``deer.wolf``,
+    # whose ``.`` skips the bare-label tier) steers toward node 0 — the
+    # ``orient_to=0`` (+) pole, ``deer``.
+    from saklas.core.steering_expr import ManifoldTerm
     _mk(tmp_path, "default", "deer.wolf")
     sel.invalidate()
     s = parse_expr("0.5 deer.wolf")
-    assert s.alphas == {"deer.wolf": 0.5}
+    assert set(s.alphas) == {"default/deer.wolf%deer"}
+    term = s.alphas["default/deer.wolf%deer"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.position == "deer"
+    assert term.along == 0.5
 
 
 # -------------------------------------------------------- format/round-trip ---

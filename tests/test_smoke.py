@@ -52,12 +52,26 @@ def num_layers(layers: Any) -> int:
 
 
 def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> Any:
-    """Extract a profile for a single concept with one pair."""
-    from saklas.core.vectors import extract_difference_of_means
-    profile, _ = extract_difference_of_means(
-        model, tokenizer, [{"positive": concept, "negative": ""}], layers=layers,
+    """A per-layer direction profile for a single concept vs the empty pole.
+
+    The 4.0 equivalent of a difference-of-means vector: capture the two pole
+    centroids and fold them into a 2-node affine subspace, then take its
+    baked-direction view (``folded_vector_directions``).  Same centroid-
+    difference direction the old DiM extractor produced, no pipeline needed.
+    """
+    from saklas.core.vectors import (
+        _encode_and_capture_all,
+        _fold_centroids_to_affine_manifold,
+        folded_vector_directions,
     )
-    return profile
+
+    device = next(model.parameters()).device
+    pos = _encode_and_capture_all(model, tokenizer, concept, layers, device)
+    neg = _encode_and_capture_all(model, tokenizer, "", layers, device)
+    mfld = _fold_centroids_to_affine_manifold(
+        concept, pos, neg, pos_label="p", neg_label="n", dls=False,
+    )
+    return folded_vector_directions(mfld)
 
 
 @pytest.fixture(scope="module")
@@ -313,39 +327,6 @@ class TestTraitMonitor:
         )
 
 
-class TestExtractDifferenceOfMeans:
-    def test_returns_valid_profile(self, model_and_tokenizer: Any, layers: Any, num_layers: int) -> None:
-        from saklas.core.vectors import extract_difference_of_means
-        model, tokenizer = model_and_tokenizer
-        cfg = getattr(model.config, "text_config", None) or model.config
-        hidden_dim = cfg.hidden_size
-        pairs = [
-            {"positive": "I feel happy today", "negative": "I feel sad today"},
-            {"positive": "Everything is wonderful", "negative": "Everything is terrible"},
-            {"positive": "I love this", "negative": "I hate this"},
-        ]
-        profile, diagnostics = extract_difference_of_means(model, tokenizer, pairs, layers=layers)
-        assert isinstance(profile, dict)
-        assert len(profile) > 0
-        for idx, vec in profile.items():
-            assert 0 <= idx < num_layers
-            assert vec.shape == (hidden_dim,)
-            norm = vec.norm().item()
-            assert norm > 0 and not math.isinf(norm) and not math.isnan(norm)
-        # Diagnostics surface for multi-pair extractions; layer set must
-        # match the profile so downstream consumers can index either dict
-        # by layer index without branching.
-        assert set(diagnostics.keys()) == set(profile.keys())
-        for metrics in diagnostics.values():
-            assert {
-                "evr",
-                "intra_pair_variance_mean",
-                "intra_pair_variance_std",
-                "inter_pair_alignment",
-                "diff_principal_projection",
-            } <= set(metrics.keys())
-
-
 class TestBuildChatInput:
     def test_chat_template_path(self, model_and_tokenizer: Any) -> None:
         from saklas.core.generation import build_chat_input
@@ -364,41 +345,6 @@ class TestBuildChatInput:
         ids_sys = build_chat_input(tokenizer, messages, system_prompt="You are helpful.")
         # System prompt should add tokens
         assert ids_sys.shape[1] > ids_no_sys.shape[1]
-
-
-class TestProbesBootstrap:
-    def test_bootstrap_loads_from_cache(self, monkeypatch: pytest.MonkeyPatch, model_and_tokenizer: Any, layers: Any, happy_profile: Any) -> None:
-        """Bootstrap should return cached profiles without re-extracting."""
-        from saklas.io.probes_bootstrap import bootstrap_probes
-        from saklas.core.vectors import save_profile
-        from saklas.io.paths import concept_dir, safe_model_id
-        from saklas.io.packs import materialize_bundled, PackMetadata, hash_file
-        from saklas.core.model import get_model_info
-        model, tokenizer = model_and_tokenizer
-        model_info = get_model_info(model, tokenizer)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            monkeypatch.setenv("SAKLAS_HOME", tmp)
-            materialize_bundled()
-            # Pre-populate the `happy.sad` concept tensor for this model
-            folder = concept_dir("default", "happy.sad")
-            ts_path = folder / f"{safe_model_id(model_info['model_id'])}.safetensors"
-            save_profile(happy_profile, str(ts_path), {
-                "method": "difference_of_means",
-                "statements_sha256": hash_file(folder / "statements.json"),
-            })
-            # Refresh the pack.json files map to include the new tensor
-            meta = PackMetadata.load(folder)
-            meta.files[ts_path.name] = hash_file(ts_path)
-            meta.files[ts_path.with_suffix(".json").name] = hash_file(ts_path.with_suffix(".json"))
-            meta.write(folder)
-
-            probes = bootstrap_probes(
-                model, tokenizer, layers, model_info,
-                categories=["affect"],
-            )
-            assert isinstance(probes, dict)
-            assert "happy.sad" in probes
 
 
 class TestAblationPerformance:

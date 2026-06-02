@@ -1,10 +1,10 @@
-"""4.0 step 6c — the eight-verb root CLI.
+"""4.0 — the six-verb root CLI.
 
 ``subspace`` (flat / vector ops) and ``manifold`` (curved + flat manifold
-authoring) are promoted to top-level verbs; ``vector`` becomes a deprecated
-alias that parses the old tree identically and dispatches to the new runners
-with a one-time deprecation notice.  These tests exercise the parser shape +
-dispatch wiring, not the backends.
+authoring) are the artifact verbs; the ``pack`` verb and the deprecated
+``vector`` alias are gone in 4.0 (the pack distribution surface collapsed into
+manifolds).  These tests exercise the parser shape + dispatch wiring, not the
+backends.
 """
 from __future__ import annotations
 
@@ -32,10 +32,9 @@ def _isolated_home(
 # Root verb set
 # ---------------------------------------------------------------------------
 
-def test_eight_top_level_verbs() -> None:
+def test_six_top_level_verbs() -> None:
     assert set(_COMMAND_RUNNERS) == {
-        "tui", "serve", "pack", "subspace", "manifold", "vector",
-        "config", "experiment",
+        "tui", "serve", "subspace", "manifold", "config", "experiment",
     }
 
 
@@ -123,40 +122,14 @@ def test_bare_manifold_prints_help_exit_0(
 
 
 # ---------------------------------------------------------------------------
-# vector — deprecated alias keeps parsing the old tree
+# pack / vector — removed in 4.0
 # ---------------------------------------------------------------------------
 
-def test_vector_alias_still_parses() -> None:
-    args = cli.parse_args(["vector", "extract", "happy", "sad"])
-    assert args.command == "vector"
-    assert args.vector_cmd == "extract"
-
-
-def test_vector_manifold_alias_still_parses() -> None:
-    args = cli.parse_args(["vector", "manifold", "ls"])
-    assert args.command == "vector"
-    assert args.vector_cmd == "manifold"
-    assert args.manifold_cmd == "ls"
-
-
-def test_vector_dispatch_emits_deprecation(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # ``manifold ls`` is pure-IO; under the empty isolated home it lists
-    # nothing and exits cleanly, so we can assert on the warning.
-    cli.main(["vector", "manifold", "ls"])
-    err = capsys.readouterr().err
-    assert "deprecated" in err
-    assert "saklas manifold" in err
-
-
-def test_vector_subspace_verb_dispatch_emits_deprecation(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # ``compare`` with no model resolves nothing under the empty home; the
-    # deprecation note must mention the subspace target.
+def test_pack_verb_removed() -> None:
     with pytest.raises(SystemExit):
-        cli.main(["vector", "compare", "nonexistent", "-m", "m/x"])
-    err = capsys.readouterr().err
-    assert "deprecated" in err
-    assert "saklas subspace compare" in err
+        cli.parse_args(["pack", "ls"])
+
+
+def test_vector_alias_removed() -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["vector", "extract", "happy", "sad"])

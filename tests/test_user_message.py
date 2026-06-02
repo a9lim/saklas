@@ -28,7 +28,7 @@ from saklas.core.session import (
     VectorNotRegisteredError,
 )
 from saklas.core.steering_expr import SteeringExprError
-from saklas.io.cache_ops import InstallConflict, RefreshError
+from saklas.io.hf_manifolds import ManifoldInstallConflict
 from saklas.io.cloning import (
     CorpusTooLongError,
     CorpusTooShortError,
@@ -78,9 +78,8 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (PackFormatError, 400),
     # io/hf.py
     (HFError, 502),
-    # io/cache_ops.py
-    (InstallConflict, 409),
-    (RefreshError, 500),
+    # io/hf_manifolds.py
+    (ManifoldInstallConflict, 409),
     # io/cloning.py
     (CorpusTooShortError, 400),
     (CorpusTooLongError, 400),
@@ -198,7 +197,7 @@ def test_server_routes_user_message_status_codes():
         (ConcurrentGenerationError("busy"), 409),
         (AmbiguousSelectorError("'x' matches a/x and b/x"), 400),
         (HFError("network down"), 502),
-        (InstallConflict("already exists"), 409),
+        (ManifoldInstallConflict("already exists"), 409),
         (PackFormatError("malformed"), 400),
     ]
 

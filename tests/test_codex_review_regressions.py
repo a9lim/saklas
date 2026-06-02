@@ -19,11 +19,9 @@ from typing import Any
 import pytest
 import torch
 
-from saklas.core.errors import StaleSidecarError
 from saklas.core.session import (
     ConcurrentExtractionError, GenState, SaklasSession,
 )
-from saklas.io import hf, packs
 
 
 def _stub_session_with_lock() -> SaklasSession:
@@ -72,197 +70,22 @@ def test_extract_releases_lock_on_path_through_phase_gate():
     s._gen_lock.release()
 
 
-# ---------------------------------------------------------------------------
-# Phase 1 fix — pull_pack recovers from .bak when target is missing
-# ---------------------------------------------------------------------------
-
-def _fake_repo(tmp_path: Path, name: str = "happy") -> Path:
-    repo = tmp_path / "downloaded" / name
-    repo.mkdir(parents=True)
-    (repo / "statements.json").write_text("[]")
-    meta = packs.PackMetadata(
-        name=name, description="x", version="1.0.0", license="MIT",
-        tags=["test"], recommended_alpha=0.5,
-        source="hf://user/happy", files={},
-    )
-    meta.files = {"statements.json": packs.hash_file(repo / "statements.json")}
-    meta.write(repo)
-    return repo
-
-
-def test_pull_pack_recovers_prior_install_from_bak(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-):
-    """Crash window: a prior pull died after ``target → .bak`` but
-    before ``staging → target``.  Target is absent, .bak holds the only
-    valid prior install.  The next pull must restore from .bak before
-    any new download — wiping .bak first would lose the prior install
-    if the new staging itself fails."""
-    _fake_repo(tmp_path)  # baseline 'happy' source — not used by this test
-    target = tmp_path / "installed" / "happy"
-
-    # Simulate the post-crash state: target absent, .bak present with
-    # the prior install.
-    backup = target.with_name(target.name + ".bak")
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    prior = _fake_repo(tmp_path, name="prior")
-    import shutil
-    shutil.copytree(prior, backup)
-    prior_pack_bytes = (backup / "pack.json").read_bytes()
-    assert not target.exists()
-
-    # Force the new pull to fail on staging-side install (broken repo).
-    bad = tmp_path / "downloaded" / "broken"
-    bad.mkdir(parents=True)
-    (bad / "random.txt").write_text("garbage")
-    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(bad))
-
-    with pytest.raises(hf.HFError):
-        hf.pull_pack("user/happy", target_folder=target, force=True)
-
-    # Critical: the prior install was restored from .bak before the
-    # broken-repo attempt blew up — we didn't lose it.
-    assert target.exists()
-    assert (target / "pack.json").is_file()
-    assert (target / "pack.json").read_bytes() == prior_pack_bytes
-
-
-def test_pull_pack_completed_swap_cleanup_drops_bak(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-):
-    """Other crash window: the swap completed but rmtree of .bak got
-    interrupted.  Target is the source of truth; .bak is redundant.
-    Next pull should drop .bak (after the recovery branch sees target
-    is intact)."""
-    fake = _fake_repo(tmp_path)
-    monkeypatch.setattr(hf, "_hf_snapshot_download", lambda **kw: str(fake))
-
-    target = tmp_path / "installed" / "happy"
-    hf.pull_pack("user/happy", target_folder=target, force=False)
-    assert (target / "pack.json").is_file()
-
-    # Plant a stale .bak (simulating a post-swap pre-cleanup crash).
-    backup = target.with_name(target.name + ".bak")
-    backup.mkdir(parents=True)
-    (backup / "leftover.txt").write_text("from a prior crash")
-
-    # Re-pull.  Target is intact, so .bak is just leftover noise.
-    hf.pull_pack("user/happy", target_folder=target, force=True)
-    assert not backup.exists()
+# NOTE: the Phase 1 ``pull_pack`` crash-window regressions (recover-from-.bak
+# before a new build, drop-stale-.bak on a clean swap) moved to the generic
+# ``io/staging.py::stage_verify_swap`` primitive in the 4.0 collapse and are
+# covered directly by ``test_io_staging.py`` (``pull_pack`` itself is gone).
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 fix — _try_autoload_vector enforces statements_sha256 too
+# Phase 2 — _try_autoload_vector stale-statements contract
 # ---------------------------------------------------------------------------
-
-def test_autoload_raises_on_stale_statements(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-):
-    """The session-level autoload path must apply the same
-    ``statements_sha256`` contract as ``bootstrap_probes``.  Otherwise
-    ``/steer happy.sad`` silently loads a stale tensor that
-    ``bootstrap_probes`` would have rejected."""
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.delenv("SAKLAS_ALLOW_STALE", raising=False)
-
-    # Build a concept folder with a stale tensor (recorded sha doesn't
-    # match the live statements.json).
-    cdir = tmp_path / "vectors" / "default" / "zz-stale"
-    cdir.mkdir(parents=True)
-    stmts_path = cdir / "statements.json"
-    stmts_path.write_text("[]")
-    extraction_time_sha = packs.hash_file(stmts_path)
-
-    from saklas.core.vectors import save_profile
-    save_profile(
-        {0: torch.zeros(8, dtype=torch.float32)},
-        str(cdir / "google__gemma-2-2b-it.safetensors"),
-        {"method": "contrastive_pca", "statements_sha256": extraction_time_sha},
-    )
-
-    # User edits statements; refresh pack.json so integrity passes.
-    stmts_path.write_text('[["my edit", "after extraction"]]')
-    files: dict[str, str] = {
-        "statements.json": packs.hash_file(stmts_path),
-        "google__gemma-2-2b-it.safetensors": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.safetensors"),
-        "google__gemma-2-2b-it.json": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.json"),
-    }
-    packs.PackMetadata(
-        name="zz-stale", description="x", version="1.0.0", license="MIT",
-        tags=["custom"], recommended_alpha=0.5, source="bundled",
-        files=files,
-    ).write(cdir)
-
-    # Stub a session that exposes just the autoload entry point.
-    s = _stub_session_with_lock()
-    s._model_info = {"model_id": "google/gemma-2-2b-it"}
-    from torch import device
-    s._device = device("cpu")
-    s._dtype = torch.float32
-    s._profiles = {}
-    # Tickle the selectors cache so _all_concepts sees our planted folder.
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    with pytest.raises(StaleSidecarError) as excinfo:
-        s._try_autoload_vector("zz-stale")
-
-    msg = str(excinfo.value)
-    assert "default/zz-stale" in msg
-    assert "google/gemma-2-2b-it" in msg
-    assert "saklas pack refresh" in msg
-    assert "SAKLAS_ALLOW_STALE" in msg
-
-
-def test_autoload_allow_stale_env_var_escape_hatch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-):
-    """``SAKLAS_ALLOW_STALE=1`` bypasses the autoload staleness check —
-    matching ``bootstrap_probes`` semantics."""
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.setenv("SAKLAS_ALLOW_STALE", "1")
-
-    cdir = tmp_path / "vectors" / "default" / "zz-stale"
-    cdir.mkdir(parents=True)
-    stmts_path = cdir / "statements.json"
-    stmts_path.write_text("[]")
-    extraction_time_sha = packs.hash_file(stmts_path)
-
-    from saklas.core.vectors import save_profile
-    save_profile(
-        {0: torch.zeros(8, dtype=torch.float32)},
-        str(cdir / "google__gemma-2-2b-it.safetensors"),
-        {"method": "contrastive_pca", "statements_sha256": extraction_time_sha},
-    )
-    stmts_path.write_text('[["my edit", "after extraction"]]')
-    files: dict[str, str] = {
-        "statements.json": packs.hash_file(stmts_path),
-        "google__gemma-2-2b-it.safetensors": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.safetensors"),
-        "google__gemma-2-2b-it.json": packs.hash_file(
-            cdir / "google__gemma-2-2b-it.json"),
-    }
-    packs.PackMetadata(
-        name="zz-stale", description="x", version="1.0.0", license="MIT",
-        tags=["custom"], recommended_alpha=0.5, source="bundled",
-        files=files,
-    ).write(cdir)
-
-    s = _stub_session_with_lock()
-    s._model_info = {"model_id": "google/gemma-2-2b-it"}
-    from torch import device
-    s._device = device("cpu")
-    s._dtype = torch.float32
-    s._profiles = {}
-
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    # No raise — allow-stale lets it through and the tensor lands.
-    s._try_autoload_vector("zz-stale")
-    assert "zz-stale" in s._profiles
+# NOTE: ``test_autoload_raises_on_stale_statements`` and
+# ``test_autoload_allow_stale_env_var_escape_hatch`` were deleted in 4.0.
+# ``SaklasSession._try_autoload_vector`` (the ``vectors/``-pack safetensors
+# scan that re-checked ``statements_sha256``) was removed; profile resolution
+# now folds a fitted manifold via ``_ensure_profile_registered`` (the legacy
+# ``vectors/`` folder is only *ported* to a manifold on first touch, then
+# re-fit — there is no stale-tensor autoload path left to guard).
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ def test_parse_zero_args_prints_help_and_exits_zero(capsys: pytest.CaptureFixtur
         cli.parse_args([])
     assert ex.value.code == 0
     out = capsys.readouterr().out
-    assert "tui" in out and "serve" in out and "pack" in out and "vector" in out and "config" in out
+    assert "tui" in out and "serve" in out and "subspace" in out and "manifold" in out and "config" in out
 
 
 def test_parse_bare_unknown_model_id_errors():
@@ -42,107 +42,23 @@ def test_parse_tui_with_config_only():
 
 
 # ---------------------------------------------------------------------------
-# pack subtree
+# subspace subtree (the flat-artifact / vector verbs)
 # ---------------------------------------------------------------------------
-
-def test_parse_pack_no_verb_exits_zero(capsys: pytest.CaptureFixture[str]):
-    # pack with no verb prints help and exits 0.
-    with pytest.raises(SystemExit) as ex:
-        cli.main(["pack"])
-    assert ex.value.code == 0
-
-
-def test_parse_pack_install():
-    args = cli.parse_args(["pack", "install", "a9lim/happy"])
-    assert args.command == "pack"
-    assert args.pack_cmd == "install"
-    assert args.target == "a9lim/happy"
-    assert args.statements_only is False
-
-
-def test_parse_pack_install_flags():
-    args = cli.parse_args(["pack", "install", "a9lim/happy", "-s", "-a", "local/cheer", "-f"])
-    assert args.statements_only is True
-    assert args.as_target == "local/cheer"
-    assert args.force is True
-
-
-def test_parse_pack_refresh():
-    args = cli.parse_args(["pack", "refresh", "happy"])
-    assert args.pack_cmd == "refresh"
-    assert args.selector == "happy"
-    assert args.model is None
-
-
-def test_parse_pack_refresh_neutrals():
-    args = cli.parse_args(["pack", "refresh", "neutrals"])
-    assert args.pack_cmd == "refresh"
-    assert args.selector == "neutrals"
-
-
-def test_parse_pack_clear():
-    args = cli.parse_args(["pack", "clear", "tag:emotion", "-m", "gemma-2-2b-it"])
-    assert args.pack_cmd == "clear"
-    assert args.selector == "tag:emotion"
-    assert args.model == "gemma-2-2b-it"
-
-
-def test_parse_pack_rm():
-    args = cli.parse_args(["pack", "rm", "happy"])
-    assert args.pack_cmd == "rm"
-    assert args.selector == "happy"
-    assert args.yes is False
-
-
-def test_parse_pack_ls_empty():
-    args = cli.parse_args(["pack", "ls"])
-    assert args.pack_cmd == "ls"
-    assert args.selector is None
-
-
-def test_parse_pack_ls_with_selector():
-    args = cli.parse_args(["pack", "ls", "tag:emotion", "-j"])
-    assert args.pack_cmd == "ls"
-    assert args.selector == "tag:emotion"
-    assert args.json_output is True
-
-
-def test_parse_pack_search():
-    args = cli.parse_args(["pack", "search", "emotion"])
-    assert args.pack_cmd == "search"
-    assert args.query == "emotion"
-
-
-def test_parse_pack_merge_is_gone():
-    """merge moved to vector subtree."""
-    with pytest.raises(SystemExit):
-        cli.parse_args(["pack", "merge", "bard", "default/happy:0.3"])
-
-
-# ---------------------------------------------------------------------------
-# vector subtree
-# ---------------------------------------------------------------------------
-
-def test_parse_vector_no_verb_exits_zero(capsys: pytest.CaptureFixture[str]):
-    with pytest.raises(SystemExit) as ex:
-        cli.main(["vector"])
-    assert ex.value.code == 0
-
 
 def test_parse_vector_merge():
     args = cli.parse_args([
-        "vector", "merge", "bard",
+        "subspace","merge", "bard",
         "0.3 default/happy + 0.4 a9lim/archaic",
     ])
-    assert args.command == "vector"
-    assert args.vector_cmd == "merge"
+    assert args.command == "subspace"
+    assert args.subspace_cmd == "merge"
     assert args.name == "bard"
     assert args.expression == "0.3 default/happy + 0.4 a9lim/archaic"
 
 
 def test_parse_vector_clone_required_args():
-    args = cli.parse_args(["vector", "clone", "/tmp/corpus.txt", "--name", "alice"])
-    assert args.vector_cmd == "clone"
+    args = cli.parse_args(["subspace","clone", "/tmp/corpus.txt", "--name", "alice"])
+    assert args.subspace_cmd == "clone"
     assert args.corpus_path == "/tmp/corpus.txt"
     assert args.name == "alice"
     assert args.n_pairs == 90
@@ -153,34 +69,35 @@ def test_parse_vector_clone_required_args():
 
 def test_parse_vector_clone_missing_name_errors():
     with pytest.raises(SystemExit):
-        cli.parse_args(["vector", "clone", "/tmp/corpus.txt"])
+        cli.parse_args(["subspace","clone", "/tmp/corpus.txt"])
 
 
 def test_parse_vector_extract_one_positional():
-    args = cli.parse_args(["vector", "extract", "happy.sad"])
-    assert args.vector_cmd == "extract"
+    args = cli.parse_args(["subspace","extract", "happy.sad"])
+    assert args.subspace_cmd == "extract"
     assert args.concept == ["happy.sad"]
     assert args.model is None
     assert args.force is False
 
 
 def test_parse_vector_extract_two_positionals():
-    args = cli.parse_args(["vector", "extract", "happy", "sad"])
+    args = cli.parse_args(["subspace","extract", "happy", "sad"])
     assert args.concept == ["happy", "sad"]
 
 
 def test_parse_vector_extract_all_flags():
-    args = cli.parse_args(["vector", "extract", "happy.sad", "-m", "foo/bar", "-f"])
+    args = cli.parse_args(["subspace","extract", "happy.sad", "-m", "foo/bar", "-f"])
     assert args.concept == ["happy.sad"]
     assert args.model == "foo/bar"
     assert args.force is True
 
 
-def test_parse_pack_export_gguf():
-    args = cli.parse_args(["pack", "export", "gguf", "happy.sad", "-m", "foo/bar"])
-    assert args.pack_cmd == "export"
+def test_parse_manifold_export_gguf():
+    args = cli.parse_args(["manifold", "export", "gguf", "happy.sad", "-m", "foo/bar"])
+    assert args.command == "manifold"
+    assert args.manifold_cmd == "export"
     assert args.format == "gguf"
-    assert args.selector == "happy.sad"
+    assert args.name == "happy.sad"
     assert args.model == "foo/bar"
 
 
@@ -313,99 +230,18 @@ def test_yaml_compile_invalid_type_errors(monkeypatch: pytest.MonkeyPatch, tmp_p
 # Runners
 # ---------------------------------------------------------------------------
 
-def test_run_refresh_bundled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
-    target = tmp_path / "vectors" / "default" / "angry.calm" / "statements.json"
-    if not target.exists():
-        pytest.skip("angry.calm statements.json not yet regenerated")
-    target.write_text("[]")
-    cli.main(["pack", "refresh", "default"])
-    assert target.read_text() != "[]"
-
-
-def test_run_refresh_neutrals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    (tmp_path / "neutral_statements.json").write_text("[]")
-    cli.main(["pack", "refresh", "neutrals"])
-    content = (tmp_path / "neutral_statements.json").read_text()
-    assert content != "[]"
-
-
-def test_run_install_folder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
-    from saklas.io import packs
-    src = tmp_path / "src" / "happy"
-    src.mkdir(parents=True)
-    (src / "statements.json").write_text("[]")
-    packs.PackMetadata(
-        name="happy", description="x", version="1.0.0", license="MIT",
-        tags=[], recommended_alpha=0.5, source="local",
-        files={"statements.json": packs.hash_file(src / "statements.json")},
-    ).write(src)
-    cli.main(["pack", "install", str(src)])
-    assert (tmp_path / "home" / "vectors" / "local" / "happy" / "pack.json").is_file()
-
-
-def test_run_ls_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-
-    def boom(_sel: Any) -> Any:
-        raise AssertionError("HF query must not run with pack ls")
-
-    monkeypatch.setattr("saklas.io.hf.search_packs", boom)
-    cli.main(["pack", "ls"])
-    out = capsys.readouterr().out
-    assert "NAME" in out
-
-
-def test_run_search_calls_hf(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    calls = []
-
-    def fake(sel: Any) -> list[dict[str, Any]]:
-        calls.append(sel)
-        return [{"name": "happy", "namespace": "alice", "tags": [], "recommended_alpha": 0.5}]
-
-    monkeypatch.setattr("saklas.io.hf.search_packs", fake)
-    cli.main(["pack", "search", "happy"])
-    assert calls and calls[0].value == "happy"
-    out = capsys.readouterr().out
-    assert "happy" in out
-
-
-def test_run_rm_refuses_broad(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
-    with pytest.raises(SystemExit):
-        cli.main(["pack", "rm", "all"])
-
-
-def test_run_rm_specific(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
-    cli.main(["pack", "rm", "happy.sad"])
-    assert not (tmp_path / "vectors" / "default" / "happy.sad").exists()
-
-
 def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
 
-    from saklas.io.paths import vectors_dir, safe_model_id
+    from saklas.io.paths import manifold_dir, tensor_filename
     model_id = "fake/model"
-    folder = vectors_dir() / "default" / "happy.sad"
+    # A steering vector is a 2-node pca manifold (4.0); extract lands it under
+    # ``manifolds/<ns>/<canonical>/``.  A present per-model tensor is the
+    # cache-hit marker the runner checks (no manifold load needed).
+    folder = manifold_dir("local", "happy.sad")
     folder.mkdir(parents=True, exist_ok=True)
-    tensor = folder / f"{safe_model_id(model_id)}.safetensors"
+    tensor = folder / tensor_filename(model_id)
     tensor.write_bytes(b"")
-    # 4.0 step 6b: materialize_bundled no longer ships a pack.json for this
-    # name (bundled concepts are manifolds now), so the synthetic vector
-    # folder must carry its own for ``_all_concepts()`` to surface it.
-    _install_concept_pack(folder, "happy.sad")
 
     class FakeSession:
         def __init__(self, **kw: Any) -> None:
@@ -413,9 +249,6 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
             self.model_info = {"model_type": "fake", "num_layers": 1,
                                "hidden_dim": 8, "vram_used_gb": 0.0}
             self.probes = {}
-
-        def _local_concept_folder(self, canonical: str, *, namespace: str = "local") -> Path:
-            return vectors_dir() / namespace / canonical
 
         def extract(self, *a: Any, **kw: Any) -> Any:
             raise AssertionError("extract() must not be called on cache hit")
@@ -425,7 +258,7 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
     monkeypatch.setattr(cli_runners, "_print_startup", lambda args: None)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["vector", "extract", "happy.sad", "-m", model_id])
+        cli.main(["subspace", "extract", "happy.sad", "-m", model_id])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
     assert "already extracted at" in out
@@ -434,8 +267,17 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
 
 def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
+    # 4.0: a concept is a 2-node ``pca`` manifold — author ``default/happy.sad``
+    # so the config reference resolves (and ``ensure_vectors_installed`` sees it
+    # as already installed).
+    from saklas.io.manifolds import create_discover_manifold_folder
+    create_discover_manifold_folder(
+        "default", "happy.sad", "x", fit_mode="pca",
+        node_corpora={"happy": ["a statement."], "sad": ["b statement."]},
+        hyperparams={"max_dim": 1},
+    )
+    from saklas.io import selectors as _sel
+    _sel.invalidate()
 
     p = tmp_path / "setup.yaml"
     p.write_text('model: fake-model\nvectors: "0.4 default/happy.sad"\n')
@@ -476,90 +318,106 @@ def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_p
 
 
 def test_parse_vector_compare_two_args():
-    args = cli.parse_args(["vector", "compare", "angry.calm", "happy.sad", "-m", "foo/bar"])
-    assert args.command == "vector"
-    assert args.vector_cmd == "compare"
+    args = cli.parse_args(["subspace","compare", "angry.calm", "happy.sad", "-m", "foo/bar"])
+    assert args.command == "subspace"
+    assert args.subspace_cmd == "compare"
     assert args.concepts == ["angry.calm", "happy.sad"]
     assert args.model == "foo/bar"
 
 
 def test_parse_vector_compare_one_arg():
-    args = cli.parse_args(["vector", "compare", "angry.calm", "-m", "foo/bar"])
+    args = cli.parse_args(["subspace","compare", "angry.calm", "-m", "foo/bar"])
     assert args.concepts == ["angry.calm"]
 
 
 def test_parse_vector_compare_three_plus_args():
-    args = cli.parse_args(["vector", "compare", "angry.calm", "happy.sad", "formal.casual", "-m", "foo/bar"])
+    args = cli.parse_args(["subspace","compare", "angry.calm", "happy.sad", "formal.casual", "-m", "foo/bar"])
     assert args.concepts == ["angry.calm", "happy.sad", "formal.casual"]
 
 
 def test_parse_vector_compare_selector_arg():
-    args = cli.parse_args(["vector", "compare", "tag:affect", "-m", "foo/bar"])
+    args = cli.parse_args(["subspace","compare", "tag:affect", "-m", "foo/bar"])
     assert args.concepts == ["tag:affect"]
 
 
 def test_parse_vector_compare_verbose_and_json():
-    args = cli.parse_args(["vector", "compare", "a", "b", "-m", "x", "-v", "-j"])
+    args = cli.parse_args(["subspace","compare", "a", "b", "-m", "x", "-v", "-j"])
     assert args.verbose is True
     assert args.json_output is True
 
 
 def test_parse_vector_compare_missing_model_errors():
     with pytest.raises(SystemExit):
-        cli.parse_args(["vector", "compare", "angry.calm"])
+        cli.parse_args(["subspace","compare", "angry.calm"])
 
 
-def test_vector_appears_in_help(capsys: pytest.CaptureFixture[str]):
+def test_subspace_manifold_appear_in_help_pack_vector_gone(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit):
         cli.parse_args([])
     out = capsys.readouterr().out
-    assert "vector" in out
+    assert "subspace" in out
+    assert "manifold" in out
+    # The 4.0 collapse retired the `pack` verb and the `vector` alias —
+    # neither should parse as a top-level command anymore.
+    for gone in (["pack", "ls"], ["vector", "extract", "x"]):
+        with pytest.raises(SystemExit):
+            cli.parse_args(gone)
 
 
 # ---------------------------------------------------------------------------
 # _run_compare — verbose modes (1-arg ranked, N×N matrix)
 # ---------------------------------------------------------------------------
 
-def _install_concept_pack(folder: Path, name: str) -> Path:
-    """Write a minimal valid v2 ``pack.json`` into a synthetic concept folder.
+def _patch_fold_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+    profiles_by_display: dict[str, Any],
+) -> None:
+    """Stub the two manifold-fold helpers ``_run_compare`` / ``_run_why`` call.
 
-    4.0 step 6b emptied ``saklas/data/vectors/``, so ``materialize_bundled()``
-    no longer drops a ``pack.json`` next to the fake tensors these
-    compare/why tests create — and ``resolve()`` / ``_all_concepts()`` skip any
-    folder without one (``selectors._all_concepts`` requires a loadable
-    ``pack.json``).  These tests mock ``Profile.load``, so the tensor bytes are
-    never parsed; they only need the concept to RESOLVE.  This makes each
-    synthetic concept folder self-sufficient.
+    4.0: ``subspace compare`` / ``why`` fold a fitted 2-node ``pca`` manifold
+    to a ``Profile`` via ``runners._fold_manifold_to_profile_with_identity``
+    (1-arg lookup) and ``runners._fold_all_fitted_manifolds`` (rank-all pool).
+    Rather than author + fit a real manifold per concept, we stub both helpers
+    to serve the mock profiles keyed by display name (``"<ns>/<name>"`` or the
+    bare name, with an optional ``:variant`` suffix).
+
+    ``profiles_by_display`` maps the *display* name the runner asks for
+    (e.g. ``"angry.calm"``, ``"angry.calm:sae-my-release"``,
+    ``"default/happy.sad"``) to a mock profile.  All concepts are authored
+    under ``default/``, so the returned identity is ``("default", bare)``.
     """
-    from saklas.io.packs import PackMetadata
+    import saklas.cli.runners as runners
 
-    folder.mkdir(parents=True, exist_ok=True)
-    files = {
-        p.name: ""  # hash unused: resolve()/_all_concepts() doesn't verify it
-        for p in folder.iterdir()
-        if p.suffix in {".safetensors", ".gguf"}
-    }
-    PackMetadata(
-        name=name,
-        description=f"synthetic test concept {name}",
-        version="1.0.0",
-        license="MIT",
-        tags=["synthetic"],
-        recommended_alpha=0.5,
-        source="local",
-        files=files,
-    ).write(folder)
-    return folder
+    def _fold(name: str, model_id: str, variant: str | None):
+        bare = name.split("/", 1)[1] if "/" in name else name
+        key = bare if variant is None else f"{bare}:{variant}"
+        prof = profiles_by_display.get(key)
+        if prof is None:
+            return None
+        return prof, "default", bare
+
+    def _fold_all(model_id: str, *, exclude_identity=None):
+        out: dict[str, Any] = {}
+        for key, prof in profiles_by_display.items():
+            if ":" in key:
+                continue  # only raw concepts join the rank-all pool
+            if exclude_identity is not None and exclude_identity == ("default", key):
+                continue
+            out[f"default/{key}"] = prof
+        return out
+
+    monkeypatch.setattr(
+        runners, "_fold_manifold_to_profile_with_identity", _fold,
+    )
+    monkeypatch.setattr(runners, "_fold_all_fitted_manifolds", _fold_all)
 
 
 def _setup_compare_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Set SAKLAS_HOME, materialize bundled, and return the vectors_dir path."""
+    """Set SAKLAS_HOME and return the manifolds_dir path."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
     from saklas.io import selectors
     selectors.invalidate()
-    return tmp_path / "vectors"
+    return tmp_path / "manifolds"
 
 
 def _mock_profile(agg_fn: Any, pl_fn: Any) -> Any:
@@ -577,25 +435,8 @@ def _mock_profile(agg_fn: Any, pl_fn: Any) -> Any:
 
 def test_run_compare_one_arg_verbose_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """1-arg + -v text mode: prints per-layer breakdown for top 3."""
-    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id
-    sid = safe_model_id(model_id)
-
-    target_dir = vdir / "default" / "angry.calm"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(target_dir, "angry.calm")
-
-    happy_dir = vdir / "default" / "happy.sad"
-    happy_dir.mkdir(parents=True, exist_ok=True)
-    (happy_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(happy_dir, "happy.sad")
-
-    warm_dir = vdir / "default" / "warm.clinical"
-    warm_dir.mkdir(parents=True, exist_ok=True)
-    (warm_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(warm_dir, "warm.clinical")
 
     happy_profile = _mock_profile(lambda o: None, lambda o: None)
     warm_profile = _mock_profile(lambda o: None, lambda o: None)
@@ -616,22 +457,16 @@ def test_run_compare_one_arg_verbose_text(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     target_profile = _mock_profile(target_agg, target_pl)
 
-    profiles_by_path = {
-        str(target_dir / f"{sid}.safetensors"): target_profile,
-        str(happy_dir / f"{sid}.safetensors"): happy_profile,
-        str(warm_dir / f"{sid}.safetensors"): warm_profile,
-    }
-
-    from saklas.core.profile import Profile
-
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.io.selectors import invalidate
-    invalidate()
+    _patch_fold_helpers(monkeypatch, {
+        "angry.calm": target_profile,
+        "happy.sad": happy_profile,
+        "warm.clinical": warm_profile,
+    })
 
     # ``--metric euclidean`` keeps the mock-driven test runner-focused —
     # the v2.1 default flipped to ``mahalanobis``, which would try to
     # load a real whitener from disk and fail under the mocked Profile.
-    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v",
+    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v",
               "--metric", "euclidean"])
     out = capsys.readouterr().out
     assert "angry.calm vs all installed" in out
@@ -643,20 +478,8 @@ def test_run_compare_one_arg_verbose_text(monkeypatch: pytest.MonkeyPatch, tmp_p
 def test_run_compare_one_arg_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """1-arg + -v -j JSON mode: output includes per_layer_top3 key."""
     import json as _json
-    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id
-    sid = safe_model_id(model_id)
-
-    target_dir = vdir / "default" / "angry.calm"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(target_dir, "angry.calm")
-
-    happy_dir = vdir / "default" / "happy.sad"
-    happy_dir.mkdir(parents=True, exist_ok=True)
-    (happy_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(happy_dir, "happy.sad")
 
     happy_profile = _mock_profile(lambda o: None, lambda o: None)
     target_profile = _mock_profile(
@@ -664,18 +487,12 @@ def test_run_compare_one_arg_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_p
         lambda o: {14: 0.5122, 15: 0.4891},
     )
 
-    profiles_by_path = {
-        str(target_dir / f"{sid}.safetensors"): target_profile,
-        str(happy_dir / f"{sid}.safetensors"): happy_profile,
-    }
+    _patch_fold_helpers(monkeypatch, {
+        "angry.calm": target_profile,
+        "happy.sad": happy_profile,
+    })
 
-    from saklas.core.profile import Profile
-
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    cli.main(["vector", "compare", "angry.calm", "-m", model_id, "-v", "-j",
+    cli.main(["subspace","compare", "angry.calm", "-m", model_id, "-v", "-j",
               "--metric", "euclidean"])
     out = capsys.readouterr().out
     data = _json.loads(out)
@@ -690,33 +507,17 @@ def test_run_compare_one_arg_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_p
 def test_run_compare_matrix_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """3-arg N×N + -v -j JSON mode: output includes per_layer dict keyed by 'a|b'."""
     import json as _json
-    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id
-    sid = safe_model_id(model_id)
 
     concepts = ["angry.calm", "happy.sad", "warm.clinical"]
-    dirs = {}
-    for c in concepts:
-        d = vdir / "default" / c
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"{sid}.safetensors").write_bytes(b"x")
-        _install_concept_pack(d, c)
-        dirs[c] = d
-
-    from saklas.core.profile import Profile
-
     per_layer_vals = {14: 0.3456, 15: 0.2345}
-    profiles_by_path: dict[str, Any] = {}
-    for c in concepts:
-        fp = _mock_profile(lambda o: 0.25, lambda o: per_layer_vals)
-        profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
+    _patch_fold_helpers(monkeypatch, {
+        c: _mock_profile(lambda o: 0.25, lambda o: per_layer_vals)
+        for c in concepts
+    })
 
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v", "-j",
+    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v", "-j",
                                                   "--metric", "euclidean"])
     out = capsys.readouterr().out
     data = _json.loads(out)
@@ -732,31 +533,16 @@ def test_run_compare_matrix_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
 def test_run_compare_matrix_verbose_text_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """3-arg N×N + -v text mode: no per-layer section (text matrix is dense enough)."""
-    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id
-    sid = safe_model_id(model_id)
 
     concepts = ["angry.calm", "happy.sad", "warm.clinical"]
-    dirs = {}
-    for c in concepts:
-        d = vdir / "default" / c
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"{sid}.safetensors").write_bytes(b"x")
-        _install_concept_pack(d, c)
-        dirs[c] = d
+    _patch_fold_helpers(monkeypatch, {
+        c: _mock_profile(lambda o: 0.25, lambda o: {14: 0.1})
+        for c in concepts
+    })
 
-    from saklas.core.profile import Profile
-    profiles_by_path: dict[str, Any] = {}
-    for c in concepts:
-        fp = _mock_profile(lambda o: 0.25, lambda o: {14: 0.1})
-        profiles_by_path[str(dirs[c] / f"{sid}.safetensors")] = fp
-
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profiles_by_path[str(p)]))
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    cli.main(["vector", "compare"] + concepts + ["-m", model_id, "-v",
+    cli.main(["subspace","compare"] + concepts + ["-m", model_id, "-v",
                                                   "--metric", "euclidean"])
     out = capsys.readouterr().out
     assert "per-layer" not in out
@@ -769,13 +555,11 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch: pytest.MonkeyPat
 # ---------------------------------------------------------------------------
 
 def _setup_why_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Set SAKLAS_HOME, materialize bundled, return vectors_dir."""
+    """Set SAKLAS_HOME and return the manifolds_dir path."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
     from saklas.io import selectors
     selectors.invalidate()
-    return tmp_path / "vectors"
+    return tmp_path / "manifolds"
 
 
 def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] | None = None) -> Any:
@@ -807,24 +591,24 @@ def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] 
 
 
 def test_parse_vector_why_basic():
-    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar"])
-    assert args.command == "vector"
-    assert args.vector_cmd == "why"
+    args = cli.parse_args(["subspace","why", "angry.calm", "-m", "foo/bar"])
+    assert args.command == "subspace"
+    assert args.subspace_cmd == "why"
     assert args.concept == "angry.calm"
     assert args.model == "foo/bar"
     assert args.json_output is False
 
 
 def test_parse_vector_why_json():
-    args = cli.parse_args(["vector", "why", "angry.calm", "-m", "foo/bar", "-j"])
+    args = cli.parse_args(["subspace","why", "angry.calm", "-m", "foo/bar", "-j"])
     assert args.json_output is True
 
 
 def test_parse_vector_why_removed_flags_rejected():
     # ``--all`` and ``-n`` were removed with the histogram overhaul.
     for argv in (
-        ["vector", "why", "angry.calm", "-m", "foo/bar", "--all"],
-        ["vector", "why", "angry.calm", "-m", "foo/bar", "-n", "10"],
+        ["subspace","why", "angry.calm", "-m", "foo/bar", "--all"],
+        ["subspace","why", "angry.calm", "-m", "foo/bar", "-n", "10"],
     ):
         with pytest.raises(SystemExit):
             cli.parse_args(argv)
@@ -832,30 +616,19 @@ def test_parse_vector_why_removed_flags_rejected():
 
 def test_parse_vector_why_missing_model_errors():
     with pytest.raises(SystemExit):
-        cli.parse_args(["vector", "why", "angry.calm"])
+        cli.parse_args(["subspace","why", "angry.calm"])
 
 
 def test_run_why_text_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """Text output renders a per-bucket histogram covering every layer."""
-    vdir = _setup_why_env(monkeypatch, tmp_path)
+    _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id
-    sid = safe_model_id(model_id)
-
-    target_dir = vdir / "default" / "angry.calm"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(target_dir, "angry.calm")
 
     layer_mags = {14: 0.847, 15: 0.812, 13: 0.793, 12: 0.641, 11: 0.589, 10: 0.400}
     profile = _mock_why_profile(layer_mags)
+    _patch_fold_helpers(monkeypatch, {"angry.calm": profile})
 
-    from saklas.core.profile import Profile
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    cli.main(["vector", "why", "angry.calm", "-m", model_id])
+    cli.main(["subspace","why", "angry.calm", "-m", model_id])
     out = capsys.readouterr().out
     assert "angry.calm" in out
     assert "6 layers" in out
@@ -870,25 +643,14 @@ def test_run_why_text_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
 
 def test_run_why_text_buckets_large_profile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """With >24 layers, buckets collapse into layer ranges."""
-    vdir = _setup_why_env(monkeypatch, tmp_path)
+    _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id
-    sid = safe_model_id(model_id)
-
-    target_dir = vdir / "default" / "angry.calm"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(target_dir, "angry.calm")
 
     layer_mags = {i: float(i + 1) * 0.01 for i in range(62)}
     profile = _mock_why_profile(layer_mags)
+    _patch_fold_helpers(monkeypatch, {"angry.calm": profile})
 
-    from saklas.core.profile import Profile
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    cli.main(["vector", "why", "angry.calm", "-m", model_id])
+    cli.main(["subspace","why", "angry.calm", "-m", model_id])
     out = capsys.readouterr().out
     assert "62 layers" in out
     # Range label form used when buckets span more than one layer.
@@ -902,25 +664,14 @@ def test_run_why_text_buckets_large_profile(monkeypatch: pytest.MonkeyPatch, tmp
 def test_run_why_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """JSON output is full-fidelity, in layer order."""
     import json as _json
-    vdir = _setup_why_env(monkeypatch, tmp_path)
+    _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id
-    sid = safe_model_id(model_id)
-
-    target_dir = vdir / "default" / "angry.calm"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / f"{sid}.safetensors").write_bytes(b"x")
-    _install_concept_pack(target_dir, "angry.calm")
 
     layer_mags = {14: 0.847, 15: 0.812, 13: 0.793}
     profile = _mock_why_profile(layer_mags)
+    _patch_fold_helpers(monkeypatch, {"angry.calm": profile})
 
-    from saklas.core.profile import Profile
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: profile))
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    cli.main(["vector", "why", "angry.calm", "-m", model_id, "-j"])
+    cli.main(["subspace","why", "angry.calm", "-m", model_id, "-j"])
     out = capsys.readouterr().out
     data = _json.loads(out)
     assert data["concept"] == "angry.calm"
@@ -933,8 +684,9 @@ def test_run_why_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
 def test_run_why_concept_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """Missing concept exits with code 1."""
     _setup_why_env(monkeypatch, tmp_path)
+    _patch_fold_helpers(monkeypatch, {})  # nothing folds → miss
     with pytest.raises(SystemExit) as exc:
-        cli.main(["vector", "why", "nonexistent_concept_xyz", "-m", "foo/bar"])
+        cli.main(["subspace","why", "nonexistent_concept_xyz", "-m", "foo/bar"])
     assert exc.value.code == 1
 
 
@@ -966,55 +718,28 @@ def test_split_variant_suffix_parses_sae_variants():
     )
 
 
-def test_resolve_variant_tensor_accepts_full_variant_family(tmp_path: Path):
-    from saklas.cli.runners import _resolve_variant_tensor
-    from saklas.io.paths import tensor_filename
-
-    model_id = "fake/model"
-    folder = tmp_path / "angry.calm"
-    folder.mkdir()
-    role = folder / tensor_filename(model_id, role="pirate")
-    transferred = folder / tensor_filename(
-        model_id, transferred_from="google/gemma-4-31b-it",
-    )
-    for path in (role, transferred):
-        path.write_bytes(b"x")
-
-    assert _resolve_variant_tensor(folder, model_id, "role") == role
-    assert _resolve_variant_tensor(folder, model_id, "role-pirate") == role
-    assert (
-        _resolve_variant_tensor(folder, model_id, "from-google__gemma-4-31b-it")
-        == transferred
-    )
+# NOTE: ``test_resolve_variant_tensor_accepts_full_variant_family`` was deleted
+# in 4.0 — ``runners._resolve_variant_tensor`` was removed (compare/why fold
+# fitted manifolds now, no ``vectors/`` ``Profile.load`` tensor pick).
+# ``test_run_why_sae_ambiguous_errors`` was also deleted: the "multiple SAE
+# variants" error came from the removed ``enumerate_variants`` tensor scan; the
+# fold helper now simply returns ``None`` for a bare ``:sae`` (→ "no fitted
+# manifold").
 
 
 def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """``vector why foo:sae`` must load the SAE tensor, not the raw one."""
-    vdir = _setup_why_env(monkeypatch, tmp_path)
+    """``subspace why foo:sae-<rel>`` folds the SAE-variant manifold tensor."""
+    _setup_why_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id, tensor_filename
-    sid = safe_model_id(model_id)
-
-    target_dir = vdir / "default" / "angry.calm"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    # Two tensors for the same model: raw and SAE. The caller picks via suffix.
-    raw_path = target_dir / f"{sid}.safetensors"
-    sae_path = target_dir / tensor_filename(model_id, release="my-release")
-    raw_path.write_bytes(b"x")
-    sae_path.write_bytes(b"x")
-    _install_concept_pack(target_dir, "angry.calm")
 
     raw_profile = _mock_why_profile({0: 0.1, 1: 0.1})
     sae_profile = _mock_why_profile({14: 0.9, 15: 0.8})
+    _patch_fold_helpers(monkeypatch, {
+        "angry.calm": raw_profile,
+        "angry.calm:sae-my-release": sae_profile,
+    })
 
-    by_path = {str(raw_path): raw_profile, str(sae_path): sae_profile}
-
-    from saklas.core.profile import Profile
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: by_path[str(p)]))
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    cli.main(["vector", "why", "angry.calm:sae-my-release", "-m", model_id])
+    cli.main(["subspace","why", "angry.calm:sae-my-release", "-m", model_id])
     out = capsys.readouterr().out
     # Suffix propagates into the display name.
     assert "angry.calm:sae-my-release" in out
@@ -1024,65 +749,22 @@ def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert "L0" not in out
 
 
-def test_run_why_sae_ambiguous_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """``:sae`` with multiple installed SAE variants must error out."""
-    vdir = _setup_why_env(monkeypatch, tmp_path)
-    model_id = "fake/model"
-    from saklas.io.paths import tensor_filename
-
-    target_dir = vdir / "default" / "angry.calm"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / tensor_filename(model_id, release="release-a")).write_bytes(b"x")
-    (target_dir / tensor_filename(model_id, release="release-b")).write_bytes(b"x")
-    _install_concept_pack(target_dir, "angry.calm")
-
-    from saklas.io.selectors import invalidate
-    invalidate()
-
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["vector", "why", "angry.calm:sae", "-m", model_id])
-    assert exc.value.code == 1
-    err = capsys.readouterr().err
-    assert "multiple SAE variants" in err
-
-
 def test_run_compare_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """Each concept in ``vector compare`` parses its own :variant suffix."""
-    vdir = _setup_compare_env(monkeypatch, tmp_path)
+    """Each concept in ``subspace compare`` parses its own :variant suffix."""
+    _setup_compare_env(monkeypatch, tmp_path)
     model_id = "fake/model"
-    from saklas.io.paths import safe_model_id, tensor_filename
-    sid = safe_model_id(model_id)
-
-    a_dir = vdir / "default" / "angry.calm"
-    b_dir = vdir / "default" / "happy.sad"
-    a_dir.mkdir(parents=True, exist_ok=True)
-    b_dir.mkdir(parents=True, exist_ok=True)
-    # `angry.calm` has a raw tensor and an SAE tensor; `happy.sad` has only raw.
-    a_raw = a_dir / f"{sid}.safetensors"
-    a_sae = a_dir / tensor_filename(model_id, release="my-release")
-    b_raw = b_dir / f"{sid}.safetensors"
-    for p in (a_raw, a_sae, b_raw):
-        p.write_bytes(b"x")
-    _install_concept_pack(a_dir, "angry.calm")
-    _install_concept_pack(b_dir, "happy.sad")
 
     a_raw_profile = _mock_profile(lambda o: 0.1, lambda o: {0: 0.1})
     a_sae_profile = _mock_profile(lambda o: 0.9, lambda o: {14: 0.9})
     b_profile = _mock_profile(lambda o: 0.5, lambda o: {0: 0.5})
-
-    by_path = {
-        str(a_raw): a_raw_profile,
-        str(a_sae): a_sae_profile,
-        str(b_raw): b_profile,
-    }
-
-    from saklas.core.profile import Profile
-    monkeypatch.setattr(Profile, "load", staticmethod(lambda p: by_path[str(p)]))
-    from saklas.io.selectors import invalidate
-    invalidate()
+    _patch_fold_helpers(monkeypatch, {
+        "angry.calm": a_raw_profile,
+        "angry.calm:sae-my-release": a_sae_profile,
+        "happy.sad": b_profile,
+    })
 
     cli.main([
-        "vector", "compare",
+        "subspace","compare",
         "angry.calm:sae-my-release", "happy.sad",
         "-m", model_id,
         "--metric", "euclidean",
@@ -1094,31 +776,31 @@ def test_run_compare_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
 
 def test_config_bare_pole_resolves_canonical(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Config YAML with bare pole 'wolf' should resolve to 'deer.wolf' with -1 sign."""
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import packs
-    packs.materialize_bundled()
+    """4.0: a config-YAML bare pole resolves through the MANIFOLD tier.
 
-    # Create a fake deer.wolf pack under local so resolve_pole sees it.
-    d = tmp_path / "vectors" / "local" / "deer.wolf"
-    d.mkdir(parents=True)
-    (d / "statements.json").write_text("[]")
-    packs.PackMetadata(
-        name="deer.wolf", description="x", version="1.0.0", license="MIT",
-        tags=[], recommended_alpha=0.5, source="local",
-        files={"statements.json": packs.hash_file(d / "statements.json")},
-    ).write(d)
-    # Invalidate selector cache so the new pack is visible.
+    Pre-4.0 a ``deer.wolf`` ``vectors/`` pack made bare ``wolf`` resolve to
+    the signed vector ``deer.wolf @ -0.5``.  Now a bipolar concept is a 2-node
+    ``pca`` manifold (nodes ``deer``/``wolf``), so ``0.5 wolf`` resolves to a
+    label-form ``ManifoldTerm`` at the ``wolf`` node (``default/deer.wolf%wolf``).
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import create_discover_manifold_folder
+    create_discover_manifold_folder(
+        "default", "deer.wolf", "x", fit_mode="pca",
+        node_corpora={"deer": ["a statement."], "wolf": ["b statement."]},
+        hyperparams={"max_dim": 1},
+    )
     from saklas.io.selectors import invalidate
     invalidate()
 
-    # The parser runs pole resolution on the expression: bare ``wolf``
-    # resolves to ``deer.wolf`` with sign -1, so the 0.5 coefficient
-    # becomes -0.5 in the resulting Steering.alphas.
-    from saklas.core.steering_expr import parse_expr
+    from saklas.core.steering_expr import ManifoldTerm, parse_expr
     steering = parse_expr("0.5 wolf")
-    assert "deer.wolf" in steering.alphas
-    assert steering.alphas["deer.wolf"] == -0.5
+    assert "default/deer.wolf%wolf" in steering.alphas
+    term = steering.alphas["default/deer.wolf%wolf"]
+    assert isinstance(term, ManifoldTerm)
+    assert term.manifold == "default/deer.wolf"
+    assert term.position == "wolf"
+    assert term.along == 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -1128,7 +810,7 @@ def test_config_bare_pole_resolves_canonical(monkeypatch: pytest.MonkeyPatch, tm
 def test_vector_extract_parses_sae_flag():
     """--sae RELEASE is captured on the Namespace as `sae`."""
     args = cli.parse_args([
-        "vector", "extract", "honest.deceptive",
+        "subspace","extract", "honest.deceptive",
         "-m", "google/gemma-2-2b-it",
         "--sae", "gemma-scope-2b-pt-res-canonical",
     ])
@@ -1138,7 +820,7 @@ def test_vector_extract_parses_sae_flag():
 
 def test_vector_extract_sae_revision():
     args = cli.parse_args([
-        "vector", "extract", "honest.deceptive",
+        "subspace","extract", "honest.deceptive",
         "-m", "google/gemma-2-2b-it",
         "--sae", "release-x",
         "--sae-revision", "v1.0",
@@ -1149,7 +831,7 @@ def test_vector_extract_sae_revision():
 
 def test_vector_extract_no_sae_defaults_to_none():
     args = cli.parse_args([
-        "vector", "extract", "honest.deceptive", "-m", "model",
+        "subspace","extract", "honest.deceptive", "-m", "model",
     ])
     assert args.sae is None
     assert args.sae_revision is None
@@ -1159,49 +841,7 @@ def test_vector_extract_sae_requires_value():
     """--sae must be followed by a release name; it's not a boolean switch."""
     with pytest.raises(SystemExit):
         cli.parse_args([
-            "vector", "extract", "honest.deceptive", "-m", "m", "--sae",
+            "subspace","extract", "honest.deceptive", "-m", "m", "--sae",
         ])
 
 
-# ---------------------------------------------------------------------------
-# pack push / pack clear --variant
-# ---------------------------------------------------------------------------
-
-def test_pack_push_variant_flag_default_raw():
-    """--variant default is 'raw' for push — users opt into sharing SAE variants."""
-    args = cli.parse_args([
-        "pack", "push", "honest.deceptive", "-m", "model",
-    ])
-    assert args.variant == "raw"
-
-
-def test_pack_push_variant_all():
-    args = cli.parse_args([
-        "pack", "push", "honest.deceptive", "-m", "model",
-        "--variant", "all",
-    ])
-    assert args.variant == "all"
-
-
-def test_pack_push_variant_sae():
-    args = cli.parse_args([
-        "pack", "push", "honest.deceptive", "-m", "model",
-        "--variant", "sae",
-    ])
-    assert args.variant == "sae"
-
-
-def test_pack_clear_variant_flag_default_all():
-    """--variant default is 'all' for clear — stale extractions should be fully gone."""
-    args = cli.parse_args([
-        "pack", "clear", "honest.deceptive",
-    ])
-    assert args.variant == "all"
-
-
-def test_pack_push_variant_rejects_unknown():
-    with pytest.raises(SystemExit):
-        cli.parse_args([
-            "pack", "push", "honest.deceptive", "-m", "model",
-            "--variant", "weird",
-        ])

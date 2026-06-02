@@ -68,28 +68,37 @@ def _write_fitted_manifold(
 
 class TestFoldHelper:
     def test_fold_returns_profile_for_fitted_manifold(self) -> None:
-        from saklas.cli.runners import _fold_manifold_to_profile
+        from saklas.cli.runners import _fold_manifold_to_profile_with_identity
 
         _write_fitted_manifold("default", "happy.sad")
-        prof = _fold_manifold_to_profile("happy.sad", _MODEL, None)
-        assert prof is not None
+        folded = _fold_manifold_to_profile_with_identity("happy.sad", _MODEL, None)
+        assert folded is not None
+        prof, ns, bare = folded
         assert sorted(prof.layers) == [2, 5]
+        assert (ns, bare) == ("default", "happy.sad")
 
     def test_fold_returns_none_when_unfitted(self) -> None:
-        from saklas.cli.runners import _fold_manifold_to_profile
+        from saklas.cli.runners import _fold_manifold_to_profile_with_identity
         # No tensor on disk for this model → miss (caller nudges to fit).
-        assert _fold_manifold_to_profile("happy.sad", _MODEL, None) is None
+        assert (
+            _fold_manifold_to_profile_with_identity("happy.sad", _MODEL, None)
+            is None
+        )
 
     def test_fold_bare_name_collision_raises(self) -> None:
-        from saklas.cli.runners import _fold_manifold_to_profile
+        from saklas.cli.runners import _fold_manifold_to_profile_with_identity
         from saklas.io.selectors import AmbiguousSelectorError
 
         _write_fitted_manifold("default", "happy.sad")
         _write_fitted_manifold("alice", "happy.sad")
         with pytest.raises(AmbiguousSelectorError):
-            _fold_manifold_to_profile("happy.sad", _MODEL, None)
+            _fold_manifold_to_profile_with_identity("happy.sad", _MODEL, None)
         # Namespace-qualified resolves cleanly.
-        assert _fold_manifold_to_profile("alice/happy.sad", _MODEL, None) is not None
+        folded = _fold_manifold_to_profile_with_identity(
+            "alice/happy.sad", _MODEL, None,
+        )
+        assert folded is not None
+        assert folded[1:] == ("alice", "happy.sad")
 
     def test_fold_all_fitted_excludes_target(self) -> None:
         from saklas.cli.runners import _fold_all_fitted_manifolds
@@ -250,12 +259,12 @@ def _make_full_manifold(ns: str, name: str, *, seed: int = 0) -> Path:
 
 class TestMergeFold:
     def test_merge_folds_manifold_components(self) -> None:
-        from saklas.io.merge import merge_into_pack
+        from saklas.io.merge import merge_into_manifold
         from saklas.io.paths import safe_model_id
 
         _write_fitted_manifold("default", "happy.sad", seed=1)
         _write_fitted_manifold("default", "warm.clinical", seed=2)
-        dst = merge_into_pack(
+        dst = merge_into_manifold(
             "merged",
             "0.5 default/happy.sad + 0.5 default/warm.clinical",
             model=_MODEL,
@@ -263,11 +272,11 @@ class TestMergeFold:
         assert (dst / f"{safe_model_id(_MODEL)}.safetensors").exists()
 
     def test_merge_missing_component_errors(self) -> None:
-        from saklas.io.merge import merge_into_pack, MergeError
+        from saklas.io.merge import merge_into_manifold, MergeError
 
         _write_fitted_manifold("default", "happy.sad", seed=1)
         with pytest.raises(MergeError):
-            merge_into_pack(
+            merge_into_manifold(
                 "merged",
                 "0.5 default/happy.sad + 0.5 default/nonexistent",
                 model=_MODEL,
@@ -280,21 +289,19 @@ class TestMergeFold:
 
 class TestGgufFold:
     def test_export_gguf_folds_manifold(self, tmp_path: Path) -> None:
-        from saklas.io.cache_ops import export_gguf
-        from saklas.io.selectors import parse as sel_parse
+        from saklas.io.cache_ops import _export_gguf_manifold
 
         _make_full_manifold("default", "happy.sad")
         out = tmp_path / "happy.gguf"
-        written = export_gguf(
-            sel_parse("default/happy.sad"),
+        written = _export_gguf_manifold(
+            "default", "happy.sad",
             model_scope=_MODEL, output=str(out), model_hint="llama",
         )
         assert written == [out]
         assert out.is_file()
 
     def test_export_gguf_unfitted_errors(self, tmp_path: Path) -> None:
-        from saklas.io.cache_ops import export_gguf
-        from saklas.io.selectors import parse as sel_parse
+        from saklas.io.cache_ops import _export_gguf_manifold
 
         # manifold.json but no fitted tensor for the model.
         from saklas.io.manifolds import create_discover_manifold_folder
@@ -304,8 +311,8 @@ class TestGgufFold:
             hyperparams={"max_dim": 1},
         )
         with pytest.raises(RuntimeError, match="no fitted manifold"):
-            export_gguf(
-                sel_parse("default/happy.sad"),
+            _export_gguf_manifold(
+                "default", "happy.sad",
                 model_scope=_MODEL, output=str(tmp_path / "x.gguf"),
                 model_hint="llama",
             )

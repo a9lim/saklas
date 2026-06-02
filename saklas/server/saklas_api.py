@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
-from saklas.io.probes_bootstrap import load_defaults  # noqa: F401
+from saklas.io.probes_bootstrap import load_default_manifolds as load_defaults  # noqa: F401
 from saklas.core.loom import LoomMutated
 from saklas.core.profile import Profile
 from saklas.core.results import GenerationResult, RunSet
@@ -77,7 +77,6 @@ class ExtractRequest(BaseModel):
     name: str
     source: Any = None
     baseline: str | None = None
-    dls: bool | None = None
     sae: str | None = None
     sae_revision: str | None = None
     # Role-augmented extraction (engine: ``core/role_templates``).  When
@@ -288,7 +287,8 @@ class MergeVectorRequest(BaseModel):
 
     ``expression`` is a merge expression in the shared steering grammar
     (``"0.3 default/honest + 0.4 default/warm"``); ``name`` becomes the
-    new merged pack's local name.  Reuses :func:`saklas.io.merge.merge_into_pack`.
+    new merged manifold's local name.  Reuses
+    :func:`saklas.io.merge.merge_into_manifold`.
     """
     name: str
     expression: str
@@ -550,31 +550,42 @@ def _build_steering(
     return Steering(alphas=merged, thinking=thinking)
 
 
-def _coerce_pair_source(source: Any, name: str) -> Any:
-    """Normalize JSON pair payloads into an extraction source.
+def _coerce_corpora(source: Any) -> Any:
+    """Normalize a JSON extract source into a concept name or two pole corpora.
 
-    A concept-name string passes through unchanged. A ``{pairs: [...]}``
-    object or a bare ``{positive, negative}`` object is turned into a
-    :class:`~saklas.io.datasource.DataSource` carrying ``name`` — *not*
-    a bare list. A bare list source is named ``"custom"`` by the
-    extraction pipeline regardless of the request's ``name``, so two
-    explicit-pair extractions would collide on the ``local/custom/``
-    folder and the ``"custom"`` tensor-cache key; the ``DataSource``
-    keeps each one under its own canonical name.
+    A concept-name string passes through unchanged.  A
+    ``{positive: [...], negative: [...]}`` object (two pole corpora), a
+    ``{pairs: [{positive, negative}, ...]}`` object, or a bare single
+    ``{positive, negative}`` object are all turned into a
+    ``(positive_corpus, negative_corpus)`` tuple — the two node corpora of the
+    2-node ``pca`` manifold the steering vector is fit as.  No
+    ``{positive, negative}`` pairs are retained: hand-authored contrastive
+    examples become two independent corpora at the boundary.
     """
     if not isinstance(source, dict):
         return source
 
+    # Two-corpora form: ``{positive: [...], negative: [...]}``.
+    if (
+        isinstance(source.get("positive"), list)
+        and isinstance(source.get("negative"), list)
+    ):
+        return (
+            [str(s) for s in source["positive"]],
+            [str(s) for s in source["negative"]],
+        )
+
+    # Pairs / single-pair forms — unzip into the two corpora.
     raw_pairs: list[Any]
     if "pairs" in source:
         raw_pairs = list(source["pairs"])
     elif "positive" in source and "negative" in source:
-        # A bare single-pair object.
         raw_pairs = [source]
     else:
         return source
 
-    pairs: list[tuple[str, str]] = []
+    positive: list[str] = []
+    negative: list[str] = []
     for idx, pair in enumerate(raw_pairs):
         if isinstance(pair, dict):
             if "positive" not in pair or "negative" not in pair:
@@ -582,17 +593,17 @@ def _coerce_pair_source(source: Any, name: str) -> Any:
                     400,
                     f"pairs[{idx}] must contain 'positive' and 'negative'",
                 )
-            pairs.append((str(pair["positive"]), str(pair["negative"])))
+            positive.append(str(pair["positive"]))
+            negative.append(str(pair["negative"]))
         elif isinstance(pair, (list, tuple)) and len(pair) == 2:
-            pairs.append((str(pair[0]), str(pair[1])))
+            positive.append(str(pair[0]))
+            negative.append(str(pair[1]))
         else:
             raise HTTPException(
                 400,
                 f"pairs[{idx}] must be a [positive, negative] pair",
             )
-
-    from saklas.io.datasource import DataSource
-    return DataSource(pairs=pairs, name=name)
+    return positive, negative
 
 
 def _result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
@@ -706,11 +717,6 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     from saklas.server.manifold_probe_routes import register_manifold_probe_routes
     register_manifold_probe_routes(app)
-
-    # ----- packs (top-level, not under a session) ------------------------
-
-    from saklas.server.pack_routes import register_pack_routes
-    register_pack_routes(app)
 
     # ----- sessions collection -------------------------------------------
 
@@ -1402,22 +1408,32 @@ def register_saklas_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/extract")
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
         _resolve_session_id(session, session_id)
-        source: Any = req.source if req.source is not None else req.name
-        source = _coerce_pair_source(source, req.name)
+        coerced: Any = _coerce_corpora(
+            req.source if req.source is not None else req.name
+        )
+
+        def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
+            # Two pole corpora -> author + fit directly; a concept name ->
+            # generate the corpora first.  Both land a 2-node ``pca`` manifold.
+            if isinstance(coerced, tuple):
+                positive, negative = coerced
+                return session.extract_vector_from_corpora(
+                    req.name, positive, negative,
+                    on_progress=on_progress,
+                    sae=req.sae, sae_revision=req.sae_revision,
+                    role=req.role, namespace=req.namespace, force=req.force,
+                )
+            return session.extract(
+                coerced, req.baseline,
+                on_progress=on_progress,
+                sae=req.sae, sae_revision=req.sae_revision,
+                role=req.role, namespace=req.namespace, force=req.force,
+            )
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
             async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                canonical, profile = await asyncio.to_thread(
-                    session.extract, source, req.baseline,
-                    on_progress=on_progress,
-                    sae=req.sae,
-                    sae_revision=req.sae_revision,
-                    dls=req.dls,
-                    role=req.role,
-                    namespace=req.namespace,
-                    force_statements=req.force,
-                )
+                canonical, profile = await asyncio.to_thread(_run, on_progress)
                 registry_name = _extract_registry_name(canonical, req.namespace)
                 if req.auto_register:
                     session.steer(registry_name, profile)
@@ -1436,16 +1452,7 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         progress_msgs: list[str] = []
         async with session.lock:
-            canonical, profile = await asyncio.to_thread(
-                session.extract, source, req.baseline,
-                on_progress=progress_msgs.append,
-                sae=req.sae,
-                sae_revision=req.sae_revision,
-                dls=req.dls,
-                role=req.role,
-                namespace=req.namespace,
-                force_statements=req.force,
-            )
+            canonical, profile = await asyncio.to_thread(_run, progress_msgs.append)
             registry_name = _extract_registry_name(canonical, req.namespace)
             if req.auto_register:
                 session.steer(registry_name, profile)
@@ -1536,15 +1543,18 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
     async def merge_vector(session_id: str, req: MergeVectorRequest):
-        """Merge an expression of installed vectors into a new local pack.
+        """Merge an expression of installed directions into a baked manifold.
 
-        Wraps :func:`saklas.io.merge.merge_into_pack` (model-scoped to
-        the session's loaded model), then loads the merged tensor into
-        ``session._profiles`` so it's immediately steerable. Returns the
-        same profile-JSON shape ``GET /vectors/{name}`` produces.
+        Wraps :func:`saklas.io.merge.merge_into_manifold` (model-scoped to
+        the session's loaded model) — the merge lands a corpus-less
+        ``fit_mode="baked"`` manifold — then folds the fitted tensor back to a
+        steering Profile and registers it so it's immediately steerable.
+        Returns the same profile-JSON shape ``GET /vectors/{name}`` produces.
         """
-        from saklas.io.merge import merge_into_pack, MergeError
+        from saklas.io.merge import merge_into_manifold, MergeError
         from saklas.io.paths import tensor_filename
+        from saklas.core.manifold import load_manifold
+        from saklas.core.vectors import folded_vector_directions
         from saklas.server.manifold_routes import _refuse_if_busy
         _resolve_session_id(session, session_id)
 
@@ -1555,7 +1565,7 @@ def register_saklas_routes(app: FastAPI) -> None:
             _refuse_if_busy(session)
             try:
                 dst_folder = await asyncio.to_thread(
-                    merge_into_pack,
+                    merge_into_manifold,
                     req.name,
                     req.expression,
                     session.model_id,
@@ -1571,7 +1581,12 @@ def register_saklas_routes(app: FastAPI) -> None:
                     500,
                     f"merge produced no tensor for {session.model_id} at {tensor_path}",
                 )
-            profile = await asyncio.to_thread(session.load_profile, str(tensor_path))
+
+            def _load_folded() -> Profile:
+                manifold = load_manifold(str(tensor_path))
+                return Profile(folded_vector_directions(manifold))
+
+            profile = await asyncio.to_thread(_load_folded)
             session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
 

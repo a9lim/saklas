@@ -7,8 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from saklas.io import packs
-from saklas.io.packs import PACK_FORMAT_VERSION, PackFormatError
+from saklas.io.packs import PACK_FORMAT_VERSION
 from saklas.core.profile import Profile, ProfileError
 from saklas.core.vectors import save_profile, load_profile
 
@@ -62,48 +61,10 @@ def test_profile_save_roundtrip_uses_format_version(tmp_path: Path):
     assert back.layers == [0, 1]
 
 
-def test_pack_metadata_rejects_format_version_one(tmp_path: Path):
-    d = tmp_path / "p"
-    d.mkdir()
-    (d / "pack.json").write_text(json.dumps({
-        "name": "p",
-        "description": "x",
-        "format_version": 1,
-        "version": "1.0.0",
-        "license": "MIT",
-        "tags": [],
-        "recommended_alpha": 0.5,
-        "source": "local",
-        "files": {},
-    }))
-    with pytest.raises(PackFormatError, match="upgrade_packs"):
-        packs.PackMetadata.load(d)
-
-
-def test_pack_metadata_rejects_missing_format_version(tmp_path: Path):
-    d = tmp_path / "p"
-    d.mkdir()
-    (d / "pack.json").write_text(json.dumps({
-        "name": "p",
-        "description": "x",
-        "version": "1.0.0",
-        "license": "MIT",
-        "tags": [],
-        "recommended_alpha": 0.5,
-        "source": "local",
-        "files": {},
-    }))
-    with pytest.raises(PackFormatError, match="upgrade_packs"):
-        packs.PackMetadata.load(d)
-
-
-def test_pack_metadata_write_includes_format_version(tmp_path: Path):
-    d = tmp_path / "p"
-    d.mkdir()
-    meta = packs.PackMetadata(
-        name="p", description="x", version="1.0.0", license="MIT",
-        tags=[], recommended_alpha=0.5, source="local", files={},
-    )
-    meta.write(d)
-    data = json.loads((d / "pack.json").read_text())
-    assert data["format_version"] == PACK_FORMAT_VERSION
+# NOTE: the three ``test_pack_metadata_*`` tests were deleted in 4.0 —
+# ``saklas.io.packs.PackMetadata`` (the ``vectors/`` ``pack.json`` dataclass
+# and its ``format_version`` load gate) was removed.  Concepts ship as
+# manifolds now; the manifold-side ``format_version`` gate is covered by the
+# ``MANIFOLD_FORMAT_VERSION`` tests in ``test_manifold_format.py``.  The
+# ``save_profile`` / ``Profile`` sidecar ``format_version`` checks above
+# (still using ``PACK_FORMAT_VERSION``, which SURVIVES) stay.

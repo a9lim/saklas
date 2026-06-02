@@ -340,29 +340,32 @@ def test_bare_name_resolves_to_manifold_term(tmp_path: Path, monkeypatch: pytest
     assert term.position == "pirate"
 
 
-def test_parse_bare_name_cross_tier_collision_raises(
+def test_parse_bare_name_resolves_on_manifold_tier_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
+    """4.0: ``resolve_pole`` no longer matches a bipolar pole, so a bare name
+    can't collide across the pole/manifold tiers.  Even with a ``civilian.pirate``
+    manifold present, a bare ``pirate`` resolves purely on the manifold-label
+    tier — the only ambiguity left is *within* the manifold tier (two
+    manifolds carrying the same node label).
+
+    (Pre-4.0 this raised ``AmbiguousSelectorError`` because ``pirate`` was both
+    a bipolar pole of ``civilian.pirate`` and a node of ``persona``.)
+    """
     from saklas.io.manifolds import create_discover_manifold_folder
-    from saklas.io.packs import PackMetadata, hash_folder_files
     from saklas.io.selectors import AmbiguousSelectorError, invalidate
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    vector_folder = tmp_path / "vectors" / "default" / "civilian.pirate"
-    vector_folder.mkdir(parents=True)
-    (vector_folder / "statements.json").write_text(json.dumps([]))
-    PackMetadata(
-        name="civilian.pirate",
-        description="test",
-        version="1.0.0",
-        license="MIT",
-        tags=[],
-        recommended_alpha=0.5,
-        source="local",
-        files=hash_folder_files(vector_folder),
-    ).write(vector_folder)
-
+    # A ``civilian.pirate`` manifold — its node labels are ``civilian``/``pirate``,
+    # but the manifold *name* (with a ``.``) is addressed via ``resolve_manifold_name``
+    # at its node-0 pole, never via the bare-label tier.
+    create_discover_manifold_folder(
+        "default", "civilian.pirate", "test",
+        fit_mode="pca",
+        node_corpora={"civilian": ["meek"], "pirate": ["arr"]},
+        hyperparams={"max_dim": 1},
+    )
     create_discover_manifold_folder(
         "local", "persona", "test",
         fit_mode="pca",
@@ -374,7 +377,9 @@ def test_parse_bare_name_cross_tier_collision_raises(
     )
     invalidate()
 
-    with pytest.raises(AmbiguousSelectorError, match="matches both"):
+    # ``pirate`` is a node label on both ``civilian.pirate`` and ``persona`` —
+    # an in-tier manifold-label collision.
+    with pytest.raises(AmbiguousSelectorError, match="ambiguous manifold label"):
         parse_expr("0.7 pirate")
 
 

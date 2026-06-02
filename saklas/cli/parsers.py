@@ -67,40 +67,21 @@ def _add_logit_args(p: argparse.ArgumentParser) -> None:
 # Top-level parsers
 # ---------------------------------------------------------------------------
 
-_PACK_VERBS: list[tuple[str, str]] = [
-    ("install",   "Install a concept pack from HF or a local folder"),
-    ("refresh",   "Re-pull concept(s) from their source"),
-    ("clear",     "Delete per-model tensors for matched concepts"),
-    ("rm",        "Fully remove a concept folder"),
-    ("ls",        "List locally installed concept packs"),
-    ("search",    "Search the HuggingFace hub for concept packs"),
-    ("push",      "Push a concept pack to HF as a model repo"),
-    ("export",    "Export a pack to an interchange format (gguf)"),
-]
-
 # ``subspace`` (4.0): the flat-artifact verbs — a steering vector *is* the
-# K=2 case of a flat affine subspace.  These are the old ``vector`` direct
-# subcommands, minus the nested ``manifold`` (now its own top-level verb).
+# K=2 case of a flat affine subspace.  (Pre-4.0 these were the ``vector``
+# direct subcommands; the deprecated ``vector`` alias is gone in 4.0.)
 _SUBSPACE_VERBS: list[tuple[str, str]] = [
     ("extract",   "Extract a steering vector (a 2-node flat subspace)"),
-    ("merge",     "Merge existing vectors into a new pack"),
+    ("merge",     "Merge existing vectors into a new manifold"),
     ("clone",     "Clone a persona from a text corpus"),
     ("compare",   "Cosine similarity between steering vectors"),
     ("why",       "Show which layers contribute most to a steering vector"),
     ("transfer",  "Transfer a probe from one model to another via Procrustes"),
 ]
 
-# ``vector`` is the deprecated 3.x alias — it keeps the full old tree (the
-# subspace verbs + the nested ``manifold``) so existing scripts keep working,
-# with a one-time deprecation notice routed to the new top-level verbs.
-_VECTOR_VERBS: list[tuple[str, str]] = [
-    *_SUBSPACE_VERBS,
-    ("manifold",  "Fit and inspect spline-based steering manifolds"),
-]
-
 # Verb table for ``saklas manifold <verb>`` — the source of truth for both
 # parser registration order and the bare-verb help block, mirroring how
-# ``_SUBSPACE_VERBS`` / ``_PACK_VERBS`` drive theirs.
+# ``_SUBSPACE_VERBS`` drives theirs.
 _MANIFOLD_VERBS: list[tuple[str, str]] = [
     ("fit",       "Fit an authored manifold (user-supplied coords)"),
     ("discover",  "Fit a discover-mode manifold (coords derived from activations)"),
@@ -115,6 +96,7 @@ _MANIFOLD_VERBS: list[tuple[str, str]] = [
     ("clear",     "Delete per-model fitted tensors for a manifold"),
     ("refresh",   "Re-pull / re-materialize a manifold from its source"),
     ("transfer",  "Transfer a manifold to another model via Procrustes"),
+    ("export",    "Export a fitted manifold to an interchange format (gguf)"),
 ]
 
 _EXPERIMENT_VERBS: list[tuple[str, str]] = [
@@ -215,106 +197,7 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
 
 # --- pack subtree --------------------------------------------------------
 
-def _build_pack_install(p: argparse.ArgumentParser) -> None:
-    p.add_argument("target", help="<ns>/<concept>[@revision] or path to a concept folder")
-    p.add_argument("-s", "--statements-only", action="store_true",
-                   help="Keep statements.json only; drop any bundled tensors")
-    p.add_argument("-a", "--as", dest="as_target", default=None, metavar="NS/NAME",
-                   help="Relocate the installed pack under a different namespace/name")
-    p.add_argument("-f", "--force", action="store_true",
-                   help="Overwrite an existing installation")
-
-
-def _build_pack_refresh(p: argparse.ArgumentParser) -> None:
-    p.add_argument("selector", help="Selector or the literal 'neutrals'")
-    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
-                   help="Scope to one model's tensors")
-
-
-def _build_pack_clear(p: argparse.ArgumentParser) -> None:
-    p.add_argument("selector", help="Selector (name, tag:x, namespace:x, default, all)")
-    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID",
-                   help="Scope to one model's tensors only (default: all models)")
-    p.add_argument("-y", "--yes", action="store_true",
-                   help="Skip confirmation prompt on broad selectors")
-    p.add_argument(
-        "--variant", choices=["raw", "sae", "all"], default="all",
-        help="Which tensor variant(s) to delete. Default: all.",
-    )
-
-
-def _build_pack_rm(p: argparse.ArgumentParser) -> None:
-    p.add_argument("selector", help="Selector (name, tag:x, namespace:x, default, all)")
-    p.add_argument("-y", "--yes", action="store_true",
-                   help="Required for broad selectors (all, namespace:)")
-
-
-def _build_pack_ls(p: argparse.ArgumentParser) -> None:
-    p.add_argument("selector", nargs="?", default=None,
-                   help="Optional selector (name, tag:x, namespace:x, default, all)")
-    p.add_argument("-j", "--json", dest="json_output", action="store_true",
-                   help="Emit machine-readable JSON instead of a table")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="Include descriptions in the table output")
-
-
-def _build_pack_search(p: argparse.ArgumentParser) -> None:
-    p.add_argument("query", nargs="?", default="",
-                   help="Search text (matched against HF model ids)")
-    p.add_argument("-j", "--json", dest="json_output", action="store_true",
-                   help="Emit machine-readable JSON instead of a table")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="Include descriptions in the table output")
-
-
-def _build_pack_push(p: argparse.ArgumentParser) -> None:
-    p.add_argument("selector", help="Single concept selector (name or ns/name)")
-    p.add_argument("-a", "--as", dest="as_target", default=None, metavar="OWNER/NAME")
-    p.add_argument("-p", "--private", action="store_true")
-    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
-    p.add_argument("-s", "--statements-only", action="store_true")
-    p.add_argument("-n", "--no-statements", action="store_true")
-    p.add_argument("-t", "--tag-version", action="store_true")
-    p.add_argument("-d", "--dry-run", action="store_true")
-    p.add_argument("-f", "--force", action="store_true")
-    p.add_argument(
-        "--variant", choices=["raw", "sae", "all"], default="raw",
-        help="Which tensor variant(s) to push. Default: raw. (SAE variants "
-             "carry different provenance; opt in via --variant sae|all.)",
-    )
-
-
-def _build_pack_export(p: argparse.ArgumentParser) -> None:
-    sub = p.add_subparsers(dest="format", required=True)
-    g = sub.add_parser("gguf", help="Export baked tensors to llama.cpp GGUF")
-    g.add_argument("selector", help="Single concept selector (name or ns/name)")
-    g.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
-    g.add_argument("-o", "--output", default=None, metavar="PATH")
-    g.add_argument("--model-hint", default=None, metavar="HINT")
-
-
-
-
-_PACK_BUILDERS = {
-    "install": _build_pack_install,
-    "refresh": _build_pack_refresh,
-    "clear":   _build_pack_clear,
-    "rm":      _build_pack_rm,
-    "ls":      _build_pack_ls,
-    "search":  _build_pack_search,
-    "push":    _build_pack_push,
-    "export":  _build_pack_export,
-}
-
-
-def _build_pack_parser(parser: argparse.ArgumentParser) -> None:
-    sub = parser.add_subparsers(dest="pack_cmd", required=False, metavar="VERB")
-    for verb, desc in _PACK_VERBS:
-        child = sub.add_parser(verb, help=desc, description=desc)
-        _PACK_BUILDERS[verb](child)
-
-
-# --- vector subtree ------------------------------------------------------
+# --- subspace / manifold subtree -----------------------------------------
 
 def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     p.add_argument("concept", nargs="+",
@@ -815,6 +698,26 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Emit machine-readable JSON (path + quality summary)",
     )
 
+    export = sub.add_parser(
+        "export",
+        help="Export a fitted manifold to an interchange format (gguf)",
+        description=(
+            "Fold a fitted 2-node ``pca`` manifold down to a single steering "
+            "direction and write it out in an interchange format.  Only "
+            "``gguf`` (llama.cpp control-vector) is supported today; the fold "
+            "requires an affine 2-node (R=1) subspace, so multi-node / curved "
+            "manifolds are rejected."
+        ),
+    )
+    export_fmt = export.add_subparsers(dest="format", required=True)
+    gguf = export_fmt.add_parser(
+        "gguf", help="Export a folded manifold to llama.cpp GGUF",
+    )
+    gguf.add_argument("name", help="Manifold name (or ns/name)")
+    gguf.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
+    gguf.add_argument("-o", "--output", default=None, metavar="PATH")
+    gguf.add_argument("--model-hint", default=None, metavar="HINT")
+
 
 _SUBSPACE_BUILDERS = {
     "extract":  _build_vector_extract,
@@ -825,12 +728,6 @@ _SUBSPACE_BUILDERS = {
     "transfer": _build_vector_transfer,
 }
 
-_VECTOR_BUILDERS = {
-    **_SUBSPACE_BUILDERS,
-    "manifold": _build_vector_manifold,
-}
-
-
 def _build_subspace_parser(parser: argparse.ArgumentParser) -> None:
     """``saklas subspace`` — the flat-artifact (vector) verbs."""
     sub = parser.add_subparsers(dest="subspace_cmd", required=False, metavar="VERB")
@@ -840,21 +737,8 @@ def _build_subspace_parser(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_manifold_parser(parser: argparse.ArgumentParser) -> None:
-    """``saklas manifold`` — curved/flat manifold authoring + lifecycle.
-
-    The top-level promotion of the old ``vector manifold`` subtree; reuses
-    :func:`_build_vector_manifold`, which registers the same ``manifold_cmd``
-    subparsers (so the deprecated ``vector manifold`` alias and the new
-    top-level verb parse identically).
-    """
+    """``saklas manifold`` — curved/flat manifold authoring + lifecycle."""
     _build_vector_manifold(parser)
-
-
-def _build_vector_parser(parser: argparse.ArgumentParser) -> None:
-    sub = parser.add_subparsers(dest="vector_cmd", required=False, metavar="VERB")
-    for verb, desc in _VECTOR_VERBS:
-        child = sub.add_parser(verb, help=desc, description=desc)
-        _VECTOR_BUILDERS[verb](child)
 
 
 # --- config subtree ------------------------------------------------------
@@ -1038,13 +922,6 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     _build_serve_parser(serve)
 
-    pack = sub.add_parser(
-        "pack",
-        help="Manage concept packs (install/ls/search/push/refresh/...)",
-        description="Manage concept packs",
-    )
-    _build_pack_parser(pack)
-
     subspace = sub.add_parser(
         "subspace",
         help="Flat-subspace ops (extract/merge/clone/compare/why/transfer)",
@@ -1054,18 +931,10 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     manifold = sub.add_parser(
         "manifold",
-        help="Manifold ops (fit/discover/generate/ls/show/install/...)",
+        help="Manifold ops (fit/discover/generate/ls/show/install/export/...)",
         description="Steering-manifold authoring, fitting, and lifecycle",
     )
     _build_manifold_parser(manifold)
-
-    vector = sub.add_parser(
-        "vector",
-        help="[deprecated] use `subspace` / `manifold` — alias kept for 3.x",
-        description="[deprecated 4.0] alias for `subspace` (+ nested `manifold`); "
-                    "use the top-level verbs instead",
-    )
-    _build_vector_parser(vector)
 
     cfg = sub.add_parser(
         "config",

@@ -15,14 +15,11 @@ from pathlib import Path
 import pytest
 import torch
 
-import saklas.core.vectors as V
 from saklas.core.mahalanobis import LayerWhitener
 from saklas.core.manifold import load_manifold, save_manifold
 from saklas.core.vectors import (
     _fold_centroids_to_affine_manifold,
-    extract_difference_of_means,
     fold_directions_to_subspace,
-    fold_vector_to_subspace,
     folded_vector_directions,
 )
 
@@ -291,59 +288,6 @@ def test_fold_directions_drops_zero_and_anchors_at_origin_without_neutral():
     mfld = fold_directions_to_subspace("m", directions, None)  # no neutral
     assert sorted(mfld.layers) == [0]
     assert torch.allclose(mfld.layers[0].mean, torch.zeros(d))    # P_basis(∅) = 0
-
-
-def test_fold_share_matches_dim_bake_exactly(monkeypatch: pytest.MonkeyPatch):
-    """R=1 parity gate: feed *identical* centroids to ``fold_vector_to_subspace``
-    and the production ``extract_difference_of_means``; their *normalized*
-    per-layer hook shares match bit-for-bit.  The folded μ-centered share is
-    ``‖δ_L‖_M/√2`` — proportional to the DiM bake's ``‖δ_L‖_M``, so the √2 (and
-    ``ref_norm``) both cancel through the normalization."""
-    d = 12
-    layers = (0, 1, 2)
-    g = torch.Generator().manual_seed(11)
-    acts = {L: torch.randn(80, d, generator=g) * (1.0 + 0.3 * L) for L in layers}
-    means = {L: torch.zeros(d) for L in layers}
-    whitener = LayerWhitener.from_neutral_activations(acts, means)
-
-    dirs = {L: _unit(torch.randn(d, generator=g)) for L in layers}
-    scales = {0: 1.7, 1: 0.6, 2: 1.1}
-    mean_pos = {L: scales[L] * dirs[L] for L in layers}
-    mean_neg = {L: -scales[L] * dirs[L] for L in layers}
-    mean_diffs = {L: mean_pos[L] - mean_neg[L] for L in layers}
-    n_pairs = 6
-    norm_sums = {L: float(n_pairs * 2) * (5.0 + L) for L in layers}  # ref_norm varies
-    diag = {L: [] for L in layers}
-
-    def _fake_capture(*_args: object, **_kwargs: object):
-        return (len(layers), dict(mean_diffs), dict(norm_sums),
-                dict(mean_pos), dict(mean_neg), dict(diag))
-
-    monkeypatch.setattr(V, "_capture_dim_stats_for_pairs", _fake_capture)
-
-    dummy_model = torch.nn.Module()       # unused (capture is mocked)
-    dummy_pairs = [{"positive": "p", "negative": "n"}] * n_pairs
-    dev = torch.device("cpu")
-    # DiM path: hook share = ‖baked_L‖ normalized.
-    profile, _ = extract_difference_of_means(
-        dummy_model, None, dummy_pairs, torch.nn.ModuleList(), dev,
-        whitener=whitener, layer_means=means, dls=False,
-    )
-    baked = {L: float(profile[L].norm()) for L in layers}
-    bt = sum(baked.values())
-    dim_share = {L: baked[L] / bt for L in layers}
-
-    # Folded path: normalized mahalanobis_share.
-    mfld = fold_vector_to_subspace(
-        dummy_model, None, dummy_pairs, torch.nn.ModuleList(), dev,
-        concept_label="c", pos_label="p", neg_label="n",
-        whitener=whitener, layer_means=means, dls=False,
-    )
-    st = sum(mfld.mahalanobis_share.values())
-    fold_share = {L: mfld.mahalanobis_share[L] / st for L in layers}
-
-    for L in layers:
-        assert fold_share[L] == pytest.approx(dim_share[L], abs=1e-5)
 
 
 def test_fold_round_trips_through_save_load(

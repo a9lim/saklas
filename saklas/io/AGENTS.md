@@ -211,11 +211,15 @@ delegates extraction + save to `session.extract(DataSource(pairs=...))`. Lands i
 
 ## merge.py
 
-Offline vector merging into a distributable single-vector pack.
-`merge_into_pack(name, expression, model, *, force, strict)` writes a tensors-only
-pack to `local/<name>/`; the shared grammar's `|` (project-away) is accepted,
-triggers + bare un-namespaced poles rejected. `project_away` / `linear_sum` /
-`shared_models`; sidecars carry `method="merge"` + per-component `components`.
+Offline direction merging into a corpus-less `fit_mode="baked"` manifold.
+`merge_into_manifold(name, expression, model, *, force, strict)` reads each
+component (a fitted 2-node `pca` manifold folded down, or a legacy vector pack),
+linearly combines the per-layer directions, folds the result to a one-pole ray
+(`fold_directions_to_subspace`), and writes a baked manifold to
+`manifolds/local/<name>/` — one fitted tensor per shared model, all sharing one
+`manifold.json`. The shared grammar's `|` (project-away) is accepted, triggers +
+bare un-namespaced poles rejected. `project_away` / `linear_sum` / `shared_models`;
+the baked sidecar carries `method="merge"` + per-component `components` provenance.
 
 ## alignment.py
 

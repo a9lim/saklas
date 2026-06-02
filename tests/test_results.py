@@ -17,11 +17,10 @@ from saklas.core.results import (
 
 class TestPublicAPI:
     def test_imports(self):
-        from saklas import SaklasSession, DataSource, ResultCollector
+        from saklas import SaklasSession, ResultCollector
         from saklas import RunSet
         from saklas import GenerationResult, TokenEvent, ProbeReadings
         assert SaklasSession is not None
-        assert DataSource is not None
         assert ResultCollector is not None
         assert RunSet is not None
         assert GenerationResult is not None

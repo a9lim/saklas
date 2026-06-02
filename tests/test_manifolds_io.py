@@ -7,14 +7,18 @@ from typing import Any
 
 import pytest
 
+import torch
+
 from saklas.io.manifolds import (
     MANIFOLD_FORMAT_VERSION,
+    BakedManifoldError,
     DiscoverGenerationPlan,
     ManifoldFolder,
     ManifoldFormatError,
     ManifoldSidecar,
     append_discover_manifold_node,
     clear_manifold_tensors,
+    create_baked_manifold_folder,
     create_discover_manifold_folder,
     create_manifold_folder,
     init_discover_manifold_folder,
@@ -1666,3 +1670,126 @@ def test_read_manifold_scenarios_roundtrip(tmp_path: Path):
     assert read_manifold_scenarios(folder) is None
     write_manifold_scenarios(folder, ["alpha", "beta"])
     assert read_manifold_scenarios(folder) == ["alpha", "beta"]
+
+
+# =================================================== baked (corpus-less) ===
+#
+# A baked manifold is a pre-fitted, corpus-less artifact (merge output /
+# imported control vector): geometry frozen in the tensor, no ``nodes/``
+# corpus, never re-fits.
+
+
+def _baked_manifold(name: str = "merged", n_layers: int = 3):
+    """Build an affine R=1 Manifold (the merge/import shape) via the fold."""
+    from saklas.core.vectors import fold_directions_to_subspace
+
+    directions = {i: torch.randn(8) for i in range(n_layers)}
+    return fold_directions_to_subspace(name, directions, None, label=name), directions
+
+
+def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.core.manifold import load_manifold
+    from saklas.core.vectors import folded_vector_directions
+
+    manifold, directions = _baked_manifold("merged")
+    folder, mf = create_baked_manifold_folder(
+        "local", "merged", "a merged vector", manifold, "test/model",
+        method="merge",
+    )
+    assert mf.fit_mode == "baked"
+    assert mf.is_discover is False
+    assert mf.node_labels == ["merged"]
+    assert mf.files, "files manifest should be back-filled"
+
+    # No nodes/ corpus on disk.
+    assert not (folder / "nodes").exists()
+
+    # Reloads clean, with a stable provenance hash.
+    reloaded = ManifoldFolder.load(folder)
+    assert reloaded.fit_mode == "baked"
+    assert reloaded.nodes_sha256() == mf.nodes_sha256()
+
+    # The tensor folds back to the per-layer directions it was baked from.
+    (tensor,) = list(folder.glob("*.safetensors"))
+    folded = folded_vector_directions(load_manifold(tensor))
+    assert set(folded) == set(directions)
+
+
+def test_baked_manifold_clear_and_scoped_refresh_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    manifold, _ = _baked_manifold("merged")
+    create_baked_manifold_folder(
+        "local", "merged", "", manifold, "test/model", method="merge",
+    )
+    # Both tensor-deleting ops refuse — a baked manifold can't re-fit, so
+    # clearing its tensor would destroy the only copy of its geometry.
+    with pytest.raises(BakedManifoldError, match="rm"):
+        clear_manifold_tensors("local", "merged")
+    with pytest.raises(BakedManifoldError):
+        refresh_manifold("local", "merged", model_scope="test/model")
+
+
+def test_baked_manifold_node_groups_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    manifold, _ = _baked_manifold("merged")
+    _, mf = create_baked_manifold_folder(
+        "local", "merged", "", manifold, "test/model", method="merge",
+    )
+    with pytest.raises(ManifoldFormatError, match="no node corpus"):
+        mf.node_groups()
+
+
+def test_baked_manifold_rejects_coords_on_node(tmp_path: Path):
+    """A baked node is label-only — coords would be ambiguous against the
+    frozen tensor geometry, so the loader refuses them."""
+    folder = tmp_path / "merged"
+    (folder).mkdir()
+    payload = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "merged",
+        "description": "",
+        "fit_mode": "baked",
+        "domain": {"type": "custom", "embed_dim": 1},
+        "nodes": [{"label": "merged", "coords": [1.0]}],
+        "files": {},
+    }
+    (folder / "manifold.json").write_text(json.dumps(payload))
+    with pytest.raises(ManifoldFormatError, match="must not carry 'coords'"):
+        ManifoldFolder.load(folder)
+
+
+def test_baked_manifold_requires_tensor(tmp_path: Path):
+    """A tensor-less baked folder is corrupt — the tensor is its only geometry."""
+    folder = tmp_path / "merged"
+    folder.mkdir()
+    payload = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "merged",
+        "description": "",
+        "fit_mode": "baked",
+        "domain": {"type": "custom", "embed_dim": 1},
+        "nodes": [{"label": "merged"}],
+        "files": {},
+    }
+    (folder / "manifold.json").write_text(json.dumps(payload))
+    with pytest.raises(ManifoldFormatError, match="no fitted tensor"):
+        ManifoldFolder.load(folder)
+
+
+def test_baked_manifold_requires_domain(tmp_path: Path):
+    folder = tmp_path / "merged"
+    folder.mkdir()
+    payload = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "merged",
+        "description": "",
+        "fit_mode": "baked",
+        "nodes": [{"label": "merged"}],
+        "files": {},
+    }
+    (folder / "manifold.json").write_text(json.dumps(payload))
+    with pytest.raises(ManifoldFormatError, match="needs a 'domain'"):
+        ManifoldFolder.load(folder)

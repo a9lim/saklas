@@ -14,7 +14,6 @@ import pytest
 import torch
 from fastapi.testclient import TestClient
 
-from saklas.core.profile import Profile
 from saklas.core.session import SaklasSession
 
 
@@ -79,27 +78,30 @@ def session_and_client():
 
 
 class TestMergeVector:
-    def test_happy_path(self, session_and_client: tuple[SaklasSession, TestClient], tmp_path: Path):
+    def test_happy_path(self, session_and_client: tuple[SaklasSession, TestClient], tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         session, client = session_and_client
-        # Build a fake merge tensor on disk so the route's ``load_profile``
-        # call lands on a real file via the mocked merge_into_pack output.
-        merged_folder = tmp_path / "local" / "noble"
-        merged_folder.mkdir(parents=True)
-        # Fake tensor file that the route expects to find.
+        # The merge now lands a corpus-less ``fit_mode="baked"`` manifold; the
+        # route loads + folds it back to a steering Profile.  Build a real one
+        # on disk so the route's ``load_manifold`` + fold has a valid target
+        # via the mocked ``merge_into_manifold`` output.
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        from saklas.core.vectors import (
+            fold_directions_to_subspace, folded_vector_directions,
+        )
+        from saklas.core.manifold import load_manifold
+        from saklas.io.manifolds import create_baked_manifold_folder
         from saklas.io.paths import tensor_filename
+
+        dirs = {0: torch.tensor([1.0, 0.0, 0.0, 0.0]), 5: torch.tensor([0.0, 2.0, 0.0, 0.0])}
+        manifold = fold_directions_to_subspace("noble", dirs, None, label="merged")
+        merged_folder, _ = create_baked_manifold_folder(
+            "local", "noble", "merged", manifold, session.model_id, method="merge",
+        )
         tensor_path = merged_folder / tensor_filename(session.model_id)
-        tensor_path.touch()
-
-        merged_profile = Profile({0: torch.zeros(4), 5: torch.ones(4)})
-
-        def _load_profile(path: str | Path) -> Profile:
-            assert Path(path) == tensor_path
-            return merged_profile
-
-        cast(MagicMock, session.load_profile).side_effect = _load_profile
+        expected = folded_vector_directions(load_manifold(tensor_path))
 
         with patch(
-            "saklas.io.merge.merge_into_pack",
+            "saklas.io.merge.merge_into_manifold",
             return_value=merged_folder,
         ) as m:
             resp = client.post(
@@ -120,15 +122,20 @@ class TestMergeVector:
         assert args[1] == "0.3 default/honest + 0.4 default/warm"
         assert args[2] == "test/model"
         assert kwargs["force"] is True
-        # Auto-register on the session.
+        # Auto-register on the session with the folded merged direction.
         steer_mock = cast(MagicMock, session.steer)
-        steer_mock.assert_called_once_with("noble", merged_profile)
+        steer_mock.assert_called_once()
+        call_name, call_profile = steer_mock.call_args.args
+        assert call_name == "noble"
+        assert call_profile.layers == [0, 5]
+        assert torch.allclose(call_profile[0].float(), expected[0].float(), atol=1e-5)
+        assert torch.allclose(call_profile[5].float(), expected[5].float(), atol=1e-5)
 
     def test_invalid_expression_400(self, session_and_client: tuple[SaklasSession, TestClient]):
         from saklas.io.merge import MergeError
         _, client = session_and_client
         with patch(
-            "saklas.io.merge.merge_into_pack",
+            "saklas.io.merge.merge_into_manifold",
             side_effect=MergeError("merge requires at least one component"),
         ):
             resp = client.post(
@@ -142,7 +149,7 @@ class TestMergeVector:
         from saklas.io.merge import MergeError
         _, client = session_and_client
         with patch(
-            "saklas.io.merge.merge_into_pack",
+            "saklas.io.merge.merge_into_manifold",
             side_effect=MergeError("component default/missing not installed"),
         ):
             resp = client.post(
@@ -163,9 +170,9 @@ class TestMergeVector:
         assert resp.status_code == 404
 
     def test_no_tensor_for_model_500(self, session_and_client: tuple[SaklasSession, TestClient], tmp_path: Path):
-        """If merge_into_pack returns a folder with no tensor for our model.
+        """If merge_into_manifold returns a folder with no tensor for our model.
 
-        Defensive 500 — merge_into_pack should always produce one when given
+        Defensive 500 — merge_into_manifold should always produce one when given
         a model arg, but if it doesn't (e.g. silent skip), we surface it.
         """
         session, client = session_and_client
@@ -173,7 +180,7 @@ class TestMergeVector:
         empty_folder.mkdir(parents=True)
 
         with patch(
-            "saklas.io.merge.merge_into_pack",
+            "saklas.io.merge.merge_into_manifold",
             return_value=empty_folder,
         ):
             resp = client.post(
