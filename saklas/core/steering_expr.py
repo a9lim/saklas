@@ -975,6 +975,40 @@ def _fold(terms: list[_Term], *, namespace: Optional[str]) -> "Steering":
                     manifold_hit.label, mfld_trig,
                 )
                 continue
+        # Composite-name manifold tier (4.0 step 6b): a plain term whose
+        # base names a 2-node ``pca`` manifold (``happy.sad`` — the ``.``
+        # makes it skip the bare-label tier above) steers toward node 0,
+        # the ``orient_to=0`` (+) pole — the steering-vector composite read
+        # path.  ``resolve_manifold_name`` returns None when no such manifold
+        # exists, so a genuine vector concept falls through unchanged.
+        if (
+            sel.operator is None
+            and not term.ablation
+            and sel.base.variant == "raw"
+        ):
+            from saklas.io.selectors import (
+                AmbiguousSelectorError,
+                resolve_manifold_name,
+            )
+            ns_scope = sel.base.namespace or namespace
+            try:
+                name_hit = resolve_manifold_name(
+                    sel.base.concept, namespace=ns_scope,
+                )
+            except AmbiguousSelectorError:
+                raise
+            except Exception:
+                name_hit = None
+            if name_hit is not None:
+                mfld_trig = (
+                    term.trigger if term.trigger is not None else Trigger.BOTH
+                )
+                _merge_manifold(
+                    alphas, name_hit.manifold_key,
+                    _expand_three_op_coeffs(term.coeffs),
+                    name_hit.pole_label, mfld_trig,
+                )
+                continue
         # Past this point the term is unambiguously a vector (plain /
         # projection / ablation) — the comma-separated coefficient run is a
         # manifold-``%``-only construct, so reject it here rather than

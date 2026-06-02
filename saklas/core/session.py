@@ -352,28 +352,6 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
 
 
-def _vector_push_fragment(
-    profile: dict[int, torch.Tensor],
-) -> "tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]":
-    """A folded vector / pole / projection → a rank-1 push fragment per layer.
-
-    ``basis_dirs[L]`` is the unit baked direction ``(1, D)``; ``coord_dirs[L]``
-    is its baked magnitude ``[‖d_L‖]`` (the share-carrying pole coordinate), so
-    ``synthesize_subspace``'s ``Δ = coeff · (coord @ basis) = coeff · d_L``
-    reproduces the baked direction exactly.  Degenerate (zero-norm) layers drop.
-    """
-    basis_dirs: dict[int, torch.Tensor] = {}
-    coord_dirs: dict[int, torch.Tensor] = {}
-    for L, vec in profile.items():
-        v = vec.to(torch.float32).reshape(-1)
-        n = float(torch.linalg.vector_norm(v).item())
-        if n < 1e-12:
-            continue
-        basis_dirs[L] = (v / n).reshape(1, -1)
-        coord_dirs[L] = torch.tensor([n], dtype=torch.float32)
-    return basis_dirs, coord_dirs
-
-
 def _manifold_is_affine(manifold: "Manifold") -> bool:
     """True iff every layer subspace is flat — an affine ``%`` joins the merge.
 
@@ -938,6 +916,7 @@ class SaklasSession:
 
         probe_profiles: dict[str, dict[int, torch.Tensor]] = {}
         if probe_categories:
+            # User-installed vector packs (still baked DiM under vectors/).
             probe_profiles = bootstrap_probes(
                 self._model, self._tokenizer, self._layers, self._model_info,
                 probe_categories,
@@ -946,6 +925,11 @@ class SaklasSession:
                 whitener=self._whitener,
                 layer_means=self._layer_means,
                 dls=self._dls,
+            )
+            # Bundled concepts now live as 2-node ``pca`` manifolds — fit-or-
+            # load + fold them into the same TraitMonitor probe set (4.0 6b).
+            probe_profiles.update(
+                self._bootstrap_manifold_probes(probe_categories)
             )
 
         self._monitor = TraitMonitor(
@@ -2122,10 +2106,12 @@ class SaklasSession:
         for syn_key, val in steering.alphas.items():
             if not isinstance(val, ProjectedTerm):
                 continue
-            self._ensure_profile_loaded(val.base)
-            self._ensure_profile_loaded(val.onto)
-            base_tensors = self._profiles[val.base]
-            onto_tensors = self._profiles[val.onto]
+            base_tensors = self._ensure_profile_registered(
+                val.base, role="projection base",
+            )
+            onto_tensors = self._ensure_profile_registered(
+                val.onto, role="projection onto",
+            )
             projected = project_profile(
                 base_tensors, onto_tensors, val.operator,
                 whitener=whitener,
@@ -2142,28 +2128,6 @@ class SaklasSession:
                     snapshots[syn_key] = _PROFILE_ABSENT
             self._profiles[syn_key] = projected
         return snapshots
-
-    def _ensure_profile_loaded(self, key: str) -> None:
-        """Ensure ``key`` is registered in ``self._profiles``.
-
-        ``key`` is a canonical registry key (bare for raw variants,
-        ``f"{canonical}:{variant}"`` otherwise) as produced by
-        :func:`saklas.core.steering_expr._resolve_atom`.  Routes to the
-        existing autoload path for packs that are installed but not yet
-        loaded.
-        """
-        if key in self._profiles:
-            return
-        if ":" in key:
-            canonical, variant = key.rsplit(":", 1)
-        else:
-            canonical, variant = key, "raw"
-        self._try_autoload_vector(canonical, variant=variant)
-        if key not in self._profiles:
-            raise VectorNotRegisteredError(
-                f"projection references '{key}' which is not registered "
-                f"and no pack could be autoloaded for this model"
-            )
 
     def _ensure_manifold_loaded(self, key: str) -> None:
         """Load the manifold artifact for registry key ``key`` if absent.
@@ -2395,6 +2359,99 @@ class SaklasSession:
                 f"variant '{variant}' not found for '{canonical}' on model "
                 f"'{self.model_id}' (available: {sorted(set(available)) or 'none'})"
             )
+
+    def _ensure_profile_registered(
+        self, name: str, *, role: str = "vector",
+    ) -> dict[int, torch.Tensor]:
+        """Direction profile for ``name`` — registered tensor or folded manifold.
+
+        4.0 step 6b unifies the two sources a steering direction can come from:
+
+        - an in-memory baked direction already in ``_profiles`` (ad-hoc
+          ``extract``/``clone``/``merge`` results, ``~``/``|`` projection
+          derivations) — returned verbatim;
+        - a fitted 2-node ``pca`` manifold on disk — loaded via
+          :meth:`_ensure_manifold_loaded` and folded to a per-layer direction
+          dict by :func:`~saklas.core.vectors.folded_vector_directions`, then
+          memoized in ``_profiles`` so a probe / repeat steer reuses it.
+
+        Both lower to one direction dict; the dispatch then folds it to a
+        one-pole-ray push fragment.  Raises :class:`VectorNotRegisteredError`
+        when neither source resolves.
+        """
+        existing = self._profiles.get(name)
+        if existing is not None:
+            return existing
+        # Installed vector pack (possibly variant-qualified) not yet loaded —
+        # the historical autoload path for user packs / non-bundled poles.
+        if ":" in name:
+            canonical, variant = name.rsplit(":", 1)
+        else:
+            canonical, variant = name, "raw"
+        try:
+            self._try_autoload_vector(canonical, variant=variant)
+        except Exception:
+            pass
+        loaded = self._profiles.get(name)
+        if loaded is not None:
+            return loaded
+        try:
+            self._ensure_manifold_loaded(name)
+        except Exception:
+            raise VectorNotRegisteredError(
+                f"No vector registered for {role} '{name}'"
+            )
+        from saklas.core.vectors import folded_vector_directions
+        try:
+            prof = folded_vector_directions(self._manifolds[name])
+        except Exception as e:
+            raise VectorNotRegisteredError(
+                f"{role} '{name}' is a manifold that does not fold to a single "
+                f"steering direction (not a 2-node affine subspace): {e}"
+            )
+        self._profiles[name] = prof
+        return prof
+
+    def _bootstrap_manifold_probes(
+        self, categories: list[str],
+    ) -> dict[str, dict[int, torch.Tensor]]:
+        """Source bundled-concept probe directions from their 2-node manifolds.
+
+        The 4.0 counterpart of :func:`~saklas.io.probes_bootstrap.bootstrap_probes`
+        for concepts that now live as 2-node ``pca`` manifolds.  For each
+        manifold tagged in a requested category it fits-or-loads the per-model
+        subspace (eager, same cost band as the legacy DiM extraction — both run
+        forward passes, both disk-cache) and folds it to a per-layer direction
+        via :func:`~saklas.core.vectors.folded_vector_directions`, so the
+        ``TraitMonitor`` keeps its whitened-cosine read and ``@when:`` gates
+        unchanged.  A fit/fold failure for one concept is logged and skipped,
+        never fatal to session construction.
+        """
+        from saklas.io.probes_bootstrap import load_default_manifolds
+        from saklas.core.vectors import folded_vector_directions
+        from saklas.io.manifolds import ManifoldFolder
+        from saklas.io.paths import manifold_dir
+
+        defaults = load_default_manifolds()
+        probes: dict[str, dict[int, torch.Tensor]] = {}
+        seen: set[str] = set()
+        for cat in categories:
+            for name in defaults.get(cat, []):
+                if name in seen:
+                    continue
+                seen.add(name)
+                key = f"default/{name}"
+                try:
+                    try:
+                        self._ensure_manifold_loaded(key)
+                    except ManifoldNotRegisteredError:
+                        folder = ManifoldFolder.load(manifold_dir("default", name))
+                        self.extract_manifold(folder)
+                        self._ensure_manifold_loaded(key)
+                    probes[name] = folded_vector_directions(self._manifolds[key])
+                except Exception as e:  # noqa: BLE001 — one bad probe isn't fatal
+                    _log.warning("manifold probe '%s' failed to fit/fold: %s", name, e)
+        return probes
 
     def _push_steering(
         self,
@@ -2651,16 +2708,16 @@ class SaklasSession:
         def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
             return grouped.setdefault(trigger, {"push": [], "ablate": []})
 
+        from saklas.core.vectors import fold_directions_to_subspace
+
         for name, entry in entries.items():
             if isinstance(entry, AblationTerm):
-                target = entry.target
-                if target not in self._profiles:
-                    raise VectorNotRegisteredError(
-                        f"No vector registered for ablation target '{target}'"
-                    )
+                ablate_prof = self._ensure_profile_registered(
+                    entry.target, role="ablation target",
+                )
                 ablate_dirs = {
                     L: v.to(torch.float32).reshape(-1)
-                    for L, v in self._profiles[target].items()
+                    for L, v in ablate_prof.items()
                 }
                 _bucket(entry.trigger)["ablate"].append(ablate_dirs)
                 continue
@@ -2688,9 +2745,18 @@ class SaklasSession:
                     )
                 continue
             alpha, trigger = entry
-            if name not in self._profiles:
-                raise VectorNotRegisteredError(f"No vector registered for '{name}'")
-            basis_dirs, coord_dirs = _vector_push_fragment(self._profiles[name])
+            # 4.0 step 6b: every in-memory direction (ad-hoc extracts, clones,
+            # merges, ``~``/``|`` projections, or a folded bundled concept)
+            # lowers through the one push path — fold it to a neutral-anchored
+            # one-pole-ray subspace and push label-form, exactly as an affine
+            # ``%`` term does.  There is no separate baked-vector fragment.
+            prof = self._ensure_profile_registered(name)
+            folded = fold_directions_to_subspace(name, prof, neutral_means)
+            if not folded.layers:
+                continue
+            basis_dirs, coord_dirs = _affine_manifold_push(
+                folded, folded.node_labels[0],
+            )
             _bucket(trigger)["push"].append((basis_dirs, coord_dirs, alpha))
 
         # One merged affine subspace per active trigger group.

@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "high_context.low_context",
+ "description": "Bipolar axis: high-context communication (+) vs low-context communication (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "high_context"
+  },
+  {
+   "label": "low_context"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "social_stance"
+ ]
+}

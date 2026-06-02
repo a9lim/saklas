@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "angry.calm",
+ "description": "Bipolar axis: angry (+) vs calm (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "angry"
+  },
+  {
+   "label": "calm"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "affect"
+ ]
+}

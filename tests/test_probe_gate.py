@@ -326,18 +326,23 @@ class TestSessionProbeGateDetection:
 
 class TestSteeringIntegration:
     def test_normalized_entries_propagates_gate(self):
-        s = parse_expr("0.5 angry.calm@when:angry.calm>0.3")
+        # ``myprobe.other`` is a synthetic, non-bundled name so the steering
+        # term stays a plain vector (a bundled name like ``angry.calm`` now
+        # routes to a 2-node pca ManifoldTerm).  The gate probe stays
+        # ``angry.calm`` — gate probes are stored verbatim, never resolved,
+        # so the gate-parsing intent is unaffected.
+        s = parse_expr("0.5 myprobe.other@when:angry.calm>0.3")
         out = s.normalized_entries()
-        assert "angry.calm" in out
-        _alpha, trig = out["angry.calm"]
+        assert "myprobe.other" in out
+        _alpha, trig = out["myprobe.other"]
         assert trig.gate is not None
 
     def test_steering_str_round_trips_gate(self):
-        s = parse_expr("0.3 angry.calm@when:angry.calm>=0.5")
+        s = parse_expr("0.3 myprobe.other@when:angry.calm>=0.5")
         # ``Steering.__str__`` delegates to ``format_expr``.
-        assert str(s) == "0.3 angry.calm@when:angry.calm>=0.5"
+        assert str(s) == "0.3 myprobe.other@when:angry.calm>=0.5"
 
     def test_steering_from_value_accepts_gate_string(self):
-        s = Steering.from_value("0.5 angry.calm@when:angry.calm>0.4")
+        s = Steering.from_value("0.5 myprobe.other@when:angry.calm>0.4")
         assert s is not None
-        assert "angry.calm" in s.alphas
+        assert "myprobe.other" in s.alphas

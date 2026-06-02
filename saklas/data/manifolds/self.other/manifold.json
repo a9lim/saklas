@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "self.other",
+ "description": "Bipolar axis: self-referential (+) vs other-referential (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "self"
+  },
+  {
+   "label": "other"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "social_stance"
+ ]
+}

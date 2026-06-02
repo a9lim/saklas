@@ -57,6 +57,26 @@ def load_defaults() -> dict[str, list[str]]:
     return by_tag
 
 
+def load_default_manifolds() -> dict[str, list[str]]:
+    """Return {tag: [manifold_name, ...]} for bundled default/ manifolds (4.0).
+
+    The manifold counterpart of :func:`load_defaults`: a steering vector now
+    lives as a 2-node ``pca`` manifold, tagged (``manifold.json::tags``,
+    carried from the source pack) for the same category-grouped probe
+    bootstrap.  Triggers first-run materialization of bundled manifolds.
+    """
+    from saklas.io.manifolds import (
+        iter_manifold_folders, materialize_bundled_manifolds,
+    )
+
+    materialize_bundled_manifolds()
+    by_tag: dict[str, list[str]] = {}
+    for _ns, mf in iter_manifold_folders(namespace="default"):
+        for tag in mf.tags or []:
+            by_tag.setdefault(tag, []).append(mf.name)
+    return by_tag
+
+
 def bootstrap_layer_means(
     model: Any, tokenizer: Any, layers: torch.nn.ModuleList, model_info: dict[str, Any],
 ) -> dict[int, torch.Tensor]:

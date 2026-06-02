@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "authoritative.submissive",
+ "description": "Bipolar axis: authoritative (+) vs submissive (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "authoritative"
+  },
+  {
+   "label": "submissive"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "social_stance"
+ ]
+}

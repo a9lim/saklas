@@ -113,11 +113,19 @@ _concepts_cache: dict[Path, list[ResolvedConcept]] = {}
 # concepts. Cleared in invalidate() so manifold install/refresh/remove drops it.
 _manifold_labels_cache: dict[Path, list["ResolvedManifoldLabel"]] = {}
 
+# Companion index over manifold *names* (not node labels) for the
+# vector-composite read path: a 2-node ``pca`` manifold named ``happy.sad``
+# resolves by its bare name to node 0 (the ``orient_to=0`` + pole), the way a
+# steering vector's composite name resolved before 4.0. Memoized + cleared in
+# invalidate() like the label index.
+_manifold_names_cache: dict[Path, list["ResolvedManifoldName"]] = {}
+
 
 def invalidate() -> None:
     """Drop cached concept + manifold-label walks. Call after install/delete/refresh."""
     _concepts_cache.clear()
     _manifold_labels_cache.clear()
+    _manifold_names_cache.clear()
 
 
 def _all_concepts() -> list[ResolvedConcept]:
@@ -422,6 +430,84 @@ def resolve_bare_name(
             f"'<manifold>%<label>' for the manifold node."
         )
     return pole_hit, manifold_hit
+
+
+@dataclass(frozen=True)
+class ResolvedManifoldName:
+    """A unique match for :func:`resolve_manifold_name`.
+
+    A 2-node ``pca`` manifold reads as a steering vector: its bare *name*
+    (the composite ``happy.sad``) resolves to ``pole_label`` = node 0, the
+    ``orient_to=0`` (+) pole, so ``0.5 happy.sad`` steers toward ``happy``
+    exactly as the bipolar vector did pre-4.0.
+    """
+
+    namespace: str
+    manifold_name: str
+    pole_label: str
+
+    @property
+    def manifold_key(self) -> str:
+        """``<ns>/<name>`` — the form the grammar uses to reference the manifold."""
+        return f"{self.namespace}/{self.manifold_name}"
+
+
+def _all_manifold_names() -> list[ResolvedManifoldName]:
+    """Memoized index of 2-node ``pca`` manifolds keyed for name resolution.
+
+    Only a 2-node ``pca`` fit reads as a vector composite — its name maps to
+    node 0.  Multi-node / curved / authored manifolds are addressed by
+    ``<name>%<label>`` only and never surface here.  Memoized on
+    ``manifolds_dir()`` and cleared by :func:`invalidate`, mirroring
+    :func:`_all_manifold_labels`.
+    """
+    root = manifolds_dir()
+    cached = _manifold_names_cache.get(root)
+    if cached is not None:
+        return cached
+    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
+
+    out: list[ResolvedManifoldName] = []
+    try:
+        manifolds = list(iter_manifold_folders())
+    except ManifoldFormatError:
+        _manifold_names_cache[root] = out
+        return out
+    for ns, mf in manifolds:
+        if mf.fit_mode == "pca" and len(mf.node_labels) == 2:
+            out.append(ResolvedManifoldName(
+                namespace=ns, manifold_name=mf.name, pole_label=mf.node_labels[0],
+            ))
+    _manifold_names_cache[root] = out
+    return out
+
+
+def resolve_manifold_name(
+    name: str, *, namespace: Optional[str] = None,
+) -> Optional[ResolvedManifoldName]:
+    """Resolve a 2-node ``pca`` manifold *name* to its node-0 (+) pole.
+
+    The vector-composite read path: ``happy.sad`` (the manifold name, which
+    contains a ``.`` and so skips the bare-label tier) resolves to the
+    ``happy`` pole.  Returns ``None`` on a miss (the caller falls through to
+    other tiers), and raises :class:`AmbiguousSelectorError` when the same
+    name lives in two namespaces and none was specified.
+    """
+    index = _all_manifold_names()
+    matches = [
+        m for m in index
+        if m.manifold_name == name
+        and (namespace is None or m.namespace == namespace)
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        qualified = ", ".join(m.manifold_key for m in matches)
+        raise AmbiguousSelectorError(
+            f"ambiguous manifold name '{name}': matches {qualified}. "
+            f"Specify the namespace as <ns>/{name}."
+        )
+    return matches[0]
 
 
 def parse_args(tokens: list[str]) -> tuple[Selector, Optional[str]]:

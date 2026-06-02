@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "confident.uncertain",
+ "description": "Bipolar axis: confident (+) vs uncertain (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "confident"
+  },
+  {
+   "label": "uncertain"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "epistemic"
+ ]
+}

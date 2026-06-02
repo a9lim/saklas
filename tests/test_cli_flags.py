@@ -399,8 +399,13 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
     from saklas.io.paths import vectors_dir, safe_model_id
     model_id = "fake/model"
     folder = vectors_dir() / "default" / "happy.sad"
+    folder.mkdir(parents=True, exist_ok=True)
     tensor = folder / f"{safe_model_id(model_id)}.safetensors"
     tensor.write_bytes(b"")
+    # 4.0 step 6b: materialize_bundled no longer ships a pack.json for this
+    # name (bundled concepts are manifolds now), so the synthetic vector
+    # folder must carry its own for ``_all_concepts()`` to surface it.
+    _install_concept_pack(folder, "happy.sad")
 
     class FakeSession:
         def __init__(self, **kw: Any) -> None:
@@ -515,6 +520,38 @@ def test_vector_appears_in_help(capsys: pytest.CaptureFixture[str]):
 # _run_compare — verbose modes (1-arg ranked, N×N matrix)
 # ---------------------------------------------------------------------------
 
+def _install_concept_pack(folder: Path, name: str) -> Path:
+    """Write a minimal valid v2 ``pack.json`` into a synthetic concept folder.
+
+    4.0 step 6b emptied ``saklas/data/vectors/``, so ``materialize_bundled()``
+    no longer drops a ``pack.json`` next to the fake tensors these
+    compare/why tests create — and ``resolve()`` / ``_all_concepts()`` skip any
+    folder without one (``selectors._all_concepts`` requires a loadable
+    ``pack.json``).  These tests mock ``Profile.load``, so the tensor bytes are
+    never parsed; they only need the concept to RESOLVE.  This makes each
+    synthetic concept folder self-sufficient.
+    """
+    from saklas.io.packs import PackMetadata
+
+    folder.mkdir(parents=True, exist_ok=True)
+    files = {
+        p.name: ""  # hash unused: resolve()/_all_concepts() doesn't verify it
+        for p in folder.iterdir()
+        if p.suffix in {".safetensors", ".gguf"}
+    }
+    PackMetadata(
+        name=name,
+        description=f"synthetic test concept {name}",
+        version="1.0.0",
+        license="MIT",
+        tags=["synthetic"],
+        recommended_alpha=0.5,
+        source="local",
+        files=files,
+    ).write(folder)
+    return folder
+
+
 def _setup_compare_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Set SAKLAS_HOME, materialize bundled, and return the vectors_dir path."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -548,14 +585,17 @@ def test_run_compare_one_arg_verbose_text(monkeypatch: pytest.MonkeyPatch, tmp_p
     target_dir = vdir / "default" / "angry.calm"
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(target_dir, "angry.calm")
 
     happy_dir = vdir / "default" / "happy.sad"
     happy_dir.mkdir(parents=True, exist_ok=True)
     (happy_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(happy_dir, "happy.sad")
 
     warm_dir = vdir / "default" / "warm.clinical"
     warm_dir.mkdir(parents=True, exist_ok=True)
     (warm_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(warm_dir, "warm.clinical")
 
     happy_profile = _mock_profile(lambda o: None, lambda o: None)
     warm_profile = _mock_profile(lambda o: None, lambda o: None)
@@ -611,10 +651,12 @@ def test_run_compare_one_arg_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_p
     target_dir = vdir / "default" / "angry.calm"
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(target_dir, "angry.calm")
 
     happy_dir = vdir / "default" / "happy.sad"
     happy_dir.mkdir(parents=True, exist_ok=True)
     (happy_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(happy_dir, "happy.sad")
 
     happy_profile = _mock_profile(lambda o: None, lambda o: None)
     target_profile = _mock_profile(
@@ -659,6 +701,7 @@ def test_run_compare_matrix_verbose_json(monkeypatch: pytest.MonkeyPatch, tmp_pa
         d = vdir / "default" / c
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{sid}.safetensors").write_bytes(b"x")
+        _install_concept_pack(d, c)
         dirs[c] = d
 
     from saklas.core.profile import Profile
@@ -700,6 +743,7 @@ def test_run_compare_matrix_verbose_text_unchanged(monkeypatch: pytest.MonkeyPat
         d = vdir / "default" / c
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{sid}.safetensors").write_bytes(b"x")
+        _install_concept_pack(d, c)
         dirs[c] = d
 
     from saklas.core.profile import Profile
@@ -801,6 +845,7 @@ def test_run_why_text_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
     target_dir = vdir / "default" / "angry.calm"
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(target_dir, "angry.calm")
 
     layer_mags = {14: 0.847, 15: 0.812, 13: 0.793, 12: 0.641, 11: 0.589, 10: 0.400}
     profile = _mock_why_profile(layer_mags)
@@ -833,6 +878,7 @@ def test_run_why_text_buckets_large_profile(monkeypatch: pytest.MonkeyPatch, tmp
     target_dir = vdir / "default" / "angry.calm"
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(target_dir, "angry.calm")
 
     layer_mags = {i: float(i + 1) * 0.01 for i in range(62)}
     profile = _mock_why_profile(layer_mags)
@@ -864,6 +910,7 @@ def test_run_why_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
     target_dir = vdir / "default" / "angry.calm"
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / f"{sid}.safetensors").write_bytes(b"x")
+    _install_concept_pack(target_dir, "angry.calm")
 
     layer_mags = {14: 0.847, 15: 0.812, 13: 0.793}
     profile = _mock_why_profile(layer_mags)
@@ -955,6 +1002,7 @@ def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     sae_path = target_dir / tensor_filename(model_id, release="my-release")
     raw_path.write_bytes(b"x")
     sae_path.write_bytes(b"x")
+    _install_concept_pack(target_dir, "angry.calm")
 
     raw_profile = _mock_why_profile({0: 0.1, 1: 0.1})
     sae_profile = _mock_why_profile({14: 0.9, 15: 0.8})
@@ -986,6 +1034,7 @@ def test_run_why_sae_ambiguous_errors(monkeypatch: pytest.MonkeyPatch, tmp_path:
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / tensor_filename(model_id, release="release-a")).write_bytes(b"x")
     (target_dir / tensor_filename(model_id, release="release-b")).write_bytes(b"x")
+    _install_concept_pack(target_dir, "angry.calm")
 
     from saklas.io.selectors import invalidate
     invalidate()
@@ -1014,6 +1063,8 @@ def test_run_compare_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_pat
     b_raw = b_dir / f"{sid}.safetensors"
     for p in (a_raw, a_sae, b_raw):
         p.write_bytes(b"x")
+    _install_concept_pack(a_dir, "angry.calm")
+    _install_concept_pack(b_dir, "happy.sad")
 
     a_raw_profile = _mock_profile(lambda o: 0.1, lambda o: {0: 0.1})
     a_sae_profile = _mock_profile(lambda o: 0.9, lambda o: {14: 0.9})

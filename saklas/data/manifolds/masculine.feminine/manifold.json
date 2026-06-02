@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "masculine.feminine",
+ "description": "Bipolar axis: masculine (+) vs feminine (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "masculine"
+  },
+  {
+   "label": "feminine"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "cultural"
+ ]
+}

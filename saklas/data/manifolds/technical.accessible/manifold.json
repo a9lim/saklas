@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "technical.accessible",
+ "description": "Bipolar axis: technical (+) vs accessible (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "technical"
+  },
+  {
+   "label": "accessible"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "register"
+ ]
+}

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Sequence
 import json
 from pathlib import Path
 
@@ -12,6 +12,77 @@ def _write_pack(tmp_path: Path,  data: dict[str, Any]) -> Path:
     d.mkdir()
     (d / "pack.json").write_text(json.dumps(data))
     return d
+
+
+# --- Synthetic bundled-vectors fixture --------------------------------------
+#
+# 4.0 step 6b deleted ``saklas/data/vectors/`` — the 26 bundled concepts now
+# ship as 2-node ``pca`` manifolds, so ``bundled_concept_names()`` is empty and
+# ``materialize_bundled()`` has nothing real to copy.  These tests exercise the
+# materialize MECHANISM (copy-on-miss, stale ``format_version`` upgrade,
+# user-edit preservation, gap-filling), which still ships and is still relied
+# on for HF-pulled / user-authored packs.  To keep that mechanism under test we
+# stand up a synthetic bundled-vectors package on disk and redirect the
+# ``saklas.data.vectors`` resource lookup to it, so both
+# ``bundled_concept_names()`` and ``materialize_bundled()`` run against names no
+# longer in the real bundle.
+
+# Synthetic concept names that are NOT in ``bundled_manifold_names()`` — chosen
+# so nothing routes through the manifold-label tier.
+_SYNTH_A = "synthvec.alpha"
+_SYNTH_B = "synthvec.beta"
+
+
+def _shipped_pack_json(name: str) -> str:
+    """A valid v2 (``PACK_FORMAT_VERSION``) bundled pack.json body."""
+    return json.dumps({
+        "name": name,
+        "description": f"synthetic bundled {name}",
+        "format_version": packs.PACK_FORMAT_VERSION,
+        "version": "1.0.0",
+        "license": "MIT",
+        "tags": ["synthetic"],
+        "recommended_alpha": 0.5,
+        "source": "bundled",
+        "files": {},
+    })
+
+
+def _install_synthetic_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    concepts: Sequence[str],
+) -> Path:
+    """Build a fake ``saklas/data/vectors`` tree and redirect the resource
+    lookup at it.  Returns the synthetic-bundle root.
+
+    Each concept gets a v2 ``pack.json`` + a ``statements.json`` + a
+    ``scenarios.json`` (an "other shipped file" so the copy-other-files branch
+    is exercised).  ``materialize_bundled`` also reads
+    ``_resources.files("saklas.data")`` for ``neutral_statements.json``; that
+    lookup is delegated to the real package so the neutrals branch still works.
+    """
+    bundle_root = tmp_path / "_synth_data_vectors"
+    bundle_root.mkdir()
+    for concept in concepts:
+        cdir = bundle_root / concept
+        cdir.mkdir()
+        (cdir / "pack.json").write_text(_shipped_pack_json(concept))
+        (cdir / "statements.json").write_text(
+            json.dumps([[f"{concept} pos", f"{concept} neg"]])
+        )
+        (cdir / "scenarios.json").write_text(json.dumps([f"{concept} scenario"]))
+
+    real_files = packs._resources.files
+
+    def _patched_files(anchor: str):
+        if anchor == "saklas.data.vectors":
+            return bundle_root
+        return real_files(anchor)
+
+    monkeypatch.setattr(packs._resources, "files", _patched_files)
+    return bundle_root
 
 
 def test_pack_metadata_parse_minimal(tmp_path: Path):
@@ -320,7 +391,14 @@ def test_save_load_profile_roundtrip_slim_sidecar(tmp_path: Path):
 
 
 def test_bundled_concept_names_includes_known():
-    names = packs.bundled_concept_names()
+    # 4.0 step 6b deleted saklas/data/vectors/ — the 26 bundled concepts are
+    # now shipped as 2-node ``pca`` manifolds under saklas/data/manifolds/.
+    # `bundled_concept_names()` is therefore empty; the stable known-name
+    # assertion moves to `bundled_manifold_names()`.
+    from saklas.io.manifolds import bundled_manifold_names
+
+    assert packs.bundled_concept_names() == []
+    names = bundled_manifold_names()
     # `agentic` is a stable name across pre- and post-regen layouts.
     assert "agentic" in names
     assert len(names) >= 1
@@ -328,9 +406,13 @@ def test_bundled_concept_names_includes_known():
 
 def test_materialize_empty_home(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _install_synthetic_bundle(monkeypatch, tmp_path, concepts=[_SYNTH_A])
     packs.materialize_bundled()
     assert (tmp_path / "neutral_statements.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").is_file()
+    assert (tmp_path / "vectors" / "default" / _SYNTH_A / "pack.json").is_file()
+    # The other shipped files came across too.
+    assert (tmp_path / "vectors" / "default" / _SYNTH_A / "statements.json").is_file()
+    assert (tmp_path / "vectors" / "default" / _SYNTH_A / "scenarios.json").is_file()
 
 
 def test_materialize_does_not_overwrite(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
@@ -350,13 +432,14 @@ def test_materialize_upgrades_stale_bundled(monkeypatch: pytest.MonkeyPatch,  tm
     exist here; the shipped bundled dir only contains pack.json +
     statements.json)."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    concept_dir = tmp_path / "vectors" / "default" / "agentic"
+    _install_synthetic_bundle(monkeypatch, tmp_path, concepts=[_SYNTH_A])
+    concept_dir = tmp_path / "vectors" / "default" / _SYNTH_A
     concept_dir.mkdir(parents=True)
     stale_pack = concept_dir / "pack.json"
     # Minimal v1-shaped pack.json — missing files block, but carries an
     # explicit format_version=1 that identifies it as a stale install.
     stale_pack.write_text(
-        '{"name": "agentic", "description": "stale v1", "format_version": 1}'
+        '{"name": "' + _SYNTH_A + '", "description": "stale v1", "format_version": 1}'
     )
     fake_tensor = concept_dir / "stale_model.safetensors"
     fake_tensor.write_bytes(b"\x00" * 8)
@@ -374,14 +457,16 @@ def test_materialize_upgrades_stale_bundled(monkeypatch: pytest.MonkeyPatch,  tm
 
 def test_materialize_partial_fills_gaps(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    # Pre-create `agentic` with user edits; materialization should still
-    # populate other bundled packs (at least `angry.calm` in the current
-    # data dir) without overwriting agentic.
-    (tmp_path / "vectors" / "default" / "agentic").mkdir(parents=True)
-    (tmp_path / "vectors" / "default" / "agentic" / "pack.json").write_text("{}")
+    _install_synthetic_bundle(
+        monkeypatch, tmp_path, concepts=[_SYNTH_A, _SYNTH_B],
+    )
+    # Pre-create one concept with user edits; materialization should still
+    # populate the other bundled pack without overwriting the first.
+    (tmp_path / "vectors" / "default" / _SYNTH_A).mkdir(parents=True)
+    (tmp_path / "vectors" / "default" / _SYNTH_A / "pack.json").write_text("{}")
     packs.materialize_bundled()
-    assert (tmp_path / "vectors" / "default" / "angry.calm" / "pack.json").is_file()
-    assert (tmp_path / "vectors" / "default" / "agentic" / "pack.json").read_text() == "{}"
+    assert (tmp_path / "vectors" / "default" / _SYNTH_B / "pack.json").is_file()
+    assert (tmp_path / "vectors" / "default" / _SYNTH_A / "pack.json").read_text() == "{}"
 
 
 def test_variants_for_concept_raw_and_sae(tmp_path: Path):

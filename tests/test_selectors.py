@@ -4,8 +4,55 @@ from __future__ import annotations
 import pytest
 from pathlib import Path
 
+import json
+
 from saklas.io import selectors as sel
 from saklas.io import packs
+
+
+# Synthetic bundled-vectors fixture — see the matching helpers in
+# ``tests/test_packs.py`` / ``tests/test_atomic.py``.  4.0 step 6b emptied
+# ``saklas/data/vectors/`` (bundled concepts ship as manifolds now), so
+# ``bundled_concept_names()`` is empty and ``materialize_bundled()`` copies
+# nothing real.  This test pins the materialize+invalidate visibility contract,
+# so we stand up synthetic bundled concepts and redirect the
+# ``saklas.data.vectors`` resource lookup at them.
+
+# Names NOT in ``bundled_manifold_names()`` so nothing routes elsewhere.
+_SYNTH_CONCEPTS = ["synthvec.alpha", "synthvec.beta"]
+
+
+def _install_synthetic_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    bundle_root = tmp_path / "_synth_data_vectors"
+    bundle_root.mkdir()
+    for concept in _SYNTH_CONCEPTS:
+        cdir = bundle_root / concept
+        cdir.mkdir()
+        (cdir / "pack.json").write_text(json.dumps({
+            "name": concept,
+            "description": f"synthetic bundled {concept}",
+            "format_version": packs.PACK_FORMAT_VERSION,
+            "version": "1.0.0",
+            "license": "MIT",
+            "tags": ["synthetic"],
+            "recommended_alpha": 0.5,
+            "source": "bundled",
+            "files": {},
+        }))
+        (cdir / "statements.json").write_text(
+            json.dumps([[f"{concept} pos", f"{concept} neg"]])
+        )
+
+    real_files = packs._resources.files
+
+    def _patched_files(anchor: str):
+        if anchor == "saklas.data.vectors":
+            return bundle_root
+        return real_files(anchor)
+
+    monkeypatch.setattr(packs._resources, "files", _patched_files)
 
 
 def test_parse_bare_name():
@@ -442,6 +489,7 @@ def test_materialize_then_invalidate_makes_bundled_visible(monkeypatch: pytest.M
     contract holds even when probes=[] skips probes_bootstrap entirely.
     """
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _install_synthetic_bundle(monkeypatch, tmp_path)
     sel.invalidate()
 
     # Prime the cache with an empty walk — bundled not visible yet.

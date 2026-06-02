@@ -10,6 +10,54 @@ from saklas.io import packs
 from saklas.io.atomic import _temp_path, write_bytes_atomic, write_json_atomic
 
 
+# Synthetic bundled-vectors fixture — see the matching helper in
+# ``tests/test_packs.py``.  4.0 step 6b emptied ``saklas/data/vectors/`` (the
+# 26 bundled concepts ship as manifolds now), so ``materialize_bundled()`` has
+# no real concept to upgrade.  These tests exercise the upgrade machinery
+# (stale ``format_version`` -> v2, user-edited ``statements.json`` preservation
+# vs. canonical-equal refresh), so we stand up a synthetic bundled concept and
+# redirect the ``saklas.data.vectors`` resource lookup at it.
+
+# A name NOT in ``bundled_manifold_names()`` so nothing routes elsewhere.
+_SYNTH = "synthvec.alpha"
+
+
+def _install_synthetic_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    statements: object,
+) -> Path:
+    """Build a fake ``saklas/data/vectors`` tree holding one concept and
+    redirect ``packs._resources.files`` at it.  ``statements`` is written into
+    the synthetic bundled ``statements.json``."""
+    bundle_root = tmp_path / "_synth_data_vectors"
+    cdir = bundle_root / _SYNTH
+    cdir.mkdir(parents=True)
+    (cdir / "pack.json").write_text(json.dumps({
+        "name": _SYNTH,
+        "description": f"synthetic bundled {_SYNTH}",
+        "format_version": packs.PACK_FORMAT_VERSION,
+        "version": "1.0.0",
+        "license": "MIT",
+        "tags": ["synthetic"],
+        "recommended_alpha": 0.5,
+        "source": "bundled",
+        "files": {},
+    }))
+    (cdir / "statements.json").write_text(json.dumps(statements))
+
+    real_files = packs._resources.files
+
+    def _patched_files(anchor: str):
+        if anchor == "saklas.data.vectors":
+            return bundle_root
+        return real_files(anchor)
+
+    monkeypatch.setattr(packs._resources, "files", _patched_files)
+    return bundle_root
+
+
 def test_write_json_atomic_creates_file(tmp_path: Path):
     path = tmp_path / "x.json"
     write_json_atomic(path, {"a": 1, "b": [2, 3]})
@@ -179,13 +227,18 @@ def test_materialize_preserves_user_edited_statements(monkeypatch: pytest.Monkey
     """
     import logging
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    concept_dir = tmp_path / "vectors" / "default" / "agentic"
+    # Synthetic bundled statements that differ (canonically) from the user's.
+    _install_synthetic_bundle(
+        monkeypatch, tmp_path,
+        statements=[["bundled pos", "bundled neg"]],
+    )
+    concept_dir = tmp_path / "vectors" / "default" / _SYNTH
     concept_dir.mkdir(parents=True)
 
     # Stale v1 pack.json; gets upgraded.
     stale_pack = concept_dir / "pack.json"
     stale_pack.write_text(
-        '{"name": "agentic", "description": "stale v1", "format_version": 1}'
+        '{"name": "' + _SYNTH + '", "description": "stale v1", "format_version": 1}'
     )
     stale_pack_text = stale_pack.read_text()
 
@@ -210,24 +263,23 @@ def test_materialize_preserves_user_edited_statements(monkeypatch: pytest.Monkey
     # INFO log captured the skip + the upgrade.
     messages = [r.getMessage() for r in caplog.records]
     assert any("preserving user-edited" in m for m in messages)
-    assert any("upgraded default/agentic" in m for m in messages)
+    assert any(f"upgraded default/{_SYNTH}" in m for m in messages)
 
 
 def test_materialize_overwrites_unedited_statements(monkeypatch: pytest.MonkeyPatch,  tmp_path: Path):
     """When on-disk statements.json is canonically equal to the bundled
     one, the upgrade is allowed to refresh it — no skip log."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    concept_dir = tmp_path / "vectors" / "default" / "agentic"
+    bundled_payload = [["bundled pos", "bundled neg"], ["pos2", "neg2"]]
+    _install_synthetic_bundle(monkeypatch, tmp_path, statements=bundled_payload)
+    concept_dir = tmp_path / "vectors" / "default" / _SYNTH
     concept_dir.mkdir(parents=True)
     (concept_dir / "pack.json").write_text(
-        '{"name": "agentic", "description": "stale v1", "format_version": 1}'
+        '{"name": "' + _SYNTH + '", "description": "stale v1", "format_version": 1}'
     )
 
-    # Mirror the bundled statements byte-for-byte (re-formatted to test
+    # Mirror the bundled statements canonically (re-formatted to test
     # canonical-hash equivalence: pretty-printed should still compare equal).
-    from importlib import resources as _resources
-    bundled = _resources.files("saklas.data.vectors").joinpath("agentic").joinpath("statements.json")
-    bundled_payload = json.loads(bundled.read_text())
     # Re-emit pretty so byte-equality fails but canonical hash matches.
     (concept_dir / "statements.json").write_text(json.dumps(bundled_payload, indent=4))
 

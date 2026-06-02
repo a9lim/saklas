@@ -29,10 +29,15 @@ class DataSource:
 
     @classmethod
     def curated(cls, concept: str) -> DataSource:
-        """Load the bundled 'default/<concept>' statements.json.
+        """Load the bundled 'default/<concept>' contrastive pairs.
 
         Triggers first-run materialization of bundled data into ~/.saklas/
-        and reads from there so users can edit the statements freely.
+        and reads from there so users can edit the statements freely.  A
+        steering vector now ships as a 2-node ``pca`` manifold (4.0); when no
+        ``vectors/`` ``statements.json`` exists the pairs are reconstructed
+        from the manifold's two node corpora (node 0 = positive pole, node 1 =
+        negative).  The pairing is arbitrary — DiM only needs the two
+        centroids — so the re-fit vector is identical either way.
         """
         from saklas.io.paths import concept_dir
 
@@ -40,23 +45,62 @@ class DataSource:
         folder = concept_dir("default", name)
         ds_path = folder / "statements.json"
 
-        # Short-circuit: if the concept is already materialized in the user
-        # cache, skip materialize_bundled() and the directory walk entirely.
+        # Short-circuit: already materialized as an editable vector corpus.
         if ds_path.exists():
             return cls._from_json_file(ds_path, name_override=concept)
 
+        # Manifold corpus already materialized?
+        manifold_ds = cls._from_bundled_manifold(name, concept)
+        if manifold_ds is not None:
+            return manifold_ds
+
         from saklas.io.packs import materialize_bundled
+        from saklas.io.manifolds import materialize_bundled_manifolds
         materialize_bundled()
-        if not ds_path.exists():
-            default_root = folder.parent
-            available = sorted(
-                p.name for p in default_root.iterdir() if p.is_dir()
-            ) if default_root.exists() else []
-            raise FileNotFoundError(
-                f"No curated dataset for '{concept}'. "
-                f"Available: {', '.join(available)}"
-            )
-        return cls._from_json_file(ds_path, name_override=concept)
+        materialize_bundled_manifolds()
+        if ds_path.exists():
+            return cls._from_json_file(ds_path, name_override=concept)
+        manifold_ds = cls._from_bundled_manifold(name, concept)
+        if manifold_ds is not None:
+            return manifold_ds
+
+        default_root = folder.parent
+        available = sorted(
+            p.name for p in default_root.iterdir() if p.is_dir()
+        ) if default_root.exists() else []
+        raise FileNotFoundError(
+            f"No curated dataset for '{concept}'. "
+            f"Available: {', '.join(available)}"
+        )
+
+    @classmethod
+    def _from_bundled_manifold(
+        cls, name: str, concept: str,
+    ) -> DataSource | None:
+        """Reconstruct contrastive pairs from a 2-node ``pca`` manifold.
+
+        Returns ``None`` when no such manifold is installed (the caller falls
+        through to materialization / the not-found error).
+        """
+        from saklas.io.paths import manifold_dir
+
+        mdir = manifold_dir("default", name)
+        if not (mdir / "manifold.json").exists():
+            return None
+        from saklas.io.manifolds import ManifoldFolder, ManifoldFormatError
+        try:
+            mf = ManifoldFolder.load(mdir)
+        except ManifoldFormatError:
+            return None
+        if mf.fit_mode != "pca" or len(mf.node_labels) != 2:
+            return None
+        groups = mf.node_groups()  # [(label, [statements]), ...] in node order
+        pos = groups[0][1]
+        neg = groups[1][1]
+        pairs = [(p, n) for p, n in zip(pos, neg)]
+        if not pairs:
+            return None
+        return cls(pairs=pairs, name=concept)
 
     @classmethod
     def json(cls, path: str, name: str | None = None) -> DataSource:

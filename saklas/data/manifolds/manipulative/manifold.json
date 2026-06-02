@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "manipulative",
+ "description": "Monopolar probe: manipulative.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "manipulative"
+  },
+  {
+   "label": "manipulative_neg"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "alignment"
+ ]
+}

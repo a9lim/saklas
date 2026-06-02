@@ -1,0 +1,22 @@
+{
+ "format_version": 5,
+ "name": "humorous.serious",
+ "description": "Bipolar axis: humorous (+) vs serious (-). Steer with negative alpha for the opposite pole.",
+ "fit_mode": "pca",
+ "hyperparams": {
+  "max_dim": 1,
+  "var_threshold": 0.7
+ },
+ "nodes": [
+  {
+   "label": "humorous"
+  },
+  {
+   "label": "serious"
+  }
+ ],
+ "files": {},
+ "tags": [
+  "register"
+ ]
+}

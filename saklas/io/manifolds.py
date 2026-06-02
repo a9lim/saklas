@@ -361,6 +361,12 @@ class ManifoldFolder:
     # semantically identical to today's behavior — the centroid pooling
     # just goes through the default chat-template branch.
     node_roles: list[str | None] = field(default_factory=list)
+    # Category tags, mirroring :attr:`saklas.io.packs.PackMetadata.tags`.
+    # Carried so category-grouped probe bootstrap (``load_defaults`` ->
+    # ``bootstrap_probes(categories=...)``) keeps working once a steering
+    # vector lives as a 2-node ``pca`` manifold.  Optional/additive — the
+    # loader defaults ``[]``; a tagless manifold stays byte-identical.
+    tags: list[str] = field(default_factory=list)
     # tensor stem (``<safe_model>`` or ``<safe_model>_sae-<rel>``) -> sidecar.
     _sidecars: dict[str, ManifoldSidecar] = field(default_factory=dict)
 
@@ -541,6 +547,14 @@ class ManifoldFolder:
                     f"tampered/missing {bad}"
                 )
 
+        raw_tags = data.get("tags", [])
+        if not isinstance(raw_tags, list) or not all(
+            isinstance(t, str) for t in raw_tags
+        ):
+            raise ManifoldFormatError(
+                f"manifold {name!r} 'tags' must be a list of strings"
+            )
+
         inst = cls(
             folder=folder,
             name=name,
@@ -553,6 +567,7 @@ class ManifoldFolder:
             hyperparams=hyperparams,
             source=str(data.get("source", "local")),
             node_roles=node_roles,
+            tags=[str(t) for t in raw_tags],
         )
 
         # Every node file must be present.
@@ -680,6 +695,10 @@ class ManifoldFolder:
         # after a fit has rewritten the manifest.
         if self.source and self.source != "local":
             payload["source"] = self.source
+        # Category tags survive re-fit, written only when non-empty so a
+        # tagless manifold stays byte-identical to the pre-tags shape.
+        if self.tags:
+            payload["tags"] = list(self.tags)
         # Per-node ``role`` is written only when set — keeps the legacy
         # shape (every node carries ``{label, coords}`` or ``{label}``
         # only) byte-identical for non-role manifolds, and a stray
@@ -1092,6 +1111,97 @@ def create_discover_manifold_folder(
     if scenarios is not None:
         write_manifold_scenarios(folder, scenarios)
     return folder
+
+
+def port_legacy_vector_folder(
+    vector_folder: Path,
+    *,
+    namespace: str = "local",
+    force: bool = False,
+) -> tuple[Path, "ManifoldFolder"]:
+    """Port a legacy ``vectors/<ns>/<c>/`` folder to a 2-node ``pca`` manifold.
+
+    The 4.0 back-compat primitive (step 6b detect-on-load, step 6e bulk
+    upgrade): a steering vector is the ``K = 2`` case of a flat affine
+    subspace, so a legacy concept folder's ``statements.json`` (a list of
+    ``{positive, negative}`` pairs) + ``scenarios.json`` reconstruct the
+    equivalent manifold authoring — node 0 = the positive corpus, node 1 = the
+    negative — under ``manifolds/<namespace>/<name>/``.  **No tensors are
+    carried**: the per-model subspace re-fits lazily on first steer / probe,
+    so a ported folder never ships a stale or cross-shape baked tensor.
+
+    Labels follow the convert convention: a bipolar name ``pos.neg`` splits to
+    ``(pos, neg)``; a monopolar name ``c`` becomes ``(c, c_neg)``.  ``tags``
+    and ``description`` are carried from the legacy ``pack.json`` when present.
+
+    Returns ``(manifold_folder_path, ManifoldFolder)``.  Raises
+    :class:`FileNotFoundError` when the source has no ``statements.json`` and
+    :class:`FileExistsError` when the target manifold already exists and
+    ``force`` is ``False``.
+    """
+    vector_folder = Path(vector_folder)
+    name = vector_folder.name
+    stmts_path = vector_folder / "statements.json"
+    if not stmts_path.exists():
+        raise FileNotFoundError(
+            f"legacy vector folder {vector_folder} has no statements.json to port"
+        )
+    pairs = json.loads(stmts_path.read_text())
+    if not isinstance(pairs, list) or not pairs:
+        raise ManifoldFormatError(
+            f"legacy vector folder {vector_folder}: statements.json is not a "
+            f"non-empty list of {{positive, negative}} pairs"
+        )
+    pos_corpus = [p["positive"] for p in pairs]
+    neg_corpus = [p["negative"] for p in pairs]
+
+    if "." in name:
+        pos_label, neg_label = name.split(".", 1)
+    else:
+        pos_label, neg_label = name, f"{name}_neg"
+
+    description = f"Ported steering vector {name} as a 2-node pca subspace."
+    tags: list[str] = []
+    pack_path = vector_folder / "pack.json"
+    if pack_path.exists():
+        try:
+            pack = json.loads(pack_path.read_text())
+            description = pack.get("description", description)
+            tags = [str(t) for t in pack.get("tags", [])]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    scenarios: list[str] | None = None
+    scn_path = vector_folder / "scenarios.json"
+    if scn_path.exists():
+        try:
+            raw_scn = json.loads(scn_path.read_text())
+            if isinstance(raw_scn, list):
+                scenarios = [str(s) for s in raw_scn]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    target = manifold_dir(namespace, name)
+    if (target / "manifold.json").exists():
+        if not force:
+            raise FileExistsError(
+                f"manifold {namespace}/{name} already exists; pass force=True "
+                f"to re-port"
+            )
+        shutil.rmtree(target)
+
+    create_discover_manifold_folder(
+        namespace, name, description,
+        fit_mode="pca",
+        node_corpora={pos_label: pos_corpus, neg_label: neg_corpus},
+        hyperparams={"max_dim": 1, "var_threshold": 0.70},
+        scenarios=scenarios,
+    )
+    mf = ManifoldFolder.load(target)
+    if tags:
+        mf.tags = tags
+        mf.write_metadata(files=mf.files)
+    return target, mf
 
 
 def write_manifold_scenarios(folder: Path, scenarios: list[str]) -> None:

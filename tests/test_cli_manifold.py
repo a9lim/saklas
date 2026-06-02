@@ -420,12 +420,12 @@ def test_run_manifold_clear_calls_backend(monkeypatch: pytest.MonkeyPatch, capsy
         return 3
 
     monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
-    # Bare ``circumplex`` resolves cross-namespace to the bundled
-    # ``default/circumplex`` (the only installed match) — the lifecycle
-    # verbs no longer hard-default a bare name to ``local/``.
-    cli.main(["vector", "manifold", "clear", "circumplex", "--variant", "raw"])
+    # Bare ``pad`` resolves cross-namespace to the bundled ``default/pad``
+    # (the only installed match) — the lifecycle verbs no longer hard-default
+    # a bare name to ``local/``.
+    cli.main(["vector", "manifold", "clear", "pad", "--variant", "raw"])
     assert calls == [
-        {"ns": "default", "name": "circumplex", "model_scope": None, "variant": "raw"},
+        {"ns": "default", "name": "pad", "model_scope": None, "variant": "raw"},
     ]
     out = capsys.readouterr().out
     assert "Deleted 3 files" in out
@@ -440,10 +440,10 @@ def test_run_manifold_clear_passes_model_scope(monkeypatch: pytest.MonkeyPatch, 
         return 1
 
     monkeypatch.setattr("saklas.io.manifolds.clear_manifold_tensors", fake_clear)
-    # Bare name resolves cross-namespace to bundled ``default/circumplex``.
-    cli.main(["vector", "manifold", "clear", "circumplex", "-m", "foo/bar"])
+    # Bare name resolves cross-namespace to bundled ``default/pad``.
+    cli.main(["vector", "manifold", "clear", "pad", "-m", "foo/bar"])
     assert calls == [
-        {"ns": "default", "name": "circumplex", "model_scope": "foo/bar", "variant": "all"},
+        {"ns": "default", "name": "pad", "model_scope": "foo/bar", "variant": "all"},
     ]
     captured = capsys.readouterr()
     assert "Deleted 1 files" in captured.out
@@ -472,9 +472,9 @@ def test_run_manifold_refresh_passes_model_scope(monkeypatch: pytest.MonkeyPatch
         return "scoped"
 
     monkeypatch.setattr("saklas.io.manifolds.refresh_manifold", fake_refresh)
-    # Bare name resolves cross-namespace to bundled ``default/circumplex``.
-    cli.main(["vector", "manifold", "refresh", "circumplex", "-m", "foo/bar"])
-    assert calls == [{"ns": "default", "name": "circumplex", "model_scope": "foo/bar"}]
+    # Bare name resolves cross-namespace to bundled ``default/pad``.
+    cli.main(["vector", "manifold", "refresh", "pad", "-m", "foo/bar"])
+    assert calls == [{"ns": "default", "name": "pad", "model_scope": "foo/bar"}]
     captured = capsys.readouterr()
     assert "foo/bar" in captured.out and "re-fits on next use" in captured.out
     assert "no effect" not in captured.err

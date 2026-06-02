@@ -733,14 +733,18 @@ class TestNativeSteeringField:
         session.generate.return_value = GenerationResult(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
+        # ``myvec.baseline`` is a synthetic name outside the bundled-probe
+        # vocabulary, so it parses to a plain vector term (a bundled name
+        # like ``angry.calm`` now routes to a 2-node pca ManifoldTerm when
+        # the bundled manifolds are materialized in the active home).
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
-            "steering": "0.5 angry.calm",
+            "steering": "0.5 myvec.baseline",
         })
         assert resp.status_code == 200
         kw = session.generate.call_args[1]
         assert kw["steering"] is not None
-        assert kw["steering"].alphas == {"angry.calm": 0.5}
+        assert kw["steering"].alphas == {"myvec.baseline": 0.5}
 
     def test_steering_projection_term(self, session_and_client: Any) -> None:
         session, client = session_and_client
