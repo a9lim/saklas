@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from saklas.cli.parsers import (
-    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _VECTOR_VERBS,
+    _EXPERIMENT_VERBS, _MANIFOLD_VERBS, _PACK_VERBS, _SUBSPACE_VERBS,
+    _VECTOR_VERBS,
 )
 from saklas.core.errors import SaklasError
 from saklas.core.stats import median_or_zero
@@ -2332,11 +2333,12 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
     )
 
 
-def _run_vector_manifold(args: argparse.Namespace) -> None:
-    """Dispatch ``saklas vector manifold <verb>``."""
+@_saklas_error_exit
+def _run_manifold(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas manifold <verb>`` (and the deprecated ``vector manifold``)."""
     cmd = getattr(args, "manifold_cmd", None)
     if cmd is None:
-        print("usage: saklas vector manifold <verb> [...]")
+        print("usage: saklas manifold <verb> [...]")
         print()
         width = max(len(v) for v, _ in _MANIFOLD_VERBS)
         for v, desc in _MANIFOLD_VERBS:
@@ -2381,26 +2383,49 @@ def _run_vector_manifold(args: argparse.Namespace) -> None:
     if cmd == "show":
         _run_manifold_show(args)
         return
-    print(f"unknown vector manifold verb {cmd!r}", file=sys.stderr)
+    print(f"unknown manifold verb {cmd!r}", file=sys.stderr)
     sys.exit(2)
 
 
-_VECTOR_RUNNERS = {
+_SUBSPACE_RUNNERS = {
     "extract":  _run_extract,
     "merge":    _run_merge,
     "clone":    _run_clone,
     "compare":  _run_compare,
     "why":      _run_why,
     "transfer": _run_transfer,
-    "manifold": _run_vector_manifold,
+}
+
+# The deprecated ``vector`` alias dispatches the subspace verbs plus the
+# nested ``manifold`` (which reads the same ``manifold_cmd`` dest).
+_VECTOR_RUNNERS = {
+    **_SUBSPACE_RUNNERS,
+    "manifold": _run_manifold,
 }
 
 
 @_saklas_error_exit
+def _run_subspace(args: argparse.Namespace) -> None:
+    """Dispatch ``saklas subspace <verb>`` (the flat-artifact / vector verbs)."""
+    cmd = getattr(args, "subspace_cmd", None)
+    if cmd is None:
+        print("usage: saklas subspace <verb> [...]")
+        print()
+        width = max(len(v) for v, _ in _SUBSPACE_VERBS)
+        for v, desc in _SUBSPACE_VERBS:
+            print(f"  {v:<{width}}  {desc}")
+        print()
+        print("Run `saklas subspace <verb> -h` for verb-specific options.")
+        sys.exit(0)
+    _SUBSPACE_RUNNERS[cmd](args)
+
+
+@_saklas_error_exit
 def _run_vector(args: argparse.Namespace) -> None:
+    """[deprecated 4.0] alias for ``subspace`` (+ nested ``manifold``)."""
     vector_cmd = getattr(args, "vector_cmd", None)
     if vector_cmd is None:
-        print("usage: saklas vector <verb> [...]")
+        print("usage: saklas vector <verb> [...]   [deprecated: use `subspace`/`manifold`]")
         print()
         width = max(len(v) for v, _ in _VECTOR_VERBS)
         for v, desc in _VECTOR_VERBS:
@@ -2408,8 +2433,13 @@ def _run_vector(args: argparse.Namespace) -> None:
         print()
         print("Run `saklas vector <verb> -h` for verb-specific options.")
         sys.exit(0)
-    runner = _VECTOR_RUNNERS[vector_cmd]
-    runner(args)
+    target = "manifold" if vector_cmd == "manifold" else f"subspace {vector_cmd}"
+    print(
+        f"warning: `saklas vector {vector_cmd}` is deprecated (4.0) — "
+        f"use `saklas {target}`.",
+        file=sys.stderr,
+    )
+    _VECTOR_RUNNERS[vector_cmd](args)
 
 
 @_saklas_error_exit
@@ -2727,6 +2757,8 @@ _COMMAND_RUNNERS = {
     "tui":        _run_tui,
     "serve":      _run_serve,
     "pack":       _run_pack,
+    "subspace":   _run_subspace,
+    "manifold":   _run_manifold,
     "vector":     _run_vector,
     "config":     _run_config,
     "experiment": _run_experiment,

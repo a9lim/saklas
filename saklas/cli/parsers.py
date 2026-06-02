@@ -78,13 +78,23 @@ _PACK_VERBS: list[tuple[str, str]] = [
     ("export",    "Export a pack to an interchange format (gguf)"),
 ]
 
-_VECTOR_VERBS: list[tuple[str, str]] = [
-    ("extract",   "Extract a steering vector for a concept"),
+# ``subspace`` (4.0): the flat-artifact verbs — a steering vector *is* the
+# K=2 case of a flat affine subspace.  These are the old ``vector`` direct
+# subcommands, minus the nested ``manifold`` (now its own top-level verb).
+_SUBSPACE_VERBS: list[tuple[str, str]] = [
+    ("extract",   "Extract a steering vector (a 2-node flat subspace)"),
     ("merge",     "Merge existing vectors into a new pack"),
     ("clone",     "Clone a persona from a text corpus"),
     ("compare",   "Cosine similarity between steering vectors"),
     ("why",       "Show which layers contribute most to a steering vector"),
     ("transfer",  "Transfer a probe from one model to another via Procrustes"),
+]
+
+# ``vector`` is the deprecated 3.x alias — it keeps the full old tree (the
+# subspace verbs + the nested ``manifold``) so existing scripts keep working,
+# with a one-time deprecation notice routed to the new top-level verbs.
+_VECTOR_VERBS: list[tuple[str, str]] = [
+    *_SUBSPACE_VERBS,
     ("manifold",  "Fit and inspect spline-based steering manifolds"),
 ]
 
@@ -806,15 +816,38 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     )
 
 
-_VECTOR_BUILDERS = {
+_SUBSPACE_BUILDERS = {
     "extract":  _build_vector_extract,
     "merge":    _build_vector_merge,
     "clone":    _build_vector_clone,
     "compare":  _build_vector_compare,
     "why":      _build_vector_why,
     "transfer": _build_vector_transfer,
+}
+
+_VECTOR_BUILDERS = {
+    **_SUBSPACE_BUILDERS,
     "manifold": _build_vector_manifold,
 }
+
+
+def _build_subspace_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas subspace`` — the flat-artifact (vector) verbs."""
+    sub = parser.add_subparsers(dest="subspace_cmd", required=False, metavar="VERB")
+    for verb, desc in _SUBSPACE_VERBS:
+        child = sub.add_parser(verb, help=desc, description=desc)
+        _SUBSPACE_BUILDERS[verb](child)
+
+
+def _build_manifold_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas manifold`` — curved/flat manifold authoring + lifecycle.
+
+    The top-level promotion of the old ``vector manifold`` subtree; reuses
+    :func:`_build_vector_manifold`, which registers the same ``manifold_cmd``
+    subparsers (so the deprecated ``vector manifold`` alias and the new
+    top-level verb parse identically).
+    """
+    _build_vector_manifold(parser)
 
 
 def _build_vector_parser(parser: argparse.ArgumentParser) -> None:
@@ -1012,10 +1045,25 @@ def _build_root_parser() -> argparse.ArgumentParser:
     )
     _build_pack_parser(pack)
 
+    subspace = sub.add_parser(
+        "subspace",
+        help="Flat-subspace ops (extract/merge/clone/compare/why/transfer)",
+        description="Flat-subspace (steering vector) operations",
+    )
+    _build_subspace_parser(subspace)
+
+    manifold = sub.add_parser(
+        "manifold",
+        help="Manifold ops (fit/discover/generate/ls/show/install/...)",
+        description="Steering-manifold authoring, fitting, and lifecycle",
+    )
+    _build_manifold_parser(manifold)
+
     vector = sub.add_parser(
         "vector",
-        help="Vector operations (extract/merge/clone/compare/why/transfer)",
-        description="Vector operations (extract/merge/clone/compare/why/transfer)",
+        help="[deprecated] use `subspace` / `manifold` — alias kept for 3.x",
+        description="[deprecated 4.0] alias for `subspace` (+ nested `manifold`); "
+                    "use the top-level verbs instead",
     )
     _build_vector_parser(vector)
 

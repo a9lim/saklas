@@ -1,7 +1,12 @@
 # cli/
 
-Six-verb root parser (`tui`/`serve`/`pack`/`vector`/`experiment`/`config`) split
-across:
+Eight-verb root parser
+(`tui`/`serve`/`pack`/`subspace`/`manifold`/`vector`/`experiment`/`config`). 4.0
+promoted `subspace` (flat — the old `vector` extract/merge/clone/compare/why/
+transfer) and `manifold` (the old `vector manifold *` subtree) to top-level
+verbs; `vector` is now a **deprecated alias** that parses the old tree
+identically and dispatches to the new runners with a one-time stderr notice
+(`_run_vector` → `_SUBSPACE_RUNNERS` / `_run_manifold`). Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
 - `cli/runners.py` — every `_run_X` plus the shared helpers below
@@ -10,17 +15,21 @@ across:
 - `cli/output.py` — text/JSON formatters for `pack ls` / `pack search`
 
 `main()` dispatches via `_COMMAND_RUNNERS[cmd]`. Bare `saklas` (or a bare verb
-with no subverb) prints help and exits 0, not argparse's exit 2. `manifold` is
-nested under `vector` — there is no top-level `subspace`/`manifold` verb.
+with no subverb) prints help and exits 0, not argparse's exit 2. `subspace` and
+`manifold` are top-level verbs; `vector` is the deprecated alias (`_run_vector`
+warns then routes to `_SUBSPACE_RUNNERS` / `_run_manifold`).
 
 ## Verb nesting
 
 - `pack` = distribution (install/refresh/clear/rm/ls/search/push/export) via
   `_PACK_VERBS` / `_PACK_BUILDERS` / `_PACK_RUNNERS`
-- `vector` = computation (extract/merge/clone/compare/why/transfer/manifold) via
-  `_VECTOR_VERBS` / `_VECTOR_BUILDERS` / `_VECTOR_RUNNERS`. `manifold` is itself
-  nested (`fit`/`discover`/`generate`/`merge`/`install`/`search`/`push`/`rm`/
-  `clear`/`refresh`/`transfer`/`ls`/`show`), hand-dispatched by `_run_vector_manifold`.
+- `subspace` = flat-artifact computation (extract/merge/clone/compare/why/transfer)
+  via `_SUBSPACE_VERBS` / `_SUBSPACE_BUILDERS` / `_SUBSPACE_RUNNERS` (`_run_subspace`).
+- `manifold` = the steering-manifold subtree promoted to top-level
+  (`fit`/`discover`/`generate`/`merge`/`install`/`search`/`push`/`rm`/
+  `clear`/`refresh`/`transfer`/`ls`/`show`), hand-dispatched by `_run_manifold`
+  (`_build_manifold_parser` reuses `_build_vector_manifold`, so the verb and the
+  `vector manifold` alias parse identically).
   The fit/discover/generate/transfer verbs load a model; the lifecycle verbs and
   `ls`/`show` are pure-IO over `~/.saklas/manifolds/`, addressed by
   `(namespace, name)` pairs (not the concept `Selector`/`resolve` machinery).
