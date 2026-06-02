@@ -26,7 +26,6 @@ from __future__ import annotations
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 
 import asyncio
-import json
 import time
 import uuid
 from collections import deque
@@ -34,7 +33,7 @@ from operator import itemgetter
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from saklas.core.errors import SaklasError
@@ -46,6 +45,7 @@ from saklas.core.results import GenerationResult, RunSet
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.sse import ProgressCallback, progress_sse_response
 from saklas.server.ws_events import build_token_event
 
 
@@ -1405,123 +1405,32 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
-            async def _sse():
-                # Live streaming: the `on_progress` callback fires from
-                # the worker thread (``session.extract`` runs under
-                # ``asyncio.to_thread``), so we hop each message back to
-                # the loop via ``call_soon_threadsafe`` and drain a
-                # queue here.  The previous shape collected messages
-                # into a list and yielded them only after extraction
-                # finished, which made the SSE stream silent for the
-                # whole multi-minute cold path and burst all events in
-                # one tick right before ``done`` — the client never had
-                # time to render them as live progress.
-                loop = asyncio.get_running_loop()
-                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+                canonical, profile = await asyncio.to_thread(
+                    session.extract, source, req.baseline,
+                    on_progress=on_progress,
+                    sae=req.sae,
+                    sae_revision=req.sae_revision,
+                    dls=req.dls,
+                    role=req.role,
+                    namespace=req.namespace,
+                    force_statements=req.force,
+                )
+                registry_name = _extract_registry_name(canonical, req.namespace)
+                if req.auto_register:
+                    session.steer(registry_name, profile)
+                return {
+                    "done": True,
+                    "profile": _profile_to_json(registry_name, profile),
+                    "canonical": registry_name,
+                }
 
-                def _on_progress(msg: str) -> None:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, ("progress", msg),
-                    )
-
-                async with session.lock:
-                    async def _run() -> None:
-                        try:
-                            canonical, profile = await asyncio.to_thread(
-                                session.extract, source, req.baseline,
-                                on_progress=_on_progress,
-                                sae=req.sae,
-                                sae_revision=req.sae_revision,
-                                dls=req.dls,
-                                role=req.role,
-                                namespace=req.namespace,
-                                force_statements=req.force,
-                            )
-                            registry_name = _extract_registry_name(
-                                canonical, req.namespace,
-                            )
-                            if req.auto_register:
-                                session.steer(registry_name, profile)
-                            # Yield once so any pending
-                            # ``call_soon_threadsafe`` progress
-                            # callbacks scheduled by the worker drain
-                            # into the queue *before* the terminal
-                            # ``done`` lands.  Without this nudge the
-                            # late-burst progress messages can be
-                            # short-circuited by the SSE generator's
-                            # ``done`` break.
-                            await asyncio.sleep(0)
-                            queue.put_nowait(("done", registry_name, profile))
-                        except SaklasError as e:
-                            import logging
-                            logging.getLogger("saklas.api").exception(
-                                "extract failed for session=%s", session_id,
-                            )
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": "extract failed",
-                                    "code": type(e).__name__,
-                                },
-                            ))
-                        except Exception as e:  # noqa: BLE001
-                            # Catch-all so a crash in the worker doesn't
-                            # leave the SSE generator blocked forever on
-                            # ``queue.get()``.  Log + send a generic
-                            # error frame; preserve traceback in logs.
-                            import logging
-                            logging.getLogger("saklas.api").exception(
-                                "extract crashed for session=%s", session_id,
-                            )
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": "extract failed",
-                                    "code": type(e).__name__,
-                                },
-                            ))
-
-                    task = asyncio.create_task(_run())
-                    try:
-                        while True:
-                            item = await queue.get()
-                            kind = item[0]
-                            if kind == "progress":
-                                yield (
-                                    f"event: progress\n"
-                                    f"data: {json.dumps({'message': item[1]})}\n\n"
-                                )
-                            elif kind == "done":
-                                _, canonical, profile = item
-                                body = {
-                                    "done": True,
-                                    "profile": _profile_to_json(canonical, profile),
-                                    "canonical": canonical,
-                                }
-                                yield (
-                                    f"event: done\n"
-                                    f"data: {json.dumps(body)}\n\n"
-                                )
-                                break
-                            elif kind == "error":
-                                yield (
-                                    f"event: error\n"
-                                    f"data: {json.dumps(item[1])}\n\n"
-                                )
-                                break
-                    finally:
-                        # If the client disconnects mid-stream the
-                        # generator gets cancelled here — make sure the
-                        # worker task is not orphaned.  The underlying
-                        # thread can't be stopped, but the future is.
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except BaseException:  # noqa: BLE001
-                                pass
-
-            return StreamingResponse(_sse(), media_type="text/event-stream")
+            return progress_sse_response(
+                session.lock,
+                _job,
+                error_message="extract failed",
+                log_message=f"extract failed for session={session_id}",
+            )
 
         progress_msgs: list[str] = []
         async with session.lock:
@@ -1610,73 +1519,15 @@ def register_saklas_routes(app: FastAPI) -> None:
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
-            async def _sse():
-                loop = asyncio.get_running_loop()
-                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+                return await asyncio.to_thread(_generate, on_progress)
 
-                def _on_progress(msg: str) -> None:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, ("progress", msg),
-                    )
-
-                async with session.lock:
-                    async def _run() -> None:
-                        try:
-                            body = await asyncio.to_thread(
-                                _generate, _on_progress,
-                            )
-                            await asyncio.sleep(0)
-                            queue.put_nowait(("done", body))
-                        except Exception as e:  # noqa: BLE001
-                            # Don't surface ``str(e)`` — Python exception
-                            # messages routinely echo filesystem paths or
-                            # vendor error text.  Log the full traceback
-                            # server-side, send a generic shape (matching
-                            # the clone/extract SSE workers above).
-                            import logging
-                            logging.getLogger("saklas.api").exception(
-                                "extract preview failed for session=%s",
-                                session_id,
-                            )
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": "preview failed",
-                                    "code": type(e).__name__,
-                                },
-                            ))
-
-                    task = asyncio.create_task(_run())
-                    try:
-                        while True:
-                            item = await queue.get()
-                            kind = item[0]
-                            if kind == "progress":
-                                yield (
-                                    f"event: progress\n"
-                                    f"data: {json.dumps({'message': item[1]})}\n\n"
-                                )
-                            elif kind == "done":
-                                yield (
-                                    f"event: done\n"
-                                    f"data: {json.dumps(item[1])}\n\n"
-                                )
-                                break
-                            elif kind == "error":
-                                yield (
-                                    f"event: error\n"
-                                    f"data: {json.dumps(item[1])}\n\n"
-                                )
-                                break
-                    finally:
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except BaseException:  # noqa: BLE001
-                                pass
-
-            return StreamingResponse(_sse(), media_type="text/event-stream")
+            return progress_sse_response(
+                session.lock,
+                _job,
+                error_message="preview failed",
+                log_message=f"extract preview failed for session={session_id}",
+            )
 
         async with session.lock:
             return await asyncio.to_thread(_generate, lambda _msg: None)
@@ -1746,53 +1597,30 @@ def register_saklas_routes(app: FastAPI) -> None:
             )
 
         if wants_sse:
-            async def _sse():
-                async with session.lock:
-                    try:
-                        canonical, profile = await asyncio.to_thread(_do_clone)
-                    except FileNotFoundError:
-                        # Don't surface ``str(e)`` — Python's "No such file
-                        # or directory: '<path>'" leaks server-side
-                        # filesystem layout.  Echo the request's own
-                        # ``corpus_path`` instead so the client gets a
-                        # useful 404 without any traceback content.
-                        err = {
-                            "message": f"corpus not found: {req.corpus_path}",
-                            "code": "FileNotFoundError",
-                        }
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
-                    except SaklasError as e:
-                        import logging
-                        logging.getLogger("saklas.api").exception(
-                            "clone failed for session=%s", session_id,
-                        )
-                        err = {"message": "clone failed", "code": type(e).__name__}
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
-                    except Exception as e:
-                        # Don't surface ``str(e)`` — Python exception messages
-                        # routinely echo paths, traceback fragments, or vendor
-                        # error text that we don't want flowing to a remote
-                        # caller.  Log the full traceback server-side and
-                        # return a generic shape that mirrors the SaklasError
-                        # branch above.
-                        import logging
-                        logging.getLogger("saklas.api").exception(
-                            "clone failed for session=%s", session_id,
-                        )
-                        err = {"message": "clone failed", "code": type(e).__name__}
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
-                    session.steer(req.name, profile)
-                    body = {
-                        "done": True,
-                        "canonical": canonical,
-                        "profile": _profile_to_json(req.name, profile),
-                    }
-                    yield f"event: done\ndata: {json.dumps(body)}\n\n"
+            async def _job(_on_progress: ProgressCallback) -> dict[str, Any]:
+                canonical, profile = await asyncio.to_thread(_do_clone)
+                session.steer(req.name, profile)
+                return {
+                    "done": True,
+                    "canonical": canonical,
+                    "profile": _profile_to_json(req.name, profile),
+                }
 
-            return StreamingResponse(_sse(), media_type="text/event-stream")
+            def _format_clone_error(e: Exception) -> dict[str, Any] | None:
+                if isinstance(e, FileNotFoundError):
+                    return {
+                        "message": f"corpus not found: {req.corpus_path}",
+                        "code": "FileNotFoundError",
+                    }
+                return None
+
+            return progress_sse_response(
+                session.lock,
+                _job,
+                error_message="clone failed",
+                log_message=f"clone failed for session={session_id}",
+                error_formatter=_format_clone_error,
+            )
 
         async with session.lock:
             try:

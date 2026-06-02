@@ -34,6 +34,12 @@ Native `/saklas/v1/*` resource tree, mounted by `register_saklas_routes(app)`. U
 
 **SSE error-frame scrubbing (info-disclosure discipline).** Long-running SSE workers (`/extract`, `/extract/preview`, `/vectors/clone`, manifold `generate` / `fit`) must NOT surface raw `str(e)` in the terminal `error` frame's `message` — Python exception strings routinely echo filesystem paths, traceback fragments, and vendor error text. The catch-all `except Exception` branch logs the full traceback server-side (`log.exception(...)` / `logging.getLogger("saklas.api").exception(...)`) and sends the generic shape `{"message": "<op> failed", "code": type(e).__name__}` (e.g. `"extract failed"`, `"preview failed"`, `"clone failed"`, `"generate failed"`, `"fit failed"`). Typed branches that already send a safe message — `SaklasError.user_message()`, the clone `FileNotFoundError` that echoes the request's own `corpus_path`, the manifold poisedness `ValueError`/`ConcurrentExtractionError` whose strings are author-facing not path-leaking — keep their messages. The `_on_saklas_error` HTTP handler is separate (it maps `SaklasError` to a status via `user_message()`); this discipline is specifically the catch-all SSE frame.
 
+`server/sse.py::progress_sse_response` is the shared queue-driven SSE worker for
+these long-running progress routes. It owns the progress/done/error frame loop,
+the `call_soon_threadsafe` progress bridge, cancellation cleanup, and the generic
+catch-all error shape; route modules supply only the job body and any typed
+safe-message exception formatter.
+
 Packs (top-level, not under a session). `pack_routes._pack_row(r, sid)` is the one per-pack list-entry serializer shared by the list and get-one routes — both emit identical per-pack shapes:
 - `GET /saklas/v1/packs` — locally installed packs as JSON via `cache_ops.list_concepts(None, hf=False)`. Local-only, off the network. Each row (`_pack_row`) carries a session-relative `has_tensor: bool` flag (true iff the pack folder contains `<safe_model_id>.safetensors` for the loaded model) so the webui's unified vectors drawer can split rows into extracted-vs-statements-only without re-deriving the safe-id slug.
 - `GET /saklas/v1/packs/{namespace}/{name}` — one installed pack's detail, the same `_pack_row` shape the list entries carry. Parallels `GET /saklas/v1/manifolds/{ns}/{name}`. 404 when not installed. (`/packs/search` is one segment, this is two — no routing conflict.)

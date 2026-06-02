@@ -20,7 +20,6 @@ import shutil
 from typing import Any, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from saklas.core.manifold import domain_from_spec
@@ -49,6 +48,7 @@ from saklas.io.manifolds import (
     update_manifold_folder,
 )
 from saklas.io.paths import manifold_dir, safe_model_id
+from saklas.server.sse import ProgressCallback, progress_sse_response
 
 log = logging.getLogger("saklas.api")
 
@@ -702,75 +702,24 @@ def register_manifold_routes(app: FastAPI) -> None:
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
-            async def _sse():
-                loop = asyncio.get_running_loop()
-                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+                return await asyncio.to_thread(_gen, on_progress)
 
-                def _on_progress(msg: str) -> None:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, ("progress", msg),
-                    )
+            def _format_error(e: Exception) -> dict[str, Any] | None:
+                if isinstance(e, HTTPException):
+                    return {"message": e.detail, "code": "HTTPException"}
+                if isinstance(e, ValueError):
+                    return {"message": str(e), "code": "ValueError"}
+                return None
 
-                async with session.lock:
-                    async def _run() -> None:
-                        try:
-                            body = await asyncio.to_thread(_gen, _on_progress)
-                            queue.put_nowait(("done", body))
-                        except HTTPException as e:
-                            queue.put_nowait((
-                                "error",
-                                {"message": e.detail, "code": "HTTPException"},
-                            ))
-                        except ValueError as e:
-                            queue.put_nowait((
-                                "error",
-                                {"message": str(e), "code": "ValueError"},
-                            ))
-                        except Exception as e:  # noqa: BLE001
-                            # Don't surface ``str(e)`` — Python exception
-                            # messages routinely echo filesystem paths or
-                            # vendor error text.  Log the full traceback
-                            # server-side, send a generic shape (matching
-                            # the vector clone/extract SSE workers).
-                            log.exception("manifold generate crashed")
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": "generate failed",
-                                    "code": type(e).__name__,
-                                },
-                            ))
-
-                    task = asyncio.create_task(_run())
-                    try:
-                        while True:
-                            kind, payload = await queue.get()
-                            if kind == "progress":
-                                yield (
-                                    f"event: progress\n"
-                                    f"data: {json.dumps({'message': payload})}\n\n"
-                                )
-                            elif kind == "done":
-                                yield (
-                                    f"event: done\n"
-                                    f"data: {json.dumps(payload)}\n\n"
-                                )
-                                break
-                            elif kind == "error":
-                                yield (
-                                    f"event: error\n"
-                                    f"data: {json.dumps(payload)}\n\n"
-                                )
-                                break
-                    finally:
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except BaseException:  # noqa: BLE001
-                                pass
-
-            return StreamingResponse(_sse(), media_type="text/event-stream")
+            return progress_sse_response(
+                session.lock,
+                _job,
+                error_message="generate failed",
+                log_message="manifold generate crashed",
+                error_formatter=_format_error,
+                logger=log,
+            )
 
         async with session.lock:
             try:
@@ -916,84 +865,31 @@ def register_manifold_routes(app: FastAPI) -> None:
 
         accept = request.headers.get("accept", "application/json")
         if "text/event-stream" in accept:
-            async def _sse():
-                loop = asyncio.get_running_loop()
-                queue: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+                return await asyncio.to_thread(_fit, on_progress)
 
-                def _on_progress(msg: str) -> None:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, ("progress", msg),
-                    )
+            def _format_error(e: Exception) -> dict[str, Any] | None:
+                if isinstance(e, ConcurrentExtractionError):
+                    return {"message": str(e), "code": "Conflict"}
+                if isinstance(e, (ValueError, ManifoldFormatError)):
+                    return {
+                        "message": str(e),
+                        "code": (
+                            "PoisednessError"
+                            if "poisedness" in str(e).lower()
+                            else type(e).__name__
+                        ),
+                    }
+                return None
 
-                async with session.lock:
-                    async def _run() -> None:
-                        try:
-                            body = await asyncio.to_thread(_fit, _on_progress)
-                            await asyncio.sleep(0)
-                            queue.put_nowait(("done", body))
-                        except ConcurrentExtractionError as e:
-                            queue.put_nowait((
-                                "error",
-                                {"message": str(e), "code": "Conflict"},
-                            ))
-                        except (ValueError, ManifoldFormatError) as e:
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": str(e),
-                                    "code": (
-                                        "PoisednessError"
-                                        if "poisedness" in str(e).lower()
-                                        else type(e).__name__
-                                    ),
-                                },
-                            ))
-                        except Exception as e:  # noqa: BLE001
-                            # Don't surface ``str(e)`` — Python exception
-                            # messages routinely echo filesystem paths or
-                            # vendor error text.  Log the full traceback
-                            # server-side, send a generic shape (matching
-                            # the vector clone/extract SSE workers).
-                            log.exception("manifold fit crashed")
-                            queue.put_nowait((
-                                "error",
-                                {
-                                    "message": "fit failed",
-                                    "code": type(e).__name__,
-                                },
-                            ))
-
-                    task = asyncio.create_task(_run())
-                    try:
-                        while True:
-                            item = await queue.get()
-                            kind = item[0]
-                            if kind == "progress":
-                                yield (
-                                    f"event: progress\n"
-                                    f"data: {json.dumps({'message': item[1]})}\n\n"
-                                )
-                            elif kind == "done":
-                                yield (
-                                    f"event: done\n"
-                                    f"data: {json.dumps(item[1])}\n\n"
-                                )
-                                break
-                            elif kind == "error":
-                                yield (
-                                    f"event: error\n"
-                                    f"data: {json.dumps(item[1])}\n\n"
-                                )
-                                break
-                    finally:
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except BaseException:  # noqa: BLE001
-                                pass
-
-            return StreamingResponse(_sse(), media_type="text/event-stream")
+            return progress_sse_response(
+                session.lock,
+                _job,
+                error_message="fit failed",
+                log_message="manifold fit crashed",
+                error_formatter=_format_error,
+                logger=log,
+            )
 
         async with session.lock:
             try:
