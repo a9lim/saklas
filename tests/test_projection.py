@@ -26,7 +26,7 @@ from saklas.core.session import (
 from saklas.core.steering_expr import parse_expr
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import project_profile
-from tests._whitener import synthetic_means, synthetic_whitener
+from tests._whitener import synthetic_whitener
 
 
 def _whit(layers: Any, dim: int):
@@ -73,7 +73,6 @@ class TestProjectProfile:
         onto = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
         out = project_profile(base, onto, "~", whitener=w)
         # ``~`` keeps the onto-component: result is a scalar multiple of onto.
-        ratio = out[0] / onto[0].clamp(min=1e-9)
         # All non-zero entries of onto share one ratio; onto here is e0.
         assert out[0][1:].abs().max() < 1e-5
 

@@ -8,8 +8,6 @@ CPU-only, no model load — alignment math runs over synthetic
 activation tensors.
 """
 from __future__ import annotations
-
-import json
 from pathlib import Path
 
 import pytest
@@ -121,7 +119,7 @@ class TestTransferProfile:
     # re-bake is mandatory, so every transfer needs a target whitener covering
     # the transferred layers (there is no Euclidean transfer).
     @staticmethod
-    def _whitener(dim: int, layers):
+    def _whitener(dim: int, layers: list[int]) -> object:
         from saklas.core.mahalanobis import LayerWhitener
         g = torch.Generator().manual_seed(7)
         acts = {L: torch.randn(120, dim, generator=g) for L in layers}

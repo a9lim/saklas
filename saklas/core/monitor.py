@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from saklas.core.mahalanobis import WhitenerError
-from saklas.core.manifold import decompose, invert_parameterization
+from saklas.core.manifold import invert_parameterization
 from saklas.core.results import ManifoldAggregate, ManifoldTokenReading
 
 if TYPE_CHECKING:
@@ -1376,4 +1376,3 @@ class ManifoldMonitor:
                 residual_per_layer=residual_per_layer,
             )
         return out
-

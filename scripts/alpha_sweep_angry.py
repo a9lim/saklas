@@ -1,8 +1,8 @@
-"""Alpha sweep for `angry.calm` using the bundled pack on disk.
+"""Alpha sweep for `angry.calm` using the bundled concept manifold.
 
 Extracts via the string-source pipeline (``session.extract("angry.calm")``),
-which reads from the materialized ``~/.saklas/vectors/default/angry.calm/``
-folder.  Generates at fixed seed/prompt across alphas.  Positive alpha
+which reads from or materializes ``~/.saklas/manifolds/default/angry.calm/``.
+Generates at fixed seed/prompt across alphas. Positive alpha
 → angry pole, negative alpha → calm pole.
 
 Defaults to gemma-4-e4b-it with α ∈ [-1, 1] in 0.2 steps for the v2.1
@@ -51,10 +51,9 @@ def main() -> int:
 
     print("Extracting angry.calm profile (bundled pairs)...", flush=True)
     # String-source path: extraction reads from the materialized bundled
-    # pack at ``~/.saklas/vectors/default/angry.calm/`` and writes the
-    # tensor under that same folder, so the canonical name we get back
-    # ("angry.calm") parses unambiguously when no other namespace has
-    # the concept registered.
+    # concept manifold and writes the tensor under that same folder, so
+    # the canonical name ("angry.calm") parses unambiguously when no
+    # other namespace has the concept registered.
     name, profile = session.extract(
         "angry.calm", on_progress=lambda m: print("  ", m, flush=True),
     )

@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from saklas.io.atomic import _temp_path, write_bytes_atomic, write_json_atomic
 
 

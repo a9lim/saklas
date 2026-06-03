@@ -11,7 +11,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult
-from saklas.io.packs import PACK_FORMAT_VERSION
 
 
 def _mock_session():

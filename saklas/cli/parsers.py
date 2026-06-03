@@ -213,11 +213,11 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--namespace", default=None, metavar="NS",
-        help="Destination namespace for the extracted vector folder.  "
-             "Unset lands the tensor under "
-             "``~/.saklas/vectors/local/<canonical>/`` — the historical "
-             "landing site.  Any other value relocates to "
-             "``vectors/<namespace>/<canonical>/``.  Parity with the "
+        help="Destination namespace for the extracted concept manifold. "
+             "Unset lands under "
+             "``~/.saklas/manifolds/local/<canonical>/``. Any other "
+             "value relocates to "
+             "``manifolds/<namespace>/<canonical>/``. Parity with the "
              "webui ExtractDrawer's namespace control and with "
              "``manifold`` / ``discover``'s NS slot.",
     )
@@ -274,7 +274,7 @@ def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
     Required:
         ``concept`` — selector resolving to a single concept folder.
         ``--from`` — HF coord of the source model (must already have a
-        baked tensor for the concept under ~/.saklas/vectors/...).
+        fitted tensor for the concept manifold under ~/.saklas/manifolds/...).
         ``--to`` — HF coord of the target model (the alignment is fit
         between these two using cached neutral activations).
 
@@ -283,7 +283,7 @@ def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
     provenance (``method=procrustes_transfer``, ``source_model_id``,
     ``alignment_map_hash``, ``transfer_quality_estimate``).  Reuses the
     same tensor-filename machinery as SAE variants, so subsequent
-    ``saklas pack ls`` / ``saklas subspace why`` see the transferred
+    ``saklas manifold show`` / ``saklas subspace why`` see the transferred
     profile alongside any native or SAE variants.
 
     Cached alignment maps live at

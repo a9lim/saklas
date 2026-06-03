@@ -172,9 +172,15 @@ def compute_default_centroid_per_layer(
     session: SaklasSession, statements: list[str],
 ) -> dict[int, torch.Tensor]:
     """Pool centroid_default at every layer using the manifold-pipeline pooling."""
+    prompts = [
+        opener
+        for _tag, opener in DEFAULT_OPENERS
+        for _ in range(N_STATEMENTS_PER_OPENER)
+    ]
+
     return compute_node_centroid(
         session._model, session._tokenizer, session._layers,
-        session._device, statements,
+        session._device, statements, prompts,
         role=None, model_type=session._model_info.get("model_type"),
     )
 

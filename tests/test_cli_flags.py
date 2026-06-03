@@ -380,7 +380,11 @@ def _patch_fold_helpers(
             return None
         return prof, "default", bare
 
-    def _fold_all(model_id: str, *, exclude_identity=None):
+    def _fold_all(
+        model_id: str,
+        *,
+        exclude_identity: tuple[str, str] | None = None,
+    ):
         out: dict[str, Any] = {}
         for key, prof in profiles_by_display.items():
             if ":" in key:
@@ -833,5 +837,4 @@ def test_vector_extract_sae_requires_value():
         cli.parse_args([
             "subspace","extract", "honest.deceptive", "-m", "m", "--sae",
         ])
-
 

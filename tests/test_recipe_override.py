@@ -1,6 +1,8 @@
 """Tests for the recipe-override regen mechanism (v2.3 phase 5)."""
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from saklas import Recipe, SamplingConfig
@@ -179,7 +181,8 @@ def test_compose_modifier_routes_through_overlay_in_regen_with_modifier():
             self.aid = aid
 
     stub = _StubSession()
-    stub._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+    stub_any: Any = stub
+    stub_any._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
         stub, _StubSession
     )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
@@ -216,7 +219,8 @@ def test_resolve_override_with_string_mode():
             self.aid = aid
 
     stub = _StubSession()
-    stub._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+    stub_any: Any = stub
+    stub_any._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
         stub, _StubSession
     )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)
@@ -257,7 +261,8 @@ def test_resolve_override_with_custom_recipe():
             self.tree = LoomTree()
 
     stub = _StubSession()
-    stub._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
+    stub_any: Any = stub
+    stub_any._resolve_anchor_recipe = SaklasSession._resolve_anchor_recipe.__get__(
         stub, _StubSession
     )
     resolve = SaklasSession._resolve_recipe_override.__get__(stub, _StubSession)

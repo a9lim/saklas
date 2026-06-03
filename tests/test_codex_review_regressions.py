@@ -13,11 +13,9 @@ hardening sweep.  Each test pins one of:
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 from typing import Any
 
 import pytest
-import torch
 
 from saklas.core.session import (
     ConcurrentExtractionError, GenState, SaklasSession,

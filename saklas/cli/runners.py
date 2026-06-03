@@ -760,7 +760,6 @@ def _fold_all_fitted_manifolds(
 def _run_compare(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.selectors import parse as sel_parse, resolve
-    from saklas.core.profile import Profile
 
     # Compare is Mahalanobis-only: load the per-model whitener once up
     # front and share it across every ``cosine_similarity`` call below.
@@ -962,7 +961,6 @@ def _run_compare(args: argparse.Namespace) -> None:
 def _run_why(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.selectors import AmbiguousSelectorError
-    from saklas.core.profile import Profile
 
     # Peel off a ``:<variant>`` suffix before resolving the manifold.
     name_part, variant = _split_variant_suffix(args.concept)

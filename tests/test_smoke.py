@@ -68,8 +68,9 @@ def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> A
     )
 
     device = next(model.parameters()).device
-    pos = _encode_and_capture_all(model, tokenizer, concept, layers, device)
-    neg = _encode_and_capture_all(model, tokenizer, "", layers, device)
+    prompt = "Describe your current state."
+    pos = _encode_and_capture_all(model, tokenizer, prompt, concept, layers, device)
+    neg = _encode_and_capture_all(model, tokenizer, prompt, "", layers, device)
     directions = {
         L: (pos[L].to(torch.float32) - neg[L].to(torch.float32))
         for L in pos if L in neg
@@ -259,9 +260,14 @@ class TestTraitMonitor:
         generated_ids = generate_steered(model, tokenizer, input_ids, config, state)
         mgr.clear_all()
 
-        # Measure on generated text
+        # Measure on generated text via the surviving hidden-state scoring API.
         text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        monitor.measure(model, tokenizer, layers, text, device=device)
+        from saklas.core.vectors import _encode_and_capture_all
+
+        hidden = _encode_and_capture_all(
+            model, tokenizer, "How are you feeling?", text, layers, device,
+        )
+        monitor.measure_from_hidden(hidden)
 
         # Should have one entry per generation
         happy_hist = monitor.history["happy"]

@@ -40,7 +40,6 @@ from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile
 from saklas.core.results import (
     GenerationResult,
-    ManifoldAggregate,
     ProbeReadings,
     RunSet,
     TokenEvent,

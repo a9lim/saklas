@@ -671,7 +671,9 @@ def register_manifold_routes(app: FastAPI) -> None:
             except ManifoldFormatError as e:
                 raise HTTPException(400, str(e))
             for concept in plan.pending:
-                gen_roles = {concept: concept} if node_roles_map else None
+                gen_roles: dict[str, str | None] | None = (
+                    {concept: concept} if node_roles_map else None
+                )
                 corpora = session.generate_responses(
                     [concept], [req.kind],
                     roles=gen_roles,
