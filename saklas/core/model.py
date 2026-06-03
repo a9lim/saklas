@@ -80,6 +80,11 @@ _LAYER_ACCESSORS = {
     "gemma3_text": _MODEL_LAYERS,
     "gemma4": _VLM_LANGUAGE_LAYERS,
     "gemma4_text": _MODEL_LAYERS,
+    # Gemma-4 "unified" variant (gemma-4-12B-it, 2026-06): a multimodal
+    # wrapper whose text submodel weights live under model.language_model.*,
+    # so the VLM accessor + text-extraction prefix-strip both apply as-is.
+    "gemma4_unified": _VLM_LANGUAGE_LAYERS,
+    "gemma4_unified_text": _MODEL_LAYERS,
     "recurrent_gemma": _MODEL_LAYERS,
     # Phi family
     "phi": _MODEL_LAYERS,

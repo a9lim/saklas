@@ -66,6 +66,10 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
     # stays ``model`` (gemma family convention), only the surrounding
     # delimiter changed.  Verified empirically against the
     # ``google/gemma-4-31b-it`` tokenizer's rendered chat template (2026-05).
+    # The ``gemma4_unified`` variant (``gemma-4-12B-it``, 2026-06) uses the
+    # byte-identical ``<|turn>model\n`` turn open, so it reuses this header;
+    # its only addition is an empty ``<|channel>thought\n<channel|>`` reasoning
+    # scaffold after the generation prompt, which the label swap rides over.
     gemma4 = RoleHeader(before="<|turn>", after="\n", label="model")
     llama = RoleHeader(
         before="<|start_header_id|>", after="<|end_header_id|>", label="assistant"
@@ -89,6 +93,8 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
         "gemma3_text": gemma,
         "gemma4": gemma4,
         "gemma4_text": gemma4,
+        "gemma4_unified": gemma4,
+        "gemma4_unified_text": gemma4,
         # Llama family
         "llama": llama,
         # GLM (ChatGLM-4)
@@ -138,6 +144,8 @@ def _build_user_role_headers() -> dict[str, RoleHeader | None]:
         "gemma3_text": gemma,
         "gemma4": gemma4,
         "gemma4_text": gemma4,
+        "gemma4_unified": gemma4,
+        "gemma4_unified_text": gemma4,
         "llama": llama,
         "glm": glm,
         "gpt_oss": gpt_oss,
