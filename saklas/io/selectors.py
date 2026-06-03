@@ -1,8 +1,8 @@
-"""Selector grammar used by pack and vector subcommands.
+"""Selector grammar used by manifold and subspace subcommands.
 
 Kinds:
     name      : single concept; optionally scoped by namespace (Selector.namespace)
-    tag       : concepts whose pack.json.tags contains this value
+    tag       : concepts whose manifold.json tags contain this value
     namespace : all concepts under this namespace
     model     : resource scope (restrict operation to tensors for this model)
     all       : everything

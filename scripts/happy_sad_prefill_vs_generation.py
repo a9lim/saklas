@@ -39,13 +39,13 @@ from __future__ import annotations
 
 import json
 import logging
-from importlib import resources
 from pathlib import Path
 
 import torch
 
 from saklas import SamplingConfig, SaklasSession
 from saklas.core.vectors import compute_dls_mask
+from _bundled_manifold_data import load_bundled_manifold_scenarios
 
 
 MODEL_ID = "google/gemma-4-31b-it"
@@ -83,11 +83,7 @@ PROMPT_GEN_TEMPLATE = (
 
 
 def load_happy_sad_scenarios() -> list[str]:
-    pkg = resources.files("saklas.data.vectors").joinpath(
-        "happy.sad/scenarios.json"
-    )
-    with pkg.open() as f:
-        return json.load(f)["scenarios"]
+    return load_bundled_manifold_scenarios("happy.sad")
 
 
 def parse_numbered_list(text: str, expected: int) -> list[str]:

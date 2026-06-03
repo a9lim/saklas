@@ -44,7 +44,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -52,6 +51,7 @@ import torch
 
 from saklas import Profile, SamplingConfig, SaklasSession
 from saklas.core.vectors import _capture_all_hidden_states, compute_dls_mask
+from _bundled_manifold_data import load_bipolar_manifold_pairs
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -114,16 +114,11 @@ JUDGE_PROMPT = (
 # ---------------------------------------------------------------------------
 
 
-def load_happy_sad_pack() -> tuple[list[str], list[dict[str, Any]]]:
+def load_happy_sad_pack() -> tuple[list[str], list[dict[str, str]]]:
     """Return (scenarios, statements).  ``statements[i]`` belongs to
-    scenario ``i // 5`` — the bundled pack ships 5 pairs per scenario
+    scenario ``i // 5`` — the bundled manifold ships 5 pairs per scenario
     in scenario order."""
-    pkg = resources.files("saklas.data.vectors").joinpath("happy.sad")
-    with pkg.joinpath("scenarios.json").open() as f:
-        scenarios = json.load(f)["scenarios"]
-    with pkg.joinpath("statements.json").open() as f:
-        statements = json.load(f)
-    return scenarios, statements
+    return load_bipolar_manifold_pairs("happy.sad")
 
 
 def generate_scenario_prompts(

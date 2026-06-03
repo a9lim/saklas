@@ -12,17 +12,17 @@ existing bundled vectors -- currently:
                   creative/conventional, humorous/serious, warm/clinical,
                   technical/accessible (style / register space)
 
-WHY GENERATE INSTEAD OF SPLITTING THE VECTORS.  It is tempting to build
-these corpora for free by splitting each donor vector's
-``statements.json`` {positive, negative} pairs into per-pole corpora.
-That is wrong.  Each bundled vector is generated against its own
+WHY GENERATE INSTEAD OF REUSING THE 2-NODE CONCEPT CORPORA.  It is tempting
+to build these corpora for free by splitting each donor concept manifold's
+two node corpora into per-pole corpora.  That is wrong.  Each bundled concept is
+generated against its own
 *bespoke* scenario set (masculine.feminine spans "Warfare strategy /
 Childcare pedagogy", traditional.progressive spans "Education / Family
 Structure / Criminal Justice", ...).  Within one vector the two poles
 are moment-shared, so the pole *contrast* is scenario-clean -- but
 across vectors the centroids differ in scenario as much as in concept.
 A discover PCA over poles drawn from disjoint scenario sets recovers
-"which donor vector did this come from" (the scenario clusters), not
+"which donor concept did this come from" (the scenario clusters), not
 the cultural / register axis.  Every clean manifold -- circumplex, PAD,
 personas -- shares ONE scenario set across all nodes; these must too.
 So the poles are regenerated as independent discover concepts against a

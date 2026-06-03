@@ -52,7 +52,6 @@ import json
 import logging
 import re
 import sys
-from importlib import resources
 from pathlib import Path
 from typing import Any, cast
 
@@ -61,6 +60,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas import Profile, SamplingConfig, SaklasSession
 from saklas.core.vectors import _capture_all_hidden_states, compute_dls_mask
+from _bundled_manifold_data import load_bipolar_manifold_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -175,16 +175,11 @@ JUDGE_PROMPT = (
 # ---------------------------------------------------------------------------
 
 
-def load_concept_pack() -> tuple[list[str], list[dict[str, Any]]]:
+def load_concept_pack() -> tuple[list[str], list[dict[str, str]]]:
     """Return (scenarios, statements).  ``statements[i]`` belongs to
-    scenario ``i // 5`` — the bundled pack ships 5 pairs per scenario
+    scenario ``i // 5`` — the bundled manifold ships 5 pairs per scenario
     in scenario order."""
-    pkg = resources.files("saklas.data.vectors").joinpath(CONCEPT)
-    with pkg.joinpath("scenarios.json").open() as f:
-        scenarios = json.load(f)["scenarios"]
-    with pkg.joinpath("statements.json").open() as f:
-        statements = json.load(f)
-    return scenarios, statements
+    return load_bipolar_manifold_pairs(CONCEPT)
 
 
 def generate_scenario_prompts(

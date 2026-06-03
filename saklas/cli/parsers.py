@@ -484,7 +484,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         description=(
             "Pull a manifold from a HuggingFace saklas-manifold repo "
             "(`<ns>/<name>[@revision]`) or copy-install a local folder "
-            "path.  The manifold analogue of `saklas pack install`."
+            "path."
         ),
     )
     install.add_argument(
@@ -505,8 +505,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         "search",
         help="Search the HuggingFace hub for manifolds",
         description=(
-            "Search HF for `saklas-manifold`-tagged model repos.  The "
-            "manifold analogue of `saklas pack search`."
+            "Search HF for `saklas-manifold`-tagged model repos."
         ),
     )
     search.add_argument(
@@ -561,9 +560,8 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Push a manifold to HF as a model repo",
         description=(
             "Push a manifold folder (corpus + fitted tensors) to HF as a "
-            "`saklas-manifold`-tagged model repo.  The manifold analogue "
-            "of `saklas pack push`.  The corpus is always uploaded (a "
-            "manifold can't re-fit without it); per-model tensors are "
+            "`saklas-manifold`-tagged model repo.  The corpus is always "
+            "uploaded (a manifold can't re-fit without it); per-model tensors are "
             "filtered by `-m`/`--variant`."
         ),
     )
@@ -588,9 +586,8 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         "rm",
         help="Fully remove a manifold folder",
         description=(
-            "Remove a whole manifold folder.  The manifold analogue of "
-            "`saklas pack rm`.  Bundled manifolds (`default/` namespace) "
-            "re-materialize on next session init."
+            "Remove a whole manifold folder.  Bundled manifolds "
+            "(`default/` namespace) re-materialize on next session init."
         ),
     )
     rm.add_argument("selector", help="Manifold name (or ns/name)")
@@ -604,8 +601,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Delete per-model fitted tensors for a manifold",
         description=(
             "Delete a manifold's per-model fitted tensors (they re-fit on "
-            "next use) while keeping `manifold.json` + the node corpus.  "
-            "The manifold analogue of `saklas pack clear`."
+            "next use) while keeping `manifold.json` + the node corpus."
         ),
     )
     clear.add_argument("selector", help="Manifold name (or ns/name)")

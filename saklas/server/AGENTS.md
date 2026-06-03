@@ -211,11 +211,12 @@ live hooks, not a re-render pass.
   `session.whitener` must cover every row-layer of `a`, else 409 (regenerate the
   neutral cache). Registered *before* `GET /vectors/{name}` so the literal path wins.
 - `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `_coerce_corpora`
-  normalizes `source`: a concept name routes to `session.extract` (bipolar-only
-  in 4.0 — a monopolar concept raises `NotImplementedError`), while two pole
-  corpora (`{positive, negative}` / `{pairs: [...]}` / a bare single
-  `{positive, negative}`) route to `session.extract_vector_from_corpora` — both
-  land a 2-node `pca` manifold. `namespace` controls the destination; `force`
+  normalizes `source`: a concept name routes to `session.extract` (a composite
+  name fits a 2-node `pca`; a monopolar name with no baseline fits the 1-node
+  neutral-anchored ray), while two pole corpora (`{positive, negative}` /
+  `{pairs: [...]}` / a bare single `{positive, negative}`) route to
+  `session.extract_vector_from_corpora` and land a 2-node `pca` manifold.
+  `namespace` controls the destination; `force`
   bypasses the tensor cache. There is no `/extract/preview` (the A0
   scenario/preview machinery was removed — A2 has no scenarios).
 - `POST /vectors/merge` body `{name, expression}` — wraps `merge_into_manifold`
