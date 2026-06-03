@@ -638,10 +638,11 @@ def build_chat_input(
                 **kwargs,
             )
         # Some tokenizers return a BatchEncoding dict instead of a raw tensor
-        if isinstance(result, torch.Tensor):
-            tensor = result
-        else:
-            tensor = cast(torch.Tensor, result["input_ids"])  # pyright: ignore[reportArgumentType, reportCallIssue]  # transformers BatchEncoding stub lacks str-key subscript
+        tensor = (
+            result
+            if isinstance(result, torch.Tensor)
+            else cast(torch.Tensor, result["input_ids"])  # pyright: ignore[reportArgumentType, reportCallIssue]  # transformers BatchEncoding stub lacks str-key subscript
+        )
         # Insert into cache — evict FIFO at the size cap. dict insertion
         # order is the eviction order; popping the first key removes the
         # oldest entry. Not strictly LRU (no touch-on-hit reorder), but

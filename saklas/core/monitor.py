@@ -1341,10 +1341,11 @@ class ManifoldMonitor:
                 par_norm_val = float(
                     torch.linalg.vector_norm(invert_query).item()
                 )
-                if par_norm_val < _FRACTION_EPSILON:
-                    norm_residual = 0.0
-                else:
-                    norm_residual = res_val / par_norm_val
+                norm_residual = (
+                    0.0
+                    if par_norm_val < _FRACTION_EPSILON
+                    else res_val / par_norm_val
+                )
                 residual_per_layer[layer_idx] = norm_residual
                 residual_mean += w * norm_residual
                 coord_tup = tuple(

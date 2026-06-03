@@ -1994,10 +1994,7 @@ async def _ws_handle_generate(
     from saklas.core.loom import derive_seed_schedule
     base_seed = sampling.seed if sampling is not None else None
     seeds: list[int | None]
-    if n == 1:
-        seeds = [base_seed]
-    else:
-        seeds = list(derive_seed_schedule(base_seed, n))
+    seeds = [base_seed] if n == 1 else list(derive_seed_schedule(base_seed, n))
 
     def _stop_session_safely() -> None:
         with suppress(Exception):

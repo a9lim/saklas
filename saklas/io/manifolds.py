@@ -2002,10 +2002,7 @@ def merge_discover_manifolds(
     # Reconcile hyperparams — default to the first source's, caller may
     # override wholesale.
     effective_hyperparams: dict[str, Any]
-    if hyperparams is not None:
-        effective_hyperparams = dict(hyperparams)
-    else:
-        effective_hyperparams = dict(folders[0][2].hyperparams)
+    effective_hyperparams = dict(hyperparams) if hyperparams is not None else dict(folders[0][2].hyperparams)
 
     # Pool the corpus + roles.  Iteration order: source order, then
     # per-source label order (matches how the source authored them).

@@ -213,14 +213,14 @@ class LayerWhitener:
             # for any ``ridge_scale > 0``; degenerates only when ``X`` is
             # exactly zero (covered by the all-zero guard below).
             frob_sq = float(torch.sum(X_c * X_c).item())
-            if frob_sq <= _NEAR_ZERO_DENOM:
-                # Activations are degenerate at this layer (e.g. a layer
-                # the model zeros out).  Fall back to λ=1.0 — Mahalanobis
-                # collapses to plain Euclidean for this layer, which is
-                # the only sensible behavior.
-                lam = 1.0
-            else:
-                lam = (frob_sq / (n * d)) * ridge_scale
+            # Activations can be degenerate at a layer (e.g. a layer the
+            # model zeros out). Fall back to lambda=1.0, where Mahalanobis
+            # collapses to plain Euclidean for that layer.
+            lam = (
+                1.0
+                if frob_sq <= _NEAR_ZERO_DENOM
+                else (frob_sq / (n * d)) * ridge_scale
+            )
             # K = (NλI + X X^T)^{-1}, fp32, on CPU.  The ``(NλI + X X^T)``
             # matrix is symmetric PD by construction (Gram matrix plus a
             # positive multiple of identity) — Cholesky is the right

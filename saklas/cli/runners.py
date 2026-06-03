@@ -475,10 +475,7 @@ def _require_model(args: argparse.Namespace) -> None:
         # leaf on ``manifold_cmd`` — surface it so the error reads "manifold
         # fit". Otherwise the leaf is the subspace verb (``subspace_cmd``).
         manifold_cmd = getattr(args, "manifold_cmd", None)
-        if manifold_cmd:
-            cmd = f"manifold {manifold_cmd}"
-        else:
-            cmd = getattr(args, "subspace_cmd", None) or "?"
+        cmd = f"manifold {manifold_cmd}" if manifold_cmd else getattr(args, "subspace_cmd", None) or "?"
         print(f"{cmd}: -m/--model is required", file=sys.stderr)
         sys.exit(2)
 

@@ -750,10 +750,11 @@ def main() -> None:
     print(f"  gen extraction:     {gen_swing:+.2f}")
 
     # --- verdict --------------------------------------------------------
-    if gen_swing > 0:
-        recovery = (ctx_swing - pref_swing) / max(gen_swing - pref_swing, 1e-6)
-    else:
-        recovery = float("nan")
+    recovery = (
+        (ctx_swing - pref_swing) / max(gen_swing - pref_swing, 1e-6)
+        if gen_swing > 0
+        else float("nan")
+    )
     print(
         f"\n  ctx recovery of gen-over-prefill gain: "
         f"{recovery * 100:.0f}%  "

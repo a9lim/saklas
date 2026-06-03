@@ -150,10 +150,7 @@ def _approx_kl_topk(
 
 def _finite_float(value: torch.Tensor | float) -> float | None:
     """Convert finite tensor/float values to JSON-safe floats."""
-    if isinstance(value, torch.Tensor):
-        out = float(value.item())
-    else:
-        out = float(value)
+    out = float(value.item()) if isinstance(value, torch.Tensor) else float(value)
     return out if math.isfinite(out) else None
 
 

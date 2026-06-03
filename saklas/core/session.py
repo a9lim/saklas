@@ -117,10 +117,12 @@ def _install_la_cache_patch() -> bool:
         DynamicLayer.crop(self, max_length)
         _la_crop_with_restore(self, max_length)
 
-    setattr(LinearAttentionLayer, "crop", _la_crop_with_restore)
-    setattr(LinearAttentionAndFullAttentionLayer, "crop", _hybrid_crop)
-    setattr(LinearAttentionLayer, "_saklas_save_snapshot", _save_la_snapshot)
-    setattr(LinearAttentionLayer, "_saklas_crop_patched", True)
+    linear_attention_layer: Any = LinearAttentionLayer
+    hybrid_attention_layer: Any = LinearAttentionAndFullAttentionLayer
+    linear_attention_layer.crop = _la_crop_with_restore
+    hybrid_attention_layer.crop = _hybrid_crop
+    linear_attention_layer._saklas_save_snapshot = _save_la_snapshot
+    linear_attention_layer._saklas_crop_patched = True
     return True
 
 
@@ -995,9 +997,8 @@ class SaklasSession:
 
     def unregister_trait_queue(self, loop: Any, q: Any) -> None:
         """Remove a previously registered trait queue."""
-        with self._trait_lock:
-            with suppress(ValueError):
-                self._trait_queues.remove((loop, q))
+        with self._trait_lock, suppress(ValueError):
+            self._trait_queues.remove((loop, q))
 
     # -- Neutral baseline (v2.1) --
 
@@ -2965,10 +2966,7 @@ class SaklasSession:
         # Resolve which node to anchor the regen under.  If the caller
         # passed an assistant node, regen siblings under its user-parent;
         # if a user node, siblings under it directly.
-        if parent.role == "assistant":
-            anchor_user_id = parent.parent_id
-        else:
-            anchor_user_id = parent_node_id
+        anchor_user_id = parent.parent_id if parent.role == "assistant" else parent_node_id
 
         # Reuse the existing user-turn text for sibling spawning.  When
         # the anchor is a user turn we feed the user-turn text to
@@ -4603,7 +4601,8 @@ class SaklasSession:
             )
             idx_counter[0] += 1
             q.put(event)
-        setattr(_push, "_saklas_wants_live_scores", bool(live_scores))
+        _push_flags: Any = _push
+        _push_flags._saklas_wants_live_scores = bool(live_scores)
 
         def _worker():
             try:

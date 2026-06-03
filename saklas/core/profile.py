@@ -389,10 +389,7 @@ class Profile:
 
     def __repr__(self) -> str:
         layers = self.layers
-        if len(layers) <= 4:
-            layer_desc = str(layers)
-        else:
-            layer_desc = f"[{layers[0]}..{layers[-1]}] ({len(layers)} layers)"
+        layer_desc = str(layers) if len(layers) <= 4 else f"[{layers[0]}..{layers[-1]}] ({len(layers)} layers)"
         first = next(iter(self._tensors.values()))
         return (
             f"Profile({layer_desc}, dtype={first.dtype}, "

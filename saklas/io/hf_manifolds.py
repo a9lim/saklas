@@ -267,10 +267,7 @@ def _render_manifold_card(
 
     from saklas.io.manifolds import domain_label
 
-    if mf.fit_mode == "authored" and mf.domain:
-        dom_lbl = domain_label(mf.domain)
-    else:
-        dom_lbl = f"discover-{mf.fit_mode}"
+    dom_lbl = domain_label(mf.domain) if mf.fit_mode == "authored" and mf.domain else f"discover-{mf.fit_mode}"
 
     body: list[str] = [
         f"# {mf.name}",
