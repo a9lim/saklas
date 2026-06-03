@@ -1,13 +1,11 @@
 # cli/
 
 Six-verb root parser
-(`tui`/`serve`/`subspace`/`manifold`/`experiment`/`config`). 4.0 promoted
-`subspace` (flat — the old `vector` extract/merge/clone/compare/why/transfer)
-and `manifold` (the old `vector manifold *` subtree) to top-level verbs; the
-4.0 collapse then **retired** the `pack` verb and the deprecated `vector`
-alias entirely (pack distribution folded into the manifold artifact, so
-`pack install`/`push`/`ls`/`search`/`export` are gone — install via `manifold
-install`, export via `manifold export gguf`). Split across:
+(`tui`/`serve`/`subspace`/`manifold`/`experiment`/`config`). `subspace` is the
+flat-artifact computation surface (extract/merge/clone/compare/why/transfer);
+`manifold` owns the steering-manifold tree. There is no `pack` verb and no `vector`
+alias — pack distribution folded into the manifold artifact, so install via
+`manifold install` and export via `manifold export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
 - `cli/runners.py` — every `_run_X` plus the shared helpers below
@@ -15,30 +13,28 @@ install`, export via `manifold export gguf`). Split across:
   / `ensure_vectors_installed`
 
 `main()` dispatches via `_COMMAND_RUNNERS[cmd]`. Bare `saklas` (or a bare verb
-with no subverb) prints help and exits 0, not argparse's exit 2. `subspace` and
-`manifold` are the artifact verbs; there is no `pack` verb and no `vector` alias.
+with no subverb) prints help and exits 0, not argparse's exit 2.
 
 ## Verb nesting
 
 - `subspace` = flat-artifact computation (extract/merge/clone/compare/why/transfer)
-  via `_SUBSPACE_VERBS` / `_SUBSPACE_BUILDERS` / `_SUBSPACE_RUNNERS` (`_run_subspace`).
-- `manifold` = the steering-manifold subtree promoted to top-level
+  via `_SUBSPACE_VERBS` / `_SUBSPACE_RUNNERS` (`_run_subspace`).
+- `manifold` = the steering-manifold tree
   (`fit`/`discover`/`generate`/`merge`/`install`/`search`/`push`/`rm`/
   `clear`/`refresh`/`transfer`/`ls`/`show`/`export`), hand-dispatched by
-  `_run_manifold` (`_build_manifold_parser` reuses `_build_vector_manifold`).
-  `manifold export gguf <name>` folds a fitted 2-node `pca` manifold to a
-  steering vector and writes a llama.cpp control-vector GGUF (the successor to
-  the old `pack export gguf`), via `cache_ops._export_gguf_manifold`.
-  The fit/discover/generate/transfer verbs load a model; the lifecycle verbs and
-  `ls`/`show` are pure-IO over `~/.saklas/manifolds/`, addressed by
-  `(namespace, name)` pairs (not the concept `Selector`/`resolve` machinery).
-  Bare-name resolution splits by intent: verbs addressing an *existing* manifold
-  (`clear`/`refresh`/`rm`/`transfer`, `discover`/`show`) resolve cross-namespace
-  via `_resolve_manifold_ns_name` (reaching bundled `default/`, raising on
+  `_run_manifold` (table `_MANIFOLD_VERBS`). `export gguf <name>` folds a fitted
+  2-node `pca` manifold to a steering vector and writes a llama.cpp control-vector
+  GGUF (the successor to the old `pack export gguf`), via
+  `cache_ops._export_gguf_manifold`. The fit/discover/generate/transfer verbs load
+  a model; the lifecycle verbs and `ls`/`show` are pure-IO over
+  `~/.saklas/manifolds/`, addressed by `(namespace, name)` pairs. Bare-name
+  resolution splits by intent: verbs addressing an *existing* manifold
+  (`clear`/`refresh`/`rm`/`transfer`, `discover`/`show`) resolve cross-namespace via
+  `_resolve_manifold_ns_name` (reaching bundled `default/`, raising on
   collision/miss); verbs authoring a *fresh* folder (`generate`, `merge` target,
   `push`) default a bare name to `local/` via `_split_manifold_ns_name`.
 - `experiment` = repeatable research runs (`fan`, `transcript run`, `naturalness`)
-  via `_EXPERIMENT_VERBS` / `_EXPERIMENT_BUILDERS`; `_run_experiment` hand-dispatches.
+  via `_EXPERIMENT_VERBS`; `_run_experiment` hand-dispatches.
 - `config` = show / validate.
 
 ## Config loading
@@ -74,8 +70,9 @@ runs a 32-token stateless `session.generate(...)` so dynamo's shape promotion fi
 on a realistic prefill before the user's first request; called from `tui` and
 `serve` after `_setup_steering_vectors`. `_attach_default_manifold_probes(session)`
 runs in `_run_serve` after `create_app`, gated on the dashboard being mounted
-(`web_enabled`) — it attaches the bundled `default/personas` + `default/pad`
-as read-side probes (fitted-for-model only; an unfitted one is skipped with a hint).
+(`web_enabled`) — it attaches each bundled `default/<name>` manifold already fitted
+for the loaded model as a read-side probe (`personas` / `pad` plus any fitted
+concept axes); an unfitted one is skipped with a one-line hint.
 
 ## Flags
 
@@ -98,13 +95,14 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
   `-C/--cors ORIGIN` (repeatable), `-k/--api-key` (falls back to `$SAKLAS_API_KEY`),
   `--no-web`.
 - `subspace extract`: positional `concept` (one concept or two poles, `nargs="+"`),
-  `-m/--model`, `-f/--force` (pre-deletes the existing tensor + threads
-  `force_statements=True`), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG`
-  (mutually exclusive with `--sae`; writes a `_role-<slug>` tensor + returns a
-  `:role-<slug>` tail; slug `[a-z0-9._-]+`), `--namespace NS` (destination; unset →
-  `local/`). There is **no `--method`/`--legacy`** — difference-of-means is the only
+  `-m/--model`, `-f/--force` (re-authors the pole corpora + bypasses the tensor
+  cache), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG` (mutually exclusive
+  with `--sae`; writes a `_role-<slug>` tensor + returns a `:role-<slug>` tail; slug
+  `[a-z0-9._-]+`), `--namespace NS` (destination; unset → `local/`). There is **no
+  `--method`/`--legacy`** — difference-of-means (a 2-node `pca` fit) is the only
   method.
-- `subspace merge`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`.
+- `subspace merge`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`. Lands
+  a corpus-less baked manifold via `merge_into_manifold`.
 - `subspace clone`: `corpus_path`, `-N/--name` (required), `-m/--model`,
   `-n/--n-pairs` (90), `--seed`, `-f`.
 - `subspace compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,
@@ -112,18 +110,18 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
   `--ridge-scale` (1.0, mahalanobis only). No `--legacy`. 1-arg ranks all installed
   against the target, 2-arg pairwise, 3+ an N×N matrix; the mahalanobis path loads
   `LayerWhitener.from_cache` up front (a miss is fatal — no silent Euclidean
-  fallback).
+  fallback). Concepts fold from their 2-node manifolds.
 - `subspace why`: `concept`, `-m/--model` (required), `-j`. Per-layer `‖baked‖`
   histogram (16 buckets) + sidecar diagnostics.
 - `subspace transfer`: `concept`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
-  A vector is a 2-node `pca` manifold, so `_run_transfer` now delegates to
-  `_run_manifold_transfer` (the `concept` positional is bridged onto `name`) —
-  one transfer path. It fits/loads a Procrustes alignment and writes the target's
+  A vector is a 2-node `pca` manifold, so `_run_transfer` delegates to
+  `_run_manifold_transfer` (the `concept` positional is bridged onto `name`) — one
+  transfer path. It fits/loads a Procrustes alignment and writes the target's
   `from-<safe_src>` **manifold** tensor via `transfer_manifold`. The runner
-  best-effort calls `LayerWhitener.from_neutral_cache` on the target model's
-  cached `neutral_activations.safetensors` (no model load on a cache hit) so
-  transferred shares can be re-baked in the target Mahalanobis metric; cache miss
-  or degenerate cache leaves the Euclidean fallback path.
+  best-effort calls `LayerWhitener.from_neutral_cache` on the target model's cached
+  `neutral_activations.safetensors` (no model load on a cache hit) so transferred
+  shares can be re-baked in the target Mahalanobis metric; cache miss leaves the
+  Euclidean fallback path.
 - `manifold`: top-level `fit`/`discover`/`generate`/`merge`/`install`/`search`/
   `push`/`rm`/`clear`/`refresh`/`transfer`/`ls`/`show`/`export`. `fit <folder>` runs
   `ManifoldExtractionPipeline` on an authored folder; `discover <name>
@@ -135,10 +133,12 @@ as read-side probes (fitted-for-model only; an unfitted one is skipped with a hi
   [--n-scenarios N] [--statements-per-concept K] [--seed INT] [--role-per-node]
   [-m] [-f]` LLM-authors a discover folder via `session.generate_statements`
   (`--role-per-node` doubles each concept slug as that node's assistant-role
-  substitution → a persona manifold). `export gguf <name> [-m MODEL] [-o PATH]
-  [--model-hint HINT]` folds a fitted 2-node `pca` manifold to a vector and
-  writes a llama.cpp control-vector GGUF. The only surviving `--method` flag is
-  the manifold `pca`/`spectral` one (on `discover`/`merge`).
+  substitution → a persona manifold). `install <target> [-a NS/N] [-f]` pulls an HF
+  manifold or copies a local folder (and salvages a legacy saklas-pack repo).
+  `export gguf <name> [-m MODEL] [-o PATH] [--model-hint HINT]` folds a fitted
+  2-node `pca` manifold to a vector and writes a control-vector GGUF. The only
+  surviving `--method` flag is the manifold `pca`/`spectral` one (on
+  `discover`/`merge`).
 - `experiment fan`: `model` + `prompt`, `-g/--grid CONCEPT=ALPHAS` (required,
   repeatable), `-S/--base-steering`, `--max-tokens` (256), `-j`. Runs the grid
   through `generate_sweep`.

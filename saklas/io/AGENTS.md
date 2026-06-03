@@ -1,24 +1,29 @@
 # io/
 
-Persistence + distribution: pack + manifold format, HF hub, GGUF, cloning,
-alignment, and the path/selector/cache plumbing the rest of saklas runs on.
-Vectors live under `vectors/`, manifolds under `manifolds/` — separate roots.
+Persistence + distribution. Concepts and steering manifolds are the same artifact
+now — labeled nodes on a domain, fit per-model — so `manifolds.py` is the on-disk
+format and `hf_manifolds.py` the HF distribution path. The old pack
+format/distribution surface (`PackMetadata`/`ConceptFolder`/`pull_pack`/the
+`cache_ops` install layer/`datasource.py`) is gone; `packs.py` / `cache_ops.py` /
+`hf.py` are thin shared-primitive remnants. Everything lives under
+`~/.saklas/manifolds/`; `vectors/` is read only to port pre-4.0 packs.
 
 ## paths.py
 
 Every `~/.saklas/` path resolves through `saklas_home()` (honors `$SAKLAS_HOME`).
-Helpers: `vectors_dir`, `models_dir`, `manifolds_dir`, `concept_dir(ns, name)`,
-`manifold_dir(ns, name)`, `model_dir(id)`, `neutral_statements_path`,
-`safe_model_id` (`/` → `__`), `ensure_within(root, *parts)` (path-traversal
-barrier).
+Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `models_dir`, `model_dir(id)`,
+`neutral_statements_path`, `safe_model_id` (`/` → `__`), `ensure_within(root,
+*parts)` (path-traversal barrier). `vectors_dir` / `concept_dir` survive only for
+the legacy-port scan — no current writer targets them.
 
-Owns the tensor-filename variant scheme. A folder can hold several tensors per
-model, distinguished by filename suffix — exactly one *kind* per file:
+Owns the tensor-filename variant scheme. A manifold folder can hold several
+fitted tensors per model, distinguished by filename suffix — exactly one *kind*
+per file:
 
 - `<safe_model>.safetensors` — raw DiM (canonical)
-- `<safe_model>_sae-<release>.safetensors` — DiM in SAE feature space
+- `<safe_model>_sae-<release>.safetensors` — fit in SAE feature space
 - `<safe_model>_from-<safe_src>.safetensors` — cross-model transfer
-- `<safe_model>_role-<slug>.safetensors` — role-augmented extraction
+- `<safe_model>_role-<slug>.safetensors` — role-augmented
 
 `tensor_filename(model_id, *, release=None, transferred_from=None, role=None)` +
 `sidecar_filename(...)` construct (the three kind kwargs are mutually exclusive);
@@ -29,155 +34,139 @@ suffix** — difference-of-means is the only vector extraction method.
 
 ## packs.py
 
-`PackMetadata` + `Sidecar` + `ConceptFolder`. `PACK_FORMAT_VERSION = 3` (4.0: a
-vector *is* a 2-node `pca` manifold, so v2 `vectors/` packs are legacy —
-`scripts/upgrade_packs.py` ports statements-bearing folders to `manifolds/` and
-re-stamps tensor-only ones; `_all_concepts` silently skips un-migrated v2);
-`PackMetadata.load` raises `PackFormatError` on a stale *or* newer `format_version`
-(symmetric ceiling). `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$`. Required pack.json
-fields: `name`, `description`, `version`, `license`, `tags`, `recommended_alpha`,
-`source`, `files`.
-
-`ConceptFolder.load` verifies every file in `pack.json.files` against disk
-(`verify_integrity`, with a `(size, mtime_ns)` fingerprint cache), requires at
-least one of statements.json / a tensor, and demands a sidecar beside every
-`.safetensors`. It globs `*.safetensors` + `*.gguf`; safetensors wins on a
-same-stem conflict.
-
-`Sidecar` carries `method` / `saklas_version` / `statements_sha256` plus optional
-`components` (merge provenance), `diagnostics_by_layer` (`vector why`), the
-transfer fields (`source_model_id` / `alignment_map_hash` /
-`transfer_quality_estimate`), and `role` (set on `_role-<name>` tensors). `method`
-is free-form; production writes `difference_of_means`, `dim_sae`,
-`procrustes_transfer`, `merge`, `imported`, `gguf_import` (and the cache sidecars'
-`layer_means`/`neutral_activations`/`procrustes_alignment`). No code branches on
-it.
-
-Helpers shared with `hf.py`/`session.py`: `synthesize_pack_metadata`,
-`hash_folder_files`/`hash_file`, `enumerate_variants(folder, model_id) →
-{raw | sae-<release> | from-<safe_src> | role-<name>: path}`, `is_stale` /
-`version_mismatch` / `merge_components_status`, `bundled_concept_names`.
-`materialize_bundled()` copies bundled package data into `vectors/default/<concept>/`
-(copy-on-miss; re-copies a stale `pack.json` with a `.bak`; overwrites
-`statements.json` only when the user's copy hashes equal to the bundled one).
+Shared pack-format *primitives* only — the format/distribution surface is gone.
+What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
+`hash_file` / `hash_folder_files` / `verify_integrity` (the sha256 integrity
+helpers behind the neutral/layer-means/alignment caches and the manifold integrity
+manifest), `PackFormatError`, and `PACK_FORMAT_VERSION = 3` — the *legacy-vector
+migration sentinel*: a `vectors/` pack whose `pack.json.format_version` is below it
+is legacy and ported to a 2-node `pca` manifold on touch
+(`scripts/upgrade_packs.py` / `session._port_stale_legacy_vector`). Also stamped
+onto the profile-cache sidecars `vectors.save_profile` writes.
 
 ## manifolds.py
 
-On-disk format for manifold artifacts — `~/.saklas/manifolds/<ns>/<name>/`, a peer
-of `vectors/` (N labeled nodes on a domain, not a single bipolar concept).
-`MANIFOLD_FORMAT_VERSION = 5` (decoupled from `PACK_FORMAT_VERSION`); rejects pre-v3
-and newer-than-local. v4 added `explained_variance_per_layer`, v5 added
-`origin_per_layer`; the fitted-tensor sidecar also carries
-`mahalanobis_share_per_layer` + `share_metric` + `subspace_metric` (all written by
-`core/manifold.save_manifold`; there is **no `lever_per_layer`** — the lever is
-gone). `min_nodes(n) = 2n+1`. Two folder shapes share the format, discriminated by
-`manifold.json::fit_mode`:
+The on-disk format for every concept + steering manifold —
+`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 5` (decoupled from
+`PACK_FORMAT_VERSION`); rejects pre-v3 and newer-than-local. `min_nodes(n) = 2n+1`
+(the curved-fit poisedness floor). Four `fit_mode`s share the class, discriminated
+by `manifold.json::fit_mode`:
 
-- `"authored"` — user supplies `domain` + per-node `{label, coords}`.
-- `"pca"` / `"spectral"` — discover mode: nodes carry `{label}` only, coords are
+- **`authored`** — user supplies `domain` + per-node `{label, coords}`. Curved RBF.
+- **`pca`** / **`spectral`** (discover) — nodes carry `{label}` only; coords are
   derived per-model at fit time and stored in the safetensors; `hyperparams` feeds
-  the picker.
+  the picker. `pca` is flat (also the 2-node vector case), `spectral` curved.
+- **`baked`** — corpus-less: a precomputed direction written by `subspace merge`.
+  No node corpus, no re-fit; `BakedManifoldError` guards corpus-requiring calls.
 
-`ManifoldFolder.load` validates the format version, the `NAME_REGEX` and per-node
+`ManifoldFolder.load` validates the format version, `NAME_REGEX`, and per-node
 `_LABEL_REGEX = ^[a-z][a-z0-9_-]{0,63}$` (labels drop `.` — reserved as the
 bipolar separator and the `%label` lexer would mis-read it), branches on
 `fit_mode`, enforces `min_nodes` on authored folders (discover at fit time),
-verifies `files`, and demands a sidecar per fitted tensor. `source` field
-(`local`/`bundled`/`hf://...`) mirrors `PackMetadata.source`. `node_groups()` reads
-`nodes/NN_<label>.json` in order; `nodes_sha256()` is the staleness key — hashes
-`{corpus, domain, node_coords}` (authored) / `{corpus, fit_mode, hyperparams}`
-(discover), folding in any non-`None` node role. `ManifoldSidecar` is the lean
-per-tensor JSON (`method` round-trips `manifold_pca`/`manifold_sae` authored,
-`manifold_discover_{pca,spectral,sae}` discover, `manifold_procrustes_transfer`
-transfer); tensor save/load itself lives in `core/manifold.py`.
+verifies `files`, and demands a sidecar per fitted tensor. `source`
+(`local`/`bundled`/`hf://...`) and `tags` ride `manifold.json`. `node_groups()`
+reads `nodes/NN_<label>.json` in order; `nodes_sha256()` is the staleness key —
+hashes `{corpus, domain, node_coords}` (authored) / `{corpus, fit_mode,
+hyperparams}` (discover) / a baked sentinel, folding in any non-`None` node role.
+`ManifoldSidecar` is the lean per-tensor JSON (`method` round-trips
+`manifold_pca`/`manifold_sae` authored, `manifold_discover_{pca,spectral,sae}`
+discover, `merge` baked, `manifold_procrustes_transfer` transfer + the
+share/subspace metrics, fit_mode, hyperparams, diagnostics); the tensor save/load
+itself lives in `core/manifold.py`. `hash_manifold_files` / `_hash_file` are the
+integrity twins of `packs.py`'s.
 
-Authoring: `create_manifold_folder` (authored webui/HTTP path, returns
-`(folder, advisories)`), `create_discover_manifold_folder`
-(`_sanitize_hyperparams` drops cross-method keys at the IO boundary). Streaming
-companions for big rosters (a crash keeps finished nodes):
+Authoring: `create_manifold_folder` (authored webui/HTTP path, returns `(folder,
+advisories)`), `create_discover_manifold_folder` (`_sanitize_hyperparams` drops
+cross-method keys at the IO boundary, gated by `_HYPERPARAMS_BY_MODE`),
+`create_baked_manifold_folder` + `save_baked_manifold_tensor` (the `subspace
+merge` target — one fitted tensor per model, all sharing one `manifold.json`).
+`port_legacy_vector_folder` ports a stale `vectors/<ns>/<name>/` pack to a 2-node
+`pca` discover folder (file-only — no tensors carried; they re-fit lazily).
+Streaming companions for big rosters (a crash keeps finished nodes):
 `init_discover_manifold_folder` + `append_discover_manifold_node` +
 `write_manifold_scenarios`; `plan_discover_generation → DiscoverGenerationPlan` is
-the shared resume/add-nodes planner (deliberately bypasses `ManifoldFolder.load`
-so it can inspect a partial). `merge_discover_manifolds` unions ≥2 discover
-sources' node corpora into a fresh *unfitted* folder (authored sources / label
-collisions / mixed-mode-without-override raise). `update_manifold_folder`
-re-authors authored folders.
+the shared resume/add-nodes planner (deliberately bypasses `ManifoldFolder.load` so
+it can inspect a partial). `merge_discover_manifolds` unions ≥2 discover sources'
+node corpora into a fresh *unfitted* folder (authored sources / label collisions /
+mixed-mode-without-override raise). `update_manifold_folder` re-authors authored
+folders.
 
-Lifecycle (addressed by `(namespace, name)`, not the concept `Selector`):
+Lifecycle (addressed by `(namespace, name)`, not a concept `Selector`):
 `remove_manifold_folder` (returns `rematerializes_on_restart` for `default/`/
 bundled), `clear_manifold_tensors(... model_scope=None, variant="all")` (filter
 raw/sae/from/all; keeps `manifold.json` + corpus), `refresh_manifold` (unscoped:
 `local` → skip, `bundled` → re-materialize, `hf://` → re-pull; scoped → drop one
-model's fit). `transfer_manifold(folder, *, from_model, to_model, alignment,
-whitener=None, ...)` — pure-io: applies a caller-supplied per-layer Procrustes
-`alignment` to the fitted subspaces (`mean → M_L mean`, `basis → basis @ M_Lᵀ`),
-leaves the RBF + `node_coords` untouched, re-bakes the Mahalanobis **share** in
-target space when a target whitener covers the transferred layers (no lever),
-clears `origin` (per-layer source-neutral foot), carries source `subspace_metric`,
-writes the `_from-<safe_src>` variant. `manifold_summary(folder)` is the
-session-independent serializer shared by `manifold show -j` + the HTTP
-summary route. `iter_manifold_folders`, `bundled_manifold_names`,
-`materialize_bundled_manifolds`. Per-node `role` (slug `[a-z0-9._-]+`) rides
-through the fit to `compute_node_centroid` for role-baselined centroids;
-family-unsupported raises `RoleSubstitutionUnsupportedError` at fit time.
+model's fit), `transfer_manifold(folder, *, from_model, to_model, alignment,
+whitener=None, ...)` (pure-io: applies a caller-supplied per-layer Procrustes
+`alignment` to the fitted subspaces — `mean → M_L mean`, `basis → basis @ M_Lᵀ` —
+leaves RBF + `node_coords` untouched, re-bakes the Mahalanobis **share** in target
+space when a target whitener covers the layers, clears `origin`, writes the
+`_from-<safe_src>` variant). `manifold_summary(folder)` is the session-independent
+serializer shared by `manifold show -j` + the HTTP summary route.
+`iter_manifold_folders`, `bundled_manifold_names`, `materialize_bundled_manifolds`
+(copy-on-miss into `default/`, auto-refreshes stale bundled nodes). Per-node `role`
+(slug `[a-z0-9._-]+`) rides the fit to `compute_node_centroid` for role-baselined
+centroids; family-unsupported raises `RoleSubstitutionUnsupportedError` at fit time.
 
 ## selectors.py
 
-Selector grammar shared by `cache_ops` and `core.session` (lives in `io` so
-neither imports up into `cli`). `Selector(kind, value, namespace)` with kinds
-`name` / `tag` / `namespace` / `model` / `all`; `parse(raw)` handles `ns/name`,
-the prefixes, and a trailing `:variant` via `_VARIANT_REGEX = ^(raw | sae[-…] |
-role[-…] | from[-…])$` — **no `pca`**. `resolve(selector)` walks `vectors_dir()`
-into `ResolvedConcept`s (module-level cache); `resolve_pole(raw, namespace=) →
-(canonical, sign, match, variant)` is the bare-pole alias pipeline.
-`resolve_manifold_label(label, *, namespace=) → ResolvedManifoldLabel | None`
-memoizes its own `manifolds_dir()` walk; `resolve_bare_name(raw, *, namespace=) →
-(pole_hit, manifold_hit)` is the unified tier (pole first, then manifold label,
-cross-tier collision raises). `invalidate()` clears both caches — mutating code
-must call it. `parse_args(tokens)` splits a token list into one concept selector +
-one optional `model:` scope.
+Selector grammar shared by `core.session` and the CLI (lives in `io` so neither
+imports up into `cli`). A concept *is* a manifold now: `_all_concepts` walks
+`manifolds_dir()` via `iter_manifold_folders`, and `ResolvedConcept.folder` is the
+manifold folder. `Selector(kind, value, namespace)` with kinds `name` / `tag` /
+`namespace` / `model` / `all`; `parse(raw)` handles `ns/name`, the prefixes, and a
+trailing `:variant` via `_VARIANT_REGEX = ^(raw | sae[-…] | role[-…] | from[-…])$`
+— **no `pca`**. `resolve(selector)` filters the memoized walk; `model:X` matches
+any manifold with a fitted tensor for X.
 
-## cache_ops.py
+Bare-pole resolution moved entirely to the manifold tier (a bipolar concept is a
+2-node `pca` manifold): `resolve_pole(raw, namespace=)` only peels the `:variant`
+suffix + canonicalizes (always `match=None`, `sign=+1`).
+`resolve_manifold_label(label, *, namespace=)` finds a node by label across
+installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node
+`pca` manifold's *name* (e.g. `happy.sad`) to node 0 (the `orient_to=0` + pole) —
+the vector-composite read path. `resolve_bare_name(raw, *, namespace=) →
+(pole_hit, manifold_hit)` is the unified tier (pole/name first, then manifold
+label, cross-tier collision raises). Three memoized walks
+(`_concepts_cache`/`_manifold_labels_cache`/`_manifold_names_cache`) keyed on
+`manifolds_dir()`; `invalidate()` clears all three — mutating code must call it.
+`parse_args(tokens)` splits a token list into one concept selector + one optional
+`model:` scope.
 
-Pure data layer behind `pack install/refresh/clear/rm/ls/search/push` +
-`pack export gguf`. Every function returns structured results (`ConceptRow` /
-`ConceptInfo` / `PackListResult` / `HfRow`); the CLI renders.
+## cache_ops.py / hf.py
 
-- `install(target, as_, *, force, statements_only)` — HF coord or local folder.
-- `refresh(selector, *, model_scope)` — re-pull from `pack.json.source` (scoped =
-  drop the per-model tensor pair; `local` skipped; `bundled` re-copies; `hf://`
-  re-pulls). `refresh_neutrals()` rewrites `neutral_statements.json`.
-- `delete_tensors(selector, model_scope, *, variant="all")` — filter
-  `raw`/`sae`/`from`/`all`.
-- `uninstall(selector, *, yes)` — refuses broad selectors without `yes`.
-- `export_gguf(...)` — single concept; refuses in-place export for bundled.
-- `push(selector, ...)` — single concept (default `variant="raw"`); delegates to
-  `hf.push_pack`.
-- `list_concepts` / `pack_info` / `search_remote_packs` — HF failures land in the
-  result, never raise.
+Both gutted to the surface that survives the collapse.
 
-## hf.py / hf_manifolds.py
+`cache_ops.py` is now just GGUF export: `_export_gguf_manifold(ns, name, *,
+model_scope, output, model_hint)` folds a fitted 2-node `pca` manifold to a single
+direction (`folded_vector_directions`) and writes a llama.cpp control-vector GGUF
+(one `.gguf` per model; refuses in-place export for bundled manifolds);
+`_resolve_model_hint` derives `controlvector.model_hint` from the base model's
+`AutoConfig.model_type`. The old pack data layer
+(install/refresh/clear/ls/search/push + `ConceptRow`/`PackListResult`) is gone.
 
-HF distribution as **model** repos (`repo_type="model"`; safetensors is hub-native,
-`base_model` frontmatter gives reverse-link discoverability). `split_revision`
-parses `owner/name@rev`. `stage_verify_swap` (`staging.py`) owns the shared
-stage-verify-swap choreography for HF installs: build under `.staging/`, recover
-`.bak` on interrupted swaps, then promote atomically with best-effort restore.
-`pull_pack` supplies pack-specific staging/validation; native if a `pack.json` is
-present, else `_install_synthesized_pack` (scans tensors, writes
-`method="imported"` sidecars — repeng-style GGUF-only repos install with zero
-prep). `push_pack(..., variant="all")` stages a filtered copy + one
-`upload_folder`; the model card carries `library_name: saklas`, `saklas-pack`
-tags, deduped `base_model:`, and `base_model_relation: adapter`.
-`resolve_target_coord` picks `<whoami>/<name>`.
+`hf.py` is the generic HF surface `hf_manifolds.py` builds on: `HFError`,
+`split_revision(owner/name@rev)`, the monkeypatchable `_hf_snapshot_download` /
+`_hf_hub_download` / `_hf_api` indirections, and `resolve_target_coord(name, as_)`
+(`--as owner/name` wins, else `whoami()/<name>`). All pack-shaped distribution
+(`pull_pack`/`push_pack`/`search_packs`/`fetch_info`) is gone.
 
-`hf_manifolds.py` is the manifold counterpart (`saklas-manifold` tag). `pull_manifold`
-uses the same stage-verify-swap but **rejects** a repo with no `manifold.json` (the
-geometry can't be inferred from a bare tensor dump). `push_manifold(..., variant=
-"raw")` always uploads the corpus (a manifold can't re-fit without it) and filters
-tensors; `search_manifolds`/`fetch_manifold_info` fill the picker fields
-(`domain_label`, `node_count`, `fit_mode`, `tensor_models`); `install_manifold`
-orchestrates HF pulls + local copies.
+## hf_manifolds.py
+
+HF distribution for manifolds (`saklas-manifold` tag, `repo_type="model"` —
+safetensors is hub-native, `base_model` frontmatter gives reverse-link
+discoverability). `pull_manifold` uses the shared `staging.stage_verify_swap` and
+**rejects** a repo with no `manifold.json` (the geometry can't be inferred from a
+bare tensor dump) — but `_port_legacy_pack_dir` first salvages a legacy
+`saklas-pack` repo (`pack.json` + `statements.json`) into a 2-node `pca` manifold
+on install, so old vector packs still install. `push_manifold(..., variant="raw")`
+always uploads the corpus (a manifold can't re-fit without it) and filters tensors;
+the model card (`_render_manifold_card`) carries `library_name: saklas`,
+`saklas-manifold` tags, deduped `base_model:`, `base_model_relation: adapter`.
+`search_manifolds`/`fetch_manifold_info` fill the picker fields (`domain_label`,
+`node_count`, `fit_mode`, `tensor_models`); `install_manifold` orchestrates HF
+pulls + `_install_local_manifold` copies. `ManifoldInstallConflict` on an existing
+folder without `force`.
 
 ## gguf_io.py
 
@@ -190,36 +179,38 @@ weighting with no per-layer metadata.
 
 ## probes_bootstrap.py
 
-`load_defaults()` walks `vectors/default/` into `{tag: [concept]}`.
-`bootstrap_layer_means(...)` loads/computes the per-layer probe-centering means.
-`bootstrap_probes(model, tokenizer, layers, model_info, categories, *,
-whitener=None, layer_means=None, dls=True)` loads cached probe tensors (raising
-`StaleSidecarError` on `statements.json` drift unless `SAKLAS_ALLOW_STALE=1`) and
-extracts the rest — **difference-of-means only** (no `method=` param). A `whitener`
-enables Mahalanobis bake scoring (sidecar `bake: "mahalanobis"`, else
-`"euclidean"`); `layer_means` + `dls` feed the DLS mask.
+`load_default_manifolds()` walks `manifolds/default/` into `{tag: [manifold_name]}`
+(the category-grouped probe roster; triggers `materialize_bundled_manifolds`).
+`bootstrap_layer_means(...)` loads/computes the per-layer probe-centering means
+(cached at `models/<safe>/layer_means.safetensors`, stale on
+`neutral_statements.json` drift). The old `bootstrap_probes` is gone — the session
+sources bundled probe directions by folding fitted 2-node manifolds
+(`session._bootstrap_manifold_probes`).
 
 ## cloning.py
 
 Training-free persona cloning. `clone_from_corpus(session, path, name, *,
 n_pairs=90, seed=None, batch_size=5, force=False)` reads one-utterance-per-line,
-samples exemplars, pairs each against a model-generated *neutralized* rewrite, then
-delegates extraction + save to `session.extract(DataSource(pairs=...))`. Lands in
-`local/<name>/` with `tags += ["cloned"]` and `corpus_sha256`/`n_pairs`/
-`batch_size`/`seed` provenance. Errors: `CorpusTooShortError` / `CorpusTooLongError`
-/ `InsufficientPairsError`.
+samples exemplars, pairs each against a model-generated *neutralized* rewrite,
+authors a 2-node `pca` manifold folder from the pos/neg corpora, and fits it via
+`session.extract_manifold`. Lands in `manifolds/local/<name>/` with `tags +=
+["cloned"]` and corpus provenance. Errors: `CorpusTooShortError` /
+`CorpusTooLongError` / `InsufficientPairsError`.
 
 ## merge.py
 
 Offline direction merging into a corpus-less `fit_mode="baked"` manifold.
-`merge_into_manifold(name, expression, model, *, force, strict)` reads each
-component (a fitted 2-node `pca` manifold folded down, or a legacy vector pack),
-linearly combines the per-layer directions, folds the result to a one-pole ray
+`merge_into_manifold(name, expression, model, *, force, strict)` resolves each
+component to a per-layer direction by folding a fitted 2-node `pca` manifold
+(`folded_vector_directions`), linearly combines the directions (`linear_sum`,
+`|` project-away via `project_away`), folds the result to a one-pole ray
 (`fold_directions_to_subspace`), and writes a baked manifold to
-`manifolds/local/<name>/` — one fitted tensor per shared model, all sharing one
-`manifold.json`. The shared grammar's `|` (project-away) is accepted, triggers +
-bare un-namespaced poles rejected. `project_away` / `linear_sum` / `shared_models`;
-the baked sidecar carries `method="merge"` + per-component `components` provenance.
+`manifolds/local/<name>/` — one fitted tensor per shared model
+(`create_baked_manifold_folder` / `save_baked_manifold_tensor`), all sharing one
+`manifold.json`. The shared grammar's `|` is accepted; triggers + bare
+un-namespaced poles are rejected. `shared_models(expression)` returns the models
+every term has a fitted tensor for. The baked sidecar carries `method="merge"` +
+per-component `components` provenance.
 
 ## alignment.py
 
@@ -234,12 +225,14 @@ alignment_map, *, source_model_id, ..., whitener=None)` applies `M_L @ v_src` pe
 layer (uncovered layers dropped, `method="procrustes_transfer"`), re-scaling each
 magnitude to its *target* Mahalanobis norm when a target whitener covers the
 layers. The fitted map round-trips under the *target* model dir
-(`models/<safe_tgt>/alignments/<safe_src>.…`).
+(`models/<safe_tgt>/alignments/<safe_src>.…`). `transfer_manifold`
+(`manifolds.py`) is the manifold counterpart.
 
-## atomic.py / datasource.py
+## atomic.py / staging.py
 
-`atomic.py` — `write_bytes_atomic` / `write_json_atomic`: stage to `<path>.tmp` in
-the same directory, `fsync`, then `os.replace`. `datasource.py` — `DataSource`
-normalizes contrastive pairs from raw lists, JSON, CSV, HF datasets, or curated
-bundled concepts (`DataSource.curated(concept)` triggers `materialize_bundled` and
-reads `vectors/default/<concept>/statements.json`).
+`atomic.py` — `write_bytes_atomic` / `write_json_atomic`: stage to a same-directory
+temp file, `fsync`, then `os.replace`. `staging.py` — `stage_verify_swap` is the
+shared HF-install choreography: build under `.staging/`, recover `.bak` on
+interrupted swaps, then promote atomically (`target → .bak`, `.staging → target`)
+with best-effort restore. (`datasource.py` is gone — extraction takes node corpora
+directly.)

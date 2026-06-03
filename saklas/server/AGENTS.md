@@ -1,137 +1,322 @@
 # server/
 
-Dual-protocol HTTP on one port: OpenAI `/v1/*`, Ollama `/api/*`, native `/saklas/v1/*`. One model per server; generation across all three protocols serializes on a single `asyncio.Lock`.
+Dual-protocol HTTP on one port: OpenAI `/v1/*`, Ollama `/api/*`, native
+`/saklas/v1/*`. One model per server; generation across all three protocols
+serializes on a single `asyncio.Lock`. There is **no `/saklas/v1/packs*` surface**
+— concepts are manifolds, so distribution rides the manifold routes (install) and
+the vectors-under-session routes (extract/merge/clone); HF upload stays CLI-only.
 
-## app.py
+## Module map
 
-FastAPI factory + OpenAI route handlers. `create_app(session, default_steering=None, cors_origins=None, api_key=None, *, web=False)` registers the OpenAI routes, then calls `register_ollama_routes` and `register_saklas_routes`; mounts the Svelte SPA last (after the API routes so its catch-all can't shadow them) when `web=True` (`saklas serve` default-on, `--no-web` and library callers off). `default_steering` is a pre-built `Steering` or `None`; per-request steering expressions compose over it at the key level (request keys win, default-only keys pass through, explicit empty string clears).
+`app.py` registers the OpenAI routes inline, then calls
+`register_ollama_routes(app)` (`ollama.py`) and `register_saklas_routes(app)`
+(`saklas_api.py`), then mounts the Svelte SPA last (so its catch-all can't shadow
+the API). `register_saklas_routes` is the native-tree orchestrator — it delegates
+to sub-module registrars and registers a few route groups in place:
 
-OpenAI routes: `GET /v1/models`, `GET /v1/models/{id}`, `POST /v1/chat/completions`, `POST /v1/completions`. Thin HTTP — handlers call `session.generate` / `generate_stream` with `SamplingConfig` + `Steering` directly, never mutating `session.config`.
+- `manifold_routes.register_manifold_routes` — `/saklas/v1/manifolds/*`
+- `manifold_probe_routes.register_manifold_probe_routes` — `/saklas/v1/manifold-probes/*`
+- `session_routes.register_session_routes` — `/saklas/v1/sessions` CRUD + clear/rewind
+- `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*`, one-shot `/probe` + `/manifold-probe`
+- `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
+- `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
+- in place: the loom `tree/*` routes, the `/sessions/{id}/vectors/*` routes, and
+  the `WS /sessions/{id}/stream`
 
-`_SamplingBase` (pydantic, shared by chat/completions): `stop`, `seed`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` (bool for chat / int for completions), `top_logprobs`, `stream_options.include_usage`, `max_completion_tokens` (aliased onto `max_tokens` via model validator), native `steering` field (a steering expression string in the shared grammar), native `thinking` field (`None` = auto via `supports_thinking`). Steering is a string only — dict-shaped payloads are rejected at the pydantic layer.
+`server/openai.py` is a re-export facade over `app.py`. `server/sse.py` and
+`server/ws_events.py` are the shared SSE / WS plumbing.
 
-Accept-and-ignore: `user`, `n`, `response_format: {"type": "text"}`, empty `tools: []` / `tool_choice` in `{"none", "auto"}`. Non-empty `tools`, `tool_choice` outside `none`/`auto`, and non-`text` `response_format` are rejected via `_check_langchain_compat` → 400 (LangChain compat). `ChatMessage._flatten_content` concatenates text parts of OpenAI multimodal arrays; non-text parts raise `UnsupportedContentError`.
+## app.py (OpenAI)
 
-Responses carry real `usage`, `finish_reason` from `session._gen_state.finish_reason`, per-request `created`, and a `probe_readings` block. `_stream_generation` emits a first-chunk `{role: "assistant"}` delta, takes `finish_reason` from gen state on the final chunk, and emits an optional usage chunk before `[DONE]` when `stream_options.include_usage`. Thinking tokens stream as `reasoning_content` in the chat delta. `_render_logprobs_chat` / `_render_logprobs_completions` build the two OpenAI logprobs shapes from `result.logprobs` (alt text comes off `TokenAlt`, not a re-tokenize).
+FastAPI factory + OpenAI handlers. `create_app(session, default_steering=None,
+cors_origins=None, api_key=None, *, web=False)` — `web=True` mounts the dashboard
+(`saklas serve` default-on, `--no-web` and library callers off). `default_steering`
+is a pre-built `Steering` or `None`; per-request steering expressions compose over
+it at the key level (request keys win, default-only keys pass through, explicit
+empty string clears).
 
-Manifold-probe readings ride on each choice under the vendor-prefixed `x-saklas-manifold-readings` extension, keyed by attached probe name. Non-streaming chat/completion responses carry the aggregate (`ManifoldAggregate.to_dict()` — `fraction_mean / fraction_per_layer / nearest / coords / coords_per_layer / residual_mean / residual_per_layer`); each streamed chunk carries the per-token reading (`ManifoldTokenReading.to_dict()` — `fraction / nearest`) when at least one probe is attached and `live_scores` is on; the final stream chunk carries the aggregate. The field is omitted entirely when no manifold probe is attached, so OpenAI clients that don't read the extension see no shape change. `_manifold_reading_aggregate(session)` and `_manifold_token_readings(event)` are the shared helpers (also imported by `ollama.py`).
+OpenAI routes: `GET /v1/models`, `GET /v1/models/{id}`, `POST
+/v1/chat/completions`, `POST /v1/completions`. Thin HTTP — handlers call
+`session.generate` / `generate_stream` with `SamplingConfig` + `Steering`, never
+mutating `session.config`.
 
-Auth: bearer token from `SAKLAS_API_KEY` / `--api-key`, applied as an app-level dependency over HTTP and WebSocket routes. `_require_auth` + `_check_bearer` gate HTTP; `ws_auth_ok(websocket)` is called before `websocket.accept()` in WS handlers (close 1008 on fail) and accepts either an `Authorization: Bearer ...` handshake header or the browser-dashboard fallback `?token=...`. Unset key = open server.
+`_SamplingBase` (pydantic, shared by chat/completions): `stop`, `seed`,
+`logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs` (bool for chat /
+int for completions), `top_logprobs`, `stream_options.include_usage`,
+`max_completion_tokens` (aliased onto `max_tokens`), native `steering` field (a
+steering expression string), native `thinking` field (`None` = auto via
+`supports_thinking`). Steering is a string only — dict payloads are rejected at the
+pydantic layer.
 
-`SAKLAS_STRICT_MODEL` (`1`/`true`/`yes`/`on`) makes the `model` field 404 on a name mismatch across OpenAI and Ollama routes; unset accepts any name. The accepted set is the HF id plus any Ollama-style aliases.
+Accept-and-ignore: `user`, `n`, `response_format: {"type": "text"}`, empty `tools:
+[]` / `tool_choice` in `{"none", "auto"}`. Non-empty `tools`, `tool_choice` outside
+`none`/`auto`, and non-`text` `response_format` are rejected via
+`_check_langchain_compat` → 400. `ChatMessage._flatten_content` concatenates text
+parts of OpenAI multimodal arrays; non-text parts raise `UnsupportedContentError`.
 
-`acquire_session_lock(session)` is a bounded (`SESSION_LOCK_TIMEOUT_SECONDS` = 300) async context manager over `session.lock`. Non-streaming handlers take the lock plainly; streaming handlers hold it for the full stream via `acquire_session_lock` and emit a 503 on timeout. Requests queue FIFO rather than 409. `session.lock` (`asyncio.Lock`, server-owned) is distinct from the threading `_gen_lock` inside the engine.
+Responses carry real `usage`, `finish_reason` from
+`session._gen_state.finish_reason`, per-request `created`, and a `probe_readings`
+block. `_stream_generation` emits a first-chunk `{role: "assistant"}` delta, takes
+`finish_reason` from gen state on the final chunk, and emits an optional usage
+chunk before `[DONE]`. Thinking tokens stream as `reasoning_content`.
+`_render_logprobs_chat` / `_render_logprobs_completions` build the two OpenAI
+logprobs shapes from `result.logprobs` (alt text off `TokenAlt`, not a re-tokenize).
 
-`_on_saklas_error` maps any `SaklasError` to an HTTP status and picks the Ollama (`{"error": msg}`) vs OpenAI error shape by path prefix. `RequestValidationError` is mapped to the OpenAI error shape.
+Manifold-probe readings ride each choice under the vendor-prefixed
+`x-saklas-manifold-readings` extension, keyed by attached probe name. Non-streaming
+carries the aggregate (`ManifoldAggregate.to_dict()`); each streamed chunk carries
+the per-token reading (`ManifoldTokenReading.to_dict()`) when at least one probe is
+attached and `live_scores` is on; the final chunk carries the aggregate. The field
+is omitted entirely when no manifold probe is attached, so OpenAI clients that
+don't read the extension see no shape change. `_manifold_reading_aggregate(session)`
+and `_manifold_token_readings(event)` are the shared helpers (also imported by
+`ollama.py`).
 
-Not supported by either compat protocol: tool calling, JSON-schema/structured-output mode, embeddings.
+Auth: bearer token from `SAKLAS_API_KEY` / `--api-key`, applied as an app-level
+dependency over HTTP and WebSocket routes. `_require_auth` + `_check_bearer` gate
+HTTP; `ws_auth_ok(websocket)` is called before `websocket.accept()` (close 1008 on
+fail) and accepts either an `Authorization: Bearer ...` header or the
+browser-dashboard fallback `?token=...`. Unset key = open server.
+`SAKLAS_STRICT_MODEL` (`1`/`true`/`yes`/`on`) makes the `model` field 404 on a name
+mismatch across OpenAI and Ollama; unset accepts any name.
 
-`server/openai.py` is a re-export facade over `app.py` so callers can `from saklas.server.openai import ChatCompletionRequest` without reaching into `app`.
+`acquire_session_lock(session)` is a bounded (`SESSION_LOCK_TIMEOUT_SECONDS` = 300)
+async context manager over `session.lock`. Non-streaming handlers take it plainly;
+streaming handlers hold it for the full stream and emit a 503 on timeout. Requests
+queue FIFO. `session.lock` (`asyncio.Lock`, server-owned) is distinct from the
+threading `_gen_lock` inside the engine. `_on_saklas_error` maps any `SaklasError`
+to an HTTP status and picks the Ollama vs OpenAI error shape by path prefix;
+`RequestValidationError` maps to the OpenAI shape. Not supported by either compat
+protocol: tool calling, JSON-schema/structured-output mode, embeddings.
 
-## saklas_api.py
+## saklas_api.py (native tree orchestrator + in-place routes)
 
-Native `/saklas/v1/*` resource tree, mounted by `register_saklas_routes(app)`. URL paths carry `{session_id}` for a multi-session shape, but the impl is single-session: the one session has id `"default"`, and the loaded model id also resolves to it; everything else 404s.
+URL paths carry `{session_id}` for a multi-session shape, but the impl is
+single-session: the one session has id `"default"`, and the loaded model id also
+resolves to it; everything else 404s.
 
-**SSE error-frame scrubbing (info-disclosure discipline).** Long-running SSE workers (`/extract`, `/extract/preview`, `/vectors/clone`, manifold `generate` / `fit`) must NOT surface raw `str(e)` in the terminal `error` frame's `message` — Python exception strings routinely echo filesystem paths, traceback fragments, and vendor error text. The catch-all `except Exception` branch logs the full traceback server-side (`log.exception(...)` / `logging.getLogger("saklas.api").exception(...)`) and sends the generic shape `{"message": "<op> failed", "code": type(e).__name__}` (e.g. `"extract failed"`, `"preview failed"`, `"clone failed"`, `"generate failed"`, `"fit failed"`). Typed branches that already send a safe message — `SaklasError.user_message()`, the clone `FileNotFoundError` that echoes the request's own `corpus_path`, the manifold poisedness `ValueError`/`ConcurrentExtractionError` whose strings are author-facing not path-leaking — keep their messages. The `_on_saklas_error` HTTP handler is separate (it maps `SaklasError` to a status via `user_message()`); this discipline is specifically the catch-all SSE frame.
+**SSE error-frame scrubbing (info-disclosure discipline).** Long-running SSE
+workers (`/extract`, `/extract/preview`, `/vectors/clone`, manifold `generate` /
+`fit`) must NOT surface raw `str(e)` in the terminal `error` frame — Python
+exception strings routinely echo filesystem paths and traceback fragments. The
+catch-all `except Exception` logs the full traceback server-side and sends the
+generic `{"message": "<op> failed", "code": type(e).__name__}`. Typed branches
+that already send a safe message (`SaklasError.user_message()`, the clone
+`FileNotFoundError` echoing the request's own `corpus_path`, the manifold
+poisedness `ValueError`/`ConcurrentExtractionError`) keep their messages.
+`server/sse.py::progress_sse_response` is the shared queue-driven SSE worker — it
+owns the progress/done/error frame loop, the `call_soon_threadsafe` bridge,
+cancellation cleanup, and the generic catch-all; route modules supply only the job
+body + any typed safe-message formatter.
 
-`server/sse.py::progress_sse_response` is the shared queue-driven SSE worker for
-these long-running progress routes. It owns the progress/done/error frame loop,
-the `call_soon_threadsafe` progress bridge, cancellation cleanup, and the generic
-catch-all error shape; route modules supply only the job body and any typed
-safe-message exception formatter.
+### session_routes.py
 
-Packs (top-level, not under a session). `pack_routes._pack_row(r, sid)` is the one per-pack list-entry serializer shared by the list and get-one routes — both emit identical per-pack shapes:
-- `GET /saklas/v1/packs` — locally installed packs as JSON via `cache_ops.list_concepts(None, hf=False)`. Local-only, off the network. Each row (`_pack_row`) carries a session-relative `has_tensor: bool` flag (true iff the pack folder contains `<safe_model_id>.safetensors` for the loaded model) so the webui's unified vectors drawer can split rows into extracted-vs-statements-only without re-deriving the safe-id slug.
-- `GET /saklas/v1/packs/{namespace}/{name}` — one installed pack's detail, the same `_pack_row` shape the list entries carry. Parallels `GET /saklas/v1/manifolds/{ns}/{name}`. 404 when not installed. (`/packs/search` is one segment, this is two — no routing conflict.)
-- `GET /saklas/v1/packs/search?q=&limit=` — HF-hub search proxy via `cache_ops.search_remote_packs`; returns `{query, results}`. Missing `huggingface_hub` → 503, HF transport error → 502.
-- `POST /saklas/v1/packs` body `{target, as?, force?, statements_only?}` — wraps `cache_ops.install` in a worker thread. `target` is an HF coord `ns/name[@rev]` or local folder. `InstallConflict` → 409, `ValueError` → 400, missing target → 404. Returns the historical receipt keys (`{target, installed_at, statements_only}`) as a **non-breaking superset**: the installed-pack detail fields (`_pack_row`, looked up post-install from the resolved destination folder so an `as` re-route is reflected) are layered alongside the receipt keys, the receipt keys win on overlap. Mirrors the manifold install route returning full detail.
-- `DELETE /saklas/v1/packs/{namespace}/{name}` — wraps `cache_ops.uninstall` on the parsed selector (always `yes=True` — the fully-qualified path means no broad-selector risk). Under the session lock, calls `_refuse_if_busy(session)` first (409 when an in-flight extract holds the engine gen-lock — parity with the manifold DELETE route), then detaches the concept from the rack (`session.unsteer`) before removing the folder. Response carries `{namespace, name, source, removed, rematerializes_on_restart}` — `source == "bundled"` flips the rematerialize flag so the client can pick a friendlier toast (bundled concepts respawn on next session init via `materialize_bundled`). 404 when nothing matched the selector.
-
-`POST /saklas/v1/packs` `as` is a true wire field via `Field(default=None, alias="as")` + `populate_by_name=True` on `InstallPackRequest` (so both `as` and `as_` are accepted); `InstallManifoldRequest` mirrors this exactly.
-
-Manifold probes (top-level, read-side counterpart to manifold steering — registered directly inside `register_saklas_routes`):
-- `GET /saklas/v1/manifold-probes` — list every attached probe. Each row carries `{name, manifold, top_n, layers, node_labels, node_count, domain, intrinsic_dim, feature_space}` — enough for a client to render the manifold's geometry without re-fetching the source artifact.
-- `POST /saklas/v1/manifold-probes` body `{selector, name?, top_n?}` — wraps `session.add_manifold_probe`. `selector` rides the same `[ns/]name[:variant]` shape `%` steering consumes, so probe and steering share the lazy-load cache. `name` overrides the registered probe name (defaults to the selector); `top_n` controls the per-token nearest-node list length (default 3). Returns the same row shape as the list route. 404 on unknown selector, 400 on empty selector.
-- `DELETE /saklas/v1/manifold-probes/{name}` — wraps `session.remove_manifold_probe`. 404 when the name is not attached.
-- `POST /saklas/v1/sessions/{session_id}/manifold-probe` body `{text, names?}` — one-shot manifold scoring over arbitrary text, no generation. The read-side manifold counterpart to the vector `POST /sessions/{id}/probe` (`probe_routes.py` houses both): resolves the session via `_resolve_session_id`, validates `names` against `manifold_monitor.probe_names` (400 on unknown), then runs `session.measure_manifold(text, names=names)` in `asyncio.to_thread` under the session lock. Returns `{"readings": {name: ManifoldAggregate.to_dict()}}`. `names` (optional) restricts the scored subset; defaults to every attached manifold probe.
-
-Manifolds (top-level, own resource tree — registered by `manifold_routes.register_manifold_routes`, called from `register_saklas_routes`):
-
-`_manifold_json` is the wire serializer behind every route below that returns manifold detail (list, get-one, create, install, merge, generate, fit). It builds the *session-independent* fields by calling `io.manifolds.manifold_summary(folder)` — the same serializer CLI `manifold show -j` emits — so the keys both surfaces share (`namespace` / `name` / `description` / `source` / `fit_mode` / `is_discover` / `node_count` / `node_labels` / `node_roles` / `hyperparams` / `fitted_models` / `tensor_variants`, plus authored-manifold `domain` / `domain_label` / `intrinsic_dim` / `min_nodes` / `node_coords`) carry identical names + values across CLI and server. The server then layers *session-aware* extras on top: `fitted_for_session` / `stale`, and — for a discover folder fitted on the loaded model — the materialized per-model geometry (`domain` / `domain_label` / `intrinsic_dim` / `min_nodes` / `node_coords`) lifted from the per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read, which `manifold_summary` leaves empty by design (it's pure-io, can't read the per-model safetensors without a session). `node_coords` reconciliation: `manifold_summary` reports `[]` for any discover folder; the route *overrides* it with the derived per-model layout for the fitted-discover case so the rack strip's snap-to-node still works (authored folders pass the summary's coords through untouched).
-- `GET /saklas/v1/manifolds` — every installed manifold with domain spec, intrinsic dim, node labels/coords, `min_nodes`, `fit_mode` discriminator, `hyperparams` (discover-mode), `fitted_for_session` (a tensor for the loaded model exists), and `stale` (the fitted tensor's `nodes_sha256` no longer matches the corpus). Discover folders carry no top-level `domain` on disk (it is materialized at fit time as `CustomDomain(picked_k)`); `_resolve_intrinsic_dim` falls back to the per-model sidecar's domain so the list/detail wire reports the actual `intrinsic_dim` + `domain` once a fit exists. Unfitted discover folders still report `domain == {}` and `intrinsic_dim == 0` — the rack strip's "unfitted" warning covers that state. `node_coords == []` at the list level — the derived per-model layout lives on the detail route.
-- `GET /saklas/v1/manifolds/{ns}/{name}` — one manifold, plus per-node statements and per-tensor fit detail. Shares `manifold_summary`'s session-independent keys with CLI `manifold show -j` (see above) and layers the session-aware extras on top. Discover-mode fits carry `fit_mode` + `hyperparams` + `diagnostics` per tensor; discover-mode nodes carry the derived per-model coords (loaded lazily from the safetensors `node_coords` field) or `null` when no fit exists yet. 404 on missing.
-- `POST /saklas/v1/manifolds` body `{namespace, name, description, domain, nodes:[{label,coords,statements,role?}]}` — authors an *authored* artifact via `io.manifolds.create_manifold_folder`; `domain` is box or sphere only. Per-node `role` is optional (the persona-manifold opt-in; engine validates the slug shape). Returns the detail shape plus `advisories` (soft poisedness warnings). 409 on an existing folder, 400 on malformed input.
-- `POST /saklas/v1/manifolds/discover` body `{namespace, name, description, fit_mode, nodes:[{label,statements,role?}], hyperparams?}` — authors a *discover* artifact via `create_discover_manifold_folder`; nodes carry no coords (derived per-model at fit time). Per-node `role` rides the persona-manifold path the same way. `_sanitize_hyperparams` drops cross-method keys at the IO boundary.
-- `GET /saklas/v1/manifolds/search?q=&limit=` — HF-hub search proxy via `io.hf_manifolds.search_manifolds`; returns `{query, results}` (rows shaped `{name, namespace, description, tags, node_count, domain_label, fit_mode, tensor_models}`) so the webui can render results without a follow-up `fetch_info` call per row. The `query` echo mirrors `GET /saklas/v1/packs/search`. Missing `huggingface_hub` → 503, HF transport error → 502. Parallel to `GET /saklas/v1/packs/search`.
-- `POST /saklas/v1/manifolds/install` body `{target, as?, force?}` — wraps `io.hf_manifolds.install_manifold` in a worker thread held under `session.lock`. `as` is a true wire field on `InstallManifoldRequest` (`Field(default=None, alias="as")` + `populate_by_name=True`, so both `as` and `as_` are accepted) — mirroring `InstallPackRequest` exactly. `target` is an HF coord (`<ns>/<name>[@revision]`) or a local folder path; `as`/`as_` overrides the destination (`<dst_ns>/<dst_name>`, fully qualified); `force` overwrites an existing folder. `_refuse_if_busy(session)` runs first inside the lock (409 on an in-flight engine gen-lock). `ManifoldInstallConflict` → 409, `FileNotFoundError` → 404, `ValueError` → 400, `huggingface_hub` missing → 503, HF transport error → 502. Returns the same manifold-detail JSON as `GET /saklas/v1/manifolds/{ns}/{name}`. Parallel to `POST /saklas/v1/packs`. There is deliberately **no manifold push route** — `pack_routes.py` exposes no packs-push endpoint either (the Ollama `/api/push` stub redirects to `saklas pack push`), so HF upload stays CLI-only on both surfaces for parity. `io.hf_manifolds.push_manifold` exists and is wired into `manifold push` (CLI); mirror that — do not add `POST .../push` here unless the pack side grows one first.
-- `POST /saklas/v1/manifolds/merge` body `{namespace?, name, description?, sources: [{namespace, name}, ...], fit_mode?, hyperparams?, force?}` — wraps `io.manifolds.merge_discover_manifolds` in a worker thread under `session.lock`. Restricted to *discover-mode* (autofitted) sources by design — authored manifolds carry user-declared geometry that isn't mergeable without a shared coordinate system. Pools the sources' node corpora + roles into one heap and writes an unfitted discover folder; pair with `POST .../fit` to derive coords from the combined heap. Label collisions across sources → 400 (refuse rather than silently rename), mixed `fit_mode` without an override → 400, < 2 sources → 400, missing source → 404, destination conflict without `force=True` → 409. Manifold-side counterpart to `POST /saklas/v1/vectors/merge`, but operating on node corpora rather than steering directions.
-- `POST /saklas/v1/manifolds/generate` body `{namespace, name, description, concepts, n_scenarios?, statements_per_concept?, fit_mode?, hyperparams?, force?, role_per_node?}` — LLM-authors a discover folder by wrapping `session.generate_statements` under the session lock (the unified statement-corpus generator, which produces per-cell independent statements); SSE progress when `Accept: text/event-stream`, JSON otherwise. `role_per_node=true` doubles each concept slug as that node's assistant-role substitution at fit time, producing a persona manifold. Writes a fresh discover folder + `scenarios.json` provenance; pair with `POST .../fit` to derive coords + fit.
-- `PATCH /saklas/v1/manifolds/{ns}/{name}` body `{description?, nodes?}` — re-authors via `update_manifold_folder` under the session lock (serializes against an in-flight fit reading `nodes/`). Existing tensors go stale, not deleted.
-- `DELETE /saklas/v1/manifolds/{ns}/{name}` — delegates the removal to `io.manifolds.remove_manifold_folder` (the single source of truth shared with CLI `manifold rm`, so bundled-respawn semantics live in one place) under `session.lock`; 409 when an in-flight fit holds the engine gen-lock, 404 (pre-lock existence check) when the folder is missing. Evicts any cached in-memory `Manifold` before the delete. Response carries the helper's `{namespace, name, source, removed, rematerializes_on_restart}` — a superset of the historical `{namespace, name, removed}`; `source == "bundled"` / `default`-namespace flip `rematerializes_on_restart` so the client can pick a friendlier toast, matching the pack DELETE route.
-- `POST /saklas/v1/manifolds/{ns}/{name}/fit` body `{sae?, sae_revision?, fit_mode?, hyperparams?}` — runs `session.extract_manifold` under the session lock; SSE progress / JSON like `/extract`. For discover folders the optional `fit_mode` / `hyperparams` overrides are written atomically into `manifold.json` (via `write_json_atomic`, after `_sanitize_hyperparams`) *before* the fit so the cache key reflects the actual inputs; authored folders reject these fields with 400. Poisedness failures from the RBF solve are a bare `ValueError` (not a `SaklasError`), caught explicitly and surfaced with `code: "PoisednessError"`. `ConcurrentExtractionError` → 409. Steering a fitted manifold needs no route — a `%` term in any steering expression loads the artifact lazily on scope entry.
-
-Sessions:
-- `GET/POST /saklas/v1/sessions` — list / idempotent create (POST body accepted; a model mismatch warns and returns the existing session). `_session_info` carries `is_base_model` so a frontend can switch to a raw-completion UI, plus `role_substitution_supported` / `user_role_supported` (computed by `_role_support` against `ROLE_HEADERS` / `USER_ROLE_HEADERS` for the resolved `model_type`) so the webui can gate the roles control.
-- `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update session defaults / no-op 204. (Per-message role labels are *not* session config — they ride each generate's `sampling` block; see WS below.)
+- `GET/POST /saklas/v1/sessions` — list / idempotent create (a model mismatch warns
+  and returns the existing session). `_session_info` carries `is_base_model` plus
+  `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
+  `USER_ROLE_HEADERS` for the resolved `model_type`) so the webui can gate roles.
+- `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
-Vectors under `/sessions/{id}/vectors`:
-- `GET` list, `GET /{name}` profile JSON, `POST` load-from-disk, `DELETE /{name}` (also drops the name from `default_steering`).
-- `POST /extract` — runs `session.extract` in `asyncio.to_thread`; SSE progress when `Accept: text/event-stream`, JSON otherwise. `source` accepts a concept name, a `{pairs: [{positive, negative}, ...]}` object, or a bare single-pair `{positive, negative}` object (`_coerce_pair_source` normalizes all three) — so the webui can submit hand-authored or reviewed-and-edited statement pairs without a curated concept. `namespace` controls the destination folder (`None`/unset → `~/.saklas/vectors/local/<canonical>/`, the historical landing site; any other value relocates to `vectors/<namespace>/<canonical>/`); `force` wires to the engine's `force_statements` flag and bypasses the tensor cache for a full regenerate. Both fields are parity with `ManifoldBuilderDrawer`'s namespace / overwrite controls.
-- `POST /extract/preview` body `{concept, baseline?, n_pairs?, n_scenarios?}` — runs `generate_scenarios` + `generate_statements([concept, baseline_slot], ...)` under the session lock and recovers `(positive, negative)` pairs by zipping the two per-concept corpora; returns `{concept, baseline, scenarios, pairs}` *without* committing an extraction or writing `statements.json`. For a monopolar concept (baseline omitted) the negative slot is synthesized as `the_opposite_of_<concept>` — the same trick the extraction pipeline uses to keep the unified API simple. Exposes the LLM-authoring half of the pipeline so the webui can show the generated pairs in an editable table; the edited list is POSTed back to `/extract` as `source: {pairs}`. SSE progress when `Accept: text/event-stream`.
-- `POST /vectors/merge` body `{name, expression}` — wraps `merge_into_manifold` (model-scoped, `force=True`) — the merge lands a corpus-less baked manifold, then folds the fitted tensor back to a steering Profile and registers it, held under `session.lock`. Calls `_refuse_if_busy(session)` first inside the lock (409 when an in-flight extract holds the engine gen-lock — parity with the manifold merge route; the vector merge doesn't route through an engine-gated method, so it needs the explicit probe). Returns the same JSON as `GET /vectors/{name}`. `MergeError` → 400.
-- `POST /vectors/clone` body `{name, corpus_path, n_pairs?, seed?, baseline?}` — wraps `session.clone_from_corpus` in `asyncio.to_thread` under `session.lock`; auto-registers on success. SSE branch emits only `done`/`error` (no progress hook in the clone path). Missing corpus → 404.
-- `GET /vectors/{name}/diagnostics` — 16-bucket `||baked||` histogram plus per-layer magnitudes and the `diagnostics_by_layer` / `diagnostics_summary` blocks when the profile carries them. 404 when the vector isn't registered.
-- `GET /vectors/pairwise?a=&b=&metric=` — cross-layer cosine matrix between two named vectors / probes. Same pool as `/correlation` (steering vectors ∪ active probes). Returns `{a, b, metric, layers_a, layers_b, matrix, model}` where `matrix[i][j]` is the cosine between `a`'s `layers_a[i]` and `b`'s `layers_b[j]`; near-zero norms and shape mismatches land as `null` so the heatmap renders empty cells instead of meaningless cosines. `metric` (`euclidean` default, or `mahalanobis`) toggles whitening: Mahalanobis cosine is single-layer, but the matrix is cross-layer, so each cell is whitened in vector `a`'s **row-layer** frame (`Σ_{La}⁻¹`) — exact on the layer-aligned diagonal, an A-frame read off it — decided per row (a row whose `La` the whitener doesn't cover stays Euclidean); the response echoes the *effective* metric (downgrades to `euclidean` when no whitener is available). Invalid `metric` → 400. Registered *before* `GET /vectors/{name}` so the literal path wins the routing match.
+### manifold_routes.py
 
-Probes under `/sessions/{id}/probes`: list / defaults / activate / deactivate. `POST /sessions/{id}/probe` body `{text, probes?}` — one-shot scoring via `monitor.measure` under the session lock, no generation.
+`_manifold_json` is the wire serializer behind every detail-returning route. It
+builds the *session-independent* fields via `io.manifolds.manifold_summary(folder)`
+— the same serializer CLI `manifold show -j` emits — so the shared keys
+(`namespace`/`name`/`description`/`source`/`fit_mode`/`is_discover`/`node_count`/
+`node_labels`/`node_roles`/`hyperparams`/`fitted_models`/`tensor_variants` + authored
+`domain`/`domain_label`/`intrinsic_dim`/`min_nodes`/`node_coords`) match across CLI
+and server. The route then layers *session-aware* extras: `fitted_for_session` /
+`stale`, and — for a discover folder fitted on the loaded model — the materialized
+per-model geometry (`domain`/`intrinsic_dim`/`node_coords`) lifted from the
+per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
 
-`GET /sessions/{id}/correlation?names=a,b,c` — N×N magnitude-weighted cosine matrix across loaded steering vectors and active probes (a steering vector wins a name collision over a same-named probe). Default covers everything; `names` restricts the subset. Returns `{names, matrix, layers_shared}`.
+- `GET /manifolds` — every installed manifold (domain spec, intrinsic dim, node
+  labels/coords, `min_nodes`, `fit_mode`, `hyperparams`, `fitted_for_session`,
+  `stale`). Unfitted discover folders report `domain == {}` / `intrinsic_dim == 0`;
+  `node_coords == []` at list level (lives on the detail route).
+- `GET /manifolds/{ns}/{name}` — one manifold + per-node statements + per-tensor fit
+  detail (discover fits carry `fit_mode` + `hyperparams` + `diagnostics`; discover
+  nodes carry the derived per-model coords or `null`). 404 on missing.
+- `GET /manifolds/search?q=&limit=` — HF-hub search proxy via
+  `io.hf_manifolds.search_manifolds`; `{query, results}`. Missing
+  `huggingface_hub` → 503, HF transport error → 502.
+- `POST /manifolds` — author an *authored* artifact (`create_manifold_folder`;
+  box/sphere domain; per-node `role` optional). Returns detail + `advisories`. 409
+  on existing folder, 400 malformed.
+- `POST /manifolds/discover` — author a *discover* artifact
+  (`create_discover_manifold_folder`; nodes carry no coords; `_sanitize_hyperparams`
+  drops cross-method keys).
+- `POST /manifolds/merge` — `merge_discover_manifolds` (discover-mode sources only:
+  authored geometry isn't mergeable without a shared coordinate system). Pools node
+  corpora + roles into one unfitted discover folder; pair with `/fit`. Label
+  collisions / mixed `fit_mode` without override / <2 sources / dest conflict →
+  400/409.
+- `POST /manifolds/install` — `io.hf_manifolds.install_manifold` in a worker thread
+  under `session.lock`. `InstallManifoldRequest` carries `as` as a true wire field
+  (`Field(alias="as")` + `populate_by_name`). `_refuse_if_busy(session)` first (409
+  on an in-flight engine gen-lock). `ManifoldInstallConflict` → 409, missing → 404,
+  bad input → 400, `huggingface_hub` missing → 503, HF error → 502. Returns the same
+  detail JSON as `GET .../{ns}/{name}`. There is deliberately **no install/push
+  parity gap to worry about**: `push_manifold` is wired only into CLI `manifold
+  push` — HF upload stays CLI-only, no `POST .../push` route.
+- `POST /manifolds/generate` — LLM-authors a discover folder via
+  `session.generate_statements` under the session lock; SSE progress on `Accept:
+  text/event-stream`, JSON otherwise. `role_per_node=true` → persona manifold.
+- `PATCH /manifolds/{ns}/{name}` — `update_manifold_folder` (serializes against an
+  in-flight fit). Existing tensors go stale, not deleted.
+- `DELETE /manifolds/{ns}/{name}` — `remove_manifold_folder` (single source of truth
+  shared with CLI `manifold rm`) under `session.lock`; 409 when a fit holds the
+  gen-lock, 404 pre-lock. Response `{namespace, name, source, removed,
+  rematerializes_on_restart}`.
+- `POST /manifolds/{ns}/{name}/fit` — `session.extract_manifold` under the lock; SSE
+  / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides, written
+  atomically into `manifold.json` (after `_sanitize_hyperparams`) *before* the fit;
+  authored folders reject them with 400. Poisedness `ValueError` →
+  `code: "PoisednessError"`; `ConcurrentExtractionError` → 409. Steering a fitted
+  manifold needs no route — a `%` term loads it lazily on scope entry.
 
-Loom tree under `/sessions/{id}/tree`: full-tree GET, active-path GET, and navigate / edit / branch / delete / star / note / reset mutations, plus `edge_label`, `filter`, branch `diff`, `joint_logprobs`, and transcript `transcript` / `transcript/load`. Mutations run the tree's conflict checks, so edit/delete/reset return 409 when they would corrupt an in-flight generation.
+### manifold_probe_routes.py
 
-### POST /sessions/{id}/experiments/fan
+Read-side counterpart to manifold steering. `GET /manifold-probes` lists every
+attached probe (`{name, manifold, top_n, layers, node_labels, node_count, domain,
+intrinsic_dim, feature_space}`). `POST /manifold-probes` body `{selector, name?,
+top_n?}` wraps `session.add_manifold_probe` (selector rides the same
+`[ns/]name[:variant]` shape `%` steering consumes — probe and steering share the
+lazy-load cache). `DELETE /manifold-probes/{name}` detaches.
 
-JSON alpha grid over one prompt. Body `{prompt, grid: {name: [alphas]}, base_steering?, sampling?, thinking?, raw?}`. The grid is validated server-side (empty dict / empty alpha list → 400), then `session.generate_sweep(..., stateless=False)` runs in a worker thread under `session.lock`. Returns `{kind, total, node_ids, rows}` where each row carries `idx`, `alpha_values`, `node_id`, and a `result` subset.
+### probe_routes.py
 
-### GET /sessions/{id}/traits/stream — live traits SSE
+Vector probes under `/sessions/{id}/probes`: list / defaults / activate / deactivate.
+`POST /sessions/{id}/probe` body `{text, probes?}` — one-shot vector scoring via
+`monitor.measure` under the lock. `POST /sessions/{id}/manifold-probe` body `{text,
+names?}` — one-shot manifold scoring via `session.measure_manifold` under the lock;
+returns `{"readings": {name: ManifoldAggregate.to_dict()}}`.
 
-Per-token probe scores in real time during any active generation. Uses inline per-token scoring (`TraitMonitor.score_single_token`) gated behind registered trait queues — zero overhead when no client is connected. The connection stays open across generations; multiple clients are supported. Events: `start` (`{generation_id}`), `token` (`{idx, text, thinking, probes}`), `done` (`{generation_id, finish_reason, aggregate}`), plus `: heartbeat` every 15 s when idle.
+### Vectors under `/sessions/{id}/vectors` (in `saklas_api.py`)
 
-### WS /saklas/v1/sessions/{id}/stream — token + probe co-stream
+- `GET` list, `GET /{name}` profile JSON, `POST` load-from-disk, `DELETE /{name}`
+  (also drops the name from `default_steering`).
+- `GET /{name}/diagnostics` — 16-bucket `‖baked‖` histogram + per-layer magnitudes +
+  the `diagnostics_by_layer` blocks when present.
+- `GET /vectors/pairwise?a=&b=&metric=` — cross-layer cosine matrix between two named
+  vectors / probes. `metric` (`euclidean` default / `mahalanobis`) toggles whitening
+  (whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer
+  frame; the response echoes the *effective* metric). Registered *before* `GET
+  /vectors/{name}` so the literal path wins.
+- `POST /extract` — `session.extract` in `asyncio.to_thread`; SSE / JSON. `source`
+  accepts a concept name, `{pairs: [...]}`, or a bare `{positive, negative}`
+  (`_coerce_pair_source`). `namespace` controls the destination; `force` bypasses the
+  tensor cache.
+- `POST /extract/preview` — `generate_scenarios` + `generate_statements` under the
+  lock, returns `{concept, baseline, scenarios, pairs}` without committing an
+  extraction. A monopolar concept synthesizes `the_opposite_of_<concept>` as the
+  negative slot.
+- `POST /vectors/merge` body `{name, expression}` — wraps `merge_into_manifold`
+  (model-scoped, `force=True`): lands a corpus-less baked manifold, folds the fitted
+  tensor back to a steering Profile, registers it. `_refuse_if_busy` first (409).
+  `MergeError` → 400.
+- `POST /vectors/clone` body `{name, corpus_path, n_pairs?, seed?, baseline?}` —
+  `session.clone_from_corpus` in `asyncio.to_thread` under the lock; auto-registers.
+  Missing corpus → 404.
 
-Bidirectional WebSocket. Only `session_id == "default"` is reachable (HF ids contain `/` and the path param isn't `:path`).
+`GET /sessions/{id}/correlation?names=…` — N×N magnitude-weighted cosine matrix
+across loaded steering vectors and active probes (a steering vector wins a name
+collision over a same-named probe). Default covers everything; `names` restricts.
 
-Client → server: `{type: "stop"}`, or `{type: "generate", input, steering, sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?}`. The `sampling` block (`WSSamplingParams` → `_build_sampling` → `SamplingConfig`) carries `user_role`/`assistant_role` — the per-message role-substitution labels (roleplay scaffold), stamped onto the produced user / generated-assistant loom nodes and rendered faithfully per-turn (empty → standard label). Three special generate modes:
-- **Logit fork** — `{fork_node_id, fork_raw_index, fork_alt_token_id}` routes to `session.fork_from_token`: replays the source node's raw decode prefix, forces the alt token, resamples under the node's stamped recipe. `input`/`steering`/`sampling`/`n` are ignored; all three fork fields must travel together (else 400). The fork slices on the `raw_index` carried by each `token` event.
-- **Answer-prefill** — `{prefill_node_id, prefill_text}` routes to `session.prefill_assistant`: `prefill_node_id` is a user node, `prefill_text` is tokenized into a forced decode prefix, and the seeded assistant reply lands as a sibling under it. `input` and the `fork_*` fields are ignored; `steering`/`sampling`/`n` ride through; `thinking` is forced off. Both fields must travel together; a message can't be both a fork and a prefill (400 either way).
-- **Commit (no-generation send)** — `{commit_role, commit_text, parent_node_id?, raw?}` routes to `session.append_user_turn` or `session.append_assistant_turn`. `commit_role="user"` lands a user turn under `parent_node_id` (or active node when omitted); `commit_role="assistant"` lands an authored assistant turn under the user node identified by `parent_node_id` (required). `raw=true` flags a flat (base-model) commit — it passes `allow_any_parent=True` to `append_user_turn`, lifting the user-under-user guard so an authored span may hang under a node of any role. Short-circuits the n-way / streaming machinery entirely: emits a single `started` (with `node_id=null`) followed by `done` carrying the new node id under `result.{kind="commit", role, text, node_id}`. No token frames in between. Mutually exclusive with fork and prefill (400 on mix). `input`/`steering`/`thinking`/`n` are ignored; only `sampling.user_role`/`assistant_role` are read from the sampling block (to stamp the committed turn's `role_label`, suppressed under `raw`).
-- **Recipe override** — `recipe_override` is a built-in mode string (`unsteered`/`inverted`/`reseed`/`cool`/`hot`) or a partial-recipe expression (`seed=42, temperature=1.5`), resolved against the parent recipe by the engine. Ignored when `None`.
+### Loom tree (in `saklas_api.py`)
 
-`n>1` fans out N sibling assistant nodes on one shared user parent, generated serially, each with a deterministic derived seed.
+`/sessions/{id}/tree`: full-tree GET, active-path GET, and navigate / edit / branch /
+delete / star / note / reset mutations, plus `edge_label`, `filter`, branch `diff`,
+`joint_logprobs`, and `transcript` / `transcript/load`. Mutations run the tree's
+conflict checks (409 when they would corrupt an in-flight generation).
 
-Server → client events:
-- `{type: "started", generation_id, node_id: null, sibling_index, sibling_count}` — `node_id` is filled in lazily by the first token.
-- `{type: "node_created", node_id, parent_id, role, rev}` — emitted on `begin_assistant`/`branch`/`add_user` so the client can pre-allocate a render slot.
-- `{type: "tree_mutated", op, rev, added, removed, updated, active_node_id}` — `added`/`updated` are full node objects.
-- `{type: "token", text, thinking, token_id, node_id, raw_index?, logprob?, top_alts?, scores?, per_layer_scores?, manifold_readings?}` — per token. `logprob`/`top_alts` appear when the engine captured them (logprobs or `return_top_k` requested); `scores`/`per_layer_scores` appear when probes are loaded. `manifold_readings` is `Record<probe_name, {fraction, nearest}>` (`ManifoldTokenReading.to_dict()`) and appears on every token frame while at least one manifold probe is attached, computed inline by scoring against `session._capture._per_layer` from within the WS `_on_token` callback (manifold readings have no persisted-loom-row path the way vector probes do, so the read is direct off the capture buffer). The field is omitted when no manifold probe is attached so legacy clients see no shape change.
-- `{type: "done", result, node_id, sibling_index, sibling_count}` — `result` carries `text`, `tokens`, `finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`, and `manifold_readings` (per-attached-probe `ManifoldAggregate.to_dict()`) when at least one manifold probe is attached.
-- `{type: "error", message, code, ...}` — a steering-expression / validation error sends an error frame and keeps the connection open; other failures close with 1011.
+### experiment_routes.py
 
-Concurrency: one perpetual reader task owns `websocket.receive_json()` and feeds a shared `incoming` queue (the `websockets` library forbids overlapping receives). `tree_mutated` / `node_created` events ride a connection-level `LoomMutated` subscription forwarded by a dedicated task. All sends go through one `asyncio.Lock` so two tasks can't interleave bytes. Per generate turn, `session.generate_stream` runs in a worker thread (`asyncio.to_thread`); `on_token` bridges to asyncio via `loop.call_soon_threadsafe`; the handler races the token queue against `incoming` (`asyncio.wait(FIRST_COMPLETED)`) so an in-flight `{type: "stop"}` can call `session.stop()` without blocking. Non-stop frames received mid-generation are held in a per-connection deferred deque and drained by the outer loop after the turn finishes; do not put them straight back on `incoming`, or the handler can spin by repeatedly winning the client-read race. `session.lock` is held for the full N-way batch so concurrent WS clients serialize FIFO. The WS stays open across turns; a mid-batch stop cancels the current sibling and skips remaining ones.
+`POST /sessions/{id}/experiments/fan` — JSON alpha grid over one prompt. Body
+`{prompt, grid: {name: [alphas]}, base_steering?, sampling?, thinking?, raw?}`. The
+grid is validated server-side (empty → 400), then `session.generate_sweep(...,
+stateless=False)` runs in a worker thread under the lock. Returns `{kind, total,
+node_ids, rows}`.
+
+### traits_routes.py — live traits SSE
+
+`GET /sessions/{id}/traits/stream` — per-token probe scores in real time during any
+active generation, via inline `TraitMonitor.score_single_token` gated behind
+registered trait queues (zero overhead when no client is connected). Stays open
+across generations; multiple clients supported. Events: `start`
+(`{generation_id}`), `token` (`{idx, text, thinking, probes}`), `done`
+(`{generation_id, finish_reason, aggregate}`), `: heartbeat` every 15 s when idle.
+
+### WS /saklas/v1/sessions/{id}/stream (in `saklas_api.py`)
+
+Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids contain
+`/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
+sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?}`. The
+`sampling` block (`WSSamplingParams` → `_build_sampling` → `SamplingConfig`) carries
+`user_role`/`assistant_role` — the per-message role-substitution labels, stamped
+onto the produced loom nodes and rendered faithfully per-turn. Special generate
+modes:
+- **Logit fork** (`fork_node_id`/`fork_raw_index`/`fork_alt_token_id`) →
+  `session.fork_from_token`: replays the source node's raw decode prefix, forces the
+  alt token, resamples under the node's stamped recipe. All three fork fields must
+  travel together (400 otherwise).
+- **Answer-prefill** (`prefill_node_id`/`prefill_text`) → `session.prefill_assistant`:
+  the seeded assistant reply lands as a sibling under a user node. `thinking` forced
+  off.
+- **Commit (no-generation send)** (`commit_role`/`commit_text`) →
+  `session.append_user_turn` / `append_assistant_turn`. `raw=true` lifts the
+  user-under-user guard. Emits one `started` (node_id=null) + one `done` carrying the
+  new node under `result.{kind="commit", role, text, node_id}`. No token frames.
+- **Recipe override** — a built-in mode string (`unsteered`/`inverted`/`reseed`/
+  `cool`/`hot`) or a partial-recipe expression (`seed=42, temperature=1.5`).
+
+Fork / prefill / commit are mutually exclusive (400 on mix). `n>1` fans out N sibling
+assistant nodes on one shared user parent, generated serially with deterministic
+derived seeds. Server → client: `started` (node_id filled lazily by the first
+token), `node_created`, `tree_mutated`, `token` (per token — `logprob`/`top_alts`
+when captured, `scores`/`per_layer_scores` when probes are loaded, `manifold_readings`
+`Record<name, {fraction, nearest}>` when any manifold probe is attached, computed
+inline off `session._capture._per_layer`), `done` (`result` with `text`, `tokens`,
+`finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
+`manifold_readings` aggregate), `error` (validation errors keep the connection open;
+other failures close 1011).
+
+Concurrency: one perpetual reader task owns `receive_json()` and feeds a shared
+`incoming` queue; `tree_mutated`/`node_created` ride a connection-level
+`LoomMutated` subscription; all sends go through one `asyncio.Lock`. Per generate
+turn, `generate_stream` runs in a worker thread; `on_token` bridges to asyncio via
+`call_soon_threadsafe`; the handler races the token queue against `incoming` so an
+in-flight `{type: "stop"}` calls `session.stop()` without blocking. Non-stop frames
+mid-generation hold in a per-connection deferred deque and drain after the turn.
+`session.lock` is held for the full N-way batch so concurrent WS clients serialize
+FIFO.
 
 ## ollama.py
 
-Ollama-compatible shim mounted by `register_ollama_routes(app)`, reusing `session` / `default_steering` / `session.lock` / app-level auth. Routes: `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` (no-op success for the loaded model, 404 otherwise), `HEAD /` (liveness probe), and 501 stubs for `/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/embeddings`, `/api/embed`.
+Ollama-compatible shim (`register_ollama_routes`), reusing `session` /
+`default_steering` / `session.lock` / app-level auth. Routes: `/api/version`,
+`/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull`
+(no-op success for the loaded model, 404 otherwise), `HEAD /`, and 501 stubs for
+`/api/push`, `/api/create`, `/api/copy`, `/api/delete`, `/api/embeddings`,
+`/api/embed`.
 
-Streaming responses are NDJSON (`application/x-ndjson`), matching the Ollama wire format. `/api/show.template` reflects the real HF Jinja `tokenizer.chat_template` (honest over a fake Go template). `/api/generate` omits the `context` field (saklas can't round-trip it).
-
-Model aliasing is hybrid: `_HF_TO_OLLAMA_ALIASES` overrides where Ollama's catalogue rounds differently (Gemma-2-2b is 2.6B but advertised `gemma2:2b`) or where `model_type` lacks a version suffix (Llama); otherwise `_infer_aliases` falls back to `<family>:<size>` from `session.model_info` (`_normalise_family` strips `_text`/`_moe`/`forcausallm`, `_size_tag` rounds ≥10B to integer B and keeps one decimal below). Overrides win; inference fills gaps.
-
-Option translation (`_resolve_options`) recognizes `temperature`, `top_p`, `top_k`, `seed`, `num_predict`→`max_tokens`, `stop`, `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `steer`. `repeat_penalty` maps to `presence_penalty` via `ln(repeat_penalty)` (Ollama's "divide positive logits by penalty", count-independent). Everything else in `options` (`min_p`, `mirostat*`, `num_ctx`, `typical_p`, …) is logged at debug and dropped.
-
-Steering passes through a non-standard `steer` field inside `options` (or top-level): a steering expression string in the shared grammar, composed over `default_steering` at the key level. Non-string `steer` raises a clear error. Clients that don't know about it pass through unchanged, so Open WebUI / Enchanted / LangChain's `ChatOllama` work as-is. A top-level `think` bool toggles thinking.
-
-Thinking streams as `message.thinking` (chat) / top-level `thinking` (generate). `_duration_stats` splits wall time proportionally between `prompt_eval_duration` and `eval_duration` (ns). `_finish_to_done_reason` maps saklas `stop_sequence` → Ollama `stop`. `SAKLAS_STRICT_MODEL` makes a `model` mismatch 404; option resolution is hoisted into the route handler so a bad `steer` expression returns a clean 400 before `StreamingResponse` flushes headers.
-
-Manifold-probe readings ride under the top-level `x-saklas-manifold-readings` key on chat / generate responses (non-streaming carries the aggregate, each NDJSON stream chunk carries the per-token reading, the final chunk carries the aggregate). Top-level rather than per-choice because Ollama responses have no choice container; otherwise the shape mirrors the OpenAI extension. Field is absent when no manifold probe is attached.
+Streaming responses are NDJSON. `/api/show.template` reflects the real HF Jinja
+`tokenizer.chat_template`. `/api/generate` omits `context` (saklas can't round-trip
+it). Model aliasing is hybrid: `_HF_TO_OLLAMA_ALIASES` overrides where Ollama's
+catalogue rounds differently or `model_type` lacks a version suffix; otherwise
+`_infer_aliases` falls back to `<family>:<size>` from `session.model_info`.
+`_resolve_options` recognizes `temperature`, `top_p`, `top_k`, `seed`,
+`num_predict`→`max_tokens`, `stop`, `presence_penalty`, `frequency_penalty`,
+`repeat_penalty` (→ `presence_penalty` via `ln(repeat_penalty)`), `steer`;
+everything else (`min_p`, `mirostat*`, …) is logged at debug and dropped. Steering
+passes through a non-standard `steer` field inside `options` (or top-level) — a
+steering expression composed over `default_steering` at the key level; non-string
+`steer` raises a clean 400 before headers flush. A top-level `think` bool toggles
+thinking, streamed as `message.thinking` (chat) / top-level `thinking` (generate).
+`_duration_stats` splits wall time between `prompt_eval_duration` and
+`eval_duration`; `_finish_to_done_reason` maps `stop_sequence` → `stop`.
+`SAKLAS_STRICT_MODEL` 404s a `model` mismatch. Manifold-probe readings ride under
+the top-level `x-saklas-manifold-readings` key (non-streaming = aggregate, each
+NDJSON chunk = per-token reading, final chunk = aggregate); absent when no probe is
+attached.

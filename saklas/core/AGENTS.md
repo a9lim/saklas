@@ -1,12 +1,14 @@
 # core/
 
-Engine layer: model loading, vector extraction, the unified subspace/manifold
-fit + injection, trait/manifold monitoring, session orchestration, the
-generation loop, and the loom conversation tree. The cross-cutting design lives
-in the repo-root `ARCHITECTURE.md`; this file is the per-module map.
+Engine layer: model loading, the unified manifold/subspace fit + injection,
+trait/manifold monitoring, session orchestration, the generation loop, and the
+loom conversation tree. The cross-cutting design lives in the repo-root
+`ARCHITECTURE.md`; this file is the per-module map.
 
-The 4.0 backend lowers **every** steering term — vectors, poles, `~`/`|`
-projections, `!` ablations, and affine/curved `%` — to one per-layer
+There is one artifact family — the manifold — and one injection kernel. A
+steering vector is the 2-node `pca` case; concept extraction and manifold fitting
+share `ManifoldExtractionPipeline`. Every steering term — vectors, poles, `~`/`|`
+projections, `!` ablations, and affine/curved `%` — lowers to one per-layer
 `subspace_inject` (along/onto) call. There is no angular/additive mode, no
 `injection_mode`/`theta_max`, no `_STEER_GAIN`, and no per-fit lever.
 
@@ -26,28 +28,23 @@ through CPU honoring `out=`).
 
 ## vectors.py
 
-Low-level extraction primitives. One forward pass per prompt;
-`_capture_all_hidden_states` hooks every layer at once. `_encode_and_capture_all`
-pools from the **last content token** — `last_content_index` walks back past both
-`tokenizer.all_special_ids` and `tokenizer.added_tokens_encoder` values to skip
-trailing chat-template markers (where outlier channels dominate). `special_token_ids`
-+ `last_content_index` are the one canonical "last non-special token" definition
-shared by every single-state readout (extraction, vector aggregate, manifold
-aggregate); `encode_and_capture_stack` is the full-`[T,D]` companion for the
-manifold monitor. `_render_and_tokenize_for_capture(..., role=, model_type=)` is
-the shared render+tokenize+walkback front half. Contrastive diffs are differenced
-in **fp32**.
+Low-level capture, pooling, DLS, the vector⇄subspace fold, and profile I/O. **No
+`extract_difference_of_means`** — extraction authors a 2-node `pca` manifold now
+(`extraction.py`); what survives here is the capture + fold + projection
+machinery that pipeline and dispatch both consume.
 
-`extract_difference_of_means` is the **only** vector extractor (contrastive PCA
-is gone). `_capture_diffs_for_pairs` runs the forward loop and returns diffs +
-per-layer pos/neg means + SAE layer set; the direction is `mean(diffs)` fp32.
-`_share_bake_and_warn` applies the DLS keep set, share-bakes retained layers
-(`stored_L = d̂_L × ref_norm_L × score_L / Σ score_L`), and emits the diagnostics
-warning. Bake **score** = `‖direction‖_M / ref_norm` when a `whitener` covers
-every scored layer (Mahalanobis), else `‖·‖₂ / ref_norm` (Euclidean) — all-or-
-nothing via `covers_all`. SAE: the extractor runs in feature space when passed a
-`SaeBackend` (encode → direction → decode), and the SAE branch ignores the
-whitener. Returns `(profile, diagnostics)`.
+One forward pass per prompt; `_capture_all_hidden_states` hooks every layer at
+once. `_encode_and_capture_all` pools from the **last content token** —
+`last_content_index` walks back past both `tokenizer.all_special_ids` and
+`tokenizer.added_tokens_encoder` values to skip trailing chat-template markers
+(where outlier channels dominate). `special_token_ids` + `last_content_index` are
+the one canonical "last non-special token" definition shared by every single-state
+readout (centroid pooling, vector aggregate, manifold aggregate);
+`encode_and_capture_stack` is the full-`[T,D]` companion for the manifold monitor.
+`_render_and_tokenize_for_capture(..., role=, model_type=)` is the shared
+render+tokenize+walkback front half. `compute_layer_means` /
+`compute_neutral_activations` build the probe-centering baseline + the whitener's
+neutral cache.
 
 DLS (Selective Steering, Dang & Ngo 2026 Eq. 9): `compute_dls_axes(node_centroids,
 bases, layer_means)` is the **N-node straddle** core — keep axis `d̂ᵣ` at layer L
@@ -57,52 +54,59 @@ opposite-sign product test) are thin wrappers, bit-identical at R=1. The subspac
 apply path consumes the per-axis keep set by slicing the basis
 (`LayerSubspace.select_axes`); an all-fail layer drops.
 
-`_compute_layer_diagnostics` returns `evr`, `intra_pair_variance_{mean,std}`,
-`inter_pair_alignment`, `diff_principal_projection`, persisted through
-`save_profile` → `Profile.diagnostics` and surfaced by `vector why`.
-`compute_layer_means` / `compute_neutral_activations` build the probe-centering
-baseline + the whitener's neutral cache. `project_profile(base, onto, operator,
-*, whitener=None)` is the per-layer `~`/`|` projection (LEACE under a whitener,
-Gram-Schmidt otherwise; metric all-or-nothing via `covers_all`).
+**The vector⇄subspace fold (the production vector path).**
+`fold_directions_to_subspace(name, directions, neutral_means)` folds an arbitrary
+per-layer direction (a `merge` linear-combination, a `~`/`|` projection, or a
+folded bundled concept) into a neutral-anchored affine `R=1` `Manifold` — a
+one-pole ray; `_fold_centroids_to_affine_manifold` is the bipolar (pos/neg
+centroids) sibling. `folded_vector_directions(manifold)` is the **reverse view**:
+`{L: δ̂_L · share_L}`, the baked-direction view of a 2-node affine manifold, used
+to back the `Profile`-returning surface (`extract()`, `subspace compare`/`why`,
+GGUF export) without a second stored representation. It raises on a curved or
+multi-dim manifold. Dispatch lowers every plain vector term through
+`fold_directions_to_subspace` → `_affine_manifold_push` (`session.py`) onto the
+merged affine subspace.
 
-**Subspace-native fold (the production vector path).**
-`fold_vector_to_subspace` / `_fold_centroids_to_affine_manifold` capture pos/neg
-centroids and fold them into an affine `R=1` `Manifold`; `fold_directions_to_subspace`
-is the monopolar sibling (a merge/projection direction → a one-pole ray);
-`folded_vector_directions` is the reverse view. These implement "a vector *is* a
-2-node affine manifold". 4.0 dispatch lowers every plain vector term this way:
-`session._ensure_profile_registered` resolves the direction (a registered tensor,
-or a fitted 2-node manifold loaded + folded), then `fold_directions_to_subspace`
-→ `_affine_manifold_push` joins it to the merged affine subspace. The old
-baked-`Profile` `_vector_push_fragment` shim is gone (4.0 6b).
+`save_profile`/`load_profile` round-trip a baked `dict[int, Tensor]` to
+`.safetensors` + a slim `.json` sidecar (stamped with `PACK_FORMAT_VERSION` from
+`io/packs.py`); they back the per-model `layer_means`/`neutral_activations`/
+alignment caches and the folded-profile interchange. `project_profile(base, onto,
+operator, *, whitener=None)` is the per-layer `~`/`|` projection (LEACE under a
+whitener, Gram-Schmidt otherwise; metric all-or-nothing via `covers_all`).
 
 ## extraction.py
 
-`ExtractionPipeline` — custom-concept orchestration: tensor cache → statements →
-scenarios → pairs → extract → save. Dependencies via the `ModelHandle` /
-`PackWriter` protocols (`SaklasSession` satisfies both). `DEFAULT_EXTRACTION_METHOD
-= "dim"` and difference-of-means is the only method (`_method_label` no longer
-dispatches on PCA). Tensor-cache hit re-checks `statements_sha256` against the
-sibling `statements.json` (drift → re-extract, not raise). `extract()` emits
-`VectorExtracted`.
+`ManifoldExtractionPipeline.fit(folder, *, sae=...)` is **the** extraction
+pipeline (concept extraction and manifold fitting are the same thing — a vector is
+a 2-node `pca` manifold). Dependencies via the `ModelHandle` protocol (`model` /
+`tokenizer` / `layers` / `device` / `model_id` / `_run_generator` /
+`generate_scenarios` / `generate_statements`) + an `EventBus` for
+`ManifoldExtracted`; `SaklasSession` satisfies it implicitly. Cache-hit on the
+sidecar `nodes_sha256` (folds in corpus + `{domain, node_coords}` authored /
+`{fit_mode, hyperparams}` discover) **and** `sae_revision`. Else pools per-node
+centroids (`compute_node_centroid`) and dispatches on `fit_mode`:
 
-`ManifoldExtractionPipeline.fit(folder, *, sae=...)` is the manifold/subspace
-fitter. Cache-hit on `nodes_sha256` (folds in corpus + `{domain, node_coords}`
-authored / `{fit_mode, hyperparams}` discover). Else pools per-node centroids
-(`compute_node_centroid`) and dispatches on `fit_mode`:
-- **`pca`** (flat / discover): per layer `fit_affine_subspace` (μ-centered PCA
-  basis — whitened/Fisher when the whitener covers all fit layers, Euclidean
-  otherwise — neutral-anchored frame, real per-layer `node_coords`), then per-axis
-  DLS (`compute_dls_axes` → `select_axes`) across all fit layers, then the
-  μ-centered `subspace_share` bake.
+- **`pca`** (flat / discover; the 2-node-vector case): derive per-model coords
+  (`discover_coords` at a reference layer) when discover, then per layer
+  `fit_affine_subspace` (μ-centered PCA basis — whitened/Fisher when the whitener
+  covers all fit layers, Euclidean otherwise — neutral-anchored frame, real
+  per-layer `node_coords`), per-axis DLS straddle across all fit layers
+  (`compute_dls_axes` → `select_axes`), then the μ-centered `subspace_share` bake.
+  `anchor_origin` (pca only) shifts coords so a named node lands at 0.
 - **`authored`/`spectral`** (curved): per layer `fit_layer_subspace` (PCA frame +
-  RBF surface), share bake, and a per-layer `origin` (`invert_parameterization` of
-  the neutral mean — curved only; flat's foot is coord 0).
-Discover mode derives per-model coords via `discover_coords` at a reference layer
-first. SAE coverage is fail-fast (`SaeCoverageError`). Bakes `explained_variance`,
-`mahalanobis_share` (+ `share_metric`), `origin`. **No lever** — torn out.
-Whitener resolution is deferred past the cache-hit return and gated all-or-nothing.
-Emits `ManifoldExtracted`.
+  RBF surface), μ-centered share bake, and a per-layer `origin`
+  (`invert_parameterization` of the neutral mean — curved only; flat's foot is
+  coord 0).
+
+`--sae` reconstructs each centroid through the SAE before the fit (fail-fast
+`SaeCoverageError`); the fitted subspace is model-space regardless. Bakes
+`explained_variance`, `mahalanobis_share` (+ `share_metric`/`subspace_metric`),
+`origin`. **No lever.** Whitener resolution is deferred past the cache-hit return
+and gated all-or-nothing on `covers_all`. `min_nodes(k) = 2k+1` for curved; a flat
+`pca` fit needs only `k+1` (so K=2/k=1 is a steering vector). Emits
+`ManifoldExtracted`. (Note: `extract.py`'s old concept `ExtractionPipeline` and
+the `_capture_diffs_for_pairs` DiM apparatus are gone; the `discover-pca` 2-node
+fit replaces them.)
 
 ## sae.py
 
@@ -126,12 +130,12 @@ invariant — fp16's 65504 ceiling overflows gemma-3's late layers to
 ±inf, poisoning Σ). Any layer whose centered acts or `K` come back non-finite is
 *excluded*, so `covers_all` is trustworthy as "finite factors everywhere" — the
 all-or-nothing gate shared by extraction, manifold fit, projection, monitor, and
-`vector compare`. Primitives: `mahalanobis_cosine`, `leace_project`, `apply_inv`,
-`subspace_gram(layer, B) = B Σ⁻¹ Bᵀ` (the (R,R) reduced inverse covariance behind
-whitened share + whitened manifold reads), `woodbury_factors` (device-resident
-factors for the monitor's inline per-token apply). `SaklasSession.whitener` is a
-lazy property; `bootstrap_probes` builds it eagerly and wires it into both
-monitors via `set_whitener`.
+`subspace compare`. Primitives: `mahalanobis_cosine`, `mahalanobis_norm`,
+`leace_project`, `apply_inv`, `subspace_gram(layer, B) = B Σ⁻¹ Bᵀ` (the (R,R)
+reduced inverse covariance behind whitened share + whitened manifold reads),
+`woodbury_factors` (device-resident factors for the monitor's inline per-token
+apply). `SaklasSession.whitener` is a lazy property; session construction wires it
+into both monitors via `set_whitener`.
 
 ## manifold.py
 
@@ -161,9 +165,10 @@ real `node_coords = (centroids − neutral)·basisᵀ`); `orient_to` fixes the s
 independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`).
 
 `Manifold` — domain + per-layer `LayerSubspace`s + `node_labels`/`node_coords`/
-`node_roles` + the bakes `explained_variance`/`mahalanobis_share`/`origin`. The
-`Profile` analogue. `manifold_point`, `tangent` (analytic RBF Jacobian),
-`resolve_position` (coord payload or label), `nearest_node_{index,label,role}`.
+`node_roles` + the bakes `explained_variance`/`mahalanobis_share`/`origin` +
+`feature_space`/`metadata`. The `Profile` analogue. `manifold_point`, `tangent`
+(analytic RBF Jacobian), `resolve_position` (coord payload or label),
+`nearest_node_{index,label,role}`.
 
 `decompose(h, mean, basis) → (h_par_c, h_perp)` — the shared centered
 decomposition behind injection + the read monitor. `synthesize_subspace(push,
@@ -187,7 +192,7 @@ prefix) / `derive_spectral_coords` (Laplacian eigenmaps, eigenvalue-ratio cliff)
 / `discover_coords` dispatcher, with `PcaDiagnostics`/`SpectralDiagnostics`.
 Naturalness eval: `to_hellinger`, `bhattacharyya_distance`, `fit_behavior_manifold`,
 `trajectory_naturalness`, `compute_node_behavior_centroid`,
-`compute_trajectory_distributions`.
+`compute_trajectory_distributions`, `compute_node_centroid`.
 
 ## hooks.py
 
@@ -284,36 +289,59 @@ detectors; `ThinkingState` / `GenerationState` drive the streaming state machine
 
 ## session.py
 
-`SaklasSession` owns the model, profile registry (`_profiles`), both monitors,
-`SteeringManager`, `HiddenCapture`, generation defaults (`session.config`), the
-loom tree, and a synchronous `events: EventBus`. `from_pretrained(model_id, *,
-device, dtype, quantize, probes, projection_metric=..., dls=..., compile=...,
-cuda_graphs=...)` does the HF load + probe bootstrap + layer-mean compute — there
-is no `injection_mode`/`theta_max` param. `__init__` takes a pre-loaded model.
-Both call `materialize_bundled()` + `selectors.invalidate()` early. `_N_PAIRS =
-45`, `_N_PAIRS_PER_SCENARIO = 5`.
+`SaklasSession` owns the model, the in-memory profile registry (`_profiles`), the
+loaded-manifold registry (`_manifolds`), both monitors, `SteeringManager`,
+`HiddenCapture`, generation defaults (`session.config`), the loom tree, and a
+synchronous `events: EventBus`. `from_pretrained(model_id, *, device, dtype,
+quantize, probes, projection_metric=..., dls=..., compile=..., cuda_graphs=...)`
+does the HF load + layer-mean compute + probe bootstrap — there is no
+`injection_mode`/`theta_max` param. `__init__` takes a pre-loaded model. Both call
+`materialize_bundled_manifolds()` + `selectors.invalidate()` early. `_N_PAIRS =
+45`, `_N_PAIRS_PER_SCENARIO = 5`. Module-level helpers `_manifold_is_affine` /
+`_affine_manifold_push` (per-layer basis rows + node-coord targets for a flat
+manifold) back the dispatch.
+
+`extract(concept, baseline)` authors a 2-node discover-`pca` manifold
+(`create_discover_manifold_folder`, `hyperparams={"max_dim": 1}`) and fits it via
+`ManifoldExtractionPipeline`, returning `(canonical_name,
+folded_vector_directions(manifold))`. `extract_vector_from_corpora` is the
+corpus-in sibling (cloning / hand-authored pairs skip generation);
+`extract_manifold(folder)` is the multi-node delegate that returns a `Manifold`.
+All three gate against `GenState.IDLE` (fitting runs forward passes). `_fit_vector_
+manifold` is the shared tail; `clone_from_corpus` delegates to `io.cloning`.
 
 `generate` / `generate_stream` are keyword-only and accept `steering: str |
-Steering | None` (dicts rejected), `sampling`, `thinking=None`, plus loom args
-(`parent_node_id`, `n`, `recipe_override`); both return `RunSet` (`.first` is the
-`GenerationResult`). `session.steering(value)` coerces via `Steering.from_value`,
-materializes `ProjectedTerm`s into derived profiles (`_materialize_projections` →
-`project_profile` with `session.whitener`, Gram-Schmidt fallback), and pushes a
-per-scope entries dict onto a LIFO stack so nested scopes compose. The per-call
-`projection_metric` rides a parallel `_steering_override_stack: list[str | None]`
-walked top-down by `_resolve_projection_metric` (inner wins; default Mahalanobis).
-`_resolve_pole_aliases` + the cache-hit auto-load (`_try_autoload_vector`) let
-HTTP clients steer bundled probes without pre-registration.
+Steering | None` (dicts rejected), `sampling`, `thinking=None`, plus loom args;
+both return `RunSet` (`.first` is the `GenerationResult`). `session.steering(value)`
+coerces via `Steering.from_value`, materializes `ProjectedTerm`s into derived
+profiles (`_materialize_projections` → `project_profile` with `session.whitener`),
+and pushes a per-scope entries dict onto a LIFO stack so nested scopes compose. The
+per-call `projection_metric` rides a parallel override stack walked top-down by
+`_resolve_projection_metric` (inner wins; default Mahalanobis).
+`_resolve_pole_aliases` canonicalizes + sign-flips bare poles through the manifold
+tier and routes variants.
 
-`_compose_steering_entries` is the 4.0 dispatch (`ARCHITECTURE.md` §4): classify
-each entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins
-the merge (`_affine_manifold_push`, label-form) or curved `%` → `add_manifold`;
-plain `(alpha, trigger)` → rank-1 push (`_ensure_profile_registered` →
-`fold_directions_to_subspace` → `_affine_manifold_push`, unit dir + `‖d_L‖`
-coord) — group push+ablate by trigger, `synthesize_subspace` per group,
-`add_subspace`. `_install_composed_steering` → `apply_to_model`. There are **no**
-persistent hooks. Manifold-implied roles aggregate under soft-warn +
-highest-`|coeff|`-wins (`RoleBaselineMismatchWarning`).
+**Steering resolution (manifold-first).** `_ensure_profile_registered(name)`
+resolves a direction from, in order: (1) an in-memory baked direction already in
+`_profiles` (ad-hoc `extract`/`clone`/`merge`/projection results); (2) a fitted
+2-node `pca` manifold on disk — `_try_fold_manifold` → `_ensure_manifold_loaded`
+(load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
+memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
+`vectors/<ns>/<name>/` folder — `_port_stale_legacy_vector` ports it to a 2-node
+manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
+to run. `_bootstrap_manifold_probes(categories)` is the probe-roster bootstrap:
+for each `default/` manifold tagged in a requested category, fit-or-load + fold to
+a per-layer direction so `TraitMonitor` keeps its whitened-cosine read (replaces
+the old `io.probes_bootstrap.bootstrap_probes`).
+
+`_compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
+entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins the
+merge (`_affine_manifold_push`) or curved `%` → `add_manifold`; plain `(alpha,
+trigger)` → `_ensure_profile_registered` → `fold_directions_to_subspace` →
+`_affine_manifold_push` push fragment — group push+ablate by trigger,
+`synthesize_subspace` per group, `add_subspace`. `_install_composed_steering` →
+`apply_to_model`. There are **no** persistent hooks. Manifold-implied roles
+aggregate under soft-warn + highest-`|coeff|`-wins (`RoleBaselineMismatchWarning`).
 
 `_generate_core` owns the `_gen_lock` re-entry guard, `_gen_phase` lifecycle
 (`IDLE`/`PREAMBLE`/`RUNNING`/`FINALIZING`, via `session.gen_state`), the steering
@@ -401,7 +429,7 @@ end-of-gen. `to_dict()` omits `hidden_states`.
 ## histogram.py
 
 `HIST_BUCKETS = 16`; `bucketize(norms, buckets)` collapses sorted per-layer norms
-into evenly-sized groups. Used by the TUI WHY footer + CLI `vector why`.
+into evenly-sized groups. Used by the TUI WHY footer + CLI `subspace why`.
 
 ## sampling.py / steering.py / steering_expr.py / events.py / errors.py / profile.py
 
@@ -426,9 +454,8 @@ checks). Term markers: `ProjectedTerm(coeff, trigger, operator, base, onto)`
 (materialized into derived profiles before the hook layer), `AblationTerm` (`!atom`,
 default coeff 1.0, doesn't compose with `~`/`|` — lowered through
 `synthesize_subspace`'s ablation path at dispatch), `ManifoldTerm` (`along`,
-`onto`, position; the third `toward` slot is removed — `_expand_along_onto_coeffs`
-yields a 1- or 2-tuple). Probe gates (`@when:<probe><op><threshold>`) accept three
-identifier shapes — vector (`angry.calm`), manifold fraction (`pad:fraction`),
-manifold label (`pad@elated`) — all stored verbatim in `ProbeGate.probe` so
-the runtime gate is identical; the parser is the only place the discrimination
-lives.
+`onto`, position; `_expand_along_onto_coeffs` yields a 1- or 2-tuple). Probe gates
+(`@when:<probe><op><threshold>`) accept three identifier shapes — vector
+(`angry.calm`), manifold fraction (`pad:fraction`), manifold label
+(`pad@elated`) — all stored verbatim in `ProbeGate.probe` so the runtime gate is
+identical; the parser is the only place the discrimination lives.

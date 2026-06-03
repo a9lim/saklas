@@ -6,12 +6,15 @@
 activation steering and trait monitoring on HuggingFace causal LMs. It runs
 OpenAI `/v1/*` and Ollama `/api/*` on one port, plus a native `/saklas/v1/*` API
 and a Svelte dashboard at `/`. Steering signal comes from representation
-engineering: difference-of-means vectors, multi-node affine subspaces, and curved
-RBF manifolds. Every steering term — vectors, poles, `~`/`|` projections, `!`
-ablations, and `%` manifold positions — lowers at generation time to one unified
-per-layer injection (the along/onto subspace kernel, `core/manifold.py::subspace_inject`).
-Per-call coefficients, no model mutation. Three frontends over one engine:
-`SaklasSession` (programmatic), `saklas serve` (HTTP), `saklas tui` (TUI).
+engineering, unified under a single artifact family — the **manifold**: labeled
+nodes placed on a domain, fit to a per-layer subspace. A difference-of-means
+steering vector is the 2-node flat case; `personas` is a 101-node flat fan; `pad`
+is a curved 3-D box. Every steering term — vectors, poles, `~`/`|` projections,
+`!` ablations, and `%` manifold positions — lowers at generation time to one
+unified per-layer injection (the along/onto subspace kernel,
+`core/manifold.py::subspace_inject`). Per-call coefficients, no model mutation.
+Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve`
+(HTTP), `saklas tui` (TUI).
 
 Version lives in `saklas/__init__.py` as `__version__` (currently 3.2.0).
 `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there
@@ -31,11 +34,11 @@ engine.
 Deep internals live in subtree `AGENTS.md` files — Claude Code auto-loads each
 when you work in that directory. Consult them only when editing that layer.
 
-- `saklas/core/AGENTS.md` — model loading, extraction, the subspace/manifold fit +
-  injection, monitor, session, generation loop, loom tree
-- `saklas/io/AGENTS.md` — packs, manifolds, HF distribution, GGUF, cloning,
+- `saklas/core/AGENTS.md` — model loading, the manifold/subspace fit + injection,
+  monitor, session, generation loop, loom tree
+- `saklas/io/AGENTS.md` — manifold format, HF distribution, GGUF, merge, cloning,
   alignment, paths/selectors
-- `saklas/cli/AGENTS.md` — eight-verb dispatch, config loading, flags
+- `saklas/cli/AGENTS.md` — six-verb dispatch, config loading, flags
 - `saklas/server/AGENTS.md` — OpenAI / Ollama / native routes
 - `saklas/tui/AGENTS.md` — slash commands, panels, loom screen
 - `saklas/web/AGENTS.md` — dashboard mount, wire protocol, Svelte source layout
@@ -50,16 +53,8 @@ pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
 pip install -e ".[sae]"                         # SAELens-backed SAE extraction
 saklas tui <model_id> [--projection-metric {mahalanobis,euclidean}] [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
-saklas pack install <target> [-s|-a NS/N|-f]    # HF coord or folder; -s = statements only
-saklas pack refresh <selector> [-m MODEL]       # re-pull; `refresh neutrals` is reserved
-saklas pack clear <selector> [-m MODEL] [--variant raw|sae|all]   # delete per-model tensors
-saklas pack rm <selector> [-y]                  # remove folder (bundled respawns)
-saklas pack ls [selector] [-j|-v]               # LOCAL installed packs only
-saklas pack search <query> [-j|-v]              # search HF hub for saklas-pack repos
-saklas pack push <selector> [-a OWNER/NAME] [-m MODEL] [--variant raw|sae|all] ...
-saklas pack export gguf <selector> [-m MODEL] [-o PATH] [--model-hint HINT]
 saklas subspace extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
-saklas subspace merge <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b~ns/c"
+saklas subspace merge <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
 saklas subspace clone <corpus> -N NAME [-m MODEL] [-n N_PAIRS] [--seed S]
 saklas subspace compare <concepts...> -m MODEL [--metric mahalanobis|euclidean]
 saklas subspace why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
@@ -67,14 +62,15 @@ saklas subspace transfer <concept> --from SRC --to TGT [-f]   # cross-model Proc
 saklas manifold fit <folder> [-m MODEL] [--sae REL]  # fit an authored manifold
 saklas manifold discover <name> [-m MODEL] [--method pca|spectral] [--max-dim N] ...
 saklas manifold generate <name> --concepts C... [--n-scenarios N] [--statements-per-concept K] [--seed S]
-saklas manifold install <target> [-a NS/N] [-f]      # HF coord or local folder
+saklas manifold install <target> [-a NS/N] [-f]      # HF coord or local folder (also ports legacy saklas-packs)
 saklas manifold search <query> [-j|-v]               # search HF hub for saklas-manifold repos
 saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
 saklas manifold push <name> [-a OWNER/N] [-m MODEL] [--variant raw|sae|all]
-saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes (discover coords)
+saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes
 saklas manifold clear <name> [-m MODEL] [--variant raw|sae|all]   # delete per-model fitted tensors
 saklas manifold rm <name> [-y]                       # remove folder (bundled respawns)
 saklas manifold refresh <name> [-m MODEL]            # re-pull (hf) / re-fit (-m scoped)
+saklas manifold export gguf <name> [-m MODEL] [-o PATH] [--model-hint HINT]   # fold a 2-node pca manifold to a control-vector GGUF
 saklas manifold ls [-v|-j] | show <name> [-j]        # list / inspect manifolds
 saklas experiment fan <model> "<prompt>" -g concept=0,0.5,1 # alpha grid as loom siblings
 saklas experiment transcript run <path.yaml> [model]        # replay a saved transcript
@@ -84,13 +80,15 @@ saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly eight verbs: `tui`, `serve`, `pack`, `subspace`,
-`manifold`, `vector`, `experiment`, `config`. `vector` is a deprecated 3.x alias
-for `subspace` plus the old nested `vector manifold` tree; new commands should
-use top-level `subspace` / `manifold`. No `argv[0]` peeking, no bare-TUI fallback
-— `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
-pack` / `saklas subspace` / `saklas manifold` / `saklas vector` / `saklas
-experiment` / `saklas config` print help and exit 0.
+The root parser has exactly six verbs: `tui`, `serve`, `subspace`, `manifold`,
+`experiment`, `config`. There is no `pack` verb and no `vector` alias — pack
+distribution folded into the manifold artifact, so install via `manifold install`
+and export via `manifold export gguf`. `subspace` is the flat-artifact
+computation surface (extract/merge/clone/compare/why/transfer); `manifold` owns
+the full steering-manifold tree. No `argv[0]` peeking, no bare-TUI fallback —
+`saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
+subspace` / `saklas manifold` / `saklas experiment` / `saklas config` print help
+and exit 0.
 
 Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
@@ -110,22 +108,24 @@ transfer), or `role-<name>` (role-augmented extraction — the contrast pairs we
 generated under a chat template whose assistant-role label was substituted, and
 the same substitution is auto-applied at steering time so extract baseline equals
 steer baseline). There is no `pca` variant. Bare names resolve cross-namespace and
-raise `AmbiguousSelectorError` on collision; a bare `:sae` raises
-`AmbiguousVariantError` when a concept has multiple SAE releases. Bare poles alias
-to installed bipolar concepts: `wolf` → `deer.wolf @ -0.5` (caller multiplies user
-alpha by the sign), via `io.selectors.resolve_pole`. A steering expression
-composing role-augmented terms must agree on role; plain `:raw` terms compose with
-role terms but emit a one-time `RoleBaselineMismatchWarning`.
+raise `AmbiguousSelectorError` on collision. Concepts *are* manifolds now
+(`io.selectors` walks `manifolds_dir()`): a bare pole resolves through the
+manifold tier — `resolve_bare_name` tries the bipolar-pole node first
+(`resolve_manifold_label`/`resolve_manifold_name` over the installed 2-node `pca`
+manifolds), then a multi-node manifold node label, raising on cross-tier
+collision. A steering expression composing role-augmented terms must agree on
+role; plain `:raw` terms compose with role terms but emit a one-time
+`RoleBaselineMismatchWarning`.
 
 Canonical naming: `canonical_concept_name` (module-level in `core/session.py`)
 slugs poles via `[^a-z0-9]+ → _` and joins bipolar poles with `BIPOLAR_SEP = "."`,
-so `/steer happy . sad` and `/steer happy.sad` resolve to the same vector.
+so `/steer happy . sad` and `/steer happy.sad` resolve to the same manifold.
 `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$`; `@` is forbidden (HF revision separator),
 and `.` is used over `~` because HF repo names reject `~`.
 
 ## Steering expression grammar
 
-Every input surface — Python, YAML, HTTP, TUI, `vector merge` — speaks the
+Every input surface — Python, YAML, HTTP, TUI, `subspace merge` — speaks the
 grammar in `saklas.core.steering_expr`. `parse_expr(text)` → `Steering`;
 `format_expr` round-trips it back.
 
@@ -168,50 +168,64 @@ byte-for-byte.
 point of a fitted manifold. `<position>` is `<coord_list>` (a comma-separated list
 of authoring coordinates, one per intrinsic dimension, e.g.
 `0.7 pad%0.3,0.8,0.0@response`) or `<label>` (sugar for "the coords of the node
-labeled `pirate`", e.g. `0.5 persona%pirate`). The coefficient slot is
+labeled `pirate`", e.g. `0.5 personas%pirate`). The coefficient slot is
 `along[,onto]` — `along` is the slide fraction toward the position, `onto` (curved
-manifolds only) collapses the off-surface in-subspace residual. The former third
-`toward` slot is removed. An affine `%` term (e.g. `personas%pirate`) joins the
-merged subspace as a push fragment; a curved `%` term (e.g. `pad%…`) gets
-its own injection term. A `%` term doesn't compose with `~`/`|`/`!`. Arity (coord
-form) and label existence (label form) are validated at manifold-load time. Two
-*curved* manifolds at one layer must be (near-)orthogonal or `OverlappingManifoldError`
-raises; the merged affine subspace is always orthogonalized against the curved
-spans. See "Manifold steering" below.
+manifolds only) collapses the off-surface in-subspace residual. An affine `%` term
+(flat manifold, e.g. `personas%pirate`) joins the merged subspace as a push
+fragment; a curved `%` term (e.g. `pad%…`) gets its own injection term. A `%`
+term doesn't compose with `~`/`|`/`!`. Arity (coord form) and label existence
+(label form) are validated at manifold-load time. Two *curved* manifolds at one
+layer must be (near-)orthogonal or `OverlappingManifoldError` raises; the merged
+affine subspace is always orthogonalized against the curved spans. See "Manifold
+steering" below.
 
 A bare slug (`pirate`) resolves through `io.selectors.resolve_bare_name`: first as
-an installed bipolar pole, then as a manifold node label (synthesizing a
-label-form `ManifoldTerm`, e.g. `local/persona%pirate`). Cross-tier ambiguity
-raises `AmbiguousSelectorError`. Namespace-qualified or variant-suffixed forms
-(`alice/pirate`, `pirate:role-x`, `civilian.pirate`) skip the manifold-label tier.
+a bipolar-pole node of a 2-node `pca` manifold, then as a multi-node manifold node
+label (synthesizing a label-form `ManifoldTerm`, e.g. `local/personas%pirate`).
+Cross-tier ambiguity raises `AmbiguousSelectorError`. Namespace-qualified or
+variant-suffixed forms (`alice/pirate`, `pirate:role-x`, `civilian.pirate`) skip
+the manifold-label tier.
 
 ## Extraction
 
-`extract_difference_of_means` (`core/vectors.py`) is the only vector extractor: the
-per-layer direction is the mean of contrastive diffs (fp32), in plain or SAE
-feature space. `core/extraction.py::ExtractionPipeline` orchestrates the cache-miss
-path (statements → scenarios → pairs → extract → save tensor); a tensor cache hit
-short-circuits upstream.
+There is **one** extraction pipeline. A steering vector is the K=2 flat case of a
+manifold, so `session.extract(concept, baseline)` authors a 2-node discover-`pca`
+manifold under `manifolds/<ns>/<name>/` — node 0 the positive pole, node 1 the
+negative — and fits it via `core/extraction.py::ManifoldExtractionPipeline`. There
+is no separate `{positive, negative}` / `statements.json` / baked-DiM artifact;
+the corpus lives as the manifold's two node groups. `extract()` returns
+`(canonical_name, Profile)` where the `Profile` is the **folded** per-layer
+direction view of the fitted 2-node manifold
+(`core/vectors.py::folded_vector_directions`) — the in-memory steering-vector
+shape callers expect, with the manifold the single on-disk artifact. A tensor
+cache hit (sidecar `nodes_sha256` matches the folder) short-circuits the forward
+passes.
 
-Share-baking folds the per-layer score into the tensor magnitude — `stored =
-unit_direction × ref_norm × score / Σ scores` over the DLS-retained layers — so
-sidecars carry no separate `scores` field and llama.cpp's uniform GGUF scalar
-reproduces the per-layer weighting for free.
+The per-layer fit derives the basis by **μ-centered PCA**; at K=2 the sole axis is
+exactly the unit difference-of-means `δ̂` (PCA@2 ≡ DiM). The fitted manifold stores
+each layer's `LayerSubspace` (mean, basis, real `node_coords`): the activation-space
+magnitude lives in the neutral-anchored real coords (`coord_pos − coord_neg =
+‖δ_L‖`), and a separate per-layer Mahalanobis `share` carries the cross-layer
+budget. The in-memory steering vector is the folded view `δ̂_L · share_L`
+(`folded_vector_directions`); for GGUF export llama.cpp's uniform control-vector
+scalar reproduces the relative per-layer weighting from those magnitudes.
 
 Discriminative Layer Selection (Selective Steering, Dang & Ngo 2026 Eq. 9): a
-layer/axis is kept iff the pos/neg projections relative to neutral have opposite
-signs — same-side layers encode concept *intensity*, not *polarity*. `--no-dls`
-opts out. The N-node generalization (`compute_dls_axes`) backs the subspace fit.
+layer/axis is kept iff the node projections relative to neutral straddle zero
+(both signs present) — same-side layers encode concept *intensity*, not
+*polarity*. `--no-dls` opts out. `compute_dls_axes` (N-node straddle) backs the
+flat fit; at K=2 it is exactly the pos/neg opposite-sign test. Curved manifolds
+have no pos/neg polarity, so they skip DLS — per-layer signal is the apply-time
+share alone.
 
-Bake metric: `‖mean_diff‖_M / ref_norm` when a `LayerWhitener` covers every scored
-layer (Mahalanobis, the session-driven default), `‖·‖₂ / ref_norm` otherwise. The
-choice is all-or-nothing (`covers_all`) — the two scores live on different scales
-(`‖·‖_M` carries a per-layer `1/√λ_L` factor that doesn't cancel from the
-cross-layer-normalized share). The sidecar `bake` field records which. The
-`LayerWhitener` (`core/mahalanobis.py`) is built lazily from cached neutral
-activations and also drives Mahalanobis `~`/`|` projection (closed-form LEACE),
-the whitened/Fisher subspace fit, the whitened monitor reads, and
-`vector compare --metric mahalanobis`.
+Bake/share metric: `‖·‖_M` (Mahalanobis) when a `LayerWhitener` covers every
+scored layer, `‖·‖₂` (Euclidean) otherwise. The choice is all-or-nothing
+(`covers_all`) — the two scales differ by a per-layer `1/√λ_L` factor that doesn't
+cancel from the cross-layer-normalized share. The sidecar `share_metric` /
+`subspace_metric` fields record which. The `LayerWhitener` (`core/mahalanobis.py`)
+is built lazily from cached neutral activations and also drives Mahalanobis
+`~`/`|` projection (closed-form LEACE), the whitened/Fisher subspace fit, the
+whitened monitor reads, and `subspace compare --metric mahalanobis`.
 
 ## Injection
 
@@ -228,12 +242,12 @@ subspace and applies two ops: **along** slides the in-subspace foot toward the
 target (geodesically; on a curved surface it transports the off-surface residual
 `H_n` to stay normal at the new foot), **onto** scales `H_n` by `(1 − o)` (vacuous
 when the surface fills its subspace, i.e. for every flat/affine term). The
-off-subspace residual `h_perp` is always kept verbatim — the old `toward` op that
-scaled it is removed, which is what lets a vector and N orthogonal manifolds
-compose with zero cross-talk. A flat (affine) subspace takes an analytic shortcut
-(foot = the projected coord, no Gauss-Newton / RBF), load-bearing for throughput;
-a curved manifold runs a warm-started per-token nearest-point foot-follower. fp32
-throughout; the only norm guard is the soft cap `‖h_new‖ ≤ 3·‖h‖`.
+off-subspace residual `h_perp` is always kept verbatim, which is what lets a
+vector and N orthogonal manifolds compose with zero cross-talk. A flat (affine)
+subspace takes an analytic shortcut (foot = the projected coord, no Gauss-Newton /
+RBF), load-bearing for throughput; a curved manifold runs a warm-started per-token
+nearest-point foot-follower. fp32 throughout; the only norm guard is the soft cap
+`‖h_new‖ ≤ 3·‖h‖`.
 
 Gain (`core/hooks.py`): the per-layer share is normalized to **mean 1** (`Σ_L
 share_L = n_layers`) and `eff_along_L = share_L · _MANIFOLD_GAIN` (one constant,
@@ -262,20 +276,26 @@ is the explicit-immersion escape hatch (and the identity carrier for discover
 coords and synthesized affine subspaces). The per-layer interpolant is one `r³`
 polyharmonic RBF; at n=1 over an open axis it reproduces the natural cubic spline.
 
-A manifold is its own artifact type — labeled nodes at authoring coordinates on a
-domain, each a small statement corpus, under `~/.saklas/manifolds/<ns>/<name>/`
-(not a `ConceptFolder`). Authored as `manifold.json` (domain spec + per-node
-`{label, coords}`) + `nodes/*.json` — by hand or via the webui builder
-(`io.manifolds.create_manifold_folder`). `manifold fit`, the webui fit
-action, and `POST .../fit` all run `ManifoldExtractionPipeline`: pool each node's
-centroid, embed coords through the domain, fit a per-layer subspace (flat
-`fit_affine_subspace` for `fit_mode=pca`, curved `fit_layer_subspace` for
-authored/spectral — whitened/Fisher PCA basis when the whitener covers all fit
-layers, ordinary PCA otherwise), bake the per-layer Mahalanobis share, write the
-per-model tensor. `--sae <release>` reconstructs each centroid through the SAE
-before the fit; the fitted subspace is always model-space so the hook never
-touches the SAE. `min_nodes(n) = 2n+1`; authored nodes must be *poised* (affinely
-span the embedding).
+A manifold lives under `~/.saklas/manifolds/<ns>/<name>/` as `manifold.json`
+(domain spec + per-node `{label, coords}` for authored; `fit_mode` + hyperparams +
+`{label}` for discover) + `nodes/NN_<label>.json` corpora — by hand or via the
+webui builder (`io.manifolds.create_manifold_folder` /
+`create_discover_manifold_folder`). `manifold fit`, the webui fit action, and
+`POST .../fit` all run `ManifoldExtractionPipeline`: pool each node's centroid,
+embed coords through the domain (or derive them for discover mode), fit a per-layer
+subspace (flat `fit_affine_subspace` for `fit_mode=pca`, curved
+`fit_layer_subspace` for authored/spectral — whitened/Fisher PCA basis when the
+whitener covers all fit layers, ordinary PCA otherwise), bake the per-layer
+Mahalanobis share, write the per-model tensor. `--sae <release>` reconstructs each
+centroid through the SAE before the fit; the fitted subspace is always model-space
+so the hook never touches the SAE. `min_nodes(n) = 2n+1` for a curved fit (a flat
+`pca` fit needs only `k+1`); authored nodes must be *poised* (affinely span the
+embedding).
+
+`fit_mode` is one of four: `authored` (user supplies domain + coords; curved),
+`pca` / `spectral` (discover — labeled corpora only, coords derived per-model;
+`pca` is flat, `spectral` curved), and `baked` (corpus-less, a precomputed
+direction written by `subspace merge` — see io/AGENTS.md).
 
 Per-node `role` (slug `[a-z0-9._-]+`): the centroid is pooled under a
 chat-template substitution that replaces the assistant-role label, so the fit
@@ -306,7 +326,8 @@ from the pooled centroids. PCA picks the smallest prefix whose cumulative varian
 crosses `var_threshold` (default 0.70), capped at `max_dim` (default 8); spectral
 runs Laplacian eigenmaps on a symmetric k-NN graph and picks `k` by the
 eigenvalue-ratio cliff. `fit_mode=pca` produces a flat affine subspace (no RBF);
-`spectral` (and `authored`) produces a curved RBF surface. Per-model coordinates
+`spectral` (and `authored`) produces a curved RBF surface. `anchor_origin` (pca
+only) shifts every coord so a named node lands at the origin. Per-model coordinates
 are the architectural shift: a Gemma fit and a Qwen fit produce different node
 layouts for the same heap (stored as `node_coords` in the per-model safetensors).
 
@@ -324,30 +345,32 @@ natural; `--compare-linear` scores a straight-chord baseline alongside).
 
 ### Bundled manifolds + coefficient regime
 
-Two bundled manifolds ship under `saklas/data/manifolds/`, materializing into
+The bundled artifacts ship under `saklas/data/manifolds/`, materializing into
 `~/.saklas/manifolds/default/` on session start via `materialize_bundled_manifolds()`
 (process-scope no-op after the first call):
 
-- **`personas`** — discover-mode `fit_mode=pca` (a flat ~rank-8 affine subspace),
+- **26 concept manifolds** — 2-node `fit_mode=pca` axes (24 bipolar + 2 monopolar
+  `agentic`/`manipulative`), tagged by category (`affect`, `epistemic`,
+  `alignment`, `register`, `social_stance`, `cultural`, `identity`). These are the
+  steering vectors: `0.5 angry.calm` steers toward `angry` (node 0).
+- **`personas`** — discover `fit_mode=pca` (a flat ~rank-8 affine subspace),
   101 persona nodes (100 archetypes `assistant`…`vandal` + a `default` anchor) in
   assistant-baselined activation space; from Anthropic's Assistant Axis paper
-  (arXiv 2601.10387). Per-model coords derived at fit time.
+  (arXiv 2601.10387). `anchor_origin` lands `default` at the origin.
+- **`cultural`** (9-node) / **`register`** (15-node) — discover `fit_mode=pca`
+  multi-axis subspaces grouping the cultural / register concept families into one
+  flat subspace each (`anchor_origin`, `max_subspace_dim` 4 / 6).
 - **`pad`** — *authored*, curved 3-D box on the PAD (pleasure × arousal ×
-  dominance) space, each axis `[−1, 1]`. 15 first-person mood corpora: the nine
-  valence × arousal moods at dominance 0 (cardinal moods on the axes, diagonal
-  moods at the unit-circle diagonals, `neutral` at the origin), the
-  `dominant`/`submissive` dominance poles, and four dominance-differentiated
-  affects (`furious`/`fearful`/`triumphant`/`humiliated`); 27 statements/node.
-  Steer by coord (`pad%0.6,0.4,0.0` — three coords) or label (`pad%elated`).
-  Supersedes the old 2-D `circumplex`.
+  dominance) space, each axis `[−1, 1]`. 15 first-person mood corpora. Steer by
+  coord (`pad%0.6,0.4,0.0`) or label (`pad%elated`).
 
 Recommended α is vector-comparable: aim for `α ≈ 0.5`, tune up toward `α ≈ 1.0`
 for stronger expression (α clamps to `[0,1]`, so `_MANIFOLD_GAIN = 1.0` is the
 strength ceiling). Because the share is normalized to mean 1 and the lever is
-gone, a low-dim and a high-dim fit — and `personas` vs `pad` — land in the
-same α-band without per-fit retuning. Architecture-level behavioral notes (hold
-across model families; α values are qualitative, MPS is not bitwise deterministic
-so compare qualitatively):
+gone, a low-dim and a high-dim fit — a 2-node vector and `personas` and `pad` —
+land in the same α-band without per-fit retuning. Architecture-level behavioral
+notes (hold across model families; α values are qualitative, MPS is not bitwise
+deterministic so compare qualitatively):
 
 - The whitened fit stays coherent at strong push where a Euclidean fit
   loop-collapses; caveman reaches terse primitive grammar, hacker a guarded
@@ -365,9 +388,8 @@ so compare qualitatively):
 > **Open frontiers** (see `ARCHITECTURE.md` §10): the fitted `personas` subspace is
 > a near-1-D "persona-ness" fan, so distinct personas can express the same generic
 > intense register (a steering-access problem, not the rogue problem — whitening
-> verifiably worked); `_MANIFOLD_GAIN`'s exact value is provisional and coupled to
-> that; and converging vector concepts onto the 2-node-affine-manifold representation
-> would close the last `vectors/`-vs-`manifolds/` seam.
+> verifiably worked), and `_MANIFOLD_GAIN`'s exact value is provisional and coupled
+> to that.
 
 ## Python API
 
@@ -381,7 +403,7 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
         steering=f"0.3 {name}",
         sampling=SamplingConfig(temperature=0.7, max_tokens=256, seed=42),
     )
-    with session.steering("0.5 wolf"):                 # resolves to deer.wolf @ -0.5
+    with session.steering("0.5 wolf"):                 # bare pole → deer.wolf node 1
         result = session.generate("Describe a forest.")
     for tok in session.generate_stream("Tell me a story."):
         print(tok.text, end="", flush=True)
@@ -393,9 +415,11 @@ Key contracts:
 - `generate`, `generate_batch`, `generate_sweep` always return `RunSet` — list-like,
   carrying `node_ids`/`grid`, with `.first` (the underlying `GenerationResult`) and
   common attributes delegating to it. `session.last_result` is the `GenerationResult`.
-- `extract()` returns `(name, Profile)`. `Profile` wraps `dict[int, Tensor]`
-  (mapping interface plus `layers`, `metadata`, `save`/`load`, `merged`,
-  `projected_away`, `cosine_similarity`).
+- `extract()` returns `(name, Profile)`; the `Profile` is the folded view of the
+  2-node manifold. `extract_vector_from_corpora` is the corpus-in sibling;
+  `extract_manifold(folder)` fits a multi-node manifold and returns a `Manifold`.
+  `Profile` wraps `dict[int, Tensor]` (mapping interface plus `layers`, `metadata`,
+  `save`/`load`, `merged`, `projected_away`, `cosine_similarity`).
 - `Steering` is frozen; its only per-call override field is `projection_metric`
   (`None` = inherit the session default). There is no `injection_mode`/`theta_max`.
 - `SaklasSession.__init__` takes a pre-loaded `PreTrainedModel`; use `from_pretrained`
@@ -408,8 +432,8 @@ Key contracts:
 - `saklas/__init__.py` pins the public surface (`SaklasSession`, `Profile`,
   `Steering`, `SamplingConfig`, `Trigger`, `LayerWhitener`, the `RunSet`/
   `TokenEvent`/`ResultCollector` result types, the `EventBus` + event dataclasses,
-  the `LoomTree`/`Recipe`/`Transcript` suites, `DataSource`, and their error
-  types). `from saklas import X` is stable; private submodule paths are not.
+  the `LoomTree`/`Recipe`/`Transcript` suites, and their error types). `from saklas
+  import X` is stable; private submodule paths are not.
 
 ## Cache layout
 
@@ -418,36 +442,33 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
 ```
 ~/.saklas/
   neutral_statements.json              # user-editable (copy-on-miss from package)
-  vectors/
-    default/<concept>/                 # bundled (source=bundled)
-      pack.json                        # name, description, tags, files{sha256}
-      scenarios.json  statements.json
-      <safe_model_id>.safetensors      # baked DiM tensor (+ .json slim sidecar)
-      <safe_model_id>.gguf             # optional llama.cpp parallel
-    local/<concept>/                   # user-authored (source=local; `refresh` skips)
-    <hf_owner>/<concept>/              # HF-pulled (source=hf://owner/name[@rev])
+  manifolds/<ns>/<name>/               # THE concept + steering-manifold root
+    manifold.json                      # name, source, fit_mode, domain/coords or hyperparams, files{sha256}
+    nodes/NN_<label>.json              # one JSON statement list per node (user-editable)
+    scenarios.json                     # discover-only: provenance of `generate`
+    <safe_model_id>.safetensors        # fitted per-layer subspaces (+ .json sidecar);
+                                       # discover/baked also carry node_coords (the layout)
+    <safe_model_id>_sae-<rel>.safetensors    # SAE-space fit
+    <safe_model_id>_from-<src>.safetensors   # cross-model transfer
+    <safe_model_id>_role-<slug>.safetensors  # role-augmented
   models/<safe_model_id>/
     layer_means.{safetensors,json}     # probe-centering baseline
     neutral_activations.{safetensors,json}   # 90 neutral prompts × layers, fp32
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
-  manifolds/<ns>/<name>/               # steering manifolds (own root, peer of vectors/)
-    manifold.json                      # authored: name, domain spec, nodes [{label,coords}]
-                                       # discover: name, fit_mode, hyperparams, nodes [{label}]
-    nodes/NN_<label>.json              # one JSON statement list per node (user-editable)
-    scenarios.json                     # discover-only: provenance of `generate`
-    <safe_model_id>.safetensors        # fitted per-layer subspaces; discover variant
-                                       # also carries node_coords (the derived layout)
-                                       # (+ .json sidecar with fit_mode/hyperparams/diagnostics)
+  vectors/<ns>/<concept>/              # LEGACY (pre-4.0) packs only — ported to
+                                       # manifolds/ on first touch; no longer written
   conversations/<name>.json            # explicit loom-tree saves (no autosave)
 ```
 
-`pack.json.files` / `manifold.json.files` are sha256 maps verified on load. A
-concept folder can hold multiple baked tensors per model, distinguished by
-filename suffix: `<safe>.safetensors` (canonical DiM), `_sae-<release>`,
-`_from-<safe_src>` (transfer), `_role-<slug>` — at most one kind per file (no `pca`
-suffix). `tensor_filename` / `parse_tensor_filename` in `io/paths.py` round-trip
-them. Safetensors win over GGUF on a same-stem conflict. `materialize_bundled` is
-copy-on-miss but auto-upgrades bundled concepts in place on a stale `format_version`.
+`manifold.json.files` is a sha256 map verified on load. A manifold folder can hold
+multiple fitted tensors per model, distinguished by filename suffix:
+`<safe>.safetensors` (raw DiM), `_sae-<release>`, `_from-<safe_src>` (transfer),
+`_role-<slug>` — at most one kind per file (no `pca` suffix). `tensor_filename` /
+`parse_tensor_filename` in `io/paths.py` round-trip them.
+`materialize_bundled_manifolds()` is copy-on-miss. A pre-4.0 `vectors/` pack
+(`pack.json.format_version < PACK_FORMAT_VERSION = 3`) is *legacy*: ported to a
+2-node `pca` manifold on first steer touch (`_port_stale_legacy_vector` /
+`scripts/upgrade_packs.py`) and re-fit lazily.
 
 ## Performance invariants
 
@@ -457,18 +478,18 @@ tok/s):
 - **Hot-path hooks**: no Python allocation, no `.item()`, no CPU sync, in-place
   only. The whole generation loop is wrapped in `torch.inference_mode()`.
 - **Norms use fp32** — fp16 sum-of-squares overflows at hidden_dim ≥ 2048. Applies
-  to extraction-time direction norms and the per-position norms inside
-  `subspace_inject`. Contrastive diffs are differenced in fp32 too.
+  to fit-time direction norms and the per-position norms inside `subspace_inject`.
+  Centroid differences are taken in fp32 too.
 - **One injection kernel.** Every steered layer runs `subspace_inject` (the slow,
   ctx-consulting hook path), so per-step triggers and probe gates work uniformly;
   there is no composed-tensor fast path. `torch.compile`/StaticCache graph capture
   is eligible only for unsteered generation. The affine analytic shortcut keeps the
   common case (folded vectors / flat subspaces) cheap; curved manifolds pay a
   warm-started O(R) per-token foot solve.
-- **Share baked at extraction / fit**, normalized to mean 1 at apply; the
-  subspace foot slides by `share_L · _MANIFOLD_GAIN` toward a target that already
-  carries the coefficient. No norm preservation (onto is meant to shrink `‖h‖`);
-  `norm_cap = 3·‖h‖` is the only bound.
+- **Share baked at fit**, normalized to mean 1 at apply; the subspace foot slides
+  by `share_L · _MANIFOLD_GAIN` toward a target that already carries the
+  coefficient. No norm preservation (onto is meant to shrink `‖h‖`); `norm_cap =
+  3·‖h‖` is the only bound.
 - **Top-p via `torch.topk`**, not full-vocab sort; `top_k` (default 1024 cap) is a
   hard candidate-pool cap applied before top-p (llama.cpp/Ollama order).
 - **Monitor capture is hook-driven**, inline with generation — one matmul per layer
@@ -505,9 +526,9 @@ Unsupported (mapped to `None`, `apply_with_role` raises
 
 ## Bundled concepts
 
-26 curated concepts at n=45 pairs each (9 scenarios × 5 pairs), in
-`saklas/data/vectors/<concept>/` — 24 bipolar + 2 monopolar (`agentic`,
-`manipulative`). The authoritative manifest is
+26 curated concepts at n=45 pairs each (9 scenarios × 5 pairs), each shipped as a
+2-node `pca` manifold under `saklas/data/manifolds/<concept>/` — 24 bipolar + 2
+monopolar (`agentic`, `manipulative`). The authoritative manifest is
 `scripts/regenerate_bundled_statements.py`.
 
 Categories: `affect` (angry.calm, happy.sad, fearful.unflinching), `epistemic`
@@ -518,10 +539,11 @@ verbose.concise, creative.conventional, humorous.serious, warm.clinical,
 technical.accessible), `social_stance` (authoritative.submissive,
 high_context.low_context, self.other), `cultural` (masculine.feminine,
 religious.secular, traditional.progressive, individualist.collectivist),
-`identity` (ai.human).
+`identity` (ai.human). The `cultural` / `register` families also ship as
+multi-node discover manifolds of the same name.
 
 Known model-level axis entanglements (cross-model robust, weighted cosine via
-`vector compare`) — document for users, not probe-design failures:
+`subspace compare`) — document for users, not probe-design failures:
 - `masculine.feminine ↔ traditional.progressive` (+0.5–0.6) — Hofstede MAS read as
   traditionalism
 - `hallucinating.grounded ↔ humorous.serious` (+0.5–0.7) — humor reads as
@@ -529,12 +551,11 @@ Known model-level axis entanglements (cross-model robust, weighted cosine via
 - `angry.calm ↔ authoritative.submissive` (+0.5–0.8) — anger encodes as dominance
 
 90 neutral statements in `saklas/data/neutral_statements.json` follow the same
-affect-neutral, topically-diverse discipline. Bundled-pair regeneration runs
-through `scripts/regenerate_bundled_statements.py`, which calls
-`session.generate_scenarios` / `session.generate_statements` — DiM pairs are the
-two per-concept corpora zipped pos/neg (the moment-paired generation path was
-removed; the centroid difference is identical either way). A load-bearing
-anti-allegory clause keeps non-human axes (`deer/wolf`, `brick/feather`) literal.
+affect-neutral, topically-diverse discipline. Bundled regeneration runs through
+`scripts/regenerate_bundled_statements.py`, which calls `session.generate_scenarios`
+/ `session.generate_statements` — the two per-concept corpora become the manifold's
+two node groups. A load-bearing anti-allegory clause keeps non-human axes
+(`deer/wolf`, `brick/feather`) literal.
 
 ## Package layout
 
@@ -551,7 +572,7 @@ cpu; MPS runs ~3–5× slower so extraction budgets are backend-specific. `test_
 owns the throughput regression.
 
 **CPU-only**: the bulk of the suite — core dataclasses, steering-context
-semantics, pack/manifold format integrity + staleness, selector grammar, mocked HF
+semantics, manifold format integrity + staleness, selector grammar, mocked HF
 wrappers, GGUF round-trip, config loading, monitor scoring, six-verb CLI dispatch,
 OpenAI/Ollama/native servers, TUI slash-command dispatch, loom tree/diff/filter/
 transcript.
