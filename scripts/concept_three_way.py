@@ -60,7 +60,10 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas import Profile, SamplingConfig, SaklasSession
 from saklas.core.vectors import _capture_all_hidden_states, compute_dls_mask
-from _bundled_manifold_data import load_bipolar_manifold_pairs
+from _bundled_manifold_data import (
+    load_bipolar_manifold_pairs,
+    load_folded_bundled_profile,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +545,9 @@ def main() -> None:
         f"{len(statements)} pairs"
     )
 
-    # --- profile 1: current prefill (cache hit) -------------------------
-    print("\n=== profile 1: prefill (current pipeline) ===")
-    _, prefill_prof = session.extract(f"default/{CONCEPT}")
+    # --- profile 1: folded bundled prefill profile ----------------------
+    print("\n=== profile 1: prefill (folded bundled manifold) ===")
+    prefill_prof = load_folded_bundled_profile(session, f"default/{CONCEPT}")
     print(f"  prefill profile: {len(prefill_prof)} layers retained")
 
     # --- profile 2: prefill+ctx (a9's proposal) -------------------------
