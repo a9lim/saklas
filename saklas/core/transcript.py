@@ -395,7 +395,9 @@ class Transcript:
         transcript_users = [t.text for t in self.turns if t.role == "user"]
 
         anchor_id: str = session.tree.root_id
-        for (node_id, active_text), tr_text in zip(active_users, transcript_users):
+        for (node_id, active_text), tr_text in zip(
+            active_users, transcript_users, strict=False,
+        ):
             if active_text != tr_text:
                 break
             anchor_id = node_id
@@ -437,7 +439,7 @@ class Transcript:
             anchor_path = tree.path_to(attach_parent)
             anchor_users = [n for n in anchor_path if n.role == "user"]
             transcript_users = [t for t in self.turns if t.role == "user"]
-            for path_node, t_user in zip(anchor_users, transcript_users):
+            for path_node, t_user in zip(anchor_users, transcript_users, strict=False):
                 if path_node.text != t_user.text:
                     break
                 skip_count += 1

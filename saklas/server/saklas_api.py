@@ -1208,7 +1208,7 @@ def register_saklas_routes(app: FastAPI) -> None:
             )
 
         matrix: list[list[float | None]] = []
-        for la, (va, na) in zip(layers_a, vecs_a):
+        for la, (va, na) in zip(layers_a, vecs_a, strict=True):
             row: list[float | None] = []
             for vb, nb in vecs_b:
                 if na < 1e-12 or nb < 1e-12:

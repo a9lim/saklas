@@ -836,6 +836,7 @@ class ManifoldFolder:
                 for label, coords, role, kind in zip(
                     self.node_labels, self.node_coords,
                     self._roles_padded(), self._kinds_padded(),
+                    strict=True,
                 )
             ]
         elif self.fit_mode == "baked":
@@ -845,6 +846,7 @@ class ManifoldFolder:
                 _node_payload_discover(label, role, kind)
                 for label, role, kind in zip(
                     self.node_labels, self._roles_padded(), self._kinds_padded(),
+                    strict=True,
                 )
             ]
         else:
@@ -853,6 +855,7 @@ class ManifoldFolder:
                 _node_payload_discover(label, role, kind)
                 for label, role, kind in zip(
                     self.node_labels, self._roles_padded(), self._kinds_padded(),
+                    strict=True,
                 )
             ]
         write_json_atomic(self.folder / "manifold.json", payload)

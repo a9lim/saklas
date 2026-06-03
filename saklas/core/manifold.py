@@ -1911,7 +1911,7 @@ def _connected_components(mask: torch.Tensor) -> int:
 
     # Only need the upper triangle since the mask is symmetric.
     rows, cols = mask.triu(diagonal=1).nonzero(as_tuple=True)
-    for r, c in zip(rows.tolist(), cols.tolist()):
+    for r, c in zip(rows.tolist(), cols.tolist(), strict=True):
         union(r, c)
     return len({find(i) for i in range(K)})
 

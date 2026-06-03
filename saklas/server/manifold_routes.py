@@ -346,6 +346,7 @@ def _manifold_json(
                 }
                 for label, coords, role in zip(
                     mf.node_labels, mf.node_coords, node_roles_padded,
+                    strict=True,
                 )
             ]
         else:

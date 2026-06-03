@@ -128,7 +128,7 @@ def port_pack(
     else:
         try:
             port_legacy_vector_folder(folder, namespace=namespace, force=False)
-        except Exception as e:  # noqa: BLE001 — report and skip, don't abort the sweep
+        except Exception as e:
             print(f"skip {folder}: port failed ({e})", file=sys.stderr)
             return None
         print(f"ported    {namespace}/{name}  vectors/ -> manifolds/")
@@ -158,7 +158,7 @@ def _fit_ported(ported: list[tuple[str, str]], model_id: str) -> None:
             try:
                 session.extract_manifold(folder)
                 print(f"fitted    {ns}/{name}")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 print(f"skip fit  {ns}/{name}: {e}", file=sys.stderr)
 
 

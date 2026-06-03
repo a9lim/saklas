@@ -41,12 +41,12 @@ def progress_sse_response(
                     payload = await job(_on_progress)
                     await asyncio.sleep(0)
                     queue.put_nowait(("done", payload))
-                except Exception as e:  # noqa: BLE001 - terminal SSE frame
+                except Exception as e:
                     err = None
                     if error_formatter is not None:
                         try:
                             err = error_formatter(e)
-                        except Exception:  # noqa: BLE001 - formatter fallback
+                        except Exception:
                             log.exception("%s (error formatter crashed)", log_message)
                     if err is None:
                         log.exception(log_message)

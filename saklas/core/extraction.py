@@ -297,7 +297,7 @@ class ManifoldExtractionPipeline:
         from saklas.core.vectors import _load_baseline_prompts
         baseline_prompts = _load_baseline_prompts()
         per_node: list[dict[int, torch.Tensor]] = []
-        for (label, responses), role in zip(node_groups, node_roles):
+        for (label, responses), role in zip(node_groups, node_roles, strict=True):
             role_note = f" [role={role}]" if role else ""
             _progress(
                 f"Pooling node '{label}'{role_note} "

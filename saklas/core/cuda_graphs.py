@@ -60,7 +60,7 @@ def _support_cache_key(
     dtype: torch.dtype | None = None
     try:
         dtype = next(base.parameters()).dtype
-    except Exception:  # noqa: BLE001 - probe path must stay best-effort
+    except Exception:
         dtype = None
     return id(base), str(device), dtype
 

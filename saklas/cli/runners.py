@@ -293,9 +293,7 @@ def _setup_steering_vectors(
             continue
         registry_key = canonical
         session.steer(registry_key, profile)
-        print(f"  Registered '{registry_key}'"
-              if not verbose else
-              f"  Registered '{registry_key}'")
+        print(f"  Registered '{registry_key}'")
 
     return parse_expr(expression)
 
@@ -1314,7 +1312,7 @@ def _run_manifold_show(args: argparse.Namespace) -> None:
         print(f"  domain: {domain_label(mf.domain)}")
         print("  nodes:")
         for label, coords, role in zip(
-            mf.node_labels, mf.node_coords, node_roles_padded,
+            mf.node_labels, mf.node_coords, node_roles_padded, strict=True,
         ):
             coord_str = ", ".join(f"{c:g}" for c in coords)
             role_tail = f"  [role={role}]" if role else ""

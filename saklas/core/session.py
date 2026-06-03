@@ -1218,7 +1218,7 @@ class SaklasSession:
         reps = max(1, samples_per_prompt)
         total = reps * len(prompts)
         out: dict[str, list[str]] = {}
-        for concept, kind in zip(concepts, kinds):
+        for concept, kind in zip(concepts, kinds, strict=True):
             concept_h = _humanize_concept(concept)
             system = _system_for(concept_h, kind)
             gen_role = roles.get(concept) or _role_for(_slug(concept), kind)
@@ -1368,7 +1368,8 @@ class SaklasSession:
                     roles=gen_roles, on_progress=on_progress,
                 )
                 node_corpora = {
-                    label: corpora[c] for label, c in zip(labels, gen_concepts)
+                    label: corpora[c]
+                    for label, c in zip(labels, gen_concepts, strict=True)
                 }
                 node_kinds: dict[str, str | None] = {
                     label: kind for label in labels
@@ -2148,7 +2149,7 @@ class SaklasSession:
                         self.extract_manifold(folder)
                         self._ensure_manifold_loaded(key)
                     probes[name] = folded_vector_directions(self._manifolds[key])
-                except Exception as e:  # noqa: BLE001 — one bad probe isn't fatal
+                except Exception as e:
                     _log.warning("manifold probe '%s' failed to fit/fold: %s", name, e)
         return probes
 
@@ -4793,7 +4794,7 @@ class SaklasSession:
         sibling_node_ids: list[str | None] = []
         grid_rows: list[dict[str, float]] = []
         for idx, combo in enumerate(itertools.product(*alpha_lists)):
-            alpha_values = dict(zip(concept_names, combo))
+            alpha_values = dict(zip(concept_names, combo, strict=True))
             alpha_values = {k: float(v) for k, v in alpha_values.items()}
             terms = [f"{alpha} {name}" for name, alpha in alpha_values.items()]
             expr = " + ".join(terms)

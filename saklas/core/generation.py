@@ -343,7 +343,7 @@ def detect_base_model(tokenizer: PreTrainedTokenizerBase) -> bool:
     return getattr(tokenizer, "chat_template", None) is None
 
 
-from dataclasses import dataclass  # noqa: E402
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -804,7 +804,7 @@ def generate_steered(
                         device=device,
                         dtype=model_dtype,
                     )
-                except Exception as e:  # noqa: BLE001 — fallback on any failure
+                except Exception as e:
                     warnings.warn(
                         f"StaticCache allocation failed ({type(e).__name__}: "
                         f"{e}); falling back to DynamicCache",
@@ -1104,7 +1104,7 @@ def generate_steered(
                         tli = cand_ids.index_select(0, tpos)
                         top_alts = [
                             TokenAlt(id=int(i), text=_decode_alt(int(i)), logprob=float(v))
-                            for i, v in zip(tli.tolist(), tlv.tolist())
+                            for i, v in zip(tli.tolist(), tlv.tolist(), strict=True)
                         ]
 
                 if token_id in eos_ids:

@@ -34,7 +34,7 @@ import json
 import sys
 from pathlib import Path
 
-from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION  # noqa: E402
+from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
 
 
 def _sha256(path: Path) -> str:
