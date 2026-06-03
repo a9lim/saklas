@@ -820,7 +820,7 @@ class SaklasSession:
         # does this transitively via ``load_default_manifolds``, but is
         # skipped entirely when
         # ``probes=[]`` — leaving freshly-added bundled concepts (e.g. via
-        # ``regenerate_bundled_statements.py``) invisible to the selector
+        # updating package-data bundled manifolds) invisible to the selector
         # layer for the rest of the session.  Calling explicitly here keeps
         # the invariant intact regardless of probe-loading config; the call
         # is cheap when up-to-date (format-version short-circuit).  Bundled
@@ -1043,7 +1043,7 @@ class SaklasSession:
         """Per-layer Mahalanobis whitener; built lazily on first access.
 
         Used by v2.1+ DiM extraction for Mahalanobis-flavored share
-        allocation, by ``vector compare --metric mahalanobis``, and by
+        allocation, by ``subspace compare``, and by
         callers that pass a whitener to ``project_profile`` for
         LEACE-style projection.  Returns a
         :class:`saklas.core.mahalanobis.LayerWhitener` or ``None`` if
@@ -1086,7 +1086,7 @@ class SaklasSession:
 
         Lazy: only callers who actually need Mahalanobis math (DiM
         extraction at session init, on-demand ``session.whitener``
-        access, or ``vector compare --metric mahalanobis``) trigger the
+        access, or ``subspace compare``) trigger the
         forward-pass loop over neutral statements.
         """
         from saklas.core.mahalanobis import LayerWhitener

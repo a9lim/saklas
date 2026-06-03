@@ -1471,7 +1471,7 @@ def register_saklas_routes(app: FastAPI) -> None:
     def vector_diagnostics(session_id: str, name: str):
         """Per-layer ``||baked||`` histogram + diagnostics for a registered vector.
 
-        Mirrors what ``saklas vector why <concept> -m MODEL --json`` produces:
+        Mirrors what ``saklas subspace why <concept> -m MODEL --json`` produces:
         a 16-bucket layer-magnitude histogram plus the ``diagnostics_by_layer``
         / ``diagnostics_summary`` block when the profile carries them.
         Drives the WHY-histogram strip in the web UI's probe rack.
@@ -1500,7 +1500,7 @@ def register_saklas_routes(app: FastAPI) -> None:
         )
         buckets = bucketize(layer_mags, HIST_BUCKETS)
         # Buckets: ``(lo_layer, hi_layer, mean_norm)`` triples — same shape the
-        # CLI ``vector why`` text path renders, JSON-friendly here.
+        # CLI ``subspace why`` text path renders, JSON-friendly here.
         bucket_payload = [
             {"lo": lo, "hi": hi, "mean_norm": round(mag, 6)}
             for lo, hi, mag in buckets

@@ -32,11 +32,9 @@ Hyperparams mirror the 6a author->fit->steer reference
 NO ``anchor_origin`` — the neutral anchor comes from the per-model
 ``layer_means`` at fit time, not from a corpus anchor node.
 
-This writes geometry only.  It does NOT delete ``saklas/data/vectors/`` — that
-pairs with the 6b read-path flip (both materialize otherwise and bare poles
-collide).  Tag metadata for probe bootstrap stays in ``pack.json`` + the
-``regenerate_bundled_statements.py`` manifest; 6b decides how probes read tags
-from manifolds.
+This writes geometry only. It was kept as a one-time migration helper for the
+pre-4.0 ``saklas/data/vectors/`` tree; current bundled concepts already live
+under ``saklas/data/manifolds/``.
 
 Usage:
     python scripts/convert_bundled_vectors_to_manifolds.py            # all 26

@@ -2254,8 +2254,8 @@ def save_manifold(
         # PCA subspace-selection metric ("mahalanobis" => whitened/Fisher
         # PCA, "euclidean" => ordinary centroid PCA).  Provenance only —
         # the fitted basis is baked into the tensor, so the runtime hot
-        # path needs nothing from this field; surfaced by `vector manifold
-        # show` and the inspector.
+        # path needs nothing from this field; surfaced by `manifold show`
+        # and the inspector.
         "subspace_metric",
         # Discover-mode fields.  ``fit_mode`` discriminates authored vs
         # discover at read time; ``hyperparams`` records the knobs the

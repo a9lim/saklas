@@ -459,7 +459,7 @@ def _run_serve(args: argparse.Namespace) -> None:
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
-# --- pack runners --------------------------------------------------------
+# --- subspace runners ----------------------------------------------------
 
 @_saklas_error_exit
 def _run_merge(args: argparse.Namespace) -> None:
@@ -475,9 +475,7 @@ def _require_model(args: argparse.Namespace) -> None:
     if not args.model:
         # The manifold leaves (fit / discover / generate / transfer) carry the
         # leaf on ``manifold_cmd`` — surface it so the error reads "manifold
-        # fit" under both the top-level ``manifold`` verb and the deprecated
-        # ``vector manifold`` alias. Otherwise the leaf is the subspace verb
-        # (``subspace_cmd``), the deprecated ``vector_cmd``, or a ``pack_cmd``.
+        # fit". Otherwise the leaf is the subspace verb (``subspace_cmd``).
         manifold_cmd = getattr(args, "manifold_cmd", None)
         if manifold_cmd:
             cmd = f"manifold {manifold_cmd}"

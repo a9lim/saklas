@@ -564,11 +564,10 @@ Monopolar `extract` is now implemented as a genuine **1-node** fold against the
 neutral mean ν (see "Extraction"), so a fresh `extract("agentic")` authors a
 1-node ray. The *bundled* `agentic`/`manipulative` still ship with their pre-4.0
 explicit 2-node `_neg` corpora; re-authoring them as 1-node + A2 is part of the
-bundled-regeneration TODO. The pre-4.0
-`scripts/regenerate_bundled_statements.py` (which held the authoritative manifest)
-is removed; the manifest is recoverable from git history and a 4.0 bipolar-concept
-regeneration script is a TODO (the persona + cultural/register discover scripts are
-already on A2).
+bundled-regeneration TODO. The pre-4.0 bundled statement-regeneration script is
+removed; its manifest is recoverable from git history and a 4.0 bipolar-concept
+regeneration script is a TODO (the persona + cultural/register discover scripts
+are already on A2).
 
 Categories: `affect` (angry.calm, happy.sad, fearful.unflinching), `epistemic`
 (confident.uncertain, honest.deceptive, hallucinating.grounded,

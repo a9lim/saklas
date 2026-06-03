@@ -612,12 +612,12 @@ def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
     global per-concept scale differs (the folded share is the un-normalized
     ``‖δ_L‖_M``, not the ``ref_norm``-weighted normalized share today's bake
     folds in), so this view is *exact* for scale-invariant ops — per-layer and
-    aggregate cosine, ``vector compare``/``why`` — and merely
+    aggregate cosine, ``subspace compare``/``why`` — and merely
     proportional for cross-concept magnitude (``merge`` / GGUF export, which
     migrate to read the folded artifact natively).
 
     Lets the unified folded Manifold back the legacy direction-math surface
-    (``Profile``-returning ``extract()``, ``vector compare``/``why``) without a
+    (``Profile``-returning ``extract()``, ``subspace compare``/``why``) without a
     second *stored* representation — the concept's only on-disk artifact stays
     the folded Manifold; this is a downstream in-memory view.
 

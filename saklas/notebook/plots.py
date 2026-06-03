@@ -256,7 +256,7 @@ def plot_layer_norms(
 
     Full resolution — one bar per retained layer.  This is the
     notebook-side counterpart to the TUI's 16-bucket histogram footer
-    and the ``saklas vector why`` output, surfaced here without bucketing
+    and the ``saklas subspace why`` output, surfaced here without bucketing
     so users can see the exact distribution.
     """
     go = _require_plotly()
@@ -337,4 +337,3 @@ def plot_trait_history(
         legend={"orientation": "h", "y": -0.2},
     )
     return fig
-

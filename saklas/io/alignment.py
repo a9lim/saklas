@@ -242,9 +242,9 @@ def alignment_quality(
     geometry; values near 0.0 mean transferred probes will be noisy.
 
     Surfaced through ``Sidecar.transfer_quality_estimate`` (median over
-    shared layers) so users see one summary number per transfer; the
-    full per-layer dict is exported through the `pack ls -v` JSON path
-    for callers that want it.
+    shared layers) so users see one summary number per transfer; the full
+    per-layer dict is exported in transfer sidecars and CLI JSON output for
+    callers that want it.
     """
     out: dict[int, float] = {}
     for layer, M_L in M.items():

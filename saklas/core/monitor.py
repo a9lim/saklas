@@ -85,7 +85,7 @@ class TraitMonitor:
             when set, per-layer probe similarity switches to the whitened
             (Mahalanobis) cosine on every covered layer.  ``None`` keeps
             the legacy Euclidean cosine everywhere (the legitimate
-            fallback, mirroring ``project_profile`` / ``vector compare``).
+            fallback, mirroring ``project_profile`` / ``subspace compare``).
         """
         self._raw_profiles: dict[str, dict[int, torch.Tensor]] = dict(probe_profiles)
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}

@@ -302,7 +302,7 @@ def _build_vector_transfer(p: argparse.ArgumentParser) -> None:
 
 
 def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
-    """Shared builder for ``saklas manifold`` and the deprecated alias.
+    """Shared builder for the ``saklas manifold`` subtree.
 
     Nested subparser:
       ``fit`` — fit an authored manifold (user-supplied coords).
@@ -627,7 +627,7 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
             "`hf://` re-pulls.  With `-m/--model`, instead does a scoped "
             "refresh — drops just that model's fitted tensor pair so it "
             "re-fits on next use, without re-pulling from the source.  The "
-            "manifold analogue of `saklas pack refresh`."
+            "refreshes a manifold folder or drops a scoped fitted tensor."
         ),
     )
     refresh.add_argument("selector", help="Manifold name (or ns/name)")

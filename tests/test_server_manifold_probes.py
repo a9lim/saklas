@@ -863,10 +863,10 @@ class TestWebSocketManifoldReadings:
 # don't cover the refactor).  Pin two contracts:
 #  (a) the keys the GET route shares with ``io.manifolds.manifold_summary``
 #      carry identical names + values — both consume the same serializer,
-#      so CLI ``vector manifold show -j`` and the server stay in lockstep;
+#      so CLI ``manifold show -j`` and the server stay in lockstep;
 #  (b) the DELETE route routes its removal through the shared
 #      ``remove_manifold_folder`` helper (single source of truth with the
-#      CLI ``vector manifold rm``), and its response carries that helper's
+#      CLI ``manifold rm``), and its response carries that helper's
 #      richer shape.
 
 

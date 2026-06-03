@@ -156,7 +156,7 @@ def test_sidecar_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 def test_from_cache_rejects_legacy_bf16(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``LayerWhitener.from_cache`` refuses a legacy bf16 neutral cache.
 
-    ``from_cache`` (the ``vector compare --metric mahalanobis`` path) can't
+    ``from_cache`` (the ``subspace compare`` path) can't
     recompute — no model is loaded — so it must fail loud rather than build a
     bf16-sourced whitener, which would reopen the precision seam the fp32 store
     closes.  Pairs the bf16 neutral cache with an fp32 ``layer_means`` so the

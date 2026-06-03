@@ -171,10 +171,9 @@ class FitManifoldRequest(BaseModel):
 class InstallManifoldRequest(BaseModel):
     """Body for ``POST /manifolds/install``.
 
-    Mirrors :class:`InstallPackRequest` for parity with the vector pack
-    side.  ``target`` is an HF coord (``owner/name[@revision]``) or a
-    local folder path; ``as_`` re-namespaces the destination; ``force``
-    overwrites an existing folder at the destination.
+    ``target`` is an HF coord (``owner/name[@revision]``) or a local folder path;
+    ``as_`` re-namespaces the destination; ``force`` overwrites an existing
+    folder at the destination.
     """
 
     target: str
@@ -511,13 +510,10 @@ def register_manifold_routes(app: FastAPI) -> None:
     def search_remote_manifolds(q: str = "", limit: int = 20):
         """Search HF for ``saklas-manifold``-tagged repos matching ``q``.
 
-        The manifold-side counterpart to ``GET /saklas/v1/packs/search``:
-        delegates to :func:`saklas.io.hf_manifolds.search_manifolds`,
-        returns the same row shape vector packs use plus the manifold-
-        specific ``domain_label`` / ``node_count`` / ``fit_mode`` fields
-        a frontend needs to render a search result without an extra
-        round-trip.  Missing ``huggingface_hub`` → 503, HF transport
-        error → 502.
+        Delegates to :func:`saklas.io.hf_manifolds.search_manifolds` and returns
+        the manifold-specific ``domain_label`` / ``node_count`` / ``fit_mode``
+        fields a frontend needs to render a search result without an extra
+        round-trip. Missing ``huggingface_hub`` → 503, HF transport error → 502.
         """
         try:
             rows = search_manifolds(q or None)

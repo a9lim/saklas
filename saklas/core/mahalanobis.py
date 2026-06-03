@@ -256,7 +256,7 @@ class LayerWhitener:
         Reads ``layer_means.safetensors`` and ``neutral_activations.safetensors``
         from ``~/.saklas/models/<safe_id>/``.  Raises :class:`WhitenerError`
         with a populating-command hint when either cache is missing —
-        ``vector compare`` and similar offline tools shouldn't silently
+        ``subspace compare`` and similar offline tools shouldn't silently
         load a model.
 
         Use :meth:`from_neutral_activations` instead when both tensors
@@ -278,8 +278,8 @@ class LayerWhitener:
                 f"whitener cache missing for {model_id} "
                 f"(expected {', '.join(missing)} under {md}); "
                 f"populate via any flow that loads the model + neutral "
-                f"activations (e.g. `saklas vector transfer --to {model_id}` "
-                f"once, or run any session-level extract on this model)"
+                f"activations (e.g. run any session-level extract on this "
+                f"model, or prepare a transfer that targets {model_id})"
             )
         means_raw = load_file(str(means_path))
         acts_raw = load_file(str(acts_path))

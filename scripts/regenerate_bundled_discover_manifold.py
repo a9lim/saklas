@@ -123,9 +123,9 @@ def main() -> None:
 
     if not NEUTRALS_PATH.exists():
         raise SystemExit(
-            f"neutrals missing at {NEUTRALS_PATH} -- run "
-            f"scripts/regenerate_bundled_statements.py --only-neutrals first "
-            f"(anchor node sources its corpus from this file)"
+            f"neutrals missing at {NEUTRALS_PATH} -- regenerate "
+            f"saklas/data/neutral_statements.json first (anchor node sources "
+            f"its corpus from this file)"
         )
     neutrals = json.loads(NEUTRALS_PATH.read_text())
     if not isinstance(neutrals, list) or len(neutrals) < 9:

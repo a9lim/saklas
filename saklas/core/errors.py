@@ -128,19 +128,17 @@ class OverlappingManifoldError(SteeringExprError):
 
 
 class StaleSidecarError(ValueError, SaklasError):
-    """Raised when an extracted tensor's recorded ``statements_sha256``
-    disagrees with the live ``statements.json`` on disk.
+    """Raised when an extracted tensor's recorded corpus hash disagrees with disk.
 
-    Hand-editing ``statements.json`` after extraction silently invalidates
-    the baked tensor: the contrastive PCA was run against different pairs
-    than the file now contains.  This used to log a warning and proceed;
-    the fail-loud contract makes the staleness an explicit, fixable
-    situation.
+    Historical profile sidecars used ``statements_sha256`` over a legacy
+    ``statements.json`` pack; manifold tensors now use ``nodes_sha256`` over the
+    node corpus and geometry. In both cases, hand-editing the corpus after
+    extraction invalidates the tensor, so the stale-load path remains fail-loud.
 
     Set ``SAKLAS_ALLOW_STALE=1`` to escape-hatch the check (advanced
     workflows where stale loads are deliberate, e.g. bisecting a corpus
-    edit).  The remediation in the message names the concrete
-    ``saklas pack refresh`` invocation that fixes the drift.
+    edit). The remediation should name the concrete refit/refresh command for
+    the artifact that drifted.
     """
 
     def user_message(self) -> tuple[int, str]:

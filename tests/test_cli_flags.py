@@ -686,7 +686,7 @@ def test_run_why_concept_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
-# SAE variant resolution in vector compare / vector why
+# SAE variant resolution in subspace compare / subspace why
 # ---------------------------------------------------------------------------
 
 
@@ -837,4 +837,3 @@ def test_vector_extract_sae_requires_value():
         cli.parse_args([
             "subspace","extract", "honest.deceptive", "-m", "m", "--sae",
         ])
-
