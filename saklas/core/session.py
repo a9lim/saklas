@@ -150,10 +150,7 @@ def _snapshot_la_layers(cache: Any) -> None:
             save()
 
 
-_N_PAIRS = 45
-_N_SCENARIOS = 9           # default broad domains per concept
-_N_PAIRS_PER_SCENARIO = 5  # default pairs sampled within each domain
-_MAX_GEN_ATTEMPTS = 4      # retry whole generator call on short parse
+_RESPONSE_MAX_TOKENS = 256  # per in-character response (4.0 / A2 elicitation)
 PROBE_CATEGORIES = [
     "affect",
     "epistemic",
@@ -165,22 +162,6 @@ PROBE_CATEGORIES = [
 ]
 MIN_ELAPSED_FOR_RATE = 0.1
 
-_SCENARIO_LINE_RE = re.compile(r"^\s*(\d+)\s*[.\)]\s*(.+?)\s*$")
-
-# System prompt shared by scenario and pair generators.  Stripped to
-# just the format-discipline anchor: empirically the persona-framing
-# half of the old constant ("interpretability research output
-# generator") was biasing statement register toward clinical / academic
-# voice and hurting contrastive signal on register-sensitive axes, but
-# the format-discipline half is genuinely load-bearing — without it,
-# weak models occasionally read the format example's bracket placeholders
-# (``[domain]``, ``[set 1, speaker a]``) as content and cascade into a
-# degenerate token loop ("set set set set...").  Six words is enough
-# anchor to suppress that failure mode while letting voice settle.
-#
-# Empty string drops the system role entirely — _run_generator handles
-# that gracefully (skips the system message in the chat input).
-_GEN_SYSTEM_MSG = "Emit the requested format, nothing else."
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 BIPOLAR_SEP = "."
 
@@ -205,37 +186,35 @@ def _humanize_concept(name: str) -> str:
     return name.replace("_", " ")
 
 
-def _scenario_prompt(concept_list_str: str, n: int) -> str:
-    """Build the shared scenario-domain prompt for an N-concept list.
+# Conversational (4.0 / A2) elicitation templates keyed by node ``kind``.  The
+# concept goes in the system prompt; {c} is the humanized concept, {art} its
+# a/an article.  ``abstract`` traits read as "someone {c}", ``concrete``
+# entities as "{art} {c}".
+_KIND_TEMPLATES = {
+    "abstract": "You are someone {c}. Respond exactly as someone {c} would.",
+    "concrete": "You are {art} {c}. Respond exactly as {art} {c} would.",
+}
 
-    One builder for both scenario paths — the bipolar contrast path
-    (:meth:`SaklasSession.generate_scenarios`, two poles) and the
-    multi-concept discover / persona path (the inline scenario block in
-    :meth:`SaklasSession.generate_statements`).
 
-    The phrasing asks only that each domain *admit* every literal
-    concept's perspective, not that the concepts take *distinct* ones.
-    The distinct-perspective demand pulls a hyper-diverse roster
-    (god, tree, caveman, CEO, ...) toward maximally-divisive domains
-    (war, crime, death), contaminating every node's centroid with the
-    same dramatic-scenario signal; for a bipolar axis the contrast is
-    enforced downstream by moment-shared statement generation, so the
-    softer phrasing costs it nothing.  The "literal concept" anchor is
-    load-bearing for non-human axes (deer/wolf, brick/feather) — without
-    it the model defaults to human-social framing and reads every axis
-    as allegory.
+def _article(word: str) -> str:
+    """Naive a/an for the concrete-entity template (an alien, a deer)."""
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def _system_for(concept_h: str, kind: str | None) -> str:
+    """A2 system prompt for a humanized concept under its kind (default abstract)."""
+    template = _KIND_TEMPLATES.get(kind or "abstract", _KIND_TEMPLATES["abstract"])
+    return template.format(c=concept_h, art=_article(concept_h))
+
+
+def _role_for(slug: str, kind: str | None) -> str:
+    """A2 elicitation role label (the swapped assistant header) for a node.
+
+    Abstract traits get a ``someone_{slug}`` speaker ("someone happy"); concrete
+    entities are the bare slug ("pirate").  The underscore de-slugs to a space
+    at render (:func:`saklas.core.role_templates._render_label`).
     """
-    return (
-        f"Concepts: {concept_list_str}.\n\n"
-        f"List {n} varied, distinctive situational domains. Every "
-        f"domain should let every literal concept have a perspective. "
-        f"List only the domains.\n\n"
-        f"Format:\n"
-        f"1. [domain]\n"
-        f"2. [domain]\n"
-        f"...\n"
-        f"{n}. [domain]"
-    )
+    return f"someone_{slug}" if (kind or "abstract") == "abstract" else slug
 
 
 def _split_composite_source(
@@ -245,12 +224,10 @@ def _split_composite_source(
 
     ``canonical_concept_name`` already performs this split for the
     storage name.  ``extract()`` needs the same split at the generator
-    interface so :meth:`SaklasSession.generate_scenarios` and
-    :meth:`SaklasSession.generate_statements` route ``concept`` and
-    ``baseline`` as two distinct poles — otherwise the LLM sees one
-    composite blob vs "its semantic opposite" and the A/B assignment in
-    the returned statements no longer matches the user's declared pole
-    order.
+    interface so :meth:`SaklasSession.generate_responses` elicits
+    ``concept`` and ``baseline`` as two distinct poles — otherwise the LLM
+    sees one composite blob and the pole assignment no longer matches the
+    user's declared order.
     """
     if baseline is None and BIPOLAR_SEP in concept:
         pos, neg = concept.split(BIPOLAR_SEP, 1)
@@ -1241,380 +1218,99 @@ class SaklasSession:
         decoded = self._tokenizer.decode(new_ids, skip_special_tokens=True)
         return decoded if isinstance(decoded, str) else decoded[0]
 
-    def generate_scenarios(
-        self,
-        concept: str,
-        baseline: str | None = None,
-        n: int = _N_SCENARIOS,
-        *,
-        on_progress: Callable[[str], None] | None = None,
-        role: str | None = None,
-    ) -> list[str]:
-        """Ask the generator for ``n`` broad situational domains shared across the axis.
-
-        Uses the same slim concept-list prompt as the inline scenario
-        path in :meth:`generate_statements` — for a bipolar axis the
-        two poles ride as a two-concept list; for a monopolar concept
-        the second slot is humanized to "the opposite of <concept>"
-        (mirroring how :class:`ExtractionPipeline` handles monopolar
-        downstream).
-
-        The "literal concept" anchor is the load-bearing piece for
-        non-human axes (deer/wolf, brick/feather) — without it the
-        model defaults to workplace/relationship framing and extracted
-        vectors read everything as human-social allegory.
-
-        Pure function, no disk side effects. Callers that want
-        persistence (``extract()``) write the result to scenarios.json
-        themselves.
-        """
-        if n <= 0:
-            return []
-        # Slugs on the pack/alphas side use underscores; LLM prompts read
-        # them as spaces ("artificial_intelligence" → "artificial
-        # intelligence") so the generator treats the axis as the
-        # underlying phrase rather than a literal token.
-        concept_h = _humanize_concept(concept)
-        if baseline is not None:
-            baseline_h = _humanize_concept(baseline)
-        else:
-            # Mirrors ExtractionPipeline's monopolar negative slot —
-            # humanizes to "the opposite of <concept>".
-            baseline_h = f"the opposite of {concept_h}"
-        concept_list_str = f'"{concept_h}", "{baseline_h}"'
-        prompt = _scenario_prompt(concept_list_str, n)
-        max_new_tokens = max(300, n * 40)
-        best: list[str] = []
-        for attempt in range(1, _MAX_GEN_ATTEMPTS + 1):
-            if on_progress:
-                on_progress(
-                    f"Generating {n} scenarios for '{concept}' "
-                    f"(attempt {attempt}/{_MAX_GEN_ATTEMPTS})..."
-                )
-            text = self._run_generator(
-                _GEN_SYSTEM_MSG, prompt, max_new_tokens, role=role,
-            )
-            parsed = self._parse_scenarios(text)
-            if len(parsed) >= n:
-                return parsed[:n]
-            if len(parsed) > len(best):
-                best = parsed
-        return best
-
-    @staticmethod
-    def _parse_scenarios(text: str) -> list[str]:
-        """Parse a numbered list of domain names from generated text.
-
-        Accepts ``1. name``, ``1) name``, tolerates bracket markers and
-        trailing punctuation, deduplicates case-insensitively.
-        """
-        out: list[str] = []
-        seen: set[str] = set()
-        for line in text.split("\n"):
-            m = _SCENARIO_LINE_RE.match(line)
-            if not m:
-                continue
-            name = m.group(2).strip().strip("[]").strip().rstrip(".,;:")
-            if not name:
-                continue
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(name)
-        return out
-
-    def generate_statements(
+    def generate_responses(
         self,
         concepts: list[str],
+        kinds: list[str | None],
         *,
-        scenarios: list[str] | None = None,
-        n_scenarios: int = _N_SCENARIOS,
-        statements_per_cell: int = _N_PAIRS_PER_SCENARIO,
+        roles: dict[str, str | None] | None = None,
+        samples_per_prompt: int = 1,
+        max_new_tokens: int = _RESPONSE_MAX_TOKENS,
         on_progress: Callable[[str], None] | None = None,
-        on_scenarios: Callable[[list[str]], None] | None = None,
-        on_corpus: Callable[[str, list[str]], None] | None = None,
-        neutrals: bool = False,
-        role: str | None = None,
     ) -> dict[str, list[str]]:
-        """Unified statement-corpus generator for a flat list of concepts.
+        """Generate each concept\'s conversational corpus (4.0 / A2 elicitation).
 
-        Produces ``n_scenarios * statements_per_cell`` first-person
-        statements per concept, sharing scenarios across the row so
-        statement index ``j`` of every concept came from the *same*
-        scenario.  The K-tuple analogue of "one corpus per concept,
-        scenario-aligned" — the load-bearing structural invariant for
-        downstream contrastive diffs and discover-mode centroid pools.
+        For every ``(concept, kind)`` the model answers the shared baseline
+        prompts *in character* -- the concept rides the system prompt
+        (:func:`_system_for`) and the swapped assistant-role label
+        (:func:`_role_for`, overridable per concept via ``roles``).  Responses
+        are emitted samples-outer / prompts-inner so ``response[i]`` aligns to
+        ``prompt[i % k]`` -- the alignment :func:`compute_node_centroid` and the
+        node corpus files assume.
 
-        ``neutrals=True`` is the neutrals path: no concept naming in
-        either the scenario or statement prompt, so the activation
-        average becomes the model's natural-voice baseline across
-        diverse everyday domains.  Used to build the probe-centering
-        ``mu_neutral`` reference that DLS + Mahalanobis depend on; it
-        takes exactly one concept and the returned dict uses that slug
-        as its single key (caller picks the slug as a marker).  Naming is
-        the **default** for every other call — including a single named
-        concept (e.g. a one-node discover resume), which generates that
-        concept's corpus, not a neutral baseline.
-
-        Cell fill: one LLM call per (scenario, concept) cell produces K
-        independent statements per cell.  Per-cell statements are unmatched
-        across concepts, but the scenario index aligns the row — statement
-        index ``j`` of every concept came from the *same* scenario, which is
-        the load-bearing structure (within-pair moment-matching never
-        affected the direction, since the fit is centroid-based: a 2-node
-        subspace's direction is the mean-difference regardless of pairing).
-        A steering vector is the ``len(concepts)==2`` case; the caller
-        recovers pairs via ``zip(out[concepts[0]], out[concepts[1]])``.
-
-        ``scenarios=None`` auto-generates a fresh scenario list (the
-        K-tuple scenario prompt; covers both N=2 and N>2). Pass
-        ``scenarios`` explicitly to reuse a curated list — e.g. the
-        bundled regeneration pipeline pins scenarios to the on-disk
-        ``scenarios.json`` so statements regenerate against fixed
-        domains.
-
-        The anti-allegory anchor — the directive that each concept is a
-        *literal* concept (so non-human axes like deer/wolf or
-        brick/feather stay literal rather than collapsing into
-        human-social metaphor) — is present in both prompt builders: the
-        scenario prompt and the per-cell statement prompt.  The two
-        phrasings differ in wording but both carry the "literal concept"
-        directive; the tests assert that directive's presence, not
-        byte-identical text.
-
-        Returns ``{concept: [statement, ...]}`` where each list has
-        exactly ``len(scenarios) * statements_per_cell`` entries,
-        ordered scenario-first then within-scenario.  The dict's key
-        order is the concept order the caller passed in.
-
-        Streaming sinks (both default ``None`` — no behavior change):
-        ``on_scenarios(scenarios)`` fires once with the effective
-        scenario list (passed or generated) so the caller can persist
-        provenance (e.g. a discover manifold's ``scenarios.json``).
-        ``on_corpus(concept, statements)`` fires once per *completed*
-        concept; when set, corpora are streamed to it and **not**
-        retained, so the return dict is empty and peak memory stays at
-        one concept's corpus rather than the whole roster — the path big
-        manifolds take, and which leaves finished nodes on disk if a run
-        dies mid-way.  The concept loop runs outer so each node finishes
-        before the next.
-
-        Short-cell padding: if a cell LLM call yields fewer than
-        ``statements_per_cell`` parseable rows after every retry, the
-        cell is padded by repeating its last entry (or a placeholder
-        when nothing parsed) so the scenario-shared-index invariant
-        survives a flaky LM.  A ragged corpus would silently miscount
-        scenario positions downstream.
+        Returns ``{concept: [response, ...]}`` with
+        ``len == max(1, samples_per_prompt) * len(baseline_prompts)`` per
+        concept.  Always role-swaps (no system-only fallback); a family without
+        role support raises ``RoleSubstitutionUnsupportedError`` at generation.
         """
-        concepts_in: Any = concepts
-        if not isinstance(concepts_in, list) or len(concepts_in) < 1:
-            raise ValueError(
-                "generate_statements needs >= 1 concept"
-            )
-        if neutrals and len(concepts) != 1:
-            # The neutrals baseline is a single unnamed corpus — the
-            # mu_neutral reference.  Naming is the default for every
-            # other call, including a single named concept (e.g. a
-            # one-node discover resume).
-            raise ValueError(
-                "generate_statements: neutrals=True is the single-concept "
-                "baseline path (no concept naming) — pass exactly one "
-                "concept"
-            )
-        if n_scenarios <= 0 or statements_per_cell <= 0:
-            raise ValueError(
-                "n_scenarios and statements_per_cell must both be > 0"
-            )
-        # Reject duplicates up front — they'd produce duplicate keys
-        # in the return dict, silently overwriting one corpus.
-        if len(set(concepts)) != len(concepts):
-            raise ValueError(
-                f"generate_statements: duplicate concept in {concepts!r}"
-            )
+        from saklas.core.vectors import _load_baseline_prompts
 
-        # Slug underscores read as spaces in the LLM-facing prompt; the
-        # canonical concept slug is preserved for the return-dict keys.
-        humanized = [_humanize_concept(c) for c in concepts]
-        concept_list_str = ", ".join(f'"{h}"' for h in humanized)
+        prompts = _load_baseline_prompts()
+        roles = roles or {}
+        reps = max(1, samples_per_prompt)
+        total = reps * len(prompts)
+        out: dict[str, list[str]] = {}
+        for concept, kind in zip(concepts, kinds):
+            concept_h = _humanize_concept(concept)
+            system = _system_for(concept_h, kind)
+            gen_role = roles.get(concept) or _role_for(_slug(concept), kind)
+            responses: list[str] = []
+            for _ in range(reps):
+                for prompt in prompts:
+                    if on_progress:
+                        on_progress(
+                            f"Generating {concept!r} response "
+                            f"{len(responses) + 1}/{total}..."
+                        )
+                    text = self._run_generator(
+                        system, prompt, max_new_tokens, role=gen_role,
+                    ).strip()
+                    responses.append(text)
+            out[concept] = responses
+        return out
 
-        # ---- Scenarios ------------------------------------------------
-        if scenarios is None:
-            if neutrals:
-                # Neutrals path: no concept naming in the prompt, so
-                # mu_neutral represents the model's natural-voice
-                # baseline across diverse everyday domains rather than
-                # being pulled toward any concept's activation
-                # neighborhood.  "Everyday" qualifier nudges the model
-                # toward affect-neutral / topically-mundane domains
-                # rather than affect-loaded ones the open-ended phrasing
-                # would otherwise allow.
-                scenario_prompt = (
-                    f"List {n_scenarios} varied, distinctive everyday "
-                    f"situational domains.\n\n"
-                    f"Format:\n"
-                    f"1. [domain]\n"
-                    f"2. [domain]\n"
-                    f"...\n"
-                    f"{n_scenarios}. [domain]"
-                )
-            else:
-                scenario_prompt = _scenario_prompt(
-                    concept_list_str, n_scenarios,
-                )
-            if on_progress:
-                on_progress(
-                    f"Generating {n_scenarios} shared scenarios for "
-                    f"{len(concepts)} concepts..."
-                )
-            scenarios = []
-            for _ in range(_MAX_GEN_ATTEMPTS):
-                text = self._run_generator(
-                    _GEN_SYSTEM_MSG, scenario_prompt,
-                    max_new_tokens=max(400, n_scenarios * 40),
-                    role=role,
-                )
-                parsed = self._parse_scenarios(text)
-                if len(parsed) >= n_scenarios:
-                    scenarios = parsed[:n_scenarios]
-                    break
-                if len(parsed) > len(scenarios):
-                    scenarios = parsed
-            if not scenarios:
-                raise ValueError(
-                    f"could not generate scenarios for concepts "
-                    f"{concepts!r}; try fewer or more-cohesive concepts"
-                )
+    def generate_neutral_responses(
+        self,
+        *,
+        samples_per_prompt: int = 1,
+        max_new_tokens: int = _RESPONSE_MAX_TOKENS,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        """Generate the neutral baseline corpus -- organic, unconditioned responses.
 
-        # ---- Statements ----------------------------------------------
-        # Effective scenarios (passed or generated) are now fixed — hand
-        # them to the provenance sink so the caller can persist a
-        # ``scenarios.json`` the way the vector extraction pipeline does.
-        if on_scenarios is not None:
-            on_scenarios(list(scenarios))
+        The neutral counterpart to :meth:`generate_responses`: the model answers
+        the shared baseline prompts with no system prompt and the standard
+        assistant label, so the corpus is the model\'s own voice.  Same
+        prompts-cycled order (``response[i] -> prompt[i % k]``).  This is what
+        ``neutral_statements.json`` holds under 4.0 -- regenerate it with this
+        and the per-model ``layer_means`` / neutral-activation caches recompute
+        conversationally.
+        """
+        from saklas.core.vectors import _load_baseline_prompts
 
-        corpora: dict[str, list[str]] = {c: [] for c in concepts}
-        K = statements_per_cell
-        N = len(concepts)
-
-        def _emit(label: str, statements: list[str]) -> None:
-            # Stream each completed node to ``on_corpus`` (bounded memory
-            # + crash-recoverable partial corpora on a big manifold), or
-            # retain it for the all-at-once return when no sink is set.
-            if on_corpus is not None:
-                on_corpus(label, statements)
-            else:
-                corpora[label] = statements
-
-        for c_idx, (c, h) in enumerate(zip(concepts, humanized), 1):
-            acc: list[str] = []
-            for s_idx, scenario in enumerate(scenarios, 1):
+        prompts = _load_baseline_prompts()
+        reps = max(1, samples_per_prompt)
+        total = reps * len(prompts)
+        responses: list[str] = []
+        for _ in range(reps):
+            for prompt in prompts:
                 if on_progress:
                     on_progress(
-                        f"Concept {c_idx}/{N} ('{h}'), domain "
-                        f"{s_idx}/{len(scenarios)} ({scenario}): "
-                        f"generating {K} statements..."
+                        f"Generating neutral response "
+                        f"{len(responses) + 1}/{total}..."
                     )
-                if neutrals:
-                    # Neutrals: no concept anchor, no qualifier
-                    # nudging affect-register.  The principled
-                    # definition of ``mu_neutral`` is "where the
-                    # model sits when not pushed by a concept" —
-                    # engineering the prompt toward a theoretical
-                    # affect-zero point ("stated plainly" /
-                    # "neutral") substitutes a different artificial
-                    # baseline (the model's response to *being told*
-                    # to be neutral) for the genuine one (the
-                    # model's natural unmodified output).  Letting
-                    # the model speak naturally across diverse
-                    # domains and accepting that as the baseline is
-                    # the actual operational definition.  On
-                    # symmetric axes (happy.sad) any residual
-                    # default-voice tilt cancels in the contrastive
-                    # direction; on axes where the model's default
-                    # is concept-loaded (e.g. ai.human, where the
-                    # model IS the AI side), DLS is slightly biased
-                    # — but a qualifier wouldn't fix that since the
-                    # model would default-voice the same way anyway.
-                    statement_prompt = (
-                        f"Domain: {scenario}.\n\n"
-                        f"Write {K} first-person statements about "
-                        f"this domain. Each statement should be a "
-                        f"rich and complete sentence.\n\n"
-                        f"Format:\n"
-                        f"1. [statement]\n"
-                        f"2. [statement]\n"
-                        f"...\n"
-                        f"{K}. [statement]"
-                    )
-                else:
-                    statement_prompt = (
-                        f"Concept: \"{h}\".\n"
-                        f"Domain: {scenario}.\n\n"
-                        f"Write {K} first-person statements. For each "
-                        f"statement, pick one aspect of the domain to "
-                        f"write about, then as the literal concept, "
-                        f"write one statement from their perspective. "
-                        f"Each statement should be a rich and "
-                        f"complete sentence.\n\n"
-                        f"Format:\n"
-                        f"1. [statement]\n"
-                        f"2. [statement]\n"
-                        f"...\n"
-                        f"{K}. [statement]"
-                    )
-                cell_best: list[str] = []
-                for _ in range(_MAX_GEN_ATTEMPTS):
-                    text = self._run_generator(
-                        _GEN_SYSTEM_MSG, statement_prompt,
-                        max_new_tokens=max(400, K * 80),
-                        role=role,
-                    )
-                    parsed = self._parse_numbered_statements(text)
-                    if len(parsed) >= K:
-                        cell_best = parsed[:K]
-                        break
-                    if len(parsed) > len(cell_best):
-                        cell_best = parsed
-                if not cell_best:
-                    cell_best = [
-                        f"({h} statement under '{scenario}' — "
-                        f"generation failed)"
-                    ]
-                while len(cell_best) < K:
-                    cell_best.append(cell_best[-1])
-                acc.extend(cell_best)
-            _emit(c, acc)
-
-        return {} if on_corpus is not None else corpora
-
-    @staticmethod
-    def _parse_numbered_statements(text: str) -> list[str]:
-        """Parse a plain numbered statement list (no a/b pairing).
-
-        Mirror of :meth:`_parse_scenarios` — accepts ``1. statement``,
-        ``1) statement``, tolerates bracket markers and trailing
-        punctuation, but keeps the statement body verbatim (unlike
-        scenarios which strip trailing ``.,;:``).
-        """
-        out: list[str] = []
-        for line in text.split("\n"):
-            m = _SCENARIO_LINE_RE.match(line)
-            if not m:
-                continue
-            body = m.group(2).strip().strip("[]").strip()
-            if len(body) < 8:
-                # A bare number or stub line — drop, not a real statement.
-                continue
-            out.append(body)
-        return out
+                text = self._run_generator(
+                    "", prompt, max_new_tokens, role=None,
+                ).strip()
+                responses.append(text)
+        return responses
 
     def extract(
         self,
         concept: str,
         baseline: str | None = None,
         *,
-        scenarios: list[str] | None = None,
+        kind: str = "abstract",
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
@@ -1622,31 +1318,37 @@ class SaklasSession:
         namespace: str | None = None,
         role: str | None = None,
     ) -> tuple[str, Profile]:
-        """Author + fit a steering vector as a 2-node ``pca`` manifold.
+        """Author + fit a steering vector via conversational (4.0 / A2) extraction.
 
-        A steering vector is the K=2 case of a flat affine subspace (4.0), so
-        "extracting" a concept now authors a 2-node discover-``pca`` manifold
-        under ``manifolds/<namespace>/<name>/`` — node 0 the positive pole,
-        node 1 the negative — and fits it via
-        :class:`~saklas.core.extraction.ManifoldExtractionPipeline`.  There is
-        no separate ``{positive, negative}`` / ``statements.json`` / baked-DiM
-        artifact anymore; the corpus lives as the manifold's two node groups.
+        A steering vector is a flat ``pca`` manifold.  A **bipolar** axis
+        (``concept`` + ``baseline``) authors a 2-node manifold — node 0 the
+        positive pole, node 1 the negative.  A **monopolar** concept
+        (``baseline=None``) would author a single node recovered against the
+        neutral baseline, but that 1-node fit is deferred in this 4.0 build —
+        monopolar raises ``NotImplementedError``; pass an explicit negative
+        pole for now.
 
-        Returns ``(canonical_name, Profile)`` where the ``Profile`` is the
-        folded per-layer direction view of the fitted 2-node manifold
-        (:func:`~saklas.core.vectors.folded_vector_directions`) — the
-        in-memory steering-vector shape callers expect, with the manifold the
-        single on-disk artifact.  Emits ``VectorExtracted``.
+        Each node's corpus is generated by :meth:`generate_responses`: the model
+        answers the shared baseline prompts *in character* (concept in the system
+        prompt + a kind-derived elicitation role), and extraction pools the
+        swapped-back ``[user, assistant]`` pairs in standard-assistant space.
+
+        Returns ``(canonical_name, Profile)`` — the folded per-layer direction
+        view of the fitted manifold (the in-memory steering-vector shape), with
+        the manifold the single on-disk artifact.  Emits ``VectorExtracted``.
 
         Flags:
 
-        - ``scenarios=[...]``: explicit scenarios; skips scenario generation.
-        - ``force=True``: regenerate the pole corpora + re-author the folder
+        - ``kind=`` (``"abstract"`` | ``"concrete"``): selects each node's system
+          template + elicitation role label (``someone {c}`` vs ``{c}``).
+          Applies to both poles of a bipolar axis.
+        - ``force=True``: regenerate the corpora + re-author the folder
           (otherwise an existing manifold's corpus is reused and the fit
           cache-hits when a tensor for this model is already present).
-        - ``role=<slug>``: role-augmented extraction — both poles are pooled
-          under the substituted assistant-role label (stored as the manifold's
-          per-node ``role``).
+        - ``role=<slug>``: persona-baselined extraction — the explicit role
+          overrides the kind-derived label at *both* generation and capture
+          (the centroid lives in role-baselined space; stored as the node
+          ``role``).  Omit for the standard swap-back baseline.
         - ``sae=<release>``: fit in SAE feature space (a ``_sae-<release>``
           tensor variant beside the raw one).
 
@@ -1669,31 +1371,38 @@ class SaklasSession:
             pos_raw, neg_raw = _split_composite_source(concept, baseline)
             name = canonical_concept_name(concept, baseline)
             pos_label = _slug(pos_raw)
-            if neg_raw is not None:
-                neg_label = _slug(neg_raw)
-                neg_gen = neg_raw
-                desc = f"Bipolar axis: {pos_raw} (+) vs {neg_raw} (-)."
-            else:
-                neg_label = f"{pos_label}_neg"
-                neg_gen = f"the_opposite_of_{pos_raw}"
-                desc = f"Monopolar probe: {pos_raw}."
+            if neg_raw is None:
+                # Monopolar = a 1-node subspace recovered against the neutral
+                # baseline.  The K=1 fit (synthesize neutral_mean as the implicit
+                # pole through discover-coords / fit_affine_subspace / fold /
+                # apply) is deferred to a GPU-validated release; until then a
+                # monopolar concept must be authored as an explicit bipolar axis.
+                raise NotImplementedError(
+                    f"monopolar extraction of {pos_raw!r} (a 1-node vs-neutral "
+                    f"fit) is not implemented in this 4.0 build yet; pass an "
+                    f"explicit negative pole (a bipolar axis) instead"
+                )
+            neg_label = _slug(neg_raw)
+            gen_concepts = [pos_raw, neg_raw]
+            labels = [pos_label, neg_label]
+            desc = f"Bipolar axis: {pos_raw} (+) vs {neg_raw} (-)."
 
             folder = manifold_dir(ns, name)
             manifest = folder / "manifold.json"
             if force or not manifest.exists():
-                eff_scen = scenarios or self.generate_scenarios(
-                    pos_raw, neg_raw, on_progress=on_progress, role=role,
+                gen_roles: dict[str, str | None] | None = (
+                    {c: role for c in gen_concepts} if role else None
                 )
-                corpora = self.generate_statements(
-                    [pos_raw, neg_gen], scenarios=eff_scen,
-                    on_progress=on_progress, role=role,
+                corpora = self.generate_responses(
+                    gen_concepts, [kind] * len(gen_concepts),
+                    roles=gen_roles, on_progress=on_progress,
                 )
                 node_corpora = {
-                    pos_label: corpora[pos_raw],
-                    neg_label: corpora[neg_gen],
+                    label: corpora[c] for label, c in zip(labels, gen_concepts)
                 }
+                node_kinds: dict[str, str | None] = {label: kind for label in labels}
                 node_roles: dict[str, str | None] | None = (
-                    {pos_label: role, neg_label: role} if role else None
+                    {label: role for label in labels} if role else None
                 )
                 if manifest.exists():
                     import shutil
@@ -1702,7 +1411,7 @@ class SaklasSession:
                     ns, name, desc, fit_mode="pca",
                     node_corpora=node_corpora,
                     hyperparams={"max_dim": 1, "var_threshold": 0.7},
-                    node_roles=node_roles, scenarios=eff_scen,
+                    node_roles=node_roles, node_kinds=node_kinds,
                 )
             return self._fit_vector_manifold(
                 name, folder, sae=sae, sae_revision=sae_revision,
@@ -1717,6 +1426,7 @@ class SaklasSession:
         positive: list[str],
         negative: list[str],
         *,
+        kind: str = "abstract",
         namespace: str | None = None,
         role: str | None = None,
         sae: str | None = None,
@@ -1729,10 +1439,15 @@ class SaklasSession:
 
         The corpus-in sibling of :meth:`extract` — used by persona cloning and
         the hand-authored TUI/HTTP paths, which already hold the positive and
-        negative statement lists and so skip generation.  Authors a 2-node
-        ``pca`` manifold (``positive`` → pole node, ``negative`` → its
-        opposite) and fits it; returns ``(canonical_name, Profile)`` like
-        :meth:`extract`.
+        negative corpora and so skip generation.  Authors a 2-node ``pca``
+        manifold (``positive`` → pole node, ``negative`` → its opposite) and
+        fits it; returns ``(canonical_name, Profile)`` like :meth:`extract`.
+
+        Under 4.0 the corpora are pooled conversationally — each entry is treated
+        as a response to the shared baseline prompts (``response[i] -> prompt[i
+        % k]``), so each corpus length must be a multiple of the baseline prompt
+        set.  ``kind`` is recorded per node (provenance); ``role`` opts into a
+        persona-baselined fit as in :meth:`extract`.
         """
         if not self._gen_lock.acquire(blocking=False):
             raise ConcurrentExtractionError(
@@ -1768,6 +1483,7 @@ class SaklasSession:
                     node_corpora={pos_label: positive, neg_label: negative},
                     hyperparams={"max_dim": 1, "var_threshold": 0.7},
                     node_roles=node_roles,
+                    node_kinds={pos_label: kind, neg_label: kind},
                 )
             return self._fit_vector_manifold(
                 canonical, folder, sae=sae, sae_revision=sae_revision,
@@ -1859,28 +1575,6 @@ class SaklasSession:
             )
         finally:
             self._gen_lock.release()
-
-    def clone_from_corpus(
-        self,
-        path: Any,
-        name: str,
-        *,
-        n_pairs: int = 90,
-        seed: int | None = None,
-        batch_size: int = 5,
-        force: bool = False,
-    ) -> tuple[str, Profile]:
-        """Extract a persona-cloning steering vector from a corpus file.
-
-        Thin wrapper around saklas.cloning.clone_from_corpus; see that
-        module for the full pipeline. Returns `(canonical_name, profile)`
-        matching extract()'s return shape.
-        """
-        from saklas.io.cloning import clone_from_corpus as _clone
-        return _clone(
-            self, path, name,
-            n_pairs=n_pairs, seed=seed, batch_size=batch_size, force=force,
-        )
 
     def load_profile(self, path: str) -> Profile:
         profile, meta = _load_profile(path)
@@ -3178,38 +2872,6 @@ class SaklasSession:
         """Detach a previously-attached manifold probe."""
         self._manifold_monitor.remove_probe(name)
         self._invalidate_prefix_cache()
-
-    def measure_manifold(
-        self,
-        text: str,
-        *,
-        names: list[str] | None = None,
-    ) -> dict[str, ManifoldAggregate]:
-        """One-shot manifold scoring over *text* — the read-side `%` analogue.
-
-        Runs a single forward pass over *text*, captures the hidden states
-        across the attached manifold-probe layers, and returns
-        :meth:`ManifoldMonitor.score_aggregate` keyed by probe name — the
-        manifold counterpart to how the vector ``POST /probe`` path uses
-        :meth:`TraitMonitor.measure`.  Pools each aggregate from the last
-        content token via the canonical
-        :func:`saklas.core.vectors.last_content_index` walkback (same
-        single-state discipline as extraction and the generation-time
-        aggregate).
-
-        ``names=None`` scores every attached manifold probe; a subset list
-        filters the result to those names (unknown names are dropped).
-        Returns an empty dict when no manifold probe is attached.  Caller
-        is responsible for serialization (the server holds ``session.lock``
-        the same way it does for ``monitor.measure``).
-        """
-        readings = self._manifold_monitor.measure(
-            self._model, self._tokenizer, self._layers, self._device, text,
-        )
-        if names is not None:
-            wanted = set(names)
-            readings = {k: v for k, v in readings.items() if k in wanted}
-        return readings
 
     def _probe_hash(self, name: str) -> str | None:
         """Return sha256 hex of the baked tensor bytes for ``name``.

@@ -56,22 +56,6 @@ def test_parse_vector_merge():
     assert args.expression == "0.3 default/happy + 0.4 a9lim/archaic"
 
 
-def test_parse_vector_clone_required_args():
-    args = cli.parse_args(["subspace","clone", "/tmp/corpus.txt", "--name", "alice"])
-    assert args.subspace_cmd == "clone"
-    assert args.corpus_path == "/tmp/corpus.txt"
-    assert args.name == "alice"
-    assert args.n_pairs == 90
-    assert args.seed is None
-    assert args.force is False
-    assert args.model is None
-
-
-def test_parse_vector_clone_missing_name_errors():
-    with pytest.raises(SystemExit):
-        cli.parse_args(["subspace","clone", "/tmp/corpus.txt"])
-
-
 def test_parse_vector_extract_one_positional():
     args = cli.parse_args(["subspace","extract", "happy.sad"])
     assert args.subspace_cmd == "extract"

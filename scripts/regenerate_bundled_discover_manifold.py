@@ -64,16 +64,7 @@ REPO = Path(__file__).resolve().parent.parent
 MANIFOLDS_DIR = REPO / "saklas" / "data" / "manifolds"
 NEUTRALS_PATH = REPO / "saklas" / "data" / "neutral_statements.json"
 DEFAULT_MODEL_ID = "google/gemma-4-31b-it"
-N_SCENARIOS = 9
-STATEMENTS_PER_CONCEPT = 5
 ANCHOR_LABEL = "default"
-
-# Curated shared scenarios.  ``None`` lets the model generate the shared
-# domain set (persisted to scenarios.json either way).  Unlike the
-# persona roster, the cultural/register pole sets are homogeneous-human,
-# so auto-generated scenarios behave; set this to a curated list only to
-# pin a specific domain spread across re-fits.
-SCENARIOS: list[str] | None = None
 
 # Targets are resolved against the bundled package data tree; their
 # roster / description / hyperparams come from each existing
@@ -117,13 +108,8 @@ def main() -> None:
         help=f"HF model id for the generator (default {DEFAULT_MODEL_ID}).",
     )
     ap.add_argument(
-        "--n-scenarios", type=int, default=N_SCENARIOS,
-        help=f"Shared scenarios per generation (default {N_SCENARIOS}).",
-    )
-    ap.add_argument(
-        "--statements-per-concept", type=int, default=STATEMENTS_PER_CONCEPT,
-        help=f"Statements per (scenario, pole) cell "
-             f"(default {STATEMENTS_PER_CONCEPT}).",
+        "--samples-per-prompt", dest="samples_per_prompt", type=int, default=1,
+        help="In-character responses per baseline prompt, per pole (default 1).",
     )
     args = ap.parse_args()
 
@@ -148,7 +134,6 @@ def main() -> None:
     from saklas.io.manifolds import (
         append_discover_manifold_node,
         plan_discover_generation,
-        write_manifold_scenarios,
     )
 
     # `--force` is a clean slate; the default resumes.  Plan each target
@@ -196,44 +181,31 @@ def main() -> None:
                 plan = plans[name]
                 folder = MANIFOLDS_DIR / name
                 poles = [label for label in plan.pending if label != ANCHOR_LABEL]
-                n_cells = len(poles) * args.n_scenarios
+                tot = len(plan.index_of)
                 print(
                     f"\n[{name}] streaming to {folder.relative_to(REPO)}; "
-                    f"generating {len(poles)} poles "
-                    f"(1 + {n_cells} = {1 + n_cells} LM calls)..."
+                    f"generating {len(poles)} poles ({args.samples_per_prompt} "
+                    f"response(s) per baseline prompt each)..."
                 )
-
-                def _on_scenarios(
-                    scn: list[str], _f: Path = folder, _n: str = name,
-                ) -> None:
-                    write_manifold_scenarios(_f, scn)
-                    print(f"  [{_n}] scenarios ({len(scn)}): {scn}", flush=True)
-
-                def _on_corpus(
-                    label: str, statements: list[str],
-                    _f: Path = folder,
-                    _idx: dict[str, int] = plan.index_of,
-                    _n: str = name, _tot: int = len(plan.index_of),
-                ) -> None:
-                    append_discover_manifold_node(_f, _idx[label], label, statements)
+                t0 = time.time()
+                # A2: each pole answers the shared baseline prompts in character.
+                # cultural / register poles are abstract traits.
+                for label in poles:
+                    corpora = session.generate_responses(
+                        [label], ["abstract"],
+                        samples_per_prompt=args.samples_per_prompt,
+                        on_progress=lambda msg, _n=name: print(
+                            f"  [{_n}] {msg}", flush=True,
+                        ),
+                    )
+                    append_discover_manifold_node(
+                        folder, plan.index_of[label], label, corpora[label],
+                    )
                     print(
-                        f"  [{_n}] [{_idx[label] + 1}/{_tot}] wrote node "
-                        f"{label!r} ({len(statements)} statements)",
+                        f"  [{name}] [{plan.index_of[label] + 1}/{tot}] wrote "
+                        f"node {label!r} ({len(corpora[label])} responses)",
                         flush=True,
                     )
-
-                t0 = time.time()
-                session.generate_statements(
-                    poles,
-                    scenarios=list(plan.scenarios) if plan.scenarios is not None else SCENARIOS,
-                    n_scenarios=args.n_scenarios,
-                    statements_per_cell=args.statements_per_concept,
-                    on_progress=lambda msg, _n=name: print(
-                        f"  [{_n}] {msg}", flush=True,
-                    ),
-                    on_scenarios=_on_scenarios,
-                    on_corpus=_on_corpus,
-                )
                 print(f"[{name}] generation finished in {time.time() - t0:.1f}s")
 
             del session

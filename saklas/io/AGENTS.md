@@ -12,9 +12,11 @@ format/distribution surface (`PackMetadata`/`ConceptFolder`/`pull_pack`/the
 
 Every `~/.saklas/` path resolves through `saklas_home()` (honors `$SAKLAS_HOME`).
 Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `models_dir`, `model_dir(id)`,
-`neutral_statements_path`, `safe_model_id` (`/` → `__`), `ensure_within(root,
-*parts)` (path-traversal barrier). `vectors_dir` / `concept_dir` survive only for
-the legacy-port scan — no current writer targets them.
+`neutral_statements_path`, `baseline_prompts_path` (user override for the shared A2
+baseline user prompts; falls back to bundled `saklas/data/baseline_prompts.json`),
+`safe_model_id` (`/` → `__`), `ensure_within(root, *parts)` (path-traversal
+barrier). `vectors_dir` / `concept_dir` survive only for the legacy-port scan — no
+current writer targets them.
 
 Owns the tensor-filename variant scheme. A manifold folder can hold several
 fitted tensors per model, distinguished by filename suffix — exactly one *kind*
@@ -64,10 +66,16 @@ by `manifold.json::fit_mode`:
 bipolar separator and the `%label` lexer would mis-read it), branches on
 `fit_mode`, enforces `min_nodes` on authored folders (discover at fit time),
 verifies `files`, and demands a sidecar per fitted tensor. `source`
-(`local`/`bundled`/`hf://...`) and `tags` ride `manifold.json`. `node_groups()`
-reads `nodes/NN_<label>.json` in order; `nodes_sha256()` is the staleness key —
-hashes `{corpus, domain, node_coords}` (authored) / `{corpus, fit_mode,
-hyperparams}` (discover) / a baked sentinel, folding in any non-`None` node role.
+(`local`/`bundled`/`hf://...`) and `tags` ride `manifold.json`. Each node entry
+also carries an optional `kind` ∈ {`abstract`, `concrete`} (`_validate_node_kind`),
+parallel to the optional `role` — generation-only provenance (it selects the
+generation system template + elicitation role label) that the fit never consumes;
+it rides `ManifoldFolder.node_kinds` / `ManifoldSidecar.node_kinds` and is emitted
+only when set by `_node_payload_authored` / `_node_payload_discover`.
+`node_groups()` reads `nodes/NN_<label>.json` in order; `nodes_sha256()` is the
+staleness key — hashes `{corpus, domain, node_coords}` (authored) / `{corpus,
+fit_mode, hyperparams}` (discover) / a baked sentinel, folding in any non-`None`
+node role and any non-`None` node kind.
 `ManifoldSidecar` is the lean per-tensor JSON (`method` round-trips
 `manifold_pca`/`manifold_sae` authored, `manifold_discover_{pca,spectral,sae}`
 discover, `merge` baked, `manifold_procrustes_transfer` transfer + the
@@ -75,16 +83,26 @@ share/subspace metrics, fit_mode, hyperparams, diagnostics); the tensor save/loa
 itself lives in `core/manifold.py`. `hash_manifold_files` / `_hash_file` are the
 integrity twins of `packs.py`'s.
 
+A node corpus is now a list of conversational *responses* (`list[str]`) aligned to
+the shared A2 baseline user prompts — `response[i]` answers `baseline_prompt[i % k]`
+(`baseline_prompts_path`), so a corpus length must be a multiple of `k`. The shared
+baseline prompts are global (bundled `saklas/data/baseline_prompts.json`), not
+per-manifold, so the generation path no longer writes `scenarios.json` and no
+longer calls `write_manifold_scenarios` (the helper still exists and round-trips an
+explicit `scenarios=` corpus, but generation does not feed it).
+
 Authoring: `create_manifold_folder` (authored webui/HTTP path, returns `(folder,
 advisories)`), `create_discover_manifold_folder` (`_sanitize_hyperparams` drops
-cross-method keys at the IO boundary, gated by `_HYPERPARAMS_BY_MODE`),
+cross-method keys at the IO boundary, gated by `_HYPERPARAMS_BY_MODE`; takes
+`node_roles=` / `node_kinds=` maps),
 `create_baked_manifold_folder` + `save_baked_manifold_tensor` (the `subspace
 merge` target — one fitted tensor per model, all sharing one `manifold.json`).
 `port_legacy_vector_folder` ports a stale `vectors/<ns>/<name>/` pack to a 2-node
 `pca` discover folder (file-only — no tensors carried; they re-fit lazily).
 Streaming companions for big rosters (a crash keeps finished nodes):
-`init_discover_manifold_folder` + `append_discover_manifold_node` +
-`write_manifold_scenarios`; `plan_discover_generation → DiscoverGenerationPlan` is
+`init_discover_manifold_folder` (also takes `node_kinds=`) +
+`append_discover_manifold_node`; `plan_discover_generation → DiscoverGenerationPlan`
+(also takes `node_kinds=`) is
 the shared resume/add-nodes planner (deliberately bypasses `ManifoldFolder.load` so
 it can inspect a partial). `merge_discover_manifolds` unions ≥2 discover sources'
 node corpora into a fresh *unfitted* folder (authored sources / label collisions /
@@ -186,16 +204,6 @@ weighting with no per-layer metadata.
 `neutral_statements.json` drift). The old `bootstrap_probes` is gone — the session
 sources bundled probe directions by folding fitted 2-node manifolds
 (`session._bootstrap_manifold_probes`).
-
-## cloning.py
-
-Training-free persona cloning. `clone_from_corpus(session, path, name, *,
-n_pairs=90, seed=None, batch_size=5, force=False)` reads one-utterance-per-line,
-samples exemplars, pairs each against a model-generated *neutralized* rewrite,
-authors a 2-node `pca` manifold folder from the pos/neg corpora, and fits it via
-`session.extract_manifold`. Lands in `manifolds/local/<name>/` with `tags +=
-["cloned"]` and corpus provenance. Errors: `CorpusTooShortError` /
-`CorpusTooLongError` / `InsufficientPairsError`.
 
 ## merge.py
 

@@ -537,9 +537,21 @@ def test_apply_with_role_invalid_role_punctuation():
 
 
 def test_apply_with_role_valid_role_with_underscore_and_dot():
-    """``[a-z0-9._-]`` includes underscore, dot, dash — all valid."""
+    """``[a-z0-9._-]`` includes underscore, dot, dash — all valid.
+
+    At render the slug de-slugs (``_`` → space) while dots/dashes are kept,
+    so ``sea_dog`` displays as ``sea dog`` but ``captain.ahab`` / ``pirate-king``
+    are spliced verbatim.
+    """
     tok = _qwen_tok()
-    for role in ("pirate", "sea_dog", "captain.ahab", "pirate-king", "p1rate"):
+    for role, shown in (
+        ("pirate", "pirate"),
+        ("sea_dog", "sea dog"),
+        ("captain.ahab", "captain.ahab"),
+        ("pirate-king", "pirate-king"),
+        ("p1rate", "p1rate"),
+        ("someone_happy", "someone happy"),
+    ):
         out = apply_with_role(
             tok,
             _sample_messages(),
@@ -547,7 +559,7 @@ def test_apply_with_role_valid_role_with_underscore_and_dot():
             model_type="qwen3",
             tokenize=False,
         )
-        assert f"<|im_start|>{role}\n" in out
+        assert f"<|im_start|>{shown}\n" in out
 
 
 # ---------------------------------------------------------------------------

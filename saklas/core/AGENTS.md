@@ -33,18 +33,26 @@ Low-level capture, pooling, DLS, the vector⇄subspace fold, and profile I/O. **
 (`extraction.py`); what survives here is the capture + fold + projection
 machinery that pipeline and dispatch both consume.
 
-One forward pass per prompt; `_capture_all_hidden_states` hooks every layer at
-once. `_encode_and_capture_all` pools from the **last content token** —
-`last_content_index` walks back past both `tokenizer.all_special_ids` and
-`tokenizer.added_tokens_encoder` values to skip trailing chat-template markers
-(where outlier channels dominate). `special_token_ids` + `last_content_index` are
-the one canonical "last non-special token" definition shared by every single-state
-readout (centroid pooling, vector aggregate, manifold aggregate);
-`encode_and_capture_stack` is the full-`[T,D]` companion for the manifold monitor.
-`_render_and_tokenize_for_capture(..., role=, model_type=)` is the shared
-render+tokenize+walkback front half. `compute_layer_means` /
+One forward pass per response; `_capture_all_hidden_states` hooks every layer at
+once. Capture is **conversational** (4.0 / A2): a corpus item is an assistant
+*response* to a fixed baseline *prompt*, so `_encode_and_capture_all(model,
+tokenizer, prompt, response, layers, device, *, role=, model_type=)` renders
+`[user: prompt, assistant: response]` (no system turn, standard assistant label)
+and pools from the response's **last content token** — `last_content_index` walks
+back past both `tokenizer.all_special_ids` and `tokenizer.added_tokens_encoder`
+values to skip trailing chat-template markers (where outlier channels dominate).
+`special_token_ids` + `last_content_index` are the one canonical "last non-special
+token" definition shared by every single-state readout (centroid pooling, vector
+aggregate, manifold aggregate). `_render_and_tokenize_for_capture(tokenizer,
+prompt, response, device, *, role=, model_type=)` is the shared
+render+tokenize+walkback front half; `role` substitutes the assistant label only
+when an explicit per-node role override is set (the persona-baselined fit), the
+swap-back default being the standard assistant. `_load_baseline_prompts` loads the
+shared A2 user prompts (user override → bundled `saklas/data/baseline_prompts.json`,
+64 prompts); `_neutral_pairs` pairs the neutral corpus to those prompts
+(`response[i] ↔ prompt[i % k]`). `compute_layer_means` /
 `compute_neutral_activations` build the probe-centering baseline + the whitener's
-neutral cache.
+neutral cache, pooling conversational `(prompt, response)` pairs via `_neutral_pairs`.
 
 DLS (Selective Steering, Dang & Ngo 2026 Eq. 9): `compute_dls_axes(node_centroids,
 bases, layer_means)` is the **N-node straddle** core — keep axis `d̂ᵣ` at layer L
@@ -80,11 +88,14 @@ whitener, Gram-Schmidt otherwise; metric all-or-nothing via `covers_all`).
 pipeline (concept extraction and manifold fitting are the same thing — a vector is
 a 2-node `pca` manifold). Dependencies via the `ModelHandle` protocol (`model` /
 `tokenizer` / `layers` / `device` / `model_id` / `_run_generator` /
-`generate_scenarios` / `generate_statements`) + an `EventBus` for
-`ManifoldExtracted`; `SaklasSession` satisfies it implicitly. Cache-hit on the
-sidecar `nodes_sha256` (folds in corpus + `{domain, node_coords}` authored /
-`{fit_mode, hyperparams}` discover) **and** `sae_revision`. Else pools per-node
-centroids (`compute_node_centroid`) and dispatches on `fit_mode`:
+`generate_responses`) + an `EventBus` for `ManifoldExtracted`; `SaklasSession`
+satisfies it implicitly. Cache-hit on the sidecar `nodes_sha256` (folds in corpus
++ `{domain, node_coords}` authored / `{fit_mode, hyperparams}` discover) **and**
+`sae_revision`. Else reads `_load_baseline_prompts()` and pools per-node
+conversational centroids (`compute_node_centroid(..., responses, baseline_prompts,
+role=node_role, model_type=)`), threading the folder's `node_kinds` /
+`node_roles` into the `Manifold` + sidecar metadata, then dispatches on
+`fit_mode`:
 
 - **`pca`** (flat / discover; the 2-node-vector case): derive per-model coords
   (`discover_coords` at a reference layer) when discover, then per layer
@@ -165,9 +176,12 @@ real `node_coords = (centroids − neutral)·basisᵀ`); `orient_to` fixes the s
 independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`).
 
 `Manifold` — domain + per-layer `LayerSubspace`s + `node_labels`/`node_coords`/
-`node_roles` + the bakes `explained_variance`/`mahalanobis_share`/`origin` +
-`feature_space`/`metadata`. The `Profile` analogue. `manifold_point`, `tangent`
-(analytic RBF Jacobian), `resolve_position` (coord payload or label),
+`node_roles`/`node_kinds` + the bakes `explained_variance`/`mahalanobis_share`/
+`origin` + `feature_space`/`metadata`. The `Profile` analogue. `node_kinds`
+(abstract/concrete) is generation-only provenance — it selects the system template
++ elicitation role label at authoring time, but is NOT consumed at fit; it
+round-trips through the save/load sidecar. `manifold_point`, `tangent` (analytic
+RBF Jacobian), `resolve_position` (coord payload or label),
 `nearest_node_{index,label,role}`.
 
 `decompose(h, mean, basis) → (h_par_c, h_perp)` — the shared centered
@@ -235,8 +249,11 @@ mix). The probe weight stays `‖baked‖₂` (the bake already folded the Mahal
 score in). `_ensure_cache` precomputes whitened probe directions + Mahalanobis
 norms + device-resident Woodbury factors; the hot path is one matmul + a cheap
 per-token `Σ⁻¹h_c` apply, zero `.item()`. `_layer_sims` is the shared per-layer
-kernel. Entry points: `score_per_token` (primary), `score_single_token{,_per_layer,
-_tensor}`, `score_stack`, `measure`, live-mean `begin/update/end_live`.
+kernel. Entry points: `score_per_token` (primary), `measure_from_hidden`,
+`score_single_token{,_per_layer,_tensor}`, `score_stack`, live-mean
+`begin/update/end_live`. The one-shot re-render text scorer (`measure`) is gone —
+every read source is now live hooks scoring pre-captured hidden states during
+generation, no second forward pass.
 
 `ManifoldMonitor` is the manifold read peer (accepts a whitener too).
 `add_probe(name, manifold, *, top_n)` caches per-layer reduced `(K,R)` node coords.
@@ -247,8 +264,9 @@ Mahalanobis forms (M-orthogonal share, `M_R`-metric cdist). `score_single_token`
 returns `ManifoldTokenReading`s; `flat_scalars` flattens to `{"<name>:fraction",
 "<name>@<label>": −distance}` for the probe-gate machinery. `score_aggregate`
 (end-of-gen) pools the last non-special token, runs the channels, and recovers
-authoring coords + residual via `invert_parameterization`. `measure` is the
-one-shot text helper.
+authoring coords + residual via `invert_parameterization`. The one-shot re-render
+text scorer (`measure`) is gone — like `TraitMonitor`, the read source is live
+hooks scoring captured hidden states.
 
 ## triggers.py
 
@@ -296,19 +314,32 @@ synchronous `events: EventBus`. `from_pretrained(model_id, *, device, dtype,
 quantize, probes, projection_metric=..., dls=..., compile=..., cuda_graphs=...)`
 does the HF load + layer-mean compute + probe bootstrap — there is no
 `injection_mode`/`theta_max` param. `__init__` takes a pre-loaded model. Both call
-`materialize_bundled_manifolds()` + `selectors.invalidate()` early. `_N_PAIRS =
-45`, `_N_PAIRS_PER_SCENARIO = 5`. Module-level helpers `_manifold_is_affine` /
-`_affine_manifold_push` (per-layer basis rows + node-coord targets for a flat
-manifold) back the dispatch.
+`materialize_bundled_manifolds()` + `selectors.invalidate()` early.
+`_RESPONSE_MAX_TOKENS = 256` caps each in-character response (4.0 / A2
+elicitation). Module-level helpers `_manifold_is_affine` / `_affine_manifold_push`
+(per-layer basis rows + node-coord targets for a flat manifold) back the dispatch.
+Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for`
+(the per-kind system prompt) / `_role_for` (the swapped assistant-role label:
+abstract → `someone_{slug}`, concrete → `{slug}`) author each node's corpus.
 
-`extract(concept, baseline)` authors a 2-node discover-`pca` manifold
+`extract(concept, baseline, *, kind="abstract", ...)` is **bipolar-only** (2
+nodes): it authors a 2-node discover-`pca` manifold
 (`create_discover_manifold_folder`, `hyperparams={"max_dim": 1}`) and fits it via
 `ManifoldExtractionPipeline`, returning `(canonical_name,
-folded_vector_directions(manifold))`. `extract_vector_from_corpora` is the
-corpus-in sibling (cloning / hand-authored pairs skip generation);
-`extract_manifold(folder)` is the multi-node delegate that returns a `Manifold`.
-All three gate against `GenState.IDLE` (fitting runs forward passes). `_fit_vector_
-manifold` is the shared tail; `clone_from_corpus` delegates to `io.cloning`.
+folded_vector_directions(manifold))`. The corpus is generated conversationally —
+`generate_responses(concepts, kinds, *, roles=None, samples_per_prompt=1, …)` has
+each pole answer the shared baseline prompts *in character*, the concept riding
+both the system prompt (`_system_for`) and the swapped assistant-role label
+(`_role_for`); responses are emitted samples-outer / prompts-inner so
+`response[i] ↔ prompt[i % k]`. **Monopolar** (`baseline=None`) is deferred in this
+4.0 build — raises `NotImplementedError` (pass an explicit negative pole).
+`generate_neutral_responses` is the neutral-corpus sibling (no system, standard
+label). `extract_vector_from_corpora(..., kind=...)` is the corpus-in sibling
+(hand-authored pairs skip generation; corpora pooled conversationally, each length
+a multiple of the baseline prompt set); `extract_manifold(folder)` is the
+multi-node delegate that returns a `Manifold`. All gate against `GenState.IDLE`
+(fitting runs forward passes). `_fit_vector_manifold` is the shared tail. (The
+training-free `clone_from_corpus` / `io.cloning` path is removed in 4.0.)
 
 `generate` / `generate_stream` are keyword-only and accept `steering: str |
 Steering | None` (dicts rejected), `sampling`, `thinking=None`, plus loom args;
@@ -323,7 +354,7 @@ tier and routes variants.
 
 **Steering resolution (manifold-first).** `_ensure_profile_registered(name)`
 resolves a direction from, in order: (1) an in-memory baked direction already in
-`_profiles` (ad-hoc `extract`/`clone`/`merge`/projection results); (2) a fitted
+`_profiles` (ad-hoc `extract`/`merge`/projection results); (2) a fitted
 2-node `pca` manifold on disk — `_try_fold_manifold` → `_ensure_manifold_loaded`
 (load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
 memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
@@ -351,7 +382,6 @@ True)` widens capture to every layer and lands `GenerationResult.hidden_states`,
 re-scorable via `session.score_hidden`. Manifold probes ride the same plumbing:
 `add_manifold_probe(selector, *, as_name=None, top_n=3)` resolves via
 `_ensure_manifold_loaded` and registers on `_manifold_monitor`;
-`measure_manifold(text, *, names=None)` is the one-shot text scorer;
 `_begin_capture` widens to the union of vector + manifold probe layers; the gate
 callback merges `TraitMonitor.score_single_token` and
 `ManifoldMonitor.score_single_token`/`flat_scalars` into

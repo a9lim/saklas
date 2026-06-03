@@ -159,11 +159,12 @@ USER_ROLE_HEADERS: dict[str, RoleHeader | None] = _build_user_role_headers()
 
 
 # Same alphabet as ``io.paths._UNSAFE_VARIANT_CHARS`` — the slug discipline
-# used for the SAE release and transfer-source filename variants.  A custom
-# role label is similar: a user-provided string we splice into a rendered
-# template and (downstream) into filenames.  Keeping it ``[a-z0-9._-]`` rules
-# out whitespace, uppercase, and punctuation that would corrupt either
-# surface.
+# shared with the SAE release / transfer-source / role filename variants.  A
+# custom role label is a user-provided string we splice into a rendered
+# template and (downstream) into a ``_role-<slug>`` filename, so keeping it
+# ``[a-z0-9._-]`` rules out whitespace, uppercase, and punctuation that would
+# corrupt either surface.  At render time the underscore de-slugs to a space
+# (``_render_label``), so ``someone_happy`` displays as ``someone happy``.
 _ROLE_SLUG_RE = re.compile(r"^[a-z0-9._-]+$")
 
 
@@ -218,6 +219,24 @@ def _validate_role(role: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _render_label(standard_label: str, role: str) -> str:
+    """Turn a role *slug* into the display label spliced into the template.
+
+    De-slugs ``_`` → space (hyphens are kept verbatim), then mirrors the case
+    of the family's ``standard_label`` so the substituted header matches the
+    casing the template emits.  Every live family label is lowercase
+    (``assistant``/``model``/``user``), so today this is de-slug + lowercase;
+    the case-mirror is forward-proofing for a family whose role header renders
+    in a different case.
+    """
+    label = role.replace("_", " ")
+    if standard_label.isupper():
+        return label.upper()
+    if standard_label.istitle():
+        return label.title()
+    return label
+
+
 def _lookup_header(
     registry: dict[str, RoleHeader | None], model_type: str, *, side: str
 ) -> RoleHeader:
@@ -258,7 +277,7 @@ def _splice_header(
                 f"from the live chat template"
             )
         return rendered
-    replacement = f"{header.before}{role}{header.after}"
+    replacement = f"{header.before}{_render_label(header.label, role)}{header.after}"
     return rendered.replace(pattern, replacement)
 
 
@@ -427,7 +446,7 @@ def _splice_occurrences(
         if label is None:
             parts.append(pattern)
         else:
-            parts.append(f"{header.before}{label}{header.after}")
+            parts.append(f"{header.before}{_render_label(header.label, label)}{header.after}")
         cursor = idx + len(pattern)
         occ += 1
     return "".join(parts)

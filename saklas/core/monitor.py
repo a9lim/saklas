@@ -497,22 +497,6 @@ class TraitMonitor:
                 out[layer_idx].setdefault(name, 0.0)
         return out
 
-    def measure(self, model: torch.nn.Module, tokenizer: Any, layers: torch.nn.ModuleList, text: str, device: torch.device | None = None, accumulate: bool = True) -> dict[str, float]:
-        """Run one forward pass over *text* and compute probe similarities.
-
-        Pools the last content token's hidden state per layer (same as
-        extraction), mean-centers, then computes score-weighted cosine
-        similarities against all probes. When ``accumulate`` is False,
-        history and stats are left untouched.
-        """
-        from saklas.core.vectors import _encode_and_capture_all
-
-        if device is None:
-            device = next(model.parameters()).device
-
-        hidden_per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
-        return self._score_probes(hidden_per_layer, accumulate=accumulate)
-
     def measure_from_hidden(self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True) -> dict[str, float]:
         """Score probes from pre-captured hidden states (no forward pass).
 
@@ -1418,44 +1402,3 @@ class ManifoldMonitor:
             )
         return out
 
-    def measure(
-        self,
-        model: torch.nn.Module,
-        tokenizer: Any,
-        layers: torch.nn.ModuleList,
-        device: torch.device,
-        text: str,
-        *,
-        agg_index: int | None = None,
-    ) -> dict[str, ManifoldAggregate]:
-        """One-shot manifold scoring over arbitrary *text* — no generation.
-
-        The manifold analogue of :meth:`TraitMonitor.measure`: runs a
-        single forward pass over *text*, captures the full ``[T, D]``
-        hidden stack across the attached manifolds' layers, and returns
-        :meth:`score_aggregate` keyed by probe name.  Pools the aggregate
-        from the **last content token** via the canonical
-        :func:`saklas.core.vectors.last_content_index` walkback (same
-        single-state discipline as extraction and the generation-time
-        aggregate), unless the caller supplies an explicit ``agg_index``.
-
-        Returns an empty dict when no manifold probe is attached.
-        """
-        from saklas.core.vectors import encode_and_capture_stack
-
-        if not self._probes:
-            return {}
-
-        stacks, content_idx = encode_and_capture_stack(
-            model, tokenizer, text, layers, device,
-        )
-        # Restrict the captured stack to the union of attached-manifold
-        # layers — the forward captured every layer, but scoring only
-        # reads the manifolds' own layer set.
-        wanted = self.attached_layers()
-        captured = {
-            idx: stack for idx, stack in stacks.items() if idx in wanted
-        }
-        if agg_index is None:
-            agg_index = content_idx
-        return self.score_aggregate(captured, agg_index=agg_index)

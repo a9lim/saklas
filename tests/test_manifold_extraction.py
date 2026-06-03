@@ -26,11 +26,14 @@ _N_LAYERS = 4
 
 
 def _stub_encoder(
-    model: Any, tokenizer: Any, text: str, layers: Any,
+    model: Any, tokenizer: Any, prompt: str, response: str, layers: Any,
     device: Any, **_kwargs: Any,
 ) -> dict[int, torch.Tensor]:
-    """Synthetic per-layer activations, deterministic per node label."""
-    label = text.split()[0]
+    """Synthetic per-layer activations, deterministic per node label.
+
+    Conversational signature: ignores the baseline ``prompt`` and keys off the
+    ``response`` (the node corpus entry, ``"<label> statement i"``)."""
+    label = response.split()[0]
     seed = int(hashlib.sha256(label.encode("utf-8")).hexdigest()[:8], 16)
     g = torch.Generator().manual_seed(seed)
     base = torch.randn(_DIM, generator=g)
@@ -65,26 +68,15 @@ class _Handle:
     ) -> str:
         raise NotImplementedError("stub: not called in CPU manifold tests")
 
-    def generate_scenarios(
-        self,
-        concept: str,
-        baseline: str | None = None,
-        n: int = 9,
-        *,
-        on_progress: Any = None,
-        role: str | None = None,
-    ) -> list[str]:
-        raise NotImplementedError("stub: not called in CPU manifold tests")
-
-    def generate_statements(
+    def generate_responses(
         self,
         concepts: list[str],
+        kinds: list[str | None],
         *,
-        scenarios: list[str] | None = None,
-        n_scenarios: int = 9,
-        statements_per_cell: int = 5,
+        roles: dict[str, str | None] | None = None,
+        samples_per_prompt: int = 1,
+        max_new_tokens: int = 256,
         on_progress: Any = None,
-        role: str | None = None,
     ) -> dict[str, list[str]]:
         raise NotImplementedError("stub: not called in CPU manifold tests")
 
@@ -139,6 +131,9 @@ def _author_manifold(
 def _stub(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(0)
     monkeypatch.setattr(V, "_encode_and_capture_all", _stub_encoder)
+    # Single baseline prompt so any node corpus length is a multiple of k=1
+    # (the conversational alignment invariant); the stub ignores the prompt.
+    monkeypatch.setattr(V, "_load_baseline_prompts", lambda: ["baseline prompt"])
 
 
 def test_fit_produces_manifold(tmp_path: Path) -> None:

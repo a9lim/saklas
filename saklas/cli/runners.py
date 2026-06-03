@@ -484,40 +484,6 @@ def _require_model(args: argparse.Namespace) -> None:
         sys.exit(2)
 
 
-def _run_clone(args: argparse.Namespace) -> None:
-    _require_model(args)
-    from saklas.io.cloning import (
-        CorpusTooShortError, CorpusTooLongError, InsufficientPairsError,
-    )
-    from saklas.io.selectors import _all_concepts
-
-    for c in _all_concepts():
-        if c.name == args.name and c.namespace != "local":
-            print(
-                f"warning: '{args.name}' exists in namespace '{c.namespace}'; "
-                f"reference this as 'local/{args.name}' to disambiguate",
-                file=sys.stderr,
-            )
-            break
-
-    _print_startup(args)
-    session = _make_session(args)
-    _print_model_info(session)
-
-    try:
-        canonical, _profile = session.clone_from_corpus(
-            args.corpus_path,
-            name=args.name,
-            n_pairs=args.n_pairs,
-            seed=args.seed,
-            force=args.force,
-        )
-    except (CorpusTooShortError, CorpusTooLongError, InsufficientPairsError) as e:
-        print(f"clone failed: {e}", file=sys.stderr)
-        sys.exit(1)
-    print(f"Cloned persona -> local/{canonical}")
-
-
 def _run_extract(args: argparse.Namespace) -> None:
     _require_model(args)
     import pathlib
@@ -1565,18 +1531,15 @@ def _run_manifold_discover(args: argparse.Namespace) -> None:
 
 
 def _run_manifold_generate(args: argparse.Namespace) -> None:
-    """``saklas manifold generate`` — author + LLM-fill a discover folder.
+    """``saklas manifold generate`` -- author + LLM-fill a discover folder (A2).
 
-    Two-step end-to-end: load the model, run
-    :meth:`SaklasSession.generate_statements` to fill per-concept
-    corpora with the anti-allegory K-tuple generator, then write the
-    folder via :func:`create_discover_manifold_folder`.  The folder is
-    ready for ``manifold discover`` to fit; the two-step split
-    keeps the failure modes legible (a flaky generation run leaves
-    inspectable corpora) and lets the user review the statements before
-    paying for the discover fit.
+    Two-step end-to-end: load the model, run :meth:`SaklasSession.generate_responses`
+    to fill each node's conversational corpus (in-character responses to the
+    shared baseline prompts), then leave the folder ready for ``manifold
+    discover`` to fit.  The two-step split keeps failure modes legible (a flaky
+    generation leaves inspectable corpora) and lets the user review before
+    paying for the fit.
     """
-    from saklas.io.atomic import write_json_atomic
     from saklas.io.manifolds import (
         ManifoldFormatError,
         append_discover_manifold_node,
@@ -1587,8 +1550,8 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     _require_model(args)
     if len(args.concepts) < 2:
         print(
-            "manifold generate: need >= 2 concepts (shared-scenario "
-            "structure is meaningless with one)",
+            "manifold generate: need >= 2 concepts (a discover manifold is "
+            "meaningless with one node)",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -1599,26 +1562,29 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
         namespace, name = name.split("/", 1)
 
     folder = manifold_dir(namespace, name)
-    # ``-f/--force`` is a clean slate; the default *resumes* — fills any
-    # missing node corpora and appends concepts new to the roster (locked
-    # onto the saved scenarios), so a run killed half-way picks up where
-    # it left off and adding a node is a plain re-run.
+    # ``-f/--force`` is a clean slate; the default *resumes* -- fills any
+    # missing node corpora and appends concepts new to the roster, so a run
+    # killed half-way picks up where it left off and adding a node is a re-run.
     if args.force and (folder / "manifold.json").exists():
         import shutil
         shutil.rmtree(folder)
 
-    # ``--role-per-node``: the concept slug doubles as that node's
-    # assistant-role substitution at fit time (engine validates the slug;
-    # an unsupported family raises later at the matching discover/fit call).
+    # ``--role-per-node``: the concept slug doubles as that node's assistant-role
+    # substitution -- a persona manifold pooled in role-baselined space (the
+    # explicit role overrides the kind-derived elicitation label at both
+    # generation and capture).  Otherwise the node\'s ``kind`` drives a
+    # generation-only elicitation role and capture stays standard (swap-back).
     node_roles: dict[str, str | None] | None = None
     if getattr(args, "role_per_node", False):
         node_roles = {concept: concept for concept in args.concepts}
+    node_kinds: dict[str, str | None] = {c: args.kind for c in args.concepts}
 
-    # Plan first — no model load needed to learn there is nothing to do.
+    # Plan first -- no model load needed to learn there is nothing to do.
     try:
         plan = plan_discover_generation(
             folder, name, args.description,
-            fit_mode="pca", labels=list(args.concepts), node_roles=node_roles,
+            fit_mode="pca", labels=list(args.concepts),
+            node_roles=node_roles, node_kinds=node_kinds,
         )
     except ManifoldFormatError as e:
         print(f"manifold generate failed: {e}", file=sys.stderr)
@@ -1628,7 +1594,7 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     if not plan.pending:
         print(
             f"manifold {namespace}/{name} already complete ({n_total} nodes)"
-            f" — pass -f/--force to regenerate"
+            f" -- pass -f/--force to regenerate"
         )
         return
     if plan.resumed and len(plan.pending) < n_total:
@@ -1645,47 +1611,27 @@ def _run_manifold_generate(args: argparse.Namespace) -> None:
     _print_model_info(session)
 
     print(
-        f"generating {args.n_scenarios} scenarios + "
-        f"{args.statements_per_concept} statements per (scenario × concept) "
-        f"cell for {len(plan.pending)} concept(s)..."
+        f"generating {args.samples_per_prompt} response(s) per baseline prompt "
+        f"for {len(plan.pending)} concept(s)..."
     )
-    captured_scenarios: list[str] = []
     try:
-        session.generate_statements(
-            list(plan.pending),
-            scenarios=list(plan.scenarios) if plan.scenarios is not None else None,
-            n_scenarios=args.n_scenarios,
-            statements_per_cell=args.statements_per_concept,
-            on_progress=lambda m: print(f"  {m}"),
-            on_scenarios=captured_scenarios.extend,
-            on_corpus=lambda label, stmts: append_discover_manifold_node(
-                folder, plan.index_of[label], label, stmts,
-            ),
-        )
-    except ValueError as e:
+        for concept in plan.pending:
+            gen_roles = {concept: concept} if node_roles else None
+            corpora = session.generate_responses(
+                [concept], [args.kind],
+                roles=gen_roles,
+                samples_per_prompt=args.samples_per_prompt,
+                on_progress=lambda m: print(f"  {m}"),
+            )
+            append_discover_manifold_node(
+                folder, plan.index_of[concept], concept, corpora[concept],
+            )
+    except (ValueError, RuntimeError) as e:
         print(f"manifold generate failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Record scenario provenance on the first run; a resume keeps the
-    # already-locked ``scenarios.json``.  The canonical ``"scenarios"``
-    # key (vector-pipeline convention) plus generator metadata.
-    if plan.scenarios is None:
-        write_json_atomic(
-            folder / "scenarios.json",
-            {
-                "scenarios": captured_scenarios,
-                "generator": "session.generate_statements",
-                "n_scenarios": args.n_scenarios,
-                "statements_per_concept": args.statements_per_concept,
-                "concepts": list(plan.index_of),
-                "model_id": session.model_id,
-            },
-        )
-
     print(f"wrote {namespace}/{name} ({n_total} nodes)")
-    print(
-        f"  -> run `saklas manifold discover {namespace}/{name}` to fit"
-    )
+    print(f"  -> run `saklas manifold discover {namespace}/{name}` to fit")
 
 
 def _split_manifold_ns_name(raw: str) -> tuple[str, str]:
@@ -2067,7 +2013,6 @@ def _run_manifold(args: argparse.Namespace) -> None:
 _SUBSPACE_RUNNERS = {
     "extract":  _run_extract,
     "merge":    _run_merge,
-    "clone":    _run_clone,
     "compare":  _run_compare,
     "why":      _run_why,
     "transfer": _run_transfer,

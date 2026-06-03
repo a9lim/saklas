@@ -2,7 +2,7 @@
 
 Six-verb root parser
 (`tui`/`serve`/`subspace`/`manifold`/`experiment`/`config`). `subspace` is the
-flat-artifact computation surface (extract/merge/clone/compare/why/transfer);
+flat-artifact computation surface (extract/merge/compare/why/transfer);
 `manifold` owns the steering-manifold tree. There is no `pack` verb and no `vector`
 alias — pack distribution folded into the manifold artifact, so install via
 `manifold install` and export via `manifold export gguf`. Split across:
@@ -17,7 +17,7 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
 
 ## Verb nesting
 
-- `subspace` = flat-artifact computation (extract/merge/clone/compare/why/transfer)
+- `subspace` = flat-artifact computation (extract/merge/compare/why/transfer)
   via `_SUBSPACE_VERBS` / `_SUBSPACE_RUNNERS` (`_run_subspace`).
 - `manifold` = the steering-manifold tree
   (`fit`/`discover`/`generate`/`merge`/`install`/`search`/`push`/`rm`/
@@ -103,8 +103,6 @@ concept axes); an unfitted one is skipped with a one-line hint.
   method.
 - `subspace merge`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`. Lands
   a corpus-less baked manifold via `merge_into_manifold`.
-- `subspace clone`: `corpus_path`, `-N/--name` (required), `-m/--model`,
-  `-n/--n-pairs` (90), `--seed`, `-f`.
 - `subspace compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,
   `--metric {euclidean,mahalanobis}` (default `None` → resolves to `mahalanobis`),
   `--ridge-scale` (1.0, mahalanobis only). No `--legacy`. 1-arg ranks all installed
@@ -130,10 +128,14 @@ concept axes); an unfitted one is skipped with a one-line hint.
   folder (writes any CLI hyperparam override into `manifold.json` atomically
   *before* the fit; `--max-subspace-dim` caps the per-layer PCA dim,
   argparse-default `None` → engine 64). `generate <name> --concepts C...
-  [--n-scenarios N] [--statements-per-concept K] [--seed INT] [--role-per-node]
-  [-m] [-f]` LLM-authors a discover folder via `session.generate_statements`
-  (`--role-per-node` doubles each concept slug as that node's assistant-role
-  substitution → a persona manifold). `install <target> [-a NS/N] [-f]` pulls an HF
+  [--kind {abstract,concrete}] [--samples-per-prompt K] [--seed INT]
+  [--role-per-node] [-m] [-f]` LLM-authors a discover folder via
+  `session.generate_responses` — each node's corpus is in-character responses to
+  the shared A2 baseline prompts (`--kind` selects the system template +
+  elicitation role label; `--samples-per-prompt` is responses per baseline prompt,
+  default 1). `--role-per-node` doubles each concept slug as that node's
+  assistant-role substitution → a persona manifold. `install <target> [-a NS/N]
+  [-f]` pulls an HF
   manifold or copies a local folder (and salvages a legacy saklas-pack repo).
   `export gguf <name> [-m MODEL] [-o PATH] [--model-hint HINT]` folds a fitted
   2-node `pca` manifold to a vector and writes a control-vector GGUF. The only

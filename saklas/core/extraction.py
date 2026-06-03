@@ -63,7 +63,7 @@ class ModelHandle(Protocol):
     def _run_generator(
         self, system_msg: str, prompt: str, max_new_tokens: int,
     ) -> str:
-        """Single-turn LLM call shared by scenario and pair generators.
+        """Single-turn LLM call backing conversational corpus generation.
 
         Underscore-prefixed because the override site is per-session
         (subclass-and-override is the established test pattern).  The
@@ -72,25 +72,15 @@ class ModelHandle(Protocol):
         """
         ...
 
-    def generate_scenarios(
-        self,
-        concept: str,
-        baseline: str | None = None,
-        n: int = ...,
-        *,
-        on_progress: Callable[[str], None] | None = None,
-        role: str | None = None,
-    ) -> list[str]: ...
-
-    def generate_statements(
+    def generate_responses(
         self,
         concepts: list[str],
+        kinds: list[str | None],
         *,
-        scenarios: list[str] | None = None,
-        n_scenarios: int = ...,
-        statements_per_cell: int = ...,
+        roles: dict[str, str | None] | None = None,
+        samples_per_prompt: int = ...,
+        max_new_tokens: int = ...,
         on_progress: Callable[[str], None] | None = None,
-        role: str | None = None,
     ) -> dict[str, list[str]]: ...
 
 
@@ -265,7 +255,9 @@ class ManifoldExtractionPipeline:
         # ``_encode_and_capture_all`` only consults it when ``role`` is set.
         model_type = getattr(getattr(model, "config", None), "model_type", None)
         node_roles = mf._roles_padded()
+        node_kinds = mf._kinds_padded()
         any_role = any(r is not None for r in node_roles)
+        any_kind = any(k is not None for k in node_kinds)
         if any_role and model_type is None:
             raise ValueError(
                 f"manifold {mf.name!r} carries per-node roles but model "
@@ -293,21 +285,25 @@ class ManifoldExtractionPipeline:
             fit_layers = list(range(n_layers))
             feature_space = "raw"
 
-        # 1. Per-node centroids (one forward pass per statement) — shared
-        #    between authored and discover paths.  Per-node role rides
-        #    through ``compute_node_centroid`` so each node's centroid is
-        #    pooled under its own assistant-role substitution.  A ``None``
-        #    role goes through the standard assistant baseline branch
-        #    (same byte-identical path as today's non-role manifolds).
+        # 1. Per-node centroids (one forward pass per response) — shared
+        #    between authored and discover paths.  Conversational (4.0 / A2):
+        #    each node corpus is a list of in-character responses to the shared
+        #    baseline prompts, pooled as ``[user: prompt, assistant: response]``
+        #    pairs (response[i] -> prompt[i % k]).  Per-node role rides through
+        #    ``compute_node_centroid`` only when set (persona-baselined fit);
+        #    a ``None`` role pools under the standard assistant (swap-back)
+        #    baseline.
+        from saklas.core.vectors import _load_baseline_prompts
+        baseline_prompts = _load_baseline_prompts()
         per_node: list[dict[int, torch.Tensor]] = []
-        for (label, statements), role in zip(node_groups, node_roles):
+        for (label, responses), role in zip(node_groups, node_roles):
             role_note = f" [role={role}]" if role else ""
             _progress(
                 f"Pooling node '{label}'{role_note} "
-                f"({len(statements)} statements)..."
+                f"({len(responses)} responses)..."
             )
             per_node.append(compute_node_centroid(
-                model, tokenizer, layers, device, statements,
+                model, tokenizer, layers, device, responses, baseline_prompts,
                 role=role, model_type=model_type,
             ))
 
@@ -645,6 +641,7 @@ class ManifoldExtractionPipeline:
             layers=layer_subs,
             feature_space=feature_space,
             node_roles=list(node_roles),
+            node_kinds=list(node_kinds),
             explained_variance=explained_variance,
             mahalanobis_share=mahalanobis_share,
             origin=origin,
@@ -681,6 +678,10 @@ class ManifoldExtractionPipeline:
             # order matches ``node_labels``; a missing entry means
             # ``None`` (standard assistant baseline).
             metadata["node_roles"] = list(node_roles)
+        if any_kind:
+            # Per-node kind rides into the sidecar for inspector/provenance,
+            # ``node_labels`` order; absent when no node carries a kind.
+            metadata["node_kinds"] = list(node_kinds)
         metadata.update(discover_metadata)
         save_manifold(manifold, tensor_path, metadata)
         manifold.metadata.update(metadata)

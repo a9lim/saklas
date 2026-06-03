@@ -29,11 +29,6 @@ from saklas.core.session import (
 )
 from saklas.core.steering_expr import SteeringExprError
 from saklas.io.hf_manifolds import ManifoldInstallConflict
-from saklas.io.cloning import (
-    CorpusTooLongError,
-    CorpusTooShortError,
-    InsufficientPairsError,
-)
 from saklas.io.gguf_io import GGUFNotInstalled
 from saklas.io.hf import HFError
 from saklas.io.merge import MergeError
@@ -80,10 +75,6 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (HFError, 502),
     # io/hf_manifolds.py
     (ManifoldInstallConflict, 409),
-    # io/cloning.py
-    (CorpusTooShortError, 400),
-    (CorpusTooLongError, 400),
-    (InsufficientPairsError, 422),
     # io/gguf_io.py
     (GGUFNotInstalled, 400),
     # io/merge.py

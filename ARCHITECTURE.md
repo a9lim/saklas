@@ -69,7 +69,7 @@ ships an already-fit tensor.
 `core/profile.py` — **`Profile`**: a typed `dict[int, Tensor]` wrapper (per-layer
 baked steering direction) with `merged`, `projected_away`, `cosine_similarity`,
 and safetensors `save`/`load`. It is the in-memory steering-vector shape — the
-folded view of a 2-node manifold, or an ad-hoc `extract`/`clone`/`merge` /
+folded view of a 2-node manifold, or an ad-hoc `extract`/`merge` /
 projection result — but it is no longer a *storage* form for a concept. The baked
 tensor's per-layer *magnitude* carries the layer's share (§3.7).
 
@@ -111,12 +111,12 @@ and port pre-4.0 packs.)
 
 ```
 ~/.saklas/
-  neutral_statements.json
+  neutral_statements.json                          # organic responses to the baseline prompts
+  baseline_prompts.json                            # user override for the shared A2 prompts
   manifolds/<ns>/<name>/
-    manifold.json                                  # name, source, fit_mode, files{sha256},
+    manifold.json                                  # name, source, fit_mode, files{sha256}, per-node {label,kind,role?},
                                                    #   + domain/coords (authored) | hyperparams (discover)
-    nodes/NN_<label>.json                          # one statement list per node (authored/discover)
-    scenarios.json                                 # discover-only: provenance of `generate`
+    nodes/NN_<label>.json                          # one response list per node (response[i] ↔ baseline_prompt[i % k])
     <safe_model>.safetensors (+ .json sidecar)     # fitted per-layer subspaces; discover/baked
                                                    #   also carry node_coords (the derived layout)
     <safe_model>_sae-<rel>.safetensors             # SAE-space fit
@@ -172,21 +172,23 @@ one fp32 mean per layer.
 
 ### 3.2 A steering vector as a 2-node fit
 
-`session.extract(concept, baseline)`:
+`session.extract(concept, baseline, *, kind="abstract")`:
 
-1. Splits the composite (`angry.calm` → pos `angry`, neg `calm`; a monopolar
-   `agentic` synthesizes neg = `the_opposite_of_agentic`).
-2. Generates the two pole corpora (`generate_scenarios` + `generate_statements`,
-   §3.10) unless a cached folder exists.
+1. Splits the composite (`angry.calm` → pos `angry`, neg `calm`). A **monopolar**
+   concept (`baseline=None`, a 1-node-vs-neutral fit) is deferred in 4.0 and raises
+   `NotImplementedError` — bipolar only.
+2. Generates the two pole corpora via `generate_responses` (§3.10) — in-character
+   responses to the shared baseline prompts, one corpus per pole — unless a cached
+   folder exists.
 3. Authors a discover-`pca` folder via `create_discover_manifold_folder` with
-   `node_corpora = {pos_label: [...], neg_label: [...]}` and
+   `node_corpora = {pos_label: [...], neg_label: [...]}`, `node_kinds`, and
    `hyperparams = {"max_dim": 1, "var_threshold": 0.7}` — so the derived intrinsic
    dim is 1 and the fit is a rank-1 flat subspace.
 4. Fits via `ManifoldExtractionPipeline` and returns `(canonical_name,
    folded_vector_directions(manifold))`.
 
-`extract_vector_from_corpora` is the corpus-in sibling (cloning, hand-authored
-pairs — skips generation). Both emit `VectorExtracted`; the `Profile` they return
+`extract_vector_from_corpora` is the corpus-in sibling (hand-authored pairs —
+skips generation). Both emit `VectorExtracted`; the `Profile` they return
 is the folded view, not a separately stored tensor.
 
 `folded_vector_directions(manifold)` reverses the fold: `{L: δ̂_L · share_L}`, the
@@ -381,22 +383,27 @@ is fail-fast (`SaeCoverageError` before the pooling loop). The SAE branch still
 whitens with the residual-stream whitener (the centroids are decoded back to model
 space before the fit).
 
-### 3.10 Statement generation
+### 3.10 Conversational corpus generation (A2)
 
-`session.generate_statements(concepts, *, scenarios=None, n_scenarios,
-statements_per_cell, on_scenarios=None, on_corpus=None, neutrals=False,
-role=None)` is the unified corpus generator. One LLM call writes shared
-scenarios, then one call per `(scenario, concept)` cell fills the corpus.
-Scenario-sharing across the row is load-bearing — without it per-concept
-centroids mix concept signal with scenario signal, and discover layouts surface
-scenario as the dominant axis. A literal-concept (anti-allegory) directive is
-present in every prompt builder, keeping non-human axes (deer/wolf, brick/
-feather) literal rather than collapsing into human-social metaphor (tests assert
-its presence, not byte-identity). Returns `{concept: [statements]}`. The vector
-path calls it with `[pos, neg]` and lands the two corpora as the manifold's two
-node groups; discover authoring (`manifold generate`, the HTTP route) wraps it
-into a freshly written discover folder. `on_scenarios`/`on_corpus` are streaming
-sinks the resumable discover writers (`io/manifolds.py`) use for big rosters.
+`session.generate_responses(concepts, kinds, *, roles=None, samples_per_prompt=1,
+max_new_tokens=256, on_progress=None)` is the unified corpus generator. For each
+`(concept, kind)` the model answers the **shared baseline prompts**
+(`saklas/data/baseline_prompts.json`, 64) *in character*: the concept rides a
+system prompt (`_system_for`, by kind — abstract → "someone {c}", concrete →
+"{art} {c}") and a swapped assistant-role elicitation label (`_role_for`). It
+always role-swaps (no system-only fallback). Responses are emitted samples-outer /
+prompts-inner, so `response[i] ↔ baseline_prompt[i % k]` — the alignment
+`compute_node_centroid` and the node corpus files assume (length a multiple of
+`k`). The shared prompts hold topic common-mode across nodes, replacing the old
+per-manifold scenario set (so no `scenarios.json` is written). Returns
+`{concept: [response, ...]}`. The vector path calls it with `[pos, neg]`;
+discover authoring (`manifold generate`, the HTTP route) loops it per node, writing
+each via the resumable discover writers (`io/manifolds.py`).
+`session.generate_neutral_responses` is the neutral sibling (empty system, standard
+label) that fills `neutral_statements.json` with organic responses to the same
+prompts. Extraction pools the swapped-back `[user, assistant]` pairs in
+standard-assistant space (the node `role`, when set, overrides the label for a
+persona-baselined fit).
 
 ---
 
@@ -416,7 +423,7 @@ composes the unified backend:
 
 **Resolving a direction (manifold-first).** A plain vector term resolves through
 `session._ensure_profile_registered`, in order: (1) an in-memory baked direction
-already in `_profiles` (ad-hoc `extract`/`clone`/`merge`/projection results); (2) a
+already in `_profiles` (ad-hoc `extract`/`merge`/projection results); (2) a
 fitted 2-node `pca` manifold on disk — `_try_fold_manifold` loads it
 (`_ensure_manifold_loaded`) and folds via `folded_vector_directions`, memoizing the
 result; (3) a stale (`< PACK_FORMAT_VERSION`) legacy `vectors/<ns>/<name>/` folder

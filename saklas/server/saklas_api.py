@@ -107,28 +107,9 @@ class ExtractRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class ExtractPreviewRequest(BaseModel):
-    """Request the LLM-generated contrastive pairs for review/edit.
-
-    Runs the scenario + pair generation half of the extraction pipeline
-    without committing an extraction, so the webui can show and edit the
-    pairs before they are fitted into a vector.
-    """
-
-    concept: str
-    baseline: str | None = None
-    n_pairs: int | None = None
-    n_scenarios: int | None = None
-
-
 class LoadVectorRequest(BaseModel):
     name: str
     source_path: str
-
-
-class ScoreProbeRequest(BaseModel):
-    text: str
-    probes: list[str] | None = None
 
 
 class WSSamplingParams(BaseModel):
@@ -292,22 +273,6 @@ class MergeVectorRequest(BaseModel):
     """
     name: str
     expression: str
-
-
-class CloneVectorRequest(BaseModel):
-    """Body for ``POST /saklas/v1/sessions/{id}/vectors/clone``.
-
-    Mirrors ``saklas vector clone`` flags: ``corpus_path`` points at a
-    one-utterance-per-line text file; ``n_pairs`` and ``seed`` carry
-    through to :func:`saklas.io.cloning.clone_from_corpus`. ``baseline``
-    is currently unused by the underlying clone path but reserved for
-    symmetry with extract.
-    """
-    name: str
-    corpus_path: str
-    n_pairs: int = 90
-    seed: int | None = None
-    baseline: str | None = None
 
 
 class ExperimentFanRequest(BaseModel):
@@ -1462,85 +1427,6 @@ def register_saklas_routes(app: FastAPI) -> None:
             "progress": progress_msgs,
         }
 
-    @app.post("/saklas/v1/sessions/{session_id}/extract/preview")
-    async def extract_preview(
-        session_id: str, req: ExtractPreviewRequest, request: Request,
-    ):
-        """Generate contrastive pairs for review/edit, without extracting.
-
-        Runs ``generate_scenarios`` + ``generate_statements`` and recovers
-        ``(positive, negative)`` pairs by zipping the scenario-aligned
-        per-concept corpora.  The webui shows them in an editable
-        table; the user edits, then POSTs the result back to
-        ``/extract`` as ``source: {pairs: [...]}`` — which skips
-        generation entirely.  Side-effect-free: no ``statements.json``
-        is written here.
-        """
-        _resolve_session_id(session, session_id)
-        concept = req.concept.strip()
-        if not concept:
-            raise HTTPException(400, "concept must not be empty")
-        baseline = (req.baseline or "").strip() or None
-
-        def _generate(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            # Engine defaults: 9 scenarios × 5 statements/cell = 45.
-            n_scenarios = (
-                req.n_scenarios
-                if req.n_scenarios and req.n_scenarios > 0
-                else 9
-            )
-            scenarios = session.generate_scenarios(
-                concept, baseline, n_scenarios, on_progress=on_progress,
-            )
-            # ``n_pairs`` is a total-pair budget; map onto the per-cell
-            # parameterization the engine speaks now.  Ceil-div mirrors
-            # the legacy ``generate_pairs`` derivation.
-            if req.n_pairs and req.n_pairs > 0 and scenarios:
-                statements_per_cell = max(
-                    1, -(-req.n_pairs // len(scenarios))
-                )
-            else:
-                statements_per_cell = 5
-            neg_slot = baseline if baseline is not None else (
-                f"the_opposite_of_{concept}"
-            )
-            corpora = session.generate_statements(
-                [concept, neg_slot],
-                scenarios=list(scenarios),
-                statements_per_cell=statements_per_cell,
-                on_progress=on_progress,
-            )
-            pos_lines = corpora[concept]
-            neg_lines = corpora[neg_slot]
-            pairs = list(zip(pos_lines, neg_lines))
-            # Honor the ``n_pairs`` budget if the cell parameterization
-            # over-shot (ceil-div rounded up).
-            if req.n_pairs and req.n_pairs > 0:
-                pairs = pairs[: req.n_pairs]
-            return {
-                "concept": concept,
-                "baseline": baseline,
-                "scenarios": list(scenarios),
-                "pairs": [
-                    {"positive": pos, "negative": neg} for pos, neg in pairs
-                ],
-            }
-
-        accept = request.headers.get("accept", "application/json")
-        if "text/event-stream" in accept:
-            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                return await asyncio.to_thread(_generate, on_progress)
-
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="preview failed",
-                log_message=f"extract preview failed for session={session_id}",
-            )
-
-        async with session.lock:
-            return await asyncio.to_thread(_generate, lambda _msg: None)
-
     @app.post("/saklas/v1/sessions/{session_id}/vectors/merge")
     async def merge_vector(session_id: str, req: MergeVectorRequest):
         """Merge an expression of installed directions into a baked manifold.
@@ -1589,66 +1475,6 @@ def register_saklas_routes(app: FastAPI) -> None:
             profile = await asyncio.to_thread(_load_folded)
             session.steer(req.name, profile)
         return _profile_to_json(req.name, profile)
-
-    @app.post("/saklas/v1/sessions/{session_id}/vectors/clone")
-    async def clone_vector(session_id: str, req: CloneVectorRequest, request: Request):
-        """Corpus-based persona clone, optionally streamed via SSE.
-
-        Mirrors :meth:`SaklasSession.clone_from_corpus`. JSON when the
-        client sends ``Accept: application/json`` (default); SSE
-        progress when ``Accept: text/event-stream`` — same shape as
-        the ``/extract`` endpoint, except clone has no native progress
-        stream so the only events emitted are ``done`` / ``error``.
-        """
-        _resolve_session_id(session, session_id)
-
-        accept = request.headers.get("accept", "application/json")
-        wants_sse = "text/event-stream" in accept
-
-        def _do_clone() -> tuple[str, "Profile"]:
-            return session.clone_from_corpus(
-                req.corpus_path,
-                req.name,
-                n_pairs=req.n_pairs,
-                seed=req.seed,
-            )
-
-        if wants_sse:
-            async def _job(_on_progress: ProgressCallback) -> dict[str, Any]:
-                canonical, profile = await asyncio.to_thread(_do_clone)
-                session.steer(req.name, profile)
-                return {
-                    "done": True,
-                    "canonical": canonical,
-                    "profile": _profile_to_json(req.name, profile),
-                }
-
-            def _format_clone_error(e: Exception) -> dict[str, Any] | None:
-                if isinstance(e, FileNotFoundError):
-                    return {
-                        "message": f"corpus not found: {req.corpus_path}",
-                        "code": "FileNotFoundError",
-                    }
-                return None
-
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="clone failed",
-                log_message=f"clone failed for session={session_id}",
-                error_formatter=_format_clone_error,
-            )
-
-        async with session.lock:
-            try:
-                canonical, profile = await asyncio.to_thread(_do_clone)
-            except FileNotFoundError as e:
-                raise HTTPException(404, str(e))
-            session.steer(req.name, profile)
-        return {
-            "canonical": canonical,
-            "profile": _profile_to_json(req.name, profile),
-        }
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}/diagnostics")
     def vector_diagnostics(session_id: str, name: str):

@@ -190,6 +190,27 @@ def _validate_node_role(name: str, label: str, role: Any) -> str | None:
     return role
 
 
+_NODE_KINDS = ("abstract", "concrete")
+
+
+def _validate_node_kind(name: str, label: str, kind: Any) -> str | None:
+    """Validate an optional per-node ``kind`` field.
+
+    ``None`` / missing means "unspecified".  A non-empty value must be one of
+    :data:`_NODE_KINDS` (``"abstract"`` / ``"concrete"``).  Generation-time
+    provenance only — it selects the system template and elicitation role label
+    when authoring a node's conversational corpus, and never feeds the fit.
+    """
+    if kind is None:
+        return None
+    if not isinstance(kind, str) or kind not in _NODE_KINDS:
+        raise ManifoldFormatError(
+            f"manifold {name!r} node {label!r} kind {kind!r} invalid; "
+            f"must be one of {_NODE_KINDS}"
+        )
+    return kind
+
+
 class ManifoldFormatError(ValueError, SaklasError):
     """Raised when a manifold folder is malformed or fails integrity."""
 
@@ -306,6 +327,9 @@ class ManifoldSidecar:
     # round-trip through the folder to know which role each node was
     # pooled under.
     node_roles: list[str | None] = field(default_factory=list)
+    # Per-node conceptual kind ("abstract"/"concrete"), ``node_labels`` order.
+    # Mirrors ``node_roles``' independent-copy rationale; generation provenance.
+    node_kinds: list[str | None] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "ManifoldSidecar":
@@ -330,6 +354,7 @@ class ManifoldSidecar:
             hyperparams=dict(data.get("hyperparams", {})),
             diagnostics=dict(data.get("diagnostics", {})),
             node_roles=list(data.get("node_roles", [])),
+            node_kinds=list(data.get("node_kinds", [])),
             components=data.get("components"),
         )
 
@@ -389,6 +414,12 @@ class ManifoldFolder:
     # semantically identical to today's behavior — the centroid pooling
     # just goes through the default chat-template branch.
     node_roles: list[str | None] = field(default_factory=list)
+    # Per-node conceptual ``kind`` — ``"abstract"`` (trait) or ``"concrete"``
+    # (entity), aligned with ``node_labels`` index-by-index.  ``None`` =
+    # unspecified.  Generation-time only (system template + elicitation role
+    # label); never consumed by the fit.  An all-``None`` list is byte-identical
+    # to a folder authored before the distinction existed.
+    node_kinds: list[str | None] = field(default_factory=list)
     # Category tags, mirroring :attr:`saklas.io.packs.PackMetadata.tags`.
     # Carried so category-grouped probe bootstrap (``load_defaults`` ->
     # ``bootstrap_probes(categories=...)``) keeps working once a steering
@@ -466,6 +497,7 @@ class ManifoldFolder:
         node_labels: list[str] = []
         node_coords: list[list[float]] = []
         node_roles: list[str | None] = []
+        node_kinds: list[str | None] = []
         hyperparams: dict[str, Any] = {}
         domain_spec: dict[str, Any]
 
@@ -516,6 +548,7 @@ class ManifoldFolder:
                 node_labels.append(label)
                 node_coords.append([float(c) for c in coords])
                 node_roles.append(_validate_node_role(name, label, entry.get("role")))
+                node_kinds.append(_validate_node_kind(name, label, entry.get("kind")))
             _warn_authoring_quality(name, domain, node_coords)
         elif fit_mode == "baked":
             # Baked mode: a pre-fitted, corpus-less artifact (merge output /
@@ -557,6 +590,7 @@ class ManifoldFolder:
                     )
                 node_labels.append(label)
                 node_roles.append(_validate_node_role(name, label, entry.get("role")))
+                node_kinds.append(_validate_node_kind(name, label, entry.get("kind")))
         else:
             # Discover mode: no ``domain`` field, no per-node ``coords``.
             # The fit pipeline derives coords per-model from the
@@ -595,6 +629,7 @@ class ManifoldFolder:
                     )
                 node_labels.append(label)
                 node_roles.append(_validate_node_role(name, label, entry.get("role")))
+                node_kinds.append(_validate_node_kind(name, label, entry.get("kind")))
 
         if len(set(node_labels)) != len(node_labels):
             raise ManifoldFormatError(
@@ -636,6 +671,7 @@ class ManifoldFolder:
             hyperparams=hyperparams,
             source=str(data.get("source", "local")),
             node_roles=node_roles,
+            node_kinds=node_kinds,
             tags=[str(t) for t in raw_tags],
         )
 
@@ -748,6 +784,12 @@ class ManifoldFolder:
         # whether the field is missing or explicit-None — same shape.
         if any(r is not None for r in self.node_roles):
             h.update(_canonical_json(self.node_roles))
+        # Per-node kind selects the generation system template + elicitation
+        # role label, so it shapes the corpus a re-fit would pool — a kind edit
+        # must invalidate a cached fit.  All-``None`` hashes identically to a
+        # missing field (same legacy shape).
+        if any(k is not None for k in self.node_kinds):
+            h.update(_canonical_json(self.node_kinds))
         return h.hexdigest()
 
     # -- fitted tensors ----------------------------------------------------
@@ -800,23 +842,28 @@ class ManifoldFolder:
         if self.fit_mode == "authored":
             payload["domain"] = self.domain
             payload["nodes"] = [
-                _node_payload_authored(label, coords, role)
-                for label, coords, role in zip(
-                    self.node_labels, self.node_coords, self._roles_padded(),
+                _node_payload_authored(label, coords, role, kind)
+                for label, coords, role, kind in zip(
+                    self.node_labels, self.node_coords,
+                    self._roles_padded(), self._kinds_padded(),
                 )
             ]
         elif self.fit_mode == "baked":
             # Display domain + label-only nodes (no coords, no hyperparams).
             payload["domain"] = self.domain
             payload["nodes"] = [
-                _node_payload_discover(label, role)
-                for label, role in zip(self.node_labels, self._roles_padded())
+                _node_payload_discover(label, role, kind)
+                for label, role, kind in zip(
+                    self.node_labels, self._roles_padded(), self._kinds_padded(),
+                )
             ]
         else:
             payload["hyperparams"] = self.hyperparams
             payload["nodes"] = [
-                _node_payload_discover(label, role)
-                for label, role in zip(self.node_labels, self._roles_padded())
+                _node_payload_discover(label, role, kind)
+                for label, role, kind in zip(
+                    self.node_labels, self._roles_padded(), self._kinds_padded(),
+                )
             ]
         write_json_atomic(self.folder / "manifold.json", payload)
 
@@ -832,26 +879,42 @@ class ManifoldFolder:
             return list(self.node_roles)
         return [None] * len(self.node_labels)
 
+    def _kinds_padded(self) -> list[str | None]:
+        """Return ``node_kinds`` padded to ``len(node_labels)`` with ``None``s.
+
+        Defensive twin of :meth:`_roles_padded` — keeps the kind list aligned
+        with the labels under in-memory node-list mutations.
+        """
+        if len(self.node_kinds) == len(self.node_labels):
+            return list(self.node_kinds)
+        return [None] * len(self.node_labels)
+
 
 def _node_payload_authored(
-    label: str, coords: list[float], role: str | None,
+    label: str, coords: list[float], role: str | None, kind: str | None = None,
 ) -> dict[str, Any]:
     """Build one authored-mode node entry for ``manifold.json``.
 
-    ``role`` is emitted only when set, so the legacy ``{label, coords}``
-    shape stays byte-identical for non-role manifolds.
+    ``role`` / ``kind`` are emitted only when set, so the legacy
+    ``{label, coords}`` shape stays byte-identical for plain manifolds.
     """
     out: dict[str, Any] = {"label": label, "coords": [float(c) for c in coords]}
     if role is not None:
         out["role"] = role
+    if kind is not None:
+        out["kind"] = kind
     return out
 
 
-def _node_payload_discover(label: str, role: str | None) -> dict[str, Any]:
+def _node_payload_discover(
+    label: str, role: str | None, kind: str | None = None,
+) -> dict[str, Any]:
     """Build one discover-mode node entry for ``manifold.json``."""
     out: dict[str, Any] = {"label": label}
     if role is not None:
         out["role"] = role
+    if kind is not None:
+        out["kind"] = kind
     return out
 
 
@@ -979,6 +1042,8 @@ def _validate_authored_nodes(name: str, domain: Any, nodes: Any) -> None:
         # ``role`` is optional; validate the slug shape when set, no-op
         # otherwise.  Family-unsupported is a fit-time concern.
         _validate_node_role(name, label, entry.get("role"))
+        # ``kind`` is optional; validate the enum when set, no-op otherwise.
+        _validate_node_kind(name, label, entry.get("kind"))
         labels.append(label)
     if len(set(labels)) != len(labels):
         raise ManifoldFormatError(f"manifold {name!r} has duplicate node labels")
@@ -1064,6 +1129,7 @@ def create_manifold_folder(
         "nodes": [
             _node_payload_authored(
                 entry["label"], entry["coords"], entry.get("role"),
+                entry.get("kind"),
             )
             for entry in nodes
         ],
@@ -1142,6 +1208,7 @@ def create_discover_manifold_folder(
     node_corpora: dict[str, list[str]],
     hyperparams: Optional[dict[str, Any]] = None,
     node_roles: Optional[dict[str, str | None]] = None,
+    node_kinds: Optional[dict[str, str | None]] = None,
     scenarios: Optional[list[str]] = None,
 ) -> Path:
     """Author a fresh discover-mode manifold artifact folder on disk.
@@ -1201,6 +1268,16 @@ def create_discover_manifold_folder(
             )
         for label, role in node_roles.items():
             roles_resolved[label] = _validate_node_role(name, label, role)
+    kinds_resolved: dict[str, str | None] = dict.fromkeys(node_corpora)
+    if node_kinds is not None:
+        unknown_k = set(node_kinds) - set(node_corpora)
+        if unknown_k:
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} node_kinds carries labels "
+                f"not in node_corpora: {sorted(unknown_k)}"
+            )
+        for label, kind in node_kinds.items():
+            kinds_resolved[label] = _validate_node_kind(name, label, kind)
 
     folder = manifold_dir(namespace, name)
     if (folder / "manifold.json").exists():
@@ -1225,7 +1302,7 @@ def create_discover_manifold_folder(
         "fit_mode": fit_mode,
         "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
         "nodes": [
-            _node_payload_discover(label, roles_resolved[label])
+            _node_payload_discover(label, roles_resolved[label], kinds_resolved[label])
             for label in node_corpora
         ],
         "files": {},
@@ -1463,10 +1540,11 @@ def write_manifold_scenarios(folder: Path, scenarios: list[str]) -> None:
 
     Discover-mode generation provenance — the domains the node corpora
     were generated against — mirroring the ``{"scenarios": [...]}``
-    schema the vector extraction pipeline writes.  Both the all-at-once
-    :func:`create_discover_manifold_folder` (via its ``scenarios``
-    kwarg) and the streaming path (as the ``on_scenarios`` sink of
-    :meth:`SaklasSession.generate_statements`) route through here.
+    schema the discover pipeline writes.  The all-at-once
+    :func:`create_discover_manifold_folder` (via its ``scenarios`` kwarg)
+    routes through here; under 4.0 conversational generation the shared
+    baseline prompts are global, so generation no longer writes per-manifold
+    scenarios.
     """
     write_json_atomic(
         folder / "scenarios.json",
@@ -1483,6 +1561,7 @@ def init_discover_manifold_folder(
     labels: list[str],
     hyperparams: Optional[dict[str, Any]] = None,
     node_roles: Optional[dict[str, str | None]] = None,
+    node_kinds: Optional[dict[str, str | None]] = None,
 ) -> Path:
     """Create a discover-mode skeleton for *streaming* node writes.
 
@@ -1527,6 +1606,16 @@ def init_discover_manifold_folder(
             )
         for label, role in node_roles.items():
             roles_resolved[label] = _validate_node_role(name, label, role)
+    kinds_resolved: dict[str, str | None] = dict.fromkeys(labels)
+    if node_kinds is not None:
+        unknown_k = set(node_kinds) - set(labels)
+        if unknown_k:
+            raise ManifoldFormatError(
+                f"discover manifold {name!r} node_kinds carries labels "
+                f"not in the roster: {sorted(unknown_k)}"
+            )
+        for label, kind in node_kinds.items():
+            kinds_resolved[label] = _validate_node_kind(name, label, kind)
 
     folder = manifold_dir(namespace, name)
     if (folder / "manifold.json").exists():
@@ -1541,7 +1630,7 @@ def init_discover_manifold_folder(
         "fit_mode": fit_mode,
         "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
         "nodes": [
-            _node_payload_discover(label, roles_resolved[label])
+            _node_payload_discover(label, roles_resolved[label], kinds_resolved[label])
             for label in labels
         ],
         "files": {},
@@ -1616,15 +1705,20 @@ def _discover_manifest_payload(
     labels: list[str],
     roles: dict[str, str | None],
     hyperparams: Optional[dict[str, Any]],
+    kinds: Optional[dict[str, str | None]] = None,
 ) -> dict[str, Any]:
     """Build the label-only discover ``manifold.json`` dict."""
+    kinds = kinds or {}
     return {
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": description,
         "fit_mode": fit_mode,
         "hyperparams": _sanitize_hyperparams(fit_mode, hyperparams),
-        "nodes": [_node_payload_discover(label, roles.get(label)) for label in labels],
+        "nodes": [
+            _node_payload_discover(label, roles.get(label), kinds.get(label))
+            for label in labels
+        ],
         "files": {},
     }
 
@@ -1660,6 +1754,7 @@ def plan_discover_generation(
     labels: list[str],
     hyperparams: Optional[dict[str, Any]] = None,
     node_roles: Optional[dict[str, str | None]] = None,
+    node_kinds: Optional[dict[str, str | None]] = None,
 ) -> DiscoverGenerationPlan:
     """Ensure a streamable discover skeleton at ``folder`` covering every
     label in ``labels``, and report which node corpora still need writing.
@@ -1706,6 +1801,13 @@ def plan_discover_generation(
             f"discover manifold {name!r} node_roles carries labels not in "
             f"the roster: {sorted(unknown)}"
         )
+    kinds_in = node_kinds or {}
+    unknown_k = set(kinds_in) - set(labels)
+    if unknown_k:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} node_kinds carries labels not in "
+            f"the roster: {sorted(unknown_k)}"
+        )
 
     meta_path = folder / "manifold.json"
     nodes_dir = folder / "nodes"
@@ -1716,12 +1818,17 @@ def plan_discover_generation(
             label: _validate_node_role(name, label, roles_in.get(label))
             for label in labels
         }
+        kinds_resolved = {
+            label: _validate_node_kind(name, label, kinds_in.get(label))
+            for label in labels
+        }
         folder.mkdir(parents=True, exist_ok=True)
         nodes_dir.mkdir(exist_ok=True)
         write_json_atomic(
             meta_path,
             _discover_manifest_payload(
                 name, description, fit_mode, labels, roles_resolved, hyperparams,
+                kinds_resolved,
             ),
         )
         return DiscoverGenerationPlan(
@@ -1750,20 +1857,29 @@ def plan_discover_generation(
     existing_roles: dict[str, str | None] = {
         n["label"]: n.get("role") for n in existing_nodes
     }
+    existing_kinds: dict[str, str | None] = {
+        n["label"]: n.get("kind") for n in existing_nodes
+    }
     new_labels = [label for label in labels if label not in existing_labels]
     full_labels = existing_labels + new_labels
     if new_labels:
-        # Add-nodes: append the new labels (validating their roles) and
-        # rewrite manifold.json atomically.  Existing roles/hyperparams
+        # Add-nodes: append the new labels (validating their roles/kinds) and
+        # rewrite manifold.json atomically.  Existing roles/kinds/hyperparams
         # are preserved; description refreshes to the caller's value.
         merged_roles: dict[str, str | None] = dict(existing_roles)
+        merged_kinds: dict[str, str | None] = dict(existing_kinds)
         for label in new_labels:
             merged_roles[label] = _validate_node_role(
                 name, label, roles_in.get(label),
             )
+            merged_kinds[label] = _validate_node_kind(
+                name, label, kinds_in.get(label),
+            )
         data["description"] = description
         data["nodes"] = [
-            _node_payload_discover(label, merged_roles.get(label))
+            _node_payload_discover(
+                label, merged_roles.get(label), merged_kinds.get(label),
+            )
             for label in full_labels
         ]
         write_json_atomic(meta_path, data)
@@ -1902,16 +2018,15 @@ def merge_discover_manifolds(
     # per-source label order (matches how the source authored them).
     node_corpora: dict[str, list[str]] = {}
     node_roles: dict[str, str | None] = {}
+    node_kinds: dict[str, str | None] = {}
     for _ns, _name, mf in folders:
         groups = dict(mf.node_groups())
+        roles_padded = mf._roles_padded()
+        kinds_padded = mf._kinds_padded()
         for idx, label in enumerate(mf.node_labels):
             node_corpora[label] = list(groups.get(label, []))
-            role = (
-                mf.node_roles[idx]
-                if idx < len(mf.node_roles)
-                else None
-            )
-            node_roles[label] = role
+            node_roles[label] = roles_padded[idx]
+            node_kinds[label] = kinds_padded[idx]
 
     target_folder = manifold_dir(target_namespace, target_name)
     if target_folder.exists():
@@ -1930,6 +2045,7 @@ def merge_discover_manifolds(
         node_corpora=node_corpora,
         hyperparams=effective_hyperparams,
         node_roles=node_roles,
+        node_kinds=node_kinds,
     )
 
 
@@ -1960,6 +2076,7 @@ def update_manifold_folder(
         # don't carry the field.  ``_validate_authored_nodes`` already
         # checked the slug shape, so this is a pure copy.
         mf.node_roles = [entry.get("role") for entry in nodes]
+        mf.node_kinds = [entry.get("kind") for entry in nodes]
     mf.write_metadata()
     _, advisories = _load_with_advisories(folder)
     return folder, advisories
@@ -2455,6 +2572,7 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
         "node_labels": list(mf.node_labels),
         "node_coords": [list(c) for c in mf.node_coords],
         "node_roles": list(mf._roles_padded()),
+        "node_kinds": list(mf._kinds_padded()),
         "hyperparams": dict(mf.hyperparams),
         "fitted_models": fitted_models,
         "tensor_variants": tensor_variants,

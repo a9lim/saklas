@@ -259,17 +259,6 @@ class TestProbes:
         resp = client.delete("/saklas/v1/sessions/default/probes/missing")
         assert resp.status_code == 404
 
-    def test_score_probe_oneshot(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session._monitor.probe_names = ["happy"]
-        session._monitor.measure.return_value = {"happy": 0.42}
-        resp = client.post(
-            "/saklas/v1/sessions/default/probe",
-            json={"text": "hello world"},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["readings"]["happy"] == pytest.approx(0.42)
-
 
 # ---- extract -------------------------------------------------------------
 
@@ -897,48 +886,7 @@ class TestScoreSingleToken:
 # manifold tier's job, covered in test_steering_expr / test_manifold_role).
 
 
-# ---- extract preview + manifold routes ----------------------------------
-
-
-class TestExtractPreview:
-    def test_preview_returns_pairs(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.generate_scenarios.return_value = ["a quiet morning", "a storm"]
-
-        def _statements(concepts: Any, *args: Any, scenarios: Any = None,
-                        statements_per_cell: Any = None,
-                        on_progress: Any = None, **_kw: Any) -> Any:
-            # The route wraps generate_statements with two concepts
-            # ([positive, negative_slot]) over a shared scenario row.
-            assert concepts[0] == "calm"
-            assert concepts[1] == "anxious"
-            if on_progress:
-                on_progress("generating pairs")
-            return {
-                "calm": ["I feel calm.", "Steady hands."],
-                "anxious": ["I feel anxious.", "Shaking hands."],
-            }
-
-        session.generate_statements.side_effect = _statements
-        resp = client.post(
-            "/saklas/v1/sessions/default/extract/preview",
-            json={"concept": "calm", "baseline": "anxious"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["concept"] == "calm"
-        assert data["scenarios"] == ["a quiet morning", "a storm"]
-        assert data["pairs"][0] == {
-            "positive": "I feel calm.", "negative": "I feel anxious.",
-        }
-
-    def test_preview_rejects_empty_concept(self, session_and_client: Any) -> None:
-        _session, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/default/extract/preview",
-            json={"concept": "   "},
-        )
-        assert resp.status_code == 400
+# ---- manifold routes ----------------------------------------------------
 
 
 def _box1d_payload(name: str = "mood") -> dict[str, Any]:

@@ -73,7 +73,6 @@ def _add_logit_args(p: argparse.ArgumentParser) -> None:
 _SUBSPACE_VERBS: list[tuple[str, str]] = [
     ("extract",   "Extract a steering vector (a 2-node flat subspace)"),
     ("merge",     "Merge existing vectors into a new manifold"),
-    ("clone",     "Clone a persona from a text corpus"),
     ("compare",   "Cosine similarity between steering vectors"),
     ("why",       "Show which layers contribute most to a steering vector"),
     ("transfer",  "Transfer a probe from one model to another via Procrustes"),
@@ -248,16 +247,6 @@ def _build_vector_merge(p: argparse.ArgumentParser) -> None:
     p.add_argument("-f", "--force", action="store_true")
     p.add_argument("-s", "--strict", action="store_true")
     p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
-
-
-def _build_vector_clone(p: argparse.ArgumentParser) -> None:
-    p.add_argument("corpus_path", help="Path to a UTF-8 text file, one utterance per line")
-    p.add_argument("-N", "--name", required=True, help="Persona identifier (stored under local/<name>)")
-    p.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
-    p.add_argument("-n", "--n-pairs", dest="n_pairs", type=int, default=90)
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("-f", "--force", action="store_true")
-    p.set_defaults(quantize=None, device="auto", probes=None)
 
 
 def _build_vector_compare(p: argparse.ArgumentParser) -> None:
@@ -435,15 +424,14 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         "generate",
         help="Generate per-concept corpora and write a discover-mode manifold",
         description=(
-            "Ask the loaded model for shared situational scenarios that have "
-            "purchase for every concept on the list, then for each (scenario, "
-            "concept) cell write K first-person statements as a literal "
-            "instance of that concept under that scenario.  Writes a fresh "
-            "discover-mode manifold folder under "
+            "For every concept, have the loaded model answer the shared "
+            "baseline prompts *in character* (the concept rides the system "
+            "prompt + a kind-derived elicitation role), writing one corpus per "
+            "node.  Writes a fresh discover-mode manifold folder under "
             "~/.saklas/manifolds/<ns>/<name>/ ready for `saklas manifold "
-            "discover` to fit.  Scenario sharing across the row is "
-            "load-bearing — statement j of every concept came from the same "
-            "scenario, so the per-concept centroids stay comparable."
+            "discover` to fit.  The shared baseline prompts hold the topic "
+            "common-mode across nodes, so the per-concept centroids stay "
+            "comparable (response[i] aligns to baseline prompt[i % k])."
         ),
     )
     generate.add_argument("name", help="Manifold name (use ns/name for non-local)")
@@ -452,14 +440,17 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
         help="Concept slugs to generate corpora for (>= 2)",
     )
     generate.add_argument(
-        "--n-scenarios", dest="n_scenarios", type=int, default=9,
-        metavar="N",
-        help="Number of shared scenarios (default: 9)",
+        "--kind", choices=("abstract", "concrete"), default="abstract",
+        help=(
+            "Conceptual kind for every node (default: abstract).  Selects the "
+            "system template + elicitation role label: abstract -> 'someone "
+            "{c}', concrete -> '{art} {c}'."
+        ),
     )
     generate.add_argument(
-        "--statements-per-concept", dest="statements_per_concept",
-        type=int, default=5, metavar="K",
-        help="Statements per (concept, scenario) cell (default: 5)",
+        "--samples-per-prompt", dest="samples_per_prompt",
+        type=int, default=1, metavar="K",
+        help="In-character responses generated per baseline prompt (default: 1)",
     )
     generate.add_argument(
         "--description", default="", metavar="TEXT",
@@ -467,8 +458,8 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
     )
     generate.add_argument(
         "--seed", type=int, default=None, metavar="INT",
-        help="Seed the statement generation for reproducible corpora "
-             "(parity with `vector clone --seed`; default: unseeded)",
+        help="Seed the response generation for reproducible corpora "
+             "(default: unseeded)",
     )
     generate.add_argument(
         "--role-per-node", dest="role_per_node", action="store_true",
@@ -722,7 +713,6 @@ def _build_vector_manifold(parser: argparse.ArgumentParser) -> None:
 _SUBSPACE_BUILDERS = {
     "extract":  _build_vector_extract,
     "merge":    _build_vector_merge,
-    "clone":    _build_vector_clone,
     "compare":  _build_vector_compare,
     "why":      _build_vector_why,
     "transfer": _build_vector_transfer,

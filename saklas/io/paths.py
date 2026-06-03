@@ -94,6 +94,16 @@ def neutral_statements_path() -> Path:
     return saklas_home() / "neutral_statements.json"
 
 
+def baseline_prompts_path() -> Path:
+    """User-override path for the shared A2 baseline user prompts.
+
+    Conversational extraction generates each node's corpus as responses to
+    this fixed prompt set; a node corpus aligns ``response[i] -> prompt[i % k]``.
+    Falls back to the bundled ``saklas/data/baseline_prompts.json`` when absent.
+    """
+    return saklas_home() / "baseline_prompts.json"
+
+
 def safe_model_id(model_id: str) -> str:
     """Flatten an HF-style model ID for filesystem use: '/' -> '__'."""
     return model_id.replace("/", "__")
@@ -144,7 +154,8 @@ def safe_role_suffix(role_name: str | None) -> str:
     The role name is slugified with the same ``[a-z0-9._-]`` discipline
     as :func:`safe_sae_suffix` — lowercased, unsafe characters collapsed
     to ``_`` — so the parse is unambiguous against neighbouring kind
-    separators.
+    separators.  ``parse_tensor_filename`` splits on the literal ``_role-``
+    separator, so inner hyphens/dots round-trip.
     """
     if not role_name:
         return ""

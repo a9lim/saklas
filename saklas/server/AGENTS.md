@@ -4,7 +4,7 @@ Dual-protocol HTTP on one port: OpenAI `/v1/*`, Ollama `/api/*`, native
 `/saklas/v1/*`. One model per server; generation across all three protocols
 serializes on a single `asyncio.Lock`. There is **no `/saklas/v1/packs*` surface**
 — concepts are manifolds, so distribution rides the manifold routes (install) and
-the vectors-under-session routes (extract/merge/clone); HF upload stays CLI-only.
+the vectors-under-session routes (extract/merge); HF upload stays CLI-only.
 
 ## Module map
 
@@ -17,7 +17,7 @@ to sub-module registrars and registers a few route groups in place:
 - `manifold_routes.register_manifold_routes` — `/saklas/v1/manifolds/*`
 - `manifold_probe_routes.register_manifold_probe_routes` — `/saklas/v1/manifold-probes/*`
 - `session_routes.register_session_routes` — `/saklas/v1/sessions` CRUD + clear/rewind
-- `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*`, one-shot `/probe` + `/manifold-probe`
+- `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (list / defaults / activate / deactivate)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
 - in place: the loom `tree/*` routes, the `/sessions/{id}/vectors/*` routes, and
@@ -96,14 +96,13 @@ single-session: the one session has id `"default"`, and the loaded model id also
 resolves to it; everything else 404s.
 
 **SSE error-frame scrubbing (info-disclosure discipline).** Long-running SSE
-workers (`/extract`, `/extract/preview`, `/vectors/clone`, manifold `generate` /
-`fit`) must NOT surface raw `str(e)` in the terminal `error` frame — Python
-exception strings routinely echo filesystem paths and traceback fragments. The
-catch-all `except Exception` logs the full traceback server-side and sends the
-generic `{"message": "<op> failed", "code": type(e).__name__}`. Typed branches
-that already send a safe message (`SaklasError.user_message()`, the clone
-`FileNotFoundError` echoing the request's own `corpus_path`, the manifold
-poisedness `ValueError`/`ConcurrentExtractionError`) keep their messages.
+workers (`/extract`, manifold `generate` / `fit`) must NOT surface raw `str(e)`
+in the terminal `error` frame — Python exception strings routinely echo
+filesystem paths and traceback fragments. The catch-all `except Exception` logs
+the full traceback server-side and sends the generic `{"message": "<op> failed",
+"code": type(e).__name__}`. Typed branches that already send a safe message
+(`SaklasError.user_message()`, the manifold poisedness
+`ValueError`/`ConcurrentExtractionError`) keep their messages.
 `server/sse.py::progress_sse_response` is the shared queue-driven SSE worker — it
 owns the progress/done/error frame loop, the `call_soon_threadsafe` bridge,
 cancellation cleanup, and the generic catch-all; route modules supply only the job
@@ -161,8 +160,13 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   parity gap to worry about**: `push_manifold` is wired only into CLI `manifold
   push` — HF upload stays CLI-only, no `POST .../push` route.
 - `POST /manifolds/generate` — LLM-authors a discover folder via
-  `session.generate_statements` under the session lock; SSE progress on `Accept:
-  text/event-stream`, JSON otherwise. `role_per_node=true` → persona manifold.
+  `session.generate_responses` (A2 conversational extraction — each concept
+  answers the shared baseline prompts in character, one corpus per node) under
+  the session lock; SSE progress on `Accept: text/event-stream`, JSON otherwise.
+  `GenerateManifoldRequest` body carries `kind: "abstract"|"concrete"` +
+  `samples_per_prompt: int` (no `n_scenarios`/`statements_per_concept` — A2 has
+  no scenarios, so `scenarios.json` provenance is no longer written).
+  `role_per_node=true` → persona manifold.
 - `PATCH /manifolds/{ns}/{name}` — `update_manifold_folder` (serializes against an
   in-flight fit). Existing tensors go stale, not deleted.
 - `DELETE /manifolds/{ns}/{name}` — `remove_manifold_folder` (single source of truth
@@ -188,10 +192,12 @@ lazy-load cache). `DELETE /manifold-probes/{name}` detaches.
 ### probe_routes.py
 
 Vector probes under `/sessions/{id}/probes`: list / defaults / activate / deactivate.
-`POST /sessions/{id}/probe` body `{text, probes?}` — one-shot vector scoring via
-`monitor.measure` under the lock. `POST /sessions/{id}/manifold-probe` body `{text,
-names?}` — one-shot manifold scoring via `session.measure_manifold` under the lock;
-returns `{"readings": {name: ManifoldAggregate.to_dict()}}`.
+The one-shot text-scoring endpoints (`POST .../probe`, `POST .../manifold-probe`)
+were removed in 4.0 — they re-rendered arbitrary text out of conversation context
+via the now-deleted `monitor.measure` / `session.measure_manifold`. Live per-token
+scoring during generation is unchanged: it rides the traits SSE stream and the
+manifold-probe reading extensions on the OpenAI / Ollama / WS paths, which use
+live hooks, not a re-render pass.
 
 ### Vectors under `/sessions/{id}/vectors` (in `saklas_api.py`)
 
@@ -204,21 +210,18 @@ returns `{"readings": {name: ManifoldAggregate.to_dict()}}`.
   (whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer
   frame; the response echoes the *effective* metric). Registered *before* `GET
   /vectors/{name}` so the literal path wins.
-- `POST /extract` — `session.extract` in `asyncio.to_thread`; SSE / JSON. `source`
-  accepts a concept name, `{pairs: [...]}`, or a bare `{positive, negative}`
-  (`_coerce_pair_source`). `namespace` controls the destination; `force` bypasses the
-  tensor cache.
-- `POST /extract/preview` — `generate_scenarios` + `generate_statements` under the
-  lock, returns `{concept, baseline, scenarios, pairs}` without committing an
-  extraction. A monopolar concept synthesizes `the_opposite_of_<concept>` as the
-  negative slot.
+- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `_coerce_corpora`
+  normalizes `source`: a concept name routes to `session.extract` (bipolar-only
+  in 4.0 — a monopolar concept raises `NotImplementedError`), while two pole
+  corpora (`{positive, negative}` / `{pairs: [...]}` / a bare single
+  `{positive, negative}`) route to `session.extract_vector_from_corpora` — both
+  land a 2-node `pca` manifold. `namespace` controls the destination; `force`
+  bypasses the tensor cache. There is no `/extract/preview` (the A0
+  scenario/preview machinery was removed — A2 has no scenarios).
 - `POST /vectors/merge` body `{name, expression}` — wraps `merge_into_manifold`
   (model-scoped, `force=True`): lands a corpus-less baked manifold, folds the fitted
   tensor back to a steering Profile, registers it. `_refuse_if_busy` first (409).
-  `MergeError` → 400.
-- `POST /vectors/clone` body `{name, corpus_path, n_pairs?, seed?, baseline?}` —
-  `session.clone_from_corpus` in `asyncio.to_thread` under the lock; auto-registers.
-  Missing corpus → 404.
+  `MergeError` → 400. (Cloning was removed in 4.0 — no `/vectors/clone` route.)
 
 `GET /sessions/{id}/correlation?names=…` — N×N magnitude-weighted cosine matrix
 across loaded steering vectors and active probes (a steering vector wins a name

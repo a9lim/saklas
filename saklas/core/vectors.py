@@ -161,36 +161,34 @@ def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
 def _encode_and_capture_all(
     model: torch.nn.Module,
     tokenizer: Any,
-    text: str,
+    prompt: str,
+    response: str,
     layers: torch.nn.ModuleList,
     device: torch.device,
     *,
     role: str | None = None,
     model_type: str | None = None,
 ):
-    """Tokenize text, run forward pass, return last-content-token hidden state per layer in fp32.
+    """Capture the last-content-token hidden state per layer for a turn pair, fp32.
 
-    For instruction-tuned models (those with a chat template), wraps the text
-    as an assistant response so the extraction happens in the model's actual
-    generation regime.  Base models get the raw string.
+    Conversational (4.0 / A2) capture: the corpus item is an assistant
+    *response* to a fixed baseline *prompt*, so extraction pools the model in
+    its real generation regime — ``[user: prompt, assistant: response]`` with
+    no system turn, standard assistant label.  ``role`` overrides the assistant
+    label only when an explicit per-node role is set (the persona-baselined
+    fit); ``role=None`` is the swap-back default.
 
-    Pools from the last non-special token — chat templates append trailing
-    markers (Llama's <|eot_id|>, Gemma's <end_of_turn>, Qwen's <|im_end|>)
-    whose hidden states are disconnected from content.  The last content
-    token's hidden state is itself an attention-weighted summary of prior
-    positions and is exactly what the model uses for next-token prediction.
-
-    ``role`` (optional): substitute a custom assistant-role label into the
-    chat template via :func:`saklas.core.role_templates.apply_with_role` —
-    the extraction baseline shifts from "model speaking as assistant" to
-    "model speaking as <role>".  Requires ``model_type``.  ``role=None``
-    keeps the standard assistant-baseline path with zero overhead.
+    Pools from the response's last non-special token — chat templates append
+    trailing markers (Llama's <|eot_id|>, Gemma's <end_of_turn>, Qwen's
+    <|im_end|>) whose hidden states are disconnected from content; the last
+    content token is the attention-weighted summary the model uses for
+    next-token prediction.
 
     Returns:
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
     ids, content_end = _render_and_tokenize_for_capture(
-        tokenizer, text, device, role=role, model_type=model_type,
+        tokenizer, prompt, response, device, role=role, model_type=model_type,
     )
     hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
     return {
@@ -199,59 +197,25 @@ def _encode_and_capture_all(
     }
 
 
-def encode_and_capture_stack(
-    model: torch.nn.Module,
-    tokenizer: Any,
-    text: str,
-    layers: torch.nn.ModuleList,
-    device: torch.device,
-    *,
-    role: str | None = None,
-    model_type: str | None = None,
-) -> tuple[dict[int, torch.Tensor], int]:
-    """Capture the full ``[T, D]`` per-layer hidden stack over *text*.
-
-    The stack-returning companion to :func:`_encode_and_capture_all`:
-    same chat-template rendering, tokenization, and last-content-token
-    discipline, but it returns the whole sequence stack per layer plus the
-    ``agg_index`` of the last content token rather than collapsing to a
-    single pooled state.  Used by :meth:`ManifoldMonitor.measure` (one-shot
-    manifold text scoring), where ``score_aggregate`` pools the
-    ``agg_index`` row itself.
-
-    Returns ``({layer_idx: [T, D] fp32}, agg_index)``.
-    """
-    ids, content_end = _render_and_tokenize_for_capture(
-        tokenizer, text, device, role=role, model_type=model_type,
-    )
-    hidden_per_layer = _capture_all_hidden_states(model, layers, ids)
-    stacks = {
-        idx: h[0].float()  # [T, D]
-        for idx, h in hidden_per_layer.items()
-    }
-    # content_end is already the last-content index in this sequence;
-    # clamp defensively against the captured stack length.
-    seq_len = next(iter(stacks.values())).shape[0] if stacks else 0
-    agg_index = min(content_end, seq_len - 1) if seq_len else 0
-    return stacks, agg_index
-
-
 def _render_and_tokenize_for_capture(
     tokenizer: Any,
-    text: str,
+    prompt: str,
+    response: str,
     device: torch.device,
     *,
     role: str | None = None,
     model_type: str | None = None,
 ) -> tuple[torch.Tensor, int]:
-    """Render + tokenize *text* and locate the last content token.
+    """Render a ``[user, assistant]`` pair + tokenize, locating the last content token.
 
-    The shared front half of :func:`_encode_and_capture_all` /
-    :func:`encode_and_capture_stack` — chat-template wrapping (with the
-    optional role substitution and the template-overhead fallback) plus
-    the canonical last-content-token walkback.  Returns ``(ids [1, T] on
-    device, content_end)`` so both pooling shapes share one definition of
-    how text becomes model input and where "content" ends.
+    The shared front half of :func:`_encode_and_capture_all`.  Conversational
+    (4.0 / A2) capture: ``response`` is an assistant turn answering ``prompt``,
+    rendered with no system turn and the standard assistant label.  ``role``
+    (when set) substitutes a custom assistant-role label via
+    :func:`saklas.core.role_templates.apply_with_role` for the persona-baselined
+    fit; ``role=None`` is the swap-back default.  Returns ``(ids [1, T] on
+    device, content_end)`` where ``content_end`` is the response's last
+    non-special token — the canonical pooling position.
     """
     if getattr(tokenizer, "chat_template", None) is not None:
         # Disable thinking/reasoning mode for models that support it
@@ -260,50 +224,31 @@ def _render_and_tokenize_for_capture(
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = False
 
-        def _render(msgs: list[dict[str, str]]) -> str:
-            if role is None:
-                return tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=False, **kwargs,
-                )
+        messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": response},
+        ]
+        if role is None:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False, **kwargs,
+            )
+        else:
             if model_type is None:
                 raise ValueError(
-                    "_encode_and_capture_all: role= requires model_type= "
-                    "so the family's role-header registry entry can be "
-                    "looked up"
+                    "_render_and_tokenize_for_capture: role= requires model_type= "
+                    "so the family's role-header registry entry can be looked up"
                 )
             from saklas.core.role_templates import apply_with_role
-            return apply_with_role(
-                tokenizer, msgs,
+            text = apply_with_role(
+                tokenizer, messages,
                 role=role, model_type=model_type,
-                add_generation_prompt=False,
-                tokenize=False,
-                **kwargs,
+                add_generation_prompt=False, tokenize=False, **kwargs,
             )
-
-        messages = [{"role": "assistant", "content": text}]
-        try:
-            text = _render(messages)
-        except Exception:
-            # Some chat templates require a user turn before assistant.
-            # The filler must be semantically empty — "." triggers
-            # model-specific greeting/help responses whose template
-            # tokens contaminate pooling.
-            messages = [
-                {"role": "user", "content": "Continue:"},
-                {"role": "assistant", "content": text},
-            ]
-            text = _render(messages)
-        # Some chat templates inject a large system prompt (e.g.
-        # Ministral adds ~500 tokens).  For contrastive extraction the
-        # overhead cancels in the diff but wastes memory on every
-        # forward pass.  Fall back to raw tokenization when excessive.
-        # The template-overhead probe is role-agnostic — splicing a
-        # different role label can't shift the overhead by more than a
-        # few characters, and the cache key intentionally ignores role
-        # so the probe runs once per tokenizer.
-        overhead = _chat_template_overhead(tokenizer, kwargs)
-        if overhead > _MAX_TEMPLATE_OVERHEAD:
-            text = messages[-1]["content"]  # use raw text
+    else:
+        # Base model (no chat template) — there are no turn roles to render and
+        # A2 role-swap cannot apply; capture the bare prompt+response
+        # continuation as raw text.
+        text = f"{prompt}\n{response}"
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc["input_ids"]
     if ids.numel() == 0:
@@ -313,24 +258,12 @@ def _render_and_tokenize_for_capture(
         ids = torch.tensor([[bos_id]])
     ids = ids.to(device)
 
-    # Find the last non-template-token position.  Chat templates append
-    # trailing markers like Llama's <|eot_id|>, Gemma's <end_of_turn>,
-    # Qwen's <|im_end|> — pooling from those positions yields degenerate
-    # signals disconnected from the content.  Some tokenizers don't
-    # promote chat boundary tokens to ``all_special_ids`` (talkie's
-    # ``<|user|>``/``<|end|>``/``<|assistant|>`` are added tokens but
-    # not "special"), so we also skip everything in
-    # ``added_tokens_encoder``.  Without this, extraction pools at the
-    # structural turn marker — talkie's outlier channels then dominate
-    # the captured ref_norm, baking 100×-too-large probe magnitudes
-    # that produce gibberish at any nonzero alpha.
-    skip_ids = special_token_ids(tokenizer)
-    content_end = ids.shape[1] - 1
-    if skip_ids:
-        id_list = ids[0].tolist()
-        while content_end > 0 and id_list[content_end] in skip_ids:
-            content_end -= 1
-
+    # Last non-special token — chat templates append trailing markers (Llama's
+    # <|eot_id|>, Gemma's <end_of_turn>, Qwen's <|im_end|>) whose hidden states
+    # are disconnected from content.  ``last_content_index`` is the canonical
+    # walkback (skips ``all_special_ids`` + ``added_tokens_encoder``), shared by
+    # every single-state readout so the pooling position is defined once.
+    content_end = last_content_index(ids[0].tolist(), tokenizer)
     return ids, content_end
 
 
@@ -344,6 +277,46 @@ def _load_neutral_prompts() -> list[str]:
             return json.load(f)
     with _resources.files("saklas.data").joinpath("neutral_statements.json").open() as f:
         return json.load(f)
+
+
+@functools.cache
+def _load_baseline_prompts() -> list[str]:
+    """Load the shared A2 baseline user prompts.
+
+    Prefers a user override at ``~/.saklas/baseline_prompts.json``, else the
+    bundled ``saklas/data/baseline_prompts.json`` (64 affect-neutral prompts).
+    Conversational capture pairs each node response with its prompt by
+    ``response[i] -> prompt[i % len(prompts)]``.
+    """
+    from saklas.io.paths import baseline_prompts_path
+    user_path = baseline_prompts_path()
+    if user_path.exists():
+        with open(user_path) as f:
+            return json.load(f)
+    with _resources.files("saklas.data").joinpath("baseline_prompts.json").open() as f:
+        return json.load(f)
+
+
+def _neutral_pairs() -> list[tuple[str, str]]:
+    """The neutral baseline as ``(prompt, response)`` pairs for conversational capture.
+
+    The neutral corpus (``neutral_statements.json``) is the model's organic,
+    no-system / no-role responses to the shared baseline prompts; pairing is
+    positional, ``response[i] -> baseline[i % k]`` — the same alignment a node
+    corpus uses.  Raises if the corpus length is not a multiple of the prompt
+    set (regenerate neutrals against the shared baseline).
+    """
+    responses = _load_neutral_prompts()
+    baseline = _load_baseline_prompts()
+    k = len(baseline)
+    if k == 0:
+        raise ValueError("no baseline prompts available for neutral capture")
+    if len(responses) % k != 0:
+        raise ValueError(
+            f"neutral corpus ({len(responses)}) must be a multiple of the "
+            f"baseline prompt set ({k}); regenerate neutrals against it"
+        )
+    return [(baseline[i % k], r) for i, r in enumerate(responses)]
 
 
 def compute_layer_means(
@@ -367,9 +340,11 @@ def compute_layer_means(
 
     _mps = device.type == "mps"
 
-    prompts = _load_neutral_prompts()
-    for text in prompts:
-        per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
+    pairs = _neutral_pairs()
+    for prompt, response in pairs:
+        per_layer = _encode_and_capture_all(
+            model, tokenizer, prompt, response, layers, device,
+        )
         if not sums:
             for idx in range(n_layers):
                 sums[idx] = per_layer[idx].clone()
@@ -380,7 +355,7 @@ def compute_layer_means(
         if _mps:
             torch.mps.empty_cache()
 
-    n = len(prompts)
+    n = len(pairs)
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 
@@ -411,8 +386,10 @@ def compute_neutral_activations(
     rows: list[dict[int, torch.Tensor]] = []
     _mps = device.type == "mps"
 
-    for text in _load_neutral_prompts():
-        per_layer = _encode_and_capture_all(model, tokenizer, text, layers, device)
+    for prompt, response in _neutral_pairs():
+        per_layer = _encode_and_capture_all(
+            model, tokenizer, prompt, response, layers, device,
+        )
         # Move each layer's vector to CPU before discarding the rest of
         # the captured dict — same MPS discipline as ``compute_layer_means``.
         rows.append({idx: per_layer[idx].detach().to("cpu") for idx in range(n_layers)})

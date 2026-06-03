@@ -123,18 +123,18 @@ class CreateDiscoverManifoldRequest(BaseModel):
 class GenerateManifoldRequest(BaseModel):
     """LLM-author a discover-mode manifold from a flat concept list.
 
-    Wraps :meth:`SaklasSession.generate_concept_statements` — produces
-    one statement corpus per concept by asking the loaded model for
-    shared scenarios, then per-cell statements.  No coords supplied;
-    the fit derives them per-model.
+    Wraps :meth:`SaklasSession.generate_responses` — produces one
+    conversational corpus per concept (in-character responses to the shared
+    baseline prompts, selected by ``kind``).  No coords supplied; the fit
+    derives them per-model.
     """
 
     namespace: str = "local"
     name: str
     description: str = ""
     concepts: list[str]
-    n_scenarios: int = 9
-    statements_per_concept: int = 5
+    kind: Literal["abstract", "concrete"] = "abstract"
+    samples_per_prompt: int = 1
     fit_mode: Literal["pca", "spectral"] = "pca"
     hyperparams: dict[str, Any] = {}
     force: bool = False
@@ -629,36 +629,36 @@ def register_manifold_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/manifolds/generate", status_code=201)
     async def generate_manifold(req: GenerateManifoldRequest, request: Request):
-        """LLM-author a discover-mode manifold from a flat concept list.
+        """LLM-author a discover-mode manifold from a flat concept list (A2).
 
-        Runs :meth:`SaklasSession.generate_statements` under the
-        session lock — the unified K-tuple generator producing one
-        statement corpus per concept, scenarios shared across the
-        row.  SSE progress when ``Accept: text/event-stream``, JSON
-        otherwise.  Writes a fresh discover-mode manifold folder;
-        pair with ``POST .../fit`` to derive coords + fit.
+        Runs :meth:`SaklasSession.generate_responses` under the session lock —
+        each concept answers the shared baseline prompts in character (concept
+        in the system prompt + a kind-derived elicitation role), one corpus per
+        node.  SSE progress when ``Accept: text/event-stream``, JSON otherwise.
+        Writes a fresh discover-mode manifold folder; pair with ``POST .../fit``
+        to derive coords + fit.
         """
         if len(req.concepts) < 2:
             raise HTTPException(
                 400,
                 "manifold generate: need >= 2 concepts "
-                "(shared-scenario structure is meaningless with one)",
+                "(a discover manifold is meaningless with one node)",
             )
         folder = manifold_dir(req.namespace, req.name)
 
-        # ``role_per_node`` mirrors the CLI ``--role-per-node`` flag —
-        # each concept slug doubles as that node's assistant-role
-        # substitution.  An unsupported family raises at fit time
-        # (the folder is model-agnostic; we don't pay the family check
-        # at generate time).
+        # ``role_per_node`` mirrors the CLI ``--role-per-node`` flag — each
+        # concept slug doubles as that node's assistant-role substitution (a
+        # persona manifold, pooled in role-baselined space).  Otherwise the
+        # node's ``kind`` drives a generation-only elicitation role and capture
+        # stays standard (swap-back).
         node_roles_map: dict[str, str | None] | None = None
         if req.role_per_node:
             node_roles_map = {c: c for c in req.concepts}
+        node_kinds_map: dict[str, str | None] = {c: req.kind for c in req.concepts}
 
         def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            # ``force`` is a clean slate; the default *resumes* — fill
-            # missing nodes + append any concepts new to the roster,
-            # locked onto the saved scenarios.
+            # ``force`` is a clean slate; the default *resumes* — fill missing
+            # nodes + append any concepts new to the roster.
             if req.force and (folder / "manifold.json").exists():
                 shutil.rmtree(folder)
             try:
@@ -666,34 +666,21 @@ def register_manifold_routes(app: FastAPI) -> None:
                     folder, req.name, req.description,
                     fit_mode=req.fit_mode, labels=list(req.concepts),
                     hyperparams=req.hyperparams, node_roles=node_roles_map,
+                    node_kinds=node_kinds_map,
                 )
             except ManifoldFormatError as e:
                 raise HTTPException(400, str(e))
-            if plan.pending:
-                captured_scenarios: list[str] = []
-                session.generate_statements(
-                    list(plan.pending),
-                    scenarios=list(plan.scenarios) if plan.scenarios is not None else None,
-                    n_scenarios=req.n_scenarios,
-                    statements_per_cell=req.statements_per_concept,
+            for concept in plan.pending:
+                gen_roles = {concept: concept} if node_roles_map else None
+                corpora = session.generate_responses(
+                    [concept], [req.kind],
+                    roles=gen_roles,
+                    samples_per_prompt=req.samples_per_prompt,
                     on_progress=on_progress,
-                    on_scenarios=captured_scenarios.extend,
-                    on_corpus=lambda label, stmts: append_discover_manifold_node(
-                        folder, plan.index_of[label], label, stmts,
-                    ),
                 )
-                if plan.scenarios is None:
-                    write_json_atomic(
-                        folder / "scenarios.json",
-                        {
-                            "scenarios": captured_scenarios,
-                            "generator": "session.generate_statements",
-                            "n_scenarios": req.n_scenarios,
-                            "statements_per_concept": req.statements_per_concept,
-                            "concepts": list(plan.index_of),
-                            "model_id": session.model_id,
-                        },
-                    )
+                append_discover_manifold_node(
+                    folder, plan.index_of[concept], concept, corpora[concept],
+                )
             _evict_manifold(session, req.namespace, req.name)
             ns, mf = _find_manifold(req.namespace, req.name)
             body = _manifold_json(ns, mf, session, full=True)

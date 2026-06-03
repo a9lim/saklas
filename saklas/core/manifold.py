@@ -1111,6 +1111,15 @@ class Manifold:
     # non-role manifold carries).  Used by
     # :meth:`Manifold.nearest_node_role` for role-paired steering.
     node_roles: list[str | None] = field(default_factory=list)
+    # Per-node conceptual ``kind`` — ``"abstract"`` (a trait/quality, e.g.
+    # ``happy``) or ``"concrete"`` (an entity, e.g. ``pirate``), aligned with
+    # ``node_labels``.  ``None`` = unspecified.  A *generation-time* attribute
+    # only: it selects the system template and the elicitation role label
+    # (``someone {label}`` vs ``{label}``) when authoring a node's
+    # conversational corpus.  It does NOT feed the fit — extraction pools in
+    # standard-assistant space (swap-back) regardless — so it is carried for
+    # provenance / regeneration, not consumed by ``compute_node_centroid``.
+    node_kinds: list[str | None] = field(default_factory=list)
     # Per-layer PCA explained-variance ratio recorded at fit time.
     # ``explained_variance[L] = Σ σ²[:R] / Σ σ² (all)`` where ``R`` is
     # the retained subspace rank — a per-layer fit-quality signal used
@@ -1165,6 +1174,7 @@ class Manifold:
             feature_space=self.feature_space,
             metadata=dict(self.metadata),
             node_roles=list(self.node_roles),
+            node_kinds=list(self.node_kinds),
             explained_variance=dict(self.explained_variance),
             mahalanobis_share=dict(self.mahalanobis_share),
             origin={
@@ -2077,39 +2087,52 @@ def compute_node_centroid(
     tokenizer: object,
     layers: torch.nn.ModuleList,
     device: torch.device,
-    statements: list[str],
+    responses: list[str],
+    prompts: list[str],
     *,
     role: str | None = None,
     model_type: str | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Mean per-layer pooled activation over a manifold node's statements.
+    """Mean per-layer pooled activation over a manifold node's responses.
 
-    Reuses :func:`saklas.core.vectors._encode_and_capture_all` -- the same
-    chat-templated, last-content-token, fp32 pooling discipline that
-    backs :func:`saklas.core.vectors.compute_layer_means` -- and the same
-    MPS ``empty_cache`` discipline between forward passes.
+    Conversational (4.0 / A2) pooling: a node corpus is a list of in-character
+    *responses* to the shared baseline *prompts*, aligned positionally as
+    ``responses[i] -> prompts[i % len(prompts)]``.  Each is captured as a
+    ``[user: prompt, assistant: response]`` pair (no system, standard label)
+    via :func:`saklas.core.vectors._encode_and_capture_all` -- the same
+    last-content-token, fp32 pooling discipline that backs
+    :func:`saklas.core.vectors.compute_layer_means`, with the same MPS
+    ``empty_cache`` discipline between forward passes.
 
-    ``role`` (optional): substitute a custom assistant-role label into
-    the chat template via :func:`saklas.core.role_templates.apply_with_role`
-    for every statement, so the pooled centroid lives in
-    persona-baseline activation space instead of the standard assistant
-    baseline.  Requires ``model_type`` (the family-key into the
-    role-header registry).  ``role=None`` is the zero-overhead default.
+    ``role`` (optional): substitute a custom assistant-role label into the
+    chat template via :func:`saklas.core.role_templates.apply_with_role`, so
+    the pooled centroid lives in persona-baseline activation space instead of
+    the standard assistant (swap-back) baseline.  Requires ``model_type``.
+    ``role=None`` is the swap-back default.
 
     Returns ``{layer_idx: centroid (D,)}`` in fp32 on CPU.
     """
     from saklas.core.vectors import _encode_and_capture_all
 
-    if not statements:
-        raise ValueError("manifold node has no statements")
+    if not responses:
+        raise ValueError("manifold node has no responses")
+    if not prompts:
+        raise ValueError("conversational capture needs at least one baseline prompt")
+    k = len(prompts)
+    if len(responses) % k != 0:
+        raise ValueError(
+            f"node corpus ({len(responses)} responses) must be a multiple of "
+            f"the baseline prompt set ({k}); responses align response[i] -> "
+            f"prompt[i % k]"
+        )
 
     n_layers = len(layers)
     sums: dict[int, torch.Tensor] = {}
     is_mps = getattr(device, "type", None) == "mps"
 
-    for text in statements:
+    for i, response in enumerate(responses):
         per_layer = _encode_and_capture_all(
-            model, tokenizer, text, layers, device,
+            model, tokenizer, prompts[i % k], response, layers, device,
             role=role, model_type=model_type,
         )
         if not sums:
@@ -2122,7 +2145,7 @@ def compute_node_centroid(
         if is_mps:
             torch.mps.empty_cache()
 
-    n = len(statements)
+    n = len(responses)
     return {idx: sums[idx] / n for idx in range(n_layers)}
 
 
@@ -2246,6 +2269,10 @@ def save_manifold(
         # Absent on non-role manifolds — the pipeline only stamps it
         # when at least one node opts into role substitution.
         "node_roles",
+        # Per-node conceptual kind ("abstract"/"concrete"), aligned with
+        # ``node_labels``.  Generation-time provenance (system template +
+        # elicitation role label); absent when no node carries a kind.
+        "node_kinds",
         # Merge provenance ({coord: {alpha, project_away, tensor_sha256}}),
         # carried on a ``fit_mode="baked"`` manifold produced by
         # :func:`saklas.io.merge.merge_into_manifold`.  Informational only — a
@@ -2336,6 +2363,9 @@ def load_manifold(path: str | Path) -> Manifold:
         # ``node_roles`` is absent on non-role manifolds (every
         # pre-Phase-A fit); the loaded list stays empty in that case.
         node_roles=list(sidecar.get("node_roles", [])),
+        # ``node_kinds`` is absent on manifolds authored without the
+        # abstract/concrete distinction; the loaded list stays empty then.
+        node_kinds=list(sidecar.get("node_kinds", [])),
         explained_variance=explained_variance,
         mahalanobis_share=mahalanobis_share,
         origin=origin,
